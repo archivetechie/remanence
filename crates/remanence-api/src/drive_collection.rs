@@ -471,6 +471,7 @@ pub(crate) fn identity_source_name(source: remanence_library::IdentitySource) ->
         remanence_library::IdentitySource::DvcidInline => "DvcidInline",
         remanence_library::IdentitySource::DvcidAndInquiry => "DvcidAndInquiry",
         remanence_library::IdentitySource::Derived => "Derived",
+        remanence_library::IdentitySource::Standalone => "Standalone",
     }
 }
 

@@ -620,6 +620,7 @@ mod tests {
                 controls: controls.clone(),
                 vpd_pending: false,
             }),
+            &remanence_library::StaticAllowlist::new(["/dev/sg-cal-test"]),
         )
         .expect("standalone drive opens over scripted transport")
     }

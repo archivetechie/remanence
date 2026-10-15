@@ -2814,6 +2814,9 @@ mod tests {
         state.library_snapshot = Some(std::sync::Arc::new(std::sync::RwLock::new(
             std::sync::Arc::new(crate::live_status::LibrarySnapshot {
                 report: remanence_library::DiscoveryReport {
+                    unattached_drives: Vec::new(),
+                    complete: true,
+                    incomplete_evidence: Vec::new(),
                     libraries: vec![library_a, library_b],
                     warnings: Vec::new(),
                 },
@@ -2861,6 +2864,9 @@ mod tests {
         state.library_snapshot = Some(std::sync::Arc::new(std::sync::RwLock::new(
             std::sync::Arc::new(crate::live_status::LibrarySnapshot {
                 report: remanence_library::DiscoveryReport {
+                    unattached_drives: Vec::new(),
+                    complete: true,
+                    incomplete_evidence: Vec::new(),
                     libraries: vec![library_a, library_b],
                     warnings: Vec::new(),
                 },
@@ -3024,6 +3030,9 @@ mod tests {
         );
         foreign.serial = "D2LIB".to_string();
         let report = remanence_library::DiscoveryReport {
+            unattached_drives: Vec::new(),
+            complete: true,
+            incomplete_evidence: Vec::new(),
             libraries: vec![foreign, managed],
             warnings: Vec::new(),
         };
@@ -3775,6 +3784,9 @@ mod tests {
         state.library_snapshot = Some(Arc::new(std::sync::RwLock::new(Arc::new(
             crate::live_status::LibrarySnapshot {
                 report: remanence_library::DiscoveryReport {
+                    unattached_drives: Vec::new(),
+                    complete: true,
+                    incomplete_evidence: Vec::new(),
                     libraries: vec![test_library(vec![loaded], vec![])],
                     warnings: Vec::new(),
                 },
@@ -4120,6 +4132,9 @@ mod tests {
         state.library_snapshot = Some(Arc::new(std::sync::RwLock::new(Arc::new(
             crate::live_status::LibrarySnapshot {
                 report: remanence_library::DiscoveryReport {
+                    unattached_drives: Vec::new(),
+                    complete: true,
+                    incomplete_evidence: Vec::new(),
                     libraries: vec![library],
                     warnings: Vec::new(),
                 },

@@ -35,6 +35,7 @@ use super::{capacity::*, no_parity::*, overlap::*, prepare::*, staging::*};
 #[test]
 fn rewritable_object_media_gate_fails_closed_for_worm_and_unknown() {
     let config = |write_protected, worm| TapeConfig {
+        density_code: None,
         block_size: remanence_library::BlockSize::Variable,
         compression: false,
         max_block_size_bytes: 8 * 1024 * 1024,

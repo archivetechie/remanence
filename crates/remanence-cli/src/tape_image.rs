@@ -668,6 +668,7 @@ mod tests {
         let mut drive = DriveHandle::open_standalone_with_transport(
             Path::new("/dev/sg-image-model"),
             Box::new(transport),
+            &remanence_library::StaticAllowlist::new(["/dev/sg-image-model"]),
         )
         .expect("open model drive");
         let written = write_tape_image(&mut drive, inputs).expect("write fixed image");
@@ -867,6 +868,7 @@ mod tests {
         let drive = DriveHandle::open_standalone_with_transport(
             Path::new("/dev/sg-image-model"),
             Box::new(transport),
+            &remanence_library::StaticAllowlist::new(["/dev/sg-image-model"]),
         )
         .expect("open damaged image");
         (drive, engine)

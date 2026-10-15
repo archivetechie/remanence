@@ -81,6 +81,7 @@ fn tape(
     DriveHandle::open_standalone_with_transport(
         Path::new("/dev/sg-mutation-model"),
         Box::new(transport),
+        &remanence_library::StaticAllowlist::new(["/dev/sg-mutation-model"]),
     )
     .unwrap()
 }

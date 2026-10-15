@@ -872,6 +872,7 @@ fn drive(v: &Resolved) -> (DriveHandle, FaultEngine) {
         DriveHandle::open_standalone_with_transport(
             Path::new("/dev/sg-supplement-model"),
             Box::new(transport),
+            &remanence_library::StaticAllowlist::new(["/dev/sg-supplement-model"]),
         )
         .unwrap(),
         engine,

@@ -1913,6 +1913,7 @@ pub(super) fn prepare_drive_for_write(
         .rewind()
         .map_err(|err| Status::internal(format!("rewind before write verify: {err}")))?;
     let rewind_verify_elapsed = rewind_verify_started.elapsed();
+    let identity_generation = drive.identity_generation();
     let verify_started = Instant::now();
     {
         let mut source = DriveHandleSource(drive);
@@ -1937,6 +1938,9 @@ pub(super) fn prepare_drive_for_write(
             .map_err(|err| {
                 Status::failed_precondition(format!("verify fixed-block write config: {err}"))
             })?;
+    drive
+        .bind_identity_generation(identity_generation)
+        .map_err(|err| Status::failed_precondition(format!("tape identity: {err}")))?;
     let staging_ring_buffers = drive.staging_ring_buffers();
     let effective_batch_blocks = drive.requested_write_batch_blocks().min(
         drive

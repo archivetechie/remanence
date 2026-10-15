@@ -314,6 +314,7 @@ fn source_with_read_completion(
         DriveHandle::open_standalone_with_transport(
             Path::new("/dev/sg-image-model"),
             Box::new(transport),
+            &remanence_library::StaticAllowlist::new(["/dev/sg-image-model"]),
         )
         .unwrap(),
         engine,

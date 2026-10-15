@@ -453,69 +453,61 @@ impl<S: AuditSink + Send + ?Sized + 'static> ParityAuditHook for SharedAuditAdap
 pub fn library_audit_event_record(event: &LibraryAuditEvent<'_>) -> AuditEventRecord {
     match event {
         LibraryAuditEvent::Started {
-            library_serial,
+            subject,
             operation,
             cdb,
             at,
         } => {
-            let mut detail =
-                library_detail(library_serial, Layer2AuditEventTag::Started, operation, *at);
+            let mut detail = library_detail(subject, Layer2AuditEventTag::Started, operation, *at);
             detail.insert("cdb".to_string(), CborValue::Bytes((*cdb).to_vec()));
             library_record(
                 AuditEvent::OperationStarted,
-                library_serial,
+                subject,
                 detail,
                 SourceLayer::Layer2,
             )
         }
         LibraryAuditEvent::Refused {
-            library_serial,
+            subject,
             operation,
             reason,
             at,
         } => {
-            let mut detail =
-                library_detail(library_serial, Layer2AuditEventTag::Refused, operation, *at);
+            let mut detail = library_detail(subject, Layer2AuditEventTag::Refused, operation, *at);
             text(&mut detail, "reason", *reason);
             library_record(
                 AuditEvent::OperationFailed,
-                library_serial,
+                subject,
                 detail,
                 SourceLayer::Layer2,
             )
         }
         LibraryAuditEvent::Finished {
-            library_serial,
+            subject,
             operation,
             outcome,
             at,
         } => {
-            let mut detail = library_detail(
-                library_serial,
-                Layer2AuditEventTag::Finished,
-                operation,
-                *at,
-            );
+            let mut detail = library_detail(subject, Layer2AuditEventTag::Finished, operation, *at);
             add_library_outcome_detail(&mut detail, outcome);
             library_record(
                 library_outcome_audit_event(outcome),
-                library_serial,
+                subject,
                 detail,
                 SourceLayer::Layer2,
             )
         }
         LibraryAuditEvent::Warning {
-            library_serial,
+            subject,
             operation,
             warning,
             at,
         } => {
-            let mut detail =
-                library_detail(library_serial, Layer2AuditEventTag::Warning, operation, *at);
+            let mut detail = library_detail(subject, Layer2AuditEventTag::Warning, operation, *at);
             add_rescan_warning_detail(&mut detail, warning);
             library_record(
                 AuditEvent::HardwareWarning,
-                library_serial,
+                subject,
                 detail,
                 SourceLayer::Layer2,
             )
@@ -637,7 +629,7 @@ pub fn append_sidecar_metadata_health_event(
 
 fn library_record(
     event: AuditEvent,
-    library_serial: &str,
+    subject: &remanence_library::AuditSubject<'_>,
     detail: BTreeMap<String, CborValue>,
     source_layer: SourceLayer,
 ) -> AuditEventRecord {
@@ -649,22 +641,32 @@ fn library_record(
         idempotency_key: None,
         event,
         subject: AuditSubject {
-            kind: "library".to_string(),
-            id: Some(library_serial.to_string()),
+            kind: subject.kind().to_string(),
+            id: subject.id().map(str::to_string),
         },
         detail,
     }
 }
 
 fn library_detail(
-    library_serial: &str,
+    subject: &remanence_library::AuditSubject<'_>,
     tag: Layer2AuditEventTag,
     operation: &LibraryAuditOp,
     at: SystemTime,
 ) -> BTreeMap<String, CborValue> {
     let mut detail = BTreeMap::new();
     text(&mut detail, "layer2_event", tag.as_str());
-    text(&mut detail, "library_serial", library_serial);
+    if let Some(id) = subject.id() {
+        text(
+            &mut detail,
+            if subject.kind() == "drive" {
+                "drive_serial"
+            } else {
+                "library_serial"
+            },
+            id,
+        );
+    }
     text(&mut detail, "event_at_utc", system_time_to_rfc3339(at));
     text(
         &mut detail,
@@ -709,14 +711,14 @@ fn add_library_operation_detail(
         | LibraryAuditOp::TapeReadConfig { bay }
         | LibraryAuditOp::TapeWriteConfig { bay }
         | LibraryAuditOp::TapeReadWrapPositions { bay } => {
-            uint(detail, "bay_element", u64::from(bay));
+            optional_u16(detail, "bay_element", bay);
         }
         LibraryAuditOp::TapeLocate { bay, lba } => {
-            uint(detail, "bay_element", u64::from(bay));
+            optional_u16(detail, "bay_element", bay);
             uint(detail, "lba", lba);
         }
         LibraryAuditOp::TapeSpace { bay, count, kind } => {
-            uint(detail, "bay_element", u64::from(bay));
+            optional_u16(detail, "bay_element", bay);
             int(detail, "count", count);
             text(
                 detail,
@@ -725,7 +727,7 @@ fn add_library_operation_detail(
             );
         }
         LibraryAuditOp::TapeRead { bay, len } | LibraryAuditOp::TapeWrite { bay, len } => {
-            uint(detail, "bay_element", u64::from(bay));
+            optional_u16(detail, "bay_element", bay);
             uint(detail, "len", u64::from(len));
         }
         LibraryAuditOp::TapeWriteWindow {
@@ -735,14 +737,14 @@ fn add_library_operation_detail(
             first_records,
             last_records,
         } => {
-            uint(detail, "bay_element", u64::from(bay));
+            optional_u16(detail, "bay_element", bay);
             uint(detail, "command_count", u64::from(command_count));
             uint(detail, "bytes", bytes);
             uint(detail, "first_records", u64::from(first_records));
             uint(detail, "last_records", u64::from(last_records));
         }
         LibraryAuditOp::TapeWriteFilemarks { bay, count } => {
-            uint(detail, "bay_element", u64::from(bay));
+            optional_u16(detail, "bay_element", bay);
             uint(detail, "count", u64::from(count));
         }
     }
@@ -990,12 +992,28 @@ mod tests {
         }
     }
 
+    /// A standalone event persists a drive serial without a fabricated library/bay.
+    #[test]
+    fn layer2_standalone_event_preserves_drive_subject() {
+        let record = library_audit_event_record(&LibraryAuditEvent::Started {
+            subject: remanence_library::AuditSubject::Drive("SERIAL-80"),
+            operation: LibraryAuditOp::TapeWrite { bay: None, len: 64 },
+            cdb: &[0x0a, 0, 0, 0, 64, 0],
+            at: SystemTime::UNIX_EPOCH,
+        });
+        assert_eq!(record.subject.kind, "drive");
+        assert_eq!(record.subject.id.as_deref(), Some("SERIAL-80"));
+        assert_eq!(text_detail(&record, "drive_serial"), "SERIAL-80");
+        assert!(!record.detail.contains_key("library_serial"));
+        assert_eq!(record.detail.get("bay_element"), Some(&CborValue::Null));
+    }
+
     #[test]
     fn layer2_started_event_preserves_operation_and_cdb_tags() {
         let event = LibraryAuditEvent::Started {
-            library_serial: "lib-001",
+            subject: remanence_library::AuditSubject::Library("lib-001"),
             operation: LibraryAuditOp::TapeSpace {
-                bay: 7,
+                bay: Some(7),
                 count: -3,
                 kind: SpaceKind::Filemarks,
             },
@@ -1023,7 +1041,7 @@ mod tests {
     #[test]
     fn layer2_dirty_scsi_error_maps_to_completion_unknown() {
         let event = LibraryAuditEvent::Finished {
-            library_serial: "lib-001",
+            subject: remanence_library::AuditSubject::Library("lib-001"),
             operation: LibraryAuditOp::Move { src: 1, dst: 2 },
             outcome: LibraryAuditOutcome::ScsiError {
                 sense: Some(vec![0x70, 0x00, 0x05]),
@@ -1049,7 +1067,7 @@ mod tests {
     #[test]
     fn layer2_reconciliation_warning_maps_to_hardware_warning() {
         let event = LibraryAuditEvent::Warning {
-            library_serial: "lib-001",
+            subject: remanence_library::AuditSubject::Library("lib-001"),
             operation: LibraryAuditOp::Rescan,
             warning: LibraryRescanWarning::DriveReplaced {
                 addr: 0x100,
@@ -1131,7 +1149,7 @@ mod tests {
     fn direct_append_helper_appends_library_event() {
         let mut sink = RecordingSink::default();
         let event = LibraryAuditEvent::Refused {
-            library_serial: "lib-001",
+            subject: remanence_library::AuditSubject::Library("lib-001"),
             operation: LibraryAuditOp::Export {
                 slot: 0x400,
                 ie: None,
@@ -1156,7 +1174,7 @@ mod tests {
     fn shared_adapter_feeds_library_and_parity_hooks() {
         let adapter = SharedAuditAdapter::new(RecordingSink::default());
         let event = LibraryAuditEvent::Warning {
-            library_serial: "lib-001",
+            subject: remanence_library::AuditSubject::Library("lib-001"),
             operation: LibraryAuditOp::Rescan,
             warning: LibraryRescanWarning::DriveAppeared {
                 addr: 0x100,

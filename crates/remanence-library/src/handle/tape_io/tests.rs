@@ -759,6 +759,7 @@ fn parse_mode_sense_rejects_wrong_page_code() {
 #[test]
 fn build_compression_param_list_variable_no_compression() {
     let cfg = TapeConfig {
+        density_code: None,
         block_size: BlockSize::Variable,
         compression: false,
         max_block_size_bytes: 0x80_0000, // ignored
@@ -796,6 +797,7 @@ fn build_compression_param_list_variable_no_compression() {
 #[test]
 fn build_compression_param_list_fixed_with_compression() {
     let cfg = TapeConfig {
+        density_code: None,
         block_size: BlockSize::Fixed {
             size_bytes: 0x010000,
         }, // 64 KiB
@@ -827,6 +829,7 @@ fn parse_mode_sense_round_trips_with_builder() {
     // reserved (0); MODE SENSE byte 0 is Mode Data Length.
     // For a 28-byte response, MDL = 27.
     let cfg_in = TapeConfig {
+        density_code: None,
         block_size: BlockSize::Fixed {
             size_bytes: 0x40_0000,
         },
@@ -884,6 +887,7 @@ mod reowp_drive_surface {
         DriveHandle::open_standalone_with_transport(
             Path::new("/dev/sg-reowp-test"),
             Box::new(fixture),
+            &crate::StaticAllowlist::new(["/dev/sg-reowp-test"]),
         )
         .expect("standalone drive opens over fixture transport")
     }
@@ -965,6 +969,7 @@ mod reowp_drive_surface {
         let mut drive = DriveHandle::open_standalone_with_transport(
             Path::new("/dev/sg-reowp-reject"),
             Box::new(transport),
+            &crate::StaticAllowlist::new(["/dev/sg-reowp-reject"]),
         )
         .expect("standalone drive opens");
 

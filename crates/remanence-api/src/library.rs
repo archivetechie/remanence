@@ -1322,6 +1322,9 @@ mod tests {
         state.library_snapshot = Some(Arc::new(std::sync::RwLock::new(Arc::new(
             crate::live_status::LibrarySnapshot {
                 report: DiscoveryReport {
+                    unattached_drives: Vec::new(),
+                    complete: true,
+                    incomplete_evidence: Vec::new(),
                     libraries: vec![mk_library()],
                     warnings: Vec::new(),
                 },
@@ -1631,6 +1634,9 @@ mod tests {
             .write()
             .expect("snapshot write lock") = Arc::new(crate::live_status::LibrarySnapshot {
             report: DiscoveryReport {
+                unattached_drives: Vec::new(),
+                complete: true,
+                incomplete_evidence: Vec::new(),
                 libraries: vec![refreshed_library],
                 warnings: Vec::new(),
             },
@@ -1685,6 +1691,9 @@ mod tests {
         state.library_snapshot = Some(Arc::new(std::sync::RwLock::new(Arc::new(
             crate::live_status::LibrarySnapshot {
                 report: DiscoveryReport {
+                    unattached_drives: Vec::new(),
+                    complete: true,
+                    incomplete_evidence: Vec::new(),
                     libraries: vec![first_library, second_library],
                     warnings: Vec::new(),
                 },
@@ -1912,6 +1921,9 @@ mod tests {
         state.library_snapshot = Some(Arc::new(std::sync::RwLock::new(Arc::new(
             crate::live_status::LibrarySnapshot {
                 report: DiscoveryReport {
+                    unattached_drives: Vec::new(),
+                    complete: true,
+                    incomplete_evidence: Vec::new(),
                     libraries: vec![current.report.libraries[0].clone(), second_library],
                     warnings: Vec::new(),
                 },

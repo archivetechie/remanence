@@ -94,6 +94,17 @@ fn validate_residual_claim(
 /// clean (physical state is known).
 #[derive(Debug, Error)]
 pub enum TapeIoError {
+    /// No command dispatched: the caller's proof belongs to an earlier medium state.
+    #[error("tape identity invalidated: proved generation {proved}, current generation {current}; re-establish media proof before writing")]
+    IdentityInvalidated {
+        /// Generation under which identity was proved.
+        proved: u64,
+        /// Current transport generation.
+        current: u64,
+    },
+    /// An unserialized device has no durable write authority.
+    #[error("ephemeral drive endpoints are read-only")]
+    EphemeralReadOnly,
     /// The drive returned CHECK CONDITION with sense data we could
     /// parse. Physical state is known; this is **not** a dirty
     /// signal. Caller should consult the sense bytes.
@@ -461,11 +472,33 @@ fn parse_read_position_long(buf: &[u8]) -> Result<TapePosition, TapeIoError> {
 }
 
 impl super::DriveHandle {
+    /// Generation invalidated by any UA, failed readiness check or uncertain state.
+    pub fn identity_generation(&self) -> u64 {
+        self.transport.identity_generation()
+    }
+
+    /// Bind every subsequent media dispatch (including batches and filemarks)
+    /// to the generation under which the caller established BOT identity,
+    /// readiness, removal prevention, fence, mode and append position.
+    pub fn bind_identity_generation(&mut self, generation: u64) -> Result<(), TapeIoError> {
+        self.transport.bind_identity_generation(generation)
+    }
+
+    /// Write one block using explicit identity evidence; stale evidence sends no CDB.
+    pub fn write_block_with_identity_generation(
+        &mut self,
+        buf: &[u8],
+        generation: u64,
+    ) -> Result<WriteOutcome, TapeIoError> {
+        self.bind_identity_generation(generation)?;
+        self.write_block(buf)
+    }
+
     fn fire_tape_started(&self, operation: AuditOp, cdb: &[u8]) {
         fire_audit(
             &mut lock_drive_shared(&self.shared).audit_hook,
             &AuditEvent::Started {
-                library_serial: &self.library_serial,
+                subject: self.audit_subject(),
                 operation,
                 cdb,
                 at: SystemTime::now(),
@@ -477,7 +510,7 @@ impl super::DriveHandle {
         fire_audit(
             &mut lock_drive_shared(&self.shared).audit_hook,
             &AuditEvent::Finished {
-                library_serial: &self.library_serial,
+                subject: self.audit_subject(),
                 operation,
                 outcome: AuditOutcome::Success {
                     duration,
@@ -493,7 +526,7 @@ impl super::DriveHandle {
         fire_audit(
             &mut lock_drive_shared(&self.shared).audit_hook,
             &AuditEvent::Finished {
-                library_serial: &self.library_serial,
+                subject: self.audit_subject(),
                 operation,
                 outcome: AuditOutcome::Recovered {
                     duration,
@@ -520,7 +553,7 @@ impl super::DriveHandle {
         fire_audit(
             &mut lock_drive_shared(&self.shared).audit_hook,
             &AuditEvent::Finished {
-                library_serial: &self.library_serial,
+                subject: self.audit_subject(),
                 operation,
                 outcome,
                 at: SystemTime::now(),
@@ -565,7 +598,7 @@ impl super::DriveHandle {
             fire_audit(
                 &mut lock_drive_shared(&self.shared).audit_hook,
                 &AuditEvent::Finished {
-                    library_serial: &self.library_serial,
+                    subject: self.audit_subject(),
                     operation: pending.operation,
                     outcome: pending.outcome,
                     at: SystemTime::now(),
@@ -584,7 +617,7 @@ impl super::DriveHandle {
         last_records: u32,
     ) {
         let operation = AuditOp::TapeWriteWindow {
-            bay: self.bay_address,
+            bay: self.bay_address(),
             command_count,
             bytes,
             first_records,
@@ -604,7 +637,7 @@ impl super::DriveHandle {
     ) {
         self.finish_tape_success(
             AuditOp::TapeWriteWindow {
-                bay: self.bay_address,
+                bay: self.bay_address(),
                 command_count,
                 bytes,
                 first_records,
@@ -625,7 +658,7 @@ impl super::DriveHandle {
     ) {
         self.finish_tape_error(
             AuditOp::TapeWriteWindow {
-                bay: self.bay_address,
+                bay: self.bay_address(),
                 command_count,
                 bytes,
                 first_records,
@@ -644,7 +677,7 @@ impl super::DriveHandle {
     /// clean because the physical state is known.
     pub fn rewind(&mut self) -> Result<(), TapeIoError> {
         let op = AuditOp::TapeRewind {
-            bay: self.bay_address,
+            bay: self.bay_address(),
         };
         let cdb = remanence_scsi::rewind::build_cdb();
 
@@ -680,7 +713,7 @@ impl super::DriveHandle {
     /// method.
     pub fn position(&mut self) -> Result<TapePosition, TapeIoError> {
         let op = AuditOp::TapeReadPosition {
-            bay: self.bay_address,
+            bay: self.bay_address(),
         };
         let cdb = remanence_scsi::read_position::build_cdb_long();
 
@@ -707,7 +740,7 @@ impl super::DriveHandle {
     /// transport failure.
     pub fn read_tape_alerts(&mut self) -> Result<TapeAlerts, TapeIoError> {
         let op = AuditOp::TapeReadAlerts {
-            bay: self.bay_address,
+            bay: self.bay_address(),
         };
         let cdb = remanence_scsi::log_sense::build_tape_alert_cdb(
             remanence_scsi::log_sense::TAPE_ALERT_RESPONSE_LEN,
@@ -783,7 +816,7 @@ impl super::DriveHandle {
     ) -> Result<remanence_scsi::read_end_of_wrap_position::EndOfWrapPositions, TapeIoError> {
         use remanence_scsi::read_end_of_wrap_position as reowp;
         let op = AuditOp::TapeReadWrapPositions {
-            bay: self.bay_address,
+            bay: self.bay_address(),
         };
         let cdb = reowp::build_cdb(reowp::ALLOC_LEN);
         self.fire_tape_started(op, &cdb);
@@ -936,7 +969,7 @@ impl super::DriveHandle {
         build_cdb: fn(u16) -> [u8; 10],
     ) -> Result<ErrorCounterPage, TapeIoError> {
         let op = AuditOp::TapeReadAlerts {
-            bay: self.bay_address,
+            bay: self.bay_address(),
         };
         let cdb = build_cdb(remanence_scsi::log_sense::ERROR_COUNTER_RESPONSE_LEN);
         self.fire_tape_started(op, &cdb);
@@ -978,7 +1011,7 @@ impl super::DriveHandle {
     /// [`DirtyCause::CompletionUnknown`].
     pub fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
         let op = AuditOp::TapeLocate {
-            bay: self.bay_address,
+            bay: self.bay_address(),
             lba,
         };
         let cdb = remanence_scsi::locate::build_cdb(lba);
@@ -1068,7 +1101,7 @@ impl super::DriveHandle {
         // otherwise. The CDB-builder layer handles encoding; we hand
         // it a reference-sized slice via the matching arm.
         let op = AuditOp::TapeSpace {
-            bay: self.bay_address,
+            bay: self.bay_address(),
             count,
             kind,
         };
@@ -1197,7 +1230,7 @@ impl super::DriveHandle {
             ))
         })?;
         let op = AuditOp::TapeWrite {
-            bay: self.bay_address,
+            bay: self.bay_address(),
             len: len_u32,
         };
         let cdb = remanence_scsi::read_write::build_write_fixed_cdb(records);
@@ -1417,7 +1450,7 @@ impl super::DriveHandle {
             ))
         })?;
         let operation = AuditOp::TapeWrite {
-            bay: self.bay_address,
+            bay: self.bay_address(),
             len: len_u32,
         };
 
@@ -1674,7 +1707,7 @@ impl super::DriveHandle {
         }
         self.seed_expected_position()?;
         let op = AuditOp::TapeRead {
-            bay: self.bay_address,
+            bay: self.bay_address(),
             len: transfer_len,
         };
         let cdb = remanence_scsi::read_write::build_read_fixed_cdb(records);
@@ -1768,7 +1801,7 @@ impl super::DriveHandle {
 
         let _position_before = self.seed_expected_position()?;
         let op = AuditOp::TapeRead {
-            bay: self.bay_address,
+            bay: self.bay_address(),
             len: transfer_len,
         };
         let cdb = remanence_scsi::read_write::build_read_fixed_cdb(records);
@@ -1972,7 +2005,7 @@ impl super::DriveHandle {
         };
 
         let op = AuditOp::TapeRead {
-            bay: self.bay_address,
+            bay: self.bay_address(),
             len: len_u32,
         };
         let cdb = remanence_scsi::read_write::build_read_variable_cdb(len_u32);
@@ -2015,7 +2048,7 @@ impl super::DriveHandle {
                         self.invalidate_for_reset_unit_attention();
                     }
                     if read_filemark_signal(sense) {
-                        self.mark_position_unknown();
+                        self.forget_position();
                         let mapped = TapeIoError::FilemarkEncountered;
                         self.finish_tape_error(op, &mapped);
                         return Err(mapped);
@@ -2042,7 +2075,7 @@ impl super::DriveHandle {
                             // before retrying.
                             let actual_i64 = (len_u32 as i64) - signed_info;
                             let actual_u32 = actual_i64.clamp(0, u32::MAX as i64) as u32;
-                            self.mark_position_unknown();
+                            self.forget_position();
                             let mapped = TapeIoError::ReadBufferTooSmall {
                                 actual: actual_u32,
                                 provided: len_u32,
@@ -2052,7 +2085,13 @@ impl super::DriveHandle {
                         }
                     }
                 }
-                self.mark_position_unknown();
+                if matches!(&e, ScsiError::CheckCondition { sense, .. }
+                    if !sense_is_deferred(sense) && decode_sense_key_asc(sense).is_some_and(|(key, _, _)| key == 0x08))
+                {
+                    self.forget_position();
+                } else {
+                    self.mark_position_unknown();
+                }
                 let mapped = map_scsi(e);
                 self.finish_tape_error(op, &mapped);
                 Err(mapped)
@@ -2093,7 +2132,7 @@ impl super::DriveHandle {
         };
 
         let op = AuditOp::TapeWrite {
-            bay: self.bay_address,
+            bay: self.bay_address(),
             len: len_u32,
         };
         let cdb = remanence_scsi::read_write::build_write_variable_cdb(len_u32);
@@ -2215,7 +2254,7 @@ impl super::DriveHandle {
         };
 
         let op = AuditOp::TapeWrite {
-            bay: self.bay_address,
+            bay: self.bay_address(),
             len: len_u32,
         };
         let cdb = remanence_scsi::read_write::build_write_variable_cdb(len_u32);
@@ -2346,7 +2385,7 @@ impl super::DriveHandle {
         }
 
         let op = AuditOp::TapeWriteFilemarks {
-            bay: self.bay_address,
+            bay: self.bay_address(),
             count,
         };
         let cdb = remanence_scsi::write_filemarks::build_cdb_6(count);
@@ -2430,7 +2469,7 @@ impl super::DriveHandle {
             )));
         }
         let operation = AuditOp::TapeWriteFilemarks {
-            bay: self.bay_address,
+            bay: self.bay_address(),
             count,
         };
         let cdb = remanence_scsi::write_filemarks::build_cdb_6_immediate(count);
@@ -2468,7 +2507,7 @@ impl super::DriveHandle {
             )));
         }
         let operation = AuditOp::TapeWriteFilemarks {
-            bay: self.bay_address,
+            bay: self.bay_address(),
             count,
         };
         let cdb = remanence_scsi::write_filemarks::build_cdb_6(count);
@@ -2584,7 +2623,7 @@ impl super::DriveHandle {
     /// payload-wrong condition, distinct from CHECK CONDITION).
     pub fn read_config(&mut self) -> Result<TapeConfig, TapeIoError> {
         let op = AuditOp::TapeReadConfig {
-            bay: self.bay_address,
+            bay: self.bay_address(),
         };
         let cdb_rbl = remanence_scsi::read_block_limits::build_cdb();
         self.fire_tape_started(op, &cdb_rbl);
@@ -2657,6 +2696,7 @@ impl super::DriveHandle {
         }
 
         Ok(TapeConfig {
+            density_code: mode.density_code,
             block_size: mode.block_size,
             compression: mode.compression,
             max_block_size_bytes,
@@ -2716,7 +2756,7 @@ impl super::DriveHandle {
         }
 
         let op = AuditOp::TapeWriteConfig {
-            bay: self.bay_address,
+            bay: self.bay_address(),
         };
         let param_list = build_compression_param_list(&cfg);
         let cdb = remanence_scsi::mode::build_mode_select6_cdb(
@@ -2784,12 +2824,19 @@ impl super::DriveHandle {
         self.transport.media_write_fenced_this_load()
     }
 
-    fn mark_position_unknown(&mut self) {
+    pub(super) fn mark_position_unknown(&mut self) {
+        self.transport.invalidate_identity();
+        self.forget_position();
+    }
+
+    // A normal filemark/EOD or consumed oversized record loses the arithmetic
+    // cursor, but is not evidence that cartridge identity changed.
+    fn forget_position(&mut self) {
         self.position_known = false;
         self.expected_position = None;
     }
 
-    fn invalidate_for_reset_unit_attention(&mut self) {
+    pub(super) fn invalidate_for_reset_unit_attention(&mut self) {
         self.mark_position_unknown();
         if let Some(block_size) = self.validated_fixed_block_size.take() {
             self.mode_reverification_required = Some(block_size);
@@ -2983,7 +3030,7 @@ impl super::DriveHandle {
         expected: Option<TapePosition>,
     ) -> Result<TapePosition, TapeIoError> {
         let operation = AuditOp::TapeReadPosition {
-            bay: self.bay_address,
+            bay: self.bay_address(),
         };
         let cdb = remanence_scsi::read_position::build_cdb_long();
         self.fire_tape_started(operation, &cdb);
@@ -3267,7 +3314,7 @@ fn position_drift_error(expected: TapePosition, device: TapePosition) -> TapeIoE
     ))
 }
 
-fn is_reset_unit_attention(sense: &[u8]) -> bool {
+pub(super) fn is_reset_unit_attention(sense: &[u8]) -> bool {
     decode_sense(sense).is_some_and(|decoded| {
         !decoded.is_deferred()
             && decoded.key == 0x06
@@ -3320,6 +3367,7 @@ fn position_overflow_error() -> TapeIoError {
 ///   - ... remaining fields (algorithms etc.) ignored by Layer 3a
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ModeSenseDataCompression {
+    density_code: Option<u8>,
     block_size: BlockSize,
     compression: bool,
     write_protected: bool,
@@ -3384,6 +3432,7 @@ fn parse_mode_sense_data_compression(buf: &[u8]) -> Result<ModeSenseDataCompress
     let compression = (buf[dce_offset] & 0x80) != 0;
 
     Ok(ModeSenseDataCompression {
+        density_code: Some(buf[4]),
         block_size,
         compression,
         write_protected,

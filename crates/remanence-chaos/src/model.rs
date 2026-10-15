@@ -2379,6 +2379,10 @@ mod l1b_tests {
         let (tape_file_number, block_count, manifest_sha256, payload_first_body_lba) = {
             let mut drive = open_drive(Arc::clone(&world), None);
             drive.load().expect("load drive");
+            // This fixture supplies the new load's known media identity.
+            drive
+                .bind_identity_generation(drive.identity_generation())
+                .expect("bind fixture identity");
             let mut raw = DriveHandleRawSink::new(&mut drive);
             raw.configure_parity_write_session(BLOCK_SIZE)
                 .expect("configure parity session");
@@ -3202,6 +3206,10 @@ mod l1b_tests {
         let world = loaded_world(1);
         let mut drive = open_drive(world, None);
         drive.load().expect("load drive");
+        // This fixture supplies the new load's known media identity.
+        drive
+            .bind_identity_generation(drive.identity_generation())
+            .expect("bind fixture identity");
 
         let outcome = drive
             .write_block(&vec![0xa5; BLOCK_SIZE as usize])

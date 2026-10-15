@@ -44,9 +44,10 @@ use crate::error::{
     AuditEvent, AuditOp, AuditOutcome, DriveOpError, IoErrorKind, LoadError, MoveError, OpenError,
     RescanError, UnloadError,
 };
-use crate::model::{AccessPolicy, IdentitySource, InstalledDrive, Library};
+use crate::model::{AccessPolicy, IdentitySource, InstalledDrive, Library, StaticAllowlist};
 use crate::ops;
 use crate::transport::{SgTransport, TimeoutClass};
+use crate::{DriveKey, MountEndpoint};
 
 // Layer 3a — child module so its `impl DriveHandle { ... }` block
 // can see this module's private fields. Public so the value
@@ -491,7 +492,7 @@ impl ChangerHandle {
                 fire_audit(
                     &mut lock_drive_shared(&self.shared).audit_hook,
                     &AuditEvent::Warning {
-                        library_serial: &self.library.serial,
+                        subject: crate::AuditSubject::Library(&self.library.serial),
                         operation: AuditOp::Rescan,
                         warning: crate::error::RescanWarning::ShapeMismatch { summary: mismatch },
                         at: SystemTime::now(),
@@ -531,7 +532,7 @@ impl ChangerHandle {
         fire_audit(
             &mut lock_drive_shared(&self.shared).audit_hook,
             &AuditEvent::Started {
-                library_serial: &self.library.serial,
+                subject: crate::AuditSubject::Library(&self.library.serial),
                 operation: op,
                 cdb: &cdb,
                 at: SystemTime::now(),
@@ -556,7 +557,7 @@ impl ChangerHandle {
             fire_audit(
                 &mut lock_drive_shared(&self.shared).audit_hook,
                 &AuditEvent::Finished {
-                    library_serial: &self.library.serial,
+                    subject: crate::AuditSubject::Library(&self.library.serial),
                     operation: op,
                     outcome,
                     at: SystemTime::now(),
@@ -585,7 +586,7 @@ impl ChangerHandle {
                 fire_audit(
                     &mut lock_drive_shared(&self.shared).audit_hook,
                     &AuditEvent::Finished {
-                        library_serial: &self.library.serial,
+                        subject: crate::AuditSubject::Library(&self.library.serial),
                         operation: op,
                         outcome,
                         at: SystemTime::now(),
@@ -614,7 +615,7 @@ impl ChangerHandle {
                 fire_audit(
                     &mut lock_drive_shared(&self.shared).audit_hook,
                     &AuditEvent::Finished {
-                        library_serial: &self.library.serial,
+                        subject: crate::AuditSubject::Library(&self.library.serial),
                         operation: op,
                         outcome: AuditOutcome::Success {
                             duration,
@@ -638,7 +639,7 @@ impl ChangerHandle {
                 fire_audit(
                     &mut lock_drive_shared(&self.shared).audit_hook,
                     &AuditEvent::Finished {
-                        library_serial: &self.library.serial,
+                        subject: crate::AuditSubject::Library(&self.library.serial),
                         operation: op,
                         outcome: AuditOutcome::Other {
                             summary: format!("shape mismatch: {mismatch}"),
@@ -746,7 +747,7 @@ impl ChangerHandle {
         fire_audit(
             &mut lock_drive_shared(&self.shared).audit_hook,
             &AuditEvent::Started {
-                library_serial: &self.library.serial,
+                subject: crate::AuditSubject::Library(&self.library.serial),
                 operation: op,
                 cdb: &cdb,
                 at: SystemTime::now(),
@@ -783,7 +784,7 @@ impl ChangerHandle {
                 fire_audit(
                     &mut lock_drive_shared(&self.shared).audit_hook,
                     &AuditEvent::Finished {
-                        library_serial: &self.library.serial,
+                        subject: crate::AuditSubject::Library(&self.library.serial),
                         operation: op,
                         outcome: AuditOutcome::Success {
                             duration,
@@ -811,7 +812,7 @@ impl ChangerHandle {
                 fire_audit(
                     &mut lock_drive_shared(&self.shared).audit_hook,
                     &AuditEvent::Finished {
-                        library_serial: &self.library.serial,
+                        subject: crate::AuditSubject::Library(&self.library.serial),
                         operation: op,
                         outcome,
                         at: SystemTime::now(),
@@ -1053,9 +1054,11 @@ impl LibraryHandle {
 
         let library_serial = self.changer.library.serial.clone();
         Ok(DriveHandle {
-            bay_address,
+            endpoint: MountEndpoint::Durable(DriveKey::Bay {
+                library_serial,
+                bay: bay_address,
+            }),
             drive: installed_clone,
-            library_serial,
             transport: tape_io::media_gate::MediaFencedTransport::new(transport),
             max_write_block_size_bytes: None,
             position_known: true,
@@ -1388,7 +1391,7 @@ impl ChangerHandle {
         fire_audit(
             &mut lock_drive_shared(&self.shared).audit_hook,
             &AuditEvent::Started {
-                library_serial: &self.library.serial,
+                subject: crate::AuditSubject::Library(&self.library.serial),
                 operation: op,
                 cdb: &cdb,
                 at: SystemTime::now(),
@@ -1407,7 +1410,7 @@ impl ChangerHandle {
                 fire_audit(
                     &mut lock_drive_shared(&self.shared).audit_hook,
                     &AuditEvent::Finished {
-                        library_serial: &self.library.serial,
+                        subject: crate::AuditSubject::Library(&self.library.serial),
                         operation: op,
                         outcome: AuditOutcome::Success {
                             duration,
@@ -1424,7 +1427,7 @@ impl ChangerHandle {
                 fire_audit(
                     &mut lock_drive_shared(&self.shared).audit_hook,
                     &AuditEvent::Finished {
-                        library_serial: &self.library.serial,
+                        subject: crate::AuditSubject::Library(&self.library.serial),
                         operation: op,
                         outcome,
                         at: SystemTime::now(),
@@ -1563,13 +1566,10 @@ impl<'a> Drop for RemovalLockGuard<'a> {
 /// `LibraryHandle::load` operations (which will tag their CDBs with
 /// the composed op's variant once §7.7 lands).
 pub struct DriveHandle {
-    /// Element address of the bay this drive sits in. Carried so
-    /// audit events can name the bay alongside the library serial.
-    bay_address: u16,
-    /// Snapshot of the drive's `InstalledDrive` at the time of open.
+    /// Persistent endpoint or explicitly permitted ephemeral read-only path.
+    endpoint: MountEndpoint,
+    /// Snapshot of device metadata at open.
     drive: InstalledDrive,
-    /// Library this drive belongs to. Carried for audit context.
-    library_serial: String,
     /// Open transport to the drive's `/dev/sgN`, wrapped in the
     /// media-dispatch gate: write-direction CDBs are only reachable
     /// through [`tape_io::media_gate::MediaFencedTransport`]'s single
@@ -1621,9 +1621,8 @@ impl std::fmt::Debug for DriveHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let shared = lock_drive_shared(&self.shared);
         f.debug_struct("DriveHandle")
-            .field("bay_address", &self.bay_address)
+            .field("endpoint", &self.endpoint)
             .field("drive", &self.drive)
-            .field("library_serial", &self.library_serial)
             .field("transport", &self.transport)
             .field(
                 "max_write_block_size_bytes",
@@ -1654,16 +1653,13 @@ impl std::fmt::Debug for DriveHandle {
 }
 
 impl DriveHandle {
-    /// Open an explicitly named Linux SG tape drive without a changer handle.
-    ///
-    /// This is a break-glass read/recovery surface for callers that already
-    /// possess a device path. It validates that the path still identifies a
-    /// sequential-access device before constructing the normal Layer 3a
-    /// handle; no library snapshot, catalog identity, or changer state is
-    /// consulted. Normal managed operations should continue to use
-    /// [`LibraryHandle::open_drive`].
+    /// Open an explicitly allowed Linux SG tape drive without a changer handle.
+    /// The policy must allow its VPD 0x80 serial or exact path. Missing serials
+    /// require an additional unserialized allowance and yield a read-only
+    /// ephemeral endpoint. Ownership classification belongs to discovery and
+    /// the mount layer; opening a device does not prove changer non-ownership.
     #[cfg(target_os = "linux")]
-    pub fn open_standalone(path: &Path) -> Result<Self, OpenError> {
+    pub fn open_standalone(path: &Path, policy: &StaticAllowlist) -> Result<Self, OpenError> {
         use crate::transport::LinuxSgTransport;
 
         let transport = LinuxSgTransport::open_rw(path)
@@ -1672,13 +1668,14 @@ impl DriveHandle {
                 path: path.to_path_buf(),
                 cause: IoErrorKind::from(&error),
             })?;
-        Self::open_standalone_with_transport(path, transport)
+        Self::open_standalone_with_transport(path, transport, policy)
     }
 
     /// Testable transport-injected form of [`Self::open_standalone`].
     pub fn open_standalone_with_transport(
         path: &Path,
         mut transport: Box<dyn SgTransport>,
+        policy: &StaticAllowlist,
     ) -> Result<Self, OpenError> {
         let inquiry = revalidate_inquiry(transport.as_mut())?;
         if !matches!(inquiry.device_type, DeviceType::SequentialAccess) {
@@ -1688,8 +1685,35 @@ impl DriveHandle {
                 actual: None,
             });
         }
-        let serial =
-            revalidate_serial(transport.as_mut())?.unwrap_or_else(|| path.display().to_string());
+        // VPD failure never becomes a path-derived persistent identity.
+        let serial = match revalidate_serial(transport.as_mut()) {
+            Ok(serial) => serial.filter(|s| !s.trim().is_empty()),
+            Err(_) if !policy.allows_unserialized_device(path) => {
+                return Err(OpenError::MissingDriveSerial {
+                    path: path.to_path_buf(),
+                })
+            }
+            Err(_) => None,
+        };
+        if serial.is_none() && !policy.allows_unserialized_device(path) {
+            return Err(OpenError::MissingDriveSerial {
+                path: path.to_path_buf(),
+            });
+        }
+        if !policy.allows_device(path, serial.as_deref()) {
+            return Err(OpenError::DeviceNotAllowed {
+                path: path.to_path_buf(),
+                serial,
+            });
+        }
+        let endpoint = match &serial {
+            Some(serial) => MountEndpoint::Durable(DriveKey::Standalone {
+                drive_serial: serial.clone(),
+            }),
+            None => MountEndpoint::Ephemeral {
+                sg_path: path.to_path_buf(),
+            },
+        };
         let tape_io = TapeIoRuntimeConfig::default();
         let requested_batch_blocks = tape_io
             .write_batch_blocks
@@ -1709,19 +1733,20 @@ impl DriveHandle {
             DEFAULT_TAPE_IO_RECORD_BYTES_FOR_RESERVED_BUFFER,
             tape_io.read_batch_blocks,
         );
+        let mut transport = tape_io::media_gate::MediaFencedTransport::new(transport);
+        transport.set_writable(matches!(endpoint, MountEndpoint::Durable(_)));
         Ok(Self {
-            bay_address: 0,
+            endpoint,
             drive: InstalledDrive {
-                serial,
-                identity_source: IdentitySource::Derived,
-                vendor: None,
-                product: None,
-                revision: None,
+                serial: serial.unwrap_or_default(),
+                identity_source: IdentitySource::Standalone,
+                vendor: Some(inquiry.vendor_str().to_string()),
+                product: Some(inquiry.product_str().to_string()),
+                revision: Some(inquiry.revision_str().to_string()),
                 sg_path: Some(path.to_path_buf()),
                 sysfs_path: None,
             },
-            library_serial: format!("standalone:{}", path.display()),
-            transport: tape_io::media_gate::MediaFencedTransport::new(transport),
+            transport,
             max_write_block_size_bytes: None,
             position_known: true,
             expected_position: None,
@@ -1743,8 +1768,57 @@ impl DriveHandle {
 
     /// The bay address this drive sits in (the changer element
     /// address that addresses this drive).
-    pub fn bay_address(&self) -> u16 {
-        self.bay_address
+    pub fn bay_address(&self) -> Option<u16> {
+        self.endpoint.durable_key().and_then(DriveKey::bay)
+    }
+
+    /// Mount identity; ephemeral handles can never dispatch media writes.
+    pub fn endpoint(&self) -> &MountEndpoint {
+        &self.endpoint
+    }
+
+    /// Install the synchronous audit hook for this drive. Ephemeral handles
+    /// never emit persistent audit subjects.
+    pub fn set_audit_hook<F>(&mut self, hook: F)
+    where
+        F: for<'a> FnMut(&AuditEvent<'a>) + Send + 'static,
+    {
+        lock_drive_shared(&self.shared).audit_hook = Some(Box::new(hook));
+    }
+
+    fn audit_subject(&self) -> crate::AuditSubject<'_> {
+        match &self.endpoint {
+            MountEndpoint::Durable(DriveKey::Bay { library_serial, .. }) => {
+                crate::AuditSubject::Library(library_serial)
+            }
+            MountEndpoint::Durable(DriveKey::Standalone { drive_serial }) => {
+                crate::AuditSubject::Drive(drive_serial)
+            }
+            MountEndpoint::Ephemeral { .. } => crate::AuditSubject::Ephemeral,
+        }
+    }
+
+    /// Prevent operator removal of the current cartridge for this invocation.
+    pub fn prevent_medium_removal(&mut self) -> Result<(), DriveOpError> {
+        self.issue_removal(true)
+    }
+
+    /// Allow operator removal, including recovery after a crashed invocation.
+    pub fn allow_medium_removal(&mut self) -> Result<(), DriveOpError> {
+        self.issue_removal(false)
+    }
+
+    fn issue_removal(&mut self, prevent: bool) -> Result<(), DriveOpError> {
+        if !prevent {
+            self.transport.invalidate_identity();
+        }
+        let cdb = remanence_scsi::prevent_allow::build_cdb(prevent);
+        let op = if prevent {
+            AuditOp::LockRemoval
+        } else {
+            AuditOp::AllowRemoval
+        };
+        self.issue_drive_control(&cdb, op, TimeoutClass::TapeStatus)
     }
 
     /// Snapshot of the drive's metadata at the time of open.
@@ -1753,8 +1827,10 @@ impl DriveHandle {
     }
 
     /// Library serial this drive belongs to.
-    pub fn library_serial(&self) -> &str {
-        &self.library_serial
+    pub fn library_serial(&self) -> Option<&str> {
+        self.endpoint
+            .durable_key()
+            .and_then(DriveKey::library_serial)
     }
 
     /// Requested write batch size before sg/HBA clamping.
@@ -1801,7 +1877,7 @@ impl DriveHandle {
             /* load */ false,
             /* immed */ false,
             AuditOp::DriveUnload {
-                bay: self.bay_address,
+                bay: self.bay_address(),
             },
         )
     }
@@ -1815,7 +1891,7 @@ impl DriveHandle {
             /* load */ true,
             /* immed */ false,
             AuditOp::DriveLoad {
-                bay: self.bay_address,
+                bay: self.bay_address(),
             },
         )
     }
@@ -1828,7 +1904,7 @@ impl DriveHandle {
             /* load */ true,
             /* immed */ true,
             AuditOp::DriveLoad {
-                bay: self.bay_address,
+                bay: self.bay_address(),
             },
         )
     }
@@ -1856,39 +1932,37 @@ impl DriveHandle {
         use remanence_scsi::load_unload as lu;
         let cdb = lu::build_cdb_with_immed(load, immed);
 
+        // Invalidate before dispatch: even a failed LOAD/UNLOAD may have
+        // changed the cartridge. Keep the long mechanical-command timeout.
+        self.transport.reset_media_write_fence_for_load_boundary();
+        self.issue_drive_control(&cdb, op, TimeoutClass::LoadUnload)
+    }
+
+    fn issue_drive_control(
+        &mut self,
+        cdb: &[u8],
+        op: AuditOp,
+        timeout: TimeoutClass,
+    ) -> Result<(), DriveOpError> {
         fire_audit(
             &mut lock_drive_shared(&self.shared).audit_hook,
             &AuditEvent::Started {
-                library_serial: &self.library_serial,
+                subject: self.audit_subject(),
                 operation: op,
-                cdb: &cdb,
+                cdb,
                 at: SystemTime::now(),
             },
         );
-
-        // Any SSC LOAD/UNLOAD attempt is a load boundary for the
-        // media-write fence: after it, the mounted volume may differ,
-        // so the next media-modifying CDB must re-advance the durable
-        // write epoch. Cleared before dispatch — a failed attempt may
-        // still have moved the medium (completion unknown), and an
-        // extra epoch advance is harmless false invalidation while a
-        // missed one is the silent stale-map failure.
-        self.transport.reset_media_write_fence_for_load_boundary();
-
-        // SSC LOAD/UNLOAD on an LTO drive includes mechanical
-        // unload + tape positioning; LOAD from cold can take
-        // multiple minutes. Allow the 10-minute window so a
-        // healthy operation isn't torn down by SG_IO timeout.
-        self.transport.set_timeout_for(TimeoutClass::LoadUnload);
+        self.transport.set_timeout_for(timeout);
         let started = Instant::now();
-        let result = self.transport.execute_none_nonmedia(&cdb);
+        let result = self.transport.execute_none_nonmedia(cdb);
         match result {
             Ok(()) => {
                 let duration = started.elapsed();
                 fire_audit(
                     &mut lock_drive_shared(&self.shared).audit_hook,
                     &AuditEvent::Finished {
-                        library_serial: &self.library_serial,
+                        subject: self.audit_subject(),
                         operation: op,
                         outcome: AuditOutcome::Success {
                             duration,
@@ -1901,6 +1975,12 @@ impl DriveHandle {
                 Ok(())
             }
             Err(e) => {
+                #[cfg(target_os = "linux")]
+                if let ScsiError::CheckCondition { sense, .. } = &e {
+                    if tape_io::is_reset_unit_attention(sense) {
+                        self.invalidate_for_reset_unit_attention();
+                    }
+                }
                 // `DriveHandle` shares the parent `LibraryHandle`'s dirty
                 // state, so completion-
                 // unknown transport errors flip the parent dirty bit
@@ -1909,7 +1989,7 @@ impl DriveHandle {
                 // audit stream independently of the snapshot.
                 let dirty = completion_unknown(&e);
                 if dirty {
-                    self.position_known = false;
+                    self.mark_position_unknown();
                     lock_drive_shared(&self.shared)
                         .dirty
                         .mark(DirtyCause::CompletionUnknown);
@@ -1918,7 +1998,7 @@ impl DriveHandle {
                 fire_audit(
                     &mut lock_drive_shared(&self.shared).audit_hook,
                     &AuditEvent::Finished {
-                        library_serial: &self.library_serial,
+                        subject: self.audit_subject(),
                         operation: op,
                         outcome,
                         at: SystemTime::now(),
@@ -1935,6 +2015,15 @@ impl DriveHandle {
 /// borrow checker can split the shared audit cell apart from the
 /// serial fields that `AuditEvent` borrows from.
 fn fire_audit(hook: &mut Option<AuditHook>, event: &AuditEvent<'_>) {
+    let subject = match event {
+        AuditEvent::Started { subject, .. }
+        | AuditEvent::Finished { subject, .. }
+        | AuditEvent::Refused { subject, .. }
+        | AuditEvent::Warning { subject, .. } => subject,
+    };
+    if matches!(subject, crate::AuditSubject::Ephemeral) {
+        return;
+    }
     if let Some(h) = hook.as_mut() {
         h(event);
     }
@@ -1953,7 +2042,7 @@ fn fire_warnings(
         fire_audit(
             hook,
             &AuditEvent::Warning {
-                library_serial,
+                subject: crate::AuditSubject::Library(library_serial),
                 operation,
                 warning: w.clone(),
                 at: SystemTime::now(),
@@ -2027,7 +2116,7 @@ fn fire_refused(hook: &mut Option<AuditHook>, library_serial: &str, op: AuditOp,
     fire_audit(
         hook,
         &AuditEvent::Refused {
-            library_serial,
+            subject: crate::AuditSubject::Library(library_serial),
             operation: op,
             reason,
             at: SystemTime::now(),

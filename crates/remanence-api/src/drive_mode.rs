@@ -10,6 +10,7 @@ use remanence_library::{BlockSize, DriveHandle, TapeConfig, TapeIoError};
 /// and drive limits reported by the preceding MODE SENSE.
 pub(crate) fn fixed_uncompressed_target(current: TapeConfig, block_size: u32) -> TapeConfig {
     TapeConfig {
+        density_code: None,
         block_size: BlockSize::Fixed {
             size_bytes: block_size,
         },

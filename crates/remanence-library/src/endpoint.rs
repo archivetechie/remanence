@@ -60,3 +60,24 @@ impl DriveKey {
         }
     }
 }
+
+/// A mounted location; an unserialized device has no persistent identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MountEndpoint {
+    /// Stable identity suitable for durable state.
+    Durable(DriveKey),
+    /// Explicitly allowed read-only device, never a durable authority.
+    Ephemeral {
+        /// Device path for this invocation only.
+        sg_path: std::path::PathBuf,
+    },
+}
+impl MountEndpoint {
+    /// Durable key, absent for a read-only ephemeral endpoint.
+    pub fn durable_key(&self) -> Option<&DriveKey> {
+        match self {
+            Self::Durable(key) => Some(key),
+            Self::Ephemeral { .. } => None,
+        }
+    }
+}

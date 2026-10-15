@@ -1197,6 +1197,7 @@ fn standalone_drive_open_validates_explicit_sequential_device() {
     let drive = DriveHandle::open_standalone_with_transport(
         Path::new("/dev/sg-standalone"),
         Box::new(transport),
+        &crate::StaticAllowlist::new(["/dev/sg-standalone"]),
     )
     .expect("explicit sequential-access device opens");
     assert_eq!(drive.drive().serial, "DRV_STANDALONE");
@@ -1204,7 +1205,11 @@ fn standalone_drive_open_validates_explicit_sequential_device() {
         drive.drive().sg_path.as_deref(),
         Some(Path::new("/dev/sg-standalone"))
     );
-    assert_eq!(drive.library_serial(), "standalone:/dev/sg-standalone");
+    assert_eq!(drive.library_serial(), None);
+    assert_eq!(drive.bay_address(), None);
+    assert!(
+        matches!(drive.endpoint(), crate::MountEndpoint::Durable(crate::DriveKey::Standalone { drive_serial }) if drive_serial == "DRV_STANDALONE")
+    );
 }
 
 #[test]
@@ -1213,6 +1218,7 @@ fn standalone_drive_open_rejects_non_tape_device() {
     let error = DriveHandle::open_standalone_with_transport(
         Path::new("/dev/sg-changer"),
         Box::new(transport),
+        &crate::StaticAllowlist::new(["/dev/sg-changer"]),
     )
     .expect_err("explicit non-tape device must be refused");
     assert!(matches!(error, OpenError::IdentityChanged { .. }));
@@ -1283,9 +1289,9 @@ fn open_drive_succeeds_for_resolved_bay() {
     let mut handle = lib.open_with(&policy, factory).expect("library opens");
 
     let drive = handle.open_drive(0x0100, &policy).expect("drive opens");
-    assert_eq!(drive.bay_address(), 0x0100);
+    assert_eq!(drive.bay_address(), Some(0x0100));
     assert_eq!(drive.drive().serial, "DRV_A");
-    assert_eq!(drive.library_serial(), "LIB_OD01");
+    assert_eq!(drive.library_serial(), Some("LIB_OD01"));
 }
 
 #[test]
@@ -1330,9 +1336,9 @@ fn two_drives_open_simultaneously() {
     let drive_a = handle.open_drive(0x0100, &policy).expect("drive A opens");
     let drive_b = handle.open_drive(0x0101, &policy).expect("drive B opens");
 
-    assert_eq!(drive_a.bay_address(), 0x0100);
+    assert_eq!(drive_a.bay_address(), Some(0x0100));
     assert_eq!(drive_a.drive().serial, "DRV_A");
-    assert_eq!(drive_b.bay_address(), 0x0101);
+    assert_eq!(drive_b.bay_address(), Some(0x0101));
     assert_eq!(drive_b.drive().serial, "DRV_B");
     assert!(!handle.is_dirty());
 }
@@ -1519,14 +1525,14 @@ fn drive_handle_unload_issues_correct_cdb_and_audits() {
     assert!(matches!(
         &events[0],
         CapturedEvent::Started {
-            op: AuditOp::DriveUnload { bay: 0x0100 },
+            op: AuditOp::DriveUnload { bay: Some(0x0100) },
             cdb,
         } if cdb[0] == 0x1B && cdb[4] == 0x00
     ));
     assert!(matches!(
         events[1],
         CapturedEvent::FinishedSuccess {
-            op: AuditOp::DriveUnload { bay: 0x0100 },
+            op: AuditOp::DriveUnload { bay: Some(0x0100) },
             snapshot_patched: false,
         }
     ));
@@ -1569,14 +1575,14 @@ fn drive_handle_load_issues_correct_cdb_and_audits() {
     assert!(matches!(
         &events[0],
         CapturedEvent::Started {
-            op: AuditOp::DriveLoad { bay: 0x0100 },
+            op: AuditOp::DriveLoad { bay: Some(0x0100) },
             cdb,
         } if cdb[0] == 0x1B && cdb[4] == 0x01
     ));
     assert!(matches!(
         events[1],
         CapturedEvent::FinishedSuccess {
-            op: AuditOp::DriveLoad { bay: 0x0100 },
+            op: AuditOp::DriveLoad { bay: Some(0x0100) },
             snapshot_patched: false,
         }
     ));
@@ -1765,10 +1771,10 @@ fn drive_handle_rewind_emits_cdb_and_audits_success() {
             matches!(
                 e,
                 CapturedEvent::Started {
-                    op: AuditOp::TapeRewind { bay: 0x0100 },
+                    op: AuditOp::TapeRewind { bay: Some(0x0100) },
                     ..
                 } | CapturedEvent::FinishedSuccess {
-                    op: AuditOp::TapeRewind { bay: 0x0100 },
+                    op: AuditOp::TapeRewind { bay: Some(0x0100) },
                     ..
                 }
             )
@@ -2848,10 +2854,10 @@ impl SgTransport for HotScriptTransport {
             .lock()
             .expect("timeout log")
             .push((cdb.to_vec(), self.timeout));
-        if cdb[0] != 0x10 {
+        if !matches!(cdb[0], 0x10 | 0x1e) {
             return Err(ScsiError::InvalidInput("unsupported scripted no-data CDB"));
         }
-        match self.writes.pop_front().expect("FILEMARK response scripted") {
+        match self.writes.pop_front().expect("no-data response scripted") {
             HotWriteScript::Clean => Ok(()),
             HotWriteScript::CleanWithBytes(_) => Ok(()),
             HotWriteScript::CheckCondition(sense) => Err(ScsiError::CheckCondition {
@@ -3364,6 +3370,114 @@ fn reset_unit_attention_same_handle_recovers_via_mode_and_position_reverificatio
         .expect("same daemon-lifetime handle re-verifies MODE and position");
     assert_eq!(drive.mode_reverification_required, None);
     assert!(drive.position_known);
+}
+
+/// PREVENT and ALLOW must revoke the same cached state as a reset during data I/O.
+fn check_removal_reset_recovery(prevent: bool) {
+    // Exercise automatic recovery and both orders of partial recovery. Neither
+    // mode nor position alone is sufficient to dispatch another data command.
+    for mode_first in [None, Some(true), Some(false)] {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let transport = HotScriptTransport {
+            identity_responses: VecDeque::from([lto9_inquiry(), vpd80_response("DRV_RESET")]),
+            position_responses: [10, 10, 10]
+                .into_iter()
+                .map(HotPositionScript::Clean)
+                .collect(),
+            writes: VecDeque::from([
+                HotWriteScript::CheckCondition(current_sense(0x06, 0, 0x29, 0x02)),
+                HotWriteScript::Clean,
+                HotWriteScript::Clean,
+            ]),
+            timeout: TimeoutClass::Inquiry,
+            command_timeouts: Arc::clone(&log),
+        };
+        let mut drive = DriveHandle::open_standalone_with_transport(
+            Path::new("/dev/sg-reset"),
+            Box::new(transport),
+            &StaticAllowlist::new(["DRV_RESET"]),
+        )
+        .unwrap();
+        drive.position_check_bytes = 0;
+        drive.read_config().unwrap();
+        drive.position().unwrap();
+        let generation = drive.identity_generation();
+        let result = if prevent {
+            drive.prevent_medium_removal()
+        } else {
+            drive.allow_medium_removal()
+        };
+        assert!(matches!(
+            result,
+            Err(DriveOpError::ScsiError(ScsiError::CheckCondition { .. }))
+        ));
+        assert!(drive.identity_generation() > generation);
+        assert!(!drive.position_known);
+        assert!(drive.expected_position.is_none());
+        assert_eq!(drive.validated_fixed_block_size, None);
+        assert_eq!(drive.mode_reverification_required, Some(4));
+
+        let cdb = remanence_scsi::read_write::build_write_fixed_cdb(1);
+        let assert_data_blocked = |drive: &mut DriveHandle| {
+            // Even a fresh generation cannot bypass reset-invalidated state.
+            drive
+                .bind_identity_generation(drive.identity_generation())
+                .unwrap();
+            let before = log.lock().unwrap().len();
+            assert!(matches!(
+                drive.read_block_batch(&mut [0; 4], 4, 1, 1),
+                Err(TapeIoError::InvalidRequest(_))
+            ));
+            assert!(matches!(
+                drive.write_block_batch_pipelined(&[0; 4], 4, &cdb),
+                Err(TapeIoError::InvalidRequest(_))
+            ));
+            assert_eq!(
+                log.lock().unwrap().len(),
+                before,
+                "blocked data must not reach transport"
+            );
+        };
+        assert_data_blocked(&mut drive);
+        let recovery_start = log.lock().unwrap().len();
+        match mode_first {
+            None => drive.reverify_invalidated_state().unwrap(),
+            Some(true) => {
+                drive.read_config().unwrap();
+                assert_data_blocked(&mut drive);
+                drive.position().unwrap();
+            }
+            Some(false) => {
+                drive.position().unwrap();
+                assert_data_blocked(&mut drive);
+                drive.reverify_invalidated_state().unwrap();
+            }
+        }
+        assert_eq!(drive.mode_reverification_required, None);
+        assert_eq!(drive.validated_fixed_block_size, Some(4));
+        assert!(drive.position_known);
+        let recovery_commands: Vec<_> = log.lock().unwrap()[recovery_start..]
+            .iter()
+            .map(|(cdb, _)| cdb[0])
+            .collect();
+        assert!(recovery_commands.contains(&0x1a), "MODE SENSE required");
+        assert!(recovery_commands.contains(&0x34), "READ POSITION required");
+        drive
+            .bind_identity_generation(drive.identity_generation())
+            .unwrap();
+        drive.read_block_batch(&mut [0; 4], 4, 1, 1).unwrap();
+        drive.write_block_batch_pipelined(&[0; 4], 4, &cdb).unwrap();
+    }
+}
+
+#[test]
+fn prevent_removal_reset_ua_requires_mode_and_position_reverification() {
+    check_removal_reset_recovery(true);
+}
+
+#[test]
+fn allow_removal_reset_ua_requires_mode_and_position_reverification() {
+    check_removal_reset_recovery(false);
 }
 
 #[test]
@@ -5271,6 +5385,14 @@ fn drive_handle_write_refuses_until_position_reestablished_after_transport_error
 
         let pos = drive.position().expect("READ POSITION reestablishes latch");
         assert_eq!(pos.lba, 123);
+        assert!(matches!(
+            drive.write_block(&payload),
+            Err(TapeIoError::IdentityInvalidated { .. })
+        ));
+        // The fixture stands in for a caller re-establishing identity evidence.
+        drive
+            .bind_identity_generation(drive.identity_generation())
+            .unwrap();
         let outcome = drive
             .write_block(&payload)
             .expect("write allowed after position is known");
@@ -5702,6 +5824,7 @@ fn drive_handle_write_config_rejects_fixed_block_size_zero() {
     let mut handle = lib.open_with(&policy, factory).expect("library opens");
 
     let bad = TapeConfig {
+        density_code: None,
         block_size: BlockSize::Fixed { size_bytes: 0 },
         compression: false,
         max_block_size_bytes: 0,
@@ -5745,6 +5868,7 @@ fn drive_handle_write_config_rejects_fixed_block_size_above_24_bits() {
     let mut handle = lib.open_with(&policy, factory).expect("library opens");
 
     let bad = TapeConfig {
+        density_code: None,
         block_size: BlockSize::Fixed {
             size_bytes: 0x0100_0000,
         },
@@ -5865,6 +5989,7 @@ fn drive_handle_write_config_emits_mode_select() {
     let mut handle = lib.open_with(&policy, factory).expect("library opens");
 
     let cfg = TapeConfig {
+        density_code: None,
         block_size: BlockSize::Variable,
         compression: false,
         max_block_size_bytes: 0,
@@ -7403,4 +7528,72 @@ fn build_synthetic_es_one_drive() -> Vec<u8> {
     ];
     bytes.extend_from_slice(&[0u8; 10]);
     bytes
+}
+
+/// Standalone control commands use the SSC builder and VPD audit authority.
+#[test]
+fn standalone_removal_commands_audit_the_drive_and_release_invalidates_proof() {
+    let path = Path::new("/dev/sg-standalone");
+    let transport =
+        FixtureTransport::new().with_responses([lto9_inquiry(), vpd80_response("DRV_STANDALONE")]);
+    let mut drive = DriveHandle::open_standalone_with_transport(
+        path,
+        Box::new(transport),
+        &StaticAllowlist::new(["DRV_STANDALONE"]),
+    )
+    .unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&events);
+    drive.set_audit_hook(move |event| {
+        if let AuditEvent::Started { subject, cdb, .. } = event {
+            captured.lock().unwrap().push((
+                subject.kind().to_string(),
+                subject.id().map(str::to_string),
+                cdb.to_vec(),
+            ));
+        }
+    });
+    let generation = drive.identity_generation();
+    drive.prevent_medium_removal().unwrap();
+    assert_eq!(drive.identity_generation(), generation);
+    drive.allow_medium_removal().unwrap();
+    assert!(drive.identity_generation() > generation);
+    assert!(matches!(
+        drive.write_block_with_identity_generation(&[0; 64], generation),
+        Err(TapeIoError::IdentityInvalidated { .. })
+    ));
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    for (index, (kind, serial, cdb)) in events.iter().enumerate() {
+        assert_eq!(kind, "drive");
+        assert_eq!(serial.as_deref(), Some("DRV_STANDALONE"));
+        assert_eq!(*cdb, remanence_scsi::prevent_allow::build_cdb(index == 0));
+    }
+}
+
+/// Missing serial permission does not replace the ordinary device allowlist.
+#[test]
+fn standalone_policy_denies_unlisted_devices_and_ephemeral_audit_authority() {
+    let path = Path::new("/dev/sg-standalone");
+    let fixture = || FixtureTransport::new().with_responses([lto9_inquiry(), Vec::new()]);
+    let policy = StaticAllowlist::default().with_unserialized_device_allowed(path);
+    assert!(matches!(
+        DriveHandle::open_standalone_with_transport(path, Box::new(fixture()), &policy),
+        Err(OpenError::DeviceNotAllowed { .. })
+    ));
+    let policy =
+        StaticAllowlist::new(["/dev/sg-standalone"]).with_unserialized_device_allowed(path);
+    let mut drive =
+        DriveHandle::open_standalone_with_transport(path, Box::new(fixture()), &policy).unwrap();
+    assert!(drive.drive().serial.is_empty());
+    drive.set_audit_hook(|_| panic!("ephemeral devices have no persistent audit authority"));
+    drive.prevent_medium_removal().unwrap();
+    assert!(matches!(
+        drive.write_block(&[0; 64]),
+        Err(TapeIoError::EphemeralReadOnly)
+    ));
+    assert!(matches!(
+        drive.write_filemarks(1),
+        Err(TapeIoError::EphemeralReadOnly)
+    ));
 }

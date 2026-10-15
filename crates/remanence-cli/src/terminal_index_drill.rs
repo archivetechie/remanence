@@ -1378,11 +1378,12 @@ pub(crate) fn run_live(
     let result = (|| {
         let transport = LinuxSgTransport::open_rw(&args.device)
             .map_err(|error| format!("open {}: {error}", args.device.display()))?;
-        let mut drive =
-            DriveHandle::open_standalone_with_transport(&args.device, Box::new(transport))
-                .map_err(|error| {
-                    format!("open standalone drive {}: {error}", args.device.display())
-                })?;
+        let mut drive = DriveHandle::open_standalone_with_transport(
+            &args.device,
+            Box::new(transport),
+            &remanence_library::StaticAllowlist::new([args.device.to_string_lossy().into_owned()]),
+        )
+        .map_err(|error| format!("open standalone drive {}: {error}", args.device.display()))?;
         let source = DriveHandleRawSource::new(&mut drive);
         inspect_source(
             source,

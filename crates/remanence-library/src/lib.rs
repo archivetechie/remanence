@@ -19,7 +19,7 @@ pub mod block_io;
 pub mod discovery;
 pub mod endpoint;
 pub mod error;
-pub use endpoint::DriveKey;
+pub use endpoint::{DriveKey, MountEndpoint};
 pub mod handle;
 pub mod model;
 pub mod ops;
@@ -35,10 +35,11 @@ pub use block_io::{
 };
 #[cfg(target_os = "linux")]
 pub use discovery::discover;
-pub use discovery::discover_with;
+pub use discovery::{discover_enumerated_with, discover_with};
 pub use error::{
-    AuditEvent, AuditOp, AuditOutcome, DiscoveryError, DiscoveryWarning, DriveOpError, IoErrorKind,
-    LoadError, MoveError, OpenError, RescanError, RescanWarning, UnloadError,
+    AuditEvent, AuditOp, AuditOutcome, AuditSubject, DiscoveryError, DiscoveryWarning,
+    DriveOpError, IoErrorKind, LoadError, MoveError, OpenError, RescanError, RescanWarning,
+    UnloadError,
 };
 pub use handle::tape_io::{
     classify_media_readiness_error_ref, media_readiness_poll_interval, wrap_map_is_servable,
@@ -58,9 +59,9 @@ pub use handle::{
     MIN_TAPE_IO_STAGING_RING_BUFFERS,
 };
 pub use model::{
-    resolve_load_target, AccessPolicy, DeviceCaptures, DiscoveryReport, DriveBay, ElementException,
-    ElementLayout, IdentitySource, IePort, InstalledDrive, Library, LoadPlan, Slot,
-    StaticAllowlist,
+    resolve_load_target, AccessPolicy, DeviceCaptures, DiscoveryReport, DriveBay, DriveOwnership,
+    ElementException, ElementLayout, IdentitySource, IePort, InstalledDrive, Library, LoadPlan,
+    Slot, StaticAllowlist, UnattachedDrive,
 };
 pub use ops::{apply_move, MovePatch};
 pub use physical_io::{
