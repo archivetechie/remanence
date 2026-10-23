@@ -30,9 +30,11 @@ formats are final.
 
 ## What works
 
-**Talking to hardware.** SCSI primitives, library discovery and identity,
-robotics, and hot-plug watching, with per-library allowlisting so a daemon only
-touches the libraries it was told about.
+**Talking to hardware.** SCSI primitives, library and standalone-drive
+discovery and identity, robotics, and hot-plug watching. Library daemons use a
+per-library allowlist. Direct standalone commands bind the current `/dev/sgN`
+path to an explicitly authorized drive serial and refuse writes unless
+discovery proves that no changer owns the drive.
 
 **Writing and reading tape.** Pipelined fixed-block tape I/O backed by a
 staging ring, with position proofs. This is the only path for writing and reading object data. (Verification reads single blocks and does not use it.) Reads are served through a
@@ -62,10 +64,13 @@ socket and optionally over mTLS TCP.
 
 **Operator tools.** `rem` and `rem-debug`, including a destructive-safety
 gauntlet for tape initialization and quarantine tooling for suspect media.
-Object build, inspect and extract work on local files with no tape hardware at
-all. A separate `rem-recover` binary decrypts and extracts encrypted envelope
-objects with no daemon, catalog, or configuration file. Plaintext REM-OBJECTs
-remain ordinary pax archives readable with `bsdtar`.
+`rem` can run initialization, checkpointed put/get, finalization,
+verification, adoption, and catalogless restore directly against one manually
+loaded standalone drive, with home-mode state and no daemon. Object build,
+inspect and extract also work on local files with no tape hardware. A separate
+`rem-recover` binary decrypts and extracts encrypted envelope objects with no
+daemon, catalog, or configuration file. Plaintext REM-OBJECTs remain ordinary
+pax archives readable with `bsdtar`.
 
 **Testing.** Chaos fault-injection, fuzzing of the format parsers, and
 Lean/Aeneas proofs over the parity and format cores in [`verif/`](../verif).
@@ -113,6 +118,13 @@ Remanence has been developed against a Quadstor virtual tape library and
 field-tested on an HPE MSL3040 with LTO-9 drives. The format and parity cores
 are exercised against the virtual library on every test run; time on physical
 tape hardware is episodic rather than continuous.
+
+The standalone control path has model-backed integration tests for discovery,
+authorization, initialization, checkpointed write and restore, metadata
+changes, release, and failure fencing. That is stronger than a parser-only
+claim, but it is not broad physical-drive validation. Standalone users should
+expect hardware-specific findings and include a `rem diagnostics capture`
+archive when reporting them.
 
 The formats are the part that has to last the planning horizon of 10 to 20
 years, and they are the part with specifications, pinned vectors, a clean-room

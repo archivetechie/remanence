@@ -7,9 +7,11 @@ Remanence ships two command-line tools built from `crates/remanence-cli`,
 the daemon binary from `crates/remanence-daemon`, and a standalone
 disaster-recovery binary from its own crate `crates/rem-recover`:
 
-- **`rem`** is the operator CLI. It talks to a running `rem-daemon` over
-  gRPC for daemon-backed commands, and works directly against local state
-  or local files for the rest. It cannot issue arbitrary SCSI mutations.
+- **`rem`** is the operator CLI. Library operations talk to a running
+  `rem-daemon` over gRPC. Standalone-drive operations use the same command
+  directly against one explicitly selected and authorized drive. It also
+  works against local state or local files and cannot issue arbitrary SCSI
+  commands.
 - **`rem-debug`** is the break-glass CLI. It contains everything `rem` has
   plus direct SCSI robotics (`move`, `load`, `unload`, `export`, `import`,
   `rescan`, `lock`, `unlock`), direct tape read/write commands, destructive
@@ -29,17 +31,19 @@ disaster-recovery binary from its own crate `crates/rem-recover`:
   only a REM-OBJECT object file already sitting on disk.
 
 `rem` and `rem-debug` are two separate binaries built from the same
-`remanence-cli` crate and share one command tree (defined with the `clap`
-argument-parsing library). `rem` carries the direct-hardware commands only as
-hidden aliases; they are documented under `rem-debug` below.
+`remanence-cli` crate. `rem` has a bounded direct-hardware surface for one
+standalone drive; `rem-debug` carries the broader break-glass library and SCSI
+surface.
 
 Conventions shared across both CLIs:
 
 - Daemon-backed commands take `--endpoint <URI>`, default
   `unix:/var/lib/rem/rem.sock`. TCP endpoints work with the daemon's mTLS
   listener.
-- Config-backed commands take `--config <PATH>`, default
-  `/etc/rem/config.toml`.
+- Daemon and library config-backed commands take `--config <PATH>`, default
+  `/etc/rem/config.toml`. Standalone commands use that file when it exists;
+  otherwise they create home-mode config and state under
+  `${XDG_STATE_HOME:-$HOME/.local/state}/rem`.
 - `--json` switches to stable, machine-readable JSON output intended for
   orchestrators and scripts.
 - Tape-structural unsigned 64-bit values (file numbers, LBAs, block/row counts,
@@ -61,6 +65,7 @@ this page.
 | Placeholder | What to type, and where the value comes from |
 |---|---|
 | `<SERIAL>` | A library's serial number, as printed by `rem libraries`. |
+| `<DRIVE_SERIAL>` | A standalone drive's VPD page 0x80 serial, as printed by `rem drives --json`. |
 | `<ADDR>`, `<SLOT>`, `<BAY>` | A changer element address (for example `0x0400`), a storage-slot address, and a drive-bay address. `rem library <SERIAL> --slots` lists them. |
 | `<BARCODE>` | The barcode printed on a cartridge, as shown by `rem library <SERIAL> --slots`. |
 | `<TARGET>` | A cartridge, given either as a barcode or as an element address, or as an inclusive slot range such as `0x0400..0x0407` where the command says a range is accepted. |
@@ -109,11 +114,58 @@ The `--json` output carries the same decoding in structured form
 |---|---|
 | `rem libraries [--json]` | Discover every reachable tape library on this host: joins changer inventory (READ ELEMENT STATUS) with drive identities (INQUIRY + VPD 0x80) by serial number. |
 | `rem library <SERIAL> [--slots] [--json]` | Focused view of one library: drives, loaded barcodes, and with `--slots` every storage slot. |
+| `rem drives [--json]` | Discover drive endpoints, including unattached drives proved to be standalone. JSON reports `path`, serial, endpoint kind, and ownership. |
 | `rem watch [--coalesce-window <DURATION>]` | Stream coalesced udev hot-plug events for SCSI tape/changer subsystems (default window 500ms). Requires a build with the `linux-udev` feature. |
 
 Discovery is read-only but still issues SCSI commands, so it needs the
 `tape` group and `CAP_SYS_RAWIO` (see the [quickstart](guide-quickstart.md)
 and [troubleshooting](guide-troubleshooting.md)).
+
+<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_backend.rs crates/remanence-library/src/discovery.rs @ 7a7af81d -->
+## Standalone drives
+
+The standalone interface operates one manually loaded drive directly. It does
+not need `rem-daemon`, a changer, or a `[[libraries]]` entry. The complete
+walkthrough is [Using a standalone LTO drive](guide-standalone-drive.md).
+
+Every command that opens media takes both:
+
+```text
+--device <SG> --allow-device <DRIVE_SERIAL>
+```
+
+`--device` selects the current Linux path. `--allow-device` authorizes the
+serial discovered at that path. The command refuses a path that resolves to a
+different serial or to a drive claimed by a library. A complete discovery pass
+must prove standalone ownership before a mutation. If discovery is incomplete,
+an operator can pin a known standalone serial with `[[standalone_drives]]`; an
+unresolved changer bay still blocks writes. `--acknowledge-unknown-ownership`
+and `--allow-unserialized-device` are read-only exceptions and never authorize
+a write.
+
+| Command | What it does |
+|---|---|
+| `rem doctor [--json]` | Check effective `tape`-group membership, `CAP_SYS_RAWIO` on the running binary, `/run/lock/rem`, state location, and discovered endpoints. |
+| `rem pool new <POOL> [--scheme <SCHEME>] [--block-size <BYTES>]` | Add a pool to home-mode config. The default scheme is `custom:128,4,1`; `--scheme default` selects the block-size-aware library geometry. This command does not take `--device`. |
+| `rem tape init --device <SG> --allow-device <DRIVE_SERIAL> --label <LABEL> [--generation Lx] [--pool <POOL>] [--block-size <BYTES>]` | Initialize the loaded cartridge, mint its tape UUID, write BOT, and catalog it. The default pool is `default`. This is destructive and has no standalone dry-run mode. |
+| `rem tape identify --device <SG> --allow-device <DRIVE_SERIAL>` | Read the loaded tape identity and terminal summary. |
+| `rem tape adopt --device <SG> --allow-device <DRIVE_SERIAL> [--label <LABEL>] [--pool <POOL>]` | Add an existing Remanence tape's bootstrap identity to local state without rewriting it. |
+| `rem put <PATH>... --device <SG> --allow-device <DRIVE_SERIAL> [--pool <POOL>] [--recipient <REMR>]...` | Write files through the checkpointed standalone path. Directories are recursive and each regular file becomes one object. The loaded tape's catalogued pool is authoritative; a supplied pool is a guard and must match. |
+| `rem get <OBJECT> --out <DIR> --device <SG> --allow-device <DRIVE_SERIAL> [--private-key <REMP>]` | Restore a catalogued object from the loaded tape. OBJECT may be its UUID or caller object id. |
+| `rem tape verify [--full] --device <SG> --allow-device <DRIVE_SERIAL>` | Without `--full`, verify the terminal structure. With it, read and verify all sidecar-protected data and parity. |
+| `rem tape restore --out <DIR> [--scan] --device <SG> --allow-device <DRIVE_SERIAL> [--private-key <REMP>]` | Restore without the local object catalog. The normal path uses the terminal index; `--scan` walks from BOT. |
+| `rem tape finalize --tape <UUID> --acknowledge-tape <UUID> --reason <TEXT> --idempotency-key <UUID> --expected-pool <POOL> --device <SG> --allow-device <DRIVE_SERIAL>` | Irreversibly close the exact pooled tape and write its terminal suffix. `--expected-pool` is required for a pooled tape. Reuse the idempotency UUID when retrying the same request. |
+| `rem tape assign-pool [--tape <UUID>] (--pool <POOL> \| --unassign)` | Change catalogued pool assignment. With `--tape`, this is an offline state operation; otherwise it identifies the cartridge loaded in `--device`. |
+| `rem tape set-generation --generation Lx --device <SG> --allow-device <DRIVE_SERIAL>` | Persist an operator generation observation for the loaded tape. |
+| `rem tape rebind --label <LABEL> --previous-uuid <UUID> --device <SG> --allow-device <DRIVE_SERIAL>` | Bind a reused operator label to the loaded tape while naming the previous UUID. |
+| `rem tape import-journals --from <DIR> --device <SG> --allow-device <DRIVE_SERIAL>` | Import matching journal evidence for the loaded tape. |
+| `rem tape release --device <SG> --allow-device <DRIVE_SERIAL>` | Clear a drive medium-removal guard left by an interrupted invocation. It does not clear durable quarantine. |
+| `rem diagnostics capture --out <FILE> [--device <SG> --allow-device <DRIVE_SERIAL>]` | Capture inquiry, mode, and log-page diagnostics without reading tape data or positioning the tape. |
+
+`--reserve` adds a SCSI RESERVE(6) for the invocation and releases it on normal
+exit. `--json` wraps results with `supported_endpoint_kinds` and
+`observed_endpoints`, which lets automation retain the discovery facts used by
+the command.
 
 <!-- code-anchor: crates/remanence-cli/src/lib.rs @ 6ed03ef0 -->
 ## Daemon queries
@@ -311,16 +363,17 @@ fill.
 <!-- code-anchor: crates/remanence-cli/src/put.rs @ 244bc6de -->
 ## Writing to tape
 
-`rem put` archives local files onto tape through the daemon — the same
-Layer 5 write-session path the orchestrator uses, so pool policy,
-capacity reserve, media-readiness fences, and checkpoint durability
-apply unchanged. There is no daemon-less write path, because a put
-that bypassed the daemon would also bypass the safety checks the daemon
-enforces. It takes `--endpoint` and `--json` like the other
-daemon-backed commands. The loaded cartridge must be positively reported as
-rewritable (`NotWorm`); WORM or unknown media are refused before drive mode is
-changed because whole-Object restart recovery may need to replace an
-uncommitted tail.
+In library mode, `rem put` archives local files onto tape through the daemon —
+the same Layer 5 write-session path the orchestrator uses, so pool policy,
+capacity reserve, media-readiness fences, and checkpoint durability apply
+unchanged. It takes `--endpoint` and `--json` like the other daemon-backed
+commands. With `--device` and `--allow-device`, the same command instead uses
+the bounded [standalone-drive path](#standalone-drives), which carries the
+write fence, audit, checkpoint, and catalog machinery into one direct
+invocation without starting the daemon. The loaded cartridge must be
+positively reported as rewritable (`NotWorm`); WORM or unknown media are
+refused before drive mode is changed because whole-Object restart recovery may
+need to replace an uncommitted tail.
 
 One input file becomes one object whose single member carries the file's
 archive path; directories are walked recursively, `tar`-style, one
@@ -362,10 +415,13 @@ with no pool assignment (`allow_unpooled` in the API) is likewise rejected.
 <!-- code-anchor: crates/remanence-cli/src/get.rs @ 244bc6de -->
 ## Restoring from tape
 
-`rem get` is put's counterpart: it restores an object's members from tape
-through the daemon read path. The daemon resolves the object format
-server-side and streams each member's payload bytes, so there is no
-client-side format interpretation. Every member is proven before it is
+In library mode, `rem get` is put's counterpart: it restores an object's
+members from tape through the daemon read path. With `--device` and
+`--allow-device`, it restores a catalogued object from the cartridge already
+loaded in one standalone drive; that form uses `--out` rather than `--dest`.
+The daemon path resolves the object format server-side and streams each
+member's payload bytes, so there is no client-side format interpretation.
+Every member is proven before it is
 published: bytes stream to a temporary file, are hashed as they land, and
 only rename into place when the hash matches the catalog's per-file
 sha256.

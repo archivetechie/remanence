@@ -43,6 +43,35 @@ For the daemon under systemd, grant the capability in the unit instead:
 check that `/dev/sg*` nodes exist at all (no HBA, no VTL, or the module
 is not loaded).
 
+<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-library/src/discovery.rs @ 7a7af81d -->
+## A standalone drive is missing or read-only
+
+Start with:
+
+```sh
+rem drives --json
+rem doctor --json
+```
+
+The drive you plan to write must appear with `kind: "standalone"`,
+`ownership: "standalone"`, a `/dev/sgN` path, and a serial. The common
+standalone refusals are:
+
+| Message or observation | Meaning and action |
+|---|---|
+| No drive endpoint appears | Apply the same `tape`-group and `CAP_SYS_RAWIO` fixes described above. Check the cable, HBA, `/sys/class/scsi_generic`, and kernel log. |
+| `--device requires explicit --allow-device` | Repeat the serial from `rem drives --json`: `--device /dev/sgN --allow-device SERIAL`. |
+| `--allow-device does not authorize this discovered drive` | The selected path now resolves to another serial, or the allow value is wrong. Rediscover; do not broaden the allowlist blindly. |
+| `device is not an unattached drive; library operations go through the daemon` | A changer claims this drive. Configure and use the library path instead. |
+| `ownership unknown` | Discovery could not prove that no changer owns the drive. Fix the failed probes. If this is a known standalone drive on a partially discoverable host, add its exact serial under `[[standalone_drives]]`. |
+| `unresolved changer bays prohibit device writes` | A reachable changer has a bay whose drive identity cannot be resolved. Fix that mapping; a standalone serial pin does not override it. |
+| `only permitted for read verbs` with `--allow-unserialized-device` | A drive without a readable serial has only an ephemeral identity. Reads can be explicitly allowed; writes cannot. |
+| State volume is untrusted | Put home-mode state on a local persistent filesystem. `--allow-untrusted-state-volume` is an explicit development override, not a normal archive setup. |
+| Cannot write `/run/lock/rem` | Create it for the `tape` group: `sudo install -d -o root -g tape -m 0770 /run/lock/rem`. |
+
+The full setup and first-tape sequence is in [Using a standalone LTO
+drive](guide-standalone-drive.md).
+
 <!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs crates/remanence-cli/src/lib.rs @ 6ed03ef0 -->
 ## Media-readiness fences and quarantine
 

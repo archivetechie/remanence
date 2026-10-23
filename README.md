@@ -25,6 +25,13 @@ cartridges, write self-describing objects with erasure-coded parity, and
 account for every byte in a rebuildable catalog. What to archive, when, and
 for how long are decisions for whatever orchestrator calls its API.
 
+A tape library is the long-term deployment target, but it is not the entry
+price. `rem` can operate one standalone LTO drive directly, with no changer and
+no daemon. A home or lab user can insert a cartridge, initialize it, write and
+restore files, finalize it, and verify it from the command line. The
+[standalone-drive guide](docs/guide-standalone-drive.md) is the shortest path
+to a first physical tape.
+
 Long-term tape archiving is dominated by proprietary systems whose on-tape
 formats become unreadable when the vendor disappears, and by tools that treat
 tape like a disk. Remanence makes different choices. The object format is publicly
@@ -80,9 +87,11 @@ cargo build --release
 ```
 
 yields `target/release/{rem,rem-debug,rem-daemon,rem-recover}`. `rem` is the
-operator CLI and `rem-debug` the break-glass one (direct hardware access for emergencies); `rem-recover` is a separate crate that depends on neither the daemon
-nor the catalog. One optional feature, `remanence-cli/linux-udev`, adds
-hot-plug watching and needs `pkg-config` and `libudev-dev`.
+operator CLI for daemon-backed libraries and policy-gated standalone drives;
+`rem-debug` is the break-glass tool with broader direct hardware access.
+`rem-recover` is a separate crate that depends on neither the daemon nor the
+catalog. One optional feature, `remanence-cli/linux-udev`, adds hot-plug
+watching and needs `pkg-config` and `libudev-dev`.
 
 One program is needed at run time: `bsdtar` (the `libarchive-tools` package on
 Debian and Ubuntu, `bsdtar` on Fedora). `rem archive build` needs it only to
@@ -117,12 +126,16 @@ rem archive extract --object demo.rem-object --dest restored
 `demo.rem-object` is a POSIX pax tar stream — `bsdtar -tf
 demo.rem-object` lists your files — and it is byte-for-byte what a tape write
 stores as the object body. The full walkthrough, from local round trip
-to library discovery, daemon setup, tape initialization, and a first
-tape write, is [docs/guide-quickstart.md](docs/guide-quickstart.md).
+to a standalone drive or a changer library, is
+[docs/guide-quickstart.md](docs/guide-quickstart.md). If you already have one
+LTO drive attached, go straight to the
+[standalone-drive guide](docs/guide-standalone-drive.md).
 
 ## Documentation
 
 - [Quickstart](docs/guide-quickstart.md) — runnable walkthrough.
+- [Standalone LTO drive](docs/guide-standalone-drive.md) — first physical
+  tape with one drive, no changer or daemon.
 - [Status](docs/status.md) — what works today, what does not, and how
   mature each part is.
 - [Architecture overview](docs/architecture-overview.md) — the layer

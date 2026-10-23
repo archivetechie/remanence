@@ -122,6 +122,12 @@ require an explicit opt-in.
 This lets Remanence share a host with another tape system safely, without the
 operator having to be careful with each command.
 
+A standalone drive has the same fail-closed rule without inventing a library
+identity. Discovery must prove that no changer claims it, and every direct
+operation names both the current `/dev/sgN` path and the drive serial it is
+allowed to find there. Incomplete ownership evidence permits only explicitly
+acknowledged reads; it never authorizes a write.
+
 ### 4. Phase-aware composed operations
 
 "Load slot 5 into drive 2" is two SCSI commands:

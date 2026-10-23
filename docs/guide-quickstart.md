@@ -7,8 +7,9 @@ object format works against ordinary files, and it is the same code path
 the tape write uses.
 
 Commands in the local sections were run as written against the current
-tree; hardware sections are marked, because they need a library (real or
-virtual) and host privileges.
+tree; hardware sections are marked. Remanence supports two hardware paths:
+one manually loaded standalone drive operated directly by `rem`, or a changer
+library operated through `rem-daemon`.
 
 <!-- code-anchor: Cargo.toml crates/remanence-cli/Cargo.toml crates/remanence-api/build.rs crates/remanence-cli/src/archive_ingest.rs @ 6ed03ef0 -->
 ## Build
@@ -166,6 +167,38 @@ REM-OBJECT remains an ordinary pax archive and can be inspected or extracted
 with `bsdtar`. For streaming and partial retrieval,
 `archive extract-stream` and `archive covering-range` use the same
 `--private-key` epoch-selection contract.
+
+<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_backend.rs @ 7a7af81d -->
+## First physical tape with one drive
+
+If you have a standalone LTO drive, you do not need to configure or run the
+daemon. The direct `rem` path discovers the drive, creates home-mode state
+under `${XDG_STATE_HOME:-$HOME/.local/state}/rem`, initializes a manually
+loaded cartridge, and uses the same checkpointed object writer and tape format
+as the library path.
+
+The short sequence is:
+
+```sh
+rem drives --json
+rem doctor --json
+
+rem --device /dev/sg3 --allow-device HU1234ABC5 \
+  tape init --label HOME01L9 --generation L9
+
+rem --device /dev/sg3 --allow-device HU1234ABC5 \
+  put /path/to/files
+
+rem --device /dev/sg3 --allow-device HU1234ABC5 \
+  get <OBJECT_ID_FROM_PUT> --out restored
+```
+
+Initialization writes to the cartridge immediately; the standalone command
+has no dry-run option. Before ejecting an archival tape, finalize it to write
+the terminal index and run verification. The complete walkthrough, including
+permissions, finalization, encrypted writes, catalogless recovery, and the
+ownership checks behind `--allow-device`, is in
+[Using a standalone LTO drive](guide-standalone-drive.md).
 
 <!-- code-anchor: crates/remanence-library/src/discovery.rs crates/remanence-cli/src/lib.rs Makefile @ 6ed03ef0 -->
 ## Talking to a library (requires hardware)
@@ -335,6 +368,8 @@ anything.
 
 ## Where to go next
 
+- [Standalone-drive guide](guide-standalone-drive.md) — the complete
+  one-drive workflow without a changer or daemon.
 - [CLI reference](reference-cli.md) — the full command surface.
 - [Configuration reference](reference-configuration.md) — every config
   key, default, and environment variable.

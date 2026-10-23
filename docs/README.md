@@ -11,10 +11,17 @@ their plain-language companion, and the REM Implementation and Operations Guide
 are in [../specs/publication](../specs/publication). The root
 [README.md](../README.md) is the project entry point.
 
+If your hardware is one manually loaded LTO drive, start with
+[Using a standalone LTO drive](guide-standalone-drive.md). Library operators
+can continue through the daemon half of the quickstart.
+
 ## Start here
 
 - [guide-quickstart.md](guide-quickstart.md) — runnable walkthrough from
-  build to first tape write.
+  build to first tape write, with separate standalone-drive and library paths.
+- [guide-standalone-drive.md](guide-standalone-drive.md) — initialize, write,
+  restore, finalize, and recover tapes with one manually loaded LTO drive and
+  no daemon.
 - [status.md](status.md) — what works today, what does not, and how
   mature each part is.
 - [architecture-overview.md](architecture-overview.md) — crate stack,

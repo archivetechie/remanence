@@ -2,8 +2,9 @@
 
 This document describes how Remanence is built: which programs and libraries
 make up the system, what each layer is responsible for, and what happens
-inside the daemon when an object is written to tape or read back. It is
-written for someone who wants to understand the system before using it,
+inside the daemon or a direct standalone-drive invocation when an object is
+written to tape or read back. It is written for someone who wants to
+understand the system before using it,
 extending it, or reviewing it. For the byte-level formats see the
 [tape layout reference](reference-tape-layout.md).
 
@@ -249,6 +250,18 @@ libraries run in parallel. Tape UUID reservations are global across the daemon.
 An operation addressed by tape UUID requires the cartridge's barcode to
 resolve to exactly one operated library before any changer command is sent.
 
+Standalone operation is a second Layer 5 adapter over the same lower layers.
+The `rem` process performs discovery, opens `remanence-state`, and constructs
+an `OperatorMount` for one explicitly authorized SCSI device. Its durable
+endpoint is `DriveKey::Standalone { drive_serial }`; no library serial, bay, or
+home slot is invented. There is no gRPC hop, changer actor, or long-running
+drive actor because one process owns one loaded cartridge for one invocation.
+The mount backend still installs the calibration fence, records audit and
+session state, runs the checkpointed writer or common restore/finalization
+code, and raises a durable tape-I/O fence when write completion is uncertain.
+Moving a tape between a standalone drive and a library therefore does not
+change its on-tape format or identity.
+
 The crate is organized as thin public interfaces over focused service, daemon
 state, drive-owner, and pool-writer modules. The module map and the ownership
 rules for adding new code are in [Remanence API module
@@ -258,12 +271,19 @@ organization](api-module-organization.md).
 
 *Fig. 2 — Layer 5 topology: clients reach `rem-daemon` over the unix socket or mTLS TCP, every RPC passes the default-deny role check, and one actor per mounted drive serializes hardware access; `rem-debug` has an allowlist-gated direct SCSI path for emergency work.*
 
+The figure shows the multi-drive daemon topology. The standalone `rem` path
+described above runs beside it and deliberately has no changer or service
+process.
+
 <!-- code-anchor: crates/remanence-api/src/mount.rs crates/remanence-api/src/pool_write.rs crates/remanence-api/src/write_owner.rs crates/remanence-state/src/index.rs @ 7f39930d -->
 ## The write path
 
-This section follows one object from an orchestrator's request to a committed
-copy on tape. The steps are numbered, and the notes after them cover retries,
-crashes, and the end-of-tape finalization.
+This section follows one object from an orchestrator's daemon request to a
+committed copy on tape. The standalone CLI replaces pool selection and
+robotics with the already loaded `--device`, then enters the same preparation,
+checkpoint, parity, catalog, and finalization machinery. The steps are
+numbered, and the notes after them cover retries, crashes, and end-of-tape
+finalization.
 
 1. `OpenWriteSession` names a tape pool. The daemon selects a tape according
    to the pool's policy and watermarks, reserves it, moves it by robot into a

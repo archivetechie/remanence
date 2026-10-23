@@ -3,12 +3,14 @@
 <!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-daemon/src/entry.rs @ 1dd451b2 -->
 ## The config file
 
-Remanence reads a single TOML file. There is no config-file search path and
-no environment variable that overrides its location: `rem-daemon` and every
-config-consuming CLI subcommand take a `--config <PATH>` flag whose default
-is `/etc/rem/config.toml`. Every table in the file rejects unknown keys, so a
-typo in a key name is a hard error at load time, not a silently ignored
-setting.
+Remanence reads a single TOML file. `rem-daemon` and library-oriented
+config-consuming commands take `--config <PATH>`, whose default is
+`/etc/rem/config.toml`; no environment variable overrides that daemon path.
+Standalone `rem` commands first honor an explicit `--config`. Without one,
+they use `/etc/rem/config.toml` if it exists. If it does not, they create a
+home-mode config at `${XDG_STATE_HOME:-$HOME/.local/state}/rem/config.toml`
+with state beside it and a `default` tape pool. Every table rejects unknown
+keys, so a typo is a hard error rather than a silently ignored setting.
 
 Four sections are required — `[daemon]`, `[journal]`, `[audit]`, `[index]` —
 plus `[cache]`. Everything else may be omitted and takes the defaults listed
@@ -189,6 +191,28 @@ serial = "DEC91001xx"
 serial = "DEC91002xx"
 ```
 
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-cli/src/standalone.rs @ 7a7af81d -->
+## `[[standalone_drives]]`
+
+An optional list of drive serials the operator asserts are standalone. Normal
+complete discovery proves this automatically when no changer claims a drive.
+The pin is for hosts where some unrelated SCSI device cannot be probed and the
+discovery report therefore cannot prove non-ownership.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `serial` | string | required | The drive's VPD page 0x80 serial, as printed by `rem drives --json`. |
+
+```toml
+[[standalone_drives]]
+serial = "HU1234ABC5"
+```
+
+This entry never maps the drive to a library bay and does not override a
+positive or unresolved changer claim. Standalone writes still refuse when a
+visible library has an unresolved drive bay. The per-command
+`--allow-device <SERIAL>` authorization is also still required.
+
 <!-- code-anchor: crates/remanence-state/src/config.rs @ 244bc6de -->
 ## `[[tape_pools]]` and `[[tape_pool_rules]]`
 
@@ -199,6 +223,7 @@ pool, and Remanence picks the tape. Pool ids may use letters, digits, and
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `id` | string | required | Stable pool identifier. |
+| `scheme` | parity name | unset | Parity geometry for a newly initialized standalone cartridge. Home-mode generated pools use `"custom:128,4,1"`; `"default"` selects the block-size-aware library geometry. When unset, initialization uses that library geometry. |
 | `display_name` | string | unset | Human-readable label. |
 | `copy_class` | string | unset | Copy-segregation axis (for example `copy-a`), so redundant copies land on different pools. |
 | `content_class` | string | unset | Content-segregation axis (for example `camera`). |
@@ -336,6 +361,7 @@ the config file.
 | Variable | Read by | Meaning |
 |---|---|---|
 | `RUST_LOG` | `rem-daemon` | Standard tracing filter (via tracing-subscriber's env filter). Defaults to `info` when unset or unparsable. |
+| `XDG_STATE_HOME` / `HOME` | standalone `rem` home mode | State root when no explicit config and no `/etc/rem/config.toml` exist: `$XDG_STATE_HOME/rem`, otherwise `$HOME/.local/state/rem`. Paths must resolve to an absolute location. |
 | `REM_CHAOS_ENABLED` | chaos-aware binaries | First gate for fault injection. Truthy values: `1`, `true`, `TRUE`, `yes`, `YES`, `on`, `ON`. |
 | `REM_CHAOS_ALLOW_REAL` | `rem-debug` | Second gate, required in addition to `REM_CHAOS_ENABLED` before real hardware transports are wrapped with fault injection. Both unset is the safe production state. |
 | `REM_CHAOS_STATE` | chaos engine | Path to the chaos scenario state file; required when chaos is enabled. |
@@ -369,6 +395,12 @@ For the minimal config above, a running daemon owns:
                                  rebuilt or reset
 ```
 
+Home mode creates the same classes of state under
+`${XDG_STATE_HOME:-$HOME/.local/state}/rem/`, but no socket or running daemon
+is required. Direct standalone commands acquire the state lock for one
+invocation, append audit and journal evidence, update the catalog projection,
+and release the lock when they exit.
+
 On parity tapes, the matching `.remjournal` and `.remcheckpoint` histories are
 both required while the tape is open and during terminal repair. In addition
 to the open prefix, they record the immutable terminal plan and the last
@@ -382,14 +414,15 @@ and the per-tape catalog files remain rebuildable projections.
 
 `state.lock` is a kernel `flock`. Every `rem-daemon`, including a read-only
 one, acquires it before opening the API state and holds it for the process
-lifetime. `rem-debug`'s offline state-mutating subcommands (tape init, pool
-ops, catalog reset, and similar) acquire the same lock. A second daemon cannot
-evade this ownership boundary by choosing another socket path, and an offline
-mutation cannot run beside the daemon. The lock is released automatically if
-the holding process dies, regardless of what the file's `pid=`/`host_id=`
-diagnostics still say. On startup, a non-read-only daemon also deletes any of
-its own leftover `spool-<uuid>.bin` files from a prior unclean exit before
-resolving the spool budget.
+lifetime. Direct standalone `rem` operations and `rem-debug`'s offline
+state-mutating subcommands (tape init, pool ops, catalog reset, and similar)
+acquire the same lock. A second daemon cannot evade this ownership boundary by
+choosing another socket path, and an offline mutation cannot run beside the
+daemon. The lock is released automatically if the holding process dies,
+regardless of what the file's `pid=`/`host_id=` diagnostics still say. On
+startup, a non-read-only daemon also deletes any of its own leftover
+`spool-<uuid>.bin` files from a prior unclean exit before resolving the spool
+budget.
 
 The audit log and per-tape journals are append-only records; the SQLite
 file is a projection that `rem rebuild-catalog-from-journals` can
