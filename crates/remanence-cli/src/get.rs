@@ -19,6 +19,7 @@
 //! A restore must never write outside `--dest`, whatever the catalog says.
 
 use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
@@ -107,6 +108,34 @@ struct RestoredMember {
     sha256: String,
 }
 
+/// The successful restore receipt retains capability context from the server.
+fn get_receipt_json(
+    object_uuid: &str,
+    record: &pb::ObjectRecord,
+    copy: &pb::ObjectCopy,
+    dest: &Path,
+    restored: &[RestoredMember],
+) -> serde_json::Value {
+    let receipt = serde_json::json!({
+        "object_id": object_uuid,
+        "caller_object_id": record.caller_object_id,
+        "tape_uuid": format_uuid(&copy.tape_uuid),
+        "tape_file_number": copy.tape_file_number.to_string(),
+        "pool_id": copy.pool_id,
+        "dest": dest.display().to_string(),
+        "digest_verified": true,
+        "members": restored.iter().map(|member| {
+            serde_json::json!({
+                "archive_path": member.archive_path,
+                "restored_to": member.dest_path.display().to_string(),
+                "size_bytes": member.size_bytes.to_string(),
+                "sha256": member.sha256,
+            })
+        }).collect::<Vec<_>>(),
+    });
+    crate::with_capabilities(receipt)
+}
+
 async fn get(
     args: &GetArgs,
     out: &mut dyn Write,
@@ -115,6 +144,7 @@ async fn get(
     let channel = connect_daemon(&args.endpoint)
         .await
         .map_err(DaemonClientError::from)?;
+    crate::observe_daemon(&channel, args.json).await?;
 
     // Locate the object, its copy, and its member list.
     let mut catalog = pb::catalog_client::CatalogClient::new(channel.clone());
@@ -221,23 +251,7 @@ async fn get(
     let restored = restore_result?;
 
     if args.json {
-        let receipt = serde_json::json!({
-            "object_id": object_uuid,
-            "caller_object_id": record.caller_object_id,
-            "tape_uuid": format_uuid(&copy.tape_uuid),
-            "tape_file_number": copy.tape_file_number.to_string(),
-            "pool_id": copy.pool_id,
-            "dest": args.dest.display().to_string(),
-            "digest_verified": true,
-            "members": restored.iter().map(|member| {
-                serde_json::json!({
-                    "archive_path": member.archive_path,
-                    "restored_to": member.dest_path.display().to_string(),
-                    "size_bytes": member.size_bytes.to_string(),
-                    "sha256": member.sha256,
-                })
-            }).collect::<Vec<_>>(),
-        });
+        let receipt = get_receipt_json(&object_uuid, &record, copy, &args.dest, &restored);
         writeln!(out, "{receipt}").map_err(|error| DaemonClientError::client(error.to_string()))
     } else {
         for member in &restored {
@@ -526,6 +540,25 @@ fn filter_members(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn get_receipt_carries_discovered_endpoints() {
+        let _guard = crate::OutputModeGuard::enter(crate::CliMode::Rem);
+        let expected = crate::endpoint_json(&crate::capability_tests::endpoints());
+        crate::OBSERVED_ENDPOINTS.with(|current| current.replace(expected.clone()));
+        let receipt = get_receipt_json(
+            "object",
+            &pb::ObjectRecord::default(),
+            &pb::ObjectCopy::default(),
+            Path::new("restore"),
+            &[],
+        );
+        assert_eq!(receipt["observed_endpoints"], serde_json::json!(expected));
+        assert_eq!(
+            receipt["supported_endpoint_kinds"],
+            serde_json::json!(["library", "standalone"])
+        );
+    }
+
     use std::collections::HashMap;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -907,6 +940,9 @@ mod tests {
         };
         runtime.spawn(
             tonic::transport::Server::builder()
+                .add_service(pb::daemon_server::DaemonServer::new(
+                    crate::capability_tests::DiscoveryDaemon,
+                ))
                 .add_service(pb::catalog_server::CatalogServer::new(FakeCatalog(
                     store.clone(),
                 )))

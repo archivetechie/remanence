@@ -126,6 +126,9 @@ message HealthResponse {
   map<string, string> components = 2;
   string detail            = 3;
   repeated ComponentHealth component_health = 4;
+  repeated string supported_endpoint_kinds = 5;
+  repeated string daemon_capabilities = 6;
+  repeated ObservedEndpoint observed_endpoints = 7;
 }
 
 message ComponentHealth {
@@ -143,10 +146,23 @@ message ComponentHealth {
   string other_status = 3;
 }
 
+// A discovered endpoint, not a claim about this daemon's hosting capability.
+message ObservedEndpoint {
+  string kind = 1;
+  optional string serial = 2;
+  optional string path = 3;
+  string ownership = 4;
+  optional uint32 bay = 5;
+  optional string library_serial = 6;
+}
+
 message VersionResponse {
   string daemon_version    = 1; // e.g., "0.4.1+abc1234"
   string api_version       = 2; // e.g., "v1"
   string rust_target       = 3; // e.g., "x86_64-unknown-linux-gnu"
+  repeated string supported_endpoint_kinds = 4;
+  repeated string daemon_capabilities = 5;
+  repeated ObservedEndpoint observed_endpoints = 6;
 }
 
 message GetOperationRequest    { bytes operation_id = 1; }
@@ -1939,12 +1955,13 @@ enum CompressionState {
 }
 
 message CartridgeFacts {
-  string           cartridge_generation = 1;  // e.g. "LTO-7"; empty = derive from voltag
+  optional string  cartridge_generation = 1;  // e.g. "LTO-7"; absent = unknown
   string           recording_format     = 2;  // e.g. "L7", "M8"
   string           voltag               = 3;  // barcode; resolve by the canonical §6.3 table
   uint64           block_size_bytes     = 4;
   CompressionState compression          = 5;
   uint64           written_extent_lba   = 6;  // exclusive; last written block + 1
+  optional string  generation_source = 7; // measured, label, or operator
 }
 // Note: no capacity field. Wrap boundaries come from the cached REOWP map
 // (§6.5), not from arithmetic over a published capacity. Generation and

@@ -89,6 +89,7 @@ pub(crate) fn run_inventory(
         let channel = runtime
             .block_on(connect_daemon(&args.endpoint))
             .map_err(DaemonClientError::client)?;
+        runtime.block_on(crate::observe_daemon(&channel, args.json))?;
         let mut client = pb::catalog_client::CatalogClient::new(channel);
         let mut stream = runtime
             .block_on(client.get_tape_inventory(pb::TapeInventoryRequest {
@@ -696,6 +697,7 @@ pub(crate) fn run_verify_index(
         let channel = runtime
             .block_on(connect_daemon(&args.endpoint))
             .map_err(DaemonClientError::client)?;
+        runtime.block_on(crate::observe_daemon(&channel, args.json))?;
         let mut client = pb::catalog_client::CatalogClient::new(channel);
         let verification = runtime
             .block_on(client.verify_tape_index(pb::VerifyTapeIndexRequest {

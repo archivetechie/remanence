@@ -67,6 +67,9 @@ impl pb::daemon_server::Daemon for DaemonService {
             components,
             detail: format!("sqlite quick_check={quick_check}"),
             component_health,
+            supported_endpoint_kinds: vec!["library".into(), "standalone".into()],
+            daemon_capabilities: self.state.daemon_capabilities(),
+            observed_endpoints: self.state.observed_endpoints(),
         }))
     }
 
@@ -76,6 +79,9 @@ impl pb::daemon_server::Daemon for DaemonService {
             daemon_version: self.state.daemon_version.clone(),
             api_version: self.state.api_version.clone(),
             rust_target: self.state.rust_target.clone(),
+            supported_endpoint_kinds: vec!["library".into(), "standalone".into()],
+            daemon_capabilities: self.state.daemon_capabilities(),
+            observed_endpoints: self.state.observed_endpoints(),
         }))
     }
 

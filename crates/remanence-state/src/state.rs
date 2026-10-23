@@ -31,6 +31,39 @@ use crate::index::{
 use crate::lock::StateLockGuard;
 use crate::paths::StatePaths;
 
+/// Common replay schema for provisioning, reassignment and explicit unassignment.
+fn pool_assignment_event(
+    uuid: [u8; 16],
+    pool: Option<&str>,
+    generation: u64,
+    source: &str,
+) -> AuditEventRecord {
+    AuditEventRecord {
+        actor: AuditActor::local_user(),
+        source_layer: SourceLayer::Layer4,
+        operation_id: None,
+        session_id: None,
+        idempotency_key: None,
+        event: AuditEvent::TapePoolAssigned,
+        subject: AuditSubject {
+            kind: "tape".into(),
+            id: Some(hex_tape_uuid(uuid)),
+        },
+        detail: BTreeMap::from([
+            (
+                "pool_id".into(),
+                pool.map(|p| CborValue::Text(p.into()))
+                    .unwrap_or(CborValue::Null),
+            ),
+            (
+                "assignment_generation".into(),
+                CborValue::Integer(generation.into()),
+            ),
+            ("assignment_source".into(), CborValue::Text(source.into())),
+        ]),
+    }
+}
+
 /// Open Layer 4 state owner.
 #[derive(Debug)]
 pub struct StateHandle {
@@ -765,6 +798,99 @@ impl StateHandle {
             self.calibration.record_map_evicted(prior_uuid)?;
         }
         Ok(())
+    }
+
+    /// Assign or unassign through the existing guarded ledger transaction.
+    /// The audit record is fsynced before SQLite commits; replay completes a
+    /// crash between those steps. A refused setter never appends authority.
+    pub fn assign_tape_pool(
+        &mut self,
+        tape_uuid: [u8; 16],
+        expected_generation: u64,
+        pool_id: Option<&str>,
+    ) -> Result<crate::TapeAssignmentSnapshot, StateError> {
+        self.replay_audit_projection()?;
+        let mut log = FileAuditLog::open(&self.paths.audit_dir, true)?;
+        let result = self.index.compare_and_set_tape_pool_assignment_with_audit(
+            tape_uuid,
+            expected_generation,
+            pool_id,
+            "operator",
+            |snapshot| {
+                log.append(pool_assignment_event(
+                    tape_uuid,
+                    snapshot.pool_id.as_deref(),
+                    snapshot.assignment_generation,
+                    "operator",
+                ))?;
+                Ok(())
+            },
+        );
+        self.refresh_audit_append_cursor()?;
+        result
+    }
+
+    /// Record a pool projection already established by provisioning/rules using
+    /// the same event schema as later operator assignments, including nulls.
+    pub fn record_rule_tape_pool_assignment(
+        &mut self,
+        tape_uuid: [u8; 16],
+    ) -> Result<(), StateError> {
+        let tape = self.index.get_tape(&tape_uuid)?.ok_or_else(|| {
+            StateError::TapePoolAssignmentConflict("cannot audit an unknown tape".into())
+        })?;
+        self.append_metadata_authority(pool_assignment_event(
+            tape_uuid,
+            tape.pool_id.as_deref(),
+            tape.assignment_generation,
+            "rule",
+        ))
+    }
+
+    /// Persist a BOT-proven cartridge's correction before projecting its cache.
+    /// Only generation/provenance change; provisioning and pool facts are untouched.
+    pub fn set_tape_generation(
+        &mut self,
+        tape_uuid: [u8; 16],
+        observation: crate::MediaObservation,
+    ) -> Result<(), StateError> {
+        self.replay_audit_projection()?;
+        if self.index.get_tape(&tape_uuid)?.is_none() {
+            return Err(StateError::TapeProvisionConflict(
+                "cannot set generation for an unknown tape".into(),
+            ));
+        }
+        self.append_metadata_authority(AuditEventRecord {
+            actor: AuditActor::local_user(),
+            source_layer: SourceLayer::Layer4,
+            operation_id: None,
+            session_id: None,
+            idempotency_key: None,
+            event: AuditEvent::TapeGenerationChanged,
+            subject: AuditSubject {
+                kind: "tape".into(),
+                id: Some(hex_tape_uuid(tape_uuid)),
+            },
+            detail: BTreeMap::from([
+                (
+                    "cartridge_generation".into(),
+                    CborValue::Text(observation.generation.media_code().into()),
+                ),
+                (
+                    "generation_source".into(),
+                    CborValue::Text(observation.source.as_str().into()),
+                ),
+            ]),
+        })?;
+        self.replay_audit_projection()?;
+        Ok(())
+    }
+
+    /// Authoritative metadata survives even when ordinary audit fsync is disabled.
+    fn append_metadata_authority(&mut self, record: AuditEventRecord) -> Result<(), StateError> {
+        let mut log = FileAuditLog::open(&self.paths.audit_dir, true)?;
+        log.append(record)?;
+        self.refresh_audit_append_cursor()
     }
 
     /// Rebind a shell label after the caller proves the target BOT identity.
@@ -3007,6 +3133,89 @@ pool_id = "camera.copy-a"
                 adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod)
             )
             .is_err());
+    }
+
+    /// Corrections are authority for adopted tapes too, and stale or failed
+    /// assignment transactions must not append a replayable change.
+    #[test]
+    fn metadata_corrections_rebuild_adopted_identity_and_refused_assignment_is_not_audited() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).unwrap();
+        let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
+        let mut input = adoption_input(Uuid::new_v4());
+        input.observation = Some(crate::MediaObservation {
+            generation: crate::LtoGen::Lto7,
+            source: crate::GenerationSource::Measured,
+        });
+        input.pool_id = Some("camera.copy-a".into());
+        handle
+            .adopt_bootstrap_identity(
+                input.clone(),
+                adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
+            )
+            .unwrap();
+        let before = handle.index.get_tape(&input.tape_uuid).unwrap().unwrap();
+        let events_before = FileAuditLog::replay(&handle.paths.audit_dir).unwrap().len();
+        assert!(handle
+            .assign_tape_pool(input.tape_uuid, before.assignment_generation + 1, None)
+            .is_err());
+        assert_eq!(
+            FileAuditLog::replay(&handle.paths.audit_dir).unwrap().len(),
+            events_before
+        );
+        assert!(handle
+            .index
+            .compare_and_set_tape_pool_assignment_with_audit(
+                input.tape_uuid,
+                before.assignment_generation,
+                None,
+                "operator",
+                |_| Err(StateError::ConfigInvalid("injected audit failure".into())),
+            )
+            .is_err());
+        let unchanged = handle.index.get_tape(&input.tape_uuid).unwrap().unwrap();
+        assert_eq!(unchanged.pool_id, before.pool_id);
+        assert_eq!(
+            unchanged.assignment_generation,
+            before.assignment_generation
+        );
+        handle
+            .assign_tape_pool(input.tape_uuid, before.assignment_generation, None)
+            .unwrap();
+        for generation in [crate::LtoGen::Lto8, crate::LtoGen::Lto9] {
+            handle
+                .set_tape_generation(
+                    input.tape_uuid,
+                    crate::MediaObservation {
+                        generation,
+                        source: crate::GenerationSource::Operator,
+                    },
+                )
+                .unwrap();
+            let records = FileAuditLog::replay(&handle.paths.audit_dir).unwrap();
+            assert_eq!(
+                records.last().unwrap().event,
+                AuditEvent::TapeGenerationChanged
+            );
+            let mut restored = CatalogIndex::open(":memory:").unwrap();
+            for full_rebuild in [false, false, true] {
+                if full_rebuild {
+                    restored
+                        .rebuild_from_authoritative_sources(&records, &[])
+                        .unwrap();
+                } else {
+                    restored.replay_audit_records(&records).unwrap();
+                }
+                let tape = restored.get_tape(&input.tape_uuid).unwrap().unwrap();
+                assert_eq!(
+                    crate::tape_generation(&tape),
+                    Some((generation, crate::GenerationSource::Operator))
+                );
+                assert_eq!(tape.pool_id, None);
+                assert_eq!(tape.assignment_generation, before.assignment_generation + 1);
+            }
+        }
     }
 
     #[test]

@@ -263,6 +263,7 @@ async fn put(
     let channel = connect_daemon(&args.endpoint)
         .await
         .map_err(DaemonClientError::from)?;
+    crate::observe_daemon(&channel, args.json).await?;
     let target = resolve_target(args, channel.clone()).await?;
 
     let total_bytes: u64 = inputs.iter().map(|input| input.size_bytes).sum();
@@ -1065,6 +1066,7 @@ fn print_receipt(
             "bytes_committed": session.bytes_committed,
             "objects": objects,
         });
+        let receipt = crate::with_capabilities(receipt);
         writeln!(out, "{receipt}").map_err(|error| error.to_string())
     } else {
         for (input, object) in receipts {
@@ -1133,6 +1135,33 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn put_receipt_carries_discovered_endpoints() {
+        let _guard = crate::OutputModeGuard::enter(crate::CliMode::Rem);
+        let expected = crate::endpoint_json(&crate::capability_tests::endpoints());
+        crate::OBSERVED_ENDPOINTS.with(|current| current.replace(expected.clone()));
+        let args = put_args(vec![], "unused".into());
+        let mut out = Vec::new();
+        print_receipt(
+            &args,
+            &PutTarget::Pool {
+                pool_id: "solo".into(),
+                library_uuid: vec![],
+            },
+            &pb::WriteSession::default(),
+            &[],
+            &HashMap::new(),
+            &mut out,
+        )
+        .unwrap();
+        let receipt: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(receipt["observed_endpoints"], serde_json::json!(expected));
+        assert_eq!(
+            receipt["supported_endpoint_kinds"],
+            serde_json::json!(["library", "standalone"])
+        );
+    }
+
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use tonic::{Request, Response, Status, Streaming};
@@ -1469,6 +1498,9 @@ mod tests {
         };
         runtime.spawn(
             tonic::transport::Server::builder()
+                .add_service(pb::daemon_server::DaemonServer::new(
+                    crate::capability_tests::DiscoveryDaemon,
+                ))
                 .add_service(
                     pb::write_session_service_server::WriteSessionServiceServer::new(
                         FakeWriteSessions(state),

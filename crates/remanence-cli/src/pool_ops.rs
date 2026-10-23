@@ -311,7 +311,7 @@ fn write_representation_from_args(
     })
 }
 
-fn read_recipient_files(paths: &[PathBuf]) -> Result<Vec<RecipientPublicKey>, String> {
+pub(crate) fn read_recipient_files(paths: &[PathBuf]) -> Result<Vec<RecipientPublicKey>, String> {
     if !(2..=8).contains(&paths.len()) {
         return Err("--recipient must be repeated 2 to 8 times".to_string());
     }
@@ -338,7 +338,7 @@ fn read_recipient_files(paths: &[PathBuf]) -> Result<Vec<RecipientPublicKey>, St
     Ok(recipients)
 }
 
-fn read_private_key_file(path: &Path) -> Result<RecipientPrivateKey, String> {
+pub(crate) fn read_private_key_file(path: &Path) -> Result<RecipientPrivateKey, String> {
     let mut bytes = std::fs::read(path)
         .map_err(|error| format!("read --private-key {}: {error}", path.display()))?;
     let parsed = RecipientPrivateKey::parse(&bytes)
@@ -361,7 +361,7 @@ pub(crate) fn print_locator_json(
     print_locator_json_with_recipients(object, pool_id, None, out);
 }
 
-fn print_locator_json_with_recipients(
+pub(crate) fn print_locator_json_with_recipients(
     object: &PoolWriteObjectRecord,
     pool_id: &str,
     recipient_epochs: Option<&[serde_json::Value]>,
@@ -1126,6 +1126,58 @@ pub fn export_mounted_tape_object<W: Write>(
         object_sha256: bytes_to_hex(&result.object_sha256),
     })
     .map_err(|e| e.to_string())
+}
+
+/// Restore a catalogued object using the common mounted positioning and containment sinks.
+pub(crate) fn restore_mounted_tape_object(
+    mount: MountedTape,
+    index: &CatalogIndex,
+    locator: &str,
+    private_key: Option<&Path>,
+    destination: &Path,
+) -> Result<serde_json::Value, String> {
+    let loc = decode_locator(locator)?;
+    let plan = resolve_object_read_plan(index, &loc)?;
+    let block_size = plan.block_size_bytes;
+    let anchor = plan.manifest_sha256;
+    let staging = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let stored = staging.path().join("stored");
+    let receipt = export_mounted_tape_object(
+        mount,
+        index,
+        locator,
+        std::fs::File::create(&stored).map_err(|e| e.to_string())?,
+    )?;
+    let plain = if receipt["representation"].as_str() == Some("encrypted") {
+        let key =
+            read_private_key_file(private_key.ok_or("encrypted copy requires --private-key")?)?;
+        let plain = staging.path().join("plain");
+        remanence_aead::open(
+            std::fs::File::open(&stored).map_err(|e| e.to_string())?,
+            std::fs::File::create(&plain).map_err(|e| e.to_string())?,
+            &key,
+        )
+        .map_err(|e| e.to_string())?;
+        plain
+    } else {
+        stored
+    };
+    let validated = remanence_api::validate_spooled_object(&plain, block_size, anchor)?;
+    if validated.global_pax.get("REMANENCE.object_id") != Some(&loc.object_id) {
+        return Err("stored object identity differs from catalog".into());
+    }
+    let mut source = remanence_library::FileBlockSource::open(&plain, block_size as usize)
+        .map_err(|e| e.to_string())?;
+    let blocks = source.block_count();
+    remanence_stream::restore_object_to_directory(
+        &mut source,
+        block_size as usize,
+        blocks,
+        destination,
+        Default::default(),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(receipt)
 }
 
 fn copy_stored_object_blocks<W: Write>(

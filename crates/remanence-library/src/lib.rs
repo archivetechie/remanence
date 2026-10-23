@@ -79,3 +79,13 @@ pub use transport::{
     FixtureTransport, ForeignDriveTransport, RecordingLog, RecordingTransport, SgTransport,
     TimeoutClass,
 };
+
+/// Operator-facing explanation shared by CLI discovery and daemon startup logs.
+pub fn drive_mapping_message(warning: &DiscoveryWarning) -> Option<String> {
+    match warning {
+        DiscoveryWarning::DriveMappingUnavailable { library, bays } => Some(format!(
+            "changer {library}, bays {bays:?}: this changer did not report drive identities; see the hardware-support page"
+        )),
+        _ => None,
+    }
+}

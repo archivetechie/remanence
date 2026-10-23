@@ -95,6 +95,34 @@ pub(crate) enum BayResolution {
 }
 
 impl ApiState {
+    pub(crate) fn daemon_capabilities(&self) -> Vec<String> {
+        if self.drive_pool.is_some() {
+            vec!["library_control".into()]
+        } else {
+            vec!["read_only".into()]
+        }
+    }
+    pub(crate) fn observed_endpoints(&self) -> Vec<pb::ObservedEndpoint> {
+        let Some(snapshot) = &self.library_snapshot else {
+            return Vec::new();
+        };
+        let snapshot = snapshot.read().unwrap_or_else(|e| e.into_inner());
+        crate::observed_endpoint_json(&snapshot.report)
+            .iter()
+            .map(|v| pb::ObservedEndpoint {
+                kind: v["kind"].as_str().unwrap_or_default().into(),
+                serial: v["serial"]
+                    .as_str()
+                    .or_else(|| v["drive_serial"].as_str())
+                    .map(str::to_owned),
+                path: v["path"].as_str().map(str::to_owned),
+                ownership: v["ownership"].as_str().unwrap_or("library").into(),
+                bay: v["bay"].as_u64().map(|b| b as u32),
+                library_serial: v["library_serial"].as_str().map(str::to_owned),
+            })
+            .collect()
+    }
+
     /// Build service state around an already-opened rebuildable catalog index.
     pub fn new(index: CatalogIndex) -> Self {
         Self::new_with_pool_configs(index, Vec::new())

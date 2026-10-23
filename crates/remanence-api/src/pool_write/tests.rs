@@ -446,6 +446,7 @@ fn test_pool_write_resources() -> PoolWriteResources {
 
 fn test_capacity_pool_config(selected: &SelectedTape) -> TapePoolConfig {
     TapePoolConfig {
+        scheme: None,
         id: selected.pool_id.clone(),
         display_name: None,
         copy_class: None,
@@ -1752,6 +1753,7 @@ fn no_parity_exact_close_capacity_rolls_before_whole_object_motion() {
         parity_config: ParityConfig::None,
     };
     let pool_cfg = TapePoolConfig {
+        scheme: None,
         id: selected.pool_id.clone(),
         display_name: None,
         copy_class: None,
@@ -2043,6 +2045,7 @@ fn parity_capacity_reservation_uses_physical_cursor_exact_layout_and_atomic_spoo
         parity_config: ParityConfig::Scheme(scheme.clone()),
     };
     let pool_cfg = TapePoolConfig {
+        scheme: None,
         id: selected.pool_id.clone(),
         display_name: None,
         copy_class: None,
@@ -2170,6 +2173,7 @@ fn exact_terminal_admission_rejects_high_watermark_crossing_before_spool_grant()
         parity_config: ParityConfig::Scheme(scheme.clone()),
     };
     let pool_cfg = TapePoolConfig {
+        scheme: None,
         id: selected.pool_id.clone(),
         display_name: None,
         copy_class: None,
@@ -2244,6 +2248,7 @@ fn parity_spool_shortfall_is_rejected_before_object_tape_motion() {
         parity_config: ParityConfig::Scheme(scheme.clone()),
     };
     let pool_cfg = TapePoolConfig {
+        scheme: None,
         id: selected.pool_id.clone(),
         display_name: None,
         copy_class: None,
@@ -2354,6 +2359,7 @@ fn direct_encrypted_parity_write_uses_configured_spool_ceiling_before_object_mot
         .project_tape_pool_membership(tape_uuid, pool_id)
         .expect("assign tape");
     let pool_cfg = TapePoolConfig {
+        scheme: None,
         id: pool_id.into(),
         display_name: None,
         copy_class: None,
@@ -2468,6 +2474,7 @@ fn direct_checkpointed_parity_raw_write_failure_persists_fence_and_blocks_retry(
         .project_tape_pool_membership(tape_uuid, pool_id)
         .expect("assign tape");
     let pool_cfg = TapePoolConfig {
+        scheme: None,
         id: pool_id.into(),
         display_name: None,
         copy_class: None,
@@ -2566,6 +2573,7 @@ fn parity_capacity_distinguishes_fresh_media_limit_from_current_tape_shortfall()
         parity_config: ParityConfig::Scheme(scheme.clone()),
     };
     let pool_cfg = TapePoolConfig {
+        scheme: None,
         id: selected.pool_id.clone(),
         display_name: None,
         copy_class: None,
@@ -2691,6 +2699,7 @@ fn batched_parity_post_motion_projection_failure_sets_dirty_after_retryable_spoo
         .project_tape_pool_membership(tape_uuid, pool_id)
         .expect("assign mocked tape to its selected pool");
     let pool_cfg = TapePoolConfig {
+        scheme: None,
         id: pool_id.into(),
         display_name: None,
         copy_class: None,
@@ -2916,6 +2925,7 @@ fn physical_extent_projection_prefers_authority_and_fails_closed_on_legacy_overf
 #[test]
 fn selector_fit_uses_barrier_proved_physical_extent_at_the_boundary() {
     let cfg = TapePoolConfig {
+        scheme: None,
         id: "capacity.projection".into(),
         display_name: None,
         copy_class: None,
@@ -3201,6 +3211,7 @@ fn overlap_recovery_cut_matrix_never_projects_partial_object() {
             .project_tape_pool_membership(retry_tape, retry_pool)
             .expect("assign clean retry tape");
         let retry_cfg = TapePoolConfig {
+            scheme: None,
             id: retry_pool.into(),
             display_name: None,
             copy_class: None,
@@ -3755,6 +3766,7 @@ fn append_finish_does_not_double_count() {
         .project_tape_pool_membership(tape_uuid, pool_id)
         .expect("project tape membership");
     let cfg = TapePoolConfig {
+        scheme: None,
         id: pool_id.to_string(),
         display_name: None,
         copy_class: Some("copy-a".to_string()),
@@ -3834,6 +3846,7 @@ fn batch_of_one_core_journals_tape_for_later_daemon_admission() {
         .project_tape_pool_membership(tape_uuid, pool_id)
         .expect("assign tape");
     let cfg = TapePoolConfig {
+        scheme: None,
         id: pool_id.to_string(),
         display_name: None,
         copy_class: None,
@@ -3976,6 +3989,7 @@ tape_catalog_dir = "{0}/cache/tapes"
         .project_tape_pool_membership(tape_uuid, pool_id)
         .expect("assign tape");
     let cfg = TapePoolConfig {
+        scheme: None,
         id: pool_id.to_string(),
         display_name: None,
         copy_class: None,
@@ -4139,6 +4153,7 @@ fn direct_parity_watermark_seal_commits_prefix_and_terminal_components_before_fi
         .project_tape_pool_membership(tape_uuid, pool_id)
         .expect("assign tape");
     let cfg = TapePoolConfig {
+        scheme: None,
         id: pool_id.to_string(),
         display_name: None,
         copy_class: None,
@@ -4252,6 +4267,7 @@ fn direct_terminal_failure_preserves_object_checkpoint_and_structured_intent() {
         .project_tape_pool_membership(tape_uuid, pool_id)
         .expect("assign tape");
     let cfg = TapePoolConfig {
+        scheme: None,
         id: pool_id.to_string(),
         display_name: None,
         copy_class: None,
@@ -4381,6 +4397,7 @@ fn direct_fresh_parity_requires_exact_bot_position_before_bootstrap_write() {
         .project_tape_pool_membership(tape_uuid, pool_id)
         .expect("assign tape");
     let cfg = TapePoolConfig {
+        scheme: None,
         id: pool_id.to_string(),
         display_name: None,
         copy_class: None,
@@ -4483,6 +4500,7 @@ fn bootstrap_only_parity_orphan_requires_physical_reconciliation_before_position
         .project_tape_pool_membership(tape_uuid, pool_id)
         .expect("assign tape");
     let cfg = TapePoolConfig {
+        scheme: None,
         id: pool_id.to_string(),
         display_name: None,
         copy_class: None,
@@ -4631,6 +4649,7 @@ fn checkpointed_parity_tape_is_admitted_for_daemon_resume() {
         .project_tape_pool_membership(tape_uuid, pool_id)
         .expect("assign tape");
     let cfg = TapePoolConfig {
+        scheme: None,
         id: pool_id.to_string(),
         display_name: None,
         copy_class: None,
@@ -4977,6 +4996,7 @@ fn pinned_fixture() -> PinnedFixture {
         .project_tape_pool_membership(PINNED_TAPE, PINNED_POOL)
         .expect("project membership");
     let pool_cfg = TapePoolConfig {
+        scheme: None,
         id: PINNED_POOL.to_string(),
         display_name: None,
         copy_class: Some("copy-a".to_string()),
