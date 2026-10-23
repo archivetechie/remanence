@@ -63,7 +63,13 @@ pub(crate) struct PutArgs {
     /// Pin a specific tape by UUID; the daemon mounts it into a free drive
     /// if needed. Requires --pool naming the tape's pool — pinning replaces
     /// pool selection, never admission, and a pool mismatch is a refusal.
-    #[arg(long, value_name = "UUID", conflicts_with = "drive", requires = "pool")]
+    #[arg(
+        long,
+        alias = "tape-uuid",
+        value_name = "UUID",
+        conflicts_with = "drive",
+        requires = "pool"
+    )]
     tape: Option<String>,
 
     /// Target drive element address (accepts `0x0100` or decimal). Writes to

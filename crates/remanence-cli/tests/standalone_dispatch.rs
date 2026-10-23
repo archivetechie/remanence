@@ -403,7 +403,12 @@ fn home_roundtrip_and_metadata_use_real_dispatch() {
         "release must not clear quarantine"
     );
     drop(index);
-    let health = run(&["doctor"]);
+    let (code, health) = run_result(&["doctor"]);
+    assert_ne!(code, ExitCode::SUCCESS);
+    assert_eq!(health["ok"], false);
+    assert!(health["error"].as_str().unwrap().starts_with("not ready: "));
+    assert!(health["result"]["checks"].is_array());
+    let health = &health["result"];
     assert_eq!(health["drives"][0]["ownership"], "standalone");
     assert_eq!(
         health["state_dir"],
@@ -424,6 +429,7 @@ fn home_roundtrip_and_metadata_use_real_dispatch() {
 /// Exercise the real binary selector, including Clap's alternate help spelling.
 #[test]
 fn every_new_verb_routes_help_through_the_entry_point() {
+    let home = tempfile::tempdir().unwrap();
     let verbs = [
         vec!["doctor"],
         vec!["drives"],
@@ -454,6 +460,13 @@ fn every_new_verb_routes_help_through_the_entry_point() {
                 args.push("--help");
             }
             let result = std::process::Command::new(env!("CARGO_BIN_EXE_rem"))
+                .env("REM_TEST_NO_LIVE_SCSI", "1")
+                .env("HOME", home.path())
+                .env("XDG_STATE_HOME", home.path())
+                .env(
+                    "REM_TEST_SYSTEM_CONFIG",
+                    home.path().join("absent-system.toml"),
+                )
                 .args(&args)
                 .output()
                 .unwrap();
@@ -463,26 +476,21 @@ fn every_new_verb_routes_help_through_the_entry_point() {
                 String::from_utf8_lossy(&result.stderr)
             );
             let help = String::from_utf8(result.stdout).unwrap();
-            assert!(help.contains("--allow-device"), "{args:?}: {help}");
             let library_option = match verb.as_slice() {
                 ["put"] | ["get"] | ["tape", "finalize"] => Some("--endpoint"),
                 ["tape", "init"] => Some("--library"),
                 _ => None,
             };
             if let Some(option) = library_option {
-                for expected in [
-                    "Library/daemon interface:",
-                    "Standalone device interface:",
-                    option,
-                    "--device",
-                ] {
-                    assert!(
-                        help.contains(expected),
-                        "{args:?}: missing {expected}: {help}"
-                    );
-                }
+                assert!(help.contains(option), "{args:?}: {help}");
+                assert!(
+                    help.trim_end().ends_with("For a standalone drive: rem setup, or pass --device PATH --allow-device SERIAL."),
+                    "library help follows library routing"
+                );
+            } else {
+                assert!(help.contains("--allow-device"), "{args:?}: {help}");
             }
-            if verb == ["pool", "new"] || verb == ["tape", "init"] {
+            if verb == ["pool", "new"] {
                 for expected in [
                     "custom:128,4,1",
                     "1 MiB",
@@ -512,6 +520,7 @@ fn literal_help_operands_keep_library_entry_point_routing() {
         vec!["tape", "finalize", "--reason", "help"],
     ] {
         let result = std::process::Command::new(env!("CARGO_BIN_EXE_rem"))
+            .env("REM_TEST_NO_LIVE_SCSI", "1")
             .current_dir(root.path())
             .args(&args)
             .output()
@@ -758,6 +767,8 @@ fn skipped_disk_is_informational_without_any_tape_endpoints() {
 
 /// Persistent virtual media with fresh production dispatch and state locks per invocation.
 struct VersionFixture {
+    interrupt_finalize: bool,
+    home_default: bool,
     terminal_input: bool,
     fail_after_path: std::sync::Mutex<Option<String>>,
     root: tempfile::TempDir,
@@ -770,6 +781,8 @@ impl VersionFixture {
 
     fn with_parity(parity: bool) -> Self {
         let fixture = Self {
+            interrupt_finalize: false,
+            home_default: false,
             terminal_input: false,
             fail_after_path: std::sync::Mutex::new(None),
             root: tempfile::tempdir().unwrap(),
@@ -891,7 +904,10 @@ impl VersionFixture {
         if json {
             args.push("--json");
         }
-        if extra[0] != "pool" && extra[0] != "list" && !extra.starts_with(&["tape", "quarantine"]) {
+        if !self.home_default
+            && !matches!(extra[0], "pool" | "list" | "setup")
+            && !extra.starts_with(&["tape", "quarantine"])
+        {
             args.extend([
                 "--device",
                 "/dev/home-model",
@@ -915,6 +931,7 @@ impl VersionFixture {
             }],
             |_: &Path| {
                 Ok(Box::new(VersionMutationTransport {
+                    interrupt_write: self.interrupt_finalize,
                     fail_after_path: self.fail_after_path.lock().unwrap().clone(),
                     inner: RemovalTransport {
                         inner: remanence_chaos::model::ModelTransport::new(
@@ -966,6 +983,7 @@ impl VersionFixture {
 type SourceMutation = (std::path::PathBuf, Vec<u8>, bool);
 
 struct VersionMutationTransport {
+    interrupt_write: bool,
     fail_after_path: Option<String>,
     inner: RemovalTransport,
     mutation: std::sync::Arc<std::sync::Mutex<Option<SourceMutation>>>,
@@ -983,6 +1001,10 @@ impl remanence_library::SgTransport for VersionMutationTransport {
         cdb: &[u8],
         buf: &[u8],
     ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError> {
+        assert!(
+            !(self.interrupt_write && cdb[0] == 0x0a),
+            "injected interruption before finalization media write"
+        );
         if cdb[0] == 0x0a {
             if let Some(path) = &self.fail_after_path {
                 let config = remanence_state::load_config(&self.inner.config).unwrap();
@@ -1269,6 +1291,7 @@ fn checkpoints_restore_versions_after_projection_loss_and_full_rebuild() {
         assert_eq!(f.index().list_native_object_files(id).unwrap(), files);
         // Exercise the public rebuild command, including parity journal replay.
         let rebuilt = std::process::Command::new(env!("CARGO_BIN_EXE_rem"))
+            .env("REM_TEST_NO_LIVE_SCSI", "1")
             .args([
                 "rebuild-catalog-from-journals",
                 "--config",
@@ -1916,7 +1939,13 @@ fn discovery_succeeds_while_state_is_locked() {
         vec!["diagnostics", "capture", "--out", archive.to_str().unwrap()],
     ] {
         let (code, out, errors) = f.run(&args, true);
-        assert_eq!(code, ExitCode::SUCCESS, "{out}\n{errors}");
+        if args == ["doctor"] {
+            assert_ne!(code, ExitCode::SUCCESS, "{out}\n{errors}");
+            let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(report["result"]["catalog_fence_check"]["ok"], true);
+        } else {
+            assert_eq!(code, ExitCode::SUCCESS, "{out}\n{errors}");
+        }
     }
 }
 
@@ -2029,7 +2058,7 @@ fn doctor_reports_schema_mismatch() {
     file.sync_all().unwrap();
     drop(file);
     let (code, out, errors) = f.run(&["doctor"], true);
-    assert_eq!(code, ExitCode::SUCCESS, "{out}\n{errors}");
+    assert_ne!(code, ExitCode::SUCCESS, "{out}\n{errors}");
     let report: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(
         report["result"]["catalog_fence_check"]["ok"], false,
@@ -2066,7 +2095,9 @@ fn home_put_and_get_migrate_old_catalog_but_doctor_does_not() {
     let source = f.root.path().join("migrate.txt");
     std::fs::write(&source, b"migration payload").unwrap();
     assert_eq!(catalog_schema(&f, Some(19)), 19);
-    let doctor = f.ok(&["doctor"]);
+    let (code, out, errors) = f.run(&["doctor"], true);
+    assert_ne!(code, ExitCode::SUCCESS, "{out} {errors}");
+    let doctor = VersionFixture::envelope(&out)["result"].clone();
     assert_eq!(doctor["catalog_fence_check"]["ok"], false);
     assert_eq!(catalog_schema(&f, None), 19);
     f.ok(&["put", source.to_str().unwrap()]);
@@ -2084,7 +2115,7 @@ fn home_put_and_get_migrate_old_catalog_but_doctor_does_not() {
 /// Real parser, catalog, tape transport, and filesystem sinks preserve member dates.
 #[test]
 fn restore_dates_listing_and_member_selection() {
-    let f = VersionFixture::with_parity(false);
+    let mut f = VersionFixture::with_parity(false);
     let directory = f.root.path().join("photos");
     std::fs::create_dir(&directory).unwrap();
     let source = directory.join("a.txt");
@@ -2196,8 +2227,7 @@ fn restore_dates_listing_and_member_selection() {
     assert_eq!(identified["object_count"], 2);
     assert_eq!(identified["finalized"], false);
     assert_eq!(identified["pool"], "default");
-    let tape = identified["uuid"].as_str().unwrap();
-    let operation = uuid::Uuid::new_v4().to_string();
+
     // Terminal replicas include physical separation extents; model enough media.
     f.world
         .lock()
@@ -2206,20 +2236,69 @@ fn restore_dates_listing_and_member_selection() {
         .get_mut("FIRST")
         .unwrap()
         .capacity_bytes = 3 * 1024 * 1024 * 1024;
-    let finalized = f.ok(&[
+    // Interrupt after durable request admission, before the transport writes.
+    f.interrupt_finalize = true;
+    let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        f.run(&["tape", "finalize", "--acknowledge-tape", "FIRST"], true)
+    }));
+    assert!(
+        interrupted.is_err(),
+        "fixture must reach finalization's first media write"
+    );
+    f.interrupt_finalize = false;
+    let tape_uuid: [u8; 16] = f
+        .index()
+        .get_tape_by_voltag("FIRST")
+        .unwrap()
+        .unwrap()
+        .tape_uuid
+        .try_into()
+        .unwrap();
+    let accepted = f
+        .index()
+        .terminal_finalization(&tape_uuid)
+        .unwrap()
+        .expect("interrupted request was durable");
+    let config = remanence_state::load_config(f.config()).unwrap();
+    let intent = remanence_state::FileCheckpointJournal::open(
+        config.journal.dir.join("checkpoints"),
+        tape_uuid,
+    )
+    .unwrap()
+    .terminal_finalization_intent()
+    .unwrap()
+    .expect("durable finalization intent");
+    let manual = intent.manual.expect("operator close-out identity");
+    assert_eq!(manual.reason, "finalized with rem");
+    assert_eq!(
+        manual.idempotency_key,
+        *uuid::Uuid::new_v5(
+            &uuid::Uuid::parse_str("c33a391e-7209-5b35-a198-5cab71b91ea4").unwrap(),
+            &tape_uuid
+        )
+        .as_bytes()
+    );
+    // Opening the drive reconciles abandoned sessions; reads remain available.
+    f.ok(&["tape", "identify"]);
+    // Restart recovery must fence the abandoned session; use the normal audited release.
+    let quarantine = f.ok(&["tape", "quarantine", "list"]);
+    let fences = quarantine["active_fences"].as_array().unwrap();
+    assert_eq!(fences.len(), 1);
+    f.ok(&[
         "tape",
-        "finalize",
-        "--tape",
-        tape,
-        "--acknowledge-tape",
-        tape,
-        "--reason",
-        "fixture close",
-        "--expected-pool",
-        "default",
-        "--idempotency-key",
-        &operation,
+        "quarantine",
+        "release",
+        fences[0]["quarantine_id"].as_str().unwrap(),
+        "--ack",
+        "fixture interrupted before first media write",
     ]);
+    let finalized = f.ok(&["tape", "finalize", "--acknowledge-tape", "FIRST"]);
+    assert_eq!(
+        finalized["operation_id"],
+        accepted.operation_id.unwrap().to_string()
+    );
+    let retried = f.ok(&["tape", "finalize", "--ack-tape-uuid", "FIRST"]);
+    assert_eq!(finalized["operation_id"], retried["operation_id"]);
     assert_eq!(finalized["finalized"], true);
     assert!(finalized["completed_replicas"].is_number());
     let identified = f.ok(&["tape", "identify"]);
@@ -2496,6 +2575,7 @@ fn daemon_put_get_preserves_mtime() {
         let endpoint = format!("unix:{}", socket.display());
         let run = |args: &[&str]| {
             let result = std::process::Command::new(env!("CARGO_BIN_EXE_rem"))
+                .env("REM_TEST_NO_LIVE_SCSI", "1")
                 .current_dir(f.root.path())
                 .args(args)
                 .args(["--endpoint", &endpoint, "--json"])
@@ -2912,4 +2992,330 @@ fn standalone_get_accepts_symlink_destination() {
         ExitCode::SUCCESS
     );
     assert_eq!(std::fs::read(outside).unwrap(), b"untouched");
+}
+
+/// Setup uses fixture discovery and persists only an affirmative, unique choice.
+#[test]
+fn setup_selects_one_drive_and_refuses_zero_or_two() {
+    use remanence_chaos::model::{DeviceRole, ModelTransport, VirtualWorld};
+    use std::sync::{Arc, Mutex};
+    for (count, incomplete, select) in [
+        (0, false, false),
+        (1, false, false),
+        (2, false, false),
+        (1, true, false),
+        (2, false, true),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let worlds: Vec<_> = (0..count)
+            .map(|i| {
+                Arc::new(Mutex::new(VirtualWorld::single_drive(
+                    "HIDDEN",
+                    0x100,
+                    format!("DRIVE-{i}"),
+                    0x400,
+                    0,
+                )))
+            })
+            .collect();
+        let devices: Vec<_> = (0..count)
+            .map(|i| remanence_library::DeviceAttachment {
+                sg_path: format!("/dev/setup-{i}").into(),
+                sysfs_path: format!("/sys/setup-{i}").into(),
+            })
+            .collect();
+        let mut out = Vec::new();
+        let mut errors = Vec::new();
+        let mut args = vec!["rem", "setup", "--yes", "--json"];
+        if select {
+            args.extend(["--device", "/dev/setup-1"]);
+        }
+        let code = remanence_cli::run_with_standalone_test_enumeration(
+            &args,
+            root.path(),
+            &root.path().join("state"),
+            &root.path().join("absent"),
+            &root.path().join("locks"),
+            remanence_library::sysfs::DeviceEnumeration {
+                devices,
+                warnings: if incomplete {
+                    vec![remanence_library::DiscoveryWarning::DeviceUnreachable {
+                        path: "/dev/unreachable".into(),
+                        source: remanence_library::IoErrorKind::from(&std::io::Error::from(
+                            std::io::ErrorKind::PermissionDenied,
+                        )),
+                    }]
+                } else {
+                    vec![]
+                },
+            },
+            |path| {
+                let i: usize = path
+                    .to_str()
+                    .unwrap()
+                    .rsplit('-')
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                Ok(Box::new(ModelTransport::new(
+                    worlds[i].clone(),
+                    DeviceRole::Drive { bay: 0x100 },
+                )))
+            },
+            &mut out,
+            &mut errors,
+        );
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let config_path = root.path().join("state/rem/config.toml");
+        if count == 1 || select {
+            assert_eq!(code, ExitCode::SUCCESS, "{value}");
+            let saved: remanence_state::RemConfig =
+                toml::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
+            assert_eq!(
+                saved.home.unwrap().drive_serial.as_deref(),
+                Some(if select { "DRIVE-1" } else { "DRIVE-0" })
+            );
+            assert_eq!(saved.standalone_drives.len(), usize::from(incomplete));
+            if incomplete {
+                assert_eq!(saved.standalone_drives[0].serial, "DRIVE-0");
+                assert!(!String::from_utf8_lossy(&errors).contains("[y/N]"));
+            }
+            assert!(
+                saved.journal.require_trusted_volume,
+                "diagnostics must not weaken saved durability policy"
+            );
+        } else {
+            assert_ne!(code, ExitCode::SUCCESS, "{value}");
+            assert!(
+                !config_path.exists(),
+                "ambiguous discovery must not save configuration"
+            );
+            assert!(value["error"].as_str().unwrap().contains(if count == 0 {
+                "no standalone"
+            } else {
+                "exactly one"
+            }));
+        }
+    }
+}
+
+/// Binary coverage is limited to help parsing, with an explicit route independent of host config.
+#[test]
+fn top_level_standalone_help_never_discovers() {
+    for args in [
+        vec!["tape", "--help"],
+        vec!["help", "tape", "init"],
+        vec!["tape", "help", "init"],
+        vec!["put", "--help"],
+    ] {
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_rem"))
+            .env("REM_TEST_NO_LIVE_SCSI", "1")
+            .args(["--device", "/dev/fixture"])
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(String::from_utf8(result.stdout)
+            .unwrap()
+            .contains("--allow-device"));
+    }
+}
+
+/// Saved authorization resolves by discovery and cannot authorize an explicit different path.
+#[test]
+fn saved_drive_defaults_feed_the_existing_device_gate() {
+    let mut f = VersionFixture::new();
+    f.ok(&["setup", "--yes"]);
+    f.home_default = true;
+    let identity = f.ok(&["tape", "identify"]);
+    assert_eq!(identity["label"], "FIRST");
+    let (code, out, _) = f.run(
+        &["tape", "identify", "--allow-device", "ANOTHER-DRIVE"],
+        true,
+    );
+    assert_ne!(code, ExitCode::SUCCESS);
+    assert!(VersionFixture::envelope(&out)["error"]
+        .as_str()
+        .unwrap()
+        .contains("does not authorize"));
+    let (code, out, _) = f.run(&["tape", "identify", "--device", "/dev/other"], true);
+    assert_ne!(code, ExitCode::SUCCESS);
+    assert!(VersionFixture::envelope(&out)["error"]
+        .as_str()
+        .unwrap()
+        .contains("explicit --allow-device"));
+    let (code, out, _) = f.run(
+        &[
+            "tape",
+            "identify",
+            "--device",
+            "/dev/other",
+            "--allow-device",
+            "HOME-DRIVE",
+        ],
+        true,
+    );
+    assert_ne!(code, ExitCode::SUCCESS);
+    let error = VersionFixture::envelope(&out)["error"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        error.contains("no SCSI device at /dev/other") && error.contains("/dev/home-model"),
+        "{error}"
+    );
+}
+
+/// Pin the public help output while checking every individual flag in parser tests.
+#[test]
+fn top_level_help_snapshot() {
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_rem"))
+        .env("REM_TEST_NO_LIVE_SCSI", "1")
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    assert_eq!(
+        String::from_utf8(result.stdout).unwrap(),
+        include_str!("snapshots/rem-help.txt")
+    );
+}
+
+/// Setup preserves unrelated bytes and supports reruns, replacement and pool creation.
+#[test]
+fn setup_preserves_config_and_reports_one_human_sentence() {
+    let f = VersionFixture::new();
+    let original = std::fs::read_to_string(f.config()).unwrap();
+    let (code, out, errors) = f.run(&["setup", "--yes"], false);
+    assert_eq!(code, ExitCode::SUCCESS, "{errors}");
+    assert_eq!(out.lines().count(), 1, "{out}");
+    assert!(
+        out.starts_with("saved ") && out.ends_with("serial HOME-DRIVE as this host's drive\n"),
+        "{out}"
+    );
+    assert!(!errors.contains("[y/N]"));
+    let saved = std::fs::read_to_string(f.config()).unwrap();
+    assert!(saved.starts_with(&original));
+    let loaded = remanence_state::load_config(f.config()).unwrap();
+    let roundtrip = remanence_state::parse_config_toml(&toml::to_string(&loaded).unwrap()).unwrap();
+    assert_eq!(
+        toml::to_string(&loaded).unwrap(),
+        toml::to_string(&roundtrip).unwrap()
+    );
+    let edited = format!(
+        "# operator comment\n{}",
+        saved.replace("HOME-DRIVE", "OLD-DRIVE")
+    );
+    std::fs::write(f.config(), &edited).unwrap();
+    let (code, out, errors) = f.run(&["setup", "--yes"], true);
+    assert_eq!(code, ExitCode::SUCCESS, "{out} {errors}");
+    assert_eq!(
+        std::fs::read_to_string(f.config()).unwrap(),
+        edited.replace("OLD-DRIVE", "HOME-DRIVE")
+    );
+    let (code, out, errors) = f.run(&["pool", "new", "offsite"], true);
+    assert_eq!(code, ExitCode::SUCCESS, "{out} {errors}");
+    let before = std::fs::read_to_string(f.config()).unwrap();
+    let (code, out, errors) = f.run(&["setup", "--yes"], true);
+    assert_eq!(code, ExitCode::SUCCESS, "{out} {errors}");
+    assert_eq!(std::fs::read_to_string(f.config()).unwrap(), before);
+}
+
+/// A test-spawned production binary refuses discovery without an environment guard.
+#[test]
+fn cli_children_always_disable_live_scsi() {
+    let home = tempfile::tempdir().unwrap();
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_rem"))
+        .env_remove("REM_TEST_NO_LIVE_SCSI")
+        .env_remove("REM_TEST_LIVE_SCSI")
+        .env("HOME", home.path())
+        .env("XDG_STATE_HOME", home.path())
+        .args(["drives"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("live SCSI access is forbidden"),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+/// Pin the defaults at durable admission through the actual finalize dispatcher.
+#[test]
+fn finalize_stores_literal_defaults_for_fixed_tape() {
+    let mut f = VersionFixture::with_parity(false);
+    let tape_uuid = *uuid::Uuid::parse_str("42424242-4242-4242-8242-424242424242")
+        .unwrap()
+        .as_bytes();
+    {
+        let mut world = f.world.lock().unwrap();
+        let tape = world.tapes.get_mut("FIRST").unwrap();
+        let remanence_chaos::model::Record::Block(block) = &mut tape.records[0] else {
+            panic!("initialized tape must start with bootstrap");
+        };
+        let mut bootstrap = remanence_parity::bootstrap::parse_bootstrap_block(block).unwrap();
+        bootstrap.tape_uuid = tape_uuid;
+        block.fill(0);
+        remanence_parity::bootstrap::write_bootstrap_block(&bootstrap, block).unwrap();
+        tape.capacity_bytes = 3 * 1024 * 1024 * 1024;
+    }
+    f.ok(&["tape", "adopt", "--label", "FIXED", "--pool", "default"]);
+    f.ok(&["tape", "set-generation", "--generation", "L9"]);
+    let source = f.root.path().join("fixed.txt");
+    std::fs::write(&source, b"fixed identity").unwrap();
+    f.ok(&["put", source.to_str().unwrap()]);
+    f.interrupt_finalize = true;
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            f.run(&["tape", "finalize", "--acknowledge-tape", "FIXED"], true)
+        }))
+        .is_err(),
+        "must reach the first terminal media write"
+    );
+    let config = remanence_state::load_config(f.config()).unwrap();
+    let intent = remanence_state::FileCheckpointJournal::open(
+        config.journal.dir.join("checkpoints"),
+        tape_uuid,
+    )
+    .unwrap()
+    .terminal_finalization_intent()
+    .unwrap()
+    .expect("durable request");
+    let manual = intent.manual.unwrap();
+    assert_eq!(manual.reason, "finalized with rem");
+    assert_eq!(
+        uuid::Uuid::from_bytes(manual.idempotency_key).to_string(),
+        "ec179b67-8df5-5ebe-b713-079b6e7ef632"
+    );
+}
+
+/// Explicit daemon selection must not suggest switching to standalone setup on failure.
+#[test]
+fn explicit_endpoint_connection_error_has_no_setup_hint() {
+    let home = tempfile::tempdir().unwrap();
+    let endpoint = format!("unix:{}", home.path().join("absent.sock").display());
+    for endpoint_args in [
+        vec!["--endpoint".to_string(), endpoint.clone()],
+        vec![format!("--endpoint={endpoint}")],
+    ] {
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_rem"))
+            .env("REM_TEST_NO_LIVE_SCSI", "1")
+            .env("HOME", home.path())
+            .env("XDG_STATE_HOME", home.path())
+            .args(["get", "42424242-4242-4242-8242-424242424242", "--out"])
+            .arg(home.path().join("restore"))
+            .args(endpoint_args)
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        let error = String::from_utf8_lossy(&result.stderr);
+        assert!(error.contains("connect daemon at"), "{error}");
+        assert!(!error.contains("rem setup"), "{error}");
+    }
 }

@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::{de, Deserialize, Deserializer};
+use serde::{de, Deserialize, Deserializer, Serialize};
 
 use crate::error::StateError;
 
@@ -29,7 +29,7 @@ pub const DEFAULT_CHECKPOINT_MAX_OBJECTS: u64 = 200;
 pub const DEFAULT_CHECKPOINT_MAX_AGE_SECONDS: u64 = 300;
 
 /// Top-level Remanence daemon configuration.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RemConfig {
     /// Saved home-mode selection used by `rem setup` and shared-verb routing.
@@ -72,7 +72,7 @@ pub struct RemConfig {
 }
 
 /// Home-mode defaults; `rem setup` saves the selected drive serial here.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct HomeConfig {
     /// VPD serial of the selected standalone drive.
@@ -80,7 +80,7 @@ pub struct HomeConfig {
 }
 
 /// Daemon-wide settings.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
     /// Root directory for mutable daemon state.
@@ -147,7 +147,7 @@ pub struct DaemonConfig {
 }
 
 /// Daemon policy for Layer 5 append receive staging.
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum AppendStagingMode {
     /// Receive the complete object into the legacy spool before tape writing.
@@ -174,7 +174,7 @@ impl DaemonConfig {
 }
 
 /// Server-side mutual-TLS material for the daemon's TCP listener.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonTlsConfig {
     /// Server identity certificate PEM.
@@ -186,7 +186,7 @@ pub struct DaemonTlsConfig {
 }
 
 /// Per-library operator allowlist entry.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LibraryConfig {
     /// Library serial number.
@@ -197,7 +197,7 @@ pub struct LibraryConfig {
 }
 
 /// Operator assertion of standalone ownership, never a library bay mapping.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct StandaloneDriveConfig {
     /// VPD 0x80 drive serial.
@@ -205,7 +205,7 @@ pub struct StandaloneDriveConfig {
 }
 
 /// Operator-defined pool for tape eligibility and Sutradhara placement.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TapePoolConfig {
     /// Default parity geometry for new standalone cartridges.
@@ -262,6 +262,12 @@ pub enum PoolSelectionPolicyName {
     FillOldest,
 }
 
+impl Serialize for PoolSelectionPolicyName {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
 impl PoolSelectionPolicyName {
     /// Return the stable config spelling.
     pub fn as_str(self) -> &'static str {
@@ -289,7 +295,7 @@ impl<'de> Deserialize<'de> for PoolSelectionPolicyName {
 }
 
 /// Barcode-prefix rule that derives one tape's pool from its voltag.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TapePoolRuleConfig {
     /// Barcode prefix to match. Longest matching prefix wins.
@@ -299,7 +305,7 @@ pub struct TapePoolRuleConfig {
 }
 
 /// Drive stewardship collection settings.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DrivesConfig {
     /// Library serials Remanence may actively manage. Empty means daemon-operated libraries.
@@ -327,7 +333,7 @@ impl Default for DrivesConfig {
 }
 
 /// Cleaning policy settings.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct CleaningConfig {
     /// Whether automatic cleaning is enabled.
@@ -361,7 +367,7 @@ impl Default for CleaningConfig {
 }
 
 /// Live-status serving settings.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct LiveStatusConfig {
     /// Minimum poll interval enforced by the daemon.
@@ -383,7 +389,7 @@ impl Default for LiveStatusConfig {
 }
 
 /// Tape I/O batching and position-proof settings.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct TapeIoConfig {
     /// Number of page-aligned buffers in each active drive's staging ring.
@@ -455,7 +461,7 @@ const fn default_checkpoint_max_age_seconds() -> u64 {
 }
 
 /// Layer 3c journal configuration.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct JournalConfig {
     /// Directory containing one `.remjournal` file per tape.
@@ -466,7 +472,7 @@ pub struct JournalConfig {
 }
 
 /// Audit-log configuration.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AuditConfig {
     /// Directory containing daily `.remaudit` segments.
@@ -480,7 +486,7 @@ pub struct AuditConfig {
 }
 
 /// SQLite projection configuration.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct IndexConfig {
     /// Path to the rebuildable SQLite index file.
@@ -488,7 +494,7 @@ pub struct IndexConfig {
 }
 
 /// Rebuildable cache configuration.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CacheConfig {
     /// Directory containing per-tape catalog cache files.
@@ -1104,6 +1110,20 @@ tape_catalog_dir = "{0}/cache/tapes"
             "read_only = false\n",
             &format!("read_only = false\n{extra}"),
         )
+    }
+
+    /// Serialization retains a fully populated typed configuration and loader validation.
+    #[test]
+    fn populated_config_roundtrips_through_loader() {
+        let mut config = parse_config_toml(&valid_config()).unwrap();
+        config.home = Some(HomeConfig {
+            drive_serial: Some("HOME-DRIVE".into()),
+        });
+        config.standalone_drives = vec![StandaloneDriveConfig {
+            serial: "HOME-DRIVE".into(),
+        }];
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert_eq!(parse_config_toml(&text).unwrap(), config);
     }
 
     #[test]

@@ -112,6 +112,38 @@ pub enum MediaReadiness {
     },
 }
 
+/// Operator-facing readiness descriptions shared by mount and initialization.
+impl std::fmt::Display for MediaReadiness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ready => f.write_str("drive ready"),
+            Self::NoMedium { .. } => f.write_str("no cartridge in the drive"),
+            Self::BecomingReady { .. } => f.write_str("drive becoming ready"),
+            Self::UnitAttention { .. } | Self::RepeatedUnitAttention { .. } => {
+                f.write_str("drive reported a change; retry readiness checks")
+            }
+            Self::TerminalNotReady { action, .. } => write!(f, "drive not ready: {action}"),
+            Self::CheckCondition { key, asc, ascq } => write!(
+                f,
+                "drive refused readiness check (sense {key:02x}/{asc:02x}/{ascq:02x})"
+            ),
+            Self::UndecodedCheckCondition { .. } => {
+                f.write_str("drive returned unreadable sense data")
+            }
+            Self::TargetBusy { .. } => f.write_str("drive busy"),
+            Self::ReservationConflict => f.write_str("drive reserved by another host"),
+            Self::TaskAborted => f.write_str("drive aborted the readiness check"),
+            Self::UnexpectedStatus { status } => {
+                write!(f, "drive returned unexpected status {status:02x}")
+            }
+            Self::TransportUnknown { detail } => {
+                write!(f, "drive communication uncertain: {detail}")
+            }
+            Self::InvalidRequest { detail } => write!(f, "invalid readiness request: {detail}"),
+        }
+    }
+}
+
 /// Options for a bounded TEST UNIT READY polling epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MediaReadinessWaitOptions {

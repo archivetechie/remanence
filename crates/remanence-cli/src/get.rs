@@ -50,7 +50,7 @@ pub(crate) struct GetArgs {
     object: String,
 
     /// Destination directory for the restored members.
-    #[arg(long, value_name = "DIR")]
+    #[arg(long, alias = "out", value_name = "DIR")]
     dest: PathBuf,
 
     /// Interpret OBJECT as the caller object id.
@@ -63,7 +63,7 @@ pub(crate) struct GetArgs {
 
     /// Read from the copy on this tape UUID instead of the first cataloged
     /// copy.
-    #[arg(long, value_name = "UUID")]
+    #[arg(long, alias = "tape-uuid", value_name = "UUID")]
     tape: Option<String>,
 
     /// Restore only the member with this archive path.

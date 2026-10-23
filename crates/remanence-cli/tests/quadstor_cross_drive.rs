@@ -11,6 +11,8 @@ fn required(name: &str) -> String {
 #[test]
 #[ignore = "requires a configured rem-daemon and safe Quadstor VTL cartridge"]
 fn rem_load_then_drive_pinned_verify_roundtrips() {
+    assert_eq!(std::env::var("REM_TEST_LIVE_SCSI").as_deref(), Ok("1"),
+        "run with REM_TEST_LIVE_SCSI=1 cargo test -p remanence-cli --test quadstor_cross_drive -- --ignored; set REM_QUADSTOR_CROSS_DRIVE_* coordinates");
     let endpoint = required("REM_QUADSTOR_CROSS_DRIVE_ENDPOINT");
     let library = required("REM_QUADSTOR_CROSS_DRIVE_LIBRARY");
     let bay = required("REM_QUADSTOR_CROSS_DRIVE_BAY");
@@ -25,6 +27,7 @@ fn rem_load_then_drive_pinned_verify_roundtrips() {
     );
 
     let mut load = Command::new(env!("CARGO_BIN_EXE_rem"));
+    load.env("REM_TEST_NO_LIVE_SCSI", "1");
     load.args([
         "drive",
         "load",
@@ -51,6 +54,7 @@ fn rem_load_then_drive_pinned_verify_roundtrips() {
     );
 
     let verify = Command::new(env!("CARGO_BIN_EXE_rem"))
+        .env("REM_TEST_NO_LIVE_SCSI", "1")
         .args([
             "archive",
             "verify",

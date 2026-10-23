@@ -39,6 +39,7 @@ pub struct DeviceEnumeration {
 /// and warnings for directory entries or attachments that could not be read.
 #[cfg(target_os = "linux")]
 pub fn enumerate_sg_devices() -> Result<DeviceEnumeration, IoErrorKind> {
+    assert_live_scsi_allowed();
     enumerate_sg_devices_under(Path::new("/dev"), Path::new("/sys/class/scsi_generic"))
 }
 
@@ -144,10 +145,65 @@ fn is_sg_node(name: &str) -> bool {
         .is_some()
 }
 
-// -------------------------------------------------------------------- tests
+/// Prevent test processes and their CLI children from reaching host SCSI hardware.
+/// Fixture enumeration and model transports do not call this function.
+pub(crate) fn assert_live_scsi_allowed() {
+    let in_deps = |p: &Path| {
+        p.parent()
+            .and_then(Path::file_name)
+            .is_some_and(|n| n == "deps")
+    };
+    let test_binary = std::env::current_exe().ok().is_some_and(|p| in_deps(&p));
+    // getppid avoids parsing /proc/self/stat's possibly parenthesized comm field.
+    let parent = unsafe { libc::getppid() };
+    let test_parent = fs::read_link(format!("/proc/{parent}/exe"))
+        .ok()
+        .is_some_and(|p| in_deps(&p));
+    let opted_in = std::env::var("REM_TEST_LIVE_SCSI").as_deref() == Ok("1");
+    assert!(
+        std::env::var_os("REM_TEST_NO_LIVE_SCSI").is_none()
+            && (opted_in || !(test_binary || test_parent)),
+        "live SCSI access is forbidden: inject fixtures, or explicitly run hardware tests with REM_TEST_LIVE_SCSI=1 (unset REM_TEST_NO_LIVE_SCSI)"
+    );
+}
 
 #[cfg(test)]
 mod tests {
+    /// Exercise the guard in isolated processes so environment changes cannot race.
+    #[test]
+    fn live_scsi_guard_process() {
+        if std::env::var_os("REM_GUARD_CHILD").is_some() {
+            super::assert_live_scsi_allowed();
+            return;
+        }
+        for (opt_in, deny, success) in [
+            (None, false, false),
+            (Some("0"), false, false),
+            (Some("1"), false, true),
+            (Some("1"), true, false),
+        ] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", "sysfs::tests::live_scsi_guard_process"])
+                .env("REM_GUARD_CHILD", "1")
+                .env_remove("REM_TEST_LIVE_SCSI")
+                .env_remove("REM_TEST_NO_LIVE_SCSI");
+            if let Some(value) = opt_in {
+                child.env("REM_TEST_LIVE_SCSI", value);
+            }
+            if deny {
+                child.env("REM_TEST_NO_LIVE_SCSI", "1");
+            }
+            let output = child.output().unwrap();
+            assert_eq!(
+                output.status.success(),
+                success,
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+    }
+
     use super::*;
     use std::fs;
 

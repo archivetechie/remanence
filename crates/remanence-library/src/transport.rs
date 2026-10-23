@@ -390,6 +390,9 @@ impl LinuxSgTransport {
     /// read/write — preserves the pre-§7.6 behaviour for hosts whose
     /// permissions only allow the combined mode.
     pub fn open(path: &std::path::Path) -> Result<Self, std::io::Error> {
+        if path.starts_with("/dev") {
+            crate::sysfs::assert_live_scsi_allowed();
+        }
         use std::fs::OpenOptions;
         let file = match OpenOptions::new().read(true).open(path) {
             Ok(file) => file,
@@ -417,6 +420,9 @@ impl LinuxSgTransport {
     /// surprise-fail on a read-only fd. Capability checks
     /// (`CAP_SYS_RAWIO`) are a separate gate.
     pub fn open_rw(path: &std::path::Path) -> Result<Self, std::io::Error> {
+        if path.starts_with("/dev") {
+            crate::sysfs::assert_live_scsi_allowed();
+        }
         use std::fs::OpenOptions;
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         Ok(Self {

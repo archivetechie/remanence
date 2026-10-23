@@ -23,124 +23,192 @@ use uuid::Uuid;
 // same RS(128,4) code with one stripe so a small home write does not emit the
 // library default's 512 MiB sidecar. Operators can select --scheme default.
 const HOME_PARITY_HELP: &str = "New home-mode CLI pools default to custom:128,4,1. At 256 KiB blocks, contiguous-loss tolerance is 1 MiB versus 512 MiB for the library geometry, reducing parity overhead for small writes. Use rem pool new NAME --scheme default to select the block-size-aware library geometry, then rem tape init --pool NAME.";
+const DEFAULT_FINALIZE_REASON: &str = "finalized with rem";
+const NAMESPACE_REMANENCE_FINALIZE: Uuid = Uuid::from_u128(0xc33a391e_7209_5b35_a198_5cab71b91ea4);
 const HOME_POOL_SCHEME: &str = "custom:128,4,1";
+
+/// Finalization identity is tape-scoped and deliberately independent of build metadata.
+fn default_finalize_key(tape_uuid: [u8; 16]) -> Uuid {
+    Uuid::new_v5(&NAMESPACE_REMANENCE_FINALIZE, &tape_uuid)
+}
 
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
+/// Direct standalone operations and host configuration.
 #[derive(Debug, Parser)]
 #[command(
     name = "rem",
+    version,
     about = "library operations go through the daemon; a standalone drive is operated directly."
 )]
 struct Cli {
+    /// Load this configuration instead of home defaults.
     #[arg(long, global = true)]
     config: Option<PathBuf>,
+    /// Operate this discovered SCSI tape device directly.
     #[arg(long, global = true)]
     device: Option<PathBuf>,
+    /// Authorize a drive by its discovered serial or device path.
     #[arg(long, global = true)]
     allow_device: Vec<String>,
+    /// Allow reads from a drive that has no VPD serial.
     #[arg(long, global = true)]
     allow_unserialized_device: bool,
+    /// Override volume durability checks when intentionally using an untrusted state filesystem.
     #[arg(long, global = true)]
     allow_untrusted_state_volume: bool,
+    /// Acknowledge incomplete discovery for read-only access.
     #[arg(long, global = true)]
     acknowledge_unknown_ownership: bool,
+    /// Acquire a SCSI reservation when other initiators could access this drive.
     #[arg(long, global = true)]
     reserve: bool,
+    /// Emit machine-readable JSON.
     #[arg(long, global = true)]
     json: bool,
+    /// Choose an operation.
     #[command(subcommand)]
     command: Command,
 }
+/// Available operations for this command.
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// List committed archive paths.
     List {
+        /// Filter entries by tape label or UUID.
         #[arg(long, alias = "tape-uuid")]
         tape: Option<String>,
+        /// List archive paths beginning with this prefix.
         #[arg(long)]
         path_prefix: Option<String>,
     },
+    /// Check this host and save a default standalone drive.
+    Setup {
+        /// Accept drive selection and any ownership assertion without prompting.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Check permissions and storage readiness.
     Doctor,
+    /// Show discovered tape endpoints and ownership.
     Drives,
+    /// Capture diagnostic evidence.
     Diagnostics {
+        /// Choose an operation.
         #[command(subcommand)]
         command: Diagnostics,
     },
+    /// Manage tape pools.
     Pool {
+        /// Choose an operation.
         #[command(subcommand)]
         command: Pool,
     },
+    /// Operate or inspect a tape.
     Tape {
+        /// Choose an operation.
         #[command(subcommand)]
         command: Tape,
     },
+    /// Store files on the loaded tape.
     Put {
+        /// Files to store on the loaded tape.
         #[arg(required = true)]
         paths: Vec<PathBuf>,
+        /// Select the configured tape pool.
         #[arg(long)]
         pool: Option<String>,
+        /// Encrypt for this recipient public key.
         #[arg(long)]
         recipient: Vec<PathBuf>,
         /// Permit a plaintext version when the newest committed version is encrypted.
         #[arg(long)]
         allow_plaintext_copy: bool,
+        /// Select or verify the tape identity.
         #[arg(long, alias = "tape-uuid")]
         tape: Option<String>,
     },
+    /// Restore an object or archive path.
     Get {
+        /// Object UUID or archive path to retrieve.
         object: String,
+        /// Retrieve this specific object version.
         #[arg(long)]
         version: Option<Uuid>,
+        /// Write restored files to this destination.
         #[arg(long, alias = "dest")]
         out: PathBuf,
+        /// Decrypt using this private key file.
         #[arg(long)]
         private_key: Option<PathBuf>,
     },
 }
+/// Available operations for this command.
 #[derive(Debug, Subcommand)]
 enum Diagnostics {
+    /// Capture diagnostic evidence in a tar file.
     Capture {
+        /// Write the diagnostic tar archive to this destination.
         #[arg(long)]
         out: PathBuf,
     },
 }
+/// Available operations for this command.
 #[derive(Debug, Subcommand)]
 enum Pool {
     #[command(after_help = HOME_PARITY_HELP)]
+    /// Create a tape pool.
     New {
+        /// Name of the new pool.
         name: String,
+        /// Choose the parity geometry.
         #[arg(long)]
         scheme: Option<String>,
+        /// Set the fixed tape block size in bytes.
         #[arg(long, value_parser=crate::recovery_report::parse_block_size)]
         block_size: Option<u32>,
     },
 }
+/// Available operations for this command.
 #[derive(Debug, Subcommand)]
 enum Quarantine {
+    /// List active quarantine fences.
     List,
+    /// Release a quarantine fence after recording an acknowledgement.
     Release {
+        /// Identifier of the quarantine fence to release.
         id: String,
+        /// Record the reason for releasing this fence.
         #[arg(long)]
         ack: String,
     },
 }
+/// Available operations for this command.
 #[derive(Debug, Subcommand)]
 enum Tape {
+    /// Inspect and release local tape fences.
     Quarantine {
+        /// Choose an operation.
         #[command(subcommand)]
         command: Quarantine,
     },
+    /// Read the loaded tape identity.
     Identify,
     #[command(after_help = HOME_PARITY_HELP)]
+    /// Initialize a cartridge with an operator label.
     Init {
+        /// Operator label printed on the cartridge.
         #[arg(long)]
         label: String,
+        /// Select the configured tape pool.
         #[arg(long)]
         pool: Option<String>,
+        /// Specify the cartridge generation, such as L8.
         #[arg(long)]
         generation: Option<String>,
+        /// Set the fixed tape block size in bytes.
         #[arg(long, value_parser=crate::recovery_report::parse_block_size)]
         block_size: Option<u32>,
         /// Erase foreign or existing data after exact label confirmation.
@@ -150,72 +218,104 @@ enum Tape {
         #[arg(long, requires = "clobber_data")]
         confirm_clobber: Option<String>,
     },
+    /// Import the loaded tape identity into the catalog.
     Adopt {
+        /// Operator label printed on the cartridge.
         #[arg(long)]
         label: Option<String>,
+        /// Select the configured tape pool.
         #[arg(long)]
         pool: Option<String>,
     },
+    /// Verify the loaded tape.
     Verify {
+        /// Verify all object data.
         #[arg(long)]
         full: bool,
     },
+    /// Recover archive members from the loaded tape.
     Restore {
+        /// Write restored files to this destination.
         #[arg(long, alias = "dest", required_unless_present = "list")]
         out: Option<PathBuf>,
+        /// List recoverable archive members without extracting.
         #[arg(long)]
         list: bool,
+        /// Restore only this archive member path.
         #[arg(long)]
         path: Vec<String>,
+        /// Decrypt using this private key file.
         #[arg(long)]
         private_key: Option<PathBuf>,
+        /// Scan tape objects instead of using the terminal index.
         #[arg(long)]
         scan: bool,
     },
+    /// Close the tape and write its terminal index.
     Finalize {
+        /// Select or verify the tape identity.
+        #[arg(long, alias = "tape-uuid")]
+        tape: Option<Uuid>,
+        /// Confirm the loaded tape by label or UUID.
+        #[arg(long, alias = "ack-tape-uuid")]
+        acknowledge_tape: String,
+        /// Record a finalization reason (default: finalized with rem).
         #[arg(long)]
-        tape: Uuid,
+        reason: Option<String>,
+        /// Override the stable per-tape finalization request key.
         #[arg(long)]
-        acknowledge_tape: Uuid,
-        #[arg(long)]
-        reason: String,
-        #[arg(long)]
-        idempotency_key: Uuid,
+        idempotency_key: Option<Uuid>,
+        /// Require this pool instead of the catalogued pool.
         #[arg(long)]
         expected_pool: Option<String>,
     },
+    /// Change the catalogued pool assignment.
     AssignPool {
-        #[arg(long)]
+        /// Select or verify the tape identity.
+        #[arg(long, alias = "tape-uuid")]
         tape: Option<Uuid>,
         #[arg(
             long,
             conflicts_with = "unassign",
             required_unless_present = "unassign"
         )]
+        /// Select the configured tape pool.
         pool: Option<String>,
+        /// Remove the tape from its pool.
         #[arg(long)]
         unassign: bool,
     },
+    /// Bind a cartridge label to a new identity.
     Rebind {
+        /// Operator label printed on the cartridge.
         #[arg(long)]
         label: String,
+        /// Require this previous tape UUID before rebinding.
         #[arg(long)]
         previous_uuid: Uuid,
     },
+    /// Record the cartridge generation.
     SetGeneration {
+        /// Specify the cartridge generation, such as L8.
         #[arg(long)]
         generation: String,
     },
+    /// Explicitly discard a suffix beyond local checkpoint authority.
     SupersedeTail {
-        #[arg(long)]
+        /// Confirm the loaded tape by label or UUID.
+        #[arg(long, alias = "ack-tape-uuid")]
         acknowledge_tape: String,
+        /// Confirm discarding the reported suffix with SUPERSEDE followed by its label.
         #[arg(long)]
         confirm_supersede: Option<String>,
     },
+    /// Import checkpoint journals for append recovery.
     ImportJournals {
+        /// Import checkpoint journals from this directory.
         #[arg(long)]
         from: PathBuf,
     },
+    /// Clear the drive's removal guard; quarantine fences remain active.
     Release,
 }
 
@@ -225,160 +325,99 @@ pub(crate) fn selected(args: &[OsString]) -> bool {
 }
 
 fn selected_in(args: &[OsString], env: &Environment) -> bool {
-    let words: Vec<_> = args.iter().skip(1).map(|s| s.to_string_lossy()).collect();
-    if words
-        .iter()
-        .take_while(|s| s.as_ref() != "--")
-        .any(|s| s == "--device" || s.starts_with("--device="))
-    {
+    use clap::CommandFactory;
+    fn options(command: &clap::Command, values: &mut std::collections::HashSet<String>) {
+        for arg in command.get_arguments() {
+            if arg.get_action().takes_values() {
+                if let Some(long) = arg.get_long() {
+                    values.insert(format!("--{long}"));
+                }
+                if let Some(aliases) = arg.get_all_aliases() {
+                    for alias in aliases {
+                        values.insert(format!("--{alias}"));
+                    }
+                }
+            }
+        }
+        for child in command.get_subcommands() {
+            options(child, values);
+        }
+    }
+    let mut values = std::collections::HashSet::new();
+    options(&Cli::command(), &mut values);
+    options(&crate::Cli::command(), &mut values);
+    let mut words = Vec::new();
+    let mut explicit_device = false;
+    let mut library = false;
+    let mut args = args.iter().skip(1);
+    while let Some(arg) = args.next() {
+        let word = arg.to_string_lossy();
+        if word == "--" {
+            break;
+        }
+        if word.starts_with('-') {
+            let flag = word.split('=').next().unwrap();
+            explicit_device |= flag == "--device";
+            library |= matches!(
+                flag,
+                "--config" | "--endpoint" | "--library" | "--after-settled-inventory"
+            );
+            if !word.contains('=') && values.contains(flag) {
+                args.next();
+            }
+        } else {
+            words.push(word.into_owned());
+        }
+    }
+    if explicit_device {
         return true;
     }
-    let mut i = 0;
-    while let Some(word) = words.get(i) {
-        if matches!(
-            word.as_ref(),
-            "--config" | "--allow" | "--allow-derived" | "--allow-device"
-        ) {
-            i += 2;
-            continue;
-        }
-        if word.starts_with('-') {
-            i += 1;
-            continue;
-        }
-        if word == "help" {
-            i += 1;
-            // Clap recognizes help only at a command boundary.
-            if words.get(i).is_some_and(|w| w == "help") {
-                return false;
-            }
-            continue;
-        }
-        return match word.as_ref() {
-            "doctor" | "drives" | "diagnostics" | "list" => true,
-            "pool" => words.get(i + 1).is_some_and(|w| w == "new"),
-            "tape" if words.get(i + 1).is_some_and(|w| w == "quarantine") => {
-                words
-                    .get(i + 2)
-                    .is_some_and(|w| matches!(w.as_ref(), "list" | "release"))
-                    && !env.system_config.exists()
-                    && !words.iter().any(|w| {
-                        w == "--config"
-                            || w.starts_with("--config=")
-                            || w == "--endpoint"
-                            || w.starts_with("--endpoint=")
-                    })
-                    && load(&env.xdg.join("rem/config.toml"), true)
-                        .ok()
-                        .and_then(|config| config.home)
-                        .and_then(|home| home.drive_serial)
-                        .is_some()
-                    && !words.iter().any(|w| {
-                        w == "--library"
-                            || w.starts_with("--library=")
-                            || w == "--after-settled-inventory"
-                    })
-            }
-            "tape" => words.get(i + 1).is_some_and(|w| {
-                matches!(
-                    w.as_ref(),
-                    "identify"
-                        | "verify"
-                        | "adopt"
-                        | "restore"
-                        | "assign-pool"
-                        | "rebind"
-                        | "set-generation"
-                        | "import-journals"
-                        | "release"
-                )
-            }),
-            _ => false,
-        };
+    if words.first().is_some_and(|w| w == "help") {
+        words.remove(0);
     }
-    false
+    if words
+        .first()
+        .is_some_and(|w| matches!(w.as_str(), "tape" | "pool"))
+        && words.get(1).is_some_and(|w| w == "help")
+    {
+        words.remove(1);
+    }
+    let home = !library
+        && env.system_config.try_exists().is_ok_and(|exists| !exists)
+        && load(&env.xdg.join("rem/config.toml"), true)
+            .ok()
+            .and_then(|c| c.home)
+            .and_then(|h| h.drive_serial)
+            .is_some();
+    match words.first().map(String::as_str) {
+        Some("setup" | "doctor" | "drives" | "diagnostics" | "list") => true,
+        Some("pool") => words.get(1).is_some_and(|w| w == "new"),
+        Some("put" | "get") => home,
+        Some("tape") => match words.get(1).map(String::as_str) {
+            Some(
+                "identify" | "verify" | "adopt" | "restore" | "assign-pool" | "rebind"
+                | "set-generation" | "import-journals" | "release",
+            ) => true,
+            Some("init" | "finalize" | "supersede-tail" | "quarantine") | None => home,
+            _ => false,
+        },
+        _ => false,
+    }
 }
-/// Ask Clap whether help was requested syntactically. A positional file/object
-/// named `help`, an option value, and words after `--` are ordinary operands.
-/// Shared commands display both interfaces without changing their runtime routing.
+/// Show the combined command index; command-specific help follows normal routing.
 pub(crate) fn shared_help(args: &[OsString]) -> Option<String> {
-    use clap::{error::ErrorKind, CommandFactory};
-    let libraries = crate::Cli::command();
-    let standalone = Cli::command();
-    let requested = [&libraries, &standalone].into_iter().any(|command| {
-        command
-            .clone()
-            .try_get_matches_from(args)
-            .is_err_and(|e| e.kind() == ErrorKind::DisplayHelp)
-    });
-    if !requested {
+    use clap::CommandFactory;
+    if args.len() != 2 || !matches!(args[1].to_str(), Some("--help" | "-h" | "help")) {
         return None;
     }
-    // Only inspect the command prefix. Values of global options precede it;
-    // operands and command-local options cannot select a different help target.
-    let mut words = args.iter().skip(1).map(|s| s.to_string_lossy());
-    let first = loop {
-        let word = words.next()?;
-        if matches!(
-            word.as_ref(),
-            "--config" | "--allow" | "--allow-derived" | "--allow-device" | "--device"
-        ) {
-            words.next()?;
-            continue;
+    let mut root = crate::Cli::command();
+    let standalone = Cli::command();
+    for name in ["setup", "drives", "doctor", "list"] {
+        if root.find_subcommand(name).is_none() {
+            root = root.subcommand(standalone.find_subcommand(name).unwrap().clone());
         }
-        if word == "--" {
-            return None;
-        }
-        if word.starts_with('-') {
-            continue;
-        }
-        break word;
-    };
-    let first = if first == "help" {
-        words.next()?
-    } else {
-        first
-    };
-    let path = match first.as_ref() {
-        "put" => vec!["put"],
-        "get" => vec!["get"],
-        "tape" => {
-            let child = loop {
-                let word = words.next()?;
-                if matches!(
-                    word.as_ref(),
-                    "--config" | "--allow" | "--allow-derived" | "--allow-device" | "--device"
-                ) {
-                    words.next()?;
-                    continue;
-                }
-                if word == "help" || word.starts_with('-') {
-                    continue;
-                }
-                break word;
-            };
-            match child.as_ref() {
-                "init" => vec!["tape", "init"],
-                "finalize" => vec!["tape", "finalize"],
-                _ => return None,
-            }
-        }
-        _ => return None,
-    };
-    fn render(mut root: clap::Command, path: &[&str]) -> String {
-        root.build();
-        let mut command = &mut root;
-        for name in path {
-            command = command.find_subcommand_mut(name).expect("shared command");
-        }
-        command.set_bin_name(format!("rem {}", path.join(" ")));
-        command.render_long_help().to_string()
     }
-    Some(format!(
-        "Library/daemon interface:\n{}\nStandalone device interface:\n{}",
-        render(libraries, &path),
-        render(standalone, &path)
-    ))
+    Some(root.render_long_help().to_string())
 }
 
 struct Environment {
@@ -386,6 +425,14 @@ struct Environment {
     system_config: PathBuf,
     locks: PathBuf,
     test_input: bool,
+    euid: u32,
+    doctor_checks: Option<Value>,
+}
+/// Resolve the state root consistently for process and fixture inputs.
+fn state_home(home: &Path, xdg: Option<OsString>) -> PathBuf {
+    xdg.filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/state"))
 }
 impl Environment {
     fn from_process() -> Self {
@@ -393,12 +440,17 @@ impl Environment {
             .map(PathBuf::from)
             .unwrap_or_default();
         Environment {
-            xdg: std::env::var_os("XDG_STATE_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".local/state")),
-            system_config: "/etc/rem/config.toml".into(),
+            xdg: state_home(&home, std::env::var_os("XDG_STATE_HOME")),
+            system_config: if std::env::var_os("REM_TEST_NO_LIVE_SCSI").is_some() {
+                std::env::var_os("REM_TEST_SYSTEM_CONFIG").map(PathBuf::from)
+            } else {
+                None
+            }
+            .unwrap_or_else(|| "/etc/rem/config.toml".into()),
             locks: "/run/lock/rem".into(),
             test_input: false,
+            euid: unsafe { libc::geteuid() },
+            doctor_checks: None,
         }
     }
 }
@@ -476,6 +528,8 @@ where
         system_config: system_config.into(),
         locks: locks.into(),
         test_input: !terminal_input,
+        euid: 1000,
+        doctor_checks: None,
     };
     run(
         &args.iter().map(OsString::from).collect::<Vec<_>>(),
@@ -518,6 +572,8 @@ where
         system_config: system_config.into(),
         locks: locks.into(),
         test_input: true,
+        euid: 1000,
+        doctor_checks: None,
     };
     run(
         &args.iter().map(OsString::from).collect::<Vec<_>>(),
@@ -588,6 +644,8 @@ where
             value["active_fences"] = json!(active_fences);
         }
     }
+    let doctor_not_ready =
+        matches!(cli.command, Command::Doctor) && result.as_ref().is_ok_and(|v| v["ready"] != true);
     let incomplete_finalization = matches!(
         cli.command,
         Command::Tape {
@@ -597,6 +655,9 @@ where
     let value = match &result {
         Ok(v) if incomplete_finalization => {
             json!({"ok":false,"status":"failed","error":format!("finalization outcome: {}", v["outcome"].as_str().unwrap_or("unknown")),"result":v})
+        }
+        Ok(v) if doctor_not_ready => {
+            json!({"ok":false,"error":format!("not ready: {}", v["checks"].as_array().unwrap().iter().filter(|c| c["ok"] != true).map(|c| c["name"].as_str().unwrap_or("unknown")).collect::<Vec<_>>().join(", ")),"result":v})
         }
         Ok(v) => json!({"ok":true,"result":v}),
         Err(e) if matches!(cli.command, Command::Put { .. }) => {
@@ -612,31 +673,51 @@ where
         let _ = writeln!(out, "{value}");
     } else {
         match &result {
-            Ok(v) if matches!(cli.command, Command::List { .. }) => {
+            Ok(v) if matches!(cli.command, Command::Setup { .. }) => {
                 let _ = writeln!(
                     out,
-                    "POOL  PATH  SIZE  VERSIONS  NEWEST OBJECT  TAPES  FINALIZED"
+                    "saved {} serial {} as this host's drive",
+                    cell(&v["vendor_product"]),
+                    cell(&v["drive_serial"])
                 );
+            }
+            Ok(v) if matches!(cli.command, Command::Doctor) => {
+                let _ = render_doctor(v, out);
+            }
+            Ok(_) if matches!(cli.command, Command::Drives) => {
+                let _ = render_drives(&observed, out);
+            }
+            Ok(v) if matches!(cli.command, Command::List { .. }) => {
+                let mut rows = vec![vec![
+                    "POOL",
+                    "PATH",
+                    "SIZE",
+                    "VERSIONS",
+                    "NEWEST OBJECT",
+                    "TAPES",
+                    "FINALIZED",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()];
                 for row in v["rows"].as_array().into_iter().flatten() {
-                    let labels = row["tapes"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let _ = writeln!(
-                        out,
-                        "{}  {}  {}  {}  {}  {}  {}",
-                        row["pool"].as_str().unwrap(),
-                        row["path"].as_str().unwrap(),
-                        row["size"],
-                        row["version_count"],
-                        row["newest_object_id"].as_str().unwrap(),
-                        labels,
-                        row["finalized"]
-                    );
+                    rows.push(vec![
+                        cell(&row["pool"]),
+                        cell(&row["path"]),
+                        cell(&row["size"]),
+                        cell(&row["version_count"]),
+                        cell(&row["newest_object_id"]),
+                        row["tapes"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(cell)
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        cell(&row["finalized"]),
+                    ]);
                 }
+                let _ = render_table(&rows, out);
             }
             Ok(v) if !matches!(cli.command, Command::Put { .. }) => {
                 let _ = writeln!(out, "{}", serde_json::to_string_pretty(v).unwrap());
@@ -647,7 +728,7 @@ where
             Ok(_) => {}
         }
     }
-    if result.is_ok() && !incomplete_finalization {
+    if result.is_ok() && !incomplete_finalization && !doctor_not_ready {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
@@ -667,6 +748,12 @@ fn read_only(command: &Command) -> bool {
     )
 }
 
+/// Build first-use configuration without persisting operator choices.
+fn default_home_config(root: &Path) -> String {
+    let q = |p: PathBuf| toml::Value::String(p.to_string_lossy().into_owned()).to_string();
+    format!("[daemon]\nstate_dir = {}\ndefault_idle_timeout_seconds = 1800\n[journal]\ndir = {}\n[audit]\ndir = {}\nfsync = true\n[index]\nsqlite_path = {}\n[cache]\ntape_catalog_dir = {}\n[[tape_pools]]\nid = \"default\"\nscheme = \"custom:128,4,1\"\n",q(root.to_path_buf()),q(root.join("journals")),q(root.join("audit")),q(root.join("index/rem-state.sqlite")),q(root.join("cache/tapes")))
+}
+
 fn config_path(cli: &Cli, env: &Environment) -> Result<PathBuf, String> {
     if let Some(p) = &cli.config {
         return fs::canonicalize(p).map_err(|e| format!("config {}: {e}", p.display()));
@@ -681,8 +768,7 @@ fn config_path(cli: &Cli, env: &Environment) -> Result<PathBuf, String> {
     fs::create_dir_all(&root).map_err(err)?;
     let path = root.join("config.toml");
     if !path.try_exists().map_err(err)? {
-        let q = |p: PathBuf| toml::Value::String(p.to_string_lossy().into_owned()).to_string();
-        let text=format!("[daemon]\nstate_dir = {}\ndefault_idle_timeout_seconds = 1800\n[journal]\ndir = {}\n[audit]\ndir = {}\nfsync = true\n[index]\nsqlite_path = {}\n[cache]\ntape_catalog_dir = {}\n[[tape_pools]]\nid = \"default\"\nscheme = \"custom:128,4,1\"\n",q(root.clone()),q(root.join("journals")),q(root.join("audit")),q(root.join("index/rem-state.sqlite")),q(root.join("cache/tapes")));
+        let text = default_home_config(&root);
         let mut f = tempfile::NamedTempFile::new_in(&root).map_err(err)?;
         f.write_all(text.as_bytes()).map_err(err)?;
         f.as_file().sync_all().map_err(err)?;
@@ -725,19 +811,38 @@ fn local_quarantine_config_in(
 }
 
 fn load(path: &Path, override_trust: bool) -> Result<remanence_state::RemConfig, String> {
+    load_for_use(path, override_trust, false)
+}
+
+/// Validate through the existing loader while preserving policy for configuration edits.
+fn load_for_use(
+    path: &Path,
+    override_trust: bool,
+    preserve_policy: bool,
+) -> Result<remanence_state::RemConfig, String> {
     let mut doc: toml::Value =
         toml::from_str(&fs::read_to_string(path).map_err(err)?).map_err(err)?;
+    let require_trusted_volume = doc
+        .get("journal")
+        .and_then(|j| j.get("require_trusted_volume"))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(true);
     if override_trust {
         doc.get_mut("journal")
             .and_then(toml::Value::as_table_mut)
             .ok_or("missing journal config")?
             .insert("require_trusted_volume".into(), toml::Value::Boolean(false));
     }
-    remanence_state::parse_config_toml(&toml::to_string(&doc).map_err(err)?).map_err(|e| {
-        format!(
+    let mut config = remanence_state::parse_config_toml(&toml::to_string(&doc).map_err(err)?)
+        .map_err(|e| {
+            format!(
             "{e}; use --allow-untrusted-state-volume only to explicitly override the volume check"
         )
-    })
+        })?;
+    if preserve_policy {
+        config.journal.require_trusted_volume = require_trusted_volume;
+    }
+    Ok(config)
 }
 fn assign(state: &mut StateHandle, uuid: [u8; 16], pool: Option<&str>) -> Result<(), String> {
     if let Some(p) = pool {
@@ -755,6 +860,11 @@ fn assign(state: &mut StateHandle, uuid: [u8; 16], pool: Option<&str>) -> Result
         .map_err(err)?;
     Ok(())
 }
+/// Root must explicitly select configuration before any home-state side effects.
+fn refuse_root(explicit_config: bool, system_config: bool, root: bool) -> bool {
+    root && !explicit_config && !system_config
+}
+
 fn dispatch<F, E>(
     cli: &Cli,
     env: &Environment,
@@ -768,21 +878,28 @@ where
     F: FnMut(&Path) -> Result<Box<dyn SgTransport>, IoErrorKind>,
     E: FnOnce() -> Result<remanence_library::sysfs::DeviceEnumeration, IoErrorKind>,
 {
-    if cli.device.is_none()
-        && matches!(
-            cli.command,
-            Command::Tape { .. } | Command::Put { .. } | Command::Get { .. }
-        )
-        && !matches!(
-            cli.command,
-            Command::Tape {
-                command: Tape::AssignPool { tape: Some(_), .. } | Tape::Quarantine { .. }
-            }
-        )
-    {
-        return Err("this command requires --device PATH and --allow-device <serial|PATH>".into());
+    if refuse_root(
+        cli.config.is_some(),
+        env.system_config.exists(),
+        env.euid == 0,
+    ) {
+        return Err(
+            "rem is not meant to run as root; fix permissions with `rem doctor` (or pass --config)"
+                .into(),
+        );
     }
-    if cli.device.is_some() && cli.allow_device.is_empty() {
+    if matches!(cli.command, Command::Setup { .. })
+        && (cli.config.is_some() || env.system_config.exists())
+    {
+        return Err(
+            "setup saves a home default; library hosts select drives through their daemon config"
+                .into(),
+        );
+    }
+    if cli.device.is_some()
+        && cli.allow_device.is_empty()
+        && !matches!(cli.command, Command::Setup { .. })
+    {
         return Err("--device requires explicit --allow-device <serial|PATH>".into());
     }
     if cli.allow_unserialized_device && (!read_only(&cli.command) || cli.reserve) {
@@ -831,15 +948,49 @@ where
         }
         return Ok(json!({"rows": rows}));
     }
-    let path = config_path(cli, env)?;
-    let config = load(
-        &path,
-        cli.allow_untrusted_state_volume
-            || matches!(
-                cli.command,
-                Command::Doctor | Command::Drives | Command::Diagnostics { .. }
-            ),
-    )?;
+    let setup = matches!(cli.command, Command::Setup { .. });
+    let discovery_only = matches!(
+        cli.command,
+        Command::Setup { .. } | Command::Doctor | Command::Drives | Command::Diagnostics { .. }
+    );
+    let needs_device = !discovery_only
+        && !matches!(
+            cli.command,
+            Command::Pool { .. }
+                | Command::Tape {
+                    command: Tape::Quarantine { .. } | Tape::AssignPool { tape: Some(_), .. }
+                }
+        );
+    if needs_device && cli.device.is_none() {
+        let home = env.xdg.join("rem/config.toml");
+        let saved = cli.config.is_none()
+            && !env.system_config.exists()
+            && home.exists()
+            && load(&home, true)?
+                .home
+                .and_then(|h| h.drive_serial)
+                .is_some();
+        if !saved {
+            return Err("this command requires --device PATH and --allow-device <serial|PATH>; run rem setup to save a default".into());
+        }
+    }
+    let path = if discovery_only && cli.config.is_none() && !env.system_config.exists() {
+        if !env.xdg.is_absolute() {
+            return Err("home state path must be absolute".into());
+        }
+        env.xdg.join("rem/config.toml")
+    } else {
+        config_path(cli, env)?
+    };
+    let config = if discovery_only && !path.exists() {
+        toml::from_str(&default_home_config(path.parent().unwrap())).map_err(err)?
+    } else {
+        load_for_use(
+            &path,
+            cli.allow_untrusted_state_volume || discovery_only,
+            setup,
+        )?
+    };
     if let Command::Pool {
         command: Pool::New {
             name,
@@ -907,7 +1058,7 @@ where
     let catalog_path = StatePaths::from_config(&path, &config).sqlite_path;
     let discovery_only = matches!(
         cli.command,
-        Command::Doctor | Command::Drives | Command::Diagnostics { .. }
+        Command::Setup { .. } | Command::Doctor | Command::Drives | Command::Diagnostics { .. }
     );
     let mut catalog_error = None;
     if discovery_only && catalog_path.exists() {
@@ -1011,15 +1162,12 @@ where
         )?;
         return Ok(json!({"tape":uuid,"pool":pool}));
     }
+    let mut health = matches!(cli.command, Command::Setup { .. } | Command::Doctor)
+        .then(|| doctor(env, &config));
     let enumeration = enumeration().map_err(err)?;
     let mut report = match remanence_library::discover_enumerated_with(enumeration, &mut *factory) {
         Ok(r) => r,
-        Err(remanence_library::DiscoveryError::NoLibraries { warnings })
-            if matches!(
-                cli.command,
-                Command::Doctor | Command::Drives | Command::Diagnostics { .. }
-            ) =>
-        {
+        Err(remanence_library::DiscoveryError::NoLibraries { warnings }) => {
             let incomplete_evidence: Vec<_> = warnings
                 .iter()
                 .filter(|warning| warning.is_incomplete_evidence())
@@ -1045,23 +1193,175 @@ where
         }
     }
     *observed = remanence_api::observed_endpoint_json(&report);
-    for warning in &report.warnings {
-        if let Some(message) = remanence_library::drive_mapping_message(warning)
-            .or_else(|| warning.informational_message())
+    for endpoint in observed.iter_mut() {
+        if let Some(drive) = report
+            .unattached_drives
+            .iter()
+            .find(|d| endpoint["path"].as_str() == d.sg_path.to_str())
         {
-            let _ = writeln!(errors, "{message}");
+            endpoint["vendor_product"] = json!(format!(
+                "{} {}",
+                String::from_utf8_lossy(&drive.inquiry.vendor).trim(),
+                String::from_utf8_lossy(&drive.inquiry.product).trim()
+            ));
         }
     }
+    for library in &report.libraries {
+        for endpoint in observed.iter_mut() {
+            if endpoint["path"].as_str() == library.changer_sg.to_str() {
+                endpoint["ownership"] = json!("library");
+                endpoint["vendor_product"] = json!(format!(
+                    "{} {}",
+                    String::from_utf8_lossy(&library.changer_inquiry.vendor).trim(),
+                    String::from_utf8_lossy(&library.changer_inquiry.product).trim()
+                ));
+            }
+            for drive in library
+                .drive_bays
+                .iter()
+                .filter_map(|b| b.installed.as_ref())
+            {
+                if drive
+                    .sg_path
+                    .as_ref()
+                    .and_then(|p| p.to_str())
+                    .is_some_and(|p| endpoint["path"].as_str() == Some(p))
+                {
+                    endpoint["vendor_product"] = json!(format!(
+                        "{} {}",
+                        drive.vendor.as_deref().unwrap_or("-"),
+                        drive.product.as_deref().unwrap_or("-")
+                    ));
+                }
+            }
+        }
+    }
+    for warning in &report.warnings {
+        if matches!(
+            warning,
+            remanence_library::DiscoveryWarning::UnclaimedTape { .. }
+        ) && !matches!(cli.command, Command::Drives | Command::Doctor)
+        {
+            continue;
+        }
+        let _ = writeln!(errors, "{}", discovery_message(warning));
+    }
+    if let Some(health) = &mut health {
+        finish_doctor_discovery(health, &report);
+    }
     match &cli.command {
+        Command::Setup { yes } => {
+            let checks = health.take().expect("setup checks");
+            let setup_out: &mut dyn Write = if cli.json { errors } else { output.out };
+            if !yes {
+                render_doctor(&checks, setup_out)?;
+            }
+            let candidates: Vec<_> = report
+                .unattached_drives
+                .iter()
+                .filter(|d| cli.device.as_ref().is_none_or(|p| *p == d.sg_path))
+                .collect();
+            if candidates.is_empty() {
+                return Err("no standalone tape drive found; check cabling and permissions, then run rem drives".into());
+            }
+            if candidates.len() != 1 {
+                render_drives(observed, setup_out)?;
+                return Err("several standalone drives found; disconnect drives until exactly one remains or pass rem setup --device PATH".into());
+            }
+            let drive = candidates[0];
+            let vendor_product = format!(
+                "{} {}",
+                String::from_utf8_lossy(&drive.inquiry.vendor).trim(),
+                String::from_utf8_lossy(&drive.inquiry.product).trim()
+            );
+            let serial = drive
+                .serial
+                .clone()
+                .filter(|s| !s.is_empty())
+                .ok_or("cannot save a drive without a VPD serial")?;
+            if !confirm_setup(
+                &format!(
+                    "save {vendor_product} serial {serial} at {}? [y/N]",
+                    drive.sg_path.display()
+                ),
+                *yes,
+                env,
+                setup_out,
+            )? {
+                return Err("setup cancelled; no drive saved".into());
+            }
+            let pin = !report.complete;
+            if pin && !confirm_setup("Discovery is incomplete; a standalone pin asserts this serial belongs to no library on this host. Save this ownership assertion? [y/N]", *yes, env, setup_out)? {
+                return Err("setup cancelled; no drive saved".into());
+            }
+            let generated = default_home_config(path.parent().ok_or("config has no parent")?);
+            let original = if path.exists() {
+                fs::read_to_string(&path).map_err(err)?
+            } else {
+                generated.clone()
+            };
+            // Edit one key while preserving unrelated settings, comments and formatting.
+            let instruction = format!(
+                "set drive_serial = {} under [home] in {}",
+                toml::Value::String(serial.clone()),
+                path.display()
+            );
+            let mut document = original
+                .parse::<toml_edit::DocumentMut>()
+                .map_err(|e| format!("cannot edit config: {e}; {instruction}"))?;
+            if !document.contains_key("home") {
+                document["home"] = toml_edit::Item::Table(toml_edit::Table::new());
+            }
+            let home = document["home"]
+                .as_table_like_mut()
+                .ok_or_else(|| format!("home is not a table; {instruction}"))?;
+            let mut value = toml_edit::Value::from(serial.clone());
+            if let Some(old) = home.get("drive_serial").and_then(toml_edit::Item::as_value) {
+                *value.decor_mut() = old.decor().clone();
+            }
+            home.insert("drive_serial", toml_edit::Item::Value(value));
+            let mut saved = document.to_string();
+            if pin && !config.standalone_drives.iter().any(|d| d.serial == serial) {
+                saved.push_str(&format!(
+                    "\n[[standalone_drives]]\nserial = {}\n",
+                    toml::Value::String(serial.clone())
+                ));
+            }
+            // Validate using the ordinary loader's trust override without changing the saved policy.
+            let mut validation: toml::Value = toml::from_str(&saved).map_err(err)?;
+            validation
+                .get_mut("journal")
+                .and_then(toml::Value::as_table_mut)
+                .ok_or("missing journal config")?
+                .insert("require_trusted_volume".into(), toml::Value::Boolean(false));
+            remanence_state::parse_config_toml(&toml::to_string(&validation).map_err(err)?)
+                .map_err(err)?;
+            let parent = path.parent().ok_or("config has no parent")?;
+            fs::create_dir_all(parent).map_err(err)?;
+            let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(err)?;
+            temp.write_all(saved.as_bytes()).map_err(err)?;
+            temp.as_file().sync_all().map_err(err)?;
+            temp.persist(&path).map_err(err)?;
+            fs::File::open(parent)
+                .and_then(|f| f.sync_all())
+                .map_err(err)?;
+            return Ok(
+                json!({"drive_serial":serial,"vendor_product":vendor_product,"config":path,"ready":checks["ready"]}),
+            );
+        }
         Command::Doctor => {
-            let mut result = doctor(env, &config, &report);
+            let mut result = health.take().expect("doctor checks");
+            if let Some(error) = &catalog_error {
+                result["ready"] = json!(false);
+                result["checks"].as_array_mut().unwrap().push(json!({"name":"catalog", "ok":false,"detail":error,"fix":"repair or restore the catalog before using this drive"}));
+            }
             result["catalog_fence_check"] =
                 json!({"ok": catalog_error.is_none(), "error": catalog_error});
             return Ok(result);
         }
         Command::Drives => {
             return Ok(
-                json!({"endpoints":observed,"complete":report.complete,"warnings":report.warnings.iter().map(|w| w.informational_message().unwrap_or_else(|| format!("{w:?}"))).collect::<Vec<_>>()}),
+                json!({"endpoints":observed,"complete":report.complete,"warnings":report.warnings.iter().map(discovery_message).collect::<Vec<_>>()}),
             )
         }
         Command::Diagnostics {
@@ -1070,15 +1370,39 @@ where
         _ => {}
     }
     let mut state = state.expect("device state");
-    let device = cli
-        .device
+    let saved_serial = config
+        .home
         .as_ref()
-        .ok_or("this command requires --device PATH and --allow-device <serial|PATH>")?;
+        .and_then(|home| home.drive_serial.as_ref());
+    let default_device = if cli.device.is_none() {
+        let serial = saved_serial.ok_or("this command requires --device PATH and --allow-device <serial|PATH>; run rem setup to save a default")?;
+        let matches: Vec<_> = report
+            .unattached_drives
+            .iter()
+            .filter(|d| d.serial.as_ref() == Some(serial))
+            .collect();
+        if matches.len() != 1 {
+            return Err(format!("saved drive {serial} must match exactly one standalone endpoint; tape endpoints found: {}", endpoint_paths(observed)));
+        }
+        Some(matches[0].sg_path.clone())
+    } else {
+        None
+    };
+    let device = cli.device.as_ref().or(default_device.as_ref()).unwrap();
     let drive = report
         .unattached_drives
         .iter()
         .find(|d| d.sg_path == *device)
-        .ok_or("device is not an unattached drive; library operations go through the daemon")?;
+        .ok_or_else(|| {
+            for library in &report.libraries {
+                for bay in &library.drive_bays {
+                    if bay.installed.as_ref().and_then(|d| d.sg_path.as_ref()) == Some(device) {
+                        return format!("device is not an unattached drive; library operations go through the daemon; library {} bay 0x{:04x}", library.serial, bay.element_address);
+                    }
+                }
+            }
+            format!("no SCSI device at {}; tape endpoints found: {}", device.display(), endpoint_paths(observed))
+        })?;
     let pinned = config
         .standalone_drives
         .iter()
@@ -1103,7 +1427,12 @@ where
     {
         return Err("unresolved changer bays prohibit device writes".into());
     }
-    let authorization = StaticAllowlist::new(cli.allow_device.clone());
+    let authorization =
+        StaticAllowlist::new(if cli.device.is_none() && cli.allow_device.is_empty() {
+            vec![saved_serial.unwrap().clone()]
+        } else {
+            cli.allow_device.clone()
+        });
     if !authorization.allows_device(device, drive.serial.as_deref()) {
         return Err("--allow-device does not authorize this discovered drive".into());
     }
@@ -1182,7 +1511,7 @@ where
     let expected = match &cli.command {
         Command::Tape {
             command: Tape::Finalize { tape, .. },
-        } => Some(*tape.as_bytes()),
+        } => tape.map(|t| *t.as_bytes()),
         _ => None,
     };
     let mut mounted = backend
@@ -1627,15 +1956,31 @@ where
                     idempotency_key,
                     expected_pool,
                 } => {
+                    let row = backend
+                        .catalog_index()
+                        .get_tape(&uuid)
+                        .map_err(err)?
+                        .ok_or("loaded tape is not catalogued")?;
+                    if Uuid::parse_str(acknowledge_tape)
+                        .ok()
+                        .map(|u| *u.as_bytes())
+                        != Some(uuid)
+                        && row.voltag.as_deref() != Some(acknowledge_tape.as_str())
+                    {
+                        return Err("--acknowledge-tape does not match the loaded tape".into());
+                    }
                     let result = backend
                         .finalize(
                             &mut mounted,
                             remanence_api::StandaloneFinalizeRequest {
-                                tape_uuid: *tape.as_bytes(),
-                                acknowledge_tape: *acknowledge_tape.as_bytes(),
-                                reason: reason.clone(),
-                                idempotency_key: *idempotency_key,
-                                expected_pool_id: expected_pool.clone(),
+                                tape_uuid: *tape.unwrap_or(Uuid::from_bytes(uuid)).as_bytes(),
+                                acknowledge_tape: uuid,
+                                reason: reason
+                                    .clone()
+                                    .unwrap_or_else(|| DEFAULT_FINALIZE_REASON.into()),
+                                idempotency_key: idempotency_key
+                                    .unwrap_or_else(|| default_finalize_key(uuid)),
+                                expected_pool_id: expected_pool.clone().or(row.pool_id),
                             },
                         )
                         .map_err(err)?;
@@ -1731,9 +2076,9 @@ impl PutOutput<'_> {
                 "Total: {written} written, {already_stored} already_stored, {skipped} skipped, {refused} refused{}",
                 failed
                     .map(|(p, e)| format!(
-                        "; failed {}: {e}; {}",
-                        p.display(),
-                        next.as_deref().unwrap_or("")
+                        "; failed{}: {e}{}",
+                        if p.as_os_str().is_empty() { String::new() } else { format!(" {}", p.display()) },
+                        next.as_ref().map(|n| format!("; {n}")).unwrap_or_default()
                     ))
                     .unwrap_or_default()
             )
@@ -1827,7 +2172,7 @@ fn prepare_init(
         |_| Ok(()),
     )?;
     if ready.readiness != remanence_library::MediaReadiness::Ready {
-        return Err(format!("media not ready: {:?}", ready.readiness));
+        return Err(format!("{}", ready.readiness));
     }
     drive.prevent_medium_removal().map_err(err)?;
     let proof = drive.identity_generation();
@@ -2156,11 +2501,10 @@ fn summarize_terminal(
     }
 }
 /// Report effective group membership and the executable's file capability, not a different binary.
-fn doctor(
-    env: &Environment,
-    config: &remanence_state::RemConfig,
-    report: &DiscoveryReport,
-) -> Value {
+fn doctor(env: &Environment, config: &remanence_state::RemConfig) -> Value {
+    if let Some(checks) = &env.doctor_checks {
+        return checks.clone();
+    }
     let groups = std::process::Command::new("id").arg("-Gn").output();
     let tape_group = groups
         .as_ref()
@@ -2185,7 +2529,297 @@ fn doctor(
         .and_then(|_| tempfile::NamedTempFile::new_in(&env.locks))
         .map(|_| true)
         .map_err(err);
-    json!({"tape_group":tape_group,"cap_sys_rawio_on_this_binary":cap_sys_rawio,"binary":binary,"state_dir":config.daemon.state_dir,"lock_dir":"/run/lock/rem","lock_dir_writable":lock_writable.is_ok(),"lock_error":lock_writable.err(),"drives":remanence_api::observed_endpoint_json(report),"fixes":{"tape_group":"add this user to the tape group and log in again","capability":"setcap cap_sys_rawio+ep on the rem executable shown above","lock_dir":"create /run/lock/rem with permissions for the tape group"}})
+    let state_writable = fs::create_dir_all(&config.daemon.state_dir)
+        .and_then(|_| tempfile::NamedTempFile::new_in(&config.daemon.state_dir))
+        .map(|_| ())
+        .map_err(err);
+    let mut trusted = config.clone();
+    trusted.journal.require_trusted_volume = true;
+    let trust = remanence_state::validate_trusted_volume_paths(&trusted).map_err(err);
+    let check = |name: &str, ok: bool, detail: String, fix: &str| {
+        let mut value = json!({"name":name,"ok":ok,"detail":detail});
+        if !ok {
+            value["fix"] = json!(fix);
+        }
+        value
+    };
+    let checks = vec![
+        check(
+            "tape group",
+            tape_group,
+            "effective group membership".into(),
+            "add this user to the tape group and log in again",
+        ),
+        check(
+            "capability",
+            cap_sys_rawio,
+            binary
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "cannot locate this executable".into()),
+            "setcap cap_sys_rawio+ep on the executable shown here",
+        ),
+        check(
+            "lock directory",
+            lock_writable.is_ok(),
+            format!(
+                "{}{}",
+                env.locks.display(),
+                lock_writable
+                    .as_ref()
+                    .err()
+                    .map(|e| format!(": {e}"))
+                    .unwrap_or_default()
+            ),
+            "create /run/lock/rem with permissions for the tape group",
+        ),
+        check(
+            "state directory",
+            state_writable.is_ok(),
+            format!(
+                "{}{}",
+                config.daemon.state_dir.display(),
+                state_writable
+                    .as_ref()
+                    .err()
+                    .map(|e| format!(": {e}"))
+                    .unwrap_or_default()
+            ),
+            "make the state directory writable by this user",
+        ),
+        check(
+            "trusted volume",
+            trust.is_ok(),
+            trust
+                .err()
+                .unwrap_or_else(|| "state paths support trusted durability".into()),
+            "move state to a trusted local filesystem",
+        ),
+    ];
+    let fixes: serde_json::Map<String, Value> = checks
+        .iter()
+        .filter_map(|check| {
+            check.get("fix").map(|fix| {
+                let name = match check["name"].as_str().unwrap() {
+                    "tape group" => "tape_group",
+                    "lock directory" => "lock_dir",
+                    "state directory" => "state_dir",
+                    "trusted volume" => "trusted_volume",
+                    other => other,
+                };
+                (name.to_owned(), fix.clone())
+            })
+        })
+        .collect();
+    json!({"ready":checks.iter().all(|c| c["ok"] == true),"checks":checks,"fixes":fixes,"tape_group":tape_group,"cap_sys_rawio_on_this_binary":cap_sys_rawio,"binary":binary,"state_dir":config.daemon.state_dir,"lock_dir":env.locks,"lock_dir_writable":lock_writable.is_ok(),"lock_error":lock_writable.err(),"drives":[]})
+}
+/// Add discovery readiness after host permission and state checks have run.
+fn finish_doctor_discovery(health: &mut Value, report: &DiscoveryReport) {
+    let standalone = report
+        .unattached_drives
+        .iter()
+        .filter(|d| d.ownership == remanence_library::DriveOwnership::Standalone)
+        .count();
+    let unknown = report.unattached_drives.len() - standalone;
+    let present = standalone > 0;
+    let mut check = json!({"name":"standalone drive", "ok":present, "detail":format!("{standalone} standalone drives found; {unknown} drives with unknown ownership")});
+    if !present {
+        check["fix"] = json!("connect a tape drive, check permissions with rem drives, and resolve unknown ownership with rem setup");
+    }
+    if let Some(fix) = check.get("fix") {
+        health["fixes"]["standalone_drive"] = fix.clone();
+    }
+    health["checks"].as_array_mut().unwrap().push(check);
+    health["ready"] = json!(health["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|c| c["ok"] == true));
+    health["drives"] = json!(remanence_api::observed_endpoint_json(report));
+}
+
+/// Share readable discovery warnings between JSON and human output.
+fn discovery_message(warning: &remanence_library::DiscoveryWarning) -> String {
+    use remanence_library::DiscoveryWarning;
+    match warning {
+        DiscoveryWarning::UnclaimedTape { sg_path, serial } => format!(
+            "tape drive {} (serial {serial}) is not claimed by a library",
+            sg_path.display()
+        ),
+        DiscoveryWarning::DeviceUnreachable { path, source } => {
+            format!("cannot inspect {}: {source}", path.display())
+        }
+        DiscoveryWarning::ScsiError {
+            path,
+            command,
+            summary,
+        } => format!("{}: {command} failed: {summary}", path.display()),
+        DiscoveryWarning::DriveSerialAmbiguous {
+            sg_path,
+            serial,
+            claimants,
+        } => format!(
+            "drive {} serial {serial} is claimed by multiple bays: {}",
+            sg_path.display(),
+            claimants.join(", ")
+        ),
+        DiscoveryWarning::UnresolvedDrive {
+            library,
+            serial,
+            element_address,
+        } => format!(
+            "library {library} bay 0x{element_address:04x}: drive serial {serial} is unreachable"
+        ),
+        DiscoveryWarning::LayoutMismatch { library } => {
+            format!("library {library}: reported layouts disagree; using element status")
+        }
+        DiscoveryWarning::MalformedVoltag {
+            library,
+            element_address,
+        } => {
+            format!("library {library} element 0x{element_address:04x}: unreadable cartridge label")
+        }
+        DiscoveryWarning::DriveMappingDerived { library, method } => format!(
+            "library {library}: drive mapping derived by {method}; operations need explicit opt-in"
+        ),
+        DiscoveryWarning::DriveMappingUnavailable { .. } => {
+            remanence_library::drive_mapping_message(warning).unwrap_or_default()
+        }
+        DiscoveryWarning::NotTapeOrChanger { .. } => {
+            warning.informational_message().unwrap_or_default()
+        }
+    }
+}
+
+/// Render aligned diagnostics without hiding actionable failures in JSON.
+fn render_doctor(value: &Value, out: &mut dyn Write) -> Result<(), String> {
+    let rows: Vec<Vec<String>> = value["checks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|check| {
+            vec![
+                if check["ok"] == true {
+                    "✓".into()
+                } else {
+                    "✗".into()
+                },
+                cell(&check["name"]),
+                format!(
+                    "{}{}",
+                    cell(&check["detail"]),
+                    check["fix"]
+                        .as_str()
+                        .map(|fix| format!("; fix: {fix}"))
+                        .unwrap_or_default()
+                ),
+            ]
+        })
+        .collect();
+    render_table(&rows, out)?;
+    writeln!(
+        out,
+        "{}",
+        if value["ready"] == true {
+            "ready to use the drive"
+        } else {
+            "fix the items above"
+        }
+    )
+    .map_err(err)
+}
+/// Summarize discovery without leaking a JSON object into human errors.
+fn endpoint_paths(endpoints: &[Value]) -> String {
+    if endpoints.is_empty() {
+        "none".into()
+    } else {
+        endpoints
+            .iter()
+            .map(|v| v["path"].as_str().unwrap_or("unresolved"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+/// Render the discovered endpoint inventory as a table.
+fn render_drives(endpoints: &[Value], out: &mut dyn Write) -> Result<(), String> {
+    let mut rows = vec![
+        vec!["PATH", "KIND", "OWNERSHIP", "VENDOR PRODUCT", "SERIAL"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+    ];
+    let mut endpoints: Vec<_> = endpoints.iter().collect();
+    endpoints.sort_by_key(|e| {
+        let p = cell(&e["path"]);
+        let n = p
+            .strip_prefix("/dev/sg")
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(u64::MAX);
+        (n, p)
+    });
+    for endpoint in endpoints {
+        rows.push(vec![
+            cell(&endpoint["path"]),
+            cell(&endpoint["kind"]),
+            cell(&endpoint["ownership"]),
+            cell(&endpoint["vendor_product"]),
+            cell(endpoint.get("drive_serial").unwrap_or(&endpoint["serial"])),
+        ]);
+    }
+    render_table(&rows, out)
+}
+/// Format a scalar cell, including absent discovery facts.
+fn cell(value: &Value) -> String {
+    if value.is_null() {
+        "-".into()
+    } else {
+        value
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| value.to_string())
+    }
+}
+/// Align human tables by the widest cell in each column.
+fn render_table(rows: &[Vec<String>], out: &mut dyn Write) -> Result<(), String> {
+    let count = rows.first().map(Vec::len).unwrap_or(0);
+    let widths: Vec<_> = (0..count)
+        .map(|i| {
+            rows.iter()
+                .map(|row| row[i].chars().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    for row in rows {
+        for (i, value) in row.iter().enumerate() {
+            write!(out, "{value}").map_err(err)?;
+            if i + 1 < count {
+                write!(out, "{}", " ".repeat(widths[i] - value.chars().count() + 2))
+                    .map_err(err)?;
+            }
+        }
+        writeln!(out).map_err(err)?;
+    }
+    Ok(())
+}
+/// Obtain a separate affirmative decision for drive selection and ownership.
+fn confirm_setup(
+    prompt: &str,
+    yes: bool,
+    env: &Environment,
+    out: &mut dyn Write,
+) -> Result<bool, String> {
+    if yes {
+        return Ok(true);
+    }
+    writeln!(out, "{prompt}").map_err(err)?;
+    out.flush().map_err(err)?;
+    if env.test_input {
+        return Ok(false);
+    }
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer).map_err(err)?;
+    Ok(matches!(answer.trim(), "y" | "Y"))
 }
 /// Fixed command allowlist: no READ, SPACE, LOCATE, or data-out commands occur here.
 fn diagnostics<F>(
@@ -2350,6 +2984,343 @@ fn read_catalog_display<T>(
 
 #[cfg(test)]
 mod tests {
+    /// Derived mappings remain actionable warnings instead of panicking.
+    #[test]
+    fn derived_mapping_warning_is_readable() {
+        let warning = remanence_library::DiscoveryWarning::DriveMappingDerived {
+            library: "LIB".into(),
+            method: "topology",
+        };
+        assert_eq!(
+            super::discovery_message(&warning),
+            "library LIB: drive mapping derived by topology; operations need explicit opt-in"
+        );
+    }
+
+    /// Every user-facing option must explain itself in generated help.
+    #[test]
+    fn every_standalone_flag_has_help() {
+        use clap::CommandFactory;
+        fn check(command: &clap::Command) {
+            for arg in command.get_arguments() {
+                assert!(
+                    arg.get_help()
+                        .is_some_and(|help| !help.to_string().trim().is_empty()),
+                    "{}: {} has no help",
+                    command.get_name(),
+                    arg.get_id()
+                );
+            }
+            for child in command.get_subcommands() {
+                check(child);
+            }
+        }
+        check(&super::Cli::command());
+    }
+
+    /// Selection follows syntax, not strings embedded in option values or operands.
+    #[test]
+    fn routing_matrix_and_option_operands() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let env = Environment {
+            xdg: root.path().into(),
+            system_config: root.path().join("etc.toml"),
+            locks: root.path().join("locks"),
+            test_input: true,
+            euid: 1000,
+            doctor_checks: None,
+        };
+        let path = config_path(&Cli::try_parse_from(["rem", "doctor"]).unwrap(), &env).unwrap();
+        let original = fs::read_to_string(&path).unwrap();
+        for saved in [false, true] {
+            fs::write(
+                &path,
+                if saved {
+                    format!("{original}\n[home]\ndrive_serial = \"DRIVE\"\n")
+                } else {
+                    original.clone()
+                },
+            )
+            .unwrap();
+            for system in [false, true] {
+                if system {
+                    fs::write(&env.system_config, "").unwrap();
+                } else if env.system_config.exists() {
+                    fs::remove_file(&env.system_config).unwrap();
+                }
+                for (words, expected) in [
+                    (vec!["tape", "retire", "LABEL"], false),
+                    (vec!["tape", "quarantine", "list"], saved && !system),
+                    (
+                        vec!["tape", "supersede-tail", "--acknowledge-tape", "LABEL"],
+                        saved && !system,
+                    ),
+                    (vec!["put", "file"], saved && !system),
+                    (vec!["get", "object", "--out", "out"], saved && !system),
+                    (vec!["tape", "init", "BARCODE"], saved && !system),
+                    (vec!["tape", "init", "--label", "LABEL"], saved && !system),
+                    (
+                        vec!["tape", "--config", "daemon.toml", "init", "BARCODE"],
+                        false,
+                    ),
+                    (
+                        vec!["tape", "init", "--config=daemon.toml", "BARCODE"],
+                        false,
+                    ),
+                    (vec!["put", "file", "--endpoint", "unix:/daemon"], false),
+                    (vec!["put", "--config", "--device", "file"], false),
+                    (vec!["put", "--", "--device"], saved && !system),
+                    (
+                        vec!["put", "--config", "daemon.toml", "--", "--device"],
+                        false,
+                    ),
+                    (vec!["put", "--device", "/dev/test"], true),
+                    (vec!["doctor"], true),
+                    (vec!["drives"], true),
+                    (vec!["setup"], true),
+                    (vec!["list"], true),
+                    (vec!["pool", "new", "backup"], true),
+                    (vec!["tape", "identify"], true),
+                    (vec!["help", "tape", "init"], saved && !system),
+                    (vec!["tape", "help", "init"], saved && !system),
+                    (vec!["tape", "--help"], saved && !system),
+                    (
+                        vec!["tape", "--config=daemon.toml", "init", "--help"],
+                        false,
+                    ),
+                ] {
+                    let args: Vec<OsString> = std::iter::once("rem")
+                        .chain(words.iter().copied())
+                        .map(OsString::from)
+                        .collect();
+                    assert_eq!(
+                        selected_in(&args, &env),
+                        expected,
+                        "{args:?}, saved={saved}, system={system}"
+                    );
+                    if expected
+                        && saved
+                        && !system
+                        && (words == ["put", "file"] || words == ["get", "object", "--out", "out"])
+                    {
+                        let test_env = Environment {
+                            xdg: env.xdg.clone(),
+                            system_config: env.system_config.clone(),
+                            locks: env.locks.clone(),
+                            test_input: true,
+                            euid: 1000,
+                            doctor_checks: None,
+                        };
+                        let mut out = Vec::new();
+                        let mut errors = Vec::new();
+                        let mut argv = args.clone();
+                        argv.push("--allow-untrusted-state-volume".into());
+                        assert_ne!(
+                            run(
+                                &argv,
+                                test_env,
+                                || Ok(remanence_library::sysfs::DeviceEnumeration {
+                                    devices: vec![],
+                                    warnings: vec![]
+                                }),
+                                &mut |_| panic!("fixture is empty"),
+                                &mut out,
+                                &mut errors
+                            ),
+                            ExitCode::SUCCESS
+                        );
+                        assert!(String::from_utf8_lossy(&errors).contains("saved drive DRIVE"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Missing defaults, root, and non-home setup refuse before any filesystem or hardware work.
+    #[test]
+    fn early_refusals_have_no_side_effects() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        for (words, euid, expected) in [
+            (vec!["rem", "tape", "identify"], 1000, "requires --device"),
+            (vec!["rem", "put", "file"], 1000, "requires --device"),
+            (vec!["rem", "doctor"], 0, "not meant to run as root"),
+            (
+                vec!["rem", "setup", "--config", "missing"],
+                1000,
+                "setup saves a home default",
+            ),
+        ] {
+            let env = Environment {
+                xdg: root.path().join("state"),
+                system_config: root.path().join("etc"),
+                locks: root.path().join("locks"),
+                test_input: true,
+                euid,
+                doctor_checks: None,
+            };
+            let mut out = Vec::new();
+            let mut errors = Vec::new();
+            let code = run(
+                &words.iter().map(OsString::from).collect::<Vec<_>>(),
+                env,
+                || panic!("must not enumerate"),
+                &mut |_| panic!("must not open hardware"),
+                &mut out,
+                &mut errors,
+            );
+            assert_ne!(code, ExitCode::SUCCESS);
+            assert!(String::from_utf8_lossy(&errors).contains(expected));
+            assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+        }
+    }
+
+    /// All passing host checks plus a discovered standalone drive yield a successful doctor envelope.
+    #[test]
+    fn ready_doctor_exits_zero() {
+        use super::*;
+        use remanence_chaos::model::{DeviceRole, ModelTransport, VirtualWorld};
+        let root = tempfile::tempdir().unwrap();
+        let env = Environment {
+            xdg: root.path().join("state"),
+            system_config: root.path().join("etc"),
+            locks: root.path().join("locks"),
+            test_input: true,
+            euid: 1000,
+            doctor_checks: Some(json!({"checks":[{"name":"host", "ok":true}],"fixes":{}})),
+        };
+        let world = std::sync::Arc::new(std::sync::Mutex::new(VirtualWorld::single_drive(
+            "LIB", 0x100, "DRIVE", 0x400, 0,
+        )));
+        let mut out = Vec::new();
+        let mut errors = Vec::new();
+        let code = run(
+            &["rem", "doctor", "--json"].map(OsString::from),
+            env,
+            || {
+                Ok(remanence_library::sysfs::DeviceEnumeration {
+                    devices: vec![DeviceAttachment {
+                        sg_path: "/dev/fixture".into(),
+                        sysfs_path: "/sys/fixture".into(),
+                    }],
+                    warnings: vec![],
+                })
+            },
+            &mut |_| {
+                Ok(Box::new(ModelTransport::new(
+                    world.clone(),
+                    DeviceRole::Drive { bay: 0x100 },
+                )) as Box<dyn SgTransport>)
+            },
+            &mut out,
+            &mut errors,
+        );
+        assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&out));
+        let value: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["result"]["ready"], true);
+        assert!(value.get("error").is_none());
+    }
+
+    /// Empty process values use HOME rather than a relative rem directory.
+    #[test]
+    fn empty_xdg_falls_back() {
+        const CHILD: &str = "REM_EMPTY_XDG_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            assert_eq!(
+                super::Environment::from_process().xdg,
+                std::path::PathBuf::from("/home/test/.local/state")
+            );
+        } else {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "standalone::tests::empty_xdg_falls_back"])
+                .env(CHILD, "1")
+                .env("HOME", "/home/test")
+                .env("XDG_STATE_HOME", "")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+    }
+
+    /// The minimal finalize grammar and its aliases share stable retry defaults.
+    #[test]
+    fn finalize_aliases_and_defaults() {
+        use super::*;
+        for ack in ["--acknowledge-tape", "--ack-tape-uuid"] {
+            let cli = Cli::try_parse_from(["rem", "tape", "finalize", ack, "LABEL"]).unwrap();
+            let Command::Tape {
+                command:
+                    Tape::Finalize {
+                        tape,
+                        acknowledge_tape,
+                        reason,
+                        idempotency_key,
+                        expected_pool,
+                    },
+            } = cli.command
+            else {
+                panic!("finalize parser");
+            };
+            assert_eq!(acknowledge_tape, "LABEL");
+            assert!(
+                tape.is_none()
+                    && reason.is_none()
+                    && idempotency_key.is_none()
+                    && expected_pool.is_none()
+            );
+        }
+        for dest in ["--out", "--dest"] {
+            assert!(Cli::try_parse_from(["rem", "get", "file", dest, "output"]).is_ok());
+            assert!(crate::Cli::try_parse_from(["rem", "get", "file", dest, "output"]).is_ok());
+        }
+        for (tape, ack) in [
+            ("--tape", "--acknowledge-tape"),
+            ("--tape-uuid", "--ack-tape-uuid"),
+        ] {
+            let uuid = "00000000-0000-4000-8000-000000000001";
+            let args = [
+                "rem",
+                "tape",
+                "finalize",
+                tape,
+                uuid,
+                ack,
+                uuid,
+                "--reason",
+                "close",
+                "--idempotency-key",
+                uuid,
+            ];
+            assert!(Cli::try_parse_from(args).is_ok());
+            assert!(crate::Cli::try_parse_from(args).is_ok());
+        }
+    }
+
+    /// Root permission decisions happen before automatic home configuration writes.
+    #[test]
+    fn root_requires_explicit_configuration_in_home_mode() {
+        assert!(super::refuse_root(false, false, true));
+        assert!(!super::refuse_root(true, false, true));
+        assert!(!super::refuse_root(false, true, true));
+        assert!(!super::refuse_root(false, false, false));
+    }
+
+    /// Pin the namespace and byte encoding used for durable retry identities.
+    #[test]
+    fn finalize_key_golden() {
+        assert_eq!(
+            super::default_finalize_key([0; 16]).to_string(),
+            "3bcca802-1fc9-57fd-9b2a-3926094e199f"
+        );
+    }
+
     /// Stamp changes retry once, then retain the result with a visible warning.
     #[test]
     fn catalog_display_retries_and_warns() {
@@ -2383,6 +3354,8 @@ mod tests {
             system_config: root.path().join("system.toml"),
             locks: root.path().join("locks"),
             test_input: true,
+            euid: 1000,
+            doctor_checks: None,
         };
         let mut errors = Vec::new();
         assert!(local_quarantine_config_in(&env.system_config, &env, &mut errors).is_err());
@@ -2407,6 +3380,8 @@ mod tests {
             system_config: root.path().join("system.toml"),
             locks: root.path().join("locks"),
             test_input: true,
+            euid: 1000,
+            doctor_checks: None,
         };
         fs::create_dir(root.path().join("rem")).unwrap();
         let args = [
@@ -2587,7 +3562,7 @@ mod tests {
     use super::*;
     /// Help is syntax, not a search for the word in option values or operands.
     #[test]
-    fn shared_help_preserves_literal_operands_and_both_interfaces() {
+    fn shared_help_preserves_literal_operands_and_defers_command_help() {
         for args in [
             vec!["rem", "put", "help", "--pool", "example"],
             vec!["rem", "put", "--pool", "help", "file"],
@@ -2609,9 +3584,10 @@ mod tests {
             vec!["rem", "--device", "/dev/test", "tape", "finalize", "--help"],
         ] {
             let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
-            let help = shared_help(&args).unwrap();
-            assert!(help.contains("Library/daemon interface:"));
-            assert!(help.contains("Standalone device interface:"));
+            assert!(
+                shared_help(&args).is_none(),
+                "command help must reach the selected parser"
+            );
         }
     }
 

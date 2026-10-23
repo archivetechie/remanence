@@ -996,7 +996,7 @@ fn prove_mount(
         .map_err(refusal)?;
     if poll.readiness != MediaReadiness::Ready {
         return Err(refusal(format!(
-            "media not ready: {:?}; insert the cartridge and retry",
+            "{}; insert the cartridge and retry",
             poll.readiness
         )));
     }

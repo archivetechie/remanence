@@ -12,6 +12,7 @@ use serde_json::Value;
 /// Run `rem` with `path_dir` as its whole PATH, or with the inherited PATH.
 fn rem(path_dir: Option<&Path>, args: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_rem"));
+    command.env("REM_TEST_NO_LIVE_SCSI", "1");
     if let Some(path_dir) = path_dir {
         command.env("PATH", path_dir);
     }
