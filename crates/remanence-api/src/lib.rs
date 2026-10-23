@@ -187,3 +187,41 @@ mod tape_image;
 #[allow(dead_code)]
 #[path = "../../remanence-cli/src/tape_image_vectors.rs"]
 mod tape_image_vectors;
+
+/// Discovery facts for CLI envelopes, independent of binary or daemon capabilities.
+pub fn observed_endpoint_json(
+    report: &remanence_library::DiscoveryReport,
+) -> Vec<serde_json::Value> {
+    let mut endpoints = Vec::new();
+    for library in &report.libraries {
+        endpoints.push(
+            serde_json::json!({"kind":"library","serial":library.serial,"path":library.changer_sg}),
+        );
+        for bay in &library.drive_bays {
+            endpoints.push(serde_json::json!({"kind":"library","library_serial":library.serial,"bay":bay.element_address,"drive_serial":bay.installed.as_ref().map(|d| &d.serial),"path":bay.installed.as_ref().and_then(|d|d.sg_path.as_ref()),"ownership":"library"}));
+        }
+    }
+    for drive in &report.unattached_drives {
+        endpoints.push(serde_json::json!({"kind":if drive.ownership == remanence_library::DriveOwnership::Standalone {"standalone"} else {"unknown"},"serial":drive.serial,"path":drive.sg_path,"ownership":if drive.ownership == remanence_library::DriveOwnership::Standalone {"standalone"} else {"unknown"}}));
+    }
+    endpoints
+}
+
+/// Validate a spooled canonical object against its catalog manifest before extraction.
+pub fn validate_spooled_object(
+    path: &std::path::Path,
+    block_size: u32,
+    anchor: Option<[u8; 32]>,
+) -> Result<remanence_format::RemTarStreamReport, String> {
+    let mut source = remanence_library::FileBlockSource::open(path, block_size as usize)
+        .map_err(|e| e.to_string())?;
+    let blocks = source.block_count();
+    remanence_format::stream_rem_tar_object_with_manifest_anchor(
+        &mut source,
+        block_size as usize,
+        blocks,
+        &mut pool_write::ValidateCanonicalEntrySink,
+        anchor,
+    )
+    .map_err(|e| e.to_string())
+}

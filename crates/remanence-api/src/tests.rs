@@ -1729,6 +1729,7 @@ fn project_pool(index: &mut CatalogIndex, pool_id: &str) {
 
 fn pool_config(pool_id: &str) -> TapePoolConfig {
     TapePoolConfig {
+        scheme: None,
         id: pool_id.trim().to_string(),
         display_name: None,
         copy_class: None,
@@ -1755,6 +1756,7 @@ fn pool_config_with_watermarks(
     min_object_size_bytes: u64,
 ) -> TapePoolConfig {
     TapePoolConfig {
+        scheme: None,
         id: pool_id.to_string(),
         display_name: None,
         copy_class: None,
@@ -6662,6 +6664,9 @@ async fn daemon_health_and_version_are_wired() {
         pb::component_health::Status::Healthy as i32
     );
     assert!(health.component_health[0].other_status.is_empty());
+    assert_eq!(health.supported_endpoint_kinds, ["library", "standalone"]);
+    assert_eq!(health.daemon_capabilities, ["read_only"]);
+    assert!(health.observed_endpoints.is_empty());
 
     let version = pb::daemon_server::Daemon::version(&service, Request::new(()))
         .await
@@ -6670,6 +6675,12 @@ async fn daemon_health_and_version_are_wired() {
     assert_eq!(version.api_version, "v1-draft");
     assert!(!version.daemon_version.is_empty());
     assert!(!version.rust_target.is_empty());
+    assert_eq!(
+        version.supported_endpoint_kinds,
+        health.supported_endpoint_kinds
+    );
+    assert_eq!(version.daemon_capabilities, health.daemon_capabilities);
+    assert_eq!(version.observed_endpoints, health.observed_endpoints);
 }
 
 fn drive_target_test_state(

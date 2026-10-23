@@ -37,6 +37,9 @@ pub struct RemConfig {
     /// Allowed tape libraries.
     #[serde(default)]
     pub libraries: Vec<LibraryConfig>,
+    /// Explicit serial pins for standalone ownership on partially discoverable hosts.
+    #[serde(default)]
+    pub standalone_drives: Vec<StandaloneDriveConfig>,
     /// Operator-defined tape eligibility pools.
     #[serde(default)]
     pub tape_pools: Vec<TapePoolConfig>,
@@ -182,10 +185,21 @@ pub struct LibraryConfig {
     pub allow_derived_drive_identity: bool,
 }
 
+/// Operator assertion of standalone ownership, never a library bay mapping.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StandaloneDriveConfig {
+    /// VPD 0x80 drive serial.
+    pub serial: String,
+}
+
 /// Operator-defined pool for tape eligibility and Sutradhara placement.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TapePoolConfig {
+    /// Default parity geometry for new standalone cartridges.
+    #[serde(default)]
+    pub scheme: Option<String>,
     /// Stable daemon-local pool id.
     pub id: String,
     /// Optional human-readable label.
@@ -679,6 +693,10 @@ pub fn validate_config(config: &RemConfig) -> Result<(), StateError> {
 
     let mut pool_ids = HashSet::new();
     for pool in &config.tape_pools {
+        if let Some(scheme) = &pool.scheme {
+            remanence_parity::parse_parity_arg(scheme)
+                .map_err(|e| StateError::ConfigInvalid(format!("pool {} scheme: {e}", pool.id)))?;
+        }
         let pool_id = validate_pool_id(pool.id.as_str())?;
         validate_block_size(pool.block_size_bytes)
             .map_err(|error| StateError::ConfigInvalid(format!("tape pool {pool_id} {error}")))?;

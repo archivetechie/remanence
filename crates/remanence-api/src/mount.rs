@@ -2737,6 +2737,7 @@ mod tests {
             )
             .expect("project legacy tape usage");
         let cfg = TapePoolConfig {
+            scheme: None,
             id: "camera.copy-a".to_string(),
             display_name: None,
             copy_class: None,
@@ -3244,6 +3245,7 @@ mod tests {
         block_size: u32,
     ) -> TapePoolConfig {
         let pool_config = TapePoolConfig {
+            scheme: None,
             id: pool_id.to_string(),
             display_name: None,
             copy_class: None,
@@ -3752,6 +3754,7 @@ mod tests {
         let tape_uuid = [0xA5; 16];
         let pool_id = "async-finalize";
         let pool_config = TapePoolConfig {
+            scheme: None,
             id: pool_id.to_string(),
             display_name: None,
             copy_class: None,

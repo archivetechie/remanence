@@ -713,7 +713,7 @@ pub(crate) fn plan_batch_read_response(
         ));
     }
     let resolution = resolve_cartridge_facts(
-        &facts.cartridge_generation,
+        facts.cartridge_generation.as_deref().unwrap_or(""),
         &facts.recording_format,
         &facts.voltag,
     );
@@ -1138,7 +1138,8 @@ mod tests {
 
     fn facts() -> pb::CartridgeFacts {
         pb::CartridgeFacts {
-            cartridge_generation: "LTO-8".to_string(),
+            cartridge_generation: Some("LTO-8".to_string()),
+            generation_source: None,
             recording_format: "L8".to_string(),
             voltag: String::new(),
             block_size_bytes: 262_144,
@@ -1489,7 +1490,7 @@ mod tests {
         for (code, generation, format) in supported {
             let mut req = request(vec![target(100, 200)]);
             let cartridge = req.cartridge.as_mut().unwrap();
-            cartridge.cartridge_generation.clear();
+            cartridge.cartridge_generation = None;
             cartridge.recording_format.clear();
             cartridge.voltag = format!("ARC001{code}");
             let response = call(&world, req);
@@ -1507,7 +1508,7 @@ mod tests {
         // M8: recognised but unsupported — a normal unavailable result.
         let mut req = request(vec![target(100, 200)]);
         let cartridge = req.cartridge.as_mut().unwrap();
-        cartridge.cartridge_generation.clear();
+        cartridge.cartridge_generation = None;
         cartridge.recording_format.clear();
         cartridge.voltag = "ARC001M8".to_string();
         let response = call(&world, req);
@@ -1520,7 +1521,7 @@ mod tests {
         // unsupported.
         let mut req = request(vec![target(100, 200)]);
         let cartridge = req.cartridge.as_mut().unwrap();
-        cartridge.cartridge_generation.clear();
+        cartridge.cartridge_generation = None;
         cartridge.recording_format.clear();
         cartridge.voltag = "ARC001QQ".to_string();
         let response = call(&world, req);
@@ -1538,7 +1539,7 @@ mod tests {
         let with_facts = |generation: &str, format: &str, voltag: &str| {
             let mut req = request(vec![target(100, 200)]);
             let cartridge = req.cartridge.as_mut().unwrap();
-            cartridge.cartridge_generation = generation.to_string();
+            cartridge.cartridge_generation = Some(generation.to_string());
             cartridge.recording_format = format.to_string();
             cartridge.voltag = voltag.to_string();
             req
@@ -1784,7 +1785,7 @@ mod tests {
             .expect("seed map");
         let mut req = request(vec![target(100, 200)]);
         let cartridge = req.cartridge.as_mut().unwrap();
-        cartridge.cartridge_generation = "LTO-7".to_string();
+        cartridge.cartridge_generation = Some("LTO-7".to_string());
         cartridge.recording_format = "L7".to_string();
         cartridge.written_extent_lba = 2075;
         let response = call(&world, req);
@@ -1924,7 +1925,7 @@ mod tests {
         seed_calibrated(&mut world);
         let mut req = request(oversized_targets());
         let cartridge = req.cartridge.as_mut().unwrap();
-        cartridge.cartridge_generation.clear();
+        cartridge.cartridge_generation = None;
         cartridge.recording_format.clear();
         cartridge.voltag = "ARC001M8".to_string();
         let response = call(&world, req);
@@ -1997,7 +1998,7 @@ mod tests {
         let mut req = request(vec![target(100, 200)]);
         let cartridge = req.cartridge.as_mut().unwrap();
         cartridge.compression = pb::CompressionState::CompressionUnspecified as i32;
-        cartridge.cartridge_generation = "M8".to_string();
+        cartridge.cartridge_generation = Some("M8".to_string());
         cartridge.recording_format = "M8".to_string();
         let response = call(&world, req);
         assert_eq!(

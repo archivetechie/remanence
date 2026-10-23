@@ -2166,16 +2166,7 @@ impl CatalogIndex {
         tape_uuid: [u8; 16],
         observation: MediaObservation,
     ) -> Result<(), StateError> {
-        let changed = self.conn.execute(
-            "update tapes set cartridge_generation = ?2, generation_source = ?3, updated_at_utc = ?4 where tape_uuid = ?1",
-            params![tape_uuid.as_slice(), observation.generation.media_code(), observation.source.as_str(), now_utc()?],
-        ).map_err(|e| sqlite_error("record cartridge generation", e))?;
-        if changed != 1 {
-            return Err(StateError::TapeProvisionConflict(
-                "cannot set generation for an unknown tape".into(),
-            ));
-        }
-        Ok(())
+        set_tape_generation_at(&self.conn, &tape_uuid, observation, &now_utc()?)
     }
 
     /// Adopt one checksum-validated Bootstrap as identity-only catalog state.
@@ -4791,6 +4782,25 @@ impl CatalogIndex {
         pool_id: Option<&str>,
         actor: &str,
     ) -> Result<TapeAssignmentSnapshot, StateError> {
+        self.compare_and_set_tape_pool_assignment_with_audit(
+            tape_uuid,
+            expected_generation,
+            pool_id,
+            actor,
+            |_| Ok(()),
+        )
+    }
+
+    /// State-owner hook inside the existing assignment transaction: validate and
+    /// project first, persist authority before committing the rebuildable cache.
+    pub(crate) fn compare_and_set_tape_pool_assignment_with_audit(
+        &mut self,
+        tape_uuid: [u8; 16],
+        expected_generation: u64,
+        pool_id: Option<&str>,
+        actor: &str,
+        before_commit: impl FnOnce(&TapeAssignmentSnapshot) -> Result<(), StateError>,
+    ) -> Result<TapeAssignmentSnapshot, StateError> {
         if actor.trim().is_empty() {
             return Err(StateError::ConfigInvalid(
                 "pool assignment requires an actor".into(),
@@ -4817,6 +4827,7 @@ impl CatalogIndex {
                 hex_uuid(tape_uuid)
             ))
         })?;
+        before_commit(&snapshot)?;
         tx.commit()
             .map_err(|err| sqlite_error("commit conditional tape pool assignment", err))?;
         Ok(snapshot)
@@ -7129,6 +7140,24 @@ fn audit_media_observation(
             "partial audit generation evidence".into(),
         )),
     }
+}
+
+/// Shared generation projection for direct assertions and ordered audit replay.
+fn set_tape_generation_at(
+    conn: &Connection,
+    uuid: &[u8],
+    observation: MediaObservation,
+    at: &str,
+) -> Result<(), StateError> {
+    let changed = conn.execute("update tapes set cartridge_generation=?2, generation_source=?3, updated_at_utc=?4 where tape_uuid=?1",
+        params![uuid, observation.generation.media_code(), observation.source.as_str(), at])
+        .map_err(|e| sqlite_error("record cartridge generation", e))?;
+    if changed != 1 {
+        return Err(StateError::TapeProvisionConflict(
+            "cannot set generation for an unknown tape".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Store shell provenance and generation together with identity creation.
@@ -9951,12 +9980,20 @@ fn project_catalog_evidence_record(
             )
             .map_err(|err| sqlite_error("project TapeProvisioned audit record", err))?;
             if let Some(label) = voltag.as_deref() {
+                let update_generation = audit_intent_is_new(tx, &tape_uuid, "generation", record)?;
                 record_media_observation_tx(
                     tx,
                     tape_uuid.as_slice(),
                     provenance,
-                    audit_media_observation(record, Some(label))?,
+                    if update_generation {
+                        audit_media_observation(record, Some(label))?
+                    } else {
+                        None
+                    },
                 )?;
+                if update_generation {
+                    remember_audit_intent(tx, &tape_uuid, "generation", record)?;
+                }
             }
             if update_label {
                 remember_audit_intent(tx, &tape_uuid, "label", record)?;
@@ -9966,6 +10003,18 @@ fn project_catalog_evidence_record(
                     .try_into()
                     .map_err(|_| StateError::IndexCorrupt("invalid assignment UUID".into()))?;
                 replay_assignment(tx, uuid, record)?;
+            }
+        }
+        AuditEvent::TapeGenerationChanged => {
+            let uuid = audit_tape_uuid(record).ok_or_else(|| {
+                StateError::IndexCorrupt("generation change has no tape UUID".into())
+            })?;
+            if audit_intent_is_new(tx, &uuid, "generation", record)? {
+                let observation = audit_media_observation(record, None)?.ok_or_else(|| {
+                    StateError::IndexCorrupt("generation change has no observation".into())
+                })?;
+                set_tape_generation_at(tx, &uuid, observation, &record.timestamp_utc)?;
+                remember_audit_intent(tx, &uuid, "generation", record)?;
             }
         }
         AuditEvent::TapePoolAssigned => {
@@ -10365,6 +10414,7 @@ fn project_tape_identity_adopted_record(
         )?;
         remember_audit_intent(tx, &uuid, "assignment", record)?;
         remember_audit_intent(tx, &uuid, "label", record)?;
+        remember_audit_intent(tx, &uuid, "generation", record)?;
         tx.execute(
             "update tapes set state = ?2 where tape_uuid = ?1",
             params![uuid.as_slice(), state],

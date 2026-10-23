@@ -153,75 +153,18 @@ fn lock_device(io: &mut LockIo, serial: &str) -> Result<File, MountError> {
     Ok(file)
 }
 
-/// Standalone invocation state. A second mount cannot consume another cartridge.
-pub struct OperatorMount<'a> {
-    state: &'a mut StateHandle,
+/// Physical removal recovery owns only the device lock and audit sink. It never
+/// constructs an OperatorMount or gains write/session admission methods.
+struct LockedAuditedDevice {
     drive: Option<DriveHandle>,
-    path: PathBuf,
-    _lock: Option<Arc<File>>,
+    lock: Option<Arc<File>>,
     audit_error: Arc<Mutex<Option<String>>>,
     endpoint: MountEndpoint,
-    unusable: bool,
 }
-impl<'a> OperatorMount<'a> {
-    /// Finish after a common read consumer has consumed/released MountedTape.
-    /// Refresh the state append cursor and surface any drive-audit failure.
-    pub fn finish(mut self) -> Result<(), MountError> {
-        self.flush_audit()
-    }
-
-    /// Catalog view for the common mounted-object read, verify, and export paths.
-    pub fn catalog_index(&mut self) -> &CatalogIndex {
-        self.state.catalog_index()
-    }
-
-    pub fn device_lock_path(serial: &str) -> PathBuf {
-        Path::new("/run/lock/rem").join(format!("{serial}.lock"))
-    }
-    /// Open under explicit device policy; caller must establish standalone ownership.
-    pub fn open(
-        path: &Path,
-        policy: &StaticAllowlist,
-        state: &'a mut StateHandle,
-    ) -> Result<Self, MountError> {
-        let drive = DriveHandle::open_standalone(path, policy).map_err(refusal)?;
-        Self::from_drive(path, drive, state, &mut |_, logical| Ok(logical.into()))
-    }
-    /// Transport and lock filesystem seam; uses the complete production adapter.
-    pub fn with_transport_for_test(
-        path: &Path,
-        policy: &StaticAllowlist,
-        transport: Box<dyn SgTransport>,
-        state: &'a mut StateHandle,
-        lock_root: &Path,
-    ) -> Result<Self, MountError> {
-        let drive = DriveHandle::open_standalone_with_transport(path, transport, policy)
-            .map_err(refusal)?;
-        let root = lock_root.to_owned();
-        Self::from_drive(path, drive, state, &mut move |_, logical| {
-            Ok(root.join(
-                logical
-                    .strip_prefix("/run/lock/rem")
-                    .expect("device lock namespace"),
-            ))
-        })
-    }
-    /// Inject every lock filesystem operation while retaining the production namespace.
-    pub fn with_transport_and_lock_io_for_test(
-        path: &Path,
-        policy: &StaticAllowlist,
-        transport: Box<dyn SgTransport>,
-        state: &'a mut StateHandle,
-        mut io: Box<LockIo>,
-    ) -> Result<Self, MountError> {
-        let drive = DriveHandle::open_standalone_with_transport(path, transport, policy)
-            .map_err(refusal)?;
-        Self::from_drive(path, drive, state, io.as_mut())
-    }
-    fn from_drive(
-        path: &Path,
+impl LockedAuditedDevice {
+    fn open(
         mut drive: DriveHandle,
-        state: &'a mut StateHandle,
+        state: &StateHandle,
         io: &mut LockIo,
     ) -> Result<Self, MountError> {
         let lock = match drive.endpoint() {
@@ -231,37 +174,6 @@ impl<'a> OperatorMount<'a> {
             MountEndpoint::Ephemeral { .. } => None,
             _ => return Err(refusal("operator mount requires a standalone endpoint")),
         };
-        if let Some(endpoint) = drive.endpoint().durable_key() {
-            state.replay_audit_projection().map_err(refusal)?;
-            crate::startup_guard::reject_active_tape_io_fences_on_startup(state.catalog_index())
-                .map_err(refusal)?;
-            state
-                .recover_sessions_after_restart(Some(endpoint), |state, session| {
-                    if session.session_kind == "write" {
-                        let tape_uuid = session
-                            .tape_uuid
-                            .as_deref()
-                            .and_then(|b| b.try_into().ok())
-                            .ok_or_else(|| {
-                                remanence_state::StateError::IndexCorrupt(
-                                    "unfinished write has no tape identity".into(),
-                                )
-                            })?;
-                        raise_standalone_fence(
-                            state,
-                            tape_uuid,
-                            session.drive_key.as_ref(),
-                            "standalone_write_lost_by_restart",
-                            "unfinished durable write session requires recovery",
-                        )
-                        .map_err(|e| remanence_state::StateError::IndexCorrupt(e.to_string()))?;
-                    }
-                    Ok(())
-                })
-                .map_err(refusal)?;
-            crate::startup_guard::reject_active_tape_io_fences_on_startup(state.catalog_index())
-                .map_err(refusal)?;
-        }
         let audit_error = Arc::new(Mutex::new(None));
         if drive.endpoint().durable_key().is_some() {
             let pending = Arc::clone(&audit_error);
@@ -298,20 +210,17 @@ impl<'a> OperatorMount<'a> {
         }
         let endpoint = drive.endpoint().clone();
         Ok(Self {
-            state,
             drive: Some(drive),
-            path: path.into(),
-            _lock: lock,
+            lock,
             audit_error,
             endpoint,
-            unusable: false,
         })
     }
-    fn flush_audit(&mut self) -> Result<(), MountError> {
+    fn flush_audit(&self, state: &mut StateHandle) -> Result<(), MountError> {
         if matches!(self.endpoint, MountEndpoint::Ephemeral { .. }) {
             return Ok(());
         }
-        self.state.refresh_audit_append_cursor().map_err(refusal)?;
+        state.refresh_audit_append_cursor().map_err(refusal)?;
         if let Some(error) = self
             .audit_error
             .lock()
@@ -322,6 +231,247 @@ impl<'a> OperatorMount<'a> {
         }
         Ok(())
     }
+}
+
+/// Standalone invocation state. A second mount cannot consume another cartridge.
+pub struct OperatorMount<'a> {
+    state: &'a mut StateHandle,
+    context: LockedAuditedDevice,
+    path: PathBuf,
+    unusable: bool,
+}
+impl<'a> OperatorMount<'a> {
+    /// Finish after a common read consumer has consumed/released MountedTape.
+    /// Refresh the state append cursor and surface any drive-audit failure.
+    pub fn finish(mut self) -> Result<(), MountError> {
+        self.flush_audit()
+    }
+
+    /// Catalog view for the common mounted-object read, verify, and export paths.
+    pub fn catalog_index(&mut self) -> &CatalogIndex {
+        self.state.catalog_index()
+    }
+
+    pub fn device_lock_path(serial: &str) -> PathBuf {
+        Path::new("/run/lock/rem").join(format!("{serial}.lock"))
+    }
+    /// Open under explicit device policy; caller must establish standalone ownership.
+    pub fn open(
+        path: &Path,
+        policy: &StaticAllowlist,
+        state: &'a mut StateHandle,
+    ) -> Result<Self, MountError> {
+        let drive = DriveHandle::open_standalone(path, policy).map_err(refusal)?;
+        Self::from_drive(path, drive, state, &mut |_, logical| Ok(logical.into()))
+    }
+    /// Open with caller-supplied transport and lock namespace (production uses /run/lock/rem).
+    pub fn with_transport(
+        path: &Path,
+        policy: &StaticAllowlist,
+        transport: Box<dyn SgTransport>,
+        state: &'a mut StateHandle,
+        lock_root: &Path,
+    ) -> Result<Self, MountError> {
+        let drive = DriveHandle::open_standalone_with_transport(path, transport, policy)
+            .map_err(refusal)?;
+        let root = lock_root.to_owned();
+        Self::from_drive(path, drive, state, &mut move |_, logical| {
+            Ok(root.join(
+                logical
+                    .strip_prefix("/run/lock/rem")
+                    .expect("device lock namespace"),
+            ))
+        })
+    }
+    /// Recover physical removal after a crash, without clearing any durable fence.
+    /// The recovery owner is consumed here so no write can bypass startup admission.
+    pub fn release_with_transport(
+        path: &Path,
+        policy: &StaticAllowlist,
+        transport: Box<dyn SgTransport>,
+        state: &'a mut StateHandle,
+        lock_root: &Path,
+    ) -> Result<(), MountError> {
+        let drive = DriveHandle::open_standalone_with_transport(path, transport, policy)
+            .map_err(refusal)?;
+        if drive.endpoint().durable_key().is_none() {
+            return Err(refusal(
+                "ephemeral endpoint is read-only; release requires a VPD serial",
+            ));
+        }
+        let root = lock_root.to_owned();
+        let mut context = LockedAuditedDevice::open(drive, state, &mut move |_, logical| {
+            Ok(root.join(
+                logical
+                    .strip_prefix("/run/lock/rem")
+                    .expect("device lock namespace"),
+            ))
+        })?;
+        let result = context
+            .drive
+            .as_mut()
+            .expect("opened drive")
+            .allow_medium_removal()
+            .map_err(refusal);
+        context.flush_audit(state)?;
+        result
+    }
+    /// Compatibility integration seam delegating to the production IO boundary.
+    pub fn with_transport_for_test(
+        path: &Path,
+        policy: &StaticAllowlist,
+        transport: Box<dyn SgTransport>,
+        state: &'a mut StateHandle,
+        lock_root: &Path,
+    ) -> Result<Self, MountError> {
+        Self::with_transport(path, policy, transport, state, lock_root)
+    }
+    /// Inject every lock filesystem operation while retaining the production namespace.
+    pub fn with_transport_and_lock_io_for_test(
+        path: &Path,
+        policy: &StaticAllowlist,
+        transport: Box<dyn SgTransport>,
+        state: &'a mut StateHandle,
+        mut io: Box<LockIo>,
+    ) -> Result<Self, MountError> {
+        let drive = DriveHandle::open_standalone_with_transport(path, transport, policy)
+            .map_err(refusal)?;
+        Self::from_drive(path, drive, state, io.as_mut())
+    }
+    fn from_drive(
+        path: &Path,
+        drive: DriveHandle,
+        state: &'a mut StateHandle,
+        io: &mut LockIo,
+    ) -> Result<Self, MountError> {
+        let context = LockedAuditedDevice::open(drive, state, io)?;
+        if let Some(endpoint) = context.endpoint.durable_key() {
+            state.replay_audit_projection().map_err(refusal)?;
+            crate::startup_guard::reject_active_tape_io_fences_on_startup(state.catalog_index())
+                .map_err(refusal)?;
+            state
+                .recover_sessions_after_restart(Some(endpoint), |state, session| {
+                    if session.session_kind == "write" {
+                        let tape_uuid = session
+                            .tape_uuid
+                            .as_deref()
+                            .and_then(|b| b.try_into().ok())
+                            .ok_or_else(|| {
+                                remanence_state::StateError::IndexCorrupt(
+                                    "unfinished write has no tape identity".into(),
+                                )
+                            })?;
+                        raise_standalone_fence(
+                            state,
+                            tape_uuid,
+                            session.drive_key.as_ref(),
+                            "standalone_write_lost_by_restart",
+                            "unfinished durable write session requires recovery",
+                        )
+                        .map_err(|e| remanence_state::StateError::IndexCorrupt(e.to_string()))?;
+                    }
+                    Ok(())
+                })
+                .map_err(refusal)?;
+            crate::startup_guard::reject_active_tape_io_fences_on_startup(state.catalog_index())
+                .map_err(refusal)?;
+        }
+        Ok(Self {
+            state,
+            context,
+            path: path.into(),
+            unusable: false,
+        })
+    }
+    /// Prepare a BOT initialization decision, then run its write and provisioning
+    /// under the same durable calibration/session guards as mounted writes.
+    /// Preparation must only inspect/configure media; it returns the planned UUID.
+    pub fn initialize<T, R>(
+        &mut self,
+        reserve: bool,
+        prepare: impl FnOnce(&mut DriveHandle, &mut StateHandle) -> Result<(TapeUuid, T), String>,
+        write_and_provision: impl FnOnce(&mut DriveHandle, &mut StateHandle, T) -> Result<R, String>,
+    ) -> Result<R, MountError> {
+        let mut drive = self
+            .context
+            .drive
+            .take()
+            .ok_or_else(|| refusal("one cartridge per invocation"))?;
+        if drive.endpoint().durable_key().is_none() {
+            return Err(refusal("ephemeral endpoint is read-only"));
+        }
+        let mut reserved = false;
+        let result = (|| {
+            if reserve {
+                drive.reserve().map_err(refusal)?;
+                reserved = true;
+            }
+            let (uuid, plan) = prepare(&mut drive, self.state).map_err(refusal)?;
+            self.flush_audit()?;
+            crate::startup_guard::reject_active_tape_io_fences_on_startup(
+                self.state.catalog_index(),
+            )
+            .map_err(refusal)?;
+            let control = self.state.calibration_control().clone();
+            crate::calibration::install_standalone_calibration_fence(&mut drive, &control, uuid)
+                .map_err(refusal)?;
+            let id = uuid::Uuid::new_v4();
+            self.session(uuid, id, AuditEvent::SessionOpened)?;
+            let before = drive.media_write_dispatch_count();
+            let result = write_and_provision(&mut drive, self.state, plan).map_err(refusal);
+            self.flush_audit()?;
+            let uncertain = result.is_err() && drive.media_write_dispatch_count() != before;
+            if uncertain {
+                self.unusable = true;
+                raise_standalone_fence(
+                    self.state,
+                    uuid,
+                    self.context.endpoint.durable_key(),
+                    "standalone_init_failed",
+                    &result.as_ref().err().expect("failed write").to_string(),
+                )?;
+            }
+            self.session(
+                uuid,
+                id,
+                if uncertain {
+                    AuditEvent::SessionOrphaned
+                } else {
+                    AuditEvent::SessionClosed
+                },
+            )?;
+            result
+        })();
+        let allow = drive.allow_medium_removal().map_err(refusal);
+        let release = if reserved {
+            drive.release_reservation().map_err(refusal)
+        } else {
+            Ok(())
+        };
+        self.flush_audit()?;
+        let value = result?;
+        allow?;
+        release?;
+        Ok(value)
+    }
+
+    /// Apply metadata changes only while the durable BOT proof remains valid.
+    pub fn mutate_catalog<T>(
+        &mut self,
+        mounted: &MountedTape,
+        operation: impl FnOnce(&mut StateHandle) -> Result<T, String>,
+    ) -> Result<T, MountError> {
+        self.require_durable_mount(mounted)?;
+        if mounted.identity_generation != mounted.drive.identity_generation() {
+            return Err(refusal("media identity invalidated"));
+        }
+        self.flush_audit()?;
+        operation(self.state).map_err(refusal)
+    }
+
+    fn flush_audit(&mut self) -> Result<(), MountError> {
+        self.context.flush_audit(self.state)
+    }
     fn require_durable_mount(&self, mounted: &MountedTape) -> Result<(), MountError> {
         if self.unusable {
             return Err(refusal("invocation is unusable after uncertain I/O; recover the tape and start a new invocation"));
@@ -331,7 +481,9 @@ impl<'a> OperatorMount<'a> {
                 "ephemeral endpoint is read-only; a VPD serial is required",
             ));
         }
-        if mounted.endpoint != self.endpoint || mounted.drive.endpoint() != &self.endpoint {
+        if mounted.endpoint != self.context.endpoint
+            || mounted.drive.endpoint() != &self.context.endpoint
+        {
             return Err(refusal(
                 "mounted endpoint differs from the invocation's locked device",
             ));
@@ -347,12 +499,13 @@ impl<'a> OperatorMount<'a> {
     }
     fn session(
         &mut self,
-        mounted: &MountedTape,
+        tape_uuid: TapeUuid,
         id: uuid::Uuid,
         event: AuditEvent,
     ) -> Result<(), MountError> {
         self.flush_audit()?;
-        let key = mounted
+        let key = self
+            .context
             .endpoint
             .durable_key()
             .ok_or_else(|| refusal("ephemeral endpoint is read-only"))?;
@@ -360,26 +513,30 @@ impl<'a> OperatorMount<'a> {
             ("session_kind".into(), ciborium::Value::Text("write".into())),
             (
                 "tape_uuid".into(),
-                ciborium::Value::Bytes(mounted.tape_uuid.to_vec()),
+                ciborium::Value::Bytes(tape_uuid.to_vec()),
             ),
             ("endpoint_key".into(), ciborium::Value::Text(key.encode())),
         ]);
-        self.state
-            .audit()
-            .append(AuditEventRecord {
-                event,
-                actor: AuditActor::local_user(),
-                source_layer: SourceLayer::Layer5,
-                session_id: Some(id),
-                operation_id: None,
-                idempotency_key: None,
-                subject: AuditSubject {
-                    kind: "write".into(),
-                    id: Some(id.to_string()),
-                },
-                detail,
-            })
+        // Session recovery evidence must reach stable storage before any write,
+        // even when ordinary audit appends are configured without fsync.
+        use remanence_state::AuditSink;
+        let mut log = remanence_state::FileAuditLog::open(&self.state.paths().audit_dir, true)
             .map_err(refusal)?;
+        log.append(AuditEventRecord {
+            event,
+            actor: AuditActor::local_user(),
+            source_layer: SourceLayer::Layer5,
+            session_id: Some(id),
+            operation_id: None,
+            idempotency_key: None,
+            subject: AuditSubject {
+                kind: "write".into(),
+                id: Some(id.to_string()),
+            },
+            detail,
+        })
+        .map_err(refusal)?;
+        self.state.refresh_audit_append_cursor().map_err(refusal)?;
         self.state.replay_audit_projection().map_err(refusal)?;
         Ok(())
     }
@@ -429,7 +586,7 @@ impl<'a> OperatorMount<'a> {
             _ => return Err(refusal("tape requires terminal recovery before writing")),
         };
         let id = uuid::Uuid::new_v4();
-        self.session(mounted, id, AuditEvent::SessionOpened)?;
+        self.session(mounted.tape_uuid, id, AuditEvent::SessionOpened)?;
         let before = mounted.drive.media_write_dispatch_count();
         let result = (|| {
             mounted.drive.test_unit_ready().map_err(refusal)?;
@@ -450,11 +607,11 @@ impl<'a> OperatorMount<'a> {
                 mounted.tape_uuid,
                 mounted.endpoint.durable_key(),
                 "standalone_write_failed",
-                &result.as_ref().unwrap_err().to_string(),
+                &result.as_ref().expect_err("failed write").to_string(),
             )?;
         }
         let closed = self.session(
-            mounted,
+            mounted.tape_uuid,
             id,
             if uncertain {
                 AuditEvent::SessionOrphaned
@@ -485,6 +642,7 @@ impl MountBackend for OperatorMount<'_> {
             return Err(refusal("device target differs from opened device"));
         }
         let mut drive = self
+            .context
             .drive
             .take()
             .ok_or_else(|| refusal("one cartridge per invocation; start a new invocation"))?;
@@ -517,7 +675,7 @@ impl MountBackend for OperatorMount<'_> {
                     label,
                     generation,
                     reserved: false,
-                    _device_lock: self._lock.clone(),
+                    _device_lock: self.context.lock.clone(),
                 })
             }
             Err(error) => {
@@ -749,7 +907,7 @@ impl OperatorMount<'_> {
             audit_append_lock: Arc::new(Mutex::new(())),
         };
         let session_id = uuid::Uuid::new_v4();
-        self.session(mounted, session_id, AuditEvent::SessionOpened)?;
+        self.session(mounted.tape_uuid, session_id, AuditEvent::SessionOpened)?;
         let result = (|| {
             if let Some(reply) = crate::write_owner::preflight_manual_finalize_tape(
                 self.state.catalog_index(),
@@ -792,7 +950,7 @@ impl OperatorMount<'_> {
         self.state.refresh_audit_append_cursor().map_err(refusal)?;
         self.flush_audit()?;
         self.session(
-            mounted,
+            mounted.tape_uuid,
             session_id,
             if result.is_ok() {
                 AuditEvent::SessionClosed

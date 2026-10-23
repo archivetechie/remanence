@@ -327,7 +327,11 @@ fn crash_after_session_open_refuses_restart_before_media_dispatch() {
     let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
     let mounted = mount.mount(target()).unwrap();
     mount
-        .session(&mounted, uuid::Uuid::new_v4(), AuditEvent::SessionOpened)
+        .session(
+            mounted.tape_uuid,
+            uuid::Uuid::new_v4(),
+            AuditEvent::SessionOpened,
+        )
         .unwrap();
     drop(mounted);
     drop(mount);
@@ -790,7 +794,11 @@ fn ephemeral_open_and_mount_leave_all_durable_authority_unchanged() {
     let mut backend = backend(&mut state, &world, &root.path().join("locks"), fault()).unwrap();
     let mounted = backend.mount(target()).unwrap();
     backend
-        .session(&mounted, uuid::Uuid::new_v4(), AuditEvent::SessionOpened)
+        .session(
+            mounted.tape_uuid,
+            uuid::Uuid::new_v4(),
+            AuditEvent::SessionOpened,
+        )
         .unwrap();
     backend.release(mounted);
     seed_open_session(
@@ -1184,4 +1192,92 @@ fn mounted_positioning_reuses_only_current_bootstrap_evidence_and_releases_once(
     commands.lock().unwrap().clear();
     backend.release(mounted);
     assert_eq!(*commands.lock().unwrap(), vec![vec![0x1e, 0, 0, 0, 0, 0]]);
+}
+
+/// Physical release must leave unfinished writes for the unconditional startup
+/// admission path; it cannot recover sessions or clear their fences itself.
+#[test]
+fn release_context_does_not_run_write_owner_recovery() {
+    let root = tempfile::tempdir().unwrap();
+    let mut state = state(root.path());
+    let session = seed_open_session(
+        &mut state,
+        remanence_library::DriveKey::Standalone {
+            drive_serial: SERIAL.into(),
+        },
+        UUID,
+    );
+    let world = world();
+    OperatorMount::release_with_transport(
+        Path::new(DEVICE),
+        &StaticAllowlist::new([SERIAL]),
+        Box::new(Transport {
+            inner: ModelTransport::new(Arc::clone(&world), DeviceRole::Drive { bay: BAY }),
+            fault: fault(),
+            audit_cut: None,
+            hide_serial: false,
+            commands: None,
+            cut_after_prevent: false,
+            boundary: None,
+        }),
+        &mut state,
+        &root.path().join("locks"),
+    )
+    .unwrap();
+    assert!(state
+        .catalog_index()
+        .non_terminal_sessions()
+        .unwrap()
+        .iter()
+        .any(|s| s.session_id == session));
+    assert!(state
+        .catalog_index()
+        .list_active_tape_io_fences()
+        .unwrap()
+        .is_empty());
+    assert!(backend(&mut state, &world, &root.path().join("locks"), fault()).is_err());
+    assert!(state
+        .catalog_index()
+        .non_terminal_sessions()
+        .unwrap()
+        .iter()
+        .all(|s| s.session_id != session));
+    assert_eq!(
+        state
+            .catalog_index()
+            .list_active_tape_io_fences()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// The release-only type is still a mutation boundary: ephemeral devices cannot
+/// acquire it even with the read override used by diagnostic/read consumers.
+#[test]
+fn release_context_refuses_ephemeral_devices() {
+    let root = tempfile::tempdir().unwrap();
+    let mut state = state(root.path());
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let policy = StaticAllowlist::new([DEVICE]).with_unserialized_device_allowed(Path::new(DEVICE));
+    let result = OperatorMount::release_with_transport(
+        Path::new(DEVICE),
+        &policy,
+        Box::new(Transport {
+            inner: ModelTransport::new(world(), DeviceRole::Drive { bay: BAY }),
+            fault: fault(),
+            audit_cut: None,
+            hide_serial: true,
+            commands: Some(Arc::clone(&commands)),
+            cut_after_prevent: false,
+            boundary: None,
+        }),
+        &mut state,
+        &root.path().join("locks"),
+    );
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("ephemeral endpoint is read-only"));
+    assert!(commands.lock().unwrap().iter().all(|c| c[0] != 0x1e));
 }

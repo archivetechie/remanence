@@ -136,15 +136,17 @@ enum PollFinalizationError {
 }
 
 struct DaemonFinalizationTransport {
+    json: bool,
     endpoint: String,
     runtime: tokio::runtime::Runtime,
     client: Option<pb::catalog_client::CatalogClient<Channel>>,
 }
 
 impl DaemonFinalizationTransport {
-    fn new(endpoint: &str) -> Result<Self, DaemonClientError> {
+    fn new(endpoint: &str, json: bool) -> Result<Self, DaemonClientError> {
         Ok(Self {
             endpoint: endpoint.to_string(),
+            json,
             runtime: daemon_runtime()?,
             client: None,
         })
@@ -153,6 +155,9 @@ impl DaemonFinalizationTransport {
     fn connect(&mut self) -> Result<(), String> {
         if self.client.is_none() {
             let channel = self.runtime.block_on(connect_daemon(&self.endpoint))?;
+            self.runtime
+                .block_on(crate::observe_daemon(&channel, self.json))
+                .map_err(|e| e.message)?;
             self.client = Some(pb::catalog_client::CatalogClient::new(channel));
         }
         Ok(())
@@ -220,7 +225,7 @@ pub(crate) fn run(args: &TapeFinalizeArgs, out: &mut dyn Write, err: &mut dyn Wr
             )
         }
     };
-    let mut transport = match DaemonFinalizationTransport::new(&args.endpoint) {
+    let mut transport = match DaemonFinalizationTransport::new(&args.endpoint, args.json) {
         Ok(transport) => transport,
         Err(error) => return finish_daemon_client_result(Err(error), args.json, err),
     };

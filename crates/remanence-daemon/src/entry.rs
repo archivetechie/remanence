@@ -94,6 +94,11 @@ pub async fn main_entry_with_registry(
                 return ExitCode::from(1);
             }
         };
+        for warning in &report.warnings {
+            if let Some(message) = remanence_library::drive_mapping_message(warning) {
+                eprintln!("rem-daemon: {message}");
+            }
+        }
         let mut policy = remanence_library::StaticAllowlist::new(
             config.libraries.iter().map(|l| l.serial.clone()),
         );

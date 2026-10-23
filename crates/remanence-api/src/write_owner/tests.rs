@@ -251,6 +251,7 @@ fn automatic_terminal_preflight_accepts_empty_fresh_authority() {
         parity_config: ParityConfig::None,
     };
     let pool_cfg = TapePoolConfig {
+        scheme: None,
         id: selected.pool_id.clone(),
         display_name: None,
         copy_class: None,
@@ -887,6 +888,7 @@ fn one_transition_ahead_sink_journal_reconciles_before_media_is_available() {
         .commit_terminal_component_transition(&transitions[4].0, &transitions[4].1)
         .expect("journal replica C transition");
     let lowered_pool = TapePoolConfig {
+        scheme: None,
         id: "host-authority-test".to_string(),
         display_name: None,
         copy_class: None,
@@ -979,6 +981,7 @@ fn one_transition_ahead_sink_journal_reconciles_before_media_is_available() {
         parity_config: ParityConfig::None,
     };
     let pool_cfg = TapePoolConfig {
+        scheme: None,
         id: selected.pool_id.clone(),
         display_name: None,
         copy_class: None,
@@ -2022,6 +2025,7 @@ async fn daemon_rejects_corrupt_checkpoint_authority_before_position_or_config_c
     let drive_tx = spawn_drive_actor(0x0100, drive, cfg);
     let command_start = world.lock().expect("world lock").command_log.len();
     let pool_cfg = TapePoolConfig {
+        scheme: None,
         id: "parity.authority".to_string(),
         display_name: None,
         copy_class: None,
@@ -2167,6 +2171,7 @@ async fn daemon_rejects_missing_checkpoint_authority_for_catalog_written_media_b
         drive_tx
             .send(DriveCommand::OpenWrite {
                 pool_cfg: TapePoolConfig {
+                    scheme: None,
                     id: format!("missing.{case}.authority"),
                     display_name: None,
                     copy_class: None,
@@ -2262,6 +2267,7 @@ async fn daemon_checkpoint_lease_contention_precedes_conditional_load_for_no_par
     drive_tx
         .send(DriveCommand::OpenWrite {
             pool_cfg: TapePoolConfig {
+                scheme: None,
                 id: "checkpoint.lease".to_string(),
                 display_name: None,
                 copy_class: None,
@@ -2652,6 +2658,7 @@ async fn partial_epoch_checkpoint_projects_replays_and_first_post_checkpoint_sho
         .expect("open model drive");
     let drive_tx = spawn_drive_actor(0x0100, drive, cfg);
     let pool_cfg = TapePoolConfig {
+        scheme: None,
         id: POOL_ID.to_string(),
         display_name: None,
         copy_class: None,
@@ -3614,6 +3621,7 @@ async fn checkpoint_actor_deduplicates_in_batch_and_holds_until_checkpoint() {
     let drive_tx = spawn_drive_actor(0x0100, drive, cfg);
 
     let pool_cfg = TapePoolConfig {
+        scheme: None,
         id: "checkpoint-test".to_string(),
         display_name: None,
         copy_class: None,
@@ -4077,6 +4085,7 @@ async fn daemon_watermark_terminalization_is_atomic_and_terminal_failure_stays_f
             .expect("open model drive");
         let drive_tx = spawn_drive_actor(0x0100, drive, cfg);
         let pool_cfg = TapePoolConfig {
+            scheme: None,
             id: pool_id,
             display_name: None,
             copy_class: None,
@@ -4320,6 +4329,7 @@ async fn manual_finalize_closes_below_low_and_same_key_replay_moves_no_tape() {
         .expect("open model drive");
     let drive_tx = spawn_drive_actor(0x0100, drive, cfg);
     let pool_cfg = TapePoolConfig {
+        scheme: None,
         id: pool_id.to_string(),
         display_name: None,
         copy_class: None,
@@ -4867,6 +4877,7 @@ async fn sequential_sessions_and_replay_return_catalog_copies_through_mount() {
         .expect("open model drive");
     let drive_tx = spawn_drive_actor(0x0100, drive, cfg);
     let pool_cfg = TapePoolConfig {
+        scheme: None,
         id: "batch-one-test".to_string(),
         display_name: None,
         copy_class: None,
@@ -6230,6 +6241,7 @@ async fn induced_append_and_read_failures_persist_session_snapshots() {
         .expect("close read session");
 
     let pool_cfg = TapePoolConfig {
+        scheme: None,
         id: "failure-test".to_string(),
         display_name: None,
         copy_class: None,

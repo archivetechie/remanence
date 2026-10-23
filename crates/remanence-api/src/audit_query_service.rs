@@ -275,6 +275,7 @@ pub(crate) fn audit_event_name(event: &AuditEvent) -> &'static str {
         AuditEvent::TapeIdentityAdopted => "TapeIdentityAdopted",
         AuditEvent::TapePoolAssigned => "TapePoolAssigned",
         AuditEvent::TapeLabelRebound => "TapeLabelRebound",
+        AuditEvent::TapeGenerationChanged => "TapeGenerationChanged",
         AuditEvent::TapeSealed => "TapeSealed",
         AuditEvent::DriveRetired => "DriveRetired",
         AuditEvent::DriveReinstated => "DriveReinstated",

@@ -39,6 +39,9 @@
 //! Exit codes: 0 on success, 1 on a discovery / op error, 2 when the
 //! caller asked for a library that wasn't found.
 
+mod standalone;
+pub use standalone::run_with_standalone_test_io;
+
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
 use std::ffi::OsStr;
@@ -87,6 +90,8 @@ use zeroize::Zeroize;
 mod archive_ingest;
 mod archive_map;
 #[cfg(test)]
+mod capability_tests;
+#[cfg(test)]
 mod damage_vectors;
 mod freeze_drill;
 mod get;
@@ -132,7 +137,12 @@ enum CliTransportAccess {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "rem", version, about = "Remanence — tape library operator CLI")]
+#[command(
+    name = "rem",
+    version,
+    about = "Remanence — library and standalone tape CLI",
+    after_help = "Library operations go through the daemon; a standalone drive is operated directly.\nUse --device PATH with --allow-device SERIAL for standalone media.\nAdditional commands: doctor, diagnostics capture, pool new; tape identify, adopt, restore, assign-pool, rebind, set-generation, import-journals, release."
+)]
 struct Cli {
     /// Compatibility allowlist for legacy direct-hardware invocations.
     /// Normal `rem` commands ignore this flag; use `rem-debug --allow`
@@ -208,6 +218,74 @@ impl From<DebugCli> for ParsedCli {
 enum CliMode {
     Rem,
     Debug,
+}
+
+// Rendering context is thread-local and scoped to an invocation so the shared
+// legacy printers preserve rem-debug's wire output. It never affects IO policy.
+thread_local! {
+    static OBSERVED_ENDPOINTS: std::cell::RefCell<Vec<Value>> = const { std::cell::RefCell::new(Vec::new()) };
+    static OUTPUT_MODE: std::cell::Cell<CliMode> = const { std::cell::Cell::new(CliMode::Rem) };
+}
+struct OutputModeGuard(CliMode, Vec<Value>);
+impl OutputModeGuard {
+    fn enter(mode: CliMode) -> Self {
+        Self(
+            OUTPUT_MODE.with(|current| current.replace(mode)),
+            OBSERVED_ENDPOINTS.with(|current| current.replace(Vec::new())),
+        )
+    }
+}
+impl Drop for OutputModeGuard {
+    fn drop(&mut self) {
+        OUTPUT_MODE.with(|current| current.set(self.0));
+        OBSERVED_ENDPOINTS.with(|current| current.replace(std::mem::take(&mut self.1)));
+    }
+}
+
+/// Add capability metadata from this invocation's actual discovery context.
+/// Shared printers preserve their legacy payload shape and rem-debug output.
+fn with_capabilities(mut value: Value) -> Value {
+    if OUTPUT_MODE.with(|mode| mode.get() == CliMode::Rem) {
+        value["supported_endpoint_kinds"] = json!(["library", "standalone"]);
+        value["observed_endpoints"] =
+            OBSERVED_ENDPOINTS.with(|current| json!(current.borrow().clone()));
+    }
+    value
+}
+
+/// Preserve the original serializer for rem-debug, including struct field order.
+fn write_json_with_capabilities<T: serde::Serialize>(
+    out: &mut dyn Write,
+    value: &T,
+) -> serde_json::Result<()> {
+    if OUTPUT_MODE.with(|mode| mode.get() == CliMode::Rem) {
+        serde_json::to_writer(out, &with_capabilities(serde_json::to_value(value)?))
+    } else {
+        serde_json::to_writer(out, value)
+    }
+}
+fn json_string_with_capabilities<T: serde::Serialize>(value: &T) -> serde_json::Result<String> {
+    if OUTPUT_MODE.with(|mode| mode.get() == CliMode::Rem) {
+        serde_json::to_string(&with_capabilities(serde_json::to_value(value)?))
+    } else {
+        serde_json::to_string(value)
+    }
+}
+
+/// Daemon-facing JSON describes the server's discovery, never the client's host.
+/// A failed discovery-context query fails the command rather than inventing an
+/// empty inventory. Callers invoke this before starting a write/read operation.
+async fn observe_daemon(channel: &Channel, json_output: bool) -> Result<(), DaemonClientError> {
+    if json_output && OUTPUT_MODE.with(|mode| mode.get() == CliMode::Rem) {
+        let health = pb::daemon_client::DaemonClient::new(channel.clone())
+            .health(())
+            .await
+            .map_err(status_error)?
+            .into_inner();
+        OBSERVED_ENDPOINTS
+            .with(|current| current.replace(endpoint_json(&health.observed_endpoints)));
+    }
+    Ok(())
 }
 
 fn rem_debug_only_reason(cmd: &Command) -> Option<&'static str> {
@@ -3945,7 +4023,15 @@ pub fn main_entry() -> ExitCode {
 
 /// Run the operator CLI with the foreign formats linked by a distribution.
 pub fn main_entry_with_registry(registry: ForeignFormatRegistry) -> ExitCode {
-    let cli = Cli::parse();
+    let args: Vec<_> = std::env::args_os().collect();
+    if let Some(help) = standalone::shared_help(&args) {
+        println!("{help}");
+        return ExitCode::SUCCESS;
+    }
+    if standalone::selected(&args) {
+        return standalone::run_live(&args);
+    }
+    let cli = Cli::parse_from(args);
     run_cli(cli.into(), CliMode::Rem, registry)
 }
 
@@ -4146,6 +4232,7 @@ fn run_with_mode<F>(
 where
     F: FnOnce() -> Result<DiscoveryReport, DiscoveryError>,
 {
+    let _output_mode = OutputModeGuard::enter(mode);
     if mode == CliMode::Rem {
         if let Some(reason) = rem_debug_only_reason(&cli.command) {
             let _ = writeln!(
@@ -4154,7 +4241,7 @@ where
             );
             let _ = writeln!(
                 err,
-                "       use `rem-debug` only for break-glass local hardware/debug work; normal production paths must go through the daemon"
+                "       use `rem-debug` only for break-glass local hardware/debug work; library operations go through the daemon; a standalone drive is operated directly."
             );
             return ExitCode::from(1);
         }
@@ -4401,6 +4488,8 @@ where
             return ExitCode::from(1);
         }
     };
+    OBSERVED_ENDPOINTS
+        .with(|current| current.replace(remanence_api::observed_endpoint_json(&report)));
     let allow = cli.allow.clone();
     let allow_derived = cli.allow_derived.clone();
     match cli.command {
@@ -4719,7 +4808,7 @@ fn run_archive_capabilities(out: &mut dyn Write, err: &mut dyn Write) -> ExitCod
             "ranged-ciphertext-extract"
         ]
     });
-    match serde_json::to_writer(&mut *out, &capabilities)
+    match write_json_with_capabilities(&mut *out, &capabilities)
         .and_then(|()| writeln!(out).map_err(serde_json::Error::io))
     {
         Ok(()) => ExitCode::SUCCESS,
@@ -4753,7 +4842,7 @@ fn run_archive_formats(
         })
         .collect::<Vec<_>>();
     let response = json!({"foreign_formats": formats});
-    match serde_json::to_writer(&mut *out, &response)
+    match write_json_with_capabilities(&mut *out, &response)
         .and_then(|()| writeln!(out).map_err(serde_json::Error::io))
     {
         Ok(()) => ExitCode::SUCCESS,
@@ -4780,7 +4869,7 @@ fn run_archive_recipient(
             return ExitCode::from(1);
         }
     };
-    match serde_json::to_writer(&mut *out, &report)
+    match write_json_with_capabilities(&mut *out, &report)
         .and_then(|()| writeln!(out).map_err(serde_json::Error::io))
     {
         Ok(()) => ExitCode::SUCCESS,
@@ -4851,18 +4940,20 @@ where
     F: FnOnce(&ArchiveResealArgs) -> Result<PublishedReseal, String>,
 {
     match operation(args) {
-        Ok(publication) => match serde_json::to_writer(&mut *out, &publication.report)
-            .and_then(|()| writeln!(out).map_err(serde_json::Error::io))
-        {
-            Ok(()) => {
-                publication.commit();
-                ExitCode::SUCCESS
+        Ok(publication) => {
+            match write_json_with_capabilities(&mut *out, &publication.report)
+                .and_then(|()| writeln!(out).map_err(serde_json::Error::io))
+            {
+                Ok(()) => {
+                    publication.commit();
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    let _ = writeln!(err, "error: write reseal report: {error}");
+                    ExitCode::from(1)
+                }
             }
-            Err(error) => {
-                let _ = writeln!(err, "error: write reseal report: {error}");
-                ExitCode::from(1)
-            }
-        },
+        }
         Err(error) => {
             let _ = writeln!(err, "error: {error}");
             ExitCode::from(1)
@@ -5147,6 +5238,7 @@ fn run_operation_client_command(
             let channel = connect_daemon(endpoint)
                 .await
                 .map_err(DaemonClientError::from)?;
+            observe_daemon(&channel, json_output).await?;
             let mut client = pb::daemon_client::DaemonClient::new(channel);
             match command {
                 OperationClientCommand::Get { operation_id } => {
@@ -5191,6 +5283,7 @@ fn run_catalog_client_command(
             let channel = connect_daemon(endpoint)
                 .await
                 .map_err(DaemonClientError::from)?;
+            observe_daemon(&channel, json_output).await?;
             let mut client = pb::catalog_client::CatalogClient::new(channel);
             match command {
                 CatalogClientCommand::Tapes { pool, kind } => {
@@ -5318,6 +5411,7 @@ fn run_audit_client_command(
             let channel = connect_daemon(endpoint)
                 .await
                 .map_err(DaemonClientError::from)?;
+            observe_daemon(&channel, json_output).await?;
             let mut client = pb::audit_client::AuditClient::new(channel);
             match command {
                 AuditClientCommand::Query {
@@ -5405,7 +5499,7 @@ fn print_audit_entry(
         "detail": detail,
     });
     if json_output {
-        serde_json::to_writer(&mut *out, &value).map_err(|error| error.to_string())?;
+        write_json_with_capabilities(&mut *out, &value).map_err(|error| error.to_string())?;
         writeln!(out).map_err(|error| error.to_string())
     } else {
         writeln!(
@@ -5578,6 +5672,7 @@ fn run_drive_client_command(
             let channel = connect_daemon(endpoint)
                 .await
                 .map_err(DaemonClientError::from)?;
+            observe_daemon(&channel, json_output).await?;
             let mut client =
                 pb::library_service_client::LibraryServiceClient::new(channel.clone());
             match command {
@@ -5777,6 +5872,7 @@ fn run_archive_verify_client(
             let channel = connect_daemon(endpoint)
                 .await
                 .map_err(DaemonClientError::from)?;
+            observe_daemon(&channel, true).await?;
             let library = {
                 let mut client =
                     pb::library_service_client::LibraryServiceClient::new(channel.clone());
@@ -5872,7 +5968,7 @@ fn run_archive_verify_client(
                 "tape_uuid": Uuid::from_bytes(locator.tape_uuid).to_string(),
                 "drive_element_address": drive,
             });
-            serde_json::to_writer(&mut *out, &receipt)
+            write_json_with_capabilities(&mut *out, &receipt)
                 .map_err(|error| DaemonClientError::client(error.to_string()))?;
             writeln!(out).map_err(|error| DaemonClientError::client(error.to_string()))?;
             if !verified {
@@ -5899,6 +5995,7 @@ fn run_alarms_client_command(
             let channel = connect_daemon(endpoint)
                 .await
                 .map_err(DaemonClientError::from)?;
+            observe_daemon(&channel, json_output).await?;
             let mut client = pb::library_service_client::LibraryServiceClient::new(channel);
             match command {
                 None => {
@@ -5962,6 +6059,7 @@ fn run_top_command(
             let channel = connect_daemon(endpoint)
                 .await
                 .map_err(DaemonClientError::from)?;
+            observe_daemon(&channel, json_output).await?;
             let mut client = pb::library_service_client::LibraryServiceClient::new(channel);
             let response = client
                 .get_live_status(pb::GetLiveStatusRequest {})
@@ -6124,6 +6222,8 @@ fn print_health(
     out: &mut dyn Write,
 ) -> Result<(), String> {
     if json_output {
+        OBSERVED_ENDPOINTS
+            .with(|current| current.replace(endpoint_json(&health.observed_endpoints)));
         return print_json_envelope("rem.daemon.health.v1", "item", health_json(&health), out);
     }
     let _ = writeln!(out, "status: {}", health_status_name(health.status));
@@ -6146,6 +6246,8 @@ fn print_version(
     out: &mut dyn Write,
 ) -> Result<(), String> {
     if json_output {
+        OBSERVED_ENDPOINTS
+            .with(|current| current.replace(endpoint_json(&version.observed_endpoints)));
         return print_json_envelope("rem.daemon.version.v1", "item", version_json(&version), out);
     }
     let _ = writeln!(out, "daemon: {}", version.daemon_version);
@@ -6191,7 +6293,7 @@ fn print_operation_ref(
         let json = json!({
             "operation_id": bytes_to_uuid_text(&operation.operation_id),
         });
-        serde_json::to_writer(&mut *out, &json).map_err(|err| err.to_string())?;
+        write_json_with_capabilities(&mut *out, &json).map_err(|err| err.to_string())?;
         writeln!(out).map_err(|err| err.to_string())?;
         return Ok(());
     }
@@ -6703,6 +6805,7 @@ fn print_json_envelope(
         "data": data,
         "operation": null
     });
+    let envelope = with_capabilities(envelope);
     serde_json::to_writer(&mut *out, &envelope).map_err(|error| error.to_string())?;
     writeln!(out).map_err(|error| error.to_string())
 }
@@ -6715,12 +6818,20 @@ fn print_json_error(code: &str, message: &str, err: &mut dyn Write) -> Result<()
         "message": message,
         "details": {}
     });
+    let envelope = with_capabilities(envelope);
     serde_json::to_writer(&mut *err, &envelope).map_err(|error| error.to_string())?;
     writeln!(err).map_err(|error| error.to_string())
 }
 
+fn endpoint_json(endpoints: &[pb::ObservedEndpoint]) -> Vec<Value> {
+    endpoints.iter().map(|e|json!({"kind":e.kind,"serial":e.serial,"path":e.path,"ownership":e.ownership,"bay":e.bay,"library_serial":e.library_serial})).collect()
+}
+
 fn health_json(health: &pb::HealthResponse) -> Value {
     json!({
+        "supported_endpoint_kinds": health.supported_endpoint_kinds,
+        "daemon_capabilities": health.daemon_capabilities,
+        "observed_endpoints": endpoint_json(&health.observed_endpoints),
         "status": health_status_name(health.status),
         "components": health_components(health),
         "detail": health.detail,
@@ -6759,6 +6870,9 @@ fn health_components(health: &pb::HealthResponse) -> std::collections::BTreeMap<
 
 fn version_json(version: &pb::VersionResponse) -> Value {
     json!({
+        "supported_endpoint_kinds": version.supported_endpoint_kinds,
+        "daemon_capabilities": version.daemon_capabilities,
+        "observed_endpoints": endpoint_json(&version.observed_endpoints),
         "daemon_version": version.daemon_version,
         "api_version": version.api_version,
         "rust_target": version.rust_target,
@@ -8202,34 +8316,22 @@ impl TapeInitStateOps for remanence_state::StateHandle {
         parity: remanence_api::ParityConfig,
         force: bool,
     ) -> Result<(), String> {
-        self.provision_tape(remanence_state::ProvisionTapeInput {
-            tape_uuid,
-            voltag: voltag.clone(),
-            block_size,
-            parity: parity.clone(),
-            force,
-        })
-        .map_err(|error| format!("provision catalog tape row: {error}"))?;
-        let pool_inputs = pool_projection_inputs(config);
-        self.catalog_index()
-            .reconcile_tape_pool_projection_from_rules(&pool_inputs, &config.tape_pool_rules)
-            .map_err(|error| format!("project tape pool membership: {error}"))?;
-        // Tape init's only state-changing success path runs through here
-        // (the CLI calls this when `action == WroteBootstrap`, never for
-        // idempotent no-ops or refusals), so a `TapeProvisioned` append here
-        // is exactly "a bootstrap was actually written".
-        let pool_id = self
-            .catalog_index()
-            .get_tape_pool_membership(&tape_uuid)
-            .map_err(|error| format!("read projected tape pool membership: {error}"))?;
-        append_tape_provisioned_audit_event(
+        let observation = remanence_state::MediaObservation::label_hint(&voltag);
+        provision_initialized_tape_with_media(
             self,
-            tape_uuid,
-            &voltag,
-            block_size,
-            &parity,
-            force,
-            pool_id.as_deref(),
+            config,
+            remanence_state::ProvisionTapeInput {
+                tape_uuid,
+                voltag,
+                block_size,
+                parity,
+                force,
+            },
+            ProvisioningContext {
+                provenance: remanence_state::LabelProvenance::Changer,
+                observation,
+                explicit_pool: None,
+            },
         )
     }
 
@@ -8271,17 +8373,83 @@ impl TapeInitStateOps for remanence_state::StateHandle {
     }
 }
 
+/// Shared post-bootstrap provisioning authority for library and operator init.
+/// Both paths append the same replayable provision/assignment sequence.
+struct ProvisioningContext<'a> {
+    provenance: remanence_state::LabelProvenance,
+    observation: Option<remanence_state::MediaObservation>,
+    explicit_pool: Option<&'a str>,
+}
+fn provision_initialized_tape_with_media(
+    state: &mut remanence_state::StateHandle,
+    config: &remanence_state::RemConfig,
+    input: remanence_state::ProvisionTapeInput,
+    context: ProvisioningContext<'_>,
+) -> Result<(), String> {
+    let remanence_state::ProvisionTapeInput {
+        tape_uuid,
+        voltag,
+        block_size,
+        parity,
+        force,
+    } = input;
+    // Drive IO and the state owner append under the same exclusive invocation lock.
+    state
+        .refresh_audit_append_cursor()
+        .map_err(|e| e.to_string())?;
+    state
+        .provision_tape_with_media(
+            remanence_state::ProvisionTapeInput {
+                tape_uuid,
+                voltag: voltag.clone(),
+                block_size,
+                parity: parity.clone(),
+                force,
+            },
+            context.provenance,
+            context.observation,
+        )
+        .map_err(|e| format!("provision catalog tape row: {e}"))?;
+    if context.explicit_pool.is_none() {
+        state
+            .catalog_index()
+            .reconcile_tape_pool_projection_from_rules(
+                &pool_projection_inputs(config),
+                &config.tape_pool_rules,
+            )
+            .map_err(|e| format!("project tape pool membership: {e}"))?;
+    }
+    let pool_id = state
+        .catalog_index()
+        .get_tape_pool_membership(&tape_uuid)
+        .map_err(|e| e.to_string())?;
+    append_tape_provisioned_audit_event(
+        state,
+        &remanence_state::ProvisionTapeInput {
+            tape_uuid,
+            voltag,
+            block_size,
+            parity,
+            force,
+        },
+        pool_id.as_deref(),
+        &context,
+    )
+}
+
 fn append_tape_provisioned_audit_event(
     state: &mut remanence_state::StateHandle,
-    tape_uuid: remanence_api::TapeUuid,
-    voltag: &str,
-    block_size: u32,
-    parity: &remanence_api::ParityConfig,
-    forced: bool,
+    input: &remanence_state::ProvisionTapeInput,
     pool_id: Option<&str>,
+    context: &ProvisioningContext<'_>,
 ) -> Result<(), String> {
     use ciborium::value::Value as CborValue;
 
+    let tape_uuid = input.tape_uuid;
+    let voltag = &input.voltag;
+    let block_size = input.block_size;
+    let parity = &input.parity;
+    let forced = input.force;
     let geometry = match parity {
         remanence_api::ParityConfig::None => "no-parity".to_string(),
         remanence_api::ParityConfig::Scheme(scheme) => format!(
@@ -8306,13 +8474,37 @@ fn append_tape_provisioned_audit_event(
         ),
         ("geometry".to_string(), CborValue::Text(geometry)),
         ("forced".to_string(), CborValue::Bool(forced)),
-        ("assignment_source".into(), CborValue::Text("rule".into())),
+        (
+            "assignment_source".into(),
+            CborValue::Text(
+                if context.explicit_pool.is_some() {
+                    "operator"
+                } else {
+                    "rule"
+                }
+                .into(),
+            ),
+        ),
         (
             "assignment_generation".into(),
             CborValue::Integer(assignment_generation.into()),
         ),
-        ("voltag_source".into(), CborValue::Text("changer".into())),
+        (
+            "voltag_source".into(),
+            CborValue::Text(context.provenance.as_str().into()),
+        ),
     ]);
+    detail.insert("media_observation_recorded".into(), CborValue::Bool(true));
+    if let Some(observation) = context.observation {
+        detail.insert(
+            "cartridge_generation".into(),
+            CborValue::Text(observation.generation.media_code().into()),
+        );
+        detail.insert(
+            "generation_source".into(),
+            CborValue::Text(observation.source.as_str().into()),
+        );
+    }
     if let Some(pool_id) = pool_id {
         detail.insert("pool_id".to_string(), CborValue::Text(pool_id.to_string()));
     }
@@ -8332,29 +8524,13 @@ fn append_tape_provisioned_audit_event(
             detail,
         })
         .map_err(|error| format!("append tape provisioning audit record: {error}"))?;
-    if let Some(pool_id) = pool_id {
+    if let Some(pool) = context.explicit_pool {
         state
-            .audit()
-            .append(remanence_state::AuditEventRecord {
-                actor: remanence_state::AuditActor::local_user(),
-                source_layer: remanence_state::SourceLayer::Layer4,
-                operation_id: None,
-                session_id: None,
-                idempotency_key: None,
-                event: remanence_state::AuditEvent::TapePoolAssigned,
-                subject: remanence_state::AuditSubject {
-                    kind: "tape".to_string(),
-                    id: Some(bytes_to_hex(&tape_uuid)),
-                },
-                detail: std::collections::BTreeMap::from([
-                    ("pool_id".into(), CborValue::Text(pool_id.to_string())),
-                    ("assignment_source".into(), CborValue::Text("rule".into())),
-                    (
-                        "assignment_generation".into(),
-                        CborValue::Integer(assignment_generation.into()),
-                    ),
-                ]),
-            })
+            .assign_tape_pool(tape_uuid, assignment_generation, Some(pool))
+            .map_err(|error| format!("assign initialized tape: {error}"))?;
+    } else if pool_id.is_some() {
+        state
+            .record_rule_tape_pool_assignment(tape_uuid)
             .map_err(|error| format!("append tape pool assignment audit record: {error}"))?;
     }
     Ok(())
@@ -9860,6 +10036,7 @@ fn print_tape_wait_ready_result(
             "operator_action": guidance.operator_action,
             "recommended_next_command": guidance.recommended_next_command,
         });
+        let payload = with_capabilities(payload);
         let _ = serde_json::to_writer_pretty(&mut *out, &payload);
         let _ = writeln!(out);
         return;
@@ -9912,6 +10089,7 @@ fn print_tape_wait_ready_failure(
             "operator_action": guidance.operator_action,
             "recommended_next_command": guidance.recommended_next_command,
         });
+        let payload = with_capabilities(payload);
         let _ = serde_json::to_writer_pretty(&mut *out, &payload);
         let _ = writeln!(out);
         return;
@@ -10090,7 +10268,7 @@ fn print_tape_alerts(library_serial: &str, bay: u16, alerts: &TapeAlerts, out: &
         "bay_element": bay,
         "active": active,
     });
-    if let Ok(line) = serde_json::to_string(&envelope) {
+    if let Ok(line) = serde_json::to_string(&with_capabilities(envelope)) {
         let _ = writeln!(out, "{line}");
     }
 }
@@ -12087,7 +12265,7 @@ fn run_archive_build(
             {
                 let _ = writeln!(err, "warning: {warning}");
             }
-            let line = serde_json::to_string(&report)
+            let line = json_string_with_capabilities(&report)
                 .unwrap_or_else(|error| format!("{{\"error\":\"{error}\"}}"));
             let _ = writeln!(out, "{line}");
             ExitCode::SUCCESS
@@ -12114,7 +12292,7 @@ fn run_archive_inspect(
 ) -> ExitCode {
     match inspect_archive_object_file(args) {
         Ok(report) => {
-            let line = serde_json::to_string(&report)
+            let line = json_string_with_capabilities(&report)
                 .unwrap_or_else(|error| format!("{{\"error\":\"{error}\"}}"));
             let _ = writeln!(out, "{line}");
             ExitCode::SUCCESS
@@ -12134,7 +12312,7 @@ fn run_archive_extract(
     match extract_archive_object_file(args) {
         Ok(report) => {
             print_xattr_policy_skip_warning_count(json_skipped_xattr_count(&report), err);
-            let line = serde_json::to_string(&report)
+            let line = json_string_with_capabilities(&report)
                 .unwrap_or_else(|error| format!("{{\"error\":\"{error}\"}}"));
             let _ = writeln!(out, "{line}");
             ExitCode::SUCCESS
@@ -12237,7 +12415,7 @@ fn run_archive_covering_range(
     })();
 
     match result {
-        Ok(report) => match serde_json::to_writer(&mut *out, &report)
+        Ok(report) => match write_json_with_capabilities(&mut *out, &report)
             .and_then(|()| writeln!(out).map_err(serde_json::Error::io))
         {
             Ok(()) => ExitCode::SUCCESS,
@@ -12357,7 +12535,7 @@ fn run_archive_extract_stream(
 
     match result {
         Ok(report) => {
-            let line = serde_json::to_string(&report)
+            let line = json_string_with_capabilities(&report)
                 .unwrap_or_else(|error| format!("{{\"error\":\"{error}\"}}"));
             if writeln!(err, "{line}").is_ok() {
                 ExitCode::SUCCESS
@@ -15630,7 +15808,11 @@ fn print_libraries_json(report: &DiscoveryReport, out: &mut dyn Write) {
             })
         })
         .collect::<Vec<_>>();
-    let _ = writeln!(out, "{}", json!({ "libraries": libraries }));
+    let _ = writeln!(
+        out,
+        "{}",
+        with_capabilities(json!({ "libraries": libraries }))
+    );
 }
 
 fn print_library_json(lib: &Library, include_slots: bool, out: &mut dyn Write) {
@@ -15708,6 +15890,7 @@ fn print_library_json(lib: &Library, include_slots: bool, out: &mut dyn Write) {
         "slots": slots,
         "ie_ports": ie_ports,
     });
+    let payload = with_capabilities(payload);
     let _ = serde_json::to_writer_pretty(&mut *out, &payload);
     let _ = writeln!(out);
 }
@@ -16211,6 +16394,7 @@ mod tests {
     fn tape_init_config_with_pool(block_size_bytes: u64) -> remanence_state::RemConfig {
         let root = std::env::temp_dir().join("remanence-cli-tape-init-test");
         remanence_state::RemConfig {
+            standalone_drives: vec![],
             daemon: remanence_state::DaemonConfig {
                 state_dir: root.clone(),
                 spool_dir: None,
@@ -16232,6 +16416,7 @@ mod tests {
             },
             libraries: Vec::new(),
             tape_pools: vec![remanence_state::TapePoolConfig {
+                scheme: None,
                 id: "camera.copy-a".to_string(),
                 display_name: None,
                 copy_class: None,
@@ -16533,8 +16718,14 @@ mod tests {
         assert!(help.contains("\n  catalog"));
         assert!(help.contains("\n  archive"));
         assert!(
-            !help.contains("--allow"),
+            !help
+                .split_whitespace()
+                .any(|word| matches!(word, "--allow" | "--allow-derived")),
             "rem help should not advertise hidden compatibility flags:\n{help}"
+        );
+        assert!(
+            help.contains("--allow-device"),
+            "standalone authorization must be documented"
         );
         for command in [
             "move", "load", "unload", "export", "import", "rescan", "lock", "unlock", "dev",
@@ -16736,7 +16927,12 @@ mod tests {
         assert_eq!(code, ExitCode::SUCCESS);
         assert!(err.is_empty());
         let value: Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(value, json!({"foreign_formats": []}));
+        assert_eq!(value["foreign_formats"], json!([]));
+        assert_eq!(
+            value["supported_endpoint_kinds"],
+            json!(["library", "standalone"])
+        );
+        assert_eq!(value["observed_endpoints"], json!([]));
 
         let cli = Cli::try_parse_from(["rem", "archive", "formats"]).unwrap();
         let mut registry = ForeignFormatRegistry::new();
@@ -16757,6 +16953,8 @@ mod tests {
         assert_eq!(
             value,
             json!({
+                "supported_endpoint_kinds": ["library", "standalone"],
+                "observed_endpoints": [],
                 "foreign_formats": [{
                     "id": "stateful-test",
                     "version": "test",
@@ -18194,6 +18392,9 @@ mod tests {
 
         print_health(
             pb::HealthResponse {
+                supported_endpoint_kinds: vec![],
+                daemon_capabilities: vec![],
+                observed_endpoints: vec![],
                 status: pb::health_response::Status::Healthy as i32,
                 components,
                 detail: "sqlite quick_check=ok".to_string(),
@@ -19630,7 +19831,9 @@ pool_id = "init-test"
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
         let stderr = String::from_utf8(err).unwrap();
         assert!(stderr.contains("available through `rem-debug`"));
-        assert!(stderr.contains("normal production paths must go through the daemon"));
+        assert!(stderr.contains(
+            "library operations go through the daemon; a standalone drive is operated directly."
+        ));
         assert!(out.is_empty());
     }
 
@@ -23733,6 +23936,11 @@ blob Project/Render Files/
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
         assert_eq!(err, "");
         let payload: Value = serde_json::from_str(out.trim()).expect("json");
+        assert_eq!(payload["observed_endpoints"][0]["serial"], "LIBJSON");
+        assert_eq!(
+            payload["supported_endpoint_kinds"],
+            json!(["library", "standalone"])
+        );
         let libraries = payload["libraries"].as_array().expect("libraries array");
         assert_eq!(libraries.len(), 1);
         assert_eq!(libraries[0]["serial"], "LIBJSON");

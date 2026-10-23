@@ -35,6 +35,7 @@ libc              = { workspace = true }
 prost-types       = { workspace = true }
 serde             = { workspace = true }
 serde_json        = { workspace = true }
+toml              = { workspace = true }
 sha2              = { workspace = true }
 tempfile          = { workspace = true }
 time              = { workspace = true }
@@ -47,6 +48,8 @@ zeroize           = { workspace = true }
 ratatui           = { version = "0.30", optional = true }
 
 [dev-dependencies]
+hyper-util = { workspace = true, features = ["tokio"] }
+tower = { workspace = true, features = ["util"] }
 remanence-parity = { path = "../remanence-parity", features = ["test-support"] }
 tempfile = { workspace = true }
 
