@@ -5018,6 +5018,7 @@ async fn sequential_sessions_and_replay_return_catalog_copies_through_mount() {
             &state,
             session_id,
             crate::mount::AppendFinishRequest {
+                mtime: None,
                 spool_path: source_path,
                 archive_path: PathBuf::from(format!("payload-{session_ordinal}.bin")),
                 caller_object_id: format!("batch-one-caller-{session_ordinal}"),
@@ -5104,6 +5105,7 @@ async fn sequential_sessions_and_replay_return_catalog_copies_through_mount() {
         &state,
         replay_session_id,
         crate::mount::AppendFinishRequest {
+            mtime: None,
             spool_path: replay_source,
             archive_path: PathBuf::from("payload-1.bin"),
             caller_object_id: "batch-one-caller-1".to_string(),

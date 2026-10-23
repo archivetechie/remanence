@@ -334,12 +334,13 @@ impl WriteSessionState<'_> {
         self.timer_checkpoint_waiting = None;
         let source_size = source.size_bytes().unwrap_or(0);
         let stream_control = source.stream_control();
-        let cleanup_path = match &source {
-            crate::WriteObjectSource::Path(path) => Some(path.clone()),
-            crate::WriteObjectSource::Streamed(_) | crate::WriteObjectSource::PreparedPath(_) => {
-                None
-            }
-        };
+        let cleanup_path =
+            match &source {
+                crate::WriteObjectSource::Path(path)
+                | crate::WriteObjectSource::Spool { path, .. } => Some(path.clone()),
+                crate::WriteObjectSource::Streamed(_)
+                | crate::WriteObjectSource::PreparedPath(_) => None,
+            };
         let current_caller_object_id = caller_object_id.clone();
         if let Some((provisional_index, pending)) = self.pending_batch.as_ref().and_then(|batch| {
             batch

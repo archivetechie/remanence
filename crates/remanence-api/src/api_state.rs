@@ -257,12 +257,38 @@ impl ApiState {
 
     /// Build service state with a live changer/drive actor pool.
     pub fn with_drive_pool(
+        index: CatalogIndex,
+        config: &RemConfig,
+        report: remanence_library::DiscoveryReport,
+        policy: remanence_library::StaticAllowlist,
+        spool_dir: PathBuf,
+        spool_budget_bytes: u64,
+    ) -> Result<Self, Status> {
+        Self::with_drive_pool_opener(
+            index,
+            config,
+            report,
+            policy,
+            spool_dir,
+            spool_budget_bytes,
+            |library, policy| library.open(policy),
+        )
+    }
+
+    /// Construct the same daemon runtime with an injected library transport opener.
+    /// All discovery, admission, reconciliation, and actor setup remain shared.
+    pub fn with_drive_pool_opener(
         mut index: CatalogIndex,
         config: &RemConfig,
         report: remanence_library::DiscoveryReport,
         policy: remanence_library::StaticAllowlist,
         spool_dir: PathBuf,
         spool_budget_bytes: u64,
+        mut open: impl FnMut(
+            &remanence_library::Library,
+            &remanence_library::StaticAllowlist,
+        )
+            -> Result<remanence_library::LibraryHandle, remanence_library::OpenError>,
     ) -> Result<Self, Status> {
         let index_path = index.path().to_path_buf();
         let pool_configs: HashMap<String, TapePoolConfig> = config
@@ -292,8 +318,7 @@ impl ApiState {
                     "configured library {library_serial} not found in discovery report"
                 ))
             })?;
-            let mut library = discovered
-                .open(&policy)
+            let mut library = open(discovered, &policy)
                 .map_err(|err| Status::internal(format!("open library {library_serial}: {err}")))?;
             let mut opened_drives = Vec::new();
             for bay in library.library().drive_bays.clone() {

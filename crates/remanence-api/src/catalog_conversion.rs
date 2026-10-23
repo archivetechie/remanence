@@ -406,6 +406,7 @@ pub(crate) fn native_object_file_to_proto(
         first_chunk_body_lba: record.first_chunk_lba,
         chunk_count: record.chunk_count,
         file_digest,
+        mtime: record.mtime,
     })
 }
 

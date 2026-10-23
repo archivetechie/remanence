@@ -1331,6 +1331,8 @@ message FileRecord {
   // Algorithm-aware mirror of file_sha256. During the compatibility window
   // servers populate both fields with the same SHA-256 value.
   Digest file_digest           = 8;
+  // Recorded decimal PAX seconds, including fractional precision.
+  optional string mtime        = 9;
 }
 
 message ListTapesRequest {
@@ -1740,6 +1742,8 @@ message AppendObjectStart {
   SourceReplayCapability source_replay_capability = 7;
   // Algorithm-aware mirror of expected_content_sha256.
   Digest expected_content_digest = 8;
+  // Non-negative decimal PAX seconds, optionally with fractional digits.
+  optional string mtime = 9;
 }
 
 // Start a verbatim plaintext REM-OBJECT append. This is a distinct oneof arm,

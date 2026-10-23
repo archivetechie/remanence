@@ -656,7 +656,8 @@ pub(crate) fn xattr_namespace(name: &str) -> Option<&str> {
     name.split_once('.').map(|(namespace, _)| namespace)
 }
 
-fn validate_pax_mtime(value: &str) -> Result<(), FormatError> {
+/// Validate the decimal timestamp syntax shared by catalog and object writers.
+pub fn validate_pax_mtime(value: &str) -> Result<(), FormatError> {
     let (seconds, fraction) = value
         .split_once('.')
         .map_or((value, None), |(left, right)| (left, Some(right)));

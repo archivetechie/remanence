@@ -314,14 +314,20 @@ pub(crate) fn prepare_pool_object(
     );
     options.chunk_size = block_size as usize;
     let (files, source) = match &request.source {
-        WriteObjectSource::Path(source_path) => (
-            vec![prepare_regular_file(
+        WriteObjectSource::Path(source_path)
+        | WriteObjectSource::Spool {
+            path: source_path, ..
+        } => {
+            let mut file = prepare_regular_file(
                 source_path,
                 &request.archive_path,
                 Uuid::new_v4().to_string(),
-            )?],
-            PreparedPoolSource::Paths,
-        ),
+            )?;
+            if let WriteObjectSource::Spool { mtime, .. } = &request.source {
+                file.spec.mtime = mtime.clone();
+            }
+            (vec![file], PreparedPoolSource::Paths)
+        }
         WriteObjectSource::PreparedPath(source) => {
             if Path::new(&source.0.spec.path) != request.archive_path {
                 return Err(PoolWriteError::InvalidInput(
@@ -345,7 +351,7 @@ pub(crate) fn prepare_pool_object(
                 streamed.size_bytes,
                 streamed.content_sha256,
             );
-            spec.mtime = None;
+            spec.mtime = streamed.mtime.clone();
             spec.executable = Some(false);
             (
                 vec![PreparedFile {
@@ -586,7 +592,9 @@ pub(crate) fn prepare_canonical_plaintext_pool_object(
     }
     let source_path = match &request.source {
         WriteObjectSource::Path(path) => path,
-        WriteObjectSource::Streamed(_) | WriteObjectSource::PreparedPath(_) => {
+        WriteObjectSource::Streamed(_)
+        | WriteObjectSource::Spool { .. }
+        | WriteObjectSource::PreparedPath(_) => {
             return Err(PoolWriteError::InvalidInput(
                 "canonical plaintext REM objects require a completed spool".to_string(),
             ));

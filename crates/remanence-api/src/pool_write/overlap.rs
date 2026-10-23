@@ -144,11 +144,36 @@ impl BlockSink for OverlapBlockSink<'_> {
     }
 
     fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError> {
-        self.inner.write_filemarks(count)
+        self.prove_initial_position()?;
+        let expected = self
+            .expected_next_lba
+            .checked_add(u64::from(count))
+            .ok_or_else(|| {
+                TapeIoError::OperationFailed("overlap expected next LBA overflow".to_string())
+            })?;
+        let outcome = self.inner.write_filemarks(count)?;
+        self.prove_position(
+            outcome.position_after,
+            expected,
+            "WRITE FILEMARKS completion",
+        )?;
+        self.expected_next_lba = expected;
+        Ok(outcome)
     }
 
     fn write_filemarks_immediate(&mut self, count: u32) -> Result<(), TapeIoError> {
-        self.inner.write_filemarks_immediate(count)
+        self.prove_initial_position()?;
+        let expected = self
+            .expected_next_lba
+            .checked_add(u64::from(count))
+            .ok_or_else(|| {
+                TapeIoError::OperationFailed("overlap expected next LBA overflow".to_string())
+            })?;
+        self.inner.write_filemarks_immediate(count)?;
+        // IMMED is submission, not completion. The next position proof checks
+        // this boundary after the underlying staging layer drains the command.
+        self.expected_next_lba = expected;
+        Ok(())
     }
 
     fn space_to_end_of_data(&mut self) -> Result<TapePosition, TapeIoError> {

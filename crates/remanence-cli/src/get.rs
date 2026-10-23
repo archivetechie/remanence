@@ -106,6 +106,7 @@ struct RestoredMember {
     dest_path: PathBuf,
     size_bytes: u64,
     sha256: String,
+    warnings: Vec<String>,
 }
 
 /// The successful restore receipt retains capability context from the server.
@@ -130,6 +131,7 @@ fn get_receipt_json(
                 "restored_to": member.dest_path.display().to_string(),
                 "size_bytes": member.size_bytes.to_string(),
                 "sha256": member.sha256,
+                "warnings": member.warnings,
             })
         }).collect::<Vec<_>>(),
     });
@@ -286,6 +288,17 @@ async fn restore_members(
     args: &GetArgs,
     err: &mut dyn Write,
 ) -> Result<Vec<RestoredMember>, DaemonClientError> {
+    // The caller may name the destination through a symlink. Resolve that
+    // root once; staging and member paths then share the same destination.
+    std::fs::create_dir_all(&args.dest)
+        .map_err(|e| DaemonClientError::client(format!("create {}: {e}", args.dest.display())))?;
+    let destination = std::fs::canonicalize(&args.dest)
+        .map_err(|e| DaemonClientError::client(format!("resolve {}: {e}", args.dest.display())))?;
+    let staging = remanence_stream::create_restore_staging(&destination)
+        .map_err(|e| DaemonClientError::client(e.to_string()))?;
+    for warning in &staging.warnings {
+        let _ = writeln!(err, "warning: {warning}");
+    }
     let mut restored = Vec::with_capacity(files.len());
     for file in files {
         // Catalog-supplied path: sanitize with put's own rules before it may
@@ -297,7 +310,7 @@ async fn restore_members(
                     "refusing member with unsafe archive path: {error}"
                 ))
             })?;
-        let dest_path = args.dest.join(&safe_path);
+        let dest_path = destination.join(&safe_path);
         if dest_path.exists() && !args.overwrite {
             return Err(DaemonClientError::client(format!(
                 "{} already exists; pass --overwrite to replace it",
@@ -311,12 +324,12 @@ async fn restore_members(
         }
 
         let started = Instant::now();
-        let (bytes, actual_sha256, tmp_path) = stream_member(
+        let (bytes, actual_sha256, tmp_path, handle) = stream_member(
             client,
             session_id,
             &record.object_id,
             file,
-            &dest_path,
+            staging.path(),
             args.stream_chunk_bytes,
         )
         .await?;
@@ -325,7 +338,7 @@ async fn restore_members(
         if !expected.is_empty() && expected != actual_sha256 {
             return Err(DaemonClientError::client(format!(
                 "member {} read from tape hashed {actual_sha256}, but the \
-                 catalog says {expected}; the partial restore is kept at {} — \
+                 catalog says {expected}; the temporary restore at {} will be removed — \
                  either the copy is damaged (treat it as suspect: re-read or \
                  scrub) or this object is encrypted at rest, whose ciphertext \
                  this command does not decrypt",
@@ -341,6 +354,22 @@ async fn restore_members(
                 file.path,
             );
         }
+        let mut warnings = Vec::new();
+        remanence_stream::apply_restored_mtime(
+            &handle,
+            &file.path,
+            file.mtime.as_deref(),
+            &mut warnings,
+        );
+        let _ = err.write_all(&warnings);
+        let mut warnings: Vec<String> = String::from_utf8_lossy(&warnings)
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        if restored.is_empty() {
+            warnings.extend(staging.warnings.clone());
+        }
+        drop(handle);
         std::fs::rename(&tmp_path, &dest_path).map_err(|error| {
             DaemonClientError::client(format!(
                 "install {} over {}: {error}",
@@ -366,12 +395,13 @@ async fn restore_members(
             dest_path,
             size_bytes: bytes,
             sha256: actual_sha256,
+            warnings,
         });
     }
     Ok(restored)
 }
 
-/// Stream one member to `<dest>.rem-get-tmp`, hashing as bytes land. The
+/// Stream one member into destination-local private staging, hashing as bytes land. The
 /// caller renames into place only after the digest verifies; on a transport
 /// error the temporary file is removed (nothing was proven about it).
 async fn stream_member(
@@ -381,8 +411,8 @@ async fn stream_member(
     file: &pb::FileRecord,
     dest_path: &std::path::Path,
     stream_chunk_bytes: u32,
-) -> Result<(u64, String, PathBuf), DaemonClientError> {
-    let tmp_path = dest_path.with_extension("rem-get-tmp");
+) -> Result<(u64, String, PathBuf, std::fs::File), DaemonClientError> {
+    let tmp_path = dest_path.join(uuid::Uuid::new_v4().to_string());
     let mut output = tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -436,7 +466,12 @@ async fn stream_member(
             tmp_path.display(),
         )));
     }
-    Ok((bytes, hex(&hasher.finalize()), tmp_path))
+    Ok((
+        bytes,
+        hex(&hasher.finalize()),
+        tmp_path,
+        output.into_std().await,
+    ))
 }
 
 fn selector_name(args: &GetArgs) -> &'static str {
@@ -895,6 +930,7 @@ mod tests {
                 file_id: file_id.to_vec(),
                 path: path.to_string(),
                 size_bytes: payload.len() as u64,
+                mtime: Some("1234567890.123456789".into()),
                 file_sha256: if truthful {
                     digest.to_vec()
                 } else {
@@ -996,25 +1032,47 @@ mod tests {
         let alpha = b"the get roundtrip payload".repeat(64);
         let beta = b"nested member payload".repeat(32);
         let store = store(vec![
-            member("alpha.bin", [1; 16], &alpha, true),
-            member("nested/beta.bin", [2; 16], &beta, true),
+            member("photos.txt", [1; 16], &alpha, true),
+            member("photos.md", [2; 16], &beta, true),
         ]);
         let (endpoint, _runtime, _dir) = serve_fake(store);
 
         let dest = tempfile::tempdir().unwrap();
+        std::fs::write(dest.path().join("photos.rem-get-tmp"), b"unrelated").unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let destination_link = links.path().join("restore");
+        std::os::unix::fs::symlink(dest.path(), &destination_link).unwrap();
         let args = get_args(
             Uuid::from_bytes(OBJECT_ID).to_string(),
-            dest.path().to_path_buf(),
+            destination_link,
             endpoint,
         );
         let (result, out, err) = run_get_blocking(&args);
         assert!(result.is_ok(), "{result:?}\nstderr: {err}");
 
-        assert_eq!(std::fs::read(dest.path().join("alpha.bin")).unwrap(), alpha);
         assert_eq!(
-            std::fs::read(dest.path().join("nested/beta.bin")).unwrap(),
-            beta
+            std::fs::read(dest.path().join("photos.txt")).unwrap(),
+            alpha
         );
+        assert_eq!(std::fs::read(dest.path().join("photos.md")).unwrap(), beta);
+        for member in ["photos.txt", "photos.md"] {
+            assert_eq!(
+                std::fs::metadata(dest.path().join(member))
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+                std::time::UNIX_EPOCH + std::time::Duration::new(1_234_567_890, 123_456_789)
+            );
+        }
+        assert_eq!(
+            std::fs::read(dest.path().join("photos.rem-get-tmp")).unwrap(),
+            b"unrelated"
+        );
+        assert!(!std::fs::read_dir(dest.path()).unwrap().any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".rem-staging-")));
         let receipt: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(receipt["digest_verified"], true);
         assert_eq!(receipt["members"].as_array().unwrap().len(), 2);
@@ -1023,7 +1081,7 @@ mod tests {
     }
 
     #[test]
-    fn get_refuses_a_digest_mismatch_and_keeps_the_partial() {
+    fn get_refuses_a_digest_mismatch_and_removes_staging() {
         let payload = b"tampered payload".repeat(32);
         let store = store(vec![member("data.bin", [1; 16], &payload, false)]);
         let (endpoint, _runtime, _dir) = serve_fake(store);
@@ -1047,9 +1105,9 @@ mod tests {
             "mismatch must name the encrypted possibility: {}",
             error.message
         );
-        // Not published; the unverified bytes stay in the tmp for forensics.
+        // Neither the unverified output nor private staging survives refusal.
         assert!(!dest.path().join("data.bin").exists());
-        assert!(dest.path().join("data.rem-get-tmp").exists());
+        assert_eq!(std::fs::read_dir(dest.path()).unwrap().count(), 0);
     }
 
     #[test]

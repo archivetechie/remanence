@@ -2627,6 +2627,7 @@ dependencies = [
  "remanence-aead",
  "remanence-api",
  "remanence-chaos",
+ "remanence-daemon",
  "remanence-format",
  "remanence-format-driver",
  "remanence-library",
