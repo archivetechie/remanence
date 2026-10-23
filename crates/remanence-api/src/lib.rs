@@ -88,7 +88,9 @@ pub use append_admission::{admit_checkpointed_tape, admit_initialized_tape, Appe
 #[cfg(test)]
 extern crate self as remanence_api;
 mod catalogless_restore;
-pub use catalogless_restore::{restore_catalogless, scan_and_restore};
+pub use catalogless_restore::{
+    restore_catalogless, restore_catalogless_selected, scan_and_restore,
+};
 mod catalog_request;
 mod daemon_catalog_services;
 mod diagnostics;

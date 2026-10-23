@@ -729,7 +729,11 @@ impl BlockSink for StagedBlockSink {
 
     fn write_filemarks_immediate(&mut self, count: u32) -> Result<(), TapeIoError> {
         self.flush_pending()?;
-        self.request(|reply| PipelinedSinkCommand::WriteFilemarksImmediate { count, reply })
+        // Seed before submission: a later position query already includes the marks.
+        self.seed_cursor()?;
+        self.request(|reply| PipelinedSinkCommand::WriteFilemarksImmediate { count, reply })?;
+        self.advance_cursor(count)?;
+        Ok(())
     }
 
     fn space_to_end_of_data(&mut self) -> Result<TapePosition, TapeIoError> {

@@ -109,16 +109,7 @@ impl pb::write_session_service_server::WriteSessionService for WriteSessionApi {
         &self,
         request: Request<tonic::Streaming<pb::AppendObjectMessage>>,
     ) -> Result<Response<pb::ObjectRecord>, Status> {
-        let spool_dir = self.spool_dir_for_log();
-        let result = async {
-            authorize_request(&request, AuthPermission::Write)?;
-            self.append_object_stream(request.into_inner()).await
-        }
-        .await;
-        if let Err(status) = &result {
-            log_append_object_failure(spool_dir.as_str(), status);
-        }
-        result
+        self.append_object_from_stream(request).await
     }
 
     async fn checkpoint_session(
@@ -188,6 +179,28 @@ impl pb::write_session_service_server::WriteSessionService for WriteSessionApi {
 }
 
 impl WriteSessionApi {
+    /// Run the authenticated append ingress with an in-process message stream.
+    /// The RPC delegates here so embedded callers use the same validation and writer.
+    #[doc(hidden)]
+    pub async fn append_object_from_stream<S>(
+        &self,
+        request: Request<S>,
+    ) -> Result<Response<pb::ObjectRecord>, Status>
+    where
+        S: Stream<Item = Result<pb::AppendObjectMessage, Status>> + Unpin + Send + 'static,
+    {
+        let spool_dir = self.spool_dir_for_log();
+        let result = async {
+            authorize_request(&request, AuthPermission::Write)?;
+            self.append_object_stream(request.into_inner()).await
+        }
+        .await;
+        if let Err(status) = &result {
+            log_append_object_failure(spool_dir.as_str(), status);
+        }
+        result
+    }
+
     fn spool_dir_for_log(&self) -> String {
         self.state
             .spool_dir
@@ -233,6 +246,10 @@ impl WriteSessionApi {
             logical_start,
         ) = match first.payload {
             Some(pb::append_object_message::Payload::Start(start)) => {
+                if let Some(mtime) = &start.mtime {
+                    remanence_format::layout::validate_pax_mtime(mtime)
+                        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+                }
                 if start.body_format_manifest.is_some() {
                     return Err(Status::unimplemented(
                         "body_format_manifest is not wired in this write-session slice",
@@ -308,6 +325,7 @@ impl WriteSessionApi {
                 ));
             }
         };
+        let mtime = logical_start.as_ref().and_then(|s| s.mtime.clone());
         if let Some(start) = logical_start {
             let overlap_eligible = overlap_append_eligible(
                 self.state.append_staging_mode,
@@ -423,6 +441,7 @@ impl WriteSessionApi {
             session_id,
             crate::mount::AppendFinishRequest {
                 spool_path: spool_path.clone(),
+                mtime,
                 archive_path,
                 caller_object_id,
                 expected_content_sha256,
@@ -501,12 +520,13 @@ impl WriteSessionApi {
             "remanence_write_diag",
         );
 
-        let source = StreamedWriteSource::new(
+        let mut source = StreamedWriteSource::new(
             consumer,
             declared_size_bytes,
             start_digest,
             Arc::clone(&control),
         );
+        source.mtime = start.mtime.clone();
         let append_started = Instant::now();
         let append = crate::mount::append_streamed(
             &self.state,
@@ -581,7 +601,12 @@ impl WriteSessionApi {
             Err(actor_status) => {
                 if receive_task.is_finished() {
                     if let Ok(Err(receive_status)) = receive_task.await {
-                        return Err(receive_status);
+                        // A closed ring is a consequence of the consumer failure.
+                        // Preserve the actor's cause; retain independently detected
+                        // stream validation errors (bad digest, length, or shape).
+                        if receive_status.code() != tonic::Code::Cancelled {
+                            return Err(receive_status);
+                        }
                     }
                 } else {
                     receive_task.abort();

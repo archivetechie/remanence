@@ -204,6 +204,8 @@ pub struct StreamingObjectWriteReport {
 pub struct FilesystemRestoreOptions {
     /// Replace an existing destination file.
     pub overwrite: bool,
+    /// Native REM members or slash-terminated directory prefixes; empty selects all.
+    pub members: Vec<String>,
     /// Also restore Remanence's generated manifest file.
     pub include_manifest: bool,
     /// Xattr namespace prefixes that may be restored.
@@ -214,6 +216,7 @@ impl Default for FilesystemRestoreOptions {
     fn default() -> Self {
         Self {
             overwrite: false,
+            members: Vec::new(),
             include_manifest: false,
             xattr_allowed_prefixes: vec!["user.".to_string()],
         }
@@ -223,6 +226,8 @@ impl Default for FilesystemRestoreOptions {
 /// Report from streaming an object to a filesystem directory.
 #[derive(Debug, Clone)]
 pub struct FilesystemRestoreReport {
+    /// Non-fatal metadata restoration warnings.
+    pub warnings: Vec<String>,
     /// Layer 3b streaming parse report.
     pub stream: RemTarStreamReport,
     /// User-visible files written.
@@ -474,6 +479,173 @@ pub fn write_prepared_object_to_parity_from_readers(
     })
 }
 
+/// Destination-local staging, removed on success, failure, or unwind.
+/// Directory locks distinguish abandoned work from concurrent live restores.
+pub struct RestoreStaging {
+    directory: tempfile::TempDir,
+    _lock: Option<nix::fcntl::Flock<File>>,
+    /// Abandoned staging directories removed before this restore began.
+    pub warnings: Vec<String>,
+}
+impl RestoreStaging {
+    /// The private staging directory beneath the restore destination.
+    pub fn path(&self) -> &Path {
+        self.directory.path()
+    }
+}
+
+/// Reclaim abandoned staging under the destination, then reserve a fresh directory.
+pub fn create_restore_staging(root: &Path) -> Result<RestoreStaging, StreamingError> {
+    create_restore_staging_with_lock(root, nix::fcntl::Flock::lock)
+}
+
+/// Treat only unavailable locking as optional; permissions and IO errors still fail.
+fn restore_lock_unavailable(error: nix::errno::Errno) -> bool {
+    matches!(
+        error,
+        nix::errno::Errno::ENOLCK | nix::errno::Errno::EOPNOTSUPP | nix::errno::Errno::ENOSYS
+    )
+}
+
+/// Keep lock fallback and reclamation in the same staging funnel, with injectable IO.
+fn create_restore_staging_with_lock(
+    root: &Path,
+    mut lock: impl FnMut(
+        File,
+        nix::fcntl::FlockArg,
+    ) -> Result<nix::fcntl::Flock<File>, (File, nix::errno::Errno)>,
+) -> Result<RestoreStaging, StreamingError> {
+    use nix::fcntl::FlockArg;
+    ensure_restore_root(root)?;
+    let mut run = || -> std::io::Result<RestoreStaging> {
+        // Serialize discovery and creation, including acquisition of the
+        // lifetime lock. Unsupported locking disables reclamation entirely.
+        let root_lock = match lock(File::open(root)?, FlockArg::LockExclusive) {
+            Ok(lock) => Some(lock),
+            Err((_, e)) if restore_lock_unavailable(e) => None,
+            Err((_, e)) => return Err(e.into()),
+        };
+        let mut directory = tempfile::Builder::new()
+            .prefix(&format!(".rem-staging-{}", uuid::Uuid::new_v4()))
+            .rand_bytes(0)
+            .tempdir_in(root)?;
+        let stage_lock = if root_lock.is_some() {
+            match lock(
+                File::open(directory.path())?,
+                FlockArg::LockExclusiveNonblock,
+            ) {
+                Ok(lock) => Some(lock),
+                Err((_, e)) if restore_lock_unavailable(e) => None,
+                Err((_, e)) => return Err(e.into()),
+            }
+        } else {
+            None
+        };
+        let mut warnings = Vec::new();
+        if stage_lock.is_none() {
+            // Unlocked live work must also survive a later restore on a client
+            // where locks work. Give it a name excluded from the reclaim sweep.
+            directory.close()?;
+            directory = tempfile::Builder::new()
+                .prefix(".rem-unlocked-staging-")
+                .tempdir_in(root)?;
+            warnings
+                .push("restore staging locks unavailable; abandoned staging not reclaimed".into());
+        } else {
+            for entry in fs::read_dir(root)? {
+                let entry = entry?;
+                if entry.path() == directory.path() {
+                    continue;
+                }
+                let name = entry.file_name();
+                let Some(suffix) = name.to_str().and_then(|s| s.strip_prefix(".rem-staging-"))
+                else {
+                    continue;
+                };
+                if uuid::Uuid::parse_str(suffix).is_err() || !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let file = match File::open(entry.path()) {
+                    Ok(file) => file,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e),
+                };
+                match lock(file, FlockArg::LockExclusiveNonblock) {
+                    Ok(_lock) => {
+                        match fs::remove_dir_all(entry.path()) {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                            Err(e) => return Err(e),
+                        }
+                        warnings.push(format!(
+                            "removed abandoned restore staging {}",
+                            entry.path().display()
+                        ));
+                    }
+                    Err((_, nix::errno::Errno::EWOULDBLOCK)) => {}
+                    Err((_, e)) if restore_lock_unavailable(e) => {
+                        warnings.push(
+                            "restore staging locks unavailable; abandoned staging not reclaimed"
+                                .into(),
+                        );
+                        break;
+                    }
+                    Err((_, e)) => return Err(e.into()),
+                }
+            }
+        }
+        Ok(RestoreStaging {
+            directory,
+            _lock: stage_lock,
+            warnings,
+        })
+    };
+    run().map_err(|e| io_error("create restore staging", root, e))
+}
+
+/// Apply a recorded decimal PAX mtime after validating a restored member.
+/// Timestamp failures are warnings: they never discard validated file content.
+pub fn apply_restored_mtime(
+    file: &File,
+    path: &str,
+    mtime: Option<&str>,
+    warnings: &mut dyn Write,
+) {
+    let Some(value) = mtime else { return };
+    let result = (|| {
+        let (seconds, fraction) = value.split_once('.').unwrap_or((value, ""));
+        if seconds.is_empty()
+            || (value.contains('.') && fraction.is_empty())
+            || !seconds.bytes().all(|b| b.is_ascii_digit())
+            || !fraction.bytes().all(|b| b.is_ascii_digit())
+        {
+            return Err(std::io::Error::other("invalid recorded mtime"));
+        }
+        let seconds = seconds.parse::<u64>().map_err(std::io::Error::other)?;
+        let nanos = format!("{fraction:0<9}")[..9]
+            .parse::<u32>()
+            .map_err(std::io::Error::other)?;
+        let time = UNIX_EPOCH
+            .checked_add(std::time::Duration::new(seconds, nanos))
+            .ok_or_else(|| std::io::Error::other("mtime out of range"))?;
+        file.set_modified(time)
+    })();
+    if let Err(error) = result {
+        let _ = writeln!(
+            warnings,
+            "warning: {path}: could not apply recorded mtime: {error}"
+        );
+    }
+}
+
+/// Match exact archive members, or directory prefixes ending in a slash.
+pub fn restore_member_selected(path: &str, members: &[String]) -> bool {
+    members.is_empty()
+        || members
+            .iter()
+            .any(|m| path == m || (m.ends_with('/') && path.starts_with(m)))
+}
+
 /// Restore one object-local block stream into a destination directory.
 pub fn restore_object_to_directory<S: BlockSource + ?Sized>(
     source: &mut S,
@@ -485,12 +657,22 @@ pub fn restore_object_to_directory<S: BlockSource + ?Sized>(
     let destination_root = destination_root.as_ref();
     let mut sink = FilesystemRestoreSink::new(destination_root, options)?;
     let stream = stream_rem_tar_object(source, chunk_size, block_count, &mut sink)?;
+    let selected_entries: Vec<_> = stream
+        .entries
+        .iter()
+        .filter(|e| restore_member_selected(&e.path, &sink.options.members))
+        .cloned()
+        .collect();
     let xattrs = apply_restored_xattrs(
         &sink.root,
-        &stream.entries,
+        &selected_entries,
         &sink.options.xattr_allowed_prefixes,
     )?;
     Ok(FilesystemRestoreReport {
+        warnings: String::from_utf8_lossy(&sink.warnings)
+            .lines()
+            .map(str::to_owned)
+            .collect(),
         stream,
         files_written: sink.files_written,
         directories_seen: sink.directories_seen,
@@ -1017,12 +1199,13 @@ pub fn normalize_archive_path(path: &Path) -> Result<String, StreamingError> {
     Ok(parts.join("/"))
 }
 
-fn metadata_mtime(metadata: &fs::Metadata) -> Option<String> {
+/// Format filesystem modification time as canonical decimal PAX seconds.
+pub fn metadata_mtime(metadata: &fs::Metadata) -> Option<String> {
     metadata
         .modified()
         .ok()
         .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs().to_string())
+        .map(|duration| format!("{}.{:09}", duration.as_secs(), duration.subsec_nanos()))
 }
 
 #[cfg(unix)]
@@ -1365,6 +1548,7 @@ impl EntryCatalogSink for CollectingCatalogSink {
 }
 
 struct FilesystemRestoreSink {
+    warnings: Vec<u8>,
     root: PathBuf,
     options: FilesystemRestoreOptions,
     native_destinations: BTreeMap<Vec<String>, String>,
@@ -1384,6 +1568,7 @@ impl FilesystemRestoreSink {
             options,
             native_destinations: BTreeMap::new(),
             current: RestoreTarget::None,
+            warnings: Vec::new(),
             files_written: 0,
             directories_seen: 0,
             symlinks_written: 0,
@@ -1410,7 +1595,9 @@ impl FilesystemRestoreSink {
 
 impl RemTarEntrySink for FilesystemRestoreSink {
     fn begin_file(&mut self, entry: &RemTarStreamEntry) -> Result<(), FormatError> {
-        if entry.path == MANIFEST_PATH && !self.options.include_manifest {
+        if !restore_member_selected(&entry.path, &self.options.members)
+            || (entry.path == MANIFEST_PATH && !self.options.include_manifest)
+        {
             self.current = RestoreTarget::Skip;
             return Ok(());
         }
@@ -1532,6 +1719,12 @@ impl RemTarEntrySink for FilesystemRestoreSink {
                 }
                 file.flush()
                     .map_err(|err| format_sink_io("flush restore file", &destination, err))?;
+                apply_restored_mtime(
+                    &file,
+                    &entry.path,
+                    entry.pax_records.get("mtime").map(String::as_str),
+                    &mut self.warnings,
+                );
                 self.files_written += 1;
                 Ok(())
             }
@@ -1811,6 +2004,91 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
+    /// Active locks preserve concurrent restores; crash leftovers are reclaimed and reported.
+    #[test]
+    fn staging_reclaims_only_abandoned_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let active = super::create_restore_staging(root.path()).unwrap();
+        let orphan = root
+            .path()
+            .join(format!(".rem-staging-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&orphan).unwrap();
+        std::fs::write(orphan.join("stored"), b"abandoned ciphertext").unwrap();
+        let next = super::create_restore_staging(root.path()).unwrap();
+        assert!(active.path().exists());
+        assert!(!orphan.exists());
+        assert_eq!(next.warnings.len(), 1);
+        assert!(next.warnings[0].contains(orphan.to_str().unwrap()));
+        drop(next);
+        drop(active);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    /// Unavailable locks keep content usable, skip reclaim, and warn once.
+    #[test]
+    fn staging_without_locks_preserves_other_restores() {
+        use nix::{errno::Errno, fcntl::Flock};
+        for errno in [Errno::ENOLCK, Errno::EOPNOTSUPP, Errno::ENOSYS] {
+            for fail_at in [1, 2] {
+                let root = tempfile::tempdir().unwrap();
+                let orphan = root
+                    .path()
+                    .join(format!(".rem-staging-{}", uuid::Uuid::new_v4()));
+                std::fs::create_dir(&orphan).unwrap();
+                let mut calls = 0;
+                let staging = super::create_restore_staging_with_lock(root.path(), |file, arg| {
+                    calls += 1;
+                    if calls == fail_at {
+                        Err((file, errno))
+                    } else {
+                        Flock::lock(file, arg)
+                    }
+                })
+                .unwrap();
+                assert!(orphan.exists());
+                assert_eq!(staging.warnings.len(), 1);
+                std::fs::write(staging.path().join("payload"), b"validated").unwrap();
+                let locked = super::create_restore_staging(root.path()).unwrap();
+                assert!(staging.path().join("payload").exists());
+                drop(locked);
+                let path = staging.path().to_owned();
+                drop(staging);
+                assert!(!path.exists());
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        assert!(
+            super::create_restore_staging_with_lock(root.path(), |file, _| {
+                Err((file, Errno::EACCES))
+            })
+            .is_err()
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    /// Malformed dates warn per member while preserving validated content.
+    #[test]
+    fn invalid_restore_mtime_warns_without_discarding_content() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"validated").unwrap();
+        let before = file.as_file().metadata().unwrap().modified().unwrap();
+        let mut warnings = Vec::new();
+        super::apply_restored_mtime(
+            file.as_file(),
+            "photos/a.txt",
+            Some("invalid"),
+            &mut warnings,
+        );
+        assert!(String::from_utf8(warnings)
+            .unwrap()
+            .contains("photos/a.txt: could not apply recorded mtime"));
+        assert_eq!(
+            file.as_file().metadata().unwrap().modified().unwrap(),
+            before
+        );
+        assert_eq!(std::fs::read(file.path()).unwrap(), b"validated");
+    }
+
     use std::collections::{BTreeMap, HashMap};
 
     use remanence_format::{RemTarEntryType, RemTarObjectOptions};
@@ -2805,6 +3083,30 @@ mod tests {
                 "{invalid_path} must fail before its entry is materialized"
             );
         }
+    }
+
+    /// An unrepresentable timestamp remains a structured warning after content validation.
+    #[test]
+    fn restore_report_retains_mtime_warning() {
+        let mut opts = options();
+        opts.chunk_size = 4096;
+        let mut spec = RemTarFileSpec::new("dated.txt", "dated", 5, sha256_array(b"valid"));
+        spec.mtime = Some("999999999999999999999999999999999999".into());
+        let (blocks, layout) =
+            rem_object_blocks_with_payloads(&opts, vec![(spec, b"valid".to_vec())]);
+        let mut source = VecBlockSource::new(blocks);
+        let root = tempfile::tempdir().unwrap();
+        let report = restore_object_to_directory(
+            &mut source,
+            opts.chunk_size,
+            layout.projected_size_blocks,
+            root.path(),
+            FilesystemRestoreOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(root.path().join("dated.txt")).unwrap(), b"valid");
+        assert_eq!(report.warnings.len(), 1);
+        assert!(report.warnings[0].contains("dated.txt: could not apply recorded mtime"));
     }
 
     #[test]

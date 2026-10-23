@@ -14192,7 +14192,7 @@ fn archive_extract_report_json(
         "bytes_written": report.bytes_written,
         "skipped_xattrs": &report.skipped_xattrs,
         "applied_privileged_xattrs": &report.applied_privileged_xattrs,
-        "warnings": read_warning_names(&report.stream.warnings),
+        "warnings": read_warning_names(&report.stream.warnings).into_iter().map(str::to_owned).chain(report.warnings.iter().cloned()).collect::<Vec<_>>(),
     })
 }
 
@@ -23090,6 +23090,7 @@ blob Project/Render Files/
     #[test]
     fn archive_extract_json_reports_applied_privileged_names_without_values() {
         let report = remanence_stream::FilesystemRestoreReport {
+            warnings: Vec::new(),
             stream: remanence_format::RemTarStreamReport {
                 global_pax: BTreeMap::new(),
                 entries: Vec::new(),

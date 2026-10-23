@@ -233,7 +233,8 @@ pub enum TerminalFinalizationOutcome {
 }
 
 impl TerminalFinalizationOutcome {
-    fn as_str(self) -> &'static str {
+    /// Stable machine-readable finalization outcome.
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::InProgress => "in_progress",
             Self::Finalized => "finalized",
@@ -1357,6 +1358,48 @@ impl CatalogIndex {
         let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|err| sqlite_open_error(&path, err))?;
         configure_read_only_sqlite(&conn)?;
+        validate_schema(&conn)?;
+        Ok(Self { conn, path })
+    }
+
+    /// Query the catalog in place without a temporary copy or writable read marks.
+    /// A live WAL uses SQLite's read-only SHM support; a closed catalog uses an
+    /// immutable connection so SQLite cannot create absent WAL/SHM sidecars.
+    /// Use from a reader process without writable catalog connections (SQLite
+    /// shares SHM mappings within a process), and check file stamps around reads
+    /// to detect concurrent changes to an immutable connection's catalog.
+    pub fn open_inventory(path: impl AsRef<Path>) -> Result<Self, StateError> {
+        use std::fmt::Write;
+        use std::os::unix::ffi::OsStrExt;
+        let path = fs::canonicalize(path.as_ref())
+            .map_err(|e| StateError::io_at("resolve inventory catalog", path.as_ref(), e))?;
+        let mut wal_name = path.as_os_str().to_os_string();
+        wal_name.push("-wal");
+        let has_wal = Path::new(&wal_name)
+            .try_exists()
+            .map_err(|e| StateError::io_at("stat inventory WAL", Path::new(&wal_name), e))?;
+        // Escape URI delimiters (including literal %) and non-UTF8 filename bytes.
+        let mut uri = String::from("file:");
+        for byte in path.as_os_str().as_bytes() {
+            if byte.is_ascii_alphanumeric() || b"/-._~".contains(byte) {
+                uri.push(char::from(*byte));
+            } else {
+                write!(&mut uri, "%{byte:02X}").expect("write URI to string");
+            }
+        }
+        uri.push_str(if has_wal {
+            "?mode=ro&readonly_shm=1"
+        } else {
+            "?mode=ro&immutable=1"
+        });
+        let conn = Connection::open_with_flags(
+            uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|e| sqlite_open_error(&path, e))?;
+        configure_read_only_sqlite(&conn)?;
+        conn.pragma_update(None, "temp_store", "MEMORY")
+            .map_err(|e| sqlite_error("set inventory temp store", e))?;
         validate_schema(&conn)?;
         Ok(Self { conn, path })
     }
@@ -5780,6 +5823,71 @@ impl CatalogIndex {
         archive_path: &str,
     ) -> Result<Vec<VersionRow>, StateError> {
         self.committed_versions_by_path(archive_path, None, None)
+    }
+
+    /// Read committed path inventories, grouped by copy pool, with deterministic newest versions.
+    pub fn list_committed_paths(
+        &self,
+        tape: Option<&str>,
+        prefix: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, StateError> {
+        if let Some(selector) = tape {
+            let known = self.list_tapes(None, TapeKindFilter::All)?.iter().any(|t| {
+                t.voltag.as_deref() == Some(selector)
+                    || Uuid::parse_str(selector)
+                        .is_ok_and(|id| id.as_bytes().as_slice() == t.tape_uuid)
+            });
+            if !known {
+                return Err(StateError::ConfigInvalid(format!(
+                    "unknown tape: {selector}"
+                )));
+            }
+        }
+        let mut stmt = self.conn.prepare("select distinct c.pool_id, f.path from object_files f join object_copies c on c.object_id=f.object_id join tapes t on t.tape_uuid=c.tape_uuid where c.status='committed' order by c.pool_id, f.path")
+            .map_err(|e| sqlite_error("prepare path inventory", e))?;
+        let paths = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| sqlite_error("query path inventory", e))?;
+        let mut result = Vec::new();
+        for pair in paths {
+            let (pool, path) = pair.map_err(|e| sqlite_error("read path inventory", e))?;
+            if prefix.is_some_and(|p| !path.starts_with(p)) {
+                continue;
+            }
+            let mut versions = self.committed_versions_by_path(&path, Some(&pool), None)?;
+            if let Some(selector) = tape {
+                for version in &mut versions {
+                    version.copies.retain(|(id, label)| {
+                        label.as_deref() == Some(selector)
+                            || Uuid::from_slice(id)
+                                .is_ok_and(|id| Uuid::parse_str(selector) == Ok(id))
+                    });
+                }
+                versions.retain(|v| !v.copies.is_empty());
+            }
+            let Some(newest) = versions.first() else {
+                continue;
+            };
+            let mut locations = std::collections::BTreeMap::new();
+            for version in &versions {
+                for (id, label) in &version.copies {
+                    let record = self.get_tape(id)?;
+                    let finalized = record
+                        .as_ref()
+                        .and_then(|r| r.terminal_finalization.as_ref())
+                        .is_some_and(|f| {
+                            matches!(
+                                f.outcome,
+                                TerminalFinalizationOutcome::Finalized
+                                    | TerminalFinalizationOutcome::FinalizedDegraded
+                            )
+                        });
+                    locations.insert(label.clone().unwrap_or_else(|| hex_bytes(id)), finalized);
+                }
+            }
+            result.push(serde_json::json!({"pool": pool, "path": path, "size": newest.size_bytes, "version_count": versions.len(), "newest_object_id": newest.object_id, "tapes": locations.keys().collect::<Vec<_>>(), "finalized": locations.values().all(|v| *v)}));
+        }
+        Ok(result)
     }
 
     fn committed_versions_by_path(
@@ -18675,6 +18783,29 @@ mod tests {
                 if message.contains("not a canonical unsigned BLOB column")),
             "{error}"
         );
+    }
+
+    /// Inventory URI escaping preserves the target and never permits writes.
+    #[test]
+    fn inventory_escapes_paths_and_refuses_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("catalog %?#.sqlite");
+        drop(CatalogIndex::open(&path).unwrap());
+        let before = std::fs::read(&path).unwrap();
+        let mut reader = CatalogIndex::open_inventory(&path).unwrap();
+        assert!(reader
+            .upsert_tape_pool_projection(crate::TapePoolProjectionInput {
+                pool_id: "must-not-exist".into(),
+                display_name: None,
+                copy_class: None,
+                content_class: None,
+                created_at_utc: None,
+            })
+            .is_err());
+        assert!(reader.get_tape_pool("must-not-exist").unwrap().is_none());
+        drop(reader);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read(path).unwrap(), before);
     }
 
     #[test]

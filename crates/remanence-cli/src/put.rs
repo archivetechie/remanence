@@ -863,6 +863,9 @@ async fn append_one(
     // the spooled bytes against a digest it received before the first chunk.
     // One extra local read per file is the documented price.
     let content_sha256 = hash_file(&input.fs_path).await?;
+    let mtime = remanence_stream::metadata_mtime(
+        &std::fs::metadata(&input.fs_path).map_err(|e| DaemonClientError::client(e.to_string()))?,
+    );
 
     let (tx, rx) = tokio::sync::mpsc::channel::<pb::AppendObjectMessage>(8);
     let session_id_owned = session_id.to_vec();
@@ -898,6 +901,7 @@ async fn append_one(
                 caller_metadata,
                 declared_size_bytes: Some(declared_size_bytes),
                 body_format_manifest: None,
+                mtime,
                 expected_content_sha256: Some(content_sha256.to_vec()),
                 expected_content_digest: Some(digest.clone()),
                 source_replay_capability: pb::SourceReplayCapability::ReplayFromStart as i32,

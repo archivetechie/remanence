@@ -260,13 +260,14 @@ fn native_file_proto_preserves_u64_chunk_count() {
         file_digest_algorithm: "sha256".to_string(),
         first_chunk_lba: Some(0),
         chunk_count,
-        mtime: None,
+        mtime: Some("1234567890.123456789".into()),
         executable: None,
     };
 
     let proto = native_object_file_to_proto(record).expect("valid file record");
 
     assert_eq!(proto.chunk_count, chunk_count);
+    assert_eq!(proto.mtime.as_deref(), Some("1234567890.123456789"));
 }
 
 #[test]
@@ -725,6 +726,7 @@ fn append_start_message(session_id: Uuid, declared_size_bytes: u64) -> pb::Appen
     pb::AppendObjectMessage {
         payload: Some(pb::append_object_message::Payload::Start(
             pb::AppendObjectStart {
+                mtime: None,
                 session_id: session_id.as_bytes().to_vec(),
                 caller_object_id: "caller-object".to_string(),
                 caller_metadata: HashMap::new(),
@@ -979,6 +981,7 @@ fn append_spool_cap_clamps_client_declared_size() {
 fn overlap_admission_compatibility_table_routes_deterministically() {
     let digest = [0x44; 32];
     let eligible = pb::AppendObjectStart {
+        mtime: None,
         session_id: Uuid::new_v4().as_bytes().to_vec(),
         caller_object_id: "caller-object".into(),
         caller_metadata: HashMap::new(),
@@ -7680,7 +7683,8 @@ async fn append_finish_does_not_double_count() {
                     ..
                 } => {
                     let spool_path = match source {
-                        crate::WriteObjectSource::Path(path) => path,
+                        crate::WriteObjectSource::Path(path)
+                        | crate::WriteObjectSource::Spool { path, .. } => path,
                         crate::WriteObjectSource::Streamed(_)
                         | crate::WriteObjectSource::PreparedPath(_) => {
                             panic!("test expected path-backed append source")
@@ -7720,6 +7724,7 @@ async fn append_finish_does_not_double_count() {
         &state,
         session_id,
         crate::mount::AppendFinishRequest {
+            mtime: None,
             spool_path,
             archive_path,
             caller_object_id: "caller-object".to_string(),
@@ -7736,6 +7741,105 @@ async fn append_finish_does_not_double_count() {
     assert_eq!(counter.write_bytes(), 8);
 
     actor.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlap_consumer_failure_survives_ring_cancellation() {
+    let mut state = ApiState::new(test_index());
+    let session_id = Uuid::new_v4();
+    let bay = 0x0102;
+    let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
+    let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel(1);
+    let reservations = Arc::new(std::collections::HashMap::from([(
+        bay,
+        std::sync::atomic::AtomicBool::new(false),
+    )]));
+    let pool = crate::write_owner::DrivePool::new_for_library(
+        "LIB-A",
+        changer_tx,
+        std::collections::HashMap::from([(bay, drive_tx)]),
+        reservations,
+    );
+    pool.record_session(
+        session_id,
+        crate::write_owner::MountedSession {
+            bay,
+            library_serial: "LIB-A".to_string(),
+            barcode: Some("AOX002L9".to_string()),
+            home_slot: Some(0x0401),
+            tape_uuid: [0xAC; 16],
+            drive_uuid: None,
+        },
+    );
+    state.drive_pool = Some(pool);
+    state.append_staging_mode = remanence_state::AppendStagingMode::Overlap;
+    let ring_bytes = crate::append_ring::APPEND_RING_SLAB_BYTES as u64;
+    state.append_ring_bytes = ring_bytes;
+    state.append_ring_high_pct = 50;
+    state.append_ring_low_pct = 25;
+    state.io_memory = crate::io_memory::IoMemoryReservation::new(ring_bytes).expect("manager");
+
+    let (receive_dropped_tx, receive_dropped_rx) = tokio::sync::oneshot::channel();
+    let actor = tokio::spawn(async move {
+        let command = drive_rx.recv().await.expect("append command");
+        let crate::write_owner::DriveCommand::AppendFinish { source, reply, .. } = command else {
+            panic!("expected append command");
+        };
+        drop(source);
+        // Wait until the receiver has exited on the closed ring. This pins
+        // the branch that used to replace the consumer's diagnostic.
+        receive_dropped_rx.await.expect("receiver drops stream");
+        tokio::task::yield_now().await;
+        reply
+            .send(Err(tonic::Status::failed_precondition(
+                "injected append admission refusal",
+            )))
+            .expect("deliver underlying cause");
+    });
+    struct ObservedStream {
+        messages: std::collections::VecDeque<Result<pb::AppendObjectMessage, tonic::Status>>,
+        dropped: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+    impl tokio_stream::Stream for ObservedStream {
+        type Item = Result<pb::AppendObjectMessage, tonic::Status>;
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Ready(self.messages.pop_front())
+        }
+    }
+    impl Drop for ObservedStream {
+        fn drop(&mut self) {
+            let _ = self.dropped.take().expect("drop once").send(());
+        }
+    }
+    let payload = vec![0x5a; 2 * crate::append_ring::APPEND_RING_SLAB_BYTES];
+    let digest: [u8; 32] = Sha256::digest(&payload).into();
+    let mut start_message = append_start_message(session_id, payload.len() as u64);
+    let Some(pb::append_object_message::Payload::Start(start)) = start_message.payload.as_mut()
+    else {
+        panic!("Start");
+    };
+    start.expected_content_sha256 = Some(digest.to_vec());
+    start.source_replay_capability = pb::SourceReplayCapability::ReplayFromStart as i32;
+    let stream = ObservedStream {
+        messages: [
+            Ok(start_message),
+            Ok(append_chunk_message(session_id, payload)),
+            Ok(append_finish_message(session_id, digest)),
+        ]
+        .into(),
+        dropped: Some(receive_dropped_tx),
+    };
+    let api = WriteSessionApi { state };
+    let error = tokio::time::timeout(Duration::from_secs(2), api.append_object_stream(stream))
+        .await
+        .expect("no deadlock after consumer failure")
+        .expect_err("append must fail");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(error.message(), "injected append admission refusal");
+    actor.await.expect("actor task");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7880,7 +7984,9 @@ async fn overlap_success_response_waits_for_checkpointed_receipt() {
         };
         let streamed = match source {
             crate::WriteObjectSource::Streamed(streamed) => streamed,
-            crate::WriteObjectSource::Path(_) | crate::WriteObjectSource::PreparedPath(_) => {
+            crate::WriteObjectSource::Path(_)
+            | crate::WriteObjectSource::Spool { .. }
+            | crate::WriteObjectSource::PreparedPath(_) => {
                 panic!("expected overlap stream")
             }
         };
@@ -8941,3 +9047,22 @@ async fn foreign_unit_reports_unregistered_format_in_core_distribution() {
         .contains("foreign format legacy-example-v1 is not registered in this distribution"));
 }
 use crate::auth::{authorize_request, AuthPermission};
+
+/// Malformed timestamps are rejected at ingress, before spool or mount admission.
+#[tokio::test]
+async fn append_rejects_invalid_mtime_before_io() {
+    let service = ApiState::new(test_index()).write_session_service();
+    for invalid in ["", "-1", "1.", "1.2.3", "tomorrow"] {
+        let mut start = append_start_message(Uuid::new_v4(), 4);
+        let Some(pb::append_object_message::Payload::Start(ref mut fields)) = start.payload else {
+            panic!("start")
+        };
+        fields.mtime = Some(invalid.into());
+        let error = service
+            .append_object_stream(tokio_stream::iter([Ok(start)]))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("mtime"));
+    }
+}

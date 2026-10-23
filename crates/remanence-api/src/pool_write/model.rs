@@ -302,6 +302,7 @@ pub enum WriteObjectInputKind {
 pub struct StreamedWriteSource {
     pub(super) reader: Arc<Mutex<Box<dyn Read + Send>>>,
     pub(super) size_bytes: u64,
+    pub(crate) mtime: Option<String>,
     pub(super) content_sha256: [u8; 32],
     pub(super) control: Arc<crate::append_ring::AppendRingControl>,
 }
@@ -325,6 +326,7 @@ impl StreamedWriteSource {
     ) -> Self {
         Self {
             reader: Arc::new(Mutex::new(Box::new(reader))),
+            mtime: None,
             size_bytes,
             content_sha256,
             control,
@@ -353,6 +355,13 @@ pub struct PreparedPathSource(pub(crate) remanence_stream::PreparedFile);
 pub enum WriteObjectSource {
     /// Completed local file used by the legacy serial and in-process paths.
     Path(PathBuf),
+    /// Completed daemon logical-file spool with caller metadata, never spool timestamps.
+    Spool {
+        /// Local completed spool owned by the write session.
+        path: PathBuf,
+        /// Optional validated decimal PAX timestamp supplied by the caller.
+        mtime: Option<String>,
+    },
     /// Prepared local file; the writer still validates every streamed byte.
     PreparedPath(PreparedPathSource),
     /// Live bounded-ring consumer used only by plaintext overlap appends.
@@ -362,7 +371,7 @@ pub enum WriteObjectSource {
 impl WriteObjectSource {
     pub(crate) fn size_bytes(&self) -> Result<u64, PoolWriteError> {
         match self {
-            Self::Path(path) => source_file_size(path),
+            Self::Path(path) | Self::Spool { path, .. } => source_file_size(path),
             Self::PreparedPath(source) => Ok(source.0.spec.size_bytes),
             Self::Streamed(source) => Ok(source.size_bytes),
         }
@@ -370,7 +379,7 @@ impl WriteObjectSource {
 
     pub(crate) fn content_sha256(&self) -> Result<[u8; 32], PoolWriteError> {
         match self {
-            Self::Path(path) => sha256_file(path),
+            Self::Path(path) | Self::Spool { path, .. } => sha256_file(path),
             Self::PreparedPath(source) => source.0.spec.file_sha256.ok_or_else(|| {
                 PoolWriteError::InvalidInput("prepared regular file has no digest".into())
             }),
@@ -380,13 +389,13 @@ impl WriteObjectSource {
 
     pub(crate) fn stream_control(&self) -> Option<Arc<crate::append_ring::AppendRingControl>> {
         match self {
-            Self::Path(_) | Self::PreparedPath(_) => None,
+            Self::Path(_) | Self::Spool { .. } | Self::PreparedPath(_) => None,
             Self::Streamed(source) => Some(Arc::clone(&source.control)),
         }
     }
 
     pub(crate) fn remove_completed_path(&self) {
-        if let Self::Path(path) = self {
+        if let Self::Path(path) | Self::Spool { path, .. } = self {
             let _ = fs::remove_file(path);
         }
     }

@@ -1645,7 +1645,7 @@ fn overlap_admission_plans_object_larger_than_legacy_64_gib_cap() {
     )
     .expect("ring");
     let digest = [0x42; 32];
-    let request = WriteObjectToPoolRequest {
+    let mut request = WriteObjectToPoolRequest {
         pool_id: selected.pool_id.clone(),
         source: WriteObjectSource::Streamed(StreamedWriteSource::new(
             consumer,
@@ -1661,8 +1661,16 @@ fn overlap_admission_plans_object_larger_than_legacy_64_gib_cap() {
         representation: PoolWriteRepresentation::Plaintext,
     };
 
+    let WriteObjectSource::Streamed(source) = &mut request.source else {
+        panic!("streamed source")
+    };
+    source.mtime = Some("1234567890.123456789".into());
     let prepared = prepare_pool_object(&request, selected.block_size)
         .expect("large streamed source must be plannable without payload");
+    assert_eq!(
+        prepared.files[0].spec.mtime.as_deref(),
+        Some("1234567890.123456789")
+    );
     assert_eq!(
         prepared_payload_bytes(&prepared),
         crate::APPEND_SPOOL_MAX_BYTES + 1
@@ -5379,5 +5387,51 @@ fn encrypted_first_epoch_journals_parity_state_and_replays() {
         let expected = state.get_native_object(&id).unwrap().unwrap();
         state.project_checkpoint_record(&records[0]).unwrap();
         assert_eq!(state.get_native_object(&id).unwrap().unwrap(), expected);
+    }
+}
+
+/// Both wrappers must count filemarks before reporting the following block.
+#[tokio::test]
+async fn overlap_and_staged_filemarks_advance_positions() {
+    for staged_mode in [false, true] {
+        for immediate in [false, true] {
+            let capacity = 2 * crate::append_ring::APPEND_RING_SLAB_BYTES as u64;
+            let manager = crate::io_memory::IoMemoryReservation::new(capacity).unwrap();
+            let (mut producer, _consumer, control) =
+                crate::append_ring::create_append_ring(&manager, capacity, 50, 25, capacity)
+                    .unwrap();
+            producer
+                .push(&vec![0x11; crate::append_ring::APPEND_RING_SLAB_BYTES])
+                .await
+                .unwrap();
+            let mut sink = StagedTestSink::new(2);
+            let exercise = |inner: &mut dyn BlockSink| -> Result<(), PoolWriteError> {
+                let mut gated = OverlapBlockSink {
+                    inner,
+                    control,
+                    expected_initial_lba: 0,
+                    expected_next_lba: 0,
+                    initial_position_proved: false,
+                    write_started: false,
+                    low_water_events: 0,
+                };
+                assert_eq!(gated.write_block(&[1; 4])?.position_after.lba, 1);
+                if immediate {
+                    gated.write_filemarks_immediate(1)?;
+                } else {
+                    assert_eq!(gated.write_filemarks(1)?.position_after.lba, 2);
+                }
+                assert_eq!(gated.expected_next_lba, 2);
+                assert_eq!(gated.write_block(&[2; 4])?.position_after.lba, 3);
+                assert_eq!(gated.expected_next_lba, 3);
+                Ok(())
+            };
+            if staged_mode {
+                run_staged_transfer(&mut sink, 4, exercise).unwrap();
+            } else {
+                exercise(&mut sink).unwrap();
+            }
+            assert_eq!(sink.position().unwrap().lba, 3);
+        }
     }
 }

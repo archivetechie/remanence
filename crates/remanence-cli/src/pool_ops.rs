@@ -1140,9 +1140,11 @@ pub(crate) fn restore_mounted_tape_object(
     let plan = resolve_object_read_plan(index, &loc)?;
     let block_size = plan.block_size_bytes;
     let anchor = plan.manifest_sha256;
-    let staging = tempfile::tempdir().map_err(|e| e.to_string())?;
+    remanence_stream::ensure_restore_root(destination).map_err(|e| e.to_string())?;
+    let staging =
+        remanence_stream::create_restore_staging(destination).map_err(|e| e.to_string())?;
     let stored = staging.path().join("stored");
-    let receipt = export_mounted_tape_object(
+    let mut receipt = export_mounted_tape_object(
         mount,
         index,
         locator,
@@ -1158,6 +1160,7 @@ pub(crate) fn restore_mounted_tape_object(
             &key,
         )
         .map_err(|e| e.to_string())?;
+        std::fs::remove_file(&stored).map_err(|e| e.to_string())?;
         plain
     } else {
         stored
@@ -1169,7 +1172,7 @@ pub(crate) fn restore_mounted_tape_object(
     let mut source = remanence_library::FileBlockSource::open(&plain, block_size as usize)
         .map_err(|e| e.to_string())?;
     let blocks = source.block_count();
-    remanence_stream::restore_object_to_directory(
+    let report = remanence_stream::restore_object_to_directory(
         &mut source,
         block_size as usize,
         blocks,
@@ -1177,6 +1180,11 @@ pub(crate) fn restore_mounted_tape_object(
         Default::default(),
     )
     .map_err(|e| e.to_string())?;
+    receipt["warnings"] = serde_json::json!(staging
+        .warnings
+        .iter()
+        .chain(&report.warnings)
+        .collect::<Vec<_>>());
     Ok(receipt)
 }
 

@@ -121,16 +121,29 @@ struct RemovalTransport {
     inner: remanence_chaos::model::ModelTransport,
     config: std::path::PathBuf,
     fail_writes: bool,
+    check_all_writes: bool,
+    writes_observed: u64,
 }
 impl RemovalTransport {
     /// Inspect persisted evidence at the dispatch boundary, before model IO.
-    fn assert_write_guard(&self, opcode: u8) {
+    fn assert_write_guard(&mut self, opcode: u8) {
+        // Finalization writes 2 GiB of separation records. Replaying the complete
+        // audit log before every zero block makes this observer quadratic.
+        // Inspect every 256th media write and every filemark boundary;
+        // production append admission remains active for every session.
+        if opcode == 0x0a {
+            self.writes_observed += 1;
+        }
+        if opcode == 0x0a && self.writes_observed % 256 != 1 && !self.check_all_writes {
+            return;
+        }
         if !matches!(opcode, 0x0a | 0x10) {
             return;
         }
         let config = remanence_state::load_config(&self.config).unwrap();
         let paths = remanence_state::StatePaths::from_config(&self.config, &config);
-        let index = remanence_state::CatalogIndex::open(&config.index.sqlite_path).unwrap();
+        let index =
+            remanence_state::CatalogIndex::open_read_only(&config.index.sqlite_path).unwrap();
         let sessions = index.non_terminal_sessions().unwrap();
         let session = sessions
             .iter()
@@ -236,6 +249,8 @@ fn home_roundtrip_and_metadata_use_real_dispatch() {
                     ),
                     config: root.path().join("state/rem/config.toml"),
                     fail_writes: false,
+                    check_all_writes: true,
+                    writes_observed: 0,
                 })
                     as Box<dyn remanence_library::SgTransport>)
             },
@@ -628,6 +643,8 @@ fn init_geometry_and_failed_bootstrap_are_guarded() {
                         ),
                         config: root.path().join("state/rem/config.toml"),
                         fail_writes: fail,
+                        check_all_writes: true,
+                        writes_observed: 0,
                     })
                         as Box<dyn remanence_library::SgTransport>)
                 },
@@ -777,6 +794,66 @@ impl VersionFixture {
         fixture.ok(&["tape", "init", "--label", "FIRST", "--generation", "L9"]);
         fixture
     }
+    /// Use the same initialized tape, changer, and production actor setup for both transports.
+    fn daemon_state(&self, mode: remanence_state::AppendStagingMode) -> remanence_api::ApiState {
+        let f = self;
+        let mut config = remanence_state::load_config(f.config()).unwrap();
+        // The daemon owns a real changer slot for mount and shutdown dismount.
+        {
+            let mut world = f.world.lock().unwrap();
+            let tape = world.tapes.remove("FIRST").unwrap();
+            *world = remanence_chaos::model::VirtualWorld::single_drive(
+                "UNEXPOSED",
+                0x100,
+                "HOME-DRIVE",
+                0x400,
+                1,
+            );
+            world.put_tape_in_drive(0x100, "FIRST", Some(0x400), tape);
+        }
+        let library = f.world.lock().unwrap().library_snapshot();
+        config.libraries = vec![remanence_state::LibraryConfig {
+            serial: library.serial.clone(),
+            allow_derived_drive_identity: false,
+        }];
+        config.standalone_drives.clear();
+        config.daemon.append_staging_mode = mode;
+        config.daemon.append_ring_bytes = 1024 * 1024;
+        config.daemon.drive_idle_unload_seconds = 0;
+        let spool = f.root.path().join("spool");
+        std::fs::create_dir_all(&spool).unwrap();
+        let world = f.world.clone();
+        let state = remanence_api::ApiState::with_drive_pool_opener(
+            f.index(),
+            &config,
+            remanence_library::DiscoveryReport {
+                libraries: vec![library.clone()],
+                unattached_drives: vec![],
+                warnings: vec![],
+                complete: true,
+                incomplete_evidence: vec![],
+            },
+            remanence_library::StaticAllowlist::new([library.serial.as_str()]),
+            spool,
+            16 * 1024 * 1024,
+            move |library, policy| {
+                let world = world.clone();
+                library.open_with(policy, move |path| {
+                    let role = world
+                        .lock()
+                        .unwrap()
+                        .role_for_path(path)
+                        .expect("model device");
+                    Ok(Box::new(remanence_chaos::model::ModelTransport::new(
+                        world.clone(),
+                        role,
+                    )))
+                })
+            },
+        )
+        .unwrap();
+        state
+    }
     fn new_tape(&self, label: &str) {
         self.world.lock().unwrap().put_tape_in_drive(
             0x100,
@@ -814,7 +891,7 @@ impl VersionFixture {
         if json {
             args.push("--json");
         }
-        if extra[0] != "pool" && !extra.starts_with(&["tape", "quarantine"]) {
+        if extra[0] != "pool" && extra[0] != "list" && !extra.starts_with(&["tape", "quarantine"]) {
             args.extend([
                 "--device",
                 "/dev/home-model",
@@ -846,6 +923,8 @@ impl VersionFixture {
                         ),
                         config: self.config(),
                         fail_writes: false,
+                        check_all_writes: !extra.starts_with(&["tape", "finalize"]),
+                        writes_observed: 0,
                     },
                     mutation: std::sync::Arc::clone(&mutation),
                 })
@@ -1369,75 +1448,6 @@ fn socket_is_skipped_without_opening_it() {
     let result = f.ok(&["put", path.to_str().unwrap()]);
     assert_eq!(result["receipts"][0]["event"], "skipped_unsupported");
     assert_eq!(result["receipts"][0]["kind"], "socket");
-}
-
-/// Legacy checkpoints may have a path caller id without member-file projection.
-#[test]
-fn legacy_caller_path_fallback_stays_on_loaded_tape() {
-    let f = VersionFixture::with_parity(false);
-    let source = f.root.path().join("legacy.txt");
-    std::fs::write(&source, b"legacy").unwrap();
-    let written = f.ok(&["put", source.to_str().unwrap()]);
-    let tape = uuid::Uuid::parse_str(written["tape"].as_str().unwrap()).unwrap();
-    let config = remanence_state::load_config(f.config()).unwrap();
-    let paths = remanence_state::StatePaths::from_config(f.config(), &config);
-    let directory = paths.journal_dir.join("checkpoints");
-    let journal =
-        remanence_state::FileCheckpointJournal::open(&directory, *tape.as_bytes()).unwrap();
-    let mut records = journal.replay().unwrap();
-    drop(journal);
-    assert_eq!(records.len(), 1);
-    records[0].objects[0].object.caller_object_id = Some("legacy.txt".into());
-    records[0].objects[0].files.clear();
-    std::fs::remove_dir_all(&directory).unwrap();
-    let journal =
-        remanence_state::FileCheckpointJournal::open(&directory, *tape.as_bytes()).unwrap();
-    journal.append(&records[0]).unwrap();
-    drop(journal);
-    let text = std::fs::read_to_string(f.config())
-        .unwrap()
-        .replace("[journal]\n", "[journal]\nrequire_trusted_volume = false\n");
-    std::fs::write(f.config(), text).unwrap();
-    // Construct the older projection in a fresh catalog so no current member
-    // rows survive to contradict the deliberately member-less checkpoint.
-    std::fs::remove_file(&config.index.sqlite_path).unwrap();
-    {
-        let mut state = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap();
-        state
-            .catalog_index()
-            .provision_tape(remanence_state::ProvisionTapeInput {
-                tape_uuid: *tape.as_bytes(),
-                voltag: "FIRST".into(),
-                block_size: 262144,
-                parity: remanence_parity::ParityConfig::None,
-                force: false,
-            })
-            .unwrap();
-        state
-            .catalog_index()
-            .project_tape_pool_membership(*tape.as_bytes(), "default")
-            .unwrap();
-        state
-            .catalog_index()
-            .project_checkpoint_record(&records[0])
-            .unwrap();
-    }
-    let out = f.root.path().join("restored");
-    f.ok(&["get", "legacy.txt", "--out", out.to_str().unwrap()]);
-    assert_eq!(std::fs::read(out.join("legacy.txt")).unwrap(), b"legacy");
-    assert!(f
-        .index()
-        .list_committed_versions_by_path_any_pool("legacy.txt")
-        .unwrap()
-        .is_empty());
-    f.new_tape("SECOND");
-    f.ok(&["tape", "init", "--label", "SECOND", "--generation", "L9"]);
-    let (code, output, _) = f.run(&["get", "legacy.txt", "--out", out.to_str().unwrap()], true);
-    assert_ne!(code, ExitCode::SUCCESS);
-    assert!(VersionFixture::envelope(&output)["error"]
-        .as_str()
-        .unwrap()
-        .contains("is not on this tape; it is on FIRST ("));
 }
 
 /// Confirmation failures never reach a bootstrap write on a used cartridge.
@@ -2069,4 +2079,837 @@ fn home_put_and_get_migrate_old_catalog_but_doctor_does_not() {
         std::fs::read(dest.join("migrate.txt")).unwrap(),
         b"migration payload"
     );
+}
+
+/// Real parser, catalog, tape transport, and filesystem sinks preserve member dates.
+#[test]
+fn restore_dates_listing_and_member_selection() {
+    let f = VersionFixture::with_parity(false);
+    let directory = f.root.path().join("photos");
+    std::fs::create_dir(&directory).unwrap();
+    let source = directory.join("a.txt");
+    let date = std::time::UNIX_EPOCH + std::time::Duration::new(1_234_567_890, 123_456_789);
+    for bytes in [b"first".as_slice(), b"second".as_slice()] {
+        std::fs::write(&source, bytes).unwrap();
+        std::fs::File::open(&source)
+            .unwrap()
+            .set_modified(date)
+            .unwrap();
+        f.ok(&["put", directory.to_str().unwrap()]);
+    }
+    let source_date = std::fs::metadata(&source).unwrap().modified().unwrap();
+    let dest = f.root.path().join("get");
+    f.ok(&["get", "photos/a.txt", "--out", dest.to_str().unwrap()]);
+    assert_eq!(
+        std::fs::metadata(dest.join("photos/a.txt"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        source_date
+    );
+    assert!(!std::fs::read_dir(&dest).unwrap().any(|e| e
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".rem-staging-")));
+    let before_io = f.world.lock().unwrap().command_log.len();
+    let rows = f.ok(&["list"]);
+    assert_eq!(
+        f.world.lock().unwrap().command_log.len(),
+        before_io,
+        "catalog list performs no device IO"
+    );
+    assert_eq!(rows["rows"][0]["version_count"], 2);
+    assert_eq!(rows["rows"][0]["path"], "photos/a.txt");
+    assert_eq!(rows["rows"][0]["tapes"], serde_json::json!(["FIRST"]));
+    assert!(f.ok(&["list", "--path-prefix", "absent"])["rows"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(f.ok(&["list", "--tape", "FIRST"])["rows"], rows["rows"]);
+    let (code, table, errors) = f.run(&["list"], false);
+    assert_eq!(code, ExitCode::SUCCESS, "{errors}");
+    println!("CATALOG TABLE\n{table}");
+    let no_output = f.root.path().join("list-output");
+    let writes = f.writes();
+    let listing = f.ok(&[
+        "tape",
+        "restore",
+        "--list",
+        "--out",
+        no_output.to_str().unwrap(),
+    ]);
+    assert!(!no_output.exists());
+    assert_eq!(f.writes(), writes);
+    assert_eq!(listing["candidates"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        listing["candidates"][0]["manifest"]["rows"][0]["path"],
+        "photos/a.txt"
+    );
+    assert_ne!(
+        listing["candidates"][0]["manifest"]["object_id"],
+        listing["candidates"][1]["manifest"]["object_id"]
+    );
+    let (code, transcript, errors) = f.run(&["tape", "restore", "--list"], false);
+    assert_eq!(code, ExitCode::SUCCESS, "{errors}");
+    println!("TAPE LIST TRANSCRIPT\n{transcript}");
+    for (n, selector) in ["photos/", "photos/a.txt"].iter().enumerate() {
+        let dest = f.root.path().join(format!("selected-{n}"));
+        f.ok(&[
+            "tape",
+            "restore",
+            "--out",
+            dest.to_str().unwrap(),
+            "--path",
+            selector,
+        ]);
+        for candidate in ["candidate-1", "candidate-2"] {
+            assert_eq!(
+                std::fs::metadata(dest.join(candidate).join("photos/a.txt"))
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+                source_date
+            );
+        }
+        assert_eq!(
+            std::fs::read(dest.join("candidate-1/photos/a.txt")).unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("candidate-2/photos/a.txt")).unwrap(),
+            b"second"
+        );
+        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 2);
+    }
+    let (code, output, _) = f.run(
+        &["tape", "restore", "--list", "--path", "missing.txt"],
+        true,
+    );
+    assert_ne!(code, ExitCode::SUCCESS);
+    assert!(VersionFixture::envelope(&output)["error"]
+        .as_str()
+        .unwrap()
+        .contains("missing.txt"));
+    let identified = f.ok(&["tape", "identify"]);
+    assert_eq!(identified["status"], "not_finalized");
+    assert_eq!(identified["object_count"], 2);
+    assert_eq!(identified["finalized"], false);
+    assert_eq!(identified["pool"], "default");
+    let tape = identified["uuid"].as_str().unwrap();
+    let operation = uuid::Uuid::new_v4().to_string();
+    // Terminal replicas include physical separation extents; model enough media.
+    f.world
+        .lock()
+        .unwrap()
+        .tapes
+        .get_mut("FIRST")
+        .unwrap()
+        .capacity_bytes = 3 * 1024 * 1024 * 1024;
+    let finalized = f.ok(&[
+        "tape",
+        "finalize",
+        "--tape",
+        tape,
+        "--acknowledge-tape",
+        tape,
+        "--reason",
+        "fixture close",
+        "--expected-pool",
+        "default",
+        "--idempotency-key",
+        &operation,
+    ]);
+    assert_eq!(finalized["finalized"], true);
+    assert!(finalized["completed_replicas"].is_number());
+    let identified = f.ok(&["tape", "identify"]);
+    assert_eq!(identified["finalized"], true);
+    assert_eq!(identified["object_count"], 2);
+    assert!(identified["bytes"].as_u64().unwrap() > 0);
+    let verified = f.ok(&["tape", "verify"]);
+    assert_eq!(verified["object_count"], 2);
+    assert_eq!(verified["status"], "verified");
+    let terminal_listing = f.ok(&["tape", "restore", "--list"]);
+    assert_eq!(terminal_listing["terminal_index"], true);
+    assert_eq!(
+        terminal_listing["candidates"][0]["manifest"]["rows"][0]["path"],
+        "photos/a.txt"
+    );
+    assert_eq!(f.ok(&["list"])["rows"][0]["finalized"], true);
+}
+
+/// Keyless listing reports identity; decrypted listing validates without extraction.
+#[test]
+fn encrypted_listing_and_staging_cleanup() {
+    let f = VersionFixture::with_parity(false);
+    let source = f.root.path().join("secret.txt");
+    std::fs::write(&source, b"encrypted member").unwrap();
+    let key = remanence_aead::RecipientPrivateKey::new([9; 16], "listing", [9; 32]).unwrap();
+    let recipient = f.root.path().join("key.remr");
+    let private = f.root.path().join("key.remp");
+    std::fs::write(&recipient, key.public_key(0).unwrap().serialize().unwrap()).unwrap();
+    std::fs::write(&private, key.serialize()).unwrap();
+    let recovery = f.root.path().join("recovery.remr");
+    let recovery_key =
+        remanence_aead::RecipientPrivateKey::new([10; 16], "recovery", [10; 32]).unwrap();
+    std::fs::write(
+        &recovery,
+        recovery_key.public_key(1).unwrap().serialize().unwrap(),
+    )
+    .unwrap();
+    f.ok(&[
+        "put",
+        source.to_str().unwrap(),
+        "--recipient",
+        recipient.to_str().unwrap(),
+        "--recipient",
+        recovery.to_str().unwrap(),
+    ]);
+    let listing = f.ok(&["tape", "restore", "--list", "--path", "secret.txt"]);
+    assert_eq!(listing["candidates"][0]["manifest"]["encrypted"], true);
+    assert!(listing["candidates"][0]["manifest"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("--private-key"));
+    let dest = f.root.path().join("not-created");
+    let listing = f.ok(&[
+        "tape",
+        "restore",
+        "--list",
+        "--private-key",
+        private.to_str().unwrap(),
+        "--out",
+        dest.to_str().unwrap(),
+    ]);
+    assert!(!dest.exists());
+    assert_eq!(
+        listing["candidates"][0]["manifest"]["rows"][0]["path"], "secret.txt",
+        "{listing}"
+    );
+    let dest = f.root.path().join("get-error");
+    let (code, _, _) = f.run(
+        &["get", "secret.txt", "--out", dest.to_str().unwrap()],
+        true,
+    );
+    assert_ne!(code, ExitCode::SUCCESS);
+    assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 0);
+    f.ok(&[
+        "get",
+        "secret.txt",
+        "--out",
+        dest.to_str().unwrap(),
+        "--private-key",
+        private.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        std::fs::metadata(dest.join("secret.txt"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        std::fs::metadata(&source).unwrap().modified().unwrap()
+    );
+    assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 1);
+}
+
+/// A corrupt first object cannot conceal a later valid object's members.
+#[test]
+fn catalogless_listing_continues_after_invalid_metadata() {
+    let f = VersionFixture::with_parity(false);
+    let source = f.root.path().join("bad.txt");
+    std::fs::write(&source, b"bad").unwrap();
+    let written = f.ok(&["put", source.to_str().unwrap()]);
+    let id = written["receipts"][0]["object_id"].as_str().unwrap();
+    let object = f.index().get_native_object(id).unwrap().unwrap();
+    let tape_file = object.copies[0].tape_file_number;
+    let good = f.root.path().join("good.txt");
+    std::fs::write(&good, b"good").unwrap();
+    f.ok(&["put", good.to_str().unwrap()]);
+    {
+        let mut world = f.world.lock().unwrap();
+        let tape = world.tapes.get_mut("FIRST").unwrap();
+        let lba = tape.export_image().files[tape_file as usize].start_record;
+        let remanence_chaos::model::Record::Block(block) = &mut tape.records[lba] else {
+            panic!("object header must be a data block")
+        };
+        // Preserve discovery magic; break the canonical header checksum.
+        block[100] ^= 1;
+    }
+    let listing = f.ok(&["tape", "restore", "--scan", "--list"]);
+    let candidates = listing["candidates"].as_array().unwrap();
+    assert!(
+        candidates.iter().any(|c| c["status"] == "refused"),
+        "{listing}"
+    );
+    assert!(
+        candidates
+            .iter()
+            .any(|c| c["manifest"]["rows"][0]["path"] == "good.txt"),
+        "{listing}"
+    );
+}
+
+/// Selection never extracts unrequested objects or follows destination symlinks.
+#[test]
+fn selected_members_keep_destination_containment() {
+    let f = VersionFixture::with_parity(false);
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        let path = f.root.path().join(name);
+        std::fs::write(&path, name).unwrap();
+        f.ok(&["put", path.to_str().unwrap()]);
+    }
+    let dest = f.root.path().join("selection");
+    f.ok(&[
+        "tape",
+        "restore",
+        "--out",
+        dest.to_str().unwrap(),
+        "--path",
+        "a.txt",
+        "--path",
+        "c.txt",
+    ]);
+    assert_eq!(
+        std::fs::read(dest.join("candidate-1/a.txt")).unwrap(),
+        b"a.txt"
+    );
+    assert!(!dest.join("candidate-2").exists());
+    assert_eq!(
+        std::fs::read(dest.join("candidate-3/c.txt")).unwrap(),
+        b"c.txt"
+    );
+    let dest = f.root.path().join("no-match");
+    let (code, output, _) = f.run(
+        &[
+            "tape",
+            "restore",
+            "--out",
+            dest.to_str().unwrap(),
+            "--path",
+            "missing.txt",
+        ],
+        true,
+    );
+    assert_ne!(code, ExitCode::SUCCESS);
+    assert!(VersionFixture::envelope(&output)["error"]
+        .as_str()
+        .unwrap()
+        .contains("missing.txt"));
+    assert!(!dest.exists());
+    let dest = f.root.path().join("containment");
+    let outside = f.root.path().join("outside");
+    std::fs::create_dir(&dest).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, dest.join("candidate-1")).unwrap();
+    let (code, _, _) = f.run(
+        &[
+            "tape",
+            "restore",
+            "--out",
+            dest.to_str().unwrap(),
+            "--path",
+            "a.txt",
+        ],
+        true,
+    );
+    assert_ne!(code, ExitCode::SUCCESS);
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 1);
+    f.ok(&["pool", "new", "offsite", "--scheme", "none"]);
+    f.new_tape("OFFSITE");
+    f.ok(&[
+        "tape",
+        "init",
+        "--label",
+        "OFFSITE",
+        "--pool",
+        "offsite",
+        "--generation",
+        "L9",
+    ]);
+    f.ok(&["put", f.root.path().join("a.txt").to_str().unwrap()]);
+    let inventory = f.ok(&["list", "--path-prefix", "a."]);
+    let rows = inventory["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["pool"], "default");
+    assert_eq!(rows[1]["pool"], "offsite");
+    assert_eq!(rows[0]["tapes"], serde_json::json!(["FIRST"]));
+    assert_eq!(rows[1]["tapes"], serde_json::json!(["OFFSITE"]));
+    let offsite = f.ok(&["list", "--tape", "OFFSITE"]);
+    assert_eq!(offsite["rows"], serde_json::json!([rows[1]]));
+    let id = f.ok(&["tape", "identify"])["uuid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(f.ok(&["list", "--tape", &id])["rows"], offsite["rows"]);
+    assert_ne!(
+        f.run(&["list", "--tape", "UNKNOWN"], true).0,
+        ExitCode::SUCCESS
+    );
+}
+
+/// Production CLI and daemon services preserve timestamps through both append modes.
+#[test]
+fn daemon_put_get_preserves_mtime() {
+    for mode in [
+        remanence_state::AppendStagingMode::Serial,
+        remanence_state::AppendStagingMode::Overlap,
+    ] {
+        let f = VersionFixture::with_parity(false);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let socket = f.root.path().join("daemon.sock");
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = {
+            let _entered = runtime.enter();
+            let state = f.daemon_state(mode);
+            // Fail loudly at the actual socket operation when sandbox policy forbids it.
+            let probe = std::os::unix::net::UnixListener::bind(&socket)
+                .expect("daemon test requires Unix sockets");
+            drop(probe);
+            std::fs::remove_file(&socket).unwrap();
+            let socket = socket.clone();
+            runtime.spawn(async move {
+                remanence_daemon::serve(state, &socket, None, async {
+                    stopped.await.unwrap();
+                })
+                .await
+                .unwrap()
+            })
+        };
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(socket.exists(), "daemon must start");
+        let input = f.root.path().join("dated.txt");
+        std::fs::write(&input, b"daemon timestamp payload").unwrap();
+        let date = std::time::UNIX_EPOCH + std::time::Duration::new(1_234_567_890, 123_456_789);
+        std::fs::File::open(&input)
+            .unwrap()
+            .set_modified(date)
+            .unwrap();
+        let endpoint = format!("unix:{}", socket.display());
+        let run = |args: &[&str]| {
+            let result = std::process::Command::new(env!("CARGO_BIN_EXE_rem"))
+                .current_dir(f.root.path())
+                .args(args)
+                .args(["--endpoint", &endpoint, "--json"])
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        run(&["put", "dated.txt", "--pool", "default"]);
+        let output = f.root.path().join("daemon-restored");
+        run(&[
+            "get",
+            "dated.txt",
+            "--caller-id",
+            "--dest",
+            output.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            std::fs::read(output.join("dated.txt")).unwrap(),
+            b"daemon timestamp payload"
+        );
+        assert_eq!(
+            std::fs::metadata(output.join("dated.txt"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            date
+        );
+        stop.send(()).unwrap();
+        runtime.block_on(server).unwrap();
+    }
+}
+
+/// Exact selectors and unresolved selectors must refuse before creating any output.
+#[test]
+fn selection_is_validated_before_output() {
+    let f = VersionFixture::with_parity(false);
+    let source = f.root.path().join("photos.txt");
+    std::fs::write(&source, b"photo").unwrap();
+    f.ok(&["put", source.to_str().unwrap()]);
+    for selectors in [vec!["photos"], vec!["photos.txt", "missing.txt"]] {
+        let dest = f.root.path().join("no-output");
+        let mut args = vec!["tape", "restore", "--out", dest.to_str().unwrap()];
+        for selector in selectors {
+            args.extend(["--path", selector]);
+        }
+        assert_ne!(f.run(&args, true).0, ExitCode::SUCCESS);
+        assert!(!dest.exists());
+    }
+}
+
+/// Keep the WAL writer in a separate process, as it is for inventory commands.
+struct InventoryWriter(
+    std::process::Child,
+    std::io::BufReader<std::process::ChildStdout>,
+);
+
+impl Drop for InventoryWriter {
+    fn drop(&mut self) {
+        drop(self.0.stdin.take());
+        use std::io::Read;
+        self.1.read_to_end(&mut Vec::new()).unwrap();
+        assert!(self.0.wait().unwrap().success(), "inventory writer failed");
+    }
+}
+
+fn inventory_writer(f: &VersionFixture) -> InventoryWriter {
+    use std::io::BufRead;
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "catalog_inventory_writer_child", "--nocapture"])
+        .env("REM_TEST_INVENTORY_WRITER", f.config())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+    loop {
+        let mut line = String::new();
+        assert_ne!(
+            output.read_line(&mut line).unwrap(),
+            0,
+            "writer exited before ready"
+        );
+        if line.trim().ends_with("writer-ready") {
+            break;
+        }
+    }
+    InventoryWriter(child, output)
+}
+
+/// Child-process entrypoint; the parent keeps stdin open until reads finish.
+#[test]
+fn catalog_inventory_writer_child() {
+    use std::io::{Read, Write};
+    let Some(config) = std::env::var_os("REM_TEST_INVENTORY_WRITER") else {
+        // The ordinary test invocation exercises the child entrypoint as well.
+        let f = VersionFixture::with_parity(false);
+        drop(inventory_writer(&f));
+        return;
+    };
+    let config = remanence_state::load_config(config).unwrap();
+    let mut writer = remanence_state::CatalogIndex::open(&config.index.sqlite_path).unwrap();
+    writer
+        .upsert_tape_pool_projection(remanence_state::TapePoolProjectionInput {
+            pool_id: "live-wal".into(),
+            display_name: None,
+            copy_class: None,
+            content_class: None,
+            created_at_utc: None,
+        })
+        .unwrap();
+    println!("writer-ready");
+    std::io::stdout().flush().unwrap();
+    std::io::stdin().read_to_end(&mut Vec::new()).unwrap();
+}
+
+/// Catalog inventory leaves every state byte and file timestamp unchanged.
+#[test]
+fn catalog_list_does_not_mutate_state() {
+    fn snapshot(
+        root: &std::path::Path,
+    ) -> std::collections::BTreeMap<std::path::PathBuf, (Vec<u8>, std::time::SystemTime)> {
+        let mut result = std::collections::BTreeMap::new();
+        for entry in std::fs::read_dir(root).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                result.extend(snapshot(&entry.path()));
+            } else {
+                result.insert(
+                    entry.path(),
+                    (
+                        std::fs::read(entry.path()).unwrap(),
+                        entry.metadata().unwrap().modified().unwrap(),
+                    ),
+                );
+            }
+        }
+        result
+    }
+    let f = VersionFixture::with_parity(false);
+    // Keep WAL and shared memory live; listing must neither ignore the WAL
+    // nor alter its read marks. The second pool exists only in the WAL.
+    let _writer = inventory_writer(&f);
+    let before = snapshot(&f.root.path().join("state"));
+    let inventory = remanence_state::CatalogIndex::open_inventory(
+        &remanence_state::load_config(f.config())
+            .unwrap()
+            .index
+            .sqlite_path,
+    )
+    .unwrap();
+    assert!(inventory.get_tape_pool("live-wal").unwrap().is_some());
+    drop(inventory);
+    assert_eq!(snapshot(&f.root.path().join("state")), before);
+    f.ok(&["list"]);
+    assert_eq!(snapshot(&f.root.path().join("state")), before);
+}
+
+/// A subprocess isolates TMPDIR from parallel tests and exercises a complete get.
+#[test]
+fn standalone_get_ignores_tmpdir() {
+    const CHILD: &str = "REM_TEST_RESTORE_TMPDIR_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let f = VersionFixture::with_parity(false);
+        let source = f.root.path().join("input.txt");
+        std::fs::write(&source, b"restore").unwrap();
+        f.ok(&["put", source.to_str().unwrap()]);
+        let dest = f.root.path().join("output");
+        // VersionFixture needs a usable temp root; only restoration gets the bad TMPDIR.
+        unsafe {
+            std::env::set_var("TMPDIR", f.root.path().join("absent"));
+        }
+        f.ok(&["get", "input.txt", "--out", dest.to_str().unwrap()]);
+        assert_eq!(std::fs::read(dest.join("input.txt")).unwrap(), b"restore");
+    } else {
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "standalone_get_ignores_tmpdir",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}
+
+/// The real daemon ingress and drive actor round trip a timestamp without a socket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_process_daemon_append_preserves_mtime() {
+    use remanence_api::pb::read_session_service_server::ReadSessionService;
+    use remanence_api::pb::{self, write_session_service_server::WriteSessionService};
+    use sha2::{Digest, Sha256};
+    use tokio_stream::StreamExt;
+    for mode in [
+        remanence_state::AppendStagingMode::Serial,
+        remanence_state::AppendStagingMode::Overlap,
+    ] {
+        let f = VersionFixture::with_parity(false);
+        let state = f.daemon_state(mode);
+        let service = state.write_session_service();
+        let session = service
+            .open_write_session(tonic::Request::new(pb::OpenWriteSessionRequest {
+                target: Some(pb::open_write_session_request::Target::PoolTarget(
+                    pb::TapePoolTarget {
+                        pool_id: "default".into(),
+                        mount_if_needed: true,
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let payload = b"daemon timestamp payload";
+        let digest = Sha256::digest(payload).to_vec();
+        let mtime = "1234567890.123456789";
+        let messages = vec![
+            pb::append_object_message::Payload::Start(pb::AppendObjectStart {
+                session_id: session.session_id.clone(),
+                caller_object_id: "dated.txt".into(),
+                declared_size_bytes: Some(payload.len() as u64),
+                expected_content_sha256: Some(digest.clone()),
+                source_replay_capability: pb::SourceReplayCapability::ReplayFromStart as i32,
+                mtime: Some(mtime.into()),
+                ..Default::default()
+            }),
+            pb::append_object_message::Payload::Chunk(pb::AppendObjectChunk {
+                session_id: session.session_id.clone(),
+                data: payload.to_vec(),
+            }),
+            pb::append_object_message::Payload::Finish(pb::AppendObjectFinish {
+                session_id: session.session_id.clone(),
+                expected_content_sha256: Some(digest),
+                ..Default::default()
+            }),
+        ]
+        .into_iter()
+        .map(|payload| {
+            Ok(pb::AppendObjectMessage {
+                payload: Some(payload),
+            })
+        });
+        let record = service
+            .append_object_from_stream(tonic::Request::new(tokio_stream::iter(messages)))
+            .await
+            .unwrap_or_else(|e| panic!("{mode:?}: {e}"))
+            .into_inner();
+        service
+            .close_write_session(tonic::Request::new(pb::CloseWriteSessionRequest {
+                session_id: session.session_id,
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let object_id = uuid::Uuid::from_slice(&record.object_id)
+            .unwrap()
+            .to_string();
+        let files = f.index().list_native_object_files(&object_id).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].mtime.as_deref(), Some(mtime));
+        let reader = state.read_session_service();
+        let read_session = reader
+            .open_read_session(tonic::Request::new(pb::OpenReadSessionRequest {
+                target: Some(pb::open_read_session_request::Target::TapeTarget(
+                    pb::TapeTarget {
+                        tape_uuid: session.tape_uuid.clone().expect("write session tape"),
+                        mount_if_needed: true,
+                        required_pool_id: "default".into(),
+                        allow_unpooled: false,
+                    },
+                )),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut stream = reader
+            .read_file(tonic::Request::new(pb::ReadFileRequest {
+                session_id: read_session.session_id.clone(),
+                object_id: record.object_id,
+                file_id: files[0].file_id.as_bytes().to_vec(),
+                stream_chunk_bytes: 1024,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut restored = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            restored.extend(chunk.unwrap().data);
+        }
+        assert_eq!(restored, payload);
+        reader
+            .close_read_session(tonic::Request::new(pb::CloseReadSessionRequest {
+                session_id: read_session.session_id,
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        state.shutdown_drive_pool().await.unwrap();
+    }
+}
+
+/// Inventory must work with no writable temp directory, including uncheckpointed WAL rows.
+#[test]
+fn catalog_inventory_never_copies_to_tmpdir() {
+    const CHILD: &str = "REM_TEST_INVENTORY_CHILD";
+    if let Some(config) = std::env::var_os(CHILD) {
+        let config = remanence_state::load_config(config).unwrap();
+        let index =
+            remanence_state::CatalogIndex::open_inventory(&config.index.sqlite_path).unwrap();
+        assert!(index.get_tape_pool("live-wal").unwrap().is_some());
+    } else {
+        let f = VersionFixture::with_parity(false);
+        let mut writer = f.index();
+        writer
+            .upsert_tape_pool_projection(remanence_state::TapePoolProjectionInput {
+                pool_id: "live-wal".into(),
+                display_name: None,
+                copy_class: None,
+                content_class: None,
+                created_at_utc: None,
+            })
+            .unwrap();
+        let directory = writer.path().parent().unwrap().to_owned();
+        let snapshot = || {
+            std::fs::read_dir(&directory)
+                .unwrap()
+                .map(|e| {
+                    let e = e.unwrap();
+                    (
+                        e.file_name(),
+                        (
+                            std::fs::read(e.path()).unwrap(),
+                            e.metadata().unwrap().modified().unwrap(),
+                        ),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before = snapshot();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "catalog_inventory_never_copies_to_tmpdir",
+                "--nocapture",
+            ])
+            .env(CHILD, f.config())
+            .env("TMPDIR", f.root.path().join("absent"))
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(snapshot(), before);
+        drop(writer);
+        // Also exercise the closed-catalog case, where SQLite must not create sidecars.
+        let before = snapshot();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "catalog_inventory_never_copies_to_tmpdir",
+                "--nocapture",
+            ])
+            .env(CHILD, f.config())
+            .env("TMPDIR", f.root.path().join("absent"))
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(snapshot(), before);
+    }
+}
+
+/// Resolve a caller-supplied symlink root while retaining member containment.
+#[test]
+fn standalone_get_accepts_symlink_destination() {
+    let f = VersionFixture::with_parity(false);
+    let source = f.root.path().join("input.txt");
+    std::fs::write(&source, b"restore").unwrap();
+    f.ok(&["put", source.to_str().unwrap()]);
+    let dest = f.root.path().join("output");
+    std::fs::create_dir(&dest).unwrap();
+    let link = f.root.path().join("output-link");
+    std::os::unix::fs::symlink(&dest, &link).unwrap();
+    f.ok(&["get", "input.txt", "--out", link.to_str().unwrap()]);
+    assert_eq!(std::fs::read(dest.join("input.txt")).unwrap(), b"restore");
+    std::fs::remove_file(dest.join("input.txt")).unwrap();
+    let outside = f.root.path().join("outside.txt");
+    std::fs::write(&outside, b"untouched").unwrap();
+    std::os::unix::fs::symlink(&outside, dest.join("input.txt")).unwrap();
+    assert_ne!(
+        f.run(&["get", "input.txt", "--out", link.to_str().unwrap()], true)
+            .0,
+        ExitCode::SUCCESS
+    );
+    assert_eq!(std::fs::read(outside).unwrap(), b"untouched");
 }

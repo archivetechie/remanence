@@ -56,6 +56,12 @@ struct Cli {
 }
 #[derive(Debug, Subcommand)]
 enum Command {
+    List {
+        #[arg(long, alias = "tape-uuid")]
+        tape: Option<String>,
+        #[arg(long)]
+        path_prefix: Option<String>,
+    },
     Doctor,
     Drives,
     Diagnostics {
@@ -155,8 +161,12 @@ enum Tape {
         full: bool,
     },
     Restore {
+        #[arg(long, alias = "dest", required_unless_present = "list")]
+        out: Option<PathBuf>,
         #[arg(long)]
-        out: PathBuf,
+        list: bool,
+        #[arg(long)]
+        path: Vec<String>,
         #[arg(long)]
         private_key: Option<PathBuf>,
         #[arg(long)]
@@ -245,7 +255,7 @@ fn selected_in(args: &[OsString], env: &Environment) -> bool {
             continue;
         }
         return match word.as_ref() {
-            "doctor" | "drives" | "diagnostics" => true,
+            "doctor" | "drives" | "diagnostics" | "list" => true,
             "pool" => words.get(i + 1).is_some_and(|w| w == "new"),
             "tape" if words.get(i + 1).is_some_and(|w| w == "quarantine") => {
                 words
@@ -578,7 +588,16 @@ where
             value["active_fences"] = json!(active_fences);
         }
     }
+    let incomplete_finalization = matches!(
+        cli.command,
+        Command::Tape {
+            command: Tape::Finalize { .. }
+        }
+    ) && result.as_ref().is_ok_and(|v| v["finalized"] == false);
     let value = match &result {
+        Ok(v) if incomplete_finalization => {
+            json!({"ok":false,"status":"failed","error":format!("finalization outcome: {}", v["outcome"].as_str().unwrap_or("unknown")),"result":v})
+        }
         Ok(v) => json!({"ok":true,"result":v}),
         Err(e) if matches!(cli.command, Command::Put { .. }) => {
             json!({"ok":false,"status":"failed","error":e,"result":{"receipts":receipts,"summary":summary}})
@@ -593,6 +612,32 @@ where
         let _ = writeln!(out, "{value}");
     } else {
         match &result {
+            Ok(v) if matches!(cli.command, Command::List { .. }) => {
+                let _ = writeln!(
+                    out,
+                    "POOL  PATH  SIZE  VERSIONS  NEWEST OBJECT  TAPES  FINALIZED"
+                );
+                for row in v["rows"].as_array().into_iter().flatten() {
+                    let labels = row["tapes"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let _ = writeln!(
+                        out,
+                        "{}  {}  {}  {}  {}  {}  {}",
+                        row["pool"].as_str().unwrap(),
+                        row["path"].as_str().unwrap(),
+                        row["size"],
+                        row["version_count"],
+                        row["newest_object_id"].as_str().unwrap(),
+                        labels,
+                        row["finalized"]
+                    );
+                }
+            }
             Ok(v) if !matches!(cli.command, Command::Put { .. }) => {
                 let _ = writeln!(out, "{}", serde_json::to_string_pretty(v).unwrap());
             }
@@ -602,7 +647,7 @@ where
             Ok(_) => {}
         }
     }
-    if result.is_ok() {
+    if result.is_ok() && !incomplete_finalization {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
@@ -611,7 +656,8 @@ where
 fn read_only(command: &Command) -> bool {
     matches!(
         command,
-        Command::Doctor
+        Command::List { .. }
+            | Command::Doctor
             | Command::Drives
             | Command::Diagnostics { .. }
             | Command::Get { .. }
@@ -744,6 +790,47 @@ where
             "--allow-unserialized-device is only permitted for read verbs without --reserve".into(),
         );
     }
+    if let Command::List { tape, path_prefix } = &cli.command {
+        if cli.device.is_some() {
+            return Err("list does not take --device".into());
+        }
+        // Read-only inventory never creates home config, state, journals, or locks.
+        let path = cli.config.clone().unwrap_or_else(|| {
+            if env.system_config.exists() {
+                env.system_config.clone()
+            } else {
+                env.xdg.join("rem/config.toml")
+            }
+        });
+        if !path.exists() {
+            if cli.config.is_some() || tape.is_some() {
+                return Err("catalog config does not exist".into());
+            }
+            return Ok(json!({"rows": []}));
+        }
+        let config = load(&path, true)?;
+        let catalog_path = StatePaths::from_config(&path, &config).sqlite_path;
+        if !catalog_path.exists() {
+            if cli.config.is_some() || tape.is_some() {
+                return Err("catalog does not exist".into());
+            }
+            return Ok(json!({"rows": []}));
+        }
+        let (rows, fences) = read_catalog_display(&catalog_path, errors, || {
+            let index =
+                remanence_state::CatalogIndex::open_inventory(&catalog_path).map_err(err)?;
+            let fences = index.list_active_tape_io_fences().map_err(err)?;
+            let rows = index
+                .list_committed_paths(tape.as_deref(), path_prefix.as_deref())
+                .map_err(err)?;
+            Ok((rows, fences))
+        })?;
+        output.active_fences = fences.iter().map(crate::tape_io_fence_json).collect();
+        if !output.active_fences.is_empty() {
+            writeln!(errors, "warning: active tape-I/O fences ({}); catalog reads remain available; inspect rem tape quarantine list", output.active_fences.len()).map_err(err)?;
+        }
+        return Ok(json!({"rows": rows}));
+    }
     let path = config_path(cli, env)?;
     let config = load(
         &path,
@@ -824,11 +911,13 @@ where
     );
     let mut catalog_error = None;
     if discovery_only && catalog_path.exists() {
-        let fences = remanence_state::CatalogIndex::open_read_only(&catalog_path)
-            .map_err(err)
-            .and_then(|catalog| {
-                remanence_api::standalone_fence_policy(&catalog, None, None, false).map_err(err)
-            });
+        let fences = read_catalog_display(&catalog_path, errors, || {
+            remanence_state::CatalogIndex::open_inventory(&catalog_path)
+                .map_err(err)
+                .and_then(|catalog| {
+                    remanence_api::standalone_fence_policy(&catalog, None, None, false).map_err(err)
+                })
+        });
         match fences {
             Ok(fences) => {
                 output.active_fences = fences.iter().map(crate::tape_io_fence_json).collect()
@@ -1257,20 +1346,6 @@ where
                     .find(|v| version.is_none_or(|id| v.object_id == id.to_string()));
                 if let Some(selected) = selected {
                     selected.object_id.clone()
-                } else if versions.is_empty()
-                    && version.is_none()
-                    && backend
-                        .catalog_index()
-                        .list_committed_versions_by_path_any_pool(object)
-                        .map_err(err)?
-                        .is_empty()
-                {
-                    backend
-                        .catalog_index()
-                        .get_native_object_by_caller_object_id(object)
-                        .map_err(err)?
-                        .ok_or_else(|| format!("{object} is not catalogued"))?
-                        .object_id
                 } else {
                     let elsewhere = backend
                         .catalog_index()
@@ -1337,21 +1412,62 @@ where
                     )
                 })?;
             let locator=json!({"object_id":record.object_id,"caller_object_id":record.caller_object_id,"body_format":record.body_format,"pool_id":copy.pool_id,"tape_uuid":crate::bytes_to_hex(&uuid),"tape_file_number":copy.tape_file_number.to_string(),"first_body_lba":copy.first_body_lba.to_string(),"content_sha256":crate::bytes_to_hex(record.content_hash.as_deref().ok_or("object lacks content hash")?)}).to_string();
+            // Resolve the caller's destination once; member containment still runs
+            // through the shared restore sink beneath this canonical root.
+            fs::create_dir_all(out).map_err(err)?;
+            let destination = fs::canonicalize(out).map_err(err)?;
             let result = crate::pool_ops::restore_mounted_tape_object(
                 mounted,
                 backend.catalog_index(),
                 &locator,
                 private_key.as_deref(),
-                out,
+                &destination,
             );
             backend.finish().map_err(err)?;
             return result;
         }
         Command::Tape { command } => {
             match command {
-                Tape::Identify => Ok(
-                    json!({"tape_uuid":Uuid::from_bytes(uuid),"label":mounted.label.as_ref().map(|p|&p.0),"generation":mounted.generation.map(|g|g.0.media_code()),"terminal_index":terminal_summary(&mut mounted.drive, false)?}),
-                ),
+                Tape::Identify => {
+                    let mut facts = terminal_summary(&mut mounted.drive, false)?;
+                    facts["uuid"] = json!(Uuid::from_bytes(uuid));
+                    facts["tape_uuid"] = json!(Uuid::from_bytes(uuid));
+                    facts["label"] = json!(mounted.label.as_ref().map(|p| &p.0));
+                    facts["generation"] = json!(mounted.generation.map(|g| g.0.media_code()));
+                    let tape = backend.catalog_index().get_tape(&uuid).map_err(err)?;
+                    if let Some(finalization) =
+                        tape.as_ref().and_then(|t| t.terminal_finalization.as_ref())
+                    {
+                        facts["physical_status"] = facts["status"].clone();
+                        facts["finalization_outcome"] = json!(finalization.outcome.as_str());
+                        facts["finalized"] = json!(matches!(
+                            finalization.outcome,
+                            remanence_state::TerminalFinalizationOutcome::Finalized
+                                | remanence_state::TerminalFinalizationOutcome::FinalizedDegraded
+                        ));
+                        if facts["finalized"] == true && facts["status"] == "not_finalized" {
+                            facts["status"] = json!("terminal_index_unusable");
+                        }
+                    }
+                    facts["pool"] = json!(tape.as_ref().and_then(|t| t.pool_id.as_ref()));
+                    if facts["object_count"].is_null() && tape.is_some() {
+                        let files = backend
+                            .catalog_index()
+                            .list_tape_files(&uuid)
+                            .map_err(err)?;
+                        let objects: Vec<_> =
+                            files.iter().filter(|f| f.object_id.is_some()).collect();
+                        facts["object_count"] = json!(objects.len());
+                        facts["bytes"] = json!(objects
+                            .iter()
+                            .map(|f| f.block_count.saturating_mul(
+                                tape.as_ref().and_then(|t| t.block_size).unwrap_or(0)
+                            ))
+                            .sum::<u64>());
+                        facts["inventory_source"] = json!("catalog");
+                    }
+                    Ok(facts)
+                }
                 Tape::Verify { full } => {
                     if *full {
                         let bootstrap = remanence_parity::bootstrap::discover_bootstrap(
@@ -1365,10 +1481,15 @@ where
                             bootstrap.block_size_bytes,
                         )
                         .map_err(err)?;
-                        if !result.is_complete_tape() {
-                            Err(format!("full verification incomplete: {result:?}"))
+                        let complete = result.is_complete_tape();
+                        let facts = match result {
+                            remanence_parity::TerminalIndexVerificationOutcome::VerifiedComplete(v) | remanence_parity::TerminalIndexVerificationOutcome::VerifiedDegraded(v) => json!({"verified_complete": complete, "finalized": true, "object_count": v.selected_payload.object_row_count, "verified_prefix_bytes": v.verified_prefix_record_count.saturating_mul(u64::from(bootstrap.block_size_bytes)), "edition_digest": crate::bytes_to_hex(&v.edition.edition_digest)}),
+                            remanence_parity::TerminalIndexVerificationOutcome::RecoveryRequired(r) => json!({"verified_complete": false, "status": "recovery_required", "detail": r.detail}),
+                        };
+                        if complete {
+                            Ok(facts)
                         } else {
-                            Ok(json!({"verified_complete":true}))
+                            Err(format!("full verification incomplete: {facts}"))
                         }
                     } else {
                         terminal_summary(&mut mounted.drive, true)
@@ -1378,19 +1499,25 @@ where
                     out,
                     private_key,
                     scan,
+                    list,
+                    path,
                 } => {
                     let key = private_key
                         .as_deref()
                         .map(crate::pool_ops::read_private_key_file)
                         .transpose()?;
-                    let report = if *scan {
-                        remanence_api::scan_and_restore(&mut mounted.drive, out, key.as_ref())?
-                    } else {
-                        remanence_api::restore_catalogless(&mut mounted.drive, out, key.as_ref())?
-                    };
-                    if report["candidates"]
-                        .as_array()
-                        .is_some_and(|items| items.iter().any(|item| item["status"] != "restored"))
+                    let report = remanence_api::restore_catalogless_selected(
+                        &mut mounted.drive,
+                        out.as_deref(),
+                        key.as_ref(),
+                        *scan,
+                        *list,
+                        path,
+                    )?;
+                    if !*list
+                        && report["candidates"].as_array().is_some_and(|items| {
+                            items.iter().any(|item| item["status"] != "restored")
+                        })
                     {
                         Err(format!("restore incomplete: {report}"))
                     } else {
@@ -1512,7 +1639,9 @@ where
                             },
                         )
                         .map_err(err)?;
-                    Ok(json!({"finalized":format!("{result:?}")}))
+                    Ok(
+                        json!({"finalized": matches!(result.outcome, remanence_state::TerminalFinalizationOutcome::Finalized | remanence_state::TerminalFinalizationOutcome::FinalizedDegraded), "outcome": result.outcome.as_str(), "operation_id": result.operation_id, "completed_replicas": result.completed_replicas, "edition_digest": crate::bytes_to_hex(&result.edition_digest), "layout_digest": crate::bytes_to_hex(&result.layout_digest)}),
+                    )
                 }
                 _ => unreachable!("pre-mount command"),
             }
@@ -1961,14 +2090,49 @@ fn terminal_summary(drive: &mut DriveHandle, verifying: bool) -> Result<Value, S
         None,
     )
     .map_err(err)?;
+    let mut bytes = 0u64;
     let result = remanence_parity::read_terminal_index_inventory_streamed(
         &mut remanence_parity::DriveHandleRawSource::new(drive),
         &bootstrap.tape_uuid,
         bootstrap.block_size_bytes,
-        |_| Ok(()),
+        |event| {
+            match event {
+                remanence_parity::TerminalInventoryStreamEvent::ReplicaAttemptStarted {
+                    ..
+                }
+                | remanence_parity::TerminalInventoryStreamEvent::ReplicaAttemptRejected {
+                    ..
+                } => bytes = 0,
+                remanence_parity::TerminalInventoryStreamEvent::ObjectRow { row, .. } => {
+                    bytes = bytes.saturating_add(
+                        row.stored_block_count
+                            .saturating_mul(u64::from(bootstrap.block_size_bytes)),
+                    )
+                }
+                _ => {}
+            }
+            Ok(())
+        },
     )
     .map_err(err)?;
-    summarize_terminal(result, verifying)
+    let mut summary = summarize_terminal(result, verifying)?;
+    summary["bytes"] = if summary["finalized"] == true {
+        json!(bytes)
+    } else {
+        Value::Null
+    };
+    Ok(summary)
+}
+/// Distinguish absent terminal authority from a discovered but unusable index.
+fn terminal_recovery_status(
+    reason: &remanence_parity::BotStructuralRecoveryReason,
+) -> &'static str {
+    match reason {
+        remanence_parity::BotStructuralRecoveryReason::NoUsableTerminalLayout => "not_finalized",
+        remanence_parity::BotStructuralRecoveryReason::AllMembersInvalid => {
+            "terminal_index_unusable"
+        }
+    }
 }
 fn summarize_terminal(
     result: remanence_parity::TerminalInventoryOutcome,
@@ -1979,12 +2143,15 @@ fn summarize_terminal(
             if verifying =>
         {
             Err(format!(
-                "verification failed: no usable terminal index; recovery required: {:?}",
-                recovery.reason
+                "verification failed: no usable terminal index; {}",
+                terminal_recovery_status(&recovery.reason)
             ))
         }
-        _ => Ok(
-            json!({"terminal_index":format!("{result:?}"),"status":if verifying { "verified" } else { "identified" }}),
+        remanence_parity::TerminalInventoryOutcome::Inventory(inventory) => Ok(
+            json!({"finalized": true, "object_count": inventory.payload.object_row_count, "replica": inventory.selected_replica_ordinal, "edition_digest": crate::bytes_to_hex(&inventory.edition.edition_digest), "status": if verifying { "verified" } else { "identified" }}),
+        ),
+        remanence_parity::TerminalInventoryOutcome::BotStructuralRecoveryRequired(recovery) => Ok(
+            json!({"finalized": false, "object_count": null, "status": terminal_recovery_status(&recovery.reason)}),
         ),
     }
 }
@@ -2143,8 +2310,69 @@ where
     Ok(json!({"tarball":out,"tape_data_captured":false}))
 }
 
+/// Retry display-only reads once if the database or WAL changed, including a
+/// writer appearing during an immutable read. Failed reads are retried too.
+fn read_catalog_display<T>(
+    path: &Path,
+    errors: &mut dyn Write,
+    mut read: impl FnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    use std::os::unix::fs::MetadataExt;
+    let stamp = || {
+        let mut wal = path.as_os_str().to_os_string();
+        wal.push("-wal");
+        [path, Path::new(&wal)]
+            .map(|p| match fs::metadata(p) {
+                Ok(m) => Ok(Some((m.ino(), m.len(), m.mtime(), m.mtime_nsec()))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(err(e)),
+            })
+            .into_iter()
+            .collect::<Result<Vec<_>, String>>()
+    };
+    for attempt in 0..2 {
+        let before = stamp()?;
+        let result = read();
+        if before == stamp()? {
+            return result;
+        }
+        if attempt == 1 {
+            writeln!(
+                errors,
+                "warning: catalog changed during the read; listing may be stale"
+            )
+            .map_err(err)?;
+            return result;
+        }
+    }
+    unreachable!()
+}
+
 #[cfg(test)]
 mod tests {
+    /// Stamp changes retry once, then retain the result with a visible warning.
+    #[test]
+    fn catalog_display_retries_and_warns() {
+        use super::*;
+        for changes in [0, 1, 2] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("catalog");
+            fs::write(&path, b"").unwrap();
+            let mut calls = 0;
+            let mut warnings = Vec::new();
+            let value = read_catalog_display(&path, &mut warnings, || {
+                calls += 1;
+                if calls <= changes {
+                    fs::write(&path, vec![0; calls]).unwrap();
+                }
+                Ok(calls)
+            })
+            .unwrap();
+            assert_eq!(value, if changes == 0 { 1 } else { 2 });
+            assert_eq!(!warnings.is_empty(), changes == 2);
+        }
+    }
+
     /// Reading library quarantine state never generates a replacement home config.
     #[test]
     fn quarantine_fallback_reports_path_without_creating_config() {

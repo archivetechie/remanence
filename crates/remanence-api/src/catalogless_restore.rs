@@ -24,7 +24,7 @@ pub fn scan_and_restore(
     destination: &Path,
     private_key: Option<&remanence_aead::RecipientPrivateKey>,
 ) -> Result<Value, String> {
-    restore(drive, destination, private_key, true)
+    restore_catalogless_selected(drive, Some(destination), private_key, true, false, &[])
 }
 /// Prefer a validated terminal index; fall back to structural BOT candidates.
 pub fn restore_catalogless(
@@ -32,15 +32,35 @@ pub fn restore_catalogless(
     destination: &Path,
     private_key: Option<&remanence_aead::RecipientPrivateKey>,
 ) -> Result<Value, String> {
-    restore(drive, destination, private_key, false)
+    restore_catalogless_selected(drive, Some(destination), private_key, false, false, &[])
 }
-fn restore(
+/// Discover, validate, and optionally extract selected members through the common sink.
+pub fn restore_catalogless_selected(
     drive: &mut DriveHandle,
-    destination: &Path,
+    destination: Option<&Path>,
     key: Option<&remanence_aead::RecipientPrivateKey>,
     scan: bool,
+    list: bool,
+    members: &[String],
 ) -> Result<Value, String> {
-    remanence_stream::ensure_restore_root(destination).map_err(error)?;
+    if !list && !members.is_empty() {
+        let listing = restore_catalogless_selected(drive, None, key, scan, true, members)?;
+        if listing["candidates"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|r| r["manifest"]["encrypted"] == true))
+        {
+            return Err("encrypted objects require --private-key to resolve --path".into());
+        }
+    }
+    let destination = if list {
+        None
+    } else {
+        Some(destination.ok_or("restore requires --out")?)
+    };
+    if let Some(destination) = destination {
+        remanence_stream::ensure_restore_root(destination).map_err(error)?;
+    }
+    let mut matched = vec![false; members.len()];
     let bootstrap = remanence_parity::bootstrap::discover_bootstrap(
         &mut DriveHandleRawSource::new(drive),
         None,
@@ -115,9 +135,65 @@ fn restore(
         let result = (|| {
             let count = count.ok_or_else(|| "incomplete candidate at EOD".to_string())?;
             position_to_object(&mut *drive, BotRelativeTapeFile(file)).map_err(error)?;
+            if list {
+                let start = drive
+                    .known_position()
+                    .ok_or("unknown candidate position")?
+                    .lba;
+                let mut source = TapeCandidate::new(drive, start, count, size).map_err(error)?;
+                let mut magic = [0; 4];
+                source.read_exact(&mut magic).map_err(error)?;
+                source.seek(SeekFrom::Start(0)).map_err(error)?;
+                let (validated, envelope_id) = if &magic == b"REMO" {
+                    let inspected = remanence_aead::inspect_reader(&mut source).map_err(error)?;
+                    if inspected.header.chunk_size != size {
+                        return Err("encrypted chunk size differs from bootstrap".into());
+                    }
+                    let object_id = inspected.header.object_id.clone();
+                    check_identity(&object_id, id.as_deref(), None)?;
+                    let Some(key) = key else {
+                        return Ok(
+                            json!({"object_id": object_id, "encrypted": true, "message": "encrypted — add --private-key to list members"}),
+                        );
+                    };
+                    source.seek(SeekFrom::Start(0)).map_err(error)?;
+                    let opened =
+                        remanence_aead::open(&mut source, std::io::sink(), key).map_err(error)?;
+                    source.seek(SeekFrom::Start(0)).map_err(error)?;
+                    let prefix_len = 128
+                        + opened.header.key_frame_len as usize
+                        + opened.header.metadata_frame_len as usize;
+                    let mut prefix = vec![0; prefix_len];
+                    source.read_exact(&mut prefix).map_err(error)?;
+                    let blocks = opened.metadata.plaintext_size / u64::from(size);
+                    let mut plain = EncryptedCandidate {
+                        source,
+                        prefix,
+                        key,
+                        offset: 0,
+                    };
+                    (
+                        validate_candidate(&mut plain, size, blocks, anchor).map_err(error)?,
+                        Some(object_id),
+                    )
+                } else {
+                    (
+                        validate_candidate(&mut source, size, count, anchor).map_err(error)?,
+                        None,
+                    )
+                };
+                let object_id = validated
+                    .global_pax
+                    .get("REMANENCE.object_id")
+                    .ok_or("missing object id")?;
+                check_identity(object_id, id.as_deref(), envelope_id.as_deref())?;
+                let rows = selected_rows(&validated, object_id, members, &mut matched);
+                return Ok(json!({"object_id": object_id, "rows": rows}));
+            }
+            let destination = destination.expect("restore destination checked");
             // Disk spooling bounds memory independently of object size and lets
             // validation finish before any untrusted member reaches extraction.
-            let staging = tempfile::tempdir().map_err(error)?;
+            let staging = remanence_stream::create_restore_staging(destination).map_err(error)?;
             let stored_path = staging.path().join("stored");
             let mut stored = File::create(&stored_path).map_err(error)?;
             let mut block = vec![0; size as usize];
@@ -144,6 +220,7 @@ fn restore(
                 if opened.header.chunk_size != size {
                     return Err("encrypted chunk size differs from bootstrap".into());
                 }
+                std::fs::remove_file(&stored_path).map_err(error)?;
                 envelope_id = Some(opened.header.object_id);
                 path
             } else {
@@ -155,14 +232,10 @@ fn restore(
                 .global_pax
                 .get("REMANENCE.object_id")
                 .ok_or_else(|| "missing object id".to_string())?;
-            if envelope_id
-                .as_ref()
-                .is_some_and(|expected| expected != object_id)
-                || id
-                    .as_ref()
-                    .is_some_and(|expected| expected.as_slice() != object_id.as_bytes())
-            {
-                return Err("object identity differs from recovery authority".into());
+            check_identity(object_id, id.as_deref(), envelope_id.as_deref())?;
+            let rows = selected_rows(&validated, object_id, members, &mut matched);
+            if !members.is_empty() && rows.is_empty() {
+                return Ok(json!({"object_id": object_id, "files_written": 0}));
             }
             let output = destination.join(&name);
             remanence_stream::ensure_restore_root(&output).map_err(error)?;
@@ -190,10 +263,13 @@ fn restore(
                 size as usize,
                 blocks,
                 &payload_root,
-                Default::default(),
+                remanence_stream::FilesystemRestoreOptions {
+                    members: members.to_vec(),
+                    ..Default::default()
+                },
             )
             .map_err(error)?;
-            let manifest = json!({"payload": payload, "object_id": object_id, "tape_file_number": file, "files_written": report.files_written});
+            let manifest = json!({"payload": payload, "object_id": object_id, "tape_file_number": file, "files_written": report.files_written, "warnings": staging.warnings.iter().chain(&report.warnings).collect::<Vec<_>>()});
             // Metadata and payload have disjoint namespaces; member names cannot
             // collide with this report. create_new still refuses existing links.
             let manifest_file = OpenOptions::new()
@@ -205,9 +281,23 @@ fn restore(
             Ok::<_, String>(manifest)
         })();
         outcomes.push(match result {
-            Ok(manifest) => json!({"candidate": name, "status": "restored", "manifest": manifest}),
-            Err(detail) => json!({"candidate": name, "status": "refused", "error": detail}),
+            Ok(manifest) => json!({"candidate": name, "status": if list { "listed" } else { "restored" }, "manifest": manifest}),
+            Err(detail) => json!({"candidate": name, "object_id": id.as_deref().map(String::from_utf8_lossy), "status": "refused", "error": detail}),
         });
+    }
+    let missing: Vec<_> = members
+        .iter()
+        .zip(&matched)
+        .filter(|(_, hit)| !**hit)
+        .map(|(path, _)| path.as_str())
+        .collect();
+    let keyless = outcomes.iter().any(|r| r["manifest"]["encrypted"] == true);
+    if !missing.is_empty() && !keyless {
+        return Err(format!(
+            "no members matched: {}; discovery report: {}",
+            missing.join(", "),
+            json!(outcomes)
+        ));
     }
     Ok(json!({"terminal_index": terminal, "candidates": outcomes}))
 }
@@ -220,13 +310,97 @@ fn validate_plain_candidate(
 ) -> Result<remanence_format::RemTarStreamReport, remanence_format::error::FormatError> {
     let mut source = FileBlockSource::open(path, size as usize)?;
     let blocks = source.block_count();
+    validate_candidate(&mut source, size, blocks, anchor)
+}
+
+fn validate_candidate(
+    source: &mut dyn BlockRead,
+    size: u32,
+    blocks: u64,
+    anchor: Option<[u8; 32]>,
+) -> Result<remanence_format::RemTarStreamReport, remanence_format::error::FormatError> {
     remanence_format::stream_rem_tar_object_with_manifest_anchor(
-        &mut source,
+        source,
         size as usize,
         blocks,
         &mut ValidateCanonicalEntrySink,
         anchor,
     )
+}
+
+/// Keep terminal and envelope identities bound to the validated inner object.
+fn check_identity(
+    object_id: &str,
+    terminal: Option<&[u8]>,
+    envelope: Option<&str>,
+) -> Result<(), String> {
+    if envelope.is_some_and(|e| e != object_id)
+        || terminal.is_some_and(|e| e != object_id.as_bytes())
+    {
+        return Err("object identity differs from recovery authority".into());
+    }
+    Ok(())
+}
+
+fn selected_rows(
+    report: &remanence_format::RemTarStreamReport,
+    object_id: &str,
+    members: &[String],
+    matched: &mut [bool],
+) -> Vec<Value> {
+    report
+        .entries
+        .iter()
+        .filter(|entry| entry.path != remanence_format::MANIFEST_PATH)
+        .filter_map(|entry| {
+            for (member, hit) in members.iter().zip(matched.iter_mut()) {
+                *hit |= remanence_stream::restore_member_selected(
+                    &entry.path,
+                    std::slice::from_ref(member),
+                );
+            }
+            remanence_stream::restore_member_selected(&entry.path, members).then(
+                || json!({"path": entry.path, "size": entry.size_bytes, "object_id": object_id}),
+            )
+        })
+        .collect()
+}
+
+/// Bounded decrypted block view for write-free listing after envelope validation.
+struct EncryptedCandidate<'a, 'b> {
+    source: TapeCandidate<'a>,
+    prefix: Vec<u8>,
+    key: &'b remanence_aead::RecipientPrivateKey,
+    offset: u64,
+}
+impl BlockRead for EncryptedCandidate<'_, '_> {
+    fn read_block(&mut self, out: &mut [u8]) -> Result<usize, remanence_library::TapeIoError> {
+        let run = (|| -> Result<usize, String> {
+            let range = remanence_aead::covering_stored_range(
+                &self.prefix,
+                self.key,
+                self.offset,
+                out.len() as u64,
+            )
+            .map_err(error)?;
+            let start = range.stored_range_start.ok_or("empty encrypted range")?;
+            self.source.seek(SeekFrom::Start(start)).map_err(error)?;
+            let mut writer = &mut out[..];
+            remanence_aead::open_plaintext_range_from_reader(
+                &self.prefix,
+                &mut self.source,
+                start,
+                &mut writer,
+                self.key,
+                self.offset,
+                range.plaintext_len,
+            )
+            .map_err(error)?;
+            self.offset += range.plaintext_len;
+            Ok(range.plaintext_len as usize)
+        })();
+        run.map_err(remanence_library::TapeIoError::OperationFailed)
+    }
 }
 
 /// Physical evidence beyond the caller's checkpoint. No state rows authorize it.

@@ -23,12 +23,12 @@ time       = { workspace = true }
 unicase   = { workspace = true }
 unicode-normalization = { workspace = true }
 uuid       = { workspace = true }
+tempfile = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 xattr = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

@@ -48,6 +48,7 @@ zeroize           = { workspace = true }
 ratatui           = { version = "0.30", optional = true }
 
 [dev-dependencies]
+remanence-daemon = { path = "../remanence-daemon" }
 hyper-util = { workspace = true, features = ["tokio"] }
 tower = { workspace = true, features = ["util"] }
 remanence-parity = { path = "../remanence-parity", features = ["test-support"] }
