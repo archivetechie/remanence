@@ -229,3 +229,6 @@ pub fn validate_spooled_object(
     )
     .map_err(|e| e.to_string())
 }
+
+/// Standalone fence admission and reporting.
+pub use mount_backend::{standalone_fence_policy, standalone_fence_releasable};

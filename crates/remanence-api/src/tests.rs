@@ -5413,6 +5413,7 @@ fn pool_write_rejects_pool_tape_block_size_mismatch_before_tape_io() {
     std::fs::write(&selected_path, b"selected mismatch must not reach tape")
         .expect("write selected source payload");
     let selected = SelectedTape {
+        standalone_endpoint: None,
         pool_id: "scenario-a".to_string(),
         tape_uuid: POOL_WRITE_TAPE_UUID,
         block_size: API_SESSION_BLOCK_SIZE,
@@ -5813,16 +5814,36 @@ fn retire_then_reinit_same_barcode_round_trips_without_catalog_reset() {
     );
     assert_eq!(
         decision,
-        InitDecision::FreshInit,
-        "retired identity must re-init without CLOBBER or force"
+        InitDecision::RefuseClobber {
+            reason: TapeInitError::CatalogIndicatesWritten
+        },
+        "retirement alone must not authorize overwrite"
     );
 
     // Fresh bootstrap + fresh catalog row for the same barcode.
     let mut reinit_sink = VecBlockSink::new();
-    let action = maybe_write_tape_init_bootstrap(
+    let refused = maybe_write_tape_init_bootstrap(
         &mut reinit_sink,
         &decision,
         TapeInitWriteOptions::default(),
+        SECOND_UUID,
+        API_SESSION_BLOCK_SIZE,
+        ParityConfig::None,
+        &remanence_parity::WriterIdentity::fixed(
+            "remanence-test".into(),
+            std::time::SystemTime::UNIX_EPOCH.into(),
+        ),
+    )
+    .expect("unconfirmed init refuses");
+    assert_eq!(refused, TapeInitWriteAction::Refused);
+    assert!(reinit_sink.blocks.is_empty());
+    let action = maybe_write_tape_init_bootstrap(
+        &mut reinit_sink,
+        &decision,
+        TapeInitWriteOptions {
+            clobber_data_confirmed: true,
+            ..Default::default()
+        },
         SECOND_UUID,
         API_SESSION_BLOCK_SIZE,
         ParityConfig::None,

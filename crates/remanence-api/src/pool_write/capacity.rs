@@ -719,6 +719,7 @@ pub(crate) fn selected_tape_from_record(
     let tape_uuid = tape_uuid_from_vec(tape.tape_uuid.clone(), pool_id)?;
     let (block_size, parity_config) = selected_tape_geometry(&tape, pool_id)?;
     Ok(SelectedTape {
+        standalone_endpoint: None,
         pool_id: pool_id.to_string(),
         tape_uuid,
         block_size,

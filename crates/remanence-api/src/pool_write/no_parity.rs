@@ -331,12 +331,15 @@ pub(super) fn record_tape_io_fence_for_transfer_error(
         uuid_text(selected.tape_uuid),
         json_escape(error),
     );
-    state.record_tape_io_fence(remanence_state::TapeIoFenceInput {
-        tape_uuid: selected.tape_uuid,
-        barcode,
-        reason: reason.to_string(),
-        evidence_json: Some(evidence),
-    })?;
+    state.record_tape_io_fence_at_endpoint(
+        remanence_state::TapeIoFenceInput {
+            tape_uuid: selected.tape_uuid,
+            barcode,
+            reason: reason.to_string(),
+            evidence_json: Some(evidence),
+        },
+        selected.standalone_endpoint.as_ref(),
+    )?;
     Ok(())
 }
 

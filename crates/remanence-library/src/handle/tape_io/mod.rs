@@ -319,6 +319,17 @@ pub enum TapeIoError {
     /// CDB succeeded; the payload was wrong.
     #[error("malformed MODE response: {0}")]
     MalformedModeResponse(String),
+    /// Initialization cannot safely proceed on a partitioned cartridge.
+    #[error("this cartridge has {count} partitions (LTFS formats tapes this way); Remanence needs a single-partition cartridge. To repartition it, erasing everything on it, run: `mt -f {device} mkpartition 0`")]
+    MultiPartitionMedium {
+        /// Number of configured partitions.
+        count: u16,
+        /// Non-rewinding tape device to use for repartitioning.
+        device: String,
+    },
+    /// Initialization failed to establish the medium partition layout.
+    #[error("cannot determine cartridge partitions; initialization refused: {0}")]
+    PartitionProbeFailed(Box<TapeIoError>),
 
     /// A non-MODE SCSI response parser found malformed bytes after a
     /// successful command. This is distinct from CHECK CONDITION: the
@@ -2775,6 +2786,71 @@ impl super::DriveHandle {
         }
     }
 
+    /// Read SSC Medium Partition page 0x11; refuse multi-partition cartridges
+    /// before initialization can dispatch any destructive media command.
+    pub fn require_single_partition(&mut self) -> Result<(), TapeIoError> {
+        let cdb = remanence_scsi::mode::build_mode_sense6_cdb(
+            remanence_scsi::mode::PageControl::Current,
+            0x11,
+            255,
+        );
+        self.transport.set_timeout_for(TimeoutClass::ModeConfig);
+        let mut data = [0u8; 255];
+        let op = AuditOp::TapeReadConfig {
+            bay: self.bay_address(),
+        };
+        self.fire_tape_started(op, &cdb);
+        let started = Instant::now();
+        let result = match self.transport.execute_in(&cdb, &mut data) {
+            Ok(outcome) => medium_partition_count(
+                &data[..(outcome.bytes_transferred as usize).min(data.len())],
+            ),
+            Err(ScsiError::CheckCondition { ref sense, .. })
+                if !sense_is_deferred(sense)
+                    && decode_sense_key_asc(sense) == Some((0x05, 0x24, 0x00)) =>
+            {
+                Ok(1)
+            }
+            Err(error) => Err(map_scsi(error)),
+        };
+        let count = match result {
+            Ok(count) => {
+                self.finish_tape_success(op, started.elapsed());
+                count
+            }
+            Err(error) => {
+                self.finish_tape_error(op, &error);
+                return Err(TapeIoError::PartitionProbeFailed(Box::new(error)));
+            }
+        };
+        if count > 1 {
+            let device = self
+                .drive
+                .sg_path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|name| {
+                    std::fs::read_dir(
+                        std::path::Path::new("/sys/class/scsi_generic")
+                            .join(name)
+                            .join("device/scsi_tape"),
+                    )
+                    .ok()
+                })
+                .and_then(|entries| {
+                    entries.filter_map(Result::ok).find_map(|entry| {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        name.strip_prefix("st")
+                            .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+                            .map(|n| format!("/dev/nst{n}"))
+                    })
+                })
+                .unwrap_or_else(|| "/dev/nstN for this drive".into());
+            return Err(TapeIoError::MultiPartitionMedium { count, device });
+        }
+        Ok(())
+    }
+
     /// Read the drive's current block-size + compression
     /// configuration plus its reported maximum block size. Issues
     /// **two CDBs** at session open:
@@ -3848,3 +3924,29 @@ fn units_traversed_from_space_residual(count: i64, residual: i64) -> i64 {
 mod media_gate_tests;
 #[cfg(test)]
 mod tests;
+
+/// Decode the page's Additional Partitions Defined field, including block descriptors.
+fn medium_partition_count(data: &[u8]) -> Result<u16, TapeIoError> {
+    let invalid = || {
+        TapeIoError::MalformedModeResponse("missing or truncated Medium Partition page 0x11".into())
+    };
+    if data.len() < 4 {
+        return Err(invalid());
+    }
+    let end = usize::from(data[0]) + 1;
+    if end > data.len() || end < 4 {
+        return Err(invalid());
+    }
+    let page = data
+        .get(4 + usize::from(data[3])..end)
+        .ok_or_else(invalid)?;
+    if page.len() < 4
+        || page[0] & 0x3f != 0x11
+        || page[0] & 0x40 != 0
+        || page[1] < 6
+        || usize::from(page[1]) + 2 > page.len()
+    {
+        return Err(invalid());
+    }
+    Ok(u16::from(page[3]) + 1)
+}

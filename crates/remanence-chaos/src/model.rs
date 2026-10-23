@@ -56,6 +56,8 @@ pub struct VirtualTape {
     pub block_size: u32,
     /// Hardware compression flag reported by MODE SENSE.
     pub compression: bool,
+    /// Additional partitions reported by Medium Partition MODE SENSE.
+    pub additional_partitions: u8,
     /// Test-only device quirk: acknowledge MODE SELECT while retaining the
     /// prior block size reported by subsequent MODE SENSE.
     pub retain_block_size_on_mode_select: bool,
@@ -83,6 +85,7 @@ impl VirtualTape {
             worm: false,
             block_size,
             compression: false,
+            additional_partitions: 0,
             retain_block_size_on_mode_select: false,
             retain_compression_on_mode_select: false,
             tape_alert_flags: BTreeSet::new(),
@@ -761,8 +764,13 @@ impl ModelTransport {
         copy_response(buf, &rbl_response(MAX_BLOCK_LENGTH, MIN_BLOCK_LENGTH))
     }
 
-    fn mode_sense(&self, buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
+    fn mode_sense(&self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
         let mut world = self.world.lock().expect("virtual world lock");
+        if cdb.get(2).is_some_and(|page| page & 0x3f == 0x11) {
+            let additional =
+                self.with_loaded_tape(&mut world, |tape| Ok(tape.additional_partitions))?;
+            return copy_response(buf, &[11, 0, 0, 0, 0x11, 6, 1, additional, 0, 0, 0, 0]);
+        }
         let (block_length, compression, write_protected, worm) =
             self.with_loaded_tape(&mut world, |tape| {
                 Ok((
@@ -1303,7 +1311,7 @@ impl SgTransport for ModelTransport {
                 cdb.get(1).copied().unwrap_or(0) & 0x01 != 0,
                 cdb.get(2).copied().unwrap_or(0),
             ),
-            Some(0x1a) => self.mode_sense(buf),
+            Some(0x1a) => self.mode_sense(cdb, buf),
             Some(0x34) => self.read_position(buf),
             Some(0x4d) => self.log_sense(cdb, buf),
             Some(0xa3) => self.maintenance_in(cdb, buf),

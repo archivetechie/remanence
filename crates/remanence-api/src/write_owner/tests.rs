@@ -245,6 +245,7 @@ fn automatic_terminal_preflight_accepts_empty_fresh_authority() {
     let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite"))
         .expect("open automatic preflight catalog");
     let selected = SelectedTape {
+        standalone_endpoint: None,
         pool_id: "fresh-open".to_string(),
         tape_uuid: TAPE_UUID,
         block_size: BLOCK_SIZE,
@@ -902,6 +903,7 @@ fn one_transition_ahead_sink_journal_reconciles_before_media_is_available() {
         min_object_size_bytes: 0,
     };
     let selected = SelectedTape {
+        standalone_endpoint: None,
         pool_id: lowered_pool.id.clone(),
         tape_uuid: TAPE_UUID,
         block_size: BLOCK_SIZE,
@@ -977,6 +979,7 @@ fn one_transition_ahead_sink_journal_reconciles_before_media_is_available() {
     drop(checkpoint);
     let audit_append_lock = Arc::new(std::sync::Mutex::new(()));
     let selected = SelectedTape {
+        standalone_endpoint: None,
         pool_id: "host-authority-test".to_string(),
         tape_uuid: TAPE_UUID,
         block_size: BLOCK_SIZE,
@@ -2045,6 +2048,7 @@ async fn daemon_rejects_corrupt_checkpoint_authority_before_position_or_config_c
             actor: remanence_state::AuditActor::System,
             pool_cfg: pool_cfg.clone(),
             selected: SelectedTape {
+                standalone_endpoint: None,
                 pool_id: "parity.authority".to_string(),
                 tape_uuid,
                 block_size: BLOCK_SIZE,
@@ -2201,6 +2205,7 @@ async fn bootstrap_projection_never_authorizes_writing_physically_blank_media() 
                     min_object_size_bytes: 0,
                 },
                 selected: SelectedTape {
+                    standalone_endpoint: None,
                     pool_id: format!("missing.{case}.authority"),
                     tape_uuid,
                     block_size: BLOCK_SIZE,
@@ -2298,6 +2303,7 @@ async fn daemon_checkpoint_lease_contention_precedes_conditional_load_for_no_par
                 min_object_size_bytes: 0,
             },
             selected: SelectedTape {
+                standalone_endpoint: None,
                 pool_id: "checkpoint.lease".to_string(),
                 tape_uuid,
                 block_size: BLOCK_SIZE,
@@ -2377,6 +2383,7 @@ fn fresh_parity_bootstrap_short_completion_fences_without_journal_visibility() {
     let tape_uuid = [0x46; 16];
     let scheme = remanence_parity::default_scheme_for_block_size(BLOCK_SIZE);
     let selected = SelectedTape {
+        standalone_endpoint: None,
         pool_id: "fresh-parity-fence-test".to_string(),
         tape_uuid,
         block_size: BLOCK_SIZE,
@@ -2479,6 +2486,7 @@ fn first_parity_raw_write_failure_persists_and_audits_partial_fence() {
     let cfg = test_write_owner_config(index_path, audit_dir.clone(), &library, snapshot);
     let tape_uuid = [0x45; 16];
     let selected = SelectedTape {
+        standalone_endpoint: None,
         pool_id: "parity-fence-test".to_string(),
         tape_uuid,
         block_size: 4096,
@@ -2711,6 +2719,7 @@ async fn partial_epoch_checkpoint_projects_replays_and_first_post_checkpoint_sho
             actor: remanence_state::AuditActor::System,
             pool_cfg: pool_cfg.clone(),
             selected: SelectedTape {
+                standalone_endpoint: None,
                 pool_id: POOL_ID.to_string(),
                 tape_uuid,
                 block_size: BLOCK_SIZE,
@@ -2841,6 +2850,7 @@ async fn partial_epoch_checkpoint_projects_replays_and_first_post_checkpoint_sho
             actor: remanence_state::AuditActor::System,
             pool_cfg,
             selected: SelectedTape {
+                standalone_endpoint: None,
                 pool_id: POOL_ID.to_string(),
                 tape_uuid,
                 block_size: BLOCK_SIZE,
@@ -3444,6 +3454,7 @@ async fn open_actor_test_write_session(
             actor: remanence_state::AuditActor::System,
             pool_cfg: pool_cfg.clone(),
             selected: SelectedTape {
+                standalone_endpoint: None,
                 pool_id: pool_cfg.id.clone(),
                 tape_uuid,
                 block_size: u32::try_from(pool_cfg.block_size_bytes)
@@ -3677,6 +3688,7 @@ async fn checkpoint_actor_deduplicates_in_batch_and_holds_until_checkpoint() {
             actor: remanence_state::AuditActor::System,
             pool_cfg,
             selected: SelectedTape {
+                standalone_endpoint: None,
                 pool_id: "checkpoint-test".to_string(),
                 tape_uuid,
                 block_size: BLOCK_SIZE,
@@ -4688,6 +4700,7 @@ async fn manual_finalize_closes_below_low_and_same_key_replay_moves_no_tape() {
             actor: AuditActor::System,
             pool_cfg: pool_cfg.clone(),
             selected: SelectedTape {
+                standalone_endpoint: None,
                 pool_id: pool_id.into(),
                 tape_uuid,
                 block_size: BLOCK_SIZE,
@@ -6325,6 +6338,7 @@ async fn induced_append_and_read_failures_persist_session_snapshots() {
             actor: remanence_state::AuditActor::System,
             pool_cfg: pool_cfg.clone(),
             selected: SelectedTape {
+                standalone_endpoint: None,
                 pool_id: "failure-test".to_string(),
                 tape_uuid,
                 block_size: 4096,
@@ -8282,6 +8296,7 @@ fn resume_vectors_layer5_authorities(refusal: Option<&str>) {
     );
     cfg.checkpoint_journal_dir = temp.path().join("checkpoints");
     let selected = SelectedTape {
+        standalone_endpoint: None,
         pool_id: "resume-vectors".into(),
         tape_uuid: vector.written.inputs.tape_uuid,
         block_size: crate::tape_image_vectors::BLOCK,

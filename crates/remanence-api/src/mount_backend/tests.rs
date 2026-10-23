@@ -319,7 +319,7 @@ fn insertion_removal_and_swap_require_a_new_proof() {
     );
 }
 #[test]
-fn crash_after_session_open_refuses_restart_before_media_dispatch() {
+fn crash_after_session_open_allows_read_mount_but_refuses_writes() {
     let root = tempfile::tempdir().unwrap();
     let mut state = state(root.path());
     let world = world();
@@ -339,8 +339,11 @@ fn crash_after_session_open_refuses_restart_before_media_dispatch() {
     let config = state.config().clone();
     drop(state);
     let mut state = StateHandle::open_with_config(paths, config).unwrap();
-    let result = backend(&mut state, &world, &lock, fault());
-    assert!(matches!(result, Err(MountError::Refused(ref message)) if message.contains("fence")));
+    let mut recovered = backend(&mut state, &world, &lock, fault()).unwrap();
+    let mounted = recovered.mount(target()).unwrap();
+    assert!(
+        matches!(recovered.mutate_catalog(&mounted, |_| Ok(())), Err(MountError::Refused(ref message)) if message.contains("fence"))
+    );
     assert_eq!(
         world.lock().unwrap().tapes["HAND"].written_bytes,
         u64::from(BLOCK)
@@ -380,7 +383,11 @@ fn uncertain_write_cut_is_durably_fenced_even_after_an_earlier_checkpoint() {
             })),
         "audit replay must preserve the standalone fence identity"
     );
-    assert!(backend(&mut state, &world, &lock, self::fault()).is_err());
+    let mut reopened = backend(&mut state, &world, &lock, self::fault()).unwrap();
+    let mut mounted = reopened.mount(target()).unwrap();
+    assert!(
+        matches!(reopened.write_checkpointed(&mut mounted, request(root.path(), "third")), Err(MountError::Refused(ref message)) if message.contains("fence"))
+    );
 }
 #[test]
 fn checkpoint_finalize_and_terminal_restore_share_the_production_funnels() {
@@ -978,7 +985,7 @@ fn restart_recovery_is_shared_and_scoped_to_the_owned_endpoint() {
         UUID,
     );
     let before = state.calibration_control().row(library_tape).write_epoch;
-    assert!(backend(&mut state, &world(), &root.path().join("locks"), fault()).is_err());
+    assert!(backend(&mut state, &world(), &root.path().join("locks"), fault()).is_ok());
     let open = state.catalog_index().non_terminal_sessions().unwrap();
     assert!(open.iter().any(|s| s.session_id == library_session));
     assert!(!open.iter().any(|s| s.session_id == standalone_session));
@@ -986,12 +993,13 @@ fn restart_recovery_is_shared_and_scoped_to_the_owned_endpoint() {
         state.calibration_control().row(library_tape).write_epoch,
         before
     );
-    assert!(state
-        .catalog_index()
-        .list_active_tape_io_fences()
-        .unwrap()
-        .iter()
-        .all(|f| f.tape_uuid == UUID));
+    let fences = state.catalog_index().list_active_tape_io_fences().unwrap();
+    assert!(!fences.is_empty());
+    assert!(fences.iter().all(|f| f.tape_uuid == UUID
+        && f.endpoint
+            == Some(remanence_library::DriveKey::Standalone {
+                drive_serial: SERIAL.into()
+            })));
     // The daemon uses exactly this boundary with global state ownership.
     assert_eq!(
         state
@@ -1098,6 +1106,7 @@ fn library_automatic_sealing_releases_owned_removal_guard() {
             &mut drive,
             request(root.path(), "seal"),
             crate::pool_write::SelectedTape {
+                standalone_endpoint: None,
                 pool_id: "default".into(),
                 tape_uuid: UUID,
                 block_size: BLOCK,
@@ -1194,8 +1203,7 @@ fn mounted_positioning_reuses_only_current_bootstrap_evidence_and_releases_once(
     assert_eq!(*commands.lock().unwrap(), vec![vec![0x1e, 0, 0, 0, 0, 0]]);
 }
 
-/// Physical release must leave unfinished writes for the unconditional startup
-/// admission path; it cannot recover sessions or clear their fences itself.
+/// Physical release must leave unfinished writes for startup recovery; it cannot recover sessions or clear their fences itself.
 #[test]
 fn release_context_does_not_run_write_owner_recovery() {
     let root = tempfile::tempdir().unwrap();
@@ -1235,7 +1243,14 @@ fn release_context_does_not_run_write_owner_recovery() {
         .list_active_tape_io_fences()
         .unwrap()
         .is_empty());
-    assert!(backend(&mut state, &world, &root.path().join("locks"), fault()).is_err());
+    {
+        let mut reopened =
+            backend(&mut state, &world, &root.path().join("locks"), fault()).unwrap();
+        let mounted = reopened.mount(target()).unwrap();
+        assert!(
+            matches!(reopened.mutate_catalog(&mounted, |_| Ok(())), Err(MountError::Refused(message)) if message.contains("fence"))
+        );
+    }
     assert!(state
         .catalog_index()
         .non_terminal_sessions()
@@ -1380,6 +1395,7 @@ async fn standalone_and_daemon_state_rollback_refuses_checkpoint_and_fresh_with_
                         &state,
                         world.clone(),
                         crate::SelectedTape {
+                            standalone_endpoint: None,
                             pool_id: "default".into(),
                             tape_uuid: UUID,
                             block_size: BLOCK,
@@ -1674,6 +1690,7 @@ async fn daemon_abort_crash_supersede_and_healthy_append_both_parity_modes() {
             &state,
             world,
             crate::SelectedTape {
+                standalone_endpoint: None,
                 pool_id: "default".into(),
                 tape_uuid: UUID,
                 block_size: BLOCK,
@@ -1856,7 +1873,7 @@ fn prepared_skip_and_command_reconciliation_are_independent_of_file_count() {
         let path = path.clone();
         std::fs::write(&path, b"changed before preparation").unwrap();
         let decision = mount
-            .put_path_version_with_preparation(&mut mounted, input, || {
+            .put_path_version_with_preparation(&mut mounted, input, false, || {
                 std::fs::write(path, name.as_bytes()).unwrap();
             })
             .unwrap();
@@ -1865,4 +1882,129 @@ fn prepared_skip_and_command_reconciliation_are_independent_of_file_count() {
     assert_eq!(mounted.drive.media_write_dispatch_count(), before);
     crate::startup_checkpoint::RECONCILIATION_COUNT.with(|count| assert_eq!(count.get(), 1));
     mount.release(mounted);
+}
+
+/// A historical tape identity never acquires today's endpoint; both explicit
+/// identity dimensions independently block mutations, while reads remain usable.
+#[test]
+fn standalone_fences_match_only_recorded_tape_or_endpoint() {
+    let root = tempfile::tempdir().unwrap();
+    let mut state = state(root.path());
+    let here = remanence_library::DriveKey::Standalone {
+        drive_serial: SERIAL.into(),
+    };
+    let elsewhere = remanence_library::DriveKey::Standalone {
+        drive_serial: "OTHER".into(),
+    };
+    for (tape, endpoint, blocks) in [
+        (UUID, Some(&elsewhere), true),
+        ([9; 16], Some(&here), true),
+        ([9; 16], Some(&elsewhere), false),
+        ([9; 16], None, false),
+        (UUID, None, true),
+    ] {
+        let fence = state
+            .catalog_index()
+            .record_tape_io_fence_at_endpoint(
+                remanence_state::TapeIoFenceInput {
+                    tape_uuid: tape,
+                    barcode: None,
+                    reason: "test".into(),
+                    evidence_json: None,
+                },
+                endpoint,
+            )
+            .unwrap();
+        assert_eq!(standalone_fence_releasable(&fence), endpoint.is_some());
+        let startup =
+            crate::startup_guard::reject_active_tape_io_fences_on_startup(state.catalog_index())
+                .unwrap_err();
+        assert_eq!(
+            startup.message().contains("--after-settled-inventory"),
+            endpoint.is_none()
+        );
+        if blocks {
+            let refusal =
+                standalone_fence_policy(state.catalog_index(), Some(UUID), Some(&here), true)
+                    .unwrap_err();
+            assert_eq!(
+                refusal.to_string().contains("--after-settled-inventory"),
+                endpoint.is_none()
+            );
+        }
+        assert_eq!(
+            standalone_fence_policy(state.catalog_index(), Some(UUID), Some(&here), true).is_err(),
+            blocks
+        );
+        assert_eq!(
+            standalone_fence_policy(state.catalog_index(), Some(UUID), Some(&here), false)
+                .unwrap()
+                .len(),
+            1
+        );
+        state
+            .release_tape_io_fence(&fence.quarantine_id, "checked")
+            .unwrap()
+            .unwrap();
+        let audit = remanence_state::FileAuditLog::replay(&state.paths().audit_dir).unwrap();
+        let release = audit
+            .iter()
+            .find(|r| {
+                r.event == AuditEvent::TapeIoFenceReleased
+                    && r.subject.id.as_deref() == Some(&fence.quarantine_id)
+            })
+            .unwrap();
+        assert_eq!(
+            release.detail.get("endpoint_key"),
+            endpoint
+                .map(|key| ciborium::Value::Text(key.encode()))
+                .as_ref()
+        );
+    }
+}
+
+/// Both raise and release preserve the endpoint across authoritative rebuilds.
+#[test]
+fn standalone_fence_release_rebuild_preserves_endpoint_and_ack() {
+    let root = tempfile::tempdir().unwrap();
+    let mut state = state(root.path());
+    let endpoint = remanence_library::DriveKey::Standalone {
+        drive_serial: SERIAL.into(),
+    };
+    raise_standalone_fence(
+        &mut state,
+        UUID,
+        Some(&endpoint),
+        "standalone_test",
+        "test evidence",
+    )
+    .unwrap();
+    let fence = state
+        .catalog_index()
+        .list_active_tape_io_fences()
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(standalone_fence_releasable(&fence));
+    let startup =
+        crate::startup_guard::reject_active_tape_io_fences_on_startup(state.catalog_index())
+            .unwrap_err();
+    assert!(!startup.message().contains("--after-settled-inventory"));
+    state
+        .release_tape_io_fence(&fence.quarantine_id, "rescued files")
+        .unwrap()
+        .unwrap();
+    let audit = remanence_state::FileAuditLog::replay(&state.paths().audit_dir).unwrap();
+    let mut rebuilt = CatalogIndex::open(root.path().join("rebuilt-fence.sqlite")).unwrap();
+    rebuilt
+        .rebuild_from_authoritative_sources(&audit, &[])
+        .unwrap();
+    let row = rebuilt
+        .tape_io_fence_by_quarantine_id(&fence.quarantine_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.endpoint, Some(endpoint));
+    assert_eq!(row.release_ack.as_deref(), Some("rescued files"));
+    assert_eq!(row.state, "released");
+    assert!(rebuilt.list_active_tape_io_fences().unwrap().is_empty());
 }

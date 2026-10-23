@@ -224,6 +224,11 @@ pub(crate) fn finalize_mounted_tape(
         remanence_library::WormMediaState::NotWorm
     );
     let selected = SelectedTape {
+        standalone_endpoint: drive
+            .endpoint()
+            .durable_key()
+            .filter(|key| matches!(key, remanence_library::DriveKey::Standalone { .. }))
+            .cloned(),
         pool_id: request
             .expected_pool_id
             .clone()
@@ -756,6 +761,7 @@ pub(crate) fn preflight_manual_finalize_tape(
 
     let spec = TerminalFinalizeSpec::operator(request);
     let selected = SelectedTape {
+        standalone_endpoint: None,
         pool_id: request
             .expected_pool_id
             .clone()

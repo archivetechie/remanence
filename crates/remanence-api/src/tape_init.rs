@@ -398,6 +398,16 @@ pub fn classify_bot_bytes(bot_bytes: &[u8]) -> BotClassification {
         };
     }
 
+    // LTFS XML labels are positive foreign-format evidence, never blank media.
+    if bot_bytes
+        .windows(b"<ltfslabel".len())
+        .any(|w| w == b"<ltfslabel")
+    {
+        return BotClassification::ForeignFormat {
+            name: "LTFS".into(),
+        };
+    }
+
     match sniff(bot_bytes) {
         Some(format) => BotClassification::ForeignFormat {
             name: format.as_str().to_string(),
@@ -790,20 +800,11 @@ fn decide_ours_init(
             },
         };
     }
-    // A retired identity's medium is free to re-init under a fresh uuid: the
-    // retire ceremony already declared the data on it dead and detached the
-    // barcode. The data-past-bootstrap probe is deliberately skipped here —
-    // demanding `CLOBBER` again would be double ceremony for the same intent
-    // the operator acknowledged at retire time. This arm is only reachable
-    // when the barcode is free (or points at this uuid); a barcode owned by
-    // a different live identity already returned `Anomaly` above. The
-    // retired row itself is never reused: `provision_tape` refuses it,
-    // `force` included, so `FreshInit` provisions a brand-new row. Returning
-    // before the barcode-relation check is also deliberate — a retired row's
-    // detached (NULL) voltag is an artifact of retirement, not an unrecorded
-    // relabel.
+    // Retirement preserves the old identity forever; it is not physical blankness
+    // or overwrite authority. Reuse this medium only through confirmed clobber,
+    // which provisions a fresh UUID after the ownership checks above.
     if catalog_row.disposition == CatalogRowDisposition::Retired {
-        return InitDecision::FreshInit;
+        return refuse(TapeInitError::CatalogIndicatesWritten);
     }
     if catalog_row.barcode_relation == CatalogBarcodeRelation::DiffersWithoutRelabel {
         return InitDecision::Anomaly {
@@ -1485,11 +1486,10 @@ mod tests {
     }
 
     #[test]
-    fn retired_row_with_available_barcode_is_fresh_init_despite_physical_data() {
+    fn retired_row_with_available_barcode_requires_confirmed_clobber() {
         let row = retired_catalog_row();
 
-        // The retire ceremony already declared the data dead, so the
-        // physical-data-past-bootstrap probe must not demand CLOBBER again.
+        // A retired identity does not grant authority to overwrite its medium.
         assert_eq!(
             decide(
                 &ours_bot(),
@@ -1498,7 +1498,9 @@ mod tests {
                 true,
                 &CommittedCopyState::None,
             ),
-            InitDecision::FreshInit
+            InitDecision::RefuseClobber {
+                reason: TapeInitError::CatalogIndicatesWritten
+            }
         );
     }
 

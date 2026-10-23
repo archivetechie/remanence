@@ -1071,6 +1071,7 @@ async fn recover_automatic_terminal_tape(
     let (block_size, parity_config) = crate::pool_write::selected_tape_geometry(&tape, pool_id)
         .map_err(crate::write_owner::status_from_select_tape_error)?;
     let selected = crate::SelectedTape {
+        standalone_endpoint: None,
         pool_id: pool_id.to_string(),
         tape_uuid,
         block_size,
@@ -3588,6 +3589,7 @@ mod tests {
         std::fs::write(&companion_path, companion_bytes)
             .expect("restore exact post-fsync stale companion");
         let selected_stale = crate::SelectedTape {
+            standalone_endpoint: None,
             pool_id: pool_id.to_string(),
             tape_uuid: STALE_COMPANION_TAPE,
             block_size: BLOCK_SIZE,
