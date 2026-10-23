@@ -897,13 +897,28 @@ fn c5_write_adapter_sessions_fence_audit_and_stale_fence_refusal() {
                 &mut reopened,
                 &temp.path().join("locks"),
             );
-            match attempt {
+            // Contract amendment 3 (C5, standalone fences): reads run under an
+            // active fence so the operator can rescue data; writes to the fenced
+            // tape are refused before any media dispatch.
+            let mut backend = attempt.expect("a stale fence must not refuse the read-capable open");
+            let mut mounted = backend
+                .mount(target(Some(UUID)))
+                .expect("a stale fence must not refuse a mount for reading");
+            let error = match backend.write_checkpointed(&mut mounted, request(temp.path())) {
+                Ok(_) => panic!("stale active fence must refuse writes"),
                 Err(error) => error.to_string(),
-                Ok(mut backend) => match backend.mount(target(Some(UUID))) {
-                    Ok(_) => panic!("stale active fence must refuse open"),
-                    Err(error) => error.to_string(),
-                },
-            }
+            };
+            drop(mounted);
+            drop(backend);
+            assert!(
+                !reopened
+                    .catalog_index()
+                    .list_active_tape_io_fences()
+                    .unwrap()
+                    .is_empty(),
+                "the refused write must leave the stale fence active"
+            );
+            error
         }
     };
     assert!(error.to_lowercase().contains("fence"), "{error}");

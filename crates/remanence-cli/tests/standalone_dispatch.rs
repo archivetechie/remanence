@@ -741,6 +741,7 @@ fn skipped_disk_is_informational_without_any_tape_endpoints() {
 
 /// Persistent virtual media with fresh production dispatch and state locks per invocation.
 struct VersionFixture {
+    terminal_input: bool,
     fail_after_path: std::sync::Mutex<Option<String>>,
     root: tempfile::TempDir,
     world: std::sync::Arc<std::sync::Mutex<remanence_chaos::model::VirtualWorld>>,
@@ -752,6 +753,7 @@ impl VersionFixture {
 
     fn with_parity(parity: bool) -> Self {
         let fixture = Self {
+            terminal_input: false,
             fail_after_path: std::sync::Mutex::new(None),
             root: tempfile::tempdir().unwrap(),
             world: std::sync::Arc::new(std::sync::Mutex::new(
@@ -812,7 +814,7 @@ impl VersionFixture {
         if json {
             args.push("--json");
         }
-        if extra[0] != "pool" {
+        if extra[0] != "pool" && !extra.starts_with(&["tape", "quarantine"]) {
             args.extend([
                 "--device",
                 "/dev/home-model",
@@ -824,7 +826,7 @@ impl VersionFixture {
         let mut out = Vec::new();
         let mut errors = Vec::new();
         let mutation = std::sync::Arc::new(std::sync::Mutex::new(mutation));
-        let code = remanence_cli::run_with_standalone_test_io(
+        let code = remanence_cli::run_with_standalone_test_input(
             &args,
             self.root.path(),
             &self.root.path().join("state"),
@@ -851,6 +853,7 @@ impl VersionFixture {
             },
             &mut out,
             &mut errors,
+            self.terminal_input,
         );
         (
             code,
@@ -1252,6 +1255,40 @@ fn media_failure_after_first_commit_keeps_the_written_receipt() {
             .contains("fence")
     );
     assert_eq!(f.writes(), before);
+    let fences = f.index().list_active_tape_io_fences().unwrap();
+    assert!(
+        fences.len() >= 2,
+        "exercise shared and mount-level fences: {fences:?}"
+    );
+    let listed = f.ok(&["tape", "quarantine", "list"]);
+    for fence in fences {
+        assert_eq!(
+            fence.endpoint,
+            Some(remanence_library::DriveKey::Standalone {
+                drive_serial: "HOME-DRIVE".into(),
+            })
+        );
+        assert!(
+            listed["active_fences"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| {
+                    entry["quarantine_id"] == fence.quarantine_id
+                        && !entry["endpoint_key"].is_null()
+                }),
+            "{listed}"
+        );
+        f.ok(&[
+            "tape",
+            "quarantine",
+            "release",
+            &fence.quarantine_id,
+            "--ack",
+            "inspected",
+        ]);
+    }
+    assert!(f.index().list_active_tape_io_fences().unwrap().is_empty());
 }
 
 /// Representation changes create versions even when the plaintext is unchanged.
@@ -1401,4 +1438,635 @@ fn legacy_caller_path_fallback_stays_on_loaded_tape() {
         .as_str()
         .unwrap()
         .contains("is not on this tape; it is on FIRST ("));
+}
+
+/// Confirmation failures never reach a bootstrap write on a used cartridge.
+#[test]
+fn used_cartridge_requires_exact_clobber_confirmation() {
+    use remanence_chaos::model::{Record, VirtualTape};
+    for (options, succeeds, message) in [
+        (vec![], false, "this cartridge holds LTFS data"),
+        (
+            vec!["--clobber-data"],
+            false,
+            "non-interactive clobber requires",
+        ),
+        (
+            vec!["--clobber-data", "--confirm-clobber", "WRONG"],
+            false,
+            "did not match",
+        ),
+        (
+            vec!["--clobber-data", "--confirm-clobber", "CLOBBER USED"],
+            true,
+            "",
+        ),
+    ] {
+        let f = VersionFixture::new();
+        let mut tape = VirtualTape::empty(256 * 1024 * 1024, 262144);
+        tape.records = vec![
+            Record::Block(b"<ltfslabel><creator>fixture</creator></ltfslabel>".to_vec()),
+            Record::Filemark,
+        ];
+        f.world
+            .lock()
+            .unwrap()
+            .put_tape_in_drive(0x100, "USED", None, tape);
+        let before = f.writes();
+        let mut args = vec!["tape", "init", "--label", "USED", "--generation", "L9"];
+        args.extend(options);
+        let (code, out, errors) = f.run(&args, true);
+        assert_eq!(code == ExitCode::SUCCESS, succeeds, "{out}\n{errors}");
+        if succeeds {
+            assert!(f.writes() > before);
+            assert!(f.index().get_tape_by_voltag("USED").unwrap().is_some());
+        } else {
+            assert!(out.contains(message), "{out}");
+            assert_eq!(f.writes(), before);
+        }
+    }
+}
+
+/// Encrypted newest versions require an explicit downgrade; other files continue.
+#[test]
+fn plaintext_downgrade_is_per_file_and_requires_override() {
+    let f = VersionFixture::new();
+    let source = f.root.path().join("secret.txt");
+    let other = f.root.path().join("other.txt");
+    std::fs::write(&source, b"secret").unwrap();
+    std::fs::write(&other, b"ordinary").unwrap();
+    let key = remanence_aead::RecipientPrivateKey::new([7; 16], "test", [7; 32]).unwrap();
+    let recipient = f.root.path().join("test.remr");
+    std::fs::write(&recipient, key.public_key(0).unwrap().serialize().unwrap()).unwrap();
+    let recovery = f.root.path().join("recovery.remr");
+    let recovery_key =
+        remanence_aead::RecipientPrivateKey::new([8; 16], "recovery", [8; 32]).unwrap();
+    std::fs::write(
+        &recovery,
+        recovery_key.public_key(1).unwrap().serialize().unwrap(),
+    )
+    .unwrap();
+    let encrypted = f.ok(&[
+        "put",
+        source.to_str().unwrap(),
+        "--recipient",
+        recipient.to_str().unwrap(),
+        "--recipient",
+        recovery.to_str().unwrap(),
+    ]);
+    let (code, out, _) = f.run(
+        &["put", source.to_str().unwrap(), other.to_str().unwrap()],
+        true,
+    );
+    assert_ne!(code, ExitCode::SUCCESS);
+    let result = VersionFixture::envelope(&out)["result"].clone();
+    assert_eq!(result["receipts"][0]["event"], "refused");
+    assert_eq!(
+        result["receipts"][0]["reason"],
+        "would_store_plaintext_copy_of_encrypted"
+    );
+    assert_eq!(
+        result["receipts"][0]["newest_version"],
+        encrypted["receipts"][0]["object_id"]
+    );
+    assert_eq!(result["receipts"][1]["event"], "written");
+    f.ok(&["pool", "new", "backup"]);
+    f.new_tape("BACKUP");
+    f.ok(&[
+        "tape",
+        "init",
+        "--label",
+        "BACKUP",
+        "--generation",
+        "L9",
+        "--pool",
+        "backup",
+    ]);
+    let before = f.writes();
+    assert_ne!(
+        f.run(&["put", source.to_str().unwrap()], true).0,
+        ExitCode::SUCCESS
+    );
+    assert_eq!(before, f.writes());
+    assert_eq!(
+        f.ok(&["put", source.to_str().unwrap(), "--allow-plaintext-copy"])["receipts"][0]["event"],
+        "written"
+    );
+}
+
+/// Rescue reads keep their ordinary path with a warning; release is local and audited.
+#[test]
+fn fence_allows_rescue_blocks_writes_and_releases_with_audit() {
+    let f = VersionFixture::new();
+    let source = f.root.path().join("rescue.txt");
+    std::fs::write(&source, b"rescue bytes").unwrap();
+    let put = f.ok(&["put", source.to_str().unwrap()]);
+    let tape = f.index().get_tape_by_voltag("FIRST").unwrap().unwrap();
+    let fence = f
+        .index()
+        .record_tape_io_fence_at_endpoint(
+            remanence_state::TapeIoFenceInput {
+                tape_uuid: tape.tape_uuid.try_into().unwrap(),
+                barcode: Some("FIRST".into()),
+                reason: "standalone_test".into(),
+                evidence_json: None,
+            },
+            Some(&remanence_library::DriveKey::Standalone {
+                drive_serial: "HOME-DRIVE".into(),
+            }),
+        )
+        .unwrap();
+    for args in [
+        vec![
+            "get".to_string(),
+            put["receipts"][0]["object_id"].as_str().unwrap().into(),
+            "--out".into(),
+            f.root.path().join("get").display().to_string(),
+        ],
+        vec![
+            "tape".into(),
+            "restore".into(),
+            "--scan".into(),
+            "--out".into(),
+            f.root.path().join("scan").display().to_string(),
+        ],
+    ] {
+        let (code, out, errors) = f.run(&args.iter().map(String::as_str).collect::<Vec<_>>(), true);
+        assert_eq!(code, ExitCode::SUCCESS, "{out}\n{errors}");
+        assert!(errors.contains("warning: active tape-I/O fences"));
+        assert_eq!(
+            VersionFixture::envelope(&out)["active_fences"][0]["quarantine_id"],
+            fence.quarantine_id
+        );
+    }
+    let before = f.writes();
+    assert_ne!(
+        f.run(&["put", source.to_str().unwrap()], true).0,
+        ExitCode::SUCCESS
+    );
+    assert_eq!(before, f.writes());
+    assert_eq!(
+        f.ok(&["tape", "quarantine", "list"])["active_fences"][0]["label"],
+        "FIRST"
+    );
+    f.ok(&[
+        "tape",
+        "quarantine",
+        "release",
+        &fence.quarantine_id,
+        "--ack",
+        "recovered",
+    ]);
+    assert!(f.index().list_active_tape_io_fences().unwrap().is_empty());
+    let cfg = remanence_state::load_config(f.config()).unwrap();
+    let audit = remanence_state::FileAuditLog::replay(cfg.audit.dir).unwrap();
+    assert!(audit.iter().any(
+        |r| r.event == remanence_state::AuditEvent::TapeIoFenceReleased
+            && r.subject.id.as_deref() == Some(&fence.quarantine_id)
+    ));
+}
+
+/// The child runs production confirmation on a real terminal, with model media.
+#[test]
+#[ignore = "invoked by clobber_confirmation_accepts_a_real_pty with terminal stdin"]
+fn clobber_pty_child() {
+    use std::io::IsTerminal;
+    assert!(
+        std::io::stdin().is_terminal(),
+        "child requires the parent PTY"
+    );
+    let mut f = VersionFixture::new();
+    f.terminal_input = true;
+    let mut tape = remanence_chaos::model::VirtualTape::empty(256 * 1024 * 1024, 262144);
+    tape.records.push(remanence_chaos::model::Record::Block(
+        b"<ltfslabel/>".to_vec(),
+    ));
+    f.world
+        .lock()
+        .unwrap()
+        .put_tape_in_drive(0x100, "USED", None, tape);
+    let before = f.writes();
+    f.ok(&[
+        "tape",
+        "init",
+        "--label",
+        "USED",
+        "--generation",
+        "L9",
+        "--clobber-data",
+    ]);
+    assert!(f.writes() > before);
+}
+
+/// PTY availability is required; failure is never reported as passing coverage.
+#[test]
+fn clobber_confirmation_accepts_a_real_pty() {
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+    let mut master = -1;
+    let mut slave = -1;
+    // SAFETY: valid output pointers; null optional termios/winsize request defaults.
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        },
+        0,
+        "openpty: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: successful openpty returned two newly owned file descriptors.
+    let mut master = unsafe { std::fs::File::from_raw_fd(master) };
+    let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "clobber_pty_child", "--ignored", "--nocapture"])
+        .stdin(slave)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    master.write_all(b"CLOBBER USED\n").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            panic!("PTY confirmation timed out");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let result = child.wait_with_output().unwrap();
+    assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed"));
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+/// Init must inspect the old BOT identity before planning its replacement UUID.
+#[test]
+fn clobber_refuses_fenced_old_bot_on_another_endpoint() {
+    let f = VersionFixture::new();
+    let source = f.root.path().join("old.txt");
+    std::fs::write(&source, b"old bytes").unwrap();
+    f.ok(&["put", source.to_str().unwrap()]);
+    let tape = f.index().get_tape_by_voltag("FIRST").unwrap().unwrap();
+    f.index()
+        .record_tape_io_fence_at_endpoint(
+            remanence_state::TapeIoFenceInput {
+                tape_uuid: tape.tape_uuid.try_into().unwrap(),
+                barcode: Some("FIRST".into()),
+                reason: "test".into(),
+                evidence_json: None,
+            },
+            Some(&remanence_library::DriveKey::Standalone {
+                drive_serial: "OTHER".into(),
+            }),
+        )
+        .unwrap();
+    let before = f.writes();
+    let (code, out, _) = f.run(
+        &[
+            "tape",
+            "init",
+            "--label",
+            "FIRST",
+            "--generation",
+            "L9",
+            "--clobber-data",
+            "--confirm-clobber",
+            "CLOBBER FIRST",
+        ],
+        true,
+    );
+    assert_ne!(code, ExitCode::SUCCESS);
+    assert!(
+        out.contains("write blocked by active tape-I/O fence"),
+        "{out}"
+    );
+    assert_eq!(before, f.writes());
+}
+
+/// Swapping cartridges does not erase an explicit endpoint fence, and historical
+/// UUID-only fences do not prevent writing an unrelated cartridge in that drive.
+#[test]
+fn other_cartridge_write_depends_on_recorded_endpoint() {
+    for endpoint_match in [false, true] {
+        let f = VersionFixture::new();
+        let old = f.index().get_tape_by_voltag("FIRST").unwrap().unwrap();
+        f.new_tape("SECOND");
+        f.ok(&["tape", "init", "--label", "SECOND", "--generation", "L9"]);
+        let endpoint = remanence_library::DriveKey::Standalone {
+            drive_serial: "HOME-DRIVE".into(),
+        };
+        f.index()
+            .record_tape_io_fence_at_endpoint(
+                remanence_state::TapeIoFenceInput {
+                    tape_uuid: old.tape_uuid.try_into().unwrap(),
+                    barcode: Some("FIRST".into()),
+                    reason: "test".into(),
+                    evidence_json: None,
+                },
+                endpoint_match.then_some(&endpoint),
+            )
+            .unwrap();
+        let source = f.root.path().join("new.txt");
+        std::fs::write(&source, b"new cartridge").unwrap();
+        let before = f.writes();
+        let (code, out, errors) = f.run(&["put", source.to_str().unwrap()], true);
+        assert_eq!(
+            code == ExitCode::SUCCESS,
+            !endpoint_match,
+            "{out}\n{errors}"
+        );
+        if endpoint_match {
+            assert_eq!(before, f.writes());
+        } else {
+            assert!(f.writes() > before);
+        }
+    }
+}
+
+/// A confirmed overwrite reuses the catalog provisioning path and removes stale copies.
+#[test]
+fn clobber_catalogued_tape_and_refuse_another_label_owner() {
+    let f = VersionFixture::new();
+    let source = f.root.path().join("old.txt");
+    std::fs::write(&source, b"old data").unwrap();
+    let put = f.ok(&["put", source.to_str().unwrap()]);
+    let old = f
+        .index()
+        .get_tape_by_voltag("FIRST")
+        .unwrap()
+        .unwrap()
+        .tape_uuid;
+    f.ok(&[
+        "tape",
+        "init",
+        "--label",
+        "FIRST",
+        "--generation",
+        "L9",
+        "--clobber-data",
+        "--confirm-clobber",
+        "CLOBBER FIRST",
+    ]);
+    let new = f
+        .index()
+        .get_tape_by_voltag("FIRST")
+        .unwrap()
+        .unwrap()
+        .tape_uuid;
+    assert_ne!(old, new);
+    let object = f
+        .index()
+        .get_native_object(put["receipts"][0]["object_id"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    assert!(!object.copies.iter().any(|c| c.status == "committed"));
+    let mut foreign = remanence_chaos::model::VirtualTape::empty(256 * 1024 * 1024, 262144);
+    foreign.records.push(remanence_chaos::model::Record::Block(
+        b"foreign data".to_vec(),
+    ));
+    f.world
+        .lock()
+        .unwrap()
+        .put_tape_in_drive(0x100, "OTHER", None, foreign);
+    let before = f.writes();
+    let (code, out, _) = f.run(
+        &[
+            "tape",
+            "init",
+            "--label",
+            "FIRST",
+            "--generation",
+            "L9",
+            "--clobber-data",
+        ],
+        true,
+    );
+    assert_ne!(code, ExitCode::SUCCESS);
+    assert!(out.contains("belongs to tape"), "{out}");
+    assert!(out.contains("tape rebind --previous-uuid"), "{out}");
+    assert_eq!(f.writes(), before);
+}
+
+/// Every init checks the partition page, including an explicitly confirmed clobber.
+#[test]
+fn partitioned_init_refuses_before_writes() {
+    for additional in [0, 1] {
+        for clobber in [false, true] {
+            let f = VersionFixture::new();
+            let mut tape = remanence_chaos::model::VirtualTape::empty(256 * 1024 * 1024, 262144);
+            tape.additional_partitions = additional;
+            f.world
+                .lock()
+                .unwrap()
+                .put_tape_in_drive(0x100, "PART", None, tape);
+            let before = f.writes();
+            let mut args = vec!["tape", "init", "--label", "PART", "--generation", "L9"];
+            if clobber {
+                args.extend(["--clobber-data", "--confirm-clobber", "CLOBBER PART"]);
+            }
+            let (code, out, _) = f.run(&args, true);
+            assert_eq!(code == ExitCode::SUCCESS, additional == 0, "{out}");
+            if additional != 0 {
+                assert!(out.contains("this cartridge has 2 partitions"), "{out}");
+                assert!(out.contains("mkpartition 0"), "{out}");
+                assert!(!out.contains("malformed MODE response"), "{out}");
+                assert_eq!(before, f.writes());
+            }
+        }
+    }
+}
+
+/// Discovery reads the catalog without competing with the write owner's state lock.
+#[test]
+fn discovery_succeeds_while_state_is_locked() {
+    let f = VersionFixture::new();
+    let config = remanence_state::load_config(f.config()).unwrap();
+    let _owner = remanence_state::StateHandle::open_with_config(
+        remanence_state::StatePaths::from_config(f.config(), &config),
+        config,
+    )
+    .unwrap();
+    let archive = f.root.path().join("diagnostics.tar");
+    for args in [
+        vec!["doctor"],
+        vec!["drives"],
+        vec!["diagnostics", "capture", "--out", archive.to_str().unwrap()],
+    ] {
+        let (code, out, errors) = f.run(&args, true);
+        assert_eq!(code, ExitCode::SUCCESS, "{out}\n{errors}");
+    }
+}
+
+/// Endpoint kind, not user-supplied reason, determines release authorization.
+#[test]
+fn standalone_cannot_release_a_library_fence() {
+    for endpoint in [None, Some(remanence_library::DriveKey::new("LIB", 0x100))] {
+        let f = VersionFixture::new();
+        let fence = f
+            .index()
+            .record_tape_io_fence_at_endpoint(
+                remanence_state::TapeIoFenceInput {
+                    tape_uuid: [17; 16],
+                    barcode: None,
+                    reason: "standalone_misleading_reason".into(),
+                    evidence_json: None,
+                },
+                endpoint.as_ref(),
+            )
+            .unwrap();
+        let (code, out, _) = f.run(
+            &[
+                "tape",
+                "quarantine",
+                "release",
+                &fence.quarantine_id,
+                "--ack",
+                "ok",
+            ],
+            true,
+        );
+        assert_ne!(code, ExitCode::SUCCESS);
+        assert!(out.contains("--after-settled-inventory"), "{out}");
+        assert!(out.contains("--config <the library config>"), "{out}");
+        assert!(out.contains("host that owns it"), "{out}");
+        assert_eq!(f.index().list_active_tape_io_fences().unwrap().len(), 1);
+    }
+}
+
+/// Retirement cannot bypass the physical fresh-media gate or report false success.
+#[test]
+fn retired_nonblank_cartridge_cannot_bypass_fresh_media_gate() {
+    let f = VersionFixture::new();
+    let old: [u8; 16] = f
+        .index()
+        .get_tape_by_voltag("FIRST")
+        .unwrap()
+        .unwrap()
+        .tape_uuid
+        .try_into()
+        .unwrap();
+    let config = remanence_state::load_config(f.config()).unwrap();
+    let mut state = remanence_state::StateHandle::open_with_config(
+        remanence_state::StatePaths::from_config(f.config(), &config),
+        config,
+    )
+    .unwrap();
+    state
+        .retire_tape(remanence_state::RetireTapeInput {
+            tape_uuid: old,
+            reason: "recycled".into(),
+        })
+        .unwrap();
+    drop(state);
+    let before = f.writes();
+    let (code, out, _) = f.run(
+        &["tape", "init", "--label", "FIRST", "--generation", "L9"],
+        true,
+    );
+    assert_ne!(code, ExitCode::SUCCESS);
+    assert!(out.contains("--clobber-data"), "{out}");
+    assert_eq!(before, f.writes());
+    assert!(f.index().get_tape_by_voltag("FIRST").unwrap().is_none());
+    assert_eq!(f.index().get_tape(&old).unwrap().unwrap().state, "retired");
+    f.ok(&[
+        "tape",
+        "init",
+        "--label",
+        "FIRST",
+        "--generation",
+        "L9",
+        "--clobber-data",
+        "--confirm-clobber",
+        "CLOBBER FIRST",
+    ]);
+    assert_ne!(
+        f.index()
+            .get_tape_by_voltag("FIRST")
+            .unwrap()
+            .unwrap()
+            .tape_uuid,
+        old
+    );
+    assert_eq!(f.index().get_tape(&old).unwrap().unwrap().state, "retired");
+}
+
+/// A stale catalog remains a visible failed doctor check without blocking discovery.
+#[test]
+fn doctor_reports_schema_mismatch() {
+    use std::io::{Seek, SeekFrom, Write};
+    let f = VersionFixture::new();
+    let config = remanence_state::load_config(f.config()).unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(config.index.sqlite_path)
+        .unwrap();
+    // SQLite's header stores user_version as a big-endian integer at byte 60.
+    file.seek(SeekFrom::Start(60)).unwrap();
+    file.write_all(&999_u32.to_be_bytes()).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    let (code, out, errors) = f.run(&["doctor"], true);
+    assert_eq!(code, ExitCode::SUCCESS, "{out}\n{errors}");
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        report["result"]["catalog_fence_check"]["ok"], false,
+        "{out}"
+    );
+    assert!(out.contains("999"), "{out}");
+    assert!(errors.contains("cannot check catalog fences"), "{errors}");
+}
+
+/// Header access observes migration without accidentally opening the writable catalog.
+fn catalog_schema(f: &VersionFixture, set: Option<u32>) -> u32 {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let config = remanence_state::load_config(f.config()).unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(config.index.sqlite_path)
+        .unwrap();
+    file.seek(SeekFrom::Start(60)).unwrap();
+    if let Some(version) = set {
+        file.write_all(&version.to_be_bytes()).unwrap();
+        file.sync_all().unwrap();
+        file.seek(SeekFrom::Start(60)).unwrap();
+    }
+    let mut bytes = [0; 4];
+    file.read_exact(&mut bytes).unwrap();
+    u32::from_be_bytes(bytes)
+}
+
+/// Ordinary home reads and writes migrate; discovery reports stale state without modifying it.
+#[test]
+fn home_put_and_get_migrate_old_catalog_but_doctor_does_not() {
+    let f = VersionFixture::new();
+    let source = f.root.path().join("migrate.txt");
+    std::fs::write(&source, b"migration payload").unwrap();
+    assert_eq!(catalog_schema(&f, Some(19)), 19);
+    let doctor = f.ok(&["doctor"]);
+    assert_eq!(doctor["catalog_fence_check"]["ok"], false);
+    assert_eq!(catalog_schema(&f, None), 19);
+    f.ok(&["put", source.to_str().unwrap()]);
+    assert_eq!(catalog_schema(&f, None), 20);
+    assert_eq!(catalog_schema(&f, Some(19)), 19);
+    let dest = f.root.path().join("restored-migration");
+    f.ok(&["get", "migrate.txt", "--out", dest.to_str().unwrap()]);
+    assert_eq!(catalog_schema(&f, None), 20);
+    assert_eq!(
+        std::fs::read(dest.join("migrate.txt")).unwrap(),
+        b"migration payload"
+    );
 }

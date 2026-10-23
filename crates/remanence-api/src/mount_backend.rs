@@ -19,6 +19,60 @@ use std::{
     time::Duration,
 };
 
+/// Only an explicitly standalone-raised fence permits release without inventory settlement.
+pub fn standalone_fence_releasable(fence: &remanence_state::TapeIoFenceRecord) -> bool {
+    matches!(
+        fence.endpoint,
+        Some(remanence_library::DriveKey::Standalone { .. })
+    )
+}
+
+/// Shared recovery advice for startup and standalone write admission.
+pub(crate) fn fence_release_options(fence: &remanence_state::TapeIoFenceRecord) -> &'static str {
+    if standalone_fence_releasable(fence) {
+        "--ack TEXT"
+    } else {
+        "--after-settled-inventory --ack TEXT"
+    }
+}
+
+/// Standalone reads report all fences; writes refuse only the loaded identity or endpoint.
+/// Historical UUID-only fences never inherit the endpoint of today's cartridge.
+pub fn standalone_fence_policy(
+    index: &CatalogIndex,
+    loaded_uuid: Option<TapeUuid>,
+    endpoint: Option<&remanence_library::DriveKey>,
+    writing: bool,
+) -> Result<Vec<remanence_state::TapeIoFenceRecord>, MountError> {
+    let fences = index.list_active_tape_io_fences().map_err(refusal)?;
+    if writing {
+        let identity_conflicts = if let Some(uuid) = loaded_uuid {
+            let label = index
+                .get_tape(&uuid)
+                .map_err(refusal)?
+                .and_then(|t| t.voltag);
+            index
+                .tape_io_admission_conflicts(&uuid, label.as_deref())
+                .map_err(refusal)?
+        } else {
+            Vec::new()
+        };
+        if let Some(fence) = fences.iter().find(|f| {
+            identity_conflicts
+                .iter()
+                .any(|conflict| conflict.quarantine_id == f.quarantine_id)
+                || endpoint.is_some_and(|key| f.endpoint.as_ref() == Some(key))
+        }) {
+            let release_options = fence_release_options(fence);
+            return Err(refusal(format!(
+                "write blocked by active tape-I/O fence {}: {}; inspect `rem tape quarantine list`, then release with `rem tape quarantine release {} {release_options}`",
+                fence.quarantine_id, fence.reason, fence.quarantine_id
+            )));
+        }
+    }
+    Ok(fences)
+}
+
 /// How an invocation addresses a cartridge; labels are location hints only.
 pub enum MountTarget {
     Tape {
@@ -70,6 +124,9 @@ pub enum MountError {
     Blank { path: PathBuf },
     #[error("{0}")]
     Refused(String),
+    /// A plaintext request would duplicate the newest encrypted version.
+    #[error("would store plaintext copy of encrypted version {newest_version}")]
+    PlaintextCopy { newest_version: String },
     /// Preserve typed tape failures until the command chooses continuation advice.
     #[error("{0}")]
     PoolWrite(Box<crate::PoolWriteError>),
@@ -354,8 +411,7 @@ impl<'a> OperatorMount<'a> {
         let context = LockedAuditedDevice::open(drive, state, io)?;
         if let Some(endpoint) = context.endpoint.durable_key() {
             state.replay_audit_projection().map_err(refusal)?;
-            crate::startup_guard::reject_active_tape_io_fences_on_startup(state.catalog_index())
-                .map_err(refusal)?;
+            standalone_fence_policy(state.catalog_index(), None, Some(endpoint), false)?;
             state
                 .recover_sessions_after_restart(Some(endpoint), |state, session| {
                     if session.session_kind == "write" {
@@ -380,8 +436,7 @@ impl<'a> OperatorMount<'a> {
                     Ok(())
                 })
                 .map_err(refusal)?;
-            crate::startup_guard::reject_active_tape_io_fences_on_startup(state.catalog_index())
-                .map_err(refusal)?;
+            standalone_fence_policy(state.catalog_index(), None, Some(endpoint), false)?;
         }
         Ok(Self {
             state,
@@ -416,10 +471,12 @@ impl<'a> OperatorMount<'a> {
             }
             let (uuid, plan) = prepare(&mut drive, self.state).map_err(refusal)?;
             self.flush_audit()?;
-            crate::startup_guard::reject_active_tape_io_fences_on_startup(
+            standalone_fence_policy(
                 self.state.catalog_index(),
-            )
-            .map_err(refusal)?;
+                Some(uuid),
+                drive.endpoint().durable_key(),
+                true,
+            )?;
             let control = self.state.calibration_control().clone();
             crate::calibration::install_standalone_calibration_fence(&mut drive, &control, uuid)
                 .map_err(refusal)?;
@@ -470,6 +527,12 @@ impl<'a> OperatorMount<'a> {
         operation: impl FnOnce(&mut StateHandle) -> Result<T, String>,
     ) -> Result<T, MountError> {
         self.require_durable_mount(mounted)?;
+        standalone_fence_policy(
+            self.state.catalog_index(),
+            Some(mounted.tape_uuid),
+            mounted.endpoint.durable_key(),
+            true,
+        )?;
         if mounted.identity_generation != mounted.drive.identity_generation() {
             return Err(refusal("media identity invalidated"));
         }
@@ -565,7 +628,18 @@ impl<'a> OperatorMount<'a> {
         request: WriteObjectToPoolRequest,
     ) -> Result<Result<(PoolWriteResult, &'static str), remanence_state::VersionRow>, MountError>
     {
-        self.put_path_version_with_preparation(mounted, request, || {})
+        self.put_path_version_with_policy(mounted, request, false)
+    }
+
+    /// Explicit plaintext downgrade policy around the same version and write funnel.
+    pub fn put_path_version_with_policy(
+        &mut self,
+        mounted: &mut MountedTape,
+        request: WriteObjectToPoolRequest,
+        allow_plaintext_copy: bool,
+    ) -> Result<Result<(PoolWriteResult, &'static str), remanence_state::VersionRow>, MountError>
+    {
+        self.put_path_version_with_preparation(mounted, request, allow_plaintext_copy, || {})
     }
 
     /// Keep the decision and preparation in one funnel; the hook models a source race.
@@ -573,16 +647,51 @@ impl<'a> OperatorMount<'a> {
         &mut self,
         mounted: &mut MountedTape,
         mut request: WriteObjectToPoolRequest,
+        allow_plaintext_copy: bool,
         before_prepare: impl FnOnce(),
     ) -> Result<Result<(PoolWriteResult, &'static str), remanence_state::VersionRow>, MountError>
     {
         self.require_durable_mount(mounted)?;
         self.reconcile_checkpoints()?;
-        crate::startup_guard::reject_active_tape_io_fences_on_startup(self.state.catalog_index())
-            .map_err(refusal)?;
+        standalone_fence_policy(
+            self.state.catalog_index(),
+            Some(mounted.tape_uuid),
+            mounted.endpoint.durable_key(),
+            true,
+        )?;
         let path =
             remanence_stream::normalize_archive_path(&request.archive_path).map_err(refusal)?;
         request.archive_path = PathBuf::from(&path);
+        if !allow_plaintext_copy
+            && matches!(
+                request.representation,
+                crate::PoolWriteRepresentation::Plaintext
+            )
+        {
+            if let Some(version) = self
+                .state
+                .catalog_index()
+                .list_committed_versions_by_path_any_pool(&path)
+                .map_err(refusal)?
+                .first()
+            {
+                let record = self
+                    .state
+                    .catalog_index()
+                    .get_native_object(&version.object_id)
+                    .map_err(refusal)?
+                    .ok_or_else(|| refusal("version object disappeared"))?;
+                if record
+                    .copies
+                    .iter()
+                    .any(|copy| copy.status == "committed" && copy.representation == "encrypted")
+                {
+                    return Err(MountError::PlaintextCopy {
+                        newest_version: version.object_id.clone(),
+                    });
+                }
+            }
+        }
         let newest = self
             .state
             .catalog_index()
@@ -677,8 +786,12 @@ impl<'a> OperatorMount<'a> {
         self.require_durable_mount(mounted)?;
         self.reconcile_checkpoints()?;
         self.flush_audit()?;
-        crate::startup_guard::reject_active_tape_io_fences_on_startup(self.state.catalog_index())
-            .map_err(refusal)?;
+        standalone_fence_policy(
+            self.state.catalog_index(),
+            Some(mounted.tape_uuid),
+            mounted.endpoint.durable_key(),
+            true,
+        )?;
         let pool = self
             .state
             .config()
@@ -1031,8 +1144,12 @@ impl OperatorMount<'_> {
                 "finalize requires a reason, non-nil idempotency key and canonical expected pool",
             ));
         }
-        crate::startup_guard::reject_active_tape_io_fences_on_startup(self.state.catalog_index())
-            .map_err(refusal)?;
+        standalone_fence_policy(
+            self.state.catalog_index(),
+            Some(mounted.tape_uuid),
+            mounted.endpoint.durable_key(),
+            true,
+        )?;
         let actor = AuditActor::local_user();
         let actor_fingerprint = crate::catalog_conversion::audit_actor_fingerprint(&actor);
         let fingerprint = crate::catalog_conversion::manual_finalize_request_fingerprint(
@@ -1136,6 +1253,12 @@ impl OperatorMount<'_> {
         from: &Path,
     ) -> Result<(), MountError> {
         self.require_durable_mount(mounted)?;
+        standalone_fence_policy(
+            self.state.catalog_index(),
+            Some(mounted.tape_uuid),
+            mounted.endpoint.durable_key(),
+            true,
+        )?;
         mounted.drive.rewind().map_err(refusal)?;
         crate::verify_tape_identity(
             &mut DriveHandleSource(&mut mounted.drive),
@@ -1372,6 +1495,8 @@ fn raise_standalone_fence(
         AuditEvent::TapeIoFenceRaised,
     )
     .map_err(refusal)?;
+    let release_options = fence_release_options(&fence);
+    eprintln!("standalone tape-I/O fence {}; inspect `rem tape quarantine list`; release with `rem tape quarantine release {} {release_options}`", fence.quarantine_id, fence.quarantine_id);
     state.refresh_audit_append_cursor().map_err(refusal)
 }
 
@@ -1387,6 +1512,12 @@ impl OperatorMount<'_> {
         confirm: impl FnOnce(&str, &[String]) -> Result<(), String>,
     ) -> Result<Vec<String>, MountError> {
         self.require_durable_mount(mounted)?;
+        standalone_fence_policy(
+            self.state.catalog_index(),
+            Some(mounted.tape_uuid),
+            mounted.endpoint.durable_key(),
+            true,
+        )?;
         if mounted.generation.is_none() {
             return Err(refusal(
                 "tape generation is required before superseding a tail",
@@ -1634,12 +1765,18 @@ pub(crate) fn supersede_mounted_tail(
     drive.clear_append_admission();
     if let Err(error) = result {
         let fence = index
-            .record_tape_io_fence(remanence_state::TapeIoFenceInput {
-                tape_uuid,
-                barcode: tape.voltag,
-                reason: "supersede_tail_failed".into(),
-                evidence_json: Some(serde_json::json!({"error":error}).to_string()),
-            })
+            .record_tape_io_fence_at_endpoint(
+                remanence_state::TapeIoFenceInput {
+                    tape_uuid,
+                    barcode: tape.voltag,
+                    reason: "supersede_tail_failed".into(),
+                    evidence_json: Some(serde_json::json!({"error":error}).to_string()),
+                },
+                drive
+                    .endpoint()
+                    .durable_key()
+                    .filter(|key| matches!(key, remanence_library::DriveKey::Standalone { .. })),
+            )
             .map_err(crate::status_from_state_error)?;
         crate::write_owner::append_tape_io_fence_evidence(
             index,

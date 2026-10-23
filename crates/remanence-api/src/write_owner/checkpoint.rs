@@ -875,12 +875,15 @@ pub(super) fn fence_failed_checkpoint_batch(
         "error": status.message(),
     })
     .to_string();
-    match index.record_tape_io_fence(remanence_state::TapeIoFenceInput {
-        tape_uuid: selected.tape_uuid,
-        barcode,
-        reason: "checkpoint_barrier_failed".to_string(),
-        evidence_json: Some(evidence),
-    }) {
+    match index.record_tape_io_fence_at_endpoint(
+        remanence_state::TapeIoFenceInput {
+            tape_uuid: selected.tape_uuid,
+            barcode,
+            reason: "checkpoint_barrier_failed".to_string(),
+            evidence_json: Some(evidence),
+        },
+        selected.standalone_endpoint.as_ref(),
+    ) {
         Ok(fence) => {
             match append_tape_io_fence_evidence(index, cfg, &fence, AuditEvent::TapeIoFenceRaised) {
                 Ok(()) => status,
@@ -955,12 +958,15 @@ pub(super) fn fence_failed_parity_raw_write(
         "error": error,
     })
     .to_string();
-    let fence = match index.record_tape_io_fence(remanence_state::TapeIoFenceInput {
-        tape_uuid: selected.tape_uuid,
-        barcode,
-        reason: parity_raw_write_fence_reason(error).to_string(),
-        evidence_json: Some(evidence),
-    }) {
+    let fence = match index.record_tape_io_fence_at_endpoint(
+        remanence_state::TapeIoFenceInput {
+            tape_uuid: selected.tape_uuid,
+            barcode,
+            reason: parity_raw_write_fence_reason(error).to_string(),
+            evidence_json: Some(evidence),
+        },
+        selected.standalone_endpoint.as_ref(),
+    ) {
         Ok(fence) => fence,
         Err(err) => {
             tracing::error!(

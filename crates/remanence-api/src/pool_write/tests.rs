@@ -162,6 +162,7 @@ fn selected_drive_writer_binds_media_check_and_write_to_one_drive() {
     let mut state =
         CatalogIndex::open(temp.path().join("state.sqlite")).expect("open empty test catalog");
     let selected = SelectedTape {
+        standalone_endpoint: None,
         pool_id: "direct-worm".to_string(),
         tape_uuid: TAPE_UUID,
         block_size: BLOCK_SIZE,
@@ -421,6 +422,7 @@ fn selected_drive_writer_binds_media_check_and_write_to_one_drive() {
         &pool_cfg,
         replay_request,
         SelectedTape {
+            standalone_endpoint: None,
             pool_id: pool_cfg.id.clone(),
             tape_uuid: TAPE_UUID,
             block_size: BLOCK_SIZE,
@@ -1626,6 +1628,7 @@ fn overlap_admission_plans_object_larger_than_legacy_64_gib_cap() {
         })
         .expect("provision mocked LTO-9");
     let selected = SelectedTape {
+        standalone_endpoint: None,
         pool_id: "large.overlap".into(),
         tape_uuid,
         block_size,
@@ -1697,6 +1700,7 @@ fn batched_capacity_uses_session_local_physical_extent() {
         })
         .expect("provision mocked LTO-9");
     let selected = SelectedTape {
+        standalone_endpoint: None,
         pool_id: "batched.capacity".into(),
         tape_uuid,
         block_size,
@@ -1747,6 +1751,7 @@ fn no_parity_exact_close_capacity_rolls_before_whole_object_motion() {
         })
         .expect("provision mocked LTO-9");
     let selected = SelectedTape {
+        standalone_endpoint: None,
         pool_id: "capacity.no-parity".into(),
         tape_uuid,
         block_size,
@@ -1829,6 +1834,7 @@ fn downward_pool_cap_is_the_shared_selection_and_terminal_capacity_basis() {
         })
         .expect("provision mocked LTO-9");
     let selected = SelectedTape {
+        standalone_endpoint: None,
         pool_id: "capacity.downward".into(),
         tape_uuid,
         block_size,
@@ -1884,6 +1890,7 @@ fn close_only_authority_uses_capped_c_at_equality_and_below_low() {
         })
         .expect("provision mocked LTO-9");
     let selected = SelectedTape {
+        standalone_endpoint: None,
         pool_id: "capacity.close-only".into(),
         tape_uuid,
         block_size,
@@ -2039,6 +2046,7 @@ fn parity_capacity_reservation_uses_physical_cursor_exact_layout_and_atomic_spoo
         })
         .expect("provision mocked LTO-9");
     let selected = SelectedTape {
+        standalone_endpoint: None,
         pool_id: "capacity.runtime".into(),
         tape_uuid,
         block_size,
@@ -2167,6 +2175,7 @@ fn exact_terminal_admission_rejects_high_watermark_crossing_before_spool_grant()
         stripes_per_neighborhood: 1,
     };
     let selected = SelectedTape {
+        standalone_endpoint: None,
         pool_id: "terminal.admission".to_string(),
         tape_uuid: [0x6c; 16],
         block_size,
@@ -2242,6 +2251,7 @@ fn parity_spool_shortfall_is_rejected_before_object_tape_motion() {
         })
         .expect("provision mocked LTO-9");
     let selected = SelectedTape {
+        standalone_endpoint: None,
         pool_id: "capacity.shortfall".into(),
         tape_uuid,
         block_size,
@@ -2567,6 +2577,7 @@ fn parity_capacity_distinguishes_fresh_media_limit_from_current_tape_shortfall()
         })
         .expect("provision mocked LTO-9");
     let selected = SelectedTape {
+        standalone_endpoint: None,
         pool_id: "capacity.boundary".into(),
         tape_uuid,
         block_size,
@@ -2712,6 +2723,7 @@ fn batched_parity_post_motion_projection_failure_sets_dirty_after_retryable_spoo
         min_object_size_bytes: 0,
     };
     let selected = SelectedTape {
+        standalone_endpoint: None,
         pool_id: pool_id.into(),
         tape_uuid,
         block_size,
@@ -3087,6 +3099,7 @@ fn fence_test_fixture() -> (tempfile::TempDir, CatalogIndex, SelectedTape) {
         temp,
         state,
         SelectedTape {
+            standalone_endpoint: None,
             pool_id: "fence.test".into(),
             tape_uuid,
             block_size: 4,

@@ -2119,6 +2119,24 @@ impl CatalogIndex {
         provenance: LabelProvenance,
         observation: Option<MediaObservation>,
     ) -> Result<(), StateError> {
+        self.provision_replacing_media(input, provenance, observation, None, false)
+    }
+
+    /// Reuse the provisioning transaction for a confirmed replacement of the
+    /// observed BOT identity. Preview rolls back the exact same checks.
+    pub fn provision_replacing_media(
+        &mut self,
+        input: ProvisionTapeInput,
+        provenance: LabelProvenance,
+        observation: Option<MediaObservation>,
+        previous_uuid: Option<[u8; 16]>,
+        preview: bool,
+    ) -> Result<(), StateError> {
+        if previous_uuid.is_some() && !input.force {
+            return Err(StateError::TapeProvisionConflict(
+                "BOT replacement requires confirmed clobber".into(),
+            ));
+        }
         let geometry = ProvisionTapeGeometry::from_parity(input.block_size, &input.parity)?;
         let voltag = input.voltag.trim().to_string();
         if voltag.is_empty() {
@@ -2139,14 +2157,18 @@ impl CatalogIndex {
             )
             .optional()
             .map_err(|e| sqlite_error("check operator label reuse", e))?;
-        if let Some((previous_uuid, previous_source)) = previous {
-            if previous_uuid != input.tape_uuid
+        if let Some((owner_uuid, previous_source)) = previous {
+            if owner_uuid != input.tape_uuid
+                && !(input.force
+                    && previous_uuid
+                        .as_ref()
+                        .is_some_and(|uuid| owner_uuid == uuid.to_vec()))
                 && (provenance == LabelProvenance::Operator
                     || previous_source.as_deref() == Some("operator"))
             {
                 return Err(StateError::TapeProvisionConflict(format!(
                     "label reused on a different uuid; rebind requires --previous-uuid {}",
-                    hex_uuid_from_slice(&previous_uuid)
+                    hex_uuid_from_slice(&owner_uuid)
                 )));
             }
         }
@@ -2157,10 +2179,16 @@ impl CatalogIndex {
             &geometry,
             input.force,
             updated_at.as_str(),
+            previous_uuid,
         )?;
         record_media_observation_tx(&tx, &input.tape_uuid, provenance, observation)?;
-        tx.commit()
-            .map_err(|err| sqlite_error("commit tape provisioning transaction", err))?;
+        if preview {
+            tx.rollback()
+                .map_err(|err| sqlite_error("rollback provisioning preview", err))?;
+        } else {
+            tx.commit()
+                .map_err(|err| sqlite_error("commit tape provisioning transaction", err))?;
+        }
         Ok(())
     }
 
@@ -6811,9 +6839,10 @@ fn provision_tape_tx(
     geometry: &ProvisionTapeGeometry,
     force: bool,
     updated_at: &str,
+    previous_uuid: Option<[u8; 16]>,
 ) -> Result<(), StateError> {
     let (voltag, _) = label;
-    let existing = find_provisioned_tape_tx(tx, tape_uuid, voltag)?;
+    let existing = find_provisioned_tape_tx(tx, previous_uuid.unwrap_or(tape_uuid), voltag)?;
     if let Some(existing) = existing {
         // Retirement is terminal, including against `force`: `force` reuses
         // the *row* (the `reprovision_tape_tx` escape hatch below), and a

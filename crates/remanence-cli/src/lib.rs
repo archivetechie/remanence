@@ -40,7 +40,10 @@
 //! caller asked for a library that wasn't found.
 
 mod standalone;
-pub use standalone::{run_with_standalone_test_enumeration, run_with_standalone_test_io};
+pub use standalone::{
+    run_with_standalone_test_enumeration, run_with_standalone_test_input,
+    run_with_standalone_test_io,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
@@ -2309,6 +2312,9 @@ struct TapeInitArgs {
     /// Dangerous data-clobber override. Rejected for dry-run and batch init.
     #[arg(long)]
     clobber_data: bool,
+    /// Exact destructive confirmation for non-interactive initialization.
+    #[arg(long, requires = "clobber_data")]
+    confirm_clobber: Option<String>,
 
     /// Fixed tape block size for a fresh initialization.
     #[arg(long, value_name = "BYTES", value_parser = parse_tape_block_size)]
@@ -7696,7 +7702,14 @@ fn run_tape_quarantine(
             library,
             json,
         } => {
-            let catalog = match open_catalog_read_only_for_config(config, err) {
+            let config = match standalone::local_quarantine_config(config, err) {
+                Ok(path) => path,
+                Err(error) => {
+                    let _ = writeln!(err, "error: {error}");
+                    return ExitCode::from(1);
+                }
+            };
+            let catalog = match open_catalog_read_only_for_config(&config, err) {
                 Ok(catalog) => catalog,
                 Err(code) => return code,
             };
@@ -7714,7 +7727,14 @@ fn run_tape_quarantine(
             config,
             json,
         } => {
-            let catalog = match open_catalog_read_only_for_config(config, err) {
+            let config = match standalone::local_quarantine_config(config, err) {
+                Ok(path) => path,
+                Err(error) => {
+                    let _ = writeln!(err, "error: {error}");
+                    return ExitCode::from(1);
+                }
+            };
+            let catalog = match open_catalog_read_only_for_config(&config, err) {
                 Ok(catalog) => catalog,
                 Err(code) => return code,
             };
@@ -7741,7 +7761,14 @@ fn run_tape_quarantine(
             json,
             ..
         } => {
-            let (paths, config) = match load_state_config(config, err) {
+            let config = match standalone::local_quarantine_config(config, err) {
+                Ok(path) => path,
+                Err(error) => {
+                    let _ = writeln!(err, "error: {error}");
+                    return ExitCode::from(1);
+                }
+            };
+            let (paths, config) = match load_state_config(&config, err) {
                 Ok(value) => value,
                 Err(code) => return code,
             };
@@ -7811,6 +7838,9 @@ fn tape_io_fence_json(record: &remanence_state::TapeIoFenceRecord) -> Value {
     json!({
         "quarantine_id": record.quarantine_id.as_str(),
         "fence_id": record.fence_id,
+        "endpoint_key": record.endpoint.as_ref().map(|key| key.encode()),
+        "label": record.barcode,
+        "raised_at": record.created_at_utc,
         "tape_uuid": bytes_to_uuid_text(&record.tape_uuid),
         "barcode": record.barcode.as_deref(),
         "state": record.state.as_str(),
@@ -7911,6 +7941,9 @@ fn media_readiness_record_json(record: &remanence_state::MediaReadinessOperation
         "quarantine_id": media_readiness_quarantine_id(record),
         "operation_id": record.operation_id.as_str(),
         "run_id": record.run_id.as_deref(),
+        "label": record.barcode,
+        "reason": record.state,
+        "raised_at": record.started_at_utc,
         "library_serial": record.library_serial.as_deref(),
         "changer_sg": record.changer_sg.as_deref(),
         "drive_element": record.drive_element.map(|bay| format!("0x{bay:04x}")),
@@ -8353,6 +8386,7 @@ impl TapeInitStateOps for remanence_state::StateHandle {
                 provenance: remanence_state::LabelProvenance::Changer,
                 observation,
                 explicit_pool: None,
+                previous_uuid: None,
             },
         )
     }
@@ -8401,6 +8435,7 @@ struct ProvisioningContext<'a> {
     provenance: remanence_state::LabelProvenance,
     observation: Option<remanence_state::MediaObservation>,
     explicit_pool: Option<&'a str>,
+    previous_uuid: Option<[u8; 16]>,
 }
 fn provision_initialized_tape_with_media(
     state: &mut remanence_state::StateHandle,
@@ -8420,7 +8455,7 @@ fn provision_initialized_tape_with_media(
         .refresh_audit_append_cursor()
         .map_err(|e| e.to_string())?;
     state
-        .provision_tape_with_media(
+        .provision_replacing_media(
             remanence_state::ProvisionTapeInput {
                 tape_uuid,
                 voltag: voltag.clone(),
@@ -8430,6 +8465,7 @@ fn provision_initialized_tape_with_media(
             },
             context.provenance,
             context.observation,
+            context.previous_uuid,
         )
         .map_err(|e| format!("provision catalog tape row: {e}"))?;
     if context.explicit_pool.is_none() {
@@ -11369,6 +11405,37 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
         "before_read_drive_config",
         || signal_guard.requested_signal_name(),
     )?;
+    if let Err(error) = drive.require_single_partition() {
+        if matches!(
+            error,
+            remanence_library::TapeIoError::MultiPartitionMedium { .. }
+        ) {
+            record_media_readiness_signal_if_requested(
+                state,
+                operation_id,
+                "read_medium_partitions",
+                || signal_guard.requested_signal_name(),
+            )?;
+            return Err(error.to_string());
+        }
+        if let Some(signal) = record_media_readiness_signal_or_command_failure(
+            state,
+            operation_id,
+            "read_medium_partitions",
+            None,
+            &error.to_string(),
+            signal_guard.requested_signal_name(),
+        )? {
+            return Err(signal);
+        }
+        return Err(error.to_string());
+    }
+    record_media_readiness_signal_if_requested(
+        state,
+        operation_id,
+        "after_read_medium_partitions",
+        || signal_guard.requested_signal_name(),
+    )?;
     let drive_config = match drive.read_config() {
         Ok(config) => config,
         Err(error) => {
@@ -11450,8 +11517,15 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
         bot_projection.physical_data_past_bootstrap,
         &catalog_projection.committed_copies,
     );
-    let clobber_data_confirmed = if should_confirm_clobber(args, &decision) {
-        let confirmed = match confirm_clobber_data(voltag.as_str(), &decision, err) {
+    let clobber_data_confirmed = if should_confirm_clobber(args.clobber_data, &decision) {
+        let confirmed = match confirm_clobber_data(
+            voltag.as_str(),
+            &decision,
+            args.confirm_clobber.as_deref(),
+            ClobberInputPolicy::Library,
+            &mut io::stdin().lock(),
+            err,
+        ) {
             Ok(confirmed) => confirmed,
             Err(error) => {
                 if let Some(signal) = signal_guard.requested_signal_name() {
@@ -11672,8 +11746,8 @@ fn describe_media_readiness(readiness: &MediaReadiness) -> String {
     }
 }
 
-fn should_confirm_clobber(args: &TapeInitArgs, decision: &remanence_api::InitDecision) -> bool {
-    args.clobber_data
+fn should_confirm_clobber(clobber_data: bool, decision: &remanence_api::InitDecision) -> bool {
+    clobber_data
         && matches!(
             decision,
             remanence_api::InitDecision::RefuseClobber {
@@ -11686,12 +11760,37 @@ fn should_confirm_clobber(args: &TapeInitArgs, decision: &remanence_api::InitDec
         )
 }
 
+/// Library scripts retain stdin confirmation; standalone requires a terminal
+/// unless an exact confirmation was supplied as an argument.
+enum ClobberInputPolicy {
+    Library,
+    Standalone { is_terminal: bool },
+}
+
 fn confirm_clobber_data(
     voltag: &str,
     decision: &remanence_api::InitDecision,
+    confirmation: Option<&str>,
+    policy: ClobberInputPolicy,
+    input: &mut dyn io::BufRead,
     err: &mut dyn Write,
 ) -> Result<bool, String> {
     let expected = format!("CLOBBER {voltag}");
+    if let Some(confirmation) = confirmation {
+        return if confirmation == expected {
+            Ok(true)
+        } else {
+            Err("clobber confirmation did not match; no write attempted".into())
+        };
+    }
+    if matches!(
+        policy,
+        ClobberInputPolicy::Standalone { is_terminal: false }
+    ) {
+        return Err(format!(
+            "non-interactive clobber requires --confirm-clobber {expected:?}; no write attempted"
+        ));
+    }
     let _ = writeln!(
         err,
         "danger: {voltag} would clobber data ({})",
@@ -11699,10 +11798,14 @@ fn confirm_clobber_data(
     );
     let _ = writeln!(err, "type {expected:?} to continue:");
     let mut line = String::new();
-    io::stdin()
+    input
         .read_line(&mut line)
         .map_err(|error| format!("read clobber confirmation: {error}"))?;
-    if line.trim() == expected {
+    let answer = match policy {
+        ClobberInputPolicy::Library => line.trim(),
+        ClobberInputPolicy::Standalone { .. } => line.trim_end_matches(['\r', '\n']),
+    };
+    if answer == expected {
         Ok(true)
     } else {
         Err("clobber confirmation did not match; no write attempted".to_string())
@@ -11825,8 +11928,8 @@ fn init_error_label(error: &remanence_api::TapeInitError) -> String {
             )
         }
         remanence_api::TapeInitError::LabelReusedOnDifferentUuid { previous_uuid, bot_uuid } => format!(
-            "label reused on a different uuid: previous {}; BOT {:?}; use tape rebind --previous-uuid {}",
-            Uuid::from_bytes(*previous_uuid), bot_uuid.map(Uuid::from_bytes), Uuid::from_bytes(*previous_uuid)
+            "label reused on a different uuid: previous {}; BOT {}; use tape rebind --previous-uuid {}",
+            Uuid::from_bytes(*previous_uuid), bot_uuid.map(Uuid::from_bytes).map(|id| id.to_string()).unwrap_or_else(|| "none".into()), Uuid::from_bytes(*previous_uuid)
         ),
         remanence_api::TapeInitError::BarcodeRetired => "barcode retired".to_string(),
         remanence_api::TapeInitError::MediaSwapReusedBarcode {
@@ -16422,6 +16525,7 @@ mod tests {
     fn tape_init_config_with_pool(block_size_bytes: u64) -> remanence_state::RemConfig {
         let root = std::env::temp_dir().join("remanence-cli-tape-init-test");
         remanence_state::RemConfig {
+            home: None,
             standalone_drives: vec![],
             daemon: remanence_state::DaemonConfig {
                 state_dir: root.clone(),
@@ -19323,7 +19427,7 @@ mod tests {
             }
         }
 
-        for written_bytes in [262143, 262144] {
+        for (written_bytes, additional_partitions) in [(262143, 0), (262144, 0), (0, 1)] {
             let temp = tempfile::tempdir().expect("temp state directory");
             let config_path = write_retire_test_config(temp.path());
             let mut config_text = fs::read_to_string(&config_path).expect("read test config");
@@ -19378,6 +19482,7 @@ pool_id = "init-test"
                 inner: FixtureTransport::new().with_responses([
                     lto9_inquiry_response(),
                     vpd80_response("DRV-INIT-GOOD"),
+                    vec![11, 0, 0, 0, 0x11, 6, 1, additional_partitions, 0, 0, 0, 0],
                     vec![0, 0x10, 0, 0, 0, 1],
                     mode,
                     vec![0u8; 32], // LOCATE(0) for BOT classification.
@@ -19433,7 +19538,7 @@ pool_id = "init-test"
             let log = log.borrow();
             assert_eq!(
                 log.iter().filter(|cdb| cdb[0] == 0x0a).count(),
-                1,
+                usize::from(additional_partitions == 0),
                 "{stderr}"
             );
             let complete = written_bytes == 262144;
@@ -19461,6 +19566,14 @@ pool_id = "init-test"
             if complete {
                 assert_eq!(code, ExitCode::SUCCESS, "{stderr}");
                 assert!(stdout.contains("wrote-bootstrap"), "{stdout}");
+            } else if additional_partitions > 0 {
+                assert_eq!(code, ExitCode::from(1), "{stderr}");
+                assert!(stderr.contains("partition"), "{stderr}");
+                assert!(catalog
+                    .list_active_media_readiness_operations(None)
+                    .unwrap()
+                    .is_empty());
+                assert!(catalog.list_active_tape_io_fences().unwrap().is_empty());
             } else {
                 assert_eq!(code, ExitCode::from(1), "{stderr}");
                 assert!(stdout.is_empty(), "{stdout}");
@@ -24450,5 +24563,37 @@ blob Project/Render Files/
         assert!(err.contains("no library with serial \"MISSING\""));
         assert!(err.contains("warnings (1):"));
         assert!(err.contains("FREE"));
+    }
+}
+
+#[cfg(test)]
+mod clobber_confirmation_tests {
+    use super::*;
+
+    /// Library automation retains its piped exact confirmation contract.
+    #[test]
+    fn library_confirmation_accepts_piped_input() {
+        let decision = remanence_api::InitDecision::RefuseClobber {
+            reason: remanence_api::TapeInitError::UnrecognizedData,
+        };
+        assert!(confirm_clobber_data(
+            "TEST",
+            &decision,
+            None,
+            ClobberInputPolicy::Library,
+            &mut Cursor::new(b"CLOBBER TEST\n"),
+            &mut Vec::new()
+        )
+        .unwrap());
+        assert!(confirm_clobber_data(
+            "TEST",
+            &decision,
+            None,
+            ClobberInputPolicy::Standalone { is_terminal: false },
+            &mut Cursor::new(b"CLOBBER TEST\n"),
+            &mut Vec::new()
+        )
+        .unwrap_err()
+        .contains("non-interactive"));
     }
 }

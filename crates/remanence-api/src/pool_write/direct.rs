@@ -724,6 +724,12 @@ pub(super) fn write_to_selected_drive_checkpointed_with_catalog(
     parity_journal_path: &Path,
     resources: &PoolWriteResources,
 ) -> Result<PoolWriteResult, PoolWriteError> {
+    let mut selected = selected;
+    selected.standalone_endpoint = drive
+        .endpoint()
+        .durable_key()
+        .filter(|key| matches!(key, remanence_library::DriveKey::Standalone { .. }))
+        .cloned();
     let mut write_admission = resources
         .write_admissions
         .reserve(

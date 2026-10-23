@@ -32,6 +32,9 @@ pub const DEFAULT_CHECKPOINT_MAX_AGE_SECONDS: u64 = 300;
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RemConfig {
+    /// Saved home-mode selection used by `rem setup` and shared-verb routing.
+    #[serde(default)]
+    pub home: Option<HomeConfig>,
     /// Daemon-wide settings.
     pub daemon: DaemonConfig,
     /// Allowed tape libraries.
@@ -66,6 +69,14 @@ pub struct RemConfig {
     pub index: IndexConfig,
     /// Rebuildable tape-catalog cache settings.
     pub cache: CacheConfig,
+}
+
+/// Home-mode defaults; `rem setup` saves the selected drive serial here.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HomeConfig {
+    /// VPD serial of the selected standalone drive.
+    pub drive_serial: Option<String>,
 }
 
 /// Daemon-wide settings.

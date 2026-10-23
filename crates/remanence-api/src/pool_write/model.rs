@@ -645,6 +645,8 @@ impl AppendCommitDiagnostics {
 /// Canonical pool selection returned by the Phase 1 tape selector.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SelectedTape {
+    /// Standalone mount provenance for fences raised by shared write paths.
+    pub(crate) standalone_endpoint: Option<remanence_library::DriveKey>,
     /// Normalized pool id resolved through the catalog.
     pub(crate) pool_id: String,
     /// Unique eligible tape selected inside the pool.

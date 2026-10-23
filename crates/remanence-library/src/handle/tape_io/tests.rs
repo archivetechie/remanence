@@ -983,6 +983,75 @@ mod reowp_drive_surface {
     }
 
     #[test]
+    fn partition_probe_only_accepts_unsupported_page() {
+        // Only current invalid-field sense establishes an unsupported page.
+        struct RejectPartition {
+            inner: FixtureTransport,
+            key: u8,
+            asc: u8,
+            response: u8,
+        }
+        impl SgTransport for RejectPartition {
+            fn execute_in(
+                &mut self,
+                cdb: &[u8],
+                buf: &mut [u8],
+            ) -> Result<TransferOutcome, ScsiError> {
+                if cdb.first() == Some(&0x1A) {
+                    let mut sense = vec![0u8; 32];
+                    sense[0] = self.response;
+                    sense[2] = self.key;
+                    sense[7] = 24;
+                    sense[12] = self.asc;
+                    return Err(ScsiError::CheckCondition {
+                        sense,
+                        bytes_transferred: 0,
+                    });
+                }
+                self.inner.execute_in(cdb, buf)
+            }
+            fn execute_none(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
+                self.inner.execute_none(cdb)
+            }
+            fn execute_out(
+                &mut self,
+                cdb: &[u8],
+                buf: &[u8],
+            ) -> Result<TransferOutcome, ScsiError> {
+                self.inner.execute_out(cdb, buf)
+            }
+        }
+
+        for (key, asc, response, accepted) in [
+            (5, 0x24, 0x70, true),
+            (6, 0x29, 0x70, false),
+            (5, 0x20, 0x70, false),
+            (5, 0x24, 0x71, false),
+        ] {
+            let transport = RejectPartition {
+                key,
+                asc,
+                response,
+                inner: FixtureTransport::new()
+                    .with_responses([lto9_inquiry(), vpd80_response("DRV_REOWP")]),
+            };
+            let mut drive = DriveHandle::open_standalone_with_transport(
+                Path::new("/dev/sg-reowp-reject"),
+                Box::new(transport),
+                &crate::StaticAllowlist::new(["/dev/sg-reowp-reject"]),
+            )
+            .expect("standalone drive opens");
+
+            let result = drive.require_single_partition();
+            if accepted {
+                result.expect("unsupported partition page means one partition");
+            } else {
+                assert!(matches!(result, Err(TapeIoError::PartitionProbeFailed(_))));
+            }
+        }
+    }
+
+    #[test]
     fn read_end_of_wrap_position_maps_malformed_bytes_to_malformed_response() {
         // Declared length that does not describe whole descriptors —
         // the CDB succeeded but the payload is unusable. This is the
@@ -1024,5 +1093,19 @@ mod reowp_drive_surface {
             .expect("probe parses");
         assert_eq!(support, OpcodeSupport::NotSupported);
         assert!(!support.is_supported());
+    }
+}
+
+/// Partition admission decodes both ordinary and LTFS-style layouts and fails closed.
+#[test]
+fn medium_partition_page_counts() {
+    for additional in [0, 1] {
+        let mut data = vec![11, 0, 0, 0, 0x11, 6, 1, additional, 0, 0, 0, 0];
+        assert_eq!(
+            medium_partition_count(&data).unwrap(),
+            u16::from(additional) + 1
+        );
+        data.pop();
+        assert!(medium_partition_count(&data).is_err());
     }
 }

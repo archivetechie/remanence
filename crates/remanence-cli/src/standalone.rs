@@ -77,6 +77,9 @@ enum Command {
         pool: Option<String>,
         #[arg(long)]
         recipient: Vec<PathBuf>,
+        /// Permit a plaintext version when the newest committed version is encrypted.
+        #[arg(long)]
+        allow_plaintext_copy: bool,
         #[arg(long, alias = "tape-uuid")]
         tape: Option<String>,
     },
@@ -109,7 +112,20 @@ enum Pool {
     },
 }
 #[derive(Debug, Subcommand)]
+enum Quarantine {
+    List,
+    Release {
+        id: String,
+        #[arg(long)]
+        ack: String,
+    },
+}
+#[derive(Debug, Subcommand)]
 enum Tape {
+    Quarantine {
+        #[command(subcommand)]
+        command: Quarantine,
+    },
     Identify,
     #[command(after_help = HOME_PARITY_HELP)]
     Init {
@@ -121,6 +137,12 @@ enum Tape {
         generation: Option<String>,
         #[arg(long, value_parser=crate::recovery_report::parse_block_size)]
         block_size: Option<u32>,
+        /// Erase foreign or existing data after exact label confirmation.
+        #[arg(long)]
+        clobber_data: bool,
+        /// Non-interactive confirmation: CLOBBER followed by the exact label.
+        #[arg(long, requires = "clobber_data")]
+        confirm_clobber: Option<String>,
     },
     Adopt {
         #[arg(long)]
@@ -189,6 +211,10 @@ enum Tape {
 
 /// Select explicit standalone operations before the legacy library discovery path.
 pub(crate) fn selected(args: &[OsString]) -> bool {
+    selected_in(args, &Environment::from_process())
+}
+
+fn selected_in(args: &[OsString], env: &Environment) -> bool {
     let words: Vec<_> = args.iter().skip(1).map(|s| s.to_string_lossy()).collect();
     if words
         .iter()
@@ -221,6 +247,28 @@ pub(crate) fn selected(args: &[OsString]) -> bool {
         return match word.as_ref() {
             "doctor" | "drives" | "diagnostics" => true,
             "pool" => words.get(i + 1).is_some_and(|w| w == "new"),
+            "tape" if words.get(i + 1).is_some_and(|w| w == "quarantine") => {
+                words
+                    .get(i + 2)
+                    .is_some_and(|w| matches!(w.as_ref(), "list" | "release"))
+                    && !env.system_config.exists()
+                    && !words.iter().any(|w| {
+                        w == "--config"
+                            || w.starts_with("--config=")
+                            || w == "--endpoint"
+                            || w.starts_with("--endpoint=")
+                    })
+                    && load(&env.xdg.join("rem/config.toml"), true)
+                        .ok()
+                        .and_then(|config| config.home)
+                        .and_then(|home| home.drive_serial)
+                        .is_some()
+                    && !words.iter().any(|w| {
+                        w == "--library"
+                            || w.starts_with("--library=")
+                            || w == "--after-settled-inventory"
+                    })
+            }
             "tape" => words.get(i + 1).is_some_and(|w| {
                 matches!(
                     w.as_ref(),
@@ -327,18 +375,25 @@ struct Environment {
     xdg: PathBuf,
     system_config: PathBuf,
     locks: PathBuf,
+    test_input: bool,
+}
+impl Environment {
+    fn from_process() -> Self {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        Environment {
+            xdg: std::env::var_os("XDG_STATE_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".local/state")),
+            system_config: "/etc/rem/config.toml".into(),
+            locks: "/run/lock/rem".into(),
+            test_input: false,
+        }
+    }
 }
 pub(crate) fn run_live(args: &[OsString]) -> ExitCode {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    let env = Environment {
-        xdg: std::env::var_os("XDG_STATE_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".local/state")),
-        system_config: "/etc/rem/config.toml".into(),
-        locks: "/run/lock/rem".into(),
-    };
+    let env = Environment::from_process();
     let enumeration = || remanence_library::sysfs::enumerate_sg_devices();
     let mut factory = |path: &Path| {
         remanence_library::LinuxSgTransport::open_rw(path)
@@ -371,17 +426,57 @@ pub fn run_with_standalone_test_io<F>(
 where
     F: FnMut(&Path) -> Result<Box<dyn SgTransport>, IoErrorKind>,
 {
-    run_with_standalone_test_enumeration(
+    run_with_standalone_test_input(
         args,
         home,
         xdg,
         system_config,
         locks,
-        remanence_library::sysfs::DeviceEnumeration {
-            devices,
-            warnings: vec![],
-        },
+        devices,
         factory,
+        out,
+        errors,
+        false,
+    )
+}
+
+/// Invoke the same dispatcher with terminal input explicitly enabled for PTY tests.
+#[allow(clippy::too_many_arguments)]
+pub fn run_with_standalone_test_input<F>(
+    args: &[&str],
+    home: &Path,
+    xdg: &Path,
+    system_config: &Path,
+    locks: &Path,
+    devices: Vec<DeviceAttachment>,
+    mut factory: F,
+    out: &mut dyn Write,
+    errors: &mut dyn Write,
+    terminal_input: bool,
+) -> ExitCode
+where
+    F: FnMut(&Path) -> Result<Box<dyn SgTransport>, IoErrorKind>,
+{
+    let env = Environment {
+        xdg: if xdg.as_os_str().is_empty() {
+            home.join(".local/state")
+        } else {
+            xdg.into()
+        },
+        system_config: system_config.into(),
+        locks: locks.into(),
+        test_input: !terminal_input,
+    };
+    run(
+        &args.iter().map(OsString::from).collect::<Vec<_>>(),
+        env,
+        || {
+            Ok(remanence_library::sysfs::DeviceEnumeration {
+                devices,
+                warnings: vec![],
+            })
+        },
+        &mut factory,
         out,
         errors,
     )
@@ -412,6 +507,7 @@ where
         },
         system_config: system_config.into(),
         locks: locks.into(),
+        test_input: true,
     };
     run(
         &args.iter().map(OsString::from).collect::<Vec<_>>(),
@@ -452,13 +548,14 @@ where
     };
     let mut observed = vec![];
     let mut output = PutOutput {
+        active_fences: Vec::new(),
         out,
         json: cli.json,
         receipts: Vec::new(),
         summary: None,
         tape_continuation: false,
     };
-    let result = dispatch(
+    let mut result = dispatch(
         &cli,
         &env,
         enumeration,
@@ -474,7 +571,13 @@ where
     }
     let receipts = std::mem::take(&mut output.receipts);
     let summary = output.summary.take();
+    let active_fences = std::mem::take(&mut output.active_fences);
     drop(output);
+    if read_only(&cli.command) {
+        if let Ok(value) = &mut result {
+            value["active_fences"] = json!(active_fences);
+        }
+    }
     let value = match &result {
         Ok(v) => json!({"ok":true,"result":v}),
         Err(e) if matches!(cli.command, Command::Put { .. }) => {
@@ -486,6 +589,7 @@ where
         let mut value = value;
         value["supported_endpoint_kinds"] = json!(["library", "standalone"]);
         value["observed_endpoints"] = json!(observed);
+        value["active_fences"] = json!(active_fences);
         let _ = writeln!(out, "{value}");
     } else {
         match &result {
@@ -547,6 +651,33 @@ fn config_path(cli: &Cli, env: &Environment) -> Result<PathBuf, String> {
     }
     Ok(path)
 }
+/// Local library quarantine commands share home-mode configuration resolution.
+pub(crate) fn local_quarantine_config(
+    path: &Path,
+    errors: &mut dyn Write,
+) -> Result<PathBuf, String> {
+    local_quarantine_config_in(path, &Environment::from_process(), errors)
+}
+
+fn local_quarantine_config_in(
+    path: &Path,
+    env: &Environment,
+    errors: &mut dyn Write,
+) -> Result<PathBuf, String> {
+    if path != env.system_config || path.try_exists().map_err(err)? {
+        return Ok(path.to_owned());
+    }
+    if !env.xdg.is_absolute() {
+        return Err("home state path must be absolute".into());
+    }
+    let path = env.xdg.join("rem/config.toml");
+    writeln!(errors, "using config {}", path.display()).map_err(err)?;
+    if !path.try_exists().map_err(err)? {
+        return Err(format!("config {} does not exist", path.display()));
+    }
+    Ok(path)
+}
+
 fn load(path: &Path, override_trust: bool) -> Result<remanence_state::RemConfig, String> {
     let mut doc: toml::Value =
         toml::from_str(&fs::read_to_string(path).map_err(err)?).map_err(err)?;
@@ -599,7 +730,7 @@ where
         && !matches!(
             cli.command,
             Command::Tape {
-                command: Tape::AssignPool { tape: Some(_), .. }
+                command: Tape::AssignPool { tape: Some(_), .. } | Tape::Quarantine { .. }
             }
         )
     {
@@ -686,6 +817,92 @@ where
             .map_err(err)?;
         return Ok(json!({"pool":name,"config":path}));
     }
+    let catalog_path = StatePaths::from_config(&path, &config).sqlite_path;
+    let discovery_only = matches!(
+        cli.command,
+        Command::Doctor | Command::Drives | Command::Diagnostics { .. }
+    );
+    let mut catalog_error = None;
+    if discovery_only && catalog_path.exists() {
+        let fences = remanence_state::CatalogIndex::open_read_only(&catalog_path)
+            .map_err(err)
+            .and_then(|catalog| {
+                remanence_api::standalone_fence_policy(&catalog, None, None, false).map_err(err)
+            });
+        match fences {
+            Ok(fences) => {
+                output.active_fences = fences.iter().map(crate::tape_io_fence_json).collect()
+            }
+            Err(error) => {
+                writeln!(errors, "warning: cannot check catalog fences: {error}").map_err(err)?;
+                catalog_error = Some(error);
+            }
+        }
+    }
+    let mut state = if discovery_only {
+        None
+    } else {
+        let mut state =
+            StateHandle::open_with_config(StatePaths::from_config(&path, &config), config.clone())
+                .map_err(err)?;
+        state.replay_audit_projection().map_err(err)?;
+        output.active_fences =
+            remanence_api::standalone_fence_policy(state.catalog_index(), None, None, false)
+                .map_err(err)?
+                .iter()
+                .map(crate::tape_io_fence_json)
+                .collect();
+        Some(state)
+    };
+    if !output.active_fences.is_empty() {
+        writeln!(errors, "warning: active tape-I/O fences ({}); reads remain available; inspect rem tape quarantine list", output.active_fences.len()).map_err(err)?;
+    }
+    if let Command::Tape {
+        command: Tape::Quarantine { command },
+    } = &cli.command
+    {
+        let state = state.as_mut().expect("quarantine state");
+        return match command {
+            Quarantine::List => {
+                let ops = state
+                    .catalog_index()
+                    .list_active_media_readiness_operations(None)
+                    .map_err(err)?;
+                Ok(
+                    json!({"active_fences":output.active_fences,"media_readiness":ops.iter().map(crate::media_readiness_record_json).collect::<Vec<_>>()}),
+                )
+            }
+            Quarantine::Release { id, ack } => {
+                if ack.trim().is_empty() {
+                    return Err("--ack must be non-empty".into());
+                }
+                let fences = state
+                    .catalog_index()
+                    .list_active_tape_io_fences()
+                    .map_err(err)?;
+                if fences.iter().any(|f| {
+                    f.quarantine_id == *id && !remanence_api::standalone_fence_releasable(f)
+                }) {
+                    return Err("fence raised by a library daemon: release it on the host that owns it with rem --config <the library config> tape quarantine release ID --after-settled-inventory --ack TEXT".into());
+                }
+                let released = state
+                    .release_tape_io_fence(id, ack.trim())
+                    .map_err(err)?
+                    .ok_or("no active tape-I/O fence with this ID")?;
+                output.active_fences = remanence_api::standalone_fence_policy(
+                    state.catalog_index(),
+                    None,
+                    None,
+                    false,
+                )
+                .map_err(err)?
+                .iter()
+                .map(crate::tape_io_fence_json)
+                .collect();
+                Ok(crate::tape_io_fence_json(&released))
+            }
+        };
+    }
     if let Command::Tape {
         command:
             Tape::AssignPool {
@@ -698,10 +915,11 @@ where
         if cli.device.is_some() {
             return Err("assign-pool requires exactly one of --tape or --device".into());
         }
-        let mut state =
-            StateHandle::open_with_config(StatePaths::from_config(&path, &config), config)
-                .map_err(err)?;
-        assign(&mut state, *uuid.as_bytes(), pool.as_deref())?;
+        assign(
+            state.as_mut().expect("assignment state"),
+            *uuid.as_bytes(),
+            pool.as_deref(),
+        )?;
         return Ok(json!({"tape":uuid,"pool":pool}));
     }
     let enumeration = enumeration().map_err(err)?;
@@ -746,7 +964,12 @@ where
         }
     }
     match &cli.command {
-        Command::Doctor => return Ok(doctor(env, &config, &report)),
+        Command::Doctor => {
+            let mut result = doctor(env, &config, &report);
+            result["catalog_fence_check"] =
+                json!({"ok": catalog_error.is_none(), "error": catalog_error});
+            return Ok(result);
+        }
         Command::Drives => {
             return Ok(
                 json!({"endpoints":observed,"complete":report.complete,"warnings":report.warnings.iter().map(|w| w.informational_message().unwrap_or_else(|| format!("{w:?}"))).collect::<Vec<_>>()}),
@@ -757,6 +980,7 @@ where
         } => return diagnostics(cli, &report, factory, out),
         _ => {}
     }
+    let mut state = state.expect("device state");
     let device = cli
         .device
         .as_ref()
@@ -804,9 +1028,6 @@ where
     if cli.allow_unserialized_device {
         policy = policy.with_unserialized_device_allowed(device)
     }
-    let mut state =
-        StateHandle::open_with_config(StatePaths::from_config(&path, &config), config.clone())
-            .map_err(err)?;
     let transport = factory(device).map_err(err)?;
     if matches!(
         cli.command,
@@ -821,6 +1042,16 @@ where
     let mut backend =
         OperatorMount::with_transport(device, &policy, transport, &mut state, &env.locks)
             .map_err(err)?;
+    let previous_fence_count = output.active_fences.len();
+    output.active_fences =
+        remanence_api::standalone_fence_policy(backend.catalog_index(), None, None, false)
+            .map_err(err)?
+            .iter()
+            .map(crate::tape_io_fence_json)
+            .collect();
+    if previous_fence_count != output.active_fences.len() && !output.active_fences.is_empty() {
+        writeln!(errors, "warning: active tape-I/O fences ({}); reads remain available; inspect rem tape quarantine list", output.active_fences.len()).map_err(err)?;
+    }
     if let Command::Tape {
         command:
             Tape::Init {
@@ -828,6 +1059,8 @@ where
                 pool,
                 generation,
                 block_size,
+                clobber_data,
+                confirm_clobber,
             },
     } = &cli.command
     {
@@ -842,6 +1075,12 @@ where
                         pool.as_deref().unwrap_or("default"),
                         generation.as_deref(),
                         *block_size,
+                        (
+                            *clobber_data,
+                            confirm_clobber.as_deref(),
+                            env.test_input,
+                            errors,
+                        ),
                     )
                 },
                 complete_init,
@@ -872,6 +1111,7 @@ where
             paths,
             pool,
             recipient,
+            allow_plaintext_copy,
             tape: guard,
         } => {
             backend.reconcile_checkpoints().map_err(err)?;
@@ -933,12 +1173,20 @@ where
                         representation: representation.clone(),
                         input_kind: remanence_api::WriteObjectInputKind::LogicalFile,
                     };
-                    match backend
-                        .put_path_version(&mut mounted, request)
-                        .map_err(|error| {
-                            output.tape_continuation = tape_continuation(&error);
-                            format!("{}: {error}", source.display())
-                        })? {
+                    let outcome = backend.put_path_version_with_policy(
+                        &mut mounted,
+                        request,
+                        *allow_plaintext_copy,
+                    );
+                    if let Err(remanence_api::MountError::PlaintextCopy { newest_version }) =
+                        &outcome
+                    {
+                        return output.receipt(json!({"event":"refused","reason":"would_store_plaintext_copy_of_encrypted","path":archive_path.to_string_lossy(),"newest_version":newest_version}));
+                    }
+                    match outcome.map_err(|error| {
+                        output.tape_continuation = tape_continuation(&error);
+                        format!("{}: {error}", source.display())
+                    })? {
                         Ok((result, reason)) => {
                             let mut locator = Vec::new();
                             crate::pool_ops::print_locator_json_with_recipients(
@@ -969,6 +1217,9 @@ where
             output.finish(failed.as_ref(), &loaded)?;
             match failed {
                 Some((path, error)) => Err(format!("{}: {error}", path.display())),
+                None if output.receipts.iter().any(|r| r["event"] == "refused") => {
+                    Err("one or more files refused".into())
+                }
                 None => Ok(
                     json!({"tape":Uuid::from_bytes(uuid),"pool":loaded,"objects":objects,"receipts":output.receipts,"summary":output.summary}),
                 ),
@@ -1287,6 +1538,7 @@ fn tape_continuation(error: &remanence_api::MountError) -> bool {
 
 /// Stream receipts before proceeding to another file, retaining them for the envelope.
 struct PutOutput<'a> {
+    active_fences: Vec<Value>,
     out: &'a mut dyn Write,
     json: bool,
     receipts: Vec<Value>,
@@ -1305,6 +1557,12 @@ impl PutOutput<'_> {
                 receipt["path"].as_str().unwrap_or(""),
                 if receipt["event"] == "skipped_unsupported" {
                     format!(" ({})", receipt["kind"].as_str().unwrap_or(""))
+                } else if receipt["event"] == "refused" {
+                    format!(
+                        "  {} (newest version {}); use --allow-plaintext-copy to override",
+                        receipt["reason"].as_str().unwrap_or(""),
+                        receipt["newest_version"].as_str().unwrap_or("")
+                    )
                 } else {
                     format!(
                         "  {}  {} ({}){}",
@@ -1331,16 +1589,17 @@ impl PutOutput<'_> {
             count("already_stored"),
             count("skipped_unsupported"),
         );
+        let refused = count("refused");
         let next = (failed.is_some() && self.tape_continuation).then(|| {
             format!("finalize this tape, init the next in pool {pool}, and re-run the same put")
         });
-        let summary = json!({"event":"summary","written":written,"already_stored":already_stored,"skipped":skipped,"failed":failed.map(|(path,error)|json!({"path":path.to_string_lossy(),"error":error})),"next":next});
+        let summary = json!({"event":"summary","written":written,"already_stored":already_stored,"skipped":skipped,"refused":refused,"failed":failed.map(|(path,error)|json!({"path":path.to_string_lossy(),"error":error})),"next":next});
         if self.json {
             writeln!(self.out, "{summary}").map_err(err)?;
         } else {
             writeln!(
                 self.out,
-                "Total: {written} written, {already_stored} already_stored, {skipped} skipped{}",
+                "Total: {written} written, {already_stored} already_stored, {skipped} skipped, {refused} refused{}",
                 failed
                     .map(|(p, e)| format!(
                         "; failed {}: {e}; {}",
@@ -1405,6 +1664,8 @@ struct InitPlan {
     parity: remanence_parity::ParityConfig,
     observation: MediaObservation,
     decision: remanence_api::InitDecision,
+    clobber_data_confirmed: bool,
+    previous_uuid: Option<[u8; 16]>,
 }
 fn prepare_init(
     drive: &mut DriveHandle,
@@ -1413,6 +1674,7 @@ fn prepare_init(
     pool: &str,
     generation: Option<&str>,
     block_size: Option<u32>,
+    clobber: (bool, Option<&str>, bool, &mut dyn Write),
 ) -> Result<([u8; 16], InitPlan), String> {
     let pool_config = state
         .config()
@@ -1440,6 +1702,7 @@ fn prepare_init(
     }
     drive.prevent_medium_removal().map_err(err)?;
     let proof = drive.identity_generation();
+    drive.require_single_partition().map_err(err)?;
     let mut cfg = drive.read_config().map_err(err)?;
     if cfg.write_protected {
         return Err("tape is write protected".into());
@@ -1470,6 +1733,17 @@ fn prepare_init(
     cfg.compression = false;
     drive.write_config(cfg).map_err(err)?;
     let bot = remanence_api::classify_bot_from_source(&mut DriveHandleSource(drive));
+    let loaded_uuid = match &bot.classification {
+        remanence_api::BotClassification::OursBootstrap { uuid, .. } => Some(*uuid),
+        _ => None,
+    };
+    remanence_api::standalone_fence_policy(
+        state.catalog_index(),
+        loaded_uuid,
+        drive.endpoint().durable_key(),
+        true,
+    )
+    .map_err(err)?;
     let facts = remanence_api::project_tape_init_catalog_inputs(
         state.catalog_index(),
         label,
@@ -1477,6 +1751,11 @@ fn prepare_init(
         pool,
     )
     .map_err(err)?;
+    if let remanence_api::LabelLifecycleState::AssignedTo { uuid, .. } = &facts.barcode_state {
+        if loaded_uuid != Some(*uuid) {
+            return Err(format!("label {label} belongs to tape {}; use tape rebind --previous-uuid {} or choose a new label", Uuid::from_bytes(*uuid), Uuid::from_bytes(*uuid)));
+        }
+    }
     let decision = remanence_api::decide_tape_init(
         &bot.classification,
         facts.catalog_row.as_ref(),
@@ -1485,16 +1764,6 @@ fn prepare_init(
         bot.physical_data_past_bootstrap,
         &facts.committed_copies,
     );
-    if !matches!(
-        decision,
-        remanence_api::InitDecision::FreshInit | remanence_api::InitDecision::IdempotentNoOp
-    ) {
-        return Err(format!("init refused: {decision:?}"));
-    }
-    let uuid = match &bot.classification {
-        remanence_api::BotClassification::OursBootstrap { uuid, .. } => *uuid,
-        _ => *Uuid::new_v4().as_bytes(),
-    };
     let parity = pool_config
         .scheme
         .as_deref()
@@ -1506,6 +1775,90 @@ fn prepare_init(
                 size,
             ))
         });
+    let replacement_uuid = *Uuid::new_v4().as_bytes();
+    let previous_uuid = loaded_uuid.filter(|_| {
+        facts
+            .catalog_row
+            .as_ref()
+            .is_some_and(|row| row.disposition != remanence_api::CatalogRowDisposition::Retired)
+    });
+    if crate::should_confirm_clobber(clobber.0, &decision) {
+        state
+            .catalog_index()
+            .provision_replacing_media(
+                remanence_state::ProvisionTapeInput {
+                    tape_uuid: replacement_uuid,
+                    voltag: label.into(),
+                    block_size: size,
+                    parity: parity.clone(),
+                    force: true,
+                },
+                LabelProvenance::Operator,
+                Some(observation),
+                previous_uuid,
+                true,
+            )
+            .map_err(err)?;
+    }
+    let clobber_data_confirmed = if crate::should_confirm_clobber(clobber.0, &decision) {
+        use std::io::IsTerminal;
+        if clobber.2 {
+            crate::confirm_clobber_data(
+                label,
+                &decision,
+                clobber.1,
+                crate::ClobberInputPolicy::Standalone { is_terminal: false },
+                &mut std::io::Cursor::new([]),
+                clobber.3,
+            )?
+        } else {
+            crate::confirm_clobber_data(
+                label,
+                &decision,
+                clobber.1,
+                crate::ClobberInputPolicy::Standalone {
+                    is_terminal: std::io::stdin().is_terminal(),
+                },
+                &mut std::io::stdin().lock(),
+                clobber.3,
+            )?
+        }
+    } else {
+        false
+    };
+    if !clobber_data_confirmed
+        && !matches!(
+            decision,
+            remanence_api::InitDecision::FreshInit | remanence_api::InitDecision::IdempotentNoOp
+        )
+    {
+        use remanence_api::{InitDecision, TapeInitError};
+        let reason = match &decision {
+            InitDecision::RefuseClobber { reason: TapeInitError::ForeignFormat(name) } =>
+                format!("this cartridge holds {name} data at the beginning; re-run with --clobber-data to erase it for Remanence"),
+            InitDecision::RefuseClobber { reason: TapeInitError::UnrecognizedData } =>
+                "this cartridge holds unrecognized data at the beginning; re-run with --clobber-data to erase it for Remanence".into(),
+            InitDecision::RefuseClobber { reason } =>
+                format!("Cannot initialize this cartridge: {}; re-run with --clobber-data to erase it for Remanence.", crate::init_error_label(reason)),
+            InitDecision::RequireForce { reason }
+            | InitDecision::Anomaly { reason } | InitDecision::NeedsExplicitRebuild { reason } =>
+                format!("Cannot initialize this cartridge: {}.", crate::init_error_label(reason)),
+            _ => unreachable!(),
+        };
+        return Err(reason);
+    }
+    let (uuid, size, parity) = crate::planned_init_geometry(
+        &bot.classification,
+        &decision,
+        clobber_data_confirmed,
+        size,
+        parity,
+    );
+    let uuid = if clobber_data_confirmed {
+        replacement_uuid
+    } else {
+        uuid
+    };
     cfg.block_size = BlockSize::Fixed { size_bytes: size };
     drive.write_config(cfg).map_err(err)?;
     drive.rewind().map_err(err)?;
@@ -1520,6 +1873,12 @@ fn prepare_init(
             parity,
             observation,
             decision,
+            clobber_data_confirmed,
+            previous_uuid: if clobber_data_confirmed {
+                previous_uuid
+            } else {
+                None
+            },
         },
     ))
 }
@@ -1553,17 +1912,25 @@ fn complete_init(
         parity,
         observation,
         decision,
+        clobber_data_confirmed,
+        previous_uuid,
     } = plan;
     let action = remanence_api::maybe_write_tape_init_bootstrap_on_drive(
         drive,
         &decision,
-        remanence_api::TapeInitWriteOptions::default(),
+        remanence_api::TapeInitWriteOptions {
+            clobber_data_confirmed,
+            ..Default::default()
+        },
         uuid,
         size,
         parity.clone(),
         &remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION")),
     )
     .map_err(err)?;
+    if action == remanence_api::TapeInitWriteAction::Refused {
+        return Err("initialization refused by the media write gate; no write attempted".into());
+    }
     if action == remanence_api::TapeInitWriteAction::WroteBootstrap {
         let config = state.config().clone();
         crate::provision_initialized_tape_with_media(
@@ -1574,12 +1941,13 @@ fn complete_init(
                 voltag: label.clone(),
                 block_size: size,
                 parity,
-                force: false,
+                force: clobber_data_confirmed,
             },
             crate::ProvisioningContext {
                 provenance: LabelProvenance::Operator,
                 observation: Some(observation),
                 explicit_pool: Some(&pool),
+                previous_uuid,
             },
         )?;
     }
@@ -1777,6 +2145,115 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// Reading library quarantine state never generates a replacement home config.
+    #[test]
+    fn quarantine_fallback_reports_path_without_creating_config() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let env = Environment {
+            xdg: root.path().join("state"),
+            system_config: root.path().join("system.toml"),
+            locks: root.path().join("locks"),
+            test_input: true,
+        };
+        let mut errors = Vec::new();
+        assert!(local_quarantine_config_in(&env.system_config, &env, &mut errors).is_err());
+        assert!(!env.xdg.exists());
+        assert!(String::from_utf8(errors).unwrap().contains("using config"));
+        fs::create_dir_all(env.xdg.join("rem")).unwrap();
+        let home = env.xdg.join("rem/config.toml");
+        fs::write(&home, "").unwrap();
+        assert_eq!(
+            local_quarantine_config_in(&env.system_config, &env, &mut Vec::new()).unwrap(),
+            home
+        );
+    }
+
+    /// Shared quarantine routing follows home-mode configuration, never reason text.
+    #[test]
+    fn quarantine_routing_requires_home_drive_and_no_library_config() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let env = Environment {
+            xdg: root.path().into(),
+            system_config: root.path().join("system.toml"),
+            locks: root.path().join("locks"),
+            test_input: true,
+        };
+        fs::create_dir(root.path().join("rem")).unwrap();
+        let args = [
+            "rem",
+            "--allow-untrusted-state-volume",
+            "tape",
+            "quarantine",
+            "list",
+        ]
+        .map(OsString::from);
+        assert!(!selected_in(&args, &env));
+        let cli = Cli::try_parse_from(["rem", "doctor"]).unwrap();
+        let path = config_path(&cli, &env).unwrap();
+        let text = fs::read_to_string(&path).unwrap() + "\n[home]\ndrive_serial = \"DRIVE\"\n";
+        fs::write(&path, text).unwrap();
+        let config = load(&path, true).unwrap();
+        assert_eq!(
+            config.home.as_ref().unwrap().drive_serial.as_deref(),
+            Some("DRIVE")
+        );
+        let mut state =
+            StateHandle::open_with_config(StatePaths::from_config(&path, &config), config).unwrap();
+        let fence = state
+            .catalog_index()
+            .record_tape_io_fence(remanence_state::TapeIoFenceInput {
+                tape_uuid: [17; 16],
+                barcode: None,
+                reason: "uncertain write".into(),
+                evidence_json: None,
+            })
+            .unwrap();
+        drop(state);
+        let mut out = Vec::new();
+        let mut errors = Vec::new();
+        let code = run_with_standalone_test_io(
+            &[
+                "rem",
+                "--json",
+                "--allow-untrusted-state-volume",
+                "tape",
+                "quarantine",
+                "list",
+            ],
+            root.path(),
+            &env.xdg,
+            &env.system_config,
+            &env.locks,
+            vec![],
+            |_| panic!("catalog listing must not open a device"),
+            &mut out,
+            &mut errors,
+        );
+        assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&out));
+        assert!(String::from_utf8_lossy(&out).contains(&fence.quarantine_id));
+        assert!(selected_in(&args, &env));
+        let without_override: Vec<_> = args
+            .iter()
+            .filter(|arg| *arg != "--allow-untrusted-state-volume")
+            .cloned()
+            .collect();
+        assert!(selected_in(&without_override, &env));
+        for option in [
+            "--config=local.toml",
+            "--endpoint=server",
+            "--library",
+            "--after-settled-inventory",
+        ] {
+            let mut explicit = args.to_vec();
+            explicit.push(option.into());
+            assert!(!selected_in(&explicit, &env), "{option}");
+        }
+        fs::write(&env.system_config, "").unwrap();
+        assert!(!selected_in(&args, &env));
+    }
+
     #[test]
     fn capacity_failures_preserve_totals_and_name_the_continuation_pool() {
         assert!(super::tape_continuation(
@@ -1795,6 +2272,7 @@ mod tests {
             let error = remanence_api::MountError::PoolWrite(Box::new(cause));
             let mut bytes = Vec::new();
             let mut output = super::PutOutput {
+                active_fences: Vec::new(),
                 out: &mut bytes,
                 json: true,
                 receipts: Vec::new(),
@@ -1829,6 +2307,7 @@ mod tests {
             }));
         let mut bytes = Vec::new();
         let mut output = super::PutOutput {
+            active_fences: Vec::new(),
             out: &mut bytes,
             json: true,
             receipts: Vec::new(),

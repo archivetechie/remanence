@@ -23,14 +23,16 @@ pub(crate) fn reject_active_tape_io_fences_on_startup(index: &CatalogIndex) -> R
         .list_active_tape_io_fences()
         .map_err(status_from_state_error)?;
     if let Some(first) = tape_io_fences.first() {
+        let release_options = crate::mount_backend::fence_release_options(first);
         return Err(Status::failed_precondition(format!(
-            "startup blocked by active tape-I/O fence {} tape_uuid={} barcode={} reason={}; release via `rem tape quarantine release {}` before retrying",
+            "startup blocked by active tape-I/O fence {} tape_uuid={} barcode={} reason={}; {} active fence(s); release via `rem tape quarantine release {} {release_options}` before retrying",
             first.quarantine_id,
             Uuid::from_slice(first.tape_uuid.as_slice())
                 .map(|uuid| uuid.to_string())
                 .unwrap_or_else(|_| bytes_to_hex(first.tape_uuid.as_slice())),
             first.barcode.as_deref().unwrap_or("(unknown)"),
             first.reason,
+            tape_io_fences.len(),
             first.quarantine_id,
         )));
     }

@@ -773,7 +773,21 @@ impl StateHandle {
         provenance: crate::LabelProvenance,
         observation: Option<crate::MediaObservation>,
     ) -> Result<(), StateError> {
-        let prior = match self.index.get_tape(&input.tape_uuid)? {
+        self.provision_replacing_media(input, provenance, observation, None)
+    }
+
+    /// Confirmed BOT replacement shares provisioning and calibration eviction.
+    pub fn provision_replacing_media(
+        &mut self,
+        input: ProvisionTapeInput,
+        provenance: crate::LabelProvenance,
+        observation: Option<crate::MediaObservation>,
+        previous_uuid: Option<[u8; 16]>,
+    ) -> Result<(), StateError> {
+        let prior = match self
+            .index
+            .get_tape(&previous_uuid.unwrap_or(input.tape_uuid))?
+        {
             Some(tape) => Some(tape),
             None => self.index.get_tape_by_voltag(input.voltag.as_str())?,
         };
@@ -792,8 +806,13 @@ impl StateHandle {
                 })
             })
             .transpose()?;
-        self.index
-            .provision_tape_with_media(input, provenance, observation)?;
+        self.index.provision_replacing_media(
+            input,
+            provenance,
+            observation,
+            previous_uuid,
+            false,
+        )?;
         if let Some(prior_uuid) = prior_uuid_to_evict {
             self.calibration.record_map_evicted(prior_uuid)?;
         }
@@ -1326,6 +1345,9 @@ impl StateHandle {
         ]);
         if let Some(barcode) = record.barcode.as_ref() {
             detail.insert("barcode".to_string(), CborValue::Text(barcode.clone()));
+        }
+        if let Some(endpoint) = record.endpoint.as_ref() {
+            detail.insert("endpoint_key".into(), CborValue::Text(endpoint.encode()));
         }
         self.audit.append(AuditEventRecord {
             actor: AuditActor::local_user(),
