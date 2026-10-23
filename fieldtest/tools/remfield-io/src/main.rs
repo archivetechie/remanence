@@ -659,6 +659,8 @@ async fn append_object(
                     caller_metadata,
                     declared_size_bytes: Some(input.declared_size_bytes),
                     body_format_manifest: None,
+                    // Field I/O sources are synthetic streams with no file date.
+                    mtime: None,
                     expected_content_sha256: start_digest.map(|digest| digest.to_vec()),
                     expected_content_digest: start_digest.map(|digest| pb::Digest {
                         algorithm: "sha256".to_string(),
@@ -1189,10 +1191,7 @@ fn read_range(
             let object = object.ok_or_else(|| {
                 AppError::new("--offset without --length requires catalog lookup")
             })?;
-            let size = required(
-                object.logical_size_bytes,
-                "ObjectRecord.logical_size_bytes",
-            )?;
+            let size = required(object.logical_size_bytes, "ObjectRecord.logical_size_bytes")?;
             if start > size {
                 return Err(AppError::new(format!(
                     "--offset {start} is beyond object size {size}"
@@ -1362,7 +1361,7 @@ fn uuid_bytes_to_text(bytes: &[u8]) -> AppResult<String> {
 }
 
 fn hex_to_bytes(value: &str) -> AppResult<Vec<u8>> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return Err(AppError::new(format!(
             "hex string has odd length {}",
             value.len()
