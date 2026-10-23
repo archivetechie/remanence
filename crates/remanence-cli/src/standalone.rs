@@ -354,6 +354,39 @@ pub fn run_with_standalone_test_io<F>(
     system_config: &Path,
     locks: &Path,
     devices: Vec<DeviceAttachment>,
+    factory: F,
+    out: &mut dyn Write,
+    errors: &mut dyn Write,
+) -> ExitCode
+where
+    F: FnMut(&Path) -> Result<Box<dyn SgTransport>, IoErrorKind>,
+{
+    run_with_standalone_test_enumeration(
+        args,
+        home,
+        xdg,
+        system_config,
+        locks,
+        remanence_library::sysfs::DeviceEnumeration {
+            devices,
+            warnings: vec![],
+        },
+        factory,
+        out,
+        errors,
+    )
+}
+
+/// Like [`run_with_standalone_test_io`], with a full host enumeration so tests
+/// can supply the walker's own warnings (for example skipped non-tape nodes).
+#[allow(clippy::too_many_arguments)]
+pub fn run_with_standalone_test_enumeration<F>(
+    args: &[&str],
+    home: &Path,
+    xdg: &Path,
+    system_config: &Path,
+    locks: &Path,
+    enumeration: remanence_library::sysfs::DeviceEnumeration,
     mut factory: F,
     out: &mut dyn Write,
     errors: &mut dyn Write,
@@ -373,12 +406,7 @@ where
     run(
         &args.iter().map(OsString::from).collect::<Vec<_>>(),
         env,
-        || {
-            Ok(remanence_library::sysfs::DeviceEnumeration {
-                devices,
-                warnings: vec![],
-            })
-        },
+        || Ok(enumeration),
         &mut factory,
         out,
         errors,
@@ -647,11 +675,16 @@ where
                 Command::Doctor | Command::Drives | Command::Diagnostics { .. }
             ) =>
         {
+            let incomplete_evidence: Vec<_> = warnings
+                .iter()
+                .filter(|warning| warning.is_incomplete_evidence())
+                .cloned()
+                .collect();
             DiscoveryReport {
                 libraries: vec![],
                 unattached_drives: vec![],
-                complete: warnings.is_empty(),
-                incomplete_evidence: warnings.clone(),
+                complete: incomplete_evidence.is_empty(),
+                incomplete_evidence,
                 warnings,
             }
         }
@@ -668,7 +701,9 @@ where
     }
     *observed = remanence_api::observed_endpoint_json(&report);
     for warning in &report.warnings {
-        if let Some(message) = remanence_library::drive_mapping_message(warning) {
+        if let Some(message) = remanence_library::drive_mapping_message(warning)
+            .or_else(|| warning.informational_message())
+        {
             let _ = writeln!(errors, "{message}");
         }
     }
@@ -676,7 +711,7 @@ where
         Command::Doctor => return Ok(doctor(env, &config, &report)),
         Command::Drives => {
             return Ok(
-                json!({"endpoints":observed,"complete":report.complete,"warnings":report.warnings.iter().map(|w|format!("{w:?}")).collect::<Vec<_>>()}),
+                json!({"endpoints":observed,"complete":report.complete,"warnings":report.warnings.iter().map(|w| w.informational_message().unwrap_or_else(|| format!("{w:?}"))).collect::<Vec<_>>()}),
             )
         }
         Command::Diagnostics {

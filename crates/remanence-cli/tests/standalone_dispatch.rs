@@ -682,3 +682,49 @@ fn init_geometry_and_failed_bootstrap_are_guarded() {
         }
     }
 }
+
+/// Informational skips remain complete and readable in both CLI output modes.
+#[test]
+fn skipped_disk_is_informational_without_any_tape_endpoints() {
+    for json in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut args = vec!["rem", "--allow-untrusted-state-volume", "drives"];
+        if json {
+            args.push("--json");
+        }
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = remanence_cli::run_with_standalone_test_enumeration(
+            &args,
+            temp.path(),
+            &temp.path().join("state"),
+            &temp.path().join("absent"),
+            &temp.path().join("locks"),
+            remanence_library::sysfs::DeviceEnumeration {
+                devices: vec![],
+                warnings: vec![remanence_library::DiscoveryWarning::NotTapeOrChanger {
+                    path: "/dev/sg2".into(),
+                    peripheral_type: 0,
+                }],
+            },
+            |_: &Path| panic!("disk must never be opened"),
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(
+            code,
+            ExitCode::SUCCESS,
+            "{}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(String::from_utf8_lossy(&stderr).contains("skipped /dev/sg2: disk (type 0)"));
+        if json {
+            let response: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+            assert_eq!(response["result"]["complete"], true, "{response}");
+            assert_eq!(
+                response["result"]["warnings"],
+                serde_json::json!(["skipped /dev/sg2: disk (type 0)"])
+            );
+        }
+    }
+}

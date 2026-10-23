@@ -95,7 +95,9 @@ pub async fn main_entry_with_registry(
             }
         };
         for warning in &report.warnings {
-            if let Some(message) = remanence_library::drive_mapping_message(warning) {
+            if let Some(message) = remanence_library::drive_mapping_message(warning)
+                .or_else(|| warning.informational_message())
+            {
                 eprintln!("rem-daemon: {message}");
             }
         }
