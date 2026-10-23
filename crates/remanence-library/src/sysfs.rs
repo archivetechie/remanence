@@ -3,8 +3,8 @@
 //!
 //! The walker returns attachments and any enumeration failures, so discovery
 //! cannot mistake a partial host inventory for proof of standalone ownership.
-//! It does not classify devices (that's
-//! discovery's job, since classification requires INQUIRY). Linux-only;
+//! It skips nodes whose kernel peripheral type is neither tape nor changer;
+//! discovery classifies the rest with INQUIRY. Linux-only;
 //! the rest of `remanence-library` compiles fine without this module.
 
 use std::fs;
@@ -105,6 +105,20 @@ fn resolve_sg_devices(
             }
         };
 
+        // The kernel publishes each device's INQUIRY peripheral type here.
+        // Only tape drives (1) and changers (8) can bear on drive ownership,
+        // so other known types are reported without opening their nodes;
+        // an unreadable or invalid type keeps the open-and-INQUIRY probe.
+        if let Some(peripheral_type) = peripheral_type(&link) {
+            if !matches!(peripheral_type, 1 | 8) {
+                out.warnings.push(DiscoveryWarning::NotTapeOrChanger {
+                    path,
+                    peripheral_type,
+                });
+                continue;
+            }
+        }
+
         out.devices.push(DeviceAttachment {
             sg_path: path,
             sysfs_path: resolved,
@@ -114,6 +128,13 @@ fn resolve_sg_devices(
     // Lexicographic sort by sg_path for deterministic output.
     out.devices.sort_by(|a, b| a.sg_path.cmp(&b.sg_path));
     out
+}
+
+/// Read the kernel's peripheral device type for an sg attachment.
+fn peripheral_type(device_link: &Path) -> Option<u8> {
+    fs::read_to_string(device_link.join("type"))
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
 }
 
 /// Match exactly `sg` followed by one or more ASCII digits.
@@ -275,5 +296,145 @@ mod tests {
             [DiscoveryWarning::DeviceUnreachable { path, source }]
                 if path == &dev && source.kind == "PermissionDenied"
         ));
+    }
+    /// Exercise the live enumeration funnel with a disk that cannot be opened.
+    #[test]
+    fn disk_is_skipped_before_open_and_drive_is_standalone() {
+        for peripheral_type in [0, 5, 13, 31, 255] {
+            let tmp = build_mock_host(&[("sg0", "disk"), ("sg1", "drive")]);
+            let dev = tmp.path().join("dev");
+            let sys = tmp.path().join("sys/class/scsi_generic");
+            fs::write(sys.join("sg0/device/type"), peripheral_type.to_string()).unwrap();
+            fs::write(sys.join("sg1/device/type"), "1\n").unwrap();
+            let enumeration = enumerate_sg_devices_under(&dev, &sys).unwrap();
+            assert_eq!(enumeration.devices.len(), 1, "disk must not be enumerated");
+            let mut opened = Vec::new();
+            let report = crate::discover_enumerated_with(enumeration, |path| {
+                opened.push(path.to_path_buf());
+                if path == dev.join("sg0") {
+                    return Err(IoErrorKind::from(&std::io::Error::from(
+                        std::io::ErrorKind::PermissionDenied,
+                    )));
+                }
+                Ok(drive_transport())
+            })
+            .unwrap();
+            assert_eq!(opened, [dev.join("sg1")]);
+            assert!(report.complete);
+            assert!(report.incomplete_evidence.is_empty());
+            assert_eq!(report.unattached_drives.len(), 1);
+            assert_eq!(
+                report.unattached_drives[0].ownership,
+                crate::DriveOwnership::Standalone
+            );
+            assert!(report.warnings.iter().any(|warning| matches!(warning,
+                DiscoveryWarning::NotTapeOrChanger { path, peripheral_type: t }
+                if path == &dev.join("sg0") && *t == peripheral_type)));
+        }
+    }
+
+    /// Permission failures for tape and changer nodes remain ownership evidence.
+    #[test]
+    fn tape_and_changer_open_denied_keep_ownership_unknown() {
+        for peripheral_type in [1, 8] {
+            let tmp = build_mock_host(&[("sg0", "unreachable"), ("sg1", "drive")]);
+            let dev = tmp.path().join("dev");
+            let sys = tmp.path().join("sys/class/scsi_generic");
+            fs::write(sys.join("sg0/device/type"), peripheral_type.to_string()).unwrap();
+            fs::write(sys.join("sg1/device/type"), "1").unwrap();
+            let enumeration = enumerate_sg_devices_under(&dev, &sys).unwrap();
+            let mut opened = Vec::new();
+            let report = crate::discover_enumerated_with(enumeration, |path| {
+                opened.push(path.to_path_buf());
+                if path == dev.join("sg0") {
+                    Err(IoErrorKind::from(&std::io::Error::from(
+                        std::io::ErrorKind::PermissionDenied,
+                    )))
+                } else {
+                    Ok(drive_transport())
+                }
+            })
+            .unwrap();
+            assert_eq!(opened, [dev.join("sg0"), dev.join("sg1")]);
+            assert!(!report.complete);
+            assert_eq!(
+                report.unattached_drives[0].ownership,
+                crate::DriveOwnership::Unknown
+            );
+            assert!(matches!(&report.incomplete_evidence[..],
+                [DiscoveryWarning::DeviceUnreachable { path, source }]
+                if path == &dev.join("sg0") && source.kind == "PermissionDenied"));
+        }
+    }
+
+    /// Missing, unreadable and invalid kernel types retain open-and-INQUIRY.
+    #[test]
+    fn unknown_peripheral_type_is_opened() {
+        for value in [
+            None,
+            Some("invalid"),
+            Some("256"),
+            Some("-1"),
+            Some("directory"),
+        ] {
+            let tmp = build_mock_host(&[("sg0", "drive")]);
+            let dev = tmp.path().join("dev");
+            let sys = tmp.path().join("sys/class/scsi_generic");
+            match value {
+                Some("directory") => fs::create_dir(sys.join("sg0/device/type")).unwrap(),
+                Some(value) => fs::write(sys.join("sg0/device/type"), value).unwrap(),
+                None => (),
+            }
+            let enumeration = enumerate_sg_devices_under(&dev, &sys).unwrap();
+            assert_eq!(enumeration.devices.len(), 1);
+            let mut opened = Vec::new();
+            let report = crate::discover_enumerated_with(enumeration, |path| {
+                opened.push(path.to_path_buf());
+                Ok(drive_transport())
+            })
+            .unwrap();
+            assert_eq!(opened, [dev.join("sg0")]);
+            assert!(report.complete);
+            assert_eq!(report.unattached_drives.len(), 1);
+        }
+    }
+
+    /// Type 8 reaches the changer probe through the same resolver as discover().
+    #[test]
+    fn changer_type_is_probed() {
+        let tmp = build_mock_host(&[("sg0", "changer")]);
+        let dev = tmp.path().join("dev");
+        let sys = tmp.path().join("sys/class/scsi_generic");
+        fs::write(sys.join("sg0/device/type"), "8\n").unwrap();
+        let enumeration = resolve_sg_devices(&dev, &sys, [Ok(dev.join("sg0"))]);
+        assert_eq!(enumeration.devices.len(), 1);
+        let res = include_bytes!("../../../fixtures/element-status/quadstor-msl-g3.bin");
+        let mut opened = Vec::new();
+        let report = crate::discover_enumerated_with(enumeration, |path| {
+            opened.push(path.to_path_buf());
+            Ok(crate::FixtureTransport::new().with_responses([
+                include_bytes!("../../../fixtures/inquiry/changer-msl-g3.bin").to_vec(),
+                include_bytes!("../../../fixtures/vpd-80/changer-msl-g3.bin").to_vec(),
+                vec![0x08, 0, 0, 0],
+                res[..8].to_vec(),
+                res.to_vec(),
+            ]))
+        })
+        .unwrap();
+        assert_eq!(opened, [dev.join("sg0")]);
+        assert_eq!(report.libraries.len(), 1);
+        assert_eq!(report.libraries[0].changer_sg, dev.join("sg0"));
+        assert!(!report
+            .warnings
+            .iter()
+            .any(|w| matches!(w, DiscoveryWarning::NotTapeOrChanger { .. })));
+    }
+
+    /// Canned standard INQUIRY and serial responses for a standalone tape drive.
+    fn drive_transport() -> crate::FixtureTransport {
+        crate::FixtureTransport::new().with_responses([
+            include_bytes!("../../../fixtures/inquiry/drive1-lto9.bin").to_vec(),
+            include_bytes!("../../../fixtures/vpd-80/drive1-lto9.bin").to_vec(),
+        ])
     }
 }

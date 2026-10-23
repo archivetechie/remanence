@@ -40,7 +40,7 @@
 //! caller asked for a library that wasn't found.
 
 mod standalone;
-pub use standalone::run_with_standalone_test_io;
+pub use standalone::{run_with_standalone_test_enumeration, run_with_standalone_test_io};
 
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
@@ -16074,6 +16074,12 @@ fn print_warnings(report: &DiscoveryReport, err: &mut dyn Write) {
 /// [`print_warnings`]) and from the fatal-error path in `main`, where
 /// the warnings come out of a `DiscoveryError::NoLibraries { warnings }`.
 fn print_warning_list(warnings: &[DiscoveryWarning], err: &mut dyn Write) {
+    // Skipped non-tape nodes (disks, optical drives) are expected on most
+    // hosts; listing them as warnings would read as a fault.
+    let warnings: Vec<_> = warnings
+        .iter()
+        .filter(|w| w.informational_message().is_none())
+        .collect();
     if warnings.is_empty() {
         return;
     }
@@ -16135,6 +16141,7 @@ fn print_setcap_hint_if_needed(warnings: &[DiscoveryWarning], err: &mut dyn Writ
 
 fn format_warning(w: &DiscoveryWarning) -> String {
     match w {
+        DiscoveryWarning::NotTapeOrChanger { .. } => w.informational_message().unwrap(),
         DiscoveryWarning::DeviceUnreachable { path, source } => {
             format!(
                 "device unreachable: {} ({})",

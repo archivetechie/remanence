@@ -22,7 +22,7 @@ pub enum DiscoveryError {
     /// the operator can see *why* discovery returned nothing (most
     /// commonly: missing `CAP_SYS_RAWIO`, surfacing as a per-device
     /// SCSI error on every RES call).
-    #[error("no tape libraries or drives reachable on this host ({} warning(s))", warnings.len())]
+    #[error("no tape libraries or drives reachable on this host ({} warning(s))", warnings.iter().filter(|w| w.informational_message().is_none()).count())]
     NoLibraries {
         /// Per-device / per-library diagnostics gathered during the
         /// pass. Empty if the host genuinely has no `/dev/sg*` at all.
@@ -98,6 +98,8 @@ fn io_kind_str(k: std::io::ErrorKind) -> &'static str {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(missing_docs)]
 pub enum DiscoveryWarning {
+    /// Informational: sysfs identifies a device outside tape discovery.
+    NotTapeOrChanger { path: PathBuf, peripheral_type: u8 },
     /// Could not open or read a `/dev/sg*` that the host advertised.
     DeviceUnreachable { path: PathBuf, source: IoErrorKind },
     /// A SCSI command on a specific device returned an error.
@@ -145,6 +147,45 @@ pub enum DiscoveryWarning {
         library: String,
         element_address: u16,
     },
+}
+
+impl DiscoveryWarning {
+    /// Whether this warning leaves drive ownership unproven. Unclaimed devices
+    /// alone do not: probe failures, unresolved bays and ambiguous claims do.
+    /// Skipped non-tape nodes are informational and never count.
+    pub fn is_incomplete_evidence(&self) -> bool {
+        matches!(
+            self,
+            Self::DeviceUnreachable { .. }
+                | Self::ScsiError { .. }
+                | Self::DriveMappingUnavailable { .. }
+                | Self::UnresolvedDrive { .. }
+                | Self::DriveSerialAmbiguous { .. }
+                | Self::DriveMappingDerived { .. }
+        )
+    }
+
+    /// Informational text for a device intentionally excluded from discovery.
+    pub fn informational_message(&self) -> Option<String> {
+        if let Self::NotTapeOrChanger {
+            path,
+            peripheral_type,
+        } = self
+        {
+            let kind = match peripheral_type {
+                0 => "disk",
+                5 => "optical",
+                13 => "enclosure",
+                _ => "non-tape device",
+            };
+            Some(format!(
+                "skipped {}: {kind} (type {peripheral_type})",
+                path.display()
+            ))
+        } else {
+            None
+        }
+    }
 }
 
 /// Errors from `Library::open()` (and the equivalent drive-handle path).

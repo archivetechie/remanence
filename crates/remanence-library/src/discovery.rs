@@ -49,6 +49,8 @@ where
 }
 
 /// Discover from a host enumeration, preserving failures as incomplete evidence.
+/// The sysfs walker has already set aside nodes the kernel reports as
+/// neither tape nor changer; their informational warnings arrive here.
 /// Live callers must use this entry point so an unresolved SG attachment cannot
 /// turn an unclaimed drive into a proven standalone drive.
 pub fn discover_enumerated_with<F, T>(
@@ -134,17 +136,7 @@ where
     // unresolved bays and ambiguous claims do: none may prove non-ownership.
     let incomplete_evidence: Vec<_> = warnings
         .iter()
-        .filter(|warning| {
-            matches!(
-                warning,
-                DiscoveryWarning::DeviceUnreachable { .. }
-                    | DiscoveryWarning::ScsiError { .. }
-                    | DiscoveryWarning::DriveMappingUnavailable { .. }
-                    | DiscoveryWarning::UnresolvedDrive { .. }
-                    | DiscoveryWarning::DriveSerialAmbiguous { .. }
-                    | DiscoveryWarning::DriveMappingDerived { .. }
-            )
-        })
+        .filter(|warning| warning.is_incomplete_evidence())
         .cloned()
         .collect();
     let complete = incomplete_evidence.is_empty();
@@ -166,7 +158,7 @@ where
 }
 
 /// The standard Linux entry point — walk `/dev/sg*` via sysfs, open
-/// each through [`LinuxSgTransport`](crate::transport::LinuxSgTransport),
+/// eligible nodes through [`LinuxSgTransport`](crate::transport::LinuxSgTransport),
 /// and build a [`DiscoveryReport`]. Tests use [`discover_with`] directly with a
 /// [`FixtureTransport`](crate::transport::FixtureTransport).
 ///
