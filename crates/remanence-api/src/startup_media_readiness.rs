@@ -14,6 +14,7 @@ pub(crate) fn status_from_state_error(err: StateError) -> Status {
         StateError::IdempotencyConflict(_) => Status::already_exists(err.to_string()),
         StateError::TapePoolAssignmentConflict(_)
         | StateError::TapeProvisionConflict(_)
+        | StateError::AppendRecoveryPrecondition(_)
         | StateError::JournalReplayFailed(_) => Status::failed_precondition(err.to_string()),
         _ => Status::internal(err.to_string()),
     }

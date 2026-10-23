@@ -1025,6 +1025,60 @@ fn parity_config_from_bootstrap(payload: &BootstrapPayload) -> ParityConfig {
     }
 }
 
+/// Explicit bootstrap-only adapter for the initialization gauntlet.
+/// Pool and terminal sessions must use the admission-enforcing adapters.
+struct DriveHandleInitSink<'a>(&'a mut remanence_library::DriveHandle);
+
+impl remanence_library::BlockSink for DriveHandleInitSink<'_> {
+    fn write_block(
+        &mut self,
+        buf: &[u8],
+    ) -> Result<remanence_library::WriteOutcome, remanence_library::TapeIoError> {
+        self.0.write_block(buf)
+    }
+    fn write_filemarks(
+        &mut self,
+        count: u32,
+    ) -> Result<remanence_library::WriteFilemarksOutcome, remanence_library::TapeIoError> {
+        self.0.write_filemarks(count)
+    }
+    fn position(
+        &mut self,
+    ) -> Result<remanence_library::TapePosition, remanence_library::TapeIoError> {
+        self.0.position()
+    }
+}
+
+/// Apply the init gauntlet to a physical drive without exposing its ungated sink.
+#[allow(clippy::too_many_arguments)]
+pub fn maybe_write_tape_init_bootstrap_on_drive(
+    drive: &mut remanence_library::DriveHandle,
+    decision: &InitDecision,
+    options: TapeInitWriteOptions,
+    tape_uuid: TapeUuid,
+    block_size: u32,
+    parity: ParityConfig,
+    identity: &remanence_parity::WriterIdentity,
+) -> Result<TapeInitWriteAction, TapeInitWriteError> {
+    drive.clear_append_admission();
+    if matches!(decision, InitDecision::FreshInit) {
+        let facts = classify_bot_from_source(&mut remanence_library::DriveHandleSource(drive));
+        if !matches!(facts.classification, BotClassification::BlankCheckEod) {
+            return Ok(TapeInitWriteAction::Refused);
+        }
+    }
+    drive.rewind().map_err(crate::PoolWriteError::from)?;
+    maybe_write_tape_init_bootstrap(
+        &mut DriveHandleInitSink(drive),
+        decision,
+        options,
+        tape_uuid,
+        block_size,
+        parity,
+        identity,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;

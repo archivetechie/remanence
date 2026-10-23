@@ -2383,6 +2383,17 @@ mod l1b_tests {
             drive
                 .bind_identity_generation(drive.identity_generation())
                 .expect("bind fixture identity");
+            // The device-model fixture owns this synthetic blank medium. The
+            // API tests exercise physical admission; here the subject is I/O.
+            let position = drive.position().unwrap();
+            let _admission = drive
+                .install_append_admission(crate::model::FixtureAppendProof(
+                    TAPE_UUID,
+                    position.partition,
+                    position.lba,
+                    drive.identity_generation(),
+                ))
+                .unwrap();
             let mut raw = DriveHandleRawSink::new(&mut drive);
             raw.configure_parity_write_session(BLOCK_SIZE)
                 .expect("configure parity session");
@@ -3201,6 +3212,33 @@ mod l1b_tests {
         assert_eq!(med05["mutation_summary"]["length"], 64);
     }
 
+    /// A restored host cursor must not be confused with the physical tail.
+    /// The transport faithfully models the destructive SSC overwrite that API
+    /// append admission must prevent after state rollback.
+    #[test]
+    fn restored_append_cursor_supersedes_later_records_in_the_device_model() {
+        let world = loaded_world(64 * 1024 * 1024);
+        let mut drive = open_drive(world.clone(), None);
+        drive.write_block(&vec![0xa1; BLOCK_SIZE as usize]).unwrap();
+        drive.write_filemarks(1).unwrap();
+        let snapshot_eod = drive.position().unwrap().lba;
+        drive.write_block(&vec![0xb2; BLOCK_SIZE as usize]).unwrap();
+        drive.write_filemarks(1).unwrap();
+        drive.locate(snapshot_eod).unwrap();
+        drive.write_block(&vec![0xc3; BLOCK_SIZE as usize]).unwrap();
+        let locked = world.lock().unwrap();
+        let records = &locked.tapes[BARCODE].records;
+        assert_eq!(records.len(), snapshot_eod as usize + 1);
+        assert_eq!(records[0], Record::Block(vec![0xa1; BLOCK_SIZE as usize]));
+        assert_eq!(
+            records[snapshot_eod as usize],
+            Record::Block(vec![0xc3; BLOCK_SIZE as usize])
+        );
+        assert!(!records
+            .iter()
+            .any(|r| r == &Record::Block(vec![0xb2; BLOCK_SIZE as usize])));
+    }
+
     #[test]
     fn eom_early_warning_flows_through_fixed_sense() {
         let world = loaded_world(1);
@@ -3352,5 +3390,17 @@ mod l1b_tests {
             .expect("MED-05 event");
         assert_eq!(med05["barcode"], BARCODE);
         assert_eq!(med05["mutation_summary"]["applied_length"], 16);
+    }
+}
+
+/// Test-only authority for synthetic transport fixtures that own all media bytes.
+#[cfg(test)]
+struct FixtureAppendProof([u8; 16], u32, u64, u64);
+// SAFETY: fixture callers exclusively own synthetic transports and their entire
+// contents. This capability is never compiled into production code.
+#[cfg(test)]
+unsafe impl remanence_library::AppendBoundaryProof for FixtureAppendProof {
+    fn into_boundary(self) -> ([u8; 16], u32, u64, u64) {
+        (self.0, self.1, self.2, self.3)
     }
 }

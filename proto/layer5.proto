@@ -712,6 +712,7 @@ service Catalog {
   // that automatic trigger; all fit, fence, ownership, and format checks stay
   // mandatory. An accepted request can never reopen the tape for Objects.
   rpc FinalizeTape     (FinalizeTapeRequest)      returns (TapeFinalization);
+  rpc SupersedeTail    (SupersedeTailRequest)     returns (SupersedeTailResponse);
   rpc GetTapeFinalization (GetTapeFinalizationRequest) returns (TapeFinalization);
 
   // Body-format-aware queries. The daemon delegates to the registered
@@ -2058,4 +2059,18 @@ message AuditEntry {
   // Producing crate version plus build-time git description. Absent only for
   // audit records written before this field was introduced.
   optional string software_build = 9;
+}
+
+// Explicit recovery of an acknowledged, physically enumerated uncheckpointed tail.
+// Without confirmation this is a read-only preview. Mutation rechecks the preview.
+message SupersedeTailRequest {
+  bytes tape_uuid = 1;
+  bytes ack_tape_uuid = 2;
+  optional string confirm_supersede = 3;
+  repeated string expected_found = 4;
+}
+message SupersedeTailResponse {
+  repeated string found = 1;
+  string required_confirmation = 2;
+  bool completed = 3;
 }

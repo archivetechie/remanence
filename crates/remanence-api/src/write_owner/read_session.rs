@@ -333,6 +333,11 @@ pub(super) fn handle_drive_open_read(
                     "read session already active",
                 )));
             }
+            DriveCommand::SupersedeTail { reply, .. } => {
+                let _ = reply.send(Err(Status::failed_precondition(
+                    "drive has an active session",
+                )));
+            }
             DriveCommand::FinalizeTape { reply, .. } => {
                 let _ = reply.send(Err(Status::failed_precondition(
                     "read session already active",

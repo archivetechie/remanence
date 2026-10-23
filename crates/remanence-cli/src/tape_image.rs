@@ -119,6 +119,8 @@ pub struct WrittenTapeImage {
     pub map: FilemarkMap,
     /// Shared assembly result; absent when stopped before terminal finalization.
     pub terminal_plan: Option<TerminalTripleWritePlan>,
+    /// Physical prefix ownership used by resume admission.
+    pub terminal_prefix: Option<remanence_parity::TerminalPrefixPlan>,
 }
 
 /// Write bootstrap, Objects, scheduled checkpoints, final prefix and terminal
@@ -127,6 +129,21 @@ pub struct WrittenTapeImage {
 pub fn write_tape_image(
     drive: &mut DriveHandle,
     inputs: TapeImageInputs,
+) -> Result<WrittenTapeImage, String> {
+    write_tape_image_with_init(
+        drive,
+        inputs,
+        remanence_api::InitDecision::FreshInit,
+        remanence_api::TapeInitWriteOptions::default(),
+    )
+}
+
+/// Use the same init gauntlet for an explicitly authorized scratch-tape rewrite.
+pub(crate) fn write_tape_image_with_init(
+    drive: &mut DriveHandle,
+    inputs: TapeImageInputs,
+    decision: remanence_api::InitDecision,
+    options: remanence_api::TapeInitWriteOptions,
 ) -> Result<WrittenTapeImage, String> {
     if inputs.block_size == 0
         || inputs
@@ -151,6 +168,21 @@ pub fn write_tape_image(
         &time::format_description::well_known::Rfc3339,
     )
     .map_err(|error| error.to_string())?;
+    let action = remanence_api::maybe_write_tape_init_bootstrap_on_drive(
+        drive,
+        &decision,
+        options,
+        inputs.tape_uuid,
+        inputs.block_size,
+        remanence_parity::ParityConfig::Scheme(inputs.scheme.clone()),
+        &inputs.writer_identity,
+    )
+    .map_err(|e| e.to_string())?;
+    if action != remanence_api::TapeInitWriteAction::WroteBootstrap {
+        return Err("tape image initialization was refused by the init gauntlet".into());
+    }
+    let _admission =
+        remanence_api::admit_initialized_tape(drive, inputs.tape_uuid, inputs.block_size)?;
     let mut raw = DriveHandleRawSink::new(drive);
     raw.configure_parity_write_session(inputs.block_size)
         .map_err(|error| format!("configure parity write session: {error}"))?;
@@ -279,6 +311,7 @@ pub fn write_tape_image(
             sidecars,
             map,
             terminal_plan: None,
+            terminal_prefix: None,
         });
     }
     let prefix_plan = parity
@@ -332,6 +365,7 @@ pub fn write_tape_image(
         sidecars,
         map,
         terminal_plan: Some(terminal_plan),
+        terminal_prefix: Some(prefix_plan),
     })
 }
 

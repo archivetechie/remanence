@@ -4594,7 +4594,10 @@ fn bootstrap_only_parity_orphan_requires_physical_reconciliation_before_position
         &test_pool_write_resources(),
     )
     .expect_err("an orphaned BOT must require physical reconciliation");
-    assert!(error.to_string().contains("physical-tail reconciliation"));
+    assert!(
+        error.to_string().contains("journal recovery required"),
+        "{error}"
+    );
     assert_eq!(
         sink.locate_calls, 0,
         "orphaned evidence must be rejected before positioning tape"

@@ -1371,7 +1371,9 @@ impl RawTapeSink for DriveHandleRawSink<'_> {
     }
 
     fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
+        self.drive.check_append_admission()?;
         let position_before = self.current_or_seed_position()?;
+        self.drive.check_append_admission()?;
         let outcome = match self.drive.write_block_unpositioned(buf) {
             Ok(outcome) => outcome,
             Err(err) => {
@@ -1401,8 +1403,10 @@ impl RawTapeSink for DriveHandleRawSink<'_> {
     }
 
     fn write_filemarks(&mut self, count: u32, immed: bool) -> Result<RawWriteOutcome, ParityError> {
+        self.drive.check_append_admission()?;
         let outcome = if immed {
             let position_before = self.current_or_seed_position()?;
+            self.drive.check_append_admission()?;
             self.drive.write_filemarks_immediate(count)?;
             RawWriteOutcome::WroteFilemark {
                 position_after: device_position_after(
@@ -1684,7 +1688,7 @@ fn classify_read_boundary(err: &TapeIoError) -> Option<RawReadBoundary> {
 
         // IBM Annex B Table B.9 / Layer 3a fixture convention: READ at EOD
         // reports BLANK CHECK with ASC/ASCQ 00/05.
-        if decoded.key == 0x08 && decoded.asc == 0x00 && decoded.ascq == 0x05 {
+        if err.is_physical_eod() {
             return Some(RawReadBoundary::EndOfData);
         }
 
@@ -1699,6 +1703,34 @@ fn classify_read_boundary(err: &TapeIoError) -> Option<RawReadBoundary> {
 
 #[cfg(test)]
 mod compat_tests {
+    #[test]
+    fn fixed_read_boundary_requires_exact_current_zero_transfer_eod() {
+        for (response, key, ascq, bytes, accepted) in [
+            (0x70, 8, 5, 0, true),
+            (0x71, 8, 5, 0, false),
+            (0x70, 8, 5, 1, false),
+            (0x70, 8, 0, 0, false),
+            (0x70, 3, 5, 0, false),
+        ] {
+            let mut sense = vec![0; 18];
+            sense[0] = response;
+            sense[2] = key;
+            sense[7] = 10;
+            sense[13] = ascq;
+            let error = TapeIoError::CheckCondition(remanence_library::ScsiError::CheckCondition {
+                sense,
+                bytes_transferred: bytes,
+            });
+            assert_eq!(
+                matches!(
+                    classify_read_boundary(&error),
+                    Some(RawReadBoundary::EndOfData)
+                ),
+                accepted
+            );
+        }
+    }
+
     use super::*;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -2293,6 +2325,7 @@ mod compat_tests {
                 vec![
                     lto9_inquiry_response(),
                     vpd80_response("DRV_A"),
+                    read_position_long_response(0, 0, 6_999),
                     read_position_long_response(0, 0, 7_000),
                 ],
             ),
@@ -2301,6 +2334,16 @@ mod compat_tests {
 
         let outcome = {
             let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
+            // This low-level transport fixture supplies its admission proof.
+            let position = drive.position().unwrap();
+            let _admission = drive
+                .install_append_admission(crate::raw::FixtureAppendProof(
+                    [0x42; 16],
+                    position.partition,
+                    position.lba,
+                    drive.identity_generation(),
+                ))
+                .unwrap();
             let mut raw = DriveHandleRawSink::new(&mut drive);
             raw.write_filemarks(1, false)
                 .expect("raw sync filemark succeeds")
@@ -2343,6 +2386,7 @@ mod compat_tests {
                     lto9_inquiry_response(),
                     vpd80_response("DRV_A"),
                     read_position_long_response(0, 0, 10),
+                    read_position_long_response(0, 0, 10),
                 ],
             ),
         ]);
@@ -2350,6 +2394,16 @@ mod compat_tests {
 
         let (first, second) = {
             let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
+            // This low-level transport fixture supplies its admission proof.
+            let position = drive.position().unwrap();
+            let _admission = drive
+                .install_append_admission(crate::raw::FixtureAppendProof(
+                    [0x42; 16],
+                    position.partition,
+                    position.lba,
+                    drive.identity_generation(),
+                ))
+                .unwrap();
             let mut raw = DriveHandleRawSink::new(&mut drive);
             let first = raw
                 .write_fixed_block(&[0xAA; 1024])
@@ -2367,8 +2421,8 @@ mod compat_tests {
         let read_position_count = log.iter().filter(|cdb| cdb[0] == 0x34).count();
         let write_count = log.iter().filter(|cdb| cdb[0] == 0x0A).count();
         assert_eq!(
-            read_position_count, 1,
-            "raw fixed-block writes should seed position once, not after every block"
+            read_position_count, 2,
+            "one position proves fixture admission and raw writes seed once, not after every block"
         );
         assert_eq!(write_count, 2);
         assert!(!handle.is_dirty());
@@ -2396,6 +2450,7 @@ mod compat_tests {
                             lto9_inquiry_response(),
                             vpd80_response("DRV_A"),
                             read_position_long_response(0, 0, 10),
+                            read_position_long_response(0, 0, 10),
                             read_position_long_response(0, 0, 50),
                         ]),
                         1023,
@@ -2417,6 +2472,16 @@ mod compat_tests {
 
         let position_after_failure = {
             let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
+            // This low-level transport fixture supplies its admission proof.
+            let position = drive.position().unwrap();
+            let _admission = drive
+                .install_append_admission(crate::raw::FixtureAppendProof(
+                    [0x42; 16],
+                    position.partition,
+                    position.lba,
+                    drive.identity_generation(),
+                ))
+                .unwrap();
             let mut raw = DriveHandleRawSink::new(&mut drive);
             let err = raw
                 .write_fixed_block(&[0xAA; 1024])
@@ -2437,9 +2502,64 @@ mod compat_tests {
 
         assert_eq!(position_after_failure, PhysicalPositionHint::new(50));
         let log = log.borrow();
-        assert_eq!(log.iter().filter(|cdb| cdb[0] == 0x34).count(), 2);
+        // Admission proof, initial raw cursor, then re-query after failure.
+        assert_eq!(log.iter().filter(|cdb| cdb[0] == 0x34).count(), 3);
         assert_eq!(log.iter().filter(|cdb| cdb[0] == 0x0A).count(), 1);
         assert!(!handle.is_dirty());
+    }
+
+    #[test]
+    fn raw_cursor_seed_cannot_move_the_admitted_first_write() {
+        for filemark in [false, true] {
+            let lib = open_drive_test_lib("LIB_RAW_ADMISSION");
+            let policy = StaticAllowlist::new(["LIB_RAW_ADMISSION"]);
+            let (factory, log) = multi_recording_factory(vec![
+                (
+                    PathBuf::from("/dev/sg-mock"),
+                    vec![
+                        changer_inquiry_response(),
+                        vpd80_response("LIB_RAW_ADMISSION"),
+                    ],
+                ),
+                (
+                    PathBuf::from("/dev/sg-drive-mock"),
+                    vec![
+                        lto9_inquiry_response(),
+                        vpd80_response("DRV_A"),
+                        read_position_long_response(0, 0, 10),
+                        read_position_long_response(0, 0, 11),
+                    ],
+                ),
+            ]);
+            let mut handle = lib.open_with(&policy, factory).unwrap();
+            let mut drive = handle.open_drive(0x0100, &policy).unwrap();
+            let position = drive.position().unwrap();
+            let _admission = drive
+                .install_append_admission(crate::raw::FixtureAppendProof(
+                    [0x42; 16],
+                    position.partition,
+                    position.lba,
+                    drive.identity_generation(),
+                ))
+                .unwrap();
+            let mut raw = DriveHandleRawSink::new(&mut drive);
+            let result = if filemark {
+                raw.write_filemarks(1, true)
+            } else {
+                raw.write_fixed_block(&[0xAA; 1024])
+            };
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("admission position mismatch"));
+            assert_eq!(
+                log.borrow()
+                    .iter()
+                    .filter(|cdb| matches!(cdb[0], 0x0A | 0x10))
+                    .count(),
+                0
+            );
+        }
     }
 
     #[test]
@@ -3888,5 +4008,17 @@ mod record_length_tests {
             .read_record(&mut [0; 4])
             .expect_err("a position after u64::MAX does not fit");
         assert!(matches!(error, ParityError::TapeIo(_)), "{error:?}");
+    }
+}
+
+/// Test-only authority for synthetic transport fixtures that own all media bytes.
+#[cfg(test)]
+struct FixtureAppendProof([u8; 16], u32, u64, u64);
+// SAFETY: fixture callers exclusively own synthetic transports and their entire
+// contents. This capability is never compiled into production code.
+#[cfg(test)]
+unsafe impl remanence_library::AppendBoundaryProof for FixtureAppendProof {
+    fn into_boundary(self) -> ([u8; 16], u32, u64, u64) {
+        (self.0, self.1, self.2, self.3)
     }
 }

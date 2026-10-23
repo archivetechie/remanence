@@ -1281,3 +1281,554 @@ fn release_context_refuses_ephemeral_devices() {
         .contains("ephemeral endpoint is read-only"));
     assert!(commands.lock().unwrap().iter().all(|c| c[0] != 0x1e));
 }
+
+/// Copy closed state, including journals, as an operator backup would.
+fn copy_closed_state(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let dest = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_closed_state(&entry.path(), &dest);
+        } else {
+            std::fs::copy(entry.path(), dest).unwrap();
+        }
+    }
+}
+fn append_for_rollback(
+    state: &mut StateHandle,
+    world: &SharedVirtualWorld,
+    root: &Path,
+    name: &str,
+) -> Result<crate::PoolWriteResult, MountError> {
+    let mut mount = backend(state, world, &root.join("locks"), fault()).unwrap();
+    let mut mounted = mount.mount(target()).unwrap();
+    let result = mount.write_checkpointed(&mut mounted, request(root, name));
+    mount.release(mounted);
+    result
+}
+fn dispatched_writes(world: &SharedVirtualWorld) -> usize {
+    world
+        .lock()
+        .unwrap()
+        .command_log
+        .iter()
+        .filter(|c| matches!(c.opcode, 0x0a | 0x10))
+        .count()
+}
+fn rollback_parity(enabled: bool) -> crate::ParityConfig {
+    if enabled {
+        crate::ParityConfig::Scheme(remanence_parity::ParityScheme {
+            id: remanence_parity::SchemeId::new_static("rollback"),
+            data_blocks_per_stripe: 2,
+            parity_blocks_per_stripe: 1,
+            stripes_per_neighborhood: 1,
+        })
+    } else {
+        crate::ParityConfig::None
+    }
+}
+fn set_rollback_bootstrap(world: &SharedVirtualWorld, parity: crate::ParityConfig) {
+    let bootstrap =
+        crate::build_tape_bootstrap(UUID, BLOCK, parity, "2026-10-23T00:00:00Z", "test");
+    let mut bytes = vec![0; BLOCK as usize];
+    remanence_parity::bootstrap::write_bootstrap_block(&bootstrap, &mut bytes).unwrap();
+    world.lock().unwrap().tapes.get_mut("HAND").unwrap().records[0] = Record::Block(bytes);
+}
+
+#[tokio::test]
+async fn standalone_and_daemon_state_rollback_refuses_checkpoint_and_fresh_with_both_parity_modes()
+{
+    for parity_on in [false, true] {
+        for fresh in [false, true] {
+            for daemon in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let state_dir = root.path().join("state");
+                let backup = root.path().join("backup");
+                let parity = rollback_parity(parity_on);
+                let world = world();
+                set_rollback_bootstrap(&world, parity.clone());
+                let mut state = state_with_parity(&state_dir, true, parity.clone());
+                if !fresh {
+                    append_for_rollback(&mut state, &world, root.path(), "A").unwrap();
+                }
+                drop(state);
+                copy_closed_state(&state_dir, &backup);
+                let mut state = configured_state(&state_dir, true);
+                let b = append_for_rollback(&mut state, &world, root.path(), "B").unwrap();
+                drop(state);
+                let intact = world.lock().unwrap().tapes["HAND"].records.clone();
+                std::fs::remove_dir_all(&state_dir).unwrap();
+                copy_closed_state(&backup, &state_dir);
+                let mut state = configured_state(&state_dir, true);
+                let before = dispatched_writes(&world);
+                let old = state
+                    .catalog_index()
+                    .record_tape_io_fence(remanence_state::TapeIoFenceInput {
+                        tape_uuid: UUID,
+                        barcode: Some("HAND".into()),
+                        reason: "old_uncertain_session".into(),
+                        evidence_json: None,
+                    })
+                    .unwrap();
+                state
+                    .catalog_index()
+                    .release_tape_io_fence(&old.quarantine_id, "old recovery completed")
+                    .unwrap();
+                let error = if daemon {
+                    crate::write_owner::tests::daemon_rollback_refusal(
+                        &state,
+                        world.clone(),
+                        crate::SelectedTape {
+                            pool_id: "default".into(),
+                            tape_uuid: UUID,
+                            block_size: BLOCK,
+                            parity_config: parity,
+                        },
+                    )
+                    .await
+                } else {
+                    append_for_rollback(&mut state, &world, root.path(), "C")
+                        .unwrap_err()
+                        .to_string()
+                };
+
+                assert!(
+                    error.contains("TailBeyondKnownState"),
+                    "parity={parity_on} fresh={fresh}: {error}"
+                );
+                assert!(
+                    error.contains(&uuid::Uuid::from_bytes(b.object.object_id).to_string()),
+                    "{error}"
+                );
+                assert_eq!(dispatched_writes(&world), before);
+                assert_eq!(world.lock().unwrap().tapes["HAND"].records, intact);
+            }
+        }
+    }
+}
+
+#[test]
+fn complete_uncheckpointed_tail_requires_confirmation_and_records_discarded_ids() {
+    for finalize_after in [false, true] {
+        for parity_on in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("state");
+            let backup = root.path().join("backup");
+            let parity = rollback_parity(parity_on);
+            let world = world();
+            set_rollback_bootstrap(&world, parity.clone());
+            let mut state = state_with_parity(&dir, false, parity);
+            append_for_rollback(&mut state, &world, root.path(), "A").unwrap();
+            drop(state);
+            copy_closed_state(&dir, &backup);
+            let mut state = configured_state(&dir, false);
+            let b = append_for_rollback(&mut state, &world, root.path(), "B").unwrap();
+            drop(state);
+            // Crash after the complete object and closing delimiter, before checkpoint.
+            let b_id = uuid::Uuid::from_bytes(b.object.object_id).to_string();
+            {
+                let mut locked = world.lock().unwrap();
+                let records = &mut locked.tapes.get_mut("HAND").unwrap().records;
+                let file = b.object.copies[0].tape_file_number as usize;
+                let start = records
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| matches!(r, Record::Filemark))
+                    .nth(file - 1)
+                    .unwrap()
+                    .0
+                    + 1;
+                let end = records[start..]
+                    .iter()
+                    .position(|r| matches!(r, Record::Filemark))
+                    .unwrap()
+                    + start;
+                records.truncate(end + 1);
+            }
+            std::fs::remove_dir_all(&dir).unwrap();
+            copy_closed_state(&backup, &dir);
+            let mut state = configured_state(&dir, false);
+            let before = dispatched_writes(&world);
+            assert!(append_for_rollback(&mut state, &world, root.path(), "C")
+                .unwrap_err()
+                .to_string()
+                .contains(&b_id));
+            assert_eq!(dispatched_writes(&world), before);
+            let mut mount =
+                backend(&mut state, &world, &root.path().join("locks"), fault()).unwrap();
+            let mut mounted = mount.mount(target()).unwrap();
+            assert!(mount
+                .supersede_tail(&mut mounted, "HAND", |_, _| Err("no confirmation".into()))
+                .is_err());
+            assert_eq!(dispatched_writes(&world), before);
+            let discarded = mount
+                .supersede_tail(&mut mounted, "HAND", |expected, found| {
+                    assert_eq!(expected, "SUPERSEDE HAND");
+                    assert_eq!(found, std::slice::from_ref(&b_id));
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(discarded, std::slice::from_ref(&b_id));
+            if finalize_after {
+                mount
+                    .finalize(
+                        &mut mounted,
+                        StandaloneFinalizeRequest {
+                            tape_uuid: UUID,
+                            acknowledge_tape: UUID,
+                            expected_pool_id: Some("default".into()),
+                            reason: "close recovered tape".into(),
+                            idempotency_key: uuid::Uuid::new_v4(),
+                        },
+                    )
+                    .unwrap();
+            }
+            mount.release(mounted);
+            if !finalize_after {
+                append_for_rollback(&mut state, &world, root.path(), "C").unwrap();
+            }
+            let audit = remanence_state::FileAuditLog::replay(&state.paths().audit_dir).unwrap();
+            assert!(audit.iter().any(|r| r.event == AuditEvent::RecoveryEvent
+                && r.detail.get("discarded_object_ids")
+                    == Some(&ciborium::Value::Array(vec![ciborium::Value::Text(
+                        b_id.clone()
+                    )]))));
+        }
+    }
+}
+
+#[test]
+fn stale_import_publishes_nothing_and_terminal_finalize_preserves_foreign_objects() {
+    for parity_on in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("state");
+        let backup = root.path().join("backup");
+        let parity = rollback_parity(parity_on);
+        let world = world();
+        set_rollback_bootstrap(&world, parity.clone());
+        let mut state = state_with_parity(&dir, true, parity.clone());
+        append_for_rollback(&mut state, &world, root.path(), "A").unwrap();
+        drop(state);
+        copy_closed_state(&dir, &backup);
+        let mut state = configured_state(&dir, true);
+        let b = append_for_rollback(&mut state, &world, root.path(), "B").unwrap();
+        let id = uuid::Uuid::from_bytes(b.object.object_id).to_string();
+        drop(state);
+        let intact = world.lock().unwrap().tapes["HAND"].records.clone();
+        let before = dispatched_writes(&world);
+        let mut new_host = adopted_state(&root.path().join("new-host"), parity);
+        let destination = new_host.paths().journal_dir.clone();
+        let mut mount =
+            backend(&mut new_host, &world, &root.path().join("locks"), fault()).unwrap();
+        let mut mounted = mount.mount(target()).unwrap();
+        let error = mount
+            .import_journals(&mut mounted, &backup.join("journals"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&id), "{error}");
+        mount.release(mounted);
+        let checkpoint = destination
+            .join("checkpoints")
+            .join(format!("{}.remcheckpoint", uuid::Uuid::from_bytes(UUID)));
+        assert!(!checkpoint.exists());
+        assert!(!new_host.journal_path(UUID).exists());
+        drop(new_host);
+        std::fs::remove_dir_all(&dir).unwrap();
+        copy_closed_state(&backup, &dir);
+        let mut state = configured_state(&dir, true);
+        let mut mount = backend(&mut state, &world, &root.path().join("locks"), fault()).unwrap();
+        let mut mounted = mount.mount(target()).unwrap();
+        let error = mount
+            .finalize(
+                &mut mounted,
+                StandaloneFinalizeRequest {
+                    tape_uuid: UUID,
+                    acknowledge_tape: UUID,
+                    expected_pool_id: Some("default".into()),
+                    reason: "close tape".into(),
+                    idempotency_key: uuid::Uuid::new_v4(),
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&id), "{error}");
+        let refusal = mount
+            .supersede_tail(&mut mounted, "HAND", |_, _| Ok(()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refusal.contains("restore a newer copy of the state directory"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains("cannot clear a stale terminal intent"),
+            "{refusal}"
+        );
+        assert_eq!(dispatched_writes(&world), before);
+        assert_eq!(world.lock().unwrap().tapes["HAND"].records, intact);
+        mount.release(mounted);
+    }
+}
+
+#[test]
+fn torn_object_after_rollback_is_superseded_with_both_parity_modes() {
+    for parity_on in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("state");
+        let backup = root.path().join("backup");
+        let parity = rollback_parity(parity_on);
+        let world = world();
+        set_rollback_bootstrap(&world, parity.clone());
+        let mut state = state_with_parity(&dir, true, parity);
+        append_for_rollback(&mut state, &world, root.path(), "A").unwrap();
+        drop(state);
+        copy_closed_state(&dir, &backup);
+        let mut state = configured_state(&dir, true);
+        let b = append_for_rollback(&mut state, &world, root.path(), "B").unwrap();
+        drop(state);
+        {
+            let mut locked = world.lock().unwrap();
+            let records = &mut locked.tapes.get_mut("HAND").unwrap().records;
+            let start = records
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| matches!(r, Record::Filemark))
+                .nth(b.object.copies[0].tape_file_number as usize - 1)
+                .unwrap()
+                .0
+                + 1;
+            records.truncate(start + 1);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        copy_closed_state(&backup, &dir);
+        let mut state = configured_state(&dir, true);
+        append_for_rollback(&mut state, &world, root.path(), "C").unwrap();
+    }
+}
+
+#[test]
+fn encrypted_complete_tail_is_preserved_without_a_private_key_and_past_empty_filemarks() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("state");
+    let backup = root.path().join("backup");
+    let world = world();
+    let mut state = state(&dir);
+    append_for_rollback(&mut state, &world, root.path(), "A").unwrap();
+    let boundary = world.lock().unwrap().tapes["HAND"].records.len();
+    drop(state);
+    copy_closed_state(&dir, &backup);
+    let mut state = configured_state(&dir, true);
+    let mut mount = backend(&mut state, &world, &root.path().join("locks"), fault()).unwrap();
+    let mut mounted = mount.mount(target()).unwrap();
+    let mut input = request(root.path(), "encrypted-B");
+    input.representation = crate::PoolWriteRepresentation::Encrypted {
+        recipients: vec![
+            remanence_aead::RecipientPrivateKey::new([9; 16], "primary", [7; 32])
+                .unwrap()
+                .public_key(0)
+                .unwrap(),
+            remanence_aead::RecipientPrivateKey::new([10; 16], "backup", [8; 32])
+                .unwrap()
+                .public_key(1)
+                .unwrap(),
+        ],
+    };
+    let b = mount.write_checkpointed(&mut mounted, input).unwrap();
+    mount.release(mounted);
+    drop(state);
+    // A delimiter cannot hide later complete evidence from the suffix scan.
+    world
+        .lock()
+        .unwrap()
+        .tapes
+        .get_mut("HAND")
+        .unwrap()
+        .records
+        .insert(boundary, Record::Filemark);
+    let intact = world.lock().unwrap().tapes["HAND"].records.clone();
+    std::fs::remove_dir_all(&dir).unwrap();
+    copy_closed_state(&backup, &dir);
+    let mut state = configured_state(&dir, true);
+    let before = dispatched_writes(&world);
+    let error = append_for_rollback(&mut state, &world, root.path(), "C")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(&uuid::Uuid::from_bytes(b.object.object_id).to_string()),
+        "{error}"
+    );
+    assert_eq!(dispatched_writes(&world), before);
+    assert_eq!(world.lock().unwrap().tapes["HAND"].records, intact);
+}
+
+#[tokio::test]
+async fn daemon_abort_crash_supersede_and_healthy_append_both_parity_modes() {
+    for parity_on in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let parity = rollback_parity(parity_on);
+        let world = world();
+        set_rollback_bootstrap(&world, parity.clone());
+        let state = state_with_parity(&root.path().join("state"), true, parity.clone());
+        crate::write_owner::tests::daemon_append_recovery_roundtrip(
+            &state,
+            world,
+            crate::SelectedTape {
+                pool_id: "default".into(),
+                tape_uuid: UUID,
+                block_size: BLOCK,
+                parity_config: parity,
+            },
+            root.path(),
+        )
+        .await;
+    }
+}
+
+#[test]
+fn bootstrap_without_filemark_can_be_explicitly_superseded() {
+    let root = tempfile::tempdir().unwrap();
+    let mut state = state(root.path());
+    let world = world();
+    world
+        .lock()
+        .unwrap()
+        .tapes
+        .get_mut("HAND")
+        .unwrap()
+        .records
+        .truncate(1);
+    let mut mount = backend(&mut state, &world, &root.path().join("locks"), fault()).unwrap();
+    let mut mounted = mount.mount(target()).unwrap();
+    assert!(mount
+        .supersede_tail(&mut mounted, "HAND", |expected, found| {
+            assert_eq!(expected, "SUPERSEDE HAND");
+            assert!(found.is_empty());
+            Ok(())
+        })
+        .unwrap()
+        .is_empty());
+    mount
+        .write_checkpointed(
+            &mut mounted,
+            request(root.path(), "after-bootstrap-recovery"),
+        )
+        .unwrap();
+    mount.release(mounted);
+}
+
+#[test]
+fn zero_dispatch_probe_failure_is_unavailable_and_not_durable() {
+    let root = tempfile::tempdir().unwrap();
+    let mut state = state(root.path());
+    let cfg = crate::write_owner::TerminalWriteConfig {
+        checkpoint_journal_dir: state.paths().journal_dir.join("checkpoints"),
+        audit_dir: state.paths().audit_dir.clone(),
+        audit_fsync: true,
+        audit_append_lock: Arc::new(Mutex::new(())),
+    };
+    let status = crate::append_admission::daemon_admission_error(
+        remanence_state::AuditActor::System,
+        state.catalog_index(),
+        &cfg,
+        UUID,
+        crate::append_admission::AdmissionError::Io(
+            remanence_library::TapeIoError::OperationFailed("transient read failure".into()),
+        ),
+    );
+    assert_eq!(status.code(), tonic::Code::Unavailable);
+    assert_eq!(
+        state
+            .catalog_index()
+            .get_tape(&UUID)
+            .unwrap()
+            .unwrap()
+            .state,
+        "ready"
+    );
+    assert!(state
+        .catalog_index()
+        .list_active_tape_io_fences()
+        .unwrap()
+        .is_empty());
+    assert!(remanence_state::FileAuditLog::replay(&cfg.audit_dir)
+        .unwrap()
+        .iter()
+        .all(|r| r.event != AuditEvent::RecoveryEvent));
+}
+
+/// Structural refusals quarantine only the tape, and retain the authenticated actor.
+#[test]
+fn structural_admission_refusals_project_recovery_with_authenticated_actor() {
+    for error in [
+        crate::append_admission::AdmissionError::MissingBootstrapFilemark,
+        crate::append_admission::AdmissionError::Unproved(
+            "control suffix position mismatch".into(),
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        let cfg = crate::write_owner::TerminalWriteConfig {
+            checkpoint_journal_dir: state.paths().journal_dir.join("checkpoints"),
+            audit_dir: state.paths().audit_dir.clone(),
+            audit_fsync: true,
+            audit_append_lock: Arc::new(Mutex::new(())),
+        };
+        let actor = remanence_state::AuditActor::User("authenticated-test".into());
+        let status = crate::append_admission::daemon_admission_error(
+            actor.clone(),
+            state.catalog_index(),
+            &cfg,
+            UUID,
+            error,
+        );
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            state
+                .catalog_index()
+                .get_tape(&UUID)
+                .unwrap()
+                .unwrap()
+                .state,
+            "recovery_required"
+        );
+        assert!(state
+            .catalog_index()
+            .list_active_tape_io_fences()
+            .unwrap()
+            .is_empty());
+        let records = remanence_state::FileAuditLog::replay(&cfg.audit_dir).unwrap();
+        let recovery = records
+            .iter()
+            .find(|r| r.event == AuditEvent::RecoveryEvent)
+            .unwrap();
+        assert_eq!(recovery.actor, actor);
+    }
+}
+
+#[test]
+fn clearing_append_recovery_on_sealed_tape_is_a_precise_precondition() {
+    let root = tempfile::tempdir().unwrap();
+    let mut state = state(root.path());
+    state.catalog_index().seal_tape(UUID).unwrap();
+    let error = state
+        .catalog_index()
+        .set_append_recovery_required(UUID, false)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        remanence_state::StateError::AppendRecoveryPrecondition(_)
+    ));
+    let status = crate::status_from_state_error(error);
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(status.message().contains("cannot clear append recovery"));
+    assert_eq!(
+        state
+            .catalog_index()
+            .get_tape(&UUID)
+            .unwrap()
+            .unwrap()
+            .state,
+        "sealed"
+    );
+}

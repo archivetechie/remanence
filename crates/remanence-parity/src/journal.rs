@@ -1239,6 +1239,66 @@ impl FileTapeFileJournal {
         })
     }
 
+    /// Retain the checkpoint prefix whose next physical file number was proved
+    /// by the caller's durable checkpoint lease. This is only for a suffix the
+    /// caller has already physically abandoned or explicitly superseded. A parity
+    /// barrier can be durable before the owning checkpoint journal is published.
+    pub fn truncate_physically_discarded_suffix(
+        &mut self,
+        next_file_number: u64,
+    ) -> Result<(), JournalError> {
+        let file_len = self.file.metadata()?.len();
+        let header = read_header(&mut self.file)?;
+        if header.tape_uuid != self.tape_uuid
+            || header.block_size != self.block_size
+            || header.drive_compression != self.drive_compression
+            || header.scheme != self.scheme
+        {
+            return Err(JournalError::HeaderMismatch);
+        }
+        let header_end = self.file.stream_position()?;
+        // Validate all framing and terminal grammar before considering a cut.
+        load_committed_replay_from_reader(&mut self.file, file_len)?;
+        self.file.seek(SeekFrom::Start(header_end))?;
+        let mut next = 0u64;
+        let mut retained = None;
+        while let Some(frame) = read_validated_journal_bundle(&mut self.file, file_len)? {
+            for entry in &frame.bundle.entries {
+                if entry.tape_file_number != next {
+                    return Err(JournalError::RecoveryRequired(
+                        "noncontiguous physical journal prefix".into(),
+                    ));
+                }
+                next = next
+                    .checked_add(1)
+                    .ok_or_else(|| JournalError::Codec("tape file number overflow".into()))?;
+            }
+            if next == next_file_number
+                && frame.bundle.kind == CommittedBundleKind::CheckpointedThrough
+            {
+                retained = Some(self.file.stream_position()?);
+            }
+        }
+        // A fresh session may not yet have checkpointed even its bootstrap.
+        let retained = retained
+            .or_else(|| (next_file_number == 1).then_some(header_end))
+            .ok_or_else(|| {
+                JournalError::RecoveryRequired(
+                    "durable checkpoint has no matching parity journal prefix".into(),
+                )
+            })?;
+        self.file.seek(SeekFrom::Start(header_end))?;
+        let prefix = load_committed_replay_from_reader(&mut self.file, retained)?;
+        self.file.set_len(retained)?;
+        self.file.seek(SeekFrom::Start(retained))?;
+        self.file.sync_all()?;
+        self.last_highest_protected_ordinal = prefix.state.highest_protected_ordinal;
+        self.last_total_committed_ordinals = prefix.state.total_committed_ordinals;
+        self.orphaned_bundles_preserved_on_open = 0;
+        self.terminal_grammar = prefix.terminal_grammar;
+        Ok(())
+    }
+
     /// Durably discard only the orphan suffix that a higher recovery layer has
     /// already matched against physical tape and checkpoint authority.
     ///
@@ -2884,6 +2944,39 @@ mod tests {
         journal
             .commit_bundle(&sample_checkpoint())
             .expect("commit checkpoint watermark");
+    }
+
+    #[test]
+    fn physically_abandoned_barrier_retains_the_exact_preceding_checkpoint() {
+        let temp = tempfile::tempdir().expect("journal fixture");
+        let path = temp.path().join("tape.remjournal");
+        let mut journal = FileTapeFileJournal::open_without_volume_check_for_tests(
+            &path,
+            [0x71; 16],
+            256 * 1024,
+            default_scheme(),
+        )
+        .expect("open journal");
+        commit_sample_checkpoint(&mut journal);
+        let original = fs::read(&path).unwrap();
+        let mut next = sample_bundle();
+        next.kind = CommittedBundleKind::CheckpointSidecars;
+        next.entries = vec![next.entries.pop().unwrap()];
+        next.entries[0].tape_file_number = 2;
+        journal.commit_bundle(&next).unwrap();
+        journal.commit_bundle(&sample_checkpoint()).unwrap();
+        let advanced = fs::read(&path).unwrap();
+        assert!(advanced.len() > original.len());
+        assert!(journal.truncate_physically_discarded_suffix(4).is_err());
+        assert_eq!(fs::read(&path).unwrap(), advanced);
+        journal.truncate_physically_discarded_suffix(2).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let retained = journal.load_committed().unwrap();
+        assert_eq!(retained.entries, sample_bundle().entries);
+        assert!(retained.orphaned_bundles.is_empty());
+        journal.commit_bundle(&next).unwrap();
+        journal.commit_bundle(&sample_checkpoint()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), advanced);
     }
 
     #[test]

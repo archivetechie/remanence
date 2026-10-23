@@ -74,10 +74,10 @@ use remanence_format_driver::{ForeignFormatAdapter, ForeignFormatRegistry};
 use remanence_library::DriveHandlePhysicalSource;
 use remanence_library::{
     tape_alert_flag_name, BlockSize, DirtyCause, DiscoveryError, DiscoveryReport, DiscoveryWarning,
-    DriveBay, DriveHandle, DriveHandleSink, DriveHandleSource, ElementException, FileBlockSink,
-    FileBlockSource, IePort, IoErrorKind, Library, MediaFamily, MediaReadiness,
-    MediaReadinessWaitEvent, MediaReadinessWaitOptions, OpenError, Slot, StaticAllowlist,
-    TapeAlerts, TapeConfig, VecBlockSource, WormMediaState,
+    DriveBay, DriveHandle, DriveHandleSource, ElementException, FileBlockSink, FileBlockSource,
+    IePort, IoErrorKind, Library, MediaFamily, MediaReadiness, MediaReadinessWaitEvent,
+    MediaReadinessWaitOptions, OpenError, Slot, StaticAllowlist, TapeAlerts, TapeConfig,
+    VecBlockSource, WormMediaState,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -103,6 +103,7 @@ mod put;
 mod recovery_report;
 mod tape_finalize;
 pub mod tape_image;
+mod tape_supersede;
 // Review-only fixture code used by the example and the executor.
 #[doc(hidden)]
 pub mod negative_vectors;
@@ -324,6 +325,7 @@ fn rem_debug_only_reason(cmd: &Command) -> Option<&'static str> {
         | Command::AlarmsClient { .. }
         | Command::Top { .. }
         | Command::TapeAlertsAlias { .. }
+        | Command::TapeSupersedeClient(_)
         | Command::TapeFinalizeClient(_)
         | Command::TapeInventoryClient(_)
         | Command::TapeVerifyIndexClient(_)
@@ -344,6 +346,7 @@ fn rem_only_reason(cmd: &Command) -> Option<&'static str> {
         | Command::GetClient(_)
         | Command::Top { .. }
         | Command::TapeAlertsAlias { .. }
+        | Command::TapeSupersedeClient(_)
         | Command::TapeFinalizeClient(_)
         | Command::TapeInventoryClient(_)
         | Command::TapeVerifyIndexClient(_)
@@ -743,6 +746,7 @@ impl From<RemCommand> for Command {
                     json: args.json,
                     drive: args.drive,
                 },
+                RemTapeCommand::SupersedeTail(args) => Self::TapeSupersedeClient(args),
                 RemTapeCommand::Finalize(args) => Self::TapeFinalizeClient(args),
                 RemTapeCommand::Inventory(args) => Self::TapeInventoryClient(args),
                 RemTapeCommand::VerifyIndex(args) => Self::TapeVerifyIndexClient(args),
@@ -803,6 +807,7 @@ fn state_changing_target(cmd: &Command) -> Option<&str> {
         | Command::AlarmsClient { .. }
         | Command::Top { .. }
         | Command::TapeAlertsAlias { .. }
+        | Command::TapeSupersedeClient(_)
         | Command::TapeFinalizeClient(_)
         | Command::TapeInventoryClient(_)
         | Command::TapeVerifyIndexClient(_)
@@ -1248,6 +1253,7 @@ enum Command {
     /// Finalize one exact tape through the daemon.
     #[command(name = "tape-finalize-client", hide = true)]
     TapeFinalizeClient(tape_finalize::TapeFinalizeArgs),
+    TapeSupersedeClient(tape_supersede::TapeSupersedeArgs),
 
     /// Read one exact tape's terminal-index inventory through the daemon.
     #[command(name = "tape-inventory-client", hide = true)]
@@ -1604,6 +1610,9 @@ impl CatalogTapeKindArg {
 
 #[derive(Subcommand, Debug)]
 enum RemTapeCommand {
+    /// Explicitly discard an enumerated tail through the daemon.
+    SupersedeTail(tape_supersede::TapeSupersedeArgs),
+
     /// Deprecated alias; use `rem drive alerts <serial|uuid>`.
     Alerts(TapeAlertsAliasArgs),
 
@@ -1639,6 +1648,9 @@ impl From<RemTapeCommand> for TapeCommand {
         match value {
             RemTapeCommand::Alerts(_) => {
                 unreachable!("rem tape alerts is dispatched as a daemon drive-alerts alias")
+            }
+            RemTapeCommand::SupersedeTail(_) => {
+                unreachable!("supersede-tail is dispatched as a daemon client")
             }
             RemTapeCommand::Init(args) => Self::Init(args),
             RemTapeCommand::WaitReady(args) => Self::WaitReady(args),
@@ -4302,6 +4314,7 @@ where
             };
             return run_drive_client_command(endpoint, *json, &command, out, err);
         }
+        Command::TapeSupersedeClient(args) => return tape_supersede::run(args, out, err),
         Command::TapeFinalizeClient(args) => return tape_finalize::run(args, out, err),
         Command::TapeInventoryClient(args) => return tape_inventory::run_inventory(args, out, err),
         Command::TapeVerifyIndexClient(args) => {
@@ -4525,6 +4538,7 @@ where
             }
         },
         Command::TapeAlertsAlias { .. } => unreachable!("daemon alias dispatched pre-discovery"),
+        Command::TapeSupersedeClient(_) => unreachable!("daemon recovery dispatched pre-discovery"),
         Command::TapeFinalizeClient(_) => {
             unreachable!("daemon tape finalization dispatched pre-discovery")
         }
@@ -11493,9 +11507,8 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
         .bind_identity_generation(identity_generation)
         .map_err(|error| error.to_string())?;
     let action_result = {
-        let mut sink = DriveHandleSink(&mut drive);
-        remanence_api::maybe_write_tape_init_bootstrap(
-            &mut sink,
+        remanence_api::maybe_write_tape_init_bootstrap_on_drive(
+            &mut drive,
             &decision,
             remanence_api::TapeInitWriteOptions {
                 dry_run: args.dry_run,
@@ -19360,6 +19373,7 @@ pool_id = "init-test"
                     vec![0, 0x10, 0, 0, 0, 1],
                     mode,
                     vec![0u8; 32], // LOCATE(0) for BOT classification.
+                    vec![0u8; 32], // Init gauntlet rechecks blank BOT.
                     position,
                     filemark_position,
                 ]),

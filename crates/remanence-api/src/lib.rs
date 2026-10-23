@@ -75,6 +75,7 @@ pub use remanence_parity::ParityConfig;
 pub use write_owner::terminal_inventory::terminal_verification_to_proto;
 
 mod api_state;
+mod append_admission;
 mod append_request;
 mod append_ring;
 mod append_spool;
@@ -83,6 +84,9 @@ mod audit_query_service;
 mod auth;
 mod calibration;
 mod catalog_conversion;
+pub use append_admission::{admit_checkpointed_tape, admit_initialized_tape, AppendAdmission};
+#[cfg(test)]
+extern crate self as remanence_api;
 mod catalogless_restore;
 pub use catalogless_restore::{restore_catalogless, scan_and_restore};
 mod catalog_request;
@@ -159,13 +163,13 @@ pub(crate) use startup_media_readiness::status_from_state_error;
 pub use tape_init::{
     classify_bootstrap_adoption_from_source, classify_bot_bytes, classify_bot_from_source,
     classify_bot_identity_bytes, decide_tape_init, has_canonical_adoption_geometry,
-    maybe_write_tape_init_bootstrap, probe_bot_identity_from_source,
-    project_tape_init_catalog_inputs, sniff, BootstrapAdoptionProjection,
-    BootstrapTailClassification, BotClassification, BotIdentityClassification, BotInitProjection,
-    CatalogBarcodeRelation, CatalogRowDisposition, CatalogTapeInitRow, CommittedCopyState,
-    FormatId, InitDecision, LabelLifecycleState, TapeInitCatalogProjection, TapeInitError,
-    TapeInitGeometry, TapeInitWriteAction, TapeInitWriteError, TapeInitWriteOptions,
-    CANONICAL_ADOPTION_BLOCK_SIZE_BYTES,
+    maybe_write_tape_init_bootstrap, maybe_write_tape_init_bootstrap_on_drive,
+    probe_bot_identity_from_source, project_tape_init_catalog_inputs, sniff,
+    BootstrapAdoptionProjection, BootstrapTailClassification, BotClassification,
+    BotIdentityClassification, BotInitProjection, CatalogBarcodeRelation, CatalogRowDisposition,
+    CatalogTapeInitRow, CommittedCopyState, FormatId, InitDecision, LabelLifecycleState,
+    TapeInitCatalogProjection, TapeInitError, TapeInitGeometry, TapeInitWriteAction,
+    TapeInitWriteError, TapeInitWriteOptions, CANONICAL_ADOPTION_BLOCK_SIZE_BYTES,
 };
 pub use write_session_ingress::WriteSessionApi;
 

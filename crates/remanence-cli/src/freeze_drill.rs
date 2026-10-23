@@ -501,7 +501,20 @@ fn write_drill_tape(
     edition_hasher.update(b"terminal-index-edition");
     let mut edition_id = [0u8; 16];
     edition_id.copy_from_slice(&edition_hasher.finalize()[..16]);
-    let image = crate::tape_image::write_tape_image(
+    // The existing scratch identity check above is the explicit rewrite authority.
+    // Pass it through the shared init gauntlet before acquiring append admission.
+    let decision = match bot.classification {
+        remanence_api::BotClassification::BlankCheckEod => remanence_api::InitDecision::FreshInit,
+        remanence_api::BotClassification::OursBootstrap { .. } => {
+            remanence_api::InitDecision::RefuseClobber {
+                reason: remanence_api::TapeInitError::PhysicalDataPastBootstrap,
+            }
+        }
+        _ => remanence_api::InitDecision::RefuseClobber {
+            reason: remanence_api::TapeInitError::BotReadError,
+        },
+    };
+    let image = crate::tape_image::write_tape_image_with_init(
         drive,
         crate::tape_image::TapeImageInputs {
             tape_uuid,
@@ -522,6 +535,11 @@ fn write_drill_tape(
             diagnostic_keys_present: true,
             capacity_bytes: DRILL_CAPACITY_BYTES,
             stop: crate::tape_image::TapeImageStop::Finalized,
+        },
+        decision,
+        remanence_api::TapeInitWriteOptions {
+            clobber_data_confirmed: true,
+            ..Default::default()
         },
     )?;
     let expected_objects = image

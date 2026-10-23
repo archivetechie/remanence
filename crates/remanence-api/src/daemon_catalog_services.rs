@@ -431,6 +431,24 @@ impl pb::catalog_server::Catalog for CatalogService {
         }
     }
 
+    async fn supersede_tail(
+        &self,
+        request: Request<pb::SupersedeTailRequest>,
+    ) -> Result<Response<pb::SupersedeTailResponse>, Status> {
+        let actor = authorize_request(&request, AuthPermission::OperationControl)?;
+        let request = request.into_inner();
+        let uuid = decode_uuid_bytes(&request.tape_uuid, "tape_uuid")?;
+        let ack = decode_uuid_bytes(&request.ack_tape_uuid, "ack_tape_uuid")?;
+        if uuid != ack {
+            return Err(Status::invalid_argument(
+                "ack_tape_uuid must match tape_uuid",
+            ));
+        }
+        crate::mount::supersede_tail(&self.state, request, actor)
+            .await
+            .map(Response::new)
+    }
+
     #[allow(deprecated)]
     async fn finalize_tape(
         &self,

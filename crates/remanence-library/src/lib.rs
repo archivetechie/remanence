@@ -43,14 +43,14 @@ pub use error::{
 };
 pub use handle::tape_io::{
     classify_media_readiness_error_ref, media_readiness_poll_interval, wrap_map_is_servable,
-    BlockSize, ComputedPosition, DevicePositionProof, DriveErrorCounters,
-    InMemoryCalibrationControl, MediaFamily, MediaReadiness, MediaReadinessPoll,
-    MediaReadinessWaitEvent, MediaReadinessWaitOptions, MediaWriteFence, MediaWriteFenceError,
-    NoCalibrationControl, PipelinedReadDiagnostics, PipelinedWriteDiagnostics, PositionAfter,
-    ReadBatchOutcome, ReadBuffer, ReadBufferHandoff, ReadDelivery, ReadHandoffOutcome,
-    ReadTerminalFlags, SequencedHandoff, SpaceKind, SpaceResult, TapeConfig, TapeIoError,
-    TapePosition, WormMediaState, WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome,
-    WriteUnpositionedOutcome,
+    AppendBoundaryProof, AppendSession, BlockSize, ComputedPosition, DevicePositionProof,
+    DriveErrorCounters, InMemoryCalibrationControl, MediaFamily, MediaReadiness,
+    MediaReadinessPoll, MediaReadinessWaitEvent, MediaReadinessWaitOptions, MediaWriteFence,
+    MediaWriteFenceError, NoCalibrationControl, PipelinedReadDiagnostics,
+    PipelinedWriteDiagnostics, PositionAfter, ReadBatchOutcome, ReadBuffer, ReadBufferHandoff,
+    ReadDelivery, ReadHandoffOutcome, ReadTerminalFlags, SequencedHandoff, SpaceKind, SpaceResult,
+    TapeConfig, TapeIoError, TapePosition, WormMediaState, WriteBatchOutcome,
+    WriteFilemarksOutcome, WriteOutcome, WriteUnpositionedOutcome,
 };
 pub use handle::{
     ChangerHandle, DirtyCause, DriveHandle, LibraryHandle, RemovalLockGuard, TapeIoRuntimeConfig,

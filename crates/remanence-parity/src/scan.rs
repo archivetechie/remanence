@@ -1035,7 +1035,7 @@ where
                 let measured = match measure_current_file(source, file_start)? {
                     MeasureCurrentFileOutcome::Complete(measured) => measured,
                     MeasureCurrentFileOutcome::Truncated(kind) => {
-                        truncation_candidate_kind = Some(classify_truncated_file_head(
+                        truncation_candidate_kind = Some(classify_tape_file_head(
                             &first_block,
                             tape_uuid,
                             block_size,
@@ -1254,7 +1254,8 @@ fn measure_current_file(
     }))
 }
 
-fn classify_truncated_file_head(
+/// Classify a candidate head using the same reserved control signatures as BOT recovery.
+pub fn classify_tape_file_head(
     block0: &[u8],
     tape_uuid: &[u8; 16],
     block_size: u32,

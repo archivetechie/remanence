@@ -140,4 +140,4 @@ pub(crate) use terminal_finalize::*;
 mod read_session;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

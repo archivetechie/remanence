@@ -668,6 +668,13 @@ mod tests {
 
     #[tonic::async_trait]
     impl pb::catalog_server::Catalog for FakeCatalog {
+        async fn supersede_tail(
+            &self,
+            _: Request<pb::SupersedeTailRequest>,
+        ) -> Result<Response<pb::SupersedeTailResponse>, Status> {
+            Err(Status::unimplemented("unused by get fixture"))
+        }
+
         async fn get_object(
             &self,
             request: Request<pb::GetObjectRequest>,

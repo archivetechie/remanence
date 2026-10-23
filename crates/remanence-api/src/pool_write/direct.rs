@@ -339,6 +339,25 @@ pub(super) fn execute_direct_terminal_tail(
     mut parity_journal: Option<&mut FileTapeFileJournal>,
     parity_prefix: Option<(ParitySinkSessionState, &TerminalPrefixPlan)>,
 ) -> Result<remanence_state::CheckpointJournalRecord, PoolWriteError> {
+    let _terminal_admission = if let Some(drive) = sink.append_admission_drive() {
+        let mut ctx = crate::append_admission::context(
+            selected.tape_uuid,
+            selected.block_size,
+            previous.eod_partition,
+            previous.eod_lba,
+        );
+        ctx.terminal_prefix = parity_prefix.as_ref().map(|(_, prefix)| (*prefix).clone());
+        Some(
+            crate::append_admission::admit_append_boundary(
+                drive,
+                crate::append_admission::AppendAuthority::Terminal { plan },
+                ctx,
+            )
+            .map_err(|e| PoolWriteError::InvalidInput(e.to_string()))?,
+        )
+    } else {
+        None
+    };
     let write_attempted = Cell::new(false);
     let execution = (|| -> Result<_, PoolWriteError> {
         let mut raw = BlockSinkRawTapeSink::new(sink);
@@ -716,6 +735,18 @@ pub(super) fn write_to_selected_drive_checkpointed_with_catalog(
     require_rewritable_object_media(current_cfg)?;
     crate::drive_mode::configure_fixed_uncompressed_write(drive, current_cfg, selected.block_size)?;
     drive.bind_identity_generation(identity_generation)?;
+    let last = prior_records.last();
+    let ctx = crate::append_admission::context(
+        selected.tape_uuid,
+        selected.block_size,
+        last.map_or(0, |r| r.eod_partition),
+        last.map_or(0, |r| r.eod_lba),
+    );
+    let authority = last.map_or(crate::append_admission::AppendAuthority::Fresh, |_| {
+        crate::append_admission::AppendAuthority::Checkpoint { eod: ctx.boundary }
+    });
+    let _admission = crate::append_admission::admit_append_boundary(drive, authority, ctx)
+        .map_err(|e| PoolWriteError::InvalidInput(e.to_string()))?;
     let appended = write_to_selected_tape_checkpointed_after_preflight(
         state,
         &mut DriveHandleSink(drive),
@@ -747,6 +778,7 @@ fn reprove_checkpoint_boundary(
     drive: &mut DriveHandle,
     record: &remanence_state::CheckpointJournalRecord,
 ) -> Result<(), PoolWriteError> {
+    drive.clear_append_admission();
     drive
         .test_unit_ready()
         .map_err(|e| PoolWriteError::InvalidInput(e.to_string()))?;
@@ -866,286 +898,326 @@ pub(super) fn write_to_selected_tape_checkpointed_after_preflight(
     prior_records: Vec<remanence_state::CheckpointJournalRecord>,
     write_admission: Option<&mut crate::write_admission::WriteAdmissionReservation>,
 ) -> Result<CheckpointedAppend, PoolWriteError> {
-    let direct_replay_fault =
-        crate::direct_replay_fault::DirectReplayFaultPlan::from_env_for_object(
-            selected.tape_uuid,
-            &request.caller_object_id,
-        )
-        .map_err(PoolWriteError::InvalidInput)?;
-    let next_ordinal = prior_records.last().map_or(Ok(1), |record| {
-        record.ordinal.checked_add(1).ok_or_else(|| {
-            PoolWriteError::InvalidInput("checkpoint ordinal overflows u64".to_string())
-        })
-    })?;
-    let next_committed_count = prior_records.last().map_or(Ok(1), |record| {
-        record.committed_object_count.checked_add(1).ok_or_else(|| {
-            PoolWriteError::InvalidInput(
-                "checkpoint committed object count overflows u64".to_string(),
+    let dispatches = sink
+        .append_admission_drive()
+        .map(|d| d.media_write_dispatch_count());
+    let execution = (|| {
+        let direct_replay_fault =
+            crate::direct_replay_fault::DirectReplayFaultPlan::from_env_for_object(
+                selected.tape_uuid,
+                &request.caller_object_id,
             )
-        })
-    })?;
-    let batch_id = *Uuid::new_v4().as_bytes();
-
-    let (
-        result,
-        next_tape_file_number,
-        sync,
-        scheme,
-        object_bundles,
-        barrier_bundle,
-        terminal_parity_state,
-    ) = match &selected.parity_config {
-        ParityConfig::None => {
-            let append = first_batched_append_context(state, &selected, &prior_records)?;
-            let result = write_batched_to_selected_tape_after_replay_check(
-                state,
-                sink,
-                pool_cfg,
-                request,
-                selected.clone(),
-                None,
-                append,
-            )?;
-            let projection = result.checkpoint_projection().cloned().ok_or_else(|| {
+            .map_err(PoolWriteError::InvalidInput)?;
+        let next_ordinal = prior_records.last().map_or(Ok(1), |record| {
+            record.ordinal.checked_add(1).ok_or_else(|| {
+                PoolWriteError::InvalidInput("checkpoint ordinal overflows u64".to_string())
+            })
+        })?;
+        let next_committed_count = prior_records.last().map_or(Ok(1), |record| {
+            record.committed_object_count.checked_add(1).ok_or_else(|| {
                 PoolWriteError::InvalidInput(
-                    "batch-of-one object is missing checkpoint projection".to_string(),
+                    "checkpoint committed object count overflows u64".to_string(),
                 )
-            })?;
-            let sync = sink.write_filemarks(0)?;
-            let next_tape_file_number = projection
-                .copy
-                .tape_file_number
-                .checked_add(1)
-                .ok_or_else(|| {
+            })
+        })?;
+        let batch_id = *Uuid::new_v4().as_bytes();
+
+        let (
+            result,
+            next_tape_file_number,
+            sync,
+            scheme,
+            object_bundles,
+            barrier_bundle,
+            terminal_parity_state,
+        ) = match &selected.parity_config {
+            ParityConfig::None => {
+                let append = first_batched_append_context(state, &selected, &prior_records)?;
+                let result = write_batched_to_selected_tape_after_replay_check(
+                    state,
+                    sink,
+                    pool_cfg,
+                    request,
+                    selected.clone(),
+                    None,
+                    append,
+                )?;
+                let projection = result.checkpoint_projection().cloned().ok_or_else(|| {
                     PoolWriteError::InvalidInput(
-                        "checkpoint next tape-file number overflows u64".to_string(),
+                        "batch-of-one object is missing checkpoint projection".to_string(),
                     )
                 })?;
-            (
-                result,
-                next_tape_file_number,
-                sync,
-                None,
-                Vec::new(),
-                None,
-                None,
-            )
-        }
-        ParityConfig::Scheme(parity_scheme) => {
-            let mut parity_journal = resume_record_result(FileTapeFileJournal::open(
-                parity_journal_path,
-                selected.tape_uuid,
-                selected.block_size,
-                parity_scheme.clone(),
-            ))?;
-            if parity_journal.orphaned_bundles_preserved_on_open() != 0 {
-                tracing::warn!(
-                    tape_uuid = %uuid_text(selected.tape_uuid),
-                    orphaned_bundle_count = parity_journal.orphaned_bundles_preserved_on_open(),
-                    "preserved sink-journal bundles beyond the last checkpoint watermark; reconciliation required"
-                );
+                let sync = sink.write_filemarks(0)?;
+                let next_tape_file_number = projection
+                    .copy
+                    .tape_file_number
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        PoolWriteError::InvalidInput(
+                            "checkpoint next tape-file number overflows u64".to_string(),
+                        )
+                    })?;
+                (
+                    result,
+                    next_tape_file_number,
+                    sync,
+                    None,
+                    Vec::new(),
+                    None,
+                    None,
+                )
             }
-            let snapshot = resume_record_result(parity_journal.committed_snapshot_bounded())?;
-            let summary = checked_bounded_resume_summary(&snapshot)?;
-            validate_parity_resume_checkpoint_authority(
-                &checkpoint_lease,
-                &parity_journal,
-                prior_records.is_empty(),
-                summary.committed_tape_file_count,
-            )
-            .map_err(|refusal| match refusal {
-                ResumeAuthorityRefusal::Records(error) => PoolWriteError::from(error),
-                ResumeAuthorityRefusal::State(error) => PoolWriteError::from(error),
-            })?;
-            let session_state = if summary.committed_tape_file_count == 0 {
-                let located = sink.locate(0)?;
-                if located.partition != 0 || located.lba != 0 {
-                    return Err(PoolWriteError::InvalidInput(format!(
+            ParityConfig::Scheme(parity_scheme) => {
+                let mut parity_journal = resume_record_result(FileTapeFileJournal::open(
+                    parity_journal_path,
+                    selected.tape_uuid,
+                    selected.block_size,
+                    parity_scheme.clone(),
+                ))?;
+                if parity_journal.orphaned_bundles_preserved_on_open() != 0 {
+                    tracing::warn!(
+                        tape_uuid = %uuid_text(selected.tape_uuid),
+                        orphaned_bundle_count = parity_journal.orphaned_bundles_preserved_on_open(),
+                        "preserved sink-journal bundles beyond the last checkpoint watermark; reconciliation required"
+                    );
+                }
+                let snapshot = resume_record_result(parity_journal.committed_snapshot_bounded())?;
+                let summary = checked_bounded_resume_summary(&snapshot)?;
+                validate_parity_resume_checkpoint_authority(
+                    &checkpoint_lease,
+                    &parity_journal,
+                    prior_records.is_empty(),
+                    summary.committed_tape_file_count,
+                )
+                .map_err(|refusal| match refusal {
+                    ResumeAuthorityRefusal::Records(error) => PoolWriteError::from(error),
+                    ResumeAuthorityRefusal::State(error) => PoolWriteError::from(error),
+                })?;
+                let session_state = if summary.committed_tape_file_count == 0 {
+                    let located = sink.locate(0)?;
+                    if located.partition != 0 || located.lba != 0 {
+                        return Err(PoolWriteError::InvalidInput(format!(
                         "fresh parity BOT locate reported partition {} lba {}, expected partition 0 lba 0",
                         located.partition, located.lba
                     )));
-                }
-                let fresh_session_state = {
-                    let mut raw = BlockSinkRawTapeSink::new(sink);
-                    let mut parity = ParitySink::new_with_journal(
-                        &mut raw,
-                        &mut parity_journal,
-                        parity_scheme.clone(),
-                        selected.tape_uuid,
-                        selected.block_size,
-                        remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION")),
-                    )?;
-                    parity.write_bootstrap()?;
-                    parity.into_session_state()?
-                };
-                project_fresh_parity_bootstrap_bundle(state, &selected, parity_scheme)?;
-                fresh_session_state
-            } else {
-                let checkpoint = prior_records.last().ok_or_else(|| {
-                    PoolWriteError::InvalidInput(
-                        "non-fresh parity tape has no checkpoint journal".to_string(),
-                    )
-                })?;
-                sink.locate(checkpoint.eod_lba)?;
-                let plan = summary.append_plan(parity_scheme)?;
-                if !plan.sidecars_to_emit.is_empty()
-                    || plan.highest_protected_ordinal_before_rebuild != plan.next_data_ordinal
-                {
-                    return Err(PoolWriteError::InvalidInput(
-                        "checkpointed parity tape retains an open epoch".to_string(),
-                    ));
-                }
-                let resume_result = plan.complete(Vec::new())?;
-                let resume_session_state = {
-                    let mut raw = BlockSinkRawTapeSink::new(sink);
-                    let parity = ParitySink::new_sidecar_only_from_bounded_resume(
-                        &mut raw,
-                        &mut parity_journal,
-                        parity_scheme.clone(),
-                        selected.tape_uuid,
-                        selected.block_size,
-                        BoundedResumeWriterSeed {
-                            committed_prefix_snapshot: snapshot,
-                            committed_prefix_summary: summary,
-                            resume_result: &resume_result,
-                            live_epoch: None,
-                        },
-                        remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION")),
-                    )?;
-                    parity.into_session_state()?
-                };
-                resume_session_state
-            };
-            let mut raw_write_attempted = false;
-            let parity_append = (|| -> Result<_, PoolWriteError> {
-                let (session_state, mut result) = {
-                    let mut raw = BlockSinkRawTapeSink::new(sink);
-                    let mut session_state = Some(session_state);
-                    let result = write_batched_parity_to_selected_tape_after_replay_check(
-                        state,
-                        &mut raw,
-                        &mut parity_journal,
-                        &mut session_state,
-                        pool_cfg,
-                        request,
-                        selected.clone(),
-                        resources.io_memory(),
-                        &mut raw_write_attempted,
-                    )?;
-                    let session_state = session_state.ok_or_else(|| {
+                    }
+                    let fresh_session_state = {
+                        let mut raw = BlockSinkRawTapeSink::new(sink);
+                        let mut parity = ParitySink::new_with_journal(
+                            &mut raw,
+                            &mut parity_journal,
+                            parity_scheme.clone(),
+                            selected.tape_uuid,
+                            selected.block_size,
+                            remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION")),
+                        )?;
+                        parity.write_bootstrap()?;
+                        parity.into_session_state()?
+                    };
+                    project_fresh_parity_bootstrap_bundle(state, &selected, parity_scheme)?;
+                    fresh_session_state
+                } else {
+                    let checkpoint = prior_records.last().ok_or_else(|| {
                         PoolWriteError::InvalidInput(
-                            "successful parity batch-of-one lost its session state".to_string(),
+                            "non-fresh parity tape has no checkpoint journal".to_string(),
                         )
                     })?;
-                    (session_state, result)
+                    sink.locate(checkpoint.eod_lba)?;
+                    let plan = summary.append_plan(parity_scheme)?;
+                    if !plan.sidecars_to_emit.is_empty()
+                        || plan.highest_protected_ordinal_before_rebuild != plan.next_data_ordinal
+                    {
+                        return Err(PoolWriteError::InvalidInput(
+                            "checkpointed parity tape retains an open epoch".to_string(),
+                        ));
+                    }
+                    let resume_result = plan.complete(Vec::new())?;
+                    let resume_session_state = {
+                        let mut raw = BlockSinkRawTapeSink::new(sink);
+                        let parity = ParitySink::new_sidecar_only_from_bounded_resume(
+                            &mut raw,
+                            &mut parity_journal,
+                            parity_scheme.clone(),
+                            selected.tape_uuid,
+                            selected.block_size,
+                            BoundedResumeWriterSeed {
+                                committed_prefix_snapshot: snapshot,
+                                committed_prefix_summary: summary,
+                                resume_result: &resume_result,
+                                live_epoch: None,
+                            },
+                            remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION")),
+                        )?;
+                        parity.into_session_state()?
+                    };
+                    resume_session_state
                 };
-                let object_bundle = result
-                    .write_report()
-                    .ok_or_else(|| {
-                        PoolWriteError::InvalidInput(
-                            "parity batch-of-one is missing its write report".to_string(),
-                        )
-                    })?
-                    .catalog
-                    .tape_file_bundle
-                    .clone();
-                let (closed, session_state) = {
-                    let mut raw = BlockSinkRawTapeSink::new(sink);
-                    let mut parity = ParitySink::from_session_state(
-                        &mut raw,
-                        &mut parity_journal,
-                        session_state,
-                    )?;
-                    let closed = parity.close_open_epoch(remanence_parity::CloseReason::Barrier)?;
-                    let state = parity.into_session_state()?;
-                    (closed, state)
-                };
-                result.hardware_early_warning |= session_state.hardware_early_warning_seen();
-                Ok((
-                    result,
-                    closed.next_tape_file_number,
-                    closed.barrier_outcome,
-                    Some(parity_scheme.clone()),
-                    vec![object_bundle],
-                    closed.committed_bundle,
-                    Some(session_state),
-                ))
-            })();
-            match parity_append {
-                Ok(result) => result,
-                Err(error) if raw_write_attempted => {
-                    return Err(fence_after_terminal_motion(
-                        state,
-                        &selected,
-                        "parity_append",
-                        error,
-                    ));
+                let mut raw_write_attempted = false;
+                let parity_append = (|| -> Result<_, PoolWriteError> {
+                    let (session_state, mut result) = {
+                        let mut raw = BlockSinkRawTapeSink::new(sink);
+                        let mut session_state = Some(session_state);
+                        let result = write_batched_parity_to_selected_tape_after_replay_check(
+                            state,
+                            &mut raw,
+                            &mut parity_journal,
+                            &mut session_state,
+                            pool_cfg,
+                            request,
+                            selected.clone(),
+                            resources.io_memory(),
+                            &mut raw_write_attempted,
+                        )?;
+                        let session_state = session_state.ok_or_else(|| {
+                            PoolWriteError::InvalidInput(
+                                "successful parity batch-of-one lost its session state".to_string(),
+                            )
+                        })?;
+                        (session_state, result)
+                    };
+                    let object_bundle = result
+                        .write_report()
+                        .ok_or_else(|| {
+                            PoolWriteError::InvalidInput(
+                                "parity batch-of-one is missing its write report".to_string(),
+                            )
+                        })?
+                        .catalog
+                        .tape_file_bundle
+                        .clone();
+                    let (closed, session_state) = {
+                        let mut raw = BlockSinkRawTapeSink::new(sink);
+                        let mut parity = ParitySink::from_session_state(
+                            &mut raw,
+                            &mut parity_journal,
+                            session_state,
+                        )?;
+                        let closed =
+                            parity.close_open_epoch(remanence_parity::CloseReason::Barrier)?;
+                        let state = parity.into_session_state()?;
+                        (closed, state)
+                    };
+                    result.hardware_early_warning |= session_state.hardware_early_warning_seen();
+                    Ok((
+                        result,
+                        closed.next_tape_file_number,
+                        closed.barrier_outcome,
+                        Some(parity_scheme.clone()),
+                        vec![object_bundle],
+                        closed.committed_bundle,
+                        Some(session_state),
+                    ))
+                })();
+                match parity_append {
+                    Ok(result) => result,
+                    Err(error) if raw_write_attempted => {
+                        return Err(fence_after_terminal_motion(
+                            state,
+                            &selected,
+                            "parity_append",
+                            error,
+                        ));
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) => return Err(error),
             }
+        };
+        let captured = sink.position()?;
+        if captured.partition != sync.position_after.partition
+            || captured.lba != sync.position_after.lba
+        {
+            return Err(PoolWriteError::TapeIo(TapeIoError::OperationFailed(
+                "batch-of-one barrier position proof mismatch".to_string(),
+            )));
         }
-    };
-    let captured = sink.position()?;
-    if captured.partition != sync.position_after.partition
-        || captured.lba != sync.position_after.lba
-    {
-        return Err(PoolWriteError::TapeIo(TapeIoError::OperationFailed(
-            "batch-of-one barrier position proof mismatch".to_string(),
-        )));
-    }
-    let projection = result.checkpoint_projection().cloned().ok_or_else(|| {
-        PoolWriteError::InvalidInput(
-            "batch-of-one object is missing checkpoint projection".to_string(),
-        )
-    })?;
-    let record = remanence_state::CheckpointJournalRecord {
-        ordinal: next_ordinal,
-        committed_object_count: next_committed_count,
-        eod_partition: captured.partition,
-        eod_lba: captured.lba,
-        tape_uuid: selected.tape_uuid,
-        batch_id,
-        next_tape_file_number,
-        block_size: selected.block_size,
-        objects: vec![projection],
-        scheme,
-        object_tape_file_bundles: object_bundles,
-        barrier_bundle,
-        terminal_finalization: None,
-        sealed_after_write: false,
-    };
-    let used_bytes = captured
-        .lba
-        .checked_mul(u64::from(selected.block_size))
-        .ok_or_else(|| {
+        let projection = result.checkpoint_projection().cloned().ok_or_else(|| {
             PoolWriteError::InvalidInput(
-                "batch-of-one post-barrier used-byte count overflows u64".to_string(),
+                "batch-of-one object is missing checkpoint projection".to_string(),
             )
         })?;
-    let seal_reason = selected_tape_seal_reason_at_barrier(
-        state,
-        &selected,
-        pool_cfg,
-        TapePositionAfterWrite {
-            used_bytes,
-            early_warning: result.hardware_early_warning || sync.early_warning,
-        },
-    )?;
-    if let Err(error) = checkpoint_lease.append(&record) {
-        quarantine_direct_admission_on_uncertain_append(&error, write_admission);
-        return Err(error.into());
-    }
-    if let Some(fault) = direct_replay_fault.as_ref() {
-        fault
-            .abort_after_checkpoint_append(&record)
-            .map_err(PoolWriteError::InvalidInput)?;
-    }
-    if let Err(error) = state.project_checkpoint_record(&record) {
-        if let Some(admission) = write_admission {
-            admission.quarantine_until_restart();
+        let record = remanence_state::CheckpointJournalRecord {
+            ordinal: next_ordinal,
+            committed_object_count: next_committed_count,
+            eod_partition: captured.partition,
+            eod_lba: captured.lba,
+            tape_uuid: selected.tape_uuid,
+            batch_id,
+            next_tape_file_number,
+            block_size: selected.block_size,
+            objects: vec![projection],
+            scheme,
+            object_tape_file_bundles: object_bundles,
+            barrier_bundle,
+            terminal_finalization: None,
+            sealed_after_write: false,
+        };
+        let used_bytes = captured
+            .lba
+            .checked_mul(u64::from(selected.block_size))
+            .ok_or_else(|| {
+                PoolWriteError::InvalidInput(
+                    "batch-of-one post-barrier used-byte count overflows u64".to_string(),
+                )
+            })?;
+        let seal_reason = selected_tape_seal_reason_at_barrier(
+            state,
+            &selected,
+            pool_cfg,
+            TapePositionAfterWrite {
+                used_bytes,
+                early_warning: result.hardware_early_warning || sync.early_warning,
+            },
+        )?;
+        if let Err(error) = checkpoint_lease.append(&record) {
+            quarantine_direct_admission_on_uncertain_append(&error, write_admission);
+            return Err(error.into());
         }
-        return Err(error.into());
-    }
+        if let Some(fault) = direct_replay_fault.as_ref() {
+            fault
+                .abort_after_checkpoint_append(&record)
+                .map_err(PoolWriteError::InvalidInput)?;
+        }
+        if let Err(error) = state.project_checkpoint_record(&record) {
+            if let Some(admission) = write_admission {
+                admission.quarantine_until_restart();
+            }
+            return Err(error.into());
+        }
+        Ok((result, record, terminal_parity_state, seal_reason))
+    })();
+    let (result, record, terminal_parity_state, seal_reason) = match execution {
+        Ok(value) => value,
+        Err(error) => {
+            if let Some(drive) = sink.append_admission_drive() {
+                if dispatches != Some(drive.media_write_dispatch_count()) {
+                    if let Err(marker) = crate::append_admission::abandon_pending_append(
+                        drive,
+                        &checkpoint_lease,
+                        None,
+                    ) {
+                        return Err(PoolWriteError::InvalidInput(format!(
+                            "{error}; abandonment marker failed: {marker}"
+                        )));
+                    }
+                    if let ParityConfig::Scheme(scheme) = &selected.parity_config {
+                        let mut journal = FileTapeFileJournal::open(
+                            parity_journal_path,
+                            selected.tape_uuid,
+                            selected.block_size,
+                            scheme.clone(),
+                        )
+                        .map_err(ParityError::from)?;
+                        crate::append_admission::discard_reconciled_parity_suffix(
+                            &mut journal,
+                            &checkpoint_lease,
+                        )
+                        .map_err(PoolWriteError::InvalidInput)?;
+                    }
+                }
+            }
+            return Err(error);
+        }
+    };
     Ok(CheckpointedAppend {
         result,
         record,
@@ -1652,13 +1724,11 @@ pub fn verify_tape_identity(
     source: &mut dyn BlockSource,
     expected_tape_uuid: &[u8; 16],
 ) -> Result<(), TapeIdentityError> {
-    source
-        .locate(0)
-        .map_err(|err| TapeIdentityError::AbsentBootstrap(format!("locate BOT: {err}")))?;
+    source.locate(0).map_err(TapeIdentityError::Io)?;
     let mut block = vec![0u8; VERIFY_BOOTSTRAP_READ_BYTES];
     let read = source
         .read_block(&mut block)
-        .map_err(|err| TapeIdentityError::AbsentBootstrap(format!("read BOT: {err}")))?;
+        .map_err(TapeIdentityError::Io)?;
     let payload = parse_bootstrap_block(&block[..read])
         .map_err(|err| TapeIdentityError::AbsentBootstrap(err.to_string()))?;
     if &payload.tape_uuid != expected_tape_uuid {

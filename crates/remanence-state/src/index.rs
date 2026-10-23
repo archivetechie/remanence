@@ -2571,6 +2571,35 @@ impl CatalogIndex {
         Ok(())
     }
 
+    /// Update the existing append-recovery projection without creating an I/O fence.
+    /// Sealed, retired, and terminal-finalizing tapes cannot be reopened here.
+    pub fn set_append_recovery_required(
+        &mut self,
+        tape_uuid: [u8; 16],
+        required: bool,
+    ) -> Result<(), StateError> {
+        let changed = self.conn.execute(
+            "update tapes set state = ?2, updated_at_utc = ?3 where tape_uuid = ?1
+             and kind = 'data' and (state in ('ready', 'recovery_required') or (?4 and state in ('finalizing', 'ingestion_pending')))
+             and (?4 or (finalization_progress is null and finalization_trigger is null
+             and finalization_operation_id is null and finalization_outcome is null))",
+            params![tape_uuid.as_slice(), if required { "recovery_required" } else { "ready" }, now_utc()?, required],
+        ).map_err(|e| sqlite_error("update append recovery state", e))?;
+        if changed != 1 {
+            return Err(StateError::AppendRecoveryPrecondition(format!(
+                "tape {} cannot {} append recovery: requires a data tape in an admissible state{}",
+                hex_uuid(tape_uuid),
+                if required { "enter" } else { "clear" },
+                if required {
+                    ""
+                } else {
+                    " with no terminal finalization projection"
+                }
+            )));
+        }
+        Ok(())
+    }
+
     /// Mark a tape closed to future writes while preserving its catalog rows.
     ///
     /// The pool selector treats any non-`ready` tape as unwritable, so this

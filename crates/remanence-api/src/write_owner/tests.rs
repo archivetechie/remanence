@@ -752,6 +752,7 @@ fn one_transition_ahead_sink_journal_reconciles_before_media_is_available() {
         .expect("simulate crash after sink component fsync");
 
     let spec = TerminalFinalizeSpec {
+        actor: AuditActor::System,
         tape_uuid: TAPE_UUID,
         block_size: BLOCK_SIZE,
         pool_config: None,
@@ -907,6 +908,7 @@ fn one_transition_ahead_sink_journal_reconciles_before_media_is_available() {
         parity_config: ParityConfig::Scheme(scheme),
     };
     let lowered_spec = TerminalFinalizeSpec {
+        actor: AuditActor::System,
         tape_uuid: TAPE_UUID,
         block_size: BLOCK_SIZE,
         pool_config: Some(lowered_pool),
@@ -2040,6 +2042,7 @@ async fn daemon_rejects_corrupt_checkpoint_authority_before_position_or_config_c
     let (open_tx, open_rx) = oneshot::channel();
     drive_tx
         .send(DriveCommand::OpenWrite {
+            actor: remanence_state::AuditActor::System,
             pool_cfg: pool_cfg.clone(),
             selected: SelectedTape {
                 pool_id: "parity.authority".to_string(),
@@ -2077,7 +2080,7 @@ async fn daemon_rejects_corrupt_checkpoint_authority_before_position_or_config_c
 }
 
 #[tokio::test]
-async fn daemon_rejects_missing_checkpoint_authority_for_catalog_written_media_before_motion() {
+async fn bootstrap_projection_never_authorizes_writing_physically_blank_media() {
     const BLOCK_SIZE: u32 = 1024;
 
     let scheme = remanence_parity::default_scheme_for_block_size(BLOCK_SIZE);
@@ -2137,6 +2140,19 @@ async fn daemon_rejects_missing_checkpoint_authority_for_catalog_written_media_b
                 },
             )
             .expect("project known written BOT prefix");
+        let pool_id = format!("missing.{case}.authority");
+        index
+            .upsert_tape_pool_projection(TapePoolProjectionInput {
+                pool_id: pool_id.clone(),
+                display_name: None,
+                copy_class: None,
+                content_class: None,
+                created_at_utc: None,
+            })
+            .expect("project pool");
+        index
+            .project_tape_pool_membership(tape_uuid, &pool_id)
+            .expect("assign pool");
         drop(index);
 
         let mut world = VirtualWorld::single_drive(
@@ -2170,6 +2186,7 @@ async fn daemon_rejects_missing_checkpoint_authority_for_catalog_written_media_b
         let (open_tx, open_rx) = oneshot::channel();
         drive_tx
             .send(DriveCommand::OpenWrite {
+                actor: remanence_state::AuditActor::System,
                 pool_cfg: TapePoolConfig {
                     scheme: None,
                     id: format!("missing.{case}.authority"),
@@ -2205,14 +2222,14 @@ async fn daemon_rejects_missing_checkpoint_authority_for_catalog_written_media_b
             .expect("open reply")
             .expect_err("missing authority for catalog-written tape must reject");
         assert!(
-            status
-                .message()
-                .contains("checkpoint journal is empty but catalog records a written tape prefix"),
+            status.message().contains("tape identity"),
             "{case}: {status}"
         );
         assert!(
-            world.lock().expect("world lock").command_log[command_start..].is_empty(),
-            "{case}: missing authority must reject before any drive command"
+            world.lock().expect("world lock").command_log[command_start..]
+                .iter()
+                .all(|command| !matches!(command.opcode, 0x0a | 0x10)),
+            "bootstrap projection must not authorize media writes"
         );
     }
 }
@@ -2266,6 +2283,7 @@ async fn daemon_checkpoint_lease_contention_precedes_conditional_load_for_no_par
     let (open_tx, open_rx) = oneshot::channel();
     drive_tx
         .send(DriveCommand::OpenWrite {
+            actor: remanence_state::AuditActor::System,
             pool_cfg: TapePoolConfig {
                 scheme: None,
                 id: "checkpoint.lease".to_string(),
@@ -2365,7 +2383,24 @@ fn fresh_parity_bootstrap_short_completion_fences_without_journal_visibility() {
         parity_config: ParityConfig::Scheme(scheme.clone()),
     };
 
+    let bootstrap = crate::build_tape_bootstrap(
+        tape_uuid,
+        BLOCK_SIZE,
+        ParityConfig::Scheme(scheme.clone()),
+        "2026-10-23T00:00:00Z",
+        "test",
+    );
+    let mut block = vec![0; BLOCK_SIZE as usize];
+    write_bootstrap_block(&bootstrap, &mut block).unwrap();
+    world
+        .lock()
+        .unwrap()
+        .tapes
+        .get_mut("PARITY001")
+        .unwrap()
+        .records = vec![Record::Block(block), Record::Filemark];
     let mut drive = library.open_drive(0x0100, &policy).expect("open drive");
+    let _admission = crate::admit_initialized_tape(&mut drive, tape_uuid, BLOCK_SIZE).unwrap();
     let status = {
         let checkpoint_journal =
             remanence_state::FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, tape_uuid)
@@ -2673,6 +2708,7 @@ async fn partial_epoch_checkpoint_projects_replays_and_first_post_checkpoint_sho
     let (open_tx, open_rx) = oneshot::channel();
     drive_tx
         .send(DriveCommand::OpenWrite {
+            actor: remanence_state::AuditActor::System,
             pool_cfg: pool_cfg.clone(),
             selected: SelectedTape {
                 pool_id: POOL_ID.to_string(),
@@ -2802,6 +2838,7 @@ async fn partial_epoch_checkpoint_projects_replays_and_first_post_checkpoint_sho
     let (resume_tx, resume_rx) = oneshot::channel();
     drive_tx
         .send(DriveCommand::OpenWrite {
+            actor: remanence_state::AuditActor::System,
             pool_cfg,
             selected: SelectedTape {
                 pool_id: POOL_ID.to_string(),
@@ -3404,6 +3441,7 @@ async fn open_actor_test_write_session(
     let (open_tx, open_rx) = oneshot::channel();
     drive_tx
         .send(DriveCommand::OpenWrite {
+            actor: remanence_state::AuditActor::System,
             pool_cfg: pool_cfg.clone(),
             selected: SelectedTape {
                 pool_id: pool_cfg.id.clone(),
@@ -3636,6 +3674,7 @@ async fn checkpoint_actor_deduplicates_in_batch_and_holds_until_checkpoint() {
     let (open_tx, open_rx) = oneshot::channel();
     drive_tx
         .send(DriveCommand::OpenWrite {
+            actor: remanence_state::AuditActor::System,
             pool_cfg,
             selected: SelectedTape {
                 pool_id: "checkpoint-test".to_string(),
@@ -4638,6 +4677,37 @@ async fn manual_finalize_closes_below_low_and_same_key_replay_moves_no_tape() {
         commands_before_crash_cut,
         "changed retry conflict must issue zero drive commands"
     );
+
+    retry_index
+        .set_append_recovery_required(tape_uuid, true)
+        .unwrap();
+    let before_open = world.lock().unwrap().command_log.len();
+    let (reply, rx) = oneshot::channel();
+    drive_tx
+        .send(DriveCommand::OpenWrite {
+            actor: AuditActor::System,
+            pool_cfg: pool_cfg.clone(),
+            selected: SelectedTape {
+                pool_id: pool_id.into(),
+                tape_uuid,
+                block_size: BLOCK_SIZE,
+                parity_config: ParityConfig::None,
+            },
+            target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPinnedTape,
+            needs_drive_load: false,
+            library_serial: library_serial.into(),
+            barcode: Some(barcode.into()),
+            source_slot: None,
+            drive_uuid: None,
+            drive_serial: None,
+            reply,
+        })
+        .await
+        .unwrap();
+    let refused = rx.await.unwrap().unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(refused.message().contains("FinalizeTape"), "{refused}");
+    assert_eq!(world.lock().unwrap().command_log.len(), before_open);
 
     let (finalize_tx, finalize_rx) = oneshot::channel();
     drive_tx
@@ -6168,11 +6238,7 @@ async fn induced_append_and_read_failures_persist_session_snapshots() {
     let mut bootstrap_block = vec![0u8; 4096];
     write_bootstrap_block(&bootstrap, &mut bootstrap_block).expect("encode bootstrap");
     let mut tape = VirtualTape::empty(64 * 1024 * 1024, 4096);
-    tape.records = vec![
-        Record::Block(bootstrap_block),
-        Record::Filemark,
-        Record::Filemark,
-    ];
+    tape.records = vec![Record::Block(bootstrap_block), Record::Filemark];
     tape.written_bytes = 4096;
     let mut world =
         VirtualWorld::single_drive("LIB-INDUCED-FAIL", 0x0100, "DRV-INDUCED-FAIL", 0x0400, 1);
@@ -6256,6 +6322,7 @@ async fn induced_append_and_read_failures_persist_session_snapshots() {
     let (open_write_tx, open_write_rx) = oneshot::channel();
     drive_tx
         .send(DriveCommand::OpenWrite {
+            actor: remanence_state::AuditActor::System,
             pool_cfg: pool_cfg.clone(),
             selected: SelectedTape {
                 pool_id: "failure-test".to_string(),
@@ -8391,6 +8458,18 @@ fn resume_vectors_layer5_authorities(refusal: Option<&str>) {
         super::checkpoint::validate_parity_actor_authority(&cfg, &selected, &lease, &checkpoints)
             .unwrap();
     let mut index = CatalogIndex::open(&cfg.index_path).unwrap();
+    let last = checkpoints.last().unwrap();
+    // This fixture tests parity journal reconstruction after an explicit discard.
+    // Its synthetic fill is deliberately not automatic append authority.
+    crate::resume_vectors::discard_synthetic_suffix(&world, last.eod_lba);
+    let _admission = crate::admit_checkpointed_tape(
+        &mut drive,
+        selected.tape_uuid,
+        selected.block_size,
+        last.eod_partition,
+        last.eod_lba,
+    )
+    .unwrap();
     let mut session = super::checkpoint::open_parity_actor_session(
         &mut index,
         &mut drive,
@@ -8438,4 +8517,346 @@ fn resume_vectors_layer5_authorities(refusal: Option<&str>) {
         .find(|c| c["id"] == "resume-closed")
         .unwrap();
     assert_expected("resume-closed", &case["expected"], &actual);
+}
+
+/// Exercise daemon session admission using the same rolled-back state as a
+/// standalone invocation. An old released fence never grants append authority.
+pub(crate) async fn daemon_rollback_refusal(
+    state: &StateHandle,
+    world: Arc<Mutex<VirtualWorld>>,
+    selected: SelectedTape,
+) -> String {
+    let mut library = open_model_library(world.clone());
+    let mut cfg = test_write_owner_config(
+        state.paths().sqlite_path.clone(),
+        state.paths().audit_dir.clone(),
+        &library,
+        library_snapshot_cell(library.library().clone()),
+    );
+    cfg.checkpoint_journal_dir = state.paths().journal_dir.join("checkpoints");
+    let mut index = CatalogIndex::open(&state.paths().sqlite_path).unwrap();
+    let session_id = Uuid::new_v4();
+    for event in [AuditEvent::SessionOpened, AuditEvent::SessionOrphaned] {
+        record_session_event(
+            &mut index,
+            &cfg,
+            SessionAuditInput {
+                session_id,
+                session_kind: "write",
+                event,
+                tape_uuid: Some(selected.tape_uuid),
+                library_serial: Some(library.library().serial.clone()),
+                drive_bay: Some(0x100),
+                drive_uuid: None,
+                drive_serial: None,
+                abort_reason: None,
+            },
+        )
+        .unwrap();
+    }
+    let serial = library.library().serial.clone();
+    let policy = remanence_library::StaticAllowlist::new([serial.as_str()]);
+    let drive = library.open_drive(0x100, &policy).unwrap();
+    let tape_uuid = selected.tape_uuid;
+    let tx = spawn_drive_actor(0x100, drive, cfg);
+    let (reply, rx) = oneshot::channel();
+    tx.send(DriveCommand::OpenWrite {
+        actor: remanence_state::AuditActor::System,
+        pool_cfg: state.config().tape_pools[0].clone(),
+        selected,
+        target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
+        needs_drive_load: false,
+        library_serial: serial,
+        barcode: Some("HAND".into()),
+        source_slot: None,
+        drive_uuid: None,
+        drive_serial: None,
+        reply,
+    })
+    .await
+    .unwrap();
+    let error = rx
+        .await
+        .unwrap()
+        .expect_err("stale daemon state must refuse");
+    assert!(error.message().contains("TailBeyondKnownState"), "{error}");
+    let index = CatalogIndex::open(&state.paths().sqlite_path).unwrap();
+    let fences = index.list_active_tape_io_fences().unwrap();
+    assert!(fences.iter().all(|f| f.tape_uuid != tape_uuid));
+    assert_eq!(
+        index.get_tape(&tape_uuid).unwrap().unwrap().state,
+        "recovery_required"
+    );
+    crate::startup_guard::reject_active_tape_io_fences_on_startup(&index).unwrap();
+    let audit = FileAuditLog::replay(&state.paths().audit_dir).unwrap();
+    assert!(audit.iter().any(|r| r.event == AuditEvent::RecoveryEvent));
+    error.to_string()
+}
+
+/// Exercise real actor transitions on one handle, including same-load abandonment
+/// and explicit recovery of the physical suffix retained by a simulated crash.
+pub(crate) async fn daemon_append_recovery_roundtrip(
+    state: &StateHandle,
+    world: Arc<Mutex<VirtualWorld>>,
+    selected: SelectedTape,
+    root: &Path,
+) {
+    let mut library = open_model_library(world.clone());
+    let mut cfg = test_write_owner_config(
+        state.paths().sqlite_path.clone(),
+        state.paths().audit_dir.clone(),
+        &library,
+        library_snapshot_cell(library.library().clone()),
+    );
+    cfg.checkpoint_journal_dir = state.paths().journal_dir.join("checkpoints");
+    cfg.checkpoint_max_objects = 100;
+    cfg.checkpoint_max_age_seconds = 3600;
+    let serial = library.library().serial.clone();
+    let drive = library
+        .open_drive(
+            0x100,
+            &remanence_library::StaticAllowlist::new([serial.as_str()]),
+        )
+        .unwrap();
+    let tx = spawn_drive_actor(0x100, drive, cfg);
+    let open = || {
+        let tx = tx.clone();
+        let serial = serial.clone();
+        let selected = selected.clone();
+        let pool_cfg = state.config().tape_pools[0].clone();
+        async move {
+            let (reply, rx) = oneshot::channel();
+            tx.send(DriveCommand::OpenWrite {
+                actor: remanence_state::AuditActor::System,
+                pool_cfg,
+                selected,
+                target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
+                needs_drive_load: false,
+                library_serial: serial,
+                barcode: Some("HAND".into()),
+                source_slot: None,
+                drive_uuid: None,
+                drive_serial: None,
+                reply,
+            })
+            .await
+            .unwrap();
+            rx.await.unwrap()
+        }
+    };
+    let first = open().await.unwrap();
+    let id = Uuid::from_slice(&first.session_id).unwrap();
+    let written = append_actor_test_file(
+        &tx,
+        id,
+        root.join("aborted"),
+        "aborted",
+        "aborted",
+        b"pending complete object",
+    )
+    .await;
+    assert!(!written.replay);
+    assert!(!written.record.object_id.is_empty());
+    let crash_records = world.lock().unwrap().tapes["HAND"].records.clone();
+    let (reply, rx) = oneshot::channel();
+    tx.send(DriveCommand::Abort {
+        session_id: id,
+        reason: Some("cancel".into()),
+        reply,
+    })
+    .await
+    .unwrap();
+    rx.await.unwrap().unwrap();
+    assert!(world.lock().unwrap().tapes["HAND"].records.len() < crash_records.len());
+    let second = open().await.unwrap();
+    let id = Uuid::from_slice(&second.session_id).unwrap();
+    append_actor_test_file(
+        &tx,
+        id,
+        root.join("after-abort"),
+        "after-abort",
+        "after-abort",
+        b"reopened successfully",
+    )
+    .await;
+    {
+        let parity_on = !matches!(selected.parity_config, ParityConfig::None);
+        if parity_on {
+            world
+                .lock()
+                .unwrap()
+                .tapes
+                .get_mut("HAND")
+                .unwrap()
+                .write_protected = true;
+        }
+        let failed = append_actor_test_file_result(
+            &tx,
+            id,
+            root.join("bad"),
+            if parity_on {
+                "valid-path"
+            } else {
+                "../invalid"
+            },
+            "bad",
+            b"failure",
+        )
+        .await
+        .unwrap_err();
+        world
+            .lock()
+            .unwrap()
+            .tapes
+            .get_mut("HAND")
+            .unwrap()
+            .write_protected = false;
+        assert!(failed.message().contains("re-send all"), "{failed}");
+    }
+    let (reply, rx) = oneshot::channel();
+    tx.send(DriveCommand::Abort {
+        session_id: id,
+        reason: None,
+        reply,
+    })
+    .await
+    .unwrap();
+    rx.await.unwrap().unwrap();
+
+    {
+        let mut index = CatalogIndex::open(&state.paths().sqlite_path).unwrap();
+        let fences = index.list_active_tape_io_fences().unwrap();
+        assert!(!fences.is_empty());
+        for fence in fences {
+            index
+                .release_tape_io_fence(&fence.quarantine_id, "release after failed batch")
+                .unwrap();
+        }
+        let session = open().await.unwrap();
+        let resend_id = Uuid::from_slice(&session.session_id).unwrap();
+        append_actor_test_file(
+            &tx,
+            resend_id,
+            root.join("resend"),
+            "after-abort",
+            "after-abort",
+            b"reopened successfully",
+        )
+        .await;
+        let (reply, rx) = oneshot::channel();
+        tx.send(DriveCommand::Abort {
+            session_id: resend_id,
+            reason: None,
+            reply,
+        })
+        .await
+        .unwrap();
+        rx.await.unwrap().unwrap();
+    }
+
+    // A process crash leaves these complete records but no checkpoint. Restore
+    // exactly that media cut after closing the actor's live session.
+    world.lock().unwrap().tapes.get_mut("HAND").unwrap().records = crash_records;
+    let refusal = open().await.unwrap_err();
+    assert!(
+        refusal.message().contains("TailBeyondKnownState"),
+        "{refusal}"
+    );
+    let index = CatalogIndex::open(&state.paths().sqlite_path).unwrap();
+    assert_eq!(
+        index.get_tape(&selected.tape_uuid).unwrap().unwrap().state,
+        "recovery_required"
+    );
+    assert!(index.list_active_tape_io_fences().unwrap().is_empty());
+    crate::startup_guard::reject_active_tape_io_fences_on_startup(&index).unwrap();
+    let mut request = pb::SupersedeTailRequest {
+        tape_uuid: selected.tape_uuid.to_vec(),
+        ack_tape_uuid: selected.tape_uuid.to_vec(),
+        confirm_supersede: None,
+        expected_found: vec![],
+    };
+    let before = world.lock().unwrap().tapes["HAND"].records.clone();
+    for completed in [false, true] {
+        let (reply, rx) = oneshot::channel();
+        tx.send(DriveCommand::SupersedeTail {
+            request: request.clone(),
+            actor: AuditActor::local_user(),
+            needs_drive_load: false,
+            library_serial: serial.clone(),
+            barcode: Some("HAND".into()),
+            source_slot: None,
+            drive_serial: None,
+            reply,
+        })
+        .await
+        .unwrap();
+        let response = rx.await.unwrap().unwrap();
+        assert_eq!(response.completed, completed);
+        if !completed {
+            assert_eq!(world.lock().unwrap().tapes["HAND"].records, before);
+        }
+        request.confirm_supersede = Some(response.required_confirmation);
+        request.expected_found = response.found;
+    }
+    assert_eq!(
+        index.get_tape(&selected.tape_uuid).unwrap().unwrap().state,
+        "ready"
+    );
+    let session = open().await.unwrap();
+    let id = Uuid::from_slice(&session.session_id).unwrap();
+    append_actor_test_file(
+        &tx,
+        id,
+        root.join("committed"),
+        "committed",
+        "committed",
+        b"healthy daemon append",
+    )
+    .await;
+    let (reply, rx) = oneshot::channel();
+    tx.send(DriveCommand::Close {
+        session_id: id,
+        reply,
+    })
+    .await
+    .unwrap();
+    let closed = rx.await.unwrap().unwrap();
+    assert_eq!(closed.session.objects_committed, 1);
+    assert_eq!(closed.session.checkpointed_objects.len(), 1);
+    let durable = world.lock().unwrap().tapes["HAND"].records.clone();
+    for commit in [false, true] {
+        let session = open().await.unwrap();
+        let id = Uuid::from_slice(&session.session_id).unwrap();
+        append_actor_test_file(
+            &tx,
+            id,
+            root.join("after-checkpoint"),
+            "after-checkpoint",
+            "after-checkpoint",
+            b"pending after durable checkpoint",
+        )
+        .await;
+        let (reply, rx) = oneshot::channel();
+        if commit {
+            tx.send(DriveCommand::Close {
+                session_id: id,
+                reply,
+            })
+            .await
+            .unwrap();
+        } else {
+            tx.send(DriveCommand::Abort {
+                session_id: id,
+                reason: None,
+                reply,
+            })
+            .await
+            .unwrap();
+        }
+        rx.await.unwrap().unwrap();
+        assert_eq!(
+            &world.lock().unwrap().tapes["HAND"].records[..durable.len()],
+            durable.as_slice()
+        );
+    }
 }

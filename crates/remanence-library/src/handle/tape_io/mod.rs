@@ -87,6 +87,176 @@ fn validate_residual_claim(
     }
 }
 
+/// Low-level session lifetime for the append funnel. Dropping it revokes every
+/// adapter on the handle. Physical classification belongs to the API admission
+/// funnel, which owns this value inside its opaque proof.
+#[derive(Debug)]
+#[must_use = "hold the admission for the entire write session"]
+pub struct AppendSession {
+    tape_uuid: [u8; 16],
+    partition: u32,
+    lba: u64,
+    identity_generation: u64,
+    _session: std::sync::Arc<()>,
+}
+
+impl AppendSession {
+    /// Identity and initial physical boundary proved for this session.
+    pub fn boundary(&self) -> ([u8; 16], u32, u64, u64) {
+        (
+            self.tape_uuid,
+            self.partition,
+            self.lba,
+            self.identity_generation,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct AppendProof {
+    tape_uuid: [u8; 16],
+    partition: u32,
+    lba: u64,
+    identity_generation: u64,
+}
+
+impl TapeIoError {
+    /// Only a current, zero-transfer BLANK CHECK 00/05 proves physical EOD.
+    pub fn is_physical_eod(&self) -> bool {
+        matches!(self, Self::CheckCondition(ScsiError::CheckCondition {
+            sense, bytes_transferred: 0,
+        }) if !sense_is_deferred(sense)
+            && decode_sense(sense).is_some_and(|s| s.key == 8 && s.asc == 0 && s.ascq == 5 && !s.filemark))
+    }
+}
+
+/// A consumed capability supplied by the physical append-admission funnel.
+/// Safe code cannot implement this contract to install an unchecked boundary.
+///
+/// # Safety
+/// Implementors must be opaque, non-cloneable proof types constructed only after
+/// the append funnel validates the entire physical suffix, restores the exact
+/// write position and proves the unchanged load identity. The capability must
+/// be consumed immediately on that same exclusively held drive; no media or
+/// positioning operations may intervene. Fabricating a proof permits irreversible
+/// overwriting of committed tape data. This contract protects media integrity.
+pub unsafe trait AppendBoundaryProof {
+    /// Consume the proof, yielding tape UUID, partition, LBA and load generation.
+    fn into_boundary(self) -> ([u8; 16], u32, u64, u64);
+}
+
+impl super::DriveHandle {
+    /// Start a new append session without inheriting an earlier session's proof.
+    pub fn clear_append_admission(&mut self) {
+        self.append_admission = None;
+    }
+
+    /// Install the funnel's consumed proof and return a revocable session capability.
+    /// Raw boundary arguments cannot authorize a media write.
+    ///
+    /// ```compile_fail
+    /// fn unchecked(drive: &mut remanence_library::DriveHandle) {
+    ///     drive.install_append_admission([0; 16], 0, 2, 0);
+    /// }
+    /// ```
+    pub fn install_append_admission(
+        &mut self,
+        proof: impl AppendBoundaryProof,
+    ) -> Result<AppendSession, TapeIoError> {
+        let (tape_uuid, partition, lba, identity_generation) = proof.into_boundary();
+        self.transport
+            .check_identity_generation(identity_generation)?;
+        let position = self.known_position().ok_or_else(|| {
+            TapeIoError::OperationFailed("append admission requires a proved position".into())
+        })?;
+        if position.partition != partition || position.lba != lba {
+            return Err(TapeIoError::OperationFailed(
+                "append admission position mismatch".into(),
+            ));
+        }
+        let session = std::sync::Arc::new(());
+        self.append_admission = Some((
+            AppendProof {
+                tape_uuid,
+                partition,
+                lba,
+                identity_generation,
+            },
+            self.media_write_dispatch_count(),
+            std::sync::Arc::downgrade(&session),
+        ));
+        Ok(AppendSession {
+            tape_uuid,
+            partition,
+            lba,
+            identity_generation,
+            _session: session,
+        })
+    }
+
+    /// Whether this admitted session dispatched any media writes.
+    pub fn append_session_has_dispatched_writes(&self) -> Result<bool, TapeIoError> {
+        let (_, initial, _) = self.append_admission.as_ref().ok_or_else(|| {
+            TapeIoError::OperationFailed("abandonment requires a live append admission".into())
+        })?;
+        Ok(self.media_write_dispatch_count() != *initial)
+    }
+
+    /// Reuse the exact cursor just proved by admission for the writer's existing
+    /// initial LOCATE. Once a write has dispatched, ordinary LOCATE semantics apply.
+    pub fn locate_admitted_append(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
+        if let Some((admission, dispatches, _)) = self.append_admission.as_ref() {
+            if *dispatches == self.media_write_dispatch_count()
+                && admission.lba == lba
+                && self.check_append_admission().is_ok()
+            {
+                return Ok(self
+                    .known_position()
+                    .expect("admission checked the exact cursor"));
+            }
+        }
+        self.locate(lba)
+    }
+
+    /// Return the identity of the currently live admitted write session.
+    pub fn admitted_tape_uuid(&self) -> Result<[u8; 16], TapeIoError> {
+        self.check_append_admission()?;
+        Ok(self
+            .append_admission
+            .as_ref()
+            .expect("checked admission")
+            .0
+            .tape_uuid)
+    }
+
+    /// Shared adapter gate: no first media write without exact physical proof.
+    /// The dispatch count keeps failed, undispatched attempts from consuming it.
+    pub fn check_append_admission(&self) -> Result<(), TapeIoError> {
+        let (admission, initial_dispatches, session) =
+            self.append_admission.as_ref().ok_or_else(|| {
+                TapeIoError::OperationFailed("media write refused: missing append admission".into())
+            })?;
+        if session.upgrade().is_none() {
+            return Err(TapeIoError::OperationFailed(
+                "media write refused: expired append session".into(),
+            ));
+        }
+        self.transport
+            .check_identity_generation(admission.identity_generation)?;
+        if self.media_write_dispatch_count() == *initial_dispatches {
+            let position = self.known_position().ok_or_else(|| {
+                TapeIoError::OperationFailed("append admission requires a proved position".into())
+            })?;
+            if position.partition != admission.partition || position.lba != admission.lba {
+                return Err(TapeIoError::OperationFailed(
+                    "append admission position mismatch".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Errors a Layer 3a tape I/O operation can return. Preserves Layer
 /// 2b's dirty-state vocabulary: completion-unknown errors mark the parent
 /// `LibraryHandle` dirty with cause `CompletionUnknown` (via
@@ -3624,7 +3794,12 @@ fn read_filemark_signal(sense: &[u8]) -> bool {
 /// buffer, negative means it was larger.
 fn ili_signed_information(sense: &[u8]) -> Option<i64> {
     let decoded = decode_sense(sense)?;
-    if !decoded.is_fixed_format() || !decoded.valid || !decoded.ili {
+    if !decoded.is_fixed_format()
+        || !decoded.valid
+        || !decoded.ili
+        || matches!(decoded.response_code, 0x71 | 0x73)
+        || !matches!(decoded.key, 0 | 1)
+    {
         return None;
     }
     let info_bytes: [u8; 4] = sense.get(3..7)?.try_into().ok()?;

@@ -489,6 +489,14 @@ pub fn execute_positive(input: &Value, vector: &VectorImage) -> Result<Resumed, 
         .plan
         .complete(Vec::new())
         .map_err(|e| e.to_string())?;
+    discard_synthetic_suffix(&world, append);
+    let _admission = remanence_api::admit_checkpointed_tape(
+        &mut drive,
+        vector.written.inputs.tape_uuid,
+        BLOCK,
+        0,
+        append,
+    )?;
     let mut raw = DriveHandleRawSink::new(&mut drive);
     raw.configure_parity_write_session(BLOCK)
         .map_err(|e| e.to_string())?;
@@ -602,6 +610,27 @@ pub fn recorded_input(id: &str) -> Value {
     serde_json::from_slice(&std::fs::read(path).expect("generated resume input must exist"))
         .expect("valid portable resume input")
 }
+/// Fixture setup for parity-resume tests: model fill is not a valid REM prefix.
+/// Remove only the fixture's homogeneous synthetic residue before exercising
+/// journal resume; production tail admission is tested with actual REM objects.
+pub(crate) fn discard_synthetic_suffix(
+    world: &std::sync::Arc<std::sync::Mutex<remanence_chaos::model::VirtualWorld>>,
+    lba: u64,
+) {
+    let mut world = world.lock().unwrap();
+    let tape = world
+        .tapes
+        .get_mut("RESUME001")
+        .expect("resume fixture tape");
+    let suffix = &tape.records[lba as usize..];
+    assert!(
+        !suffix.is_empty(),
+        "fixture must contain its synthetic residue"
+    );
+    assert!(suffix.iter().all(|r| matches!(r, remanence_chaos::model::Record::Block(b) if !b.is_empty() && b.iter().all(|v| *v == b[0]))));
+    tape.records.truncate(lba as usize);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,6 +1,7 @@
 //! Keyless encrypted REM-OBJECT inspection and geometry validation.
 
 use sha2::{Digest, Sha256};
+use std::io::{Read, Seek, SeekFrom};
 
 use crate::error::{RemObjectAeadError, Result};
 use crate::header::{RemObjectHeader, REM_OBJECT_FOOTER, REM_OBJECT_HEADER_LEN};
@@ -27,23 +28,24 @@ pub struct InspectReport {
 
 /// Inspect and verify non-authenticating encrypted REM-OBJECT geometry without a key.
 pub fn inspect_bytes(bytes: &[u8]) -> Result<InspectReport> {
-    let header_bytes: [u8; REM_OBJECT_HEADER_LEN] = bytes
-        .get(..REM_OBJECT_HEADER_LEN)
-        .ok_or(RemObjectAeadError::UnexpectedEof)?
-        .try_into()
-        .map_err(|_| RemObjectAeadError::UnexpectedEof)?;
+    inspect_reader(&mut std::io::Cursor::new(bytes))
+}
+
+/// Inspect a seekable stored object with bounded memory, without decrypting it.
+pub fn inspect_reader(input: &mut (impl Read + Seek)) -> Result<InspectReport> {
+    input.seek(SeekFrom::Start(0))?;
+    let mut header_bytes = [0; REM_OBJECT_HEADER_LEN];
+    input
+        .read_exact(&mut header_bytes)
+        .map_err(crate::error::map_read_exact_error)?;
     let header = RemObjectHeader::parse(&header_bytes)?;
     let key_frame_len = u64::from(header.key_frame_len);
-    let key_frame_end = REM_OBJECT_HEADER_LEN
-        .checked_add(header.key_frame_len as usize)
-        .ok_or(RemObjectAeadError::SizeOverflow)?;
-    let key_frame = crate::KeyFrame::parse(
-        bytes
-            .get(REM_OBJECT_HEADER_LEN..key_frame_end)
-            .ok_or(RemObjectAeadError::UnexpectedEof)?,
-    )?;
-    let stored_size_bytes =
-        u64::try_from(bytes.len()).map_err(|_| RemObjectAeadError::SizeOverflow)?;
+    let mut key_frame_bytes = vec![0; header.key_frame_len as usize];
+    input
+        .read_exact(&mut key_frame_bytes)
+        .map_err(crate::error::map_read_exact_error)?;
+    let key_frame = crate::KeyFrame::parse(&key_frame_bytes)?;
+    let stored_size_bytes = input.seek(SeekFrom::End(0))?;
     if !stored_size_bytes.is_multiple_of(u64::from(header.chunk_size)) {
         return Err(RemObjectAeadError::TrailingData);
     }
@@ -56,9 +58,17 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<InspectReport> {
         return Err(RemObjectAeadError::UnexpectedEof);
     }
 
-    let digest = Sha256::digest(bytes);
-    let mut stored_digest = [0u8; 32];
-    stored_digest.copy_from_slice(&digest);
+    input.seek(SeekFrom::Start(0))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0; 65536];
+    loop {
+        let n = input.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        digest.update(&buffer[..n]);
+    }
+    let stored_digest = digest.finalize().into();
 
     let stride = u64::from(header.chunk_size)
         .checked_add(16)
@@ -91,16 +101,22 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<InspectReport> {
         return Err(RemObjectAeadError::TrailingData);
     }
 
-    let footer_start =
-        usize::try_from(footer_offset).map_err(|_| RemObjectAeadError::SizeOverflow)?;
-    let footer_end = footer_start
-        .checked_add(REM_OBJECT_FOOTER.len())
-        .ok_or(RemObjectAeadError::SizeOverflow)?;
-    if bytes.get(footer_start..footer_end) != Some(&REM_OBJECT_FOOTER[..]) {
+    input.seek(SeekFrom::Start(footer_offset))?;
+    let mut footer = [0; 16];
+    input
+        .read_exact(&mut footer)
+        .map_err(crate::error::map_read_exact_error)?;
+    if &footer != REM_OBJECT_FOOTER {
         return Err(RemObjectAeadError::InvalidFooter);
     }
-    if bytes[footer_end..].iter().any(|byte| *byte != 0) {
-        return Err(RemObjectAeadError::FillNotZero);
+    loop {
+        let n = input.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        if buffer[..n].iter().any(|byte| *byte != 0) {
+            return Err(RemObjectAeadError::FillNotZero);
+        }
     }
 
     Ok(InspectReport {

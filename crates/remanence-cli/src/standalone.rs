@@ -3,8 +3,8 @@
 use clap::{Parser, Subcommand};
 use remanence_api::{MountBackend, MountTarget, OperatorMount};
 use remanence_library::{
-    BlockSize, DeviceAttachment, DiscoveryReport, DriveHandle, DriveHandleSink, DriveHandleSource,
-    IoErrorKind, SgTransport, StaticAllowlist,
+    BlockSize, DeviceAttachment, DiscoveryReport, DriveHandle, DriveHandleSource, IoErrorKind,
+    SgTransport, StaticAllowlist,
 };
 use remanence_state::{
     GenerationSource, LabelProvenance, MediaObservation, StateHandle, StatePaths,
@@ -169,6 +169,12 @@ enum Tape {
     SetGeneration {
         #[arg(long)]
         generation: String,
+    },
+    SupersedeTail {
+        #[arg(long)]
+        acknowledge_tape: String,
+        #[arg(long)]
+        confirm_supersede: Option<String>,
     },
     ImportJournals {
         #[arg(long)]
@@ -1043,6 +1049,31 @@ where
                         Ok(json!({"generation":generation}))
                     })
                     .map_err(err),
+                Tape::SupersedeTail {
+                    acknowledge_tape,
+                    confirm_supersede,
+                } => {
+                    let discarded = backend.supersede_tail(&mut mounted, acknowledge_tape, |expected, found| {
+                        eprintln!("Tail to discard: {}", found.join(", "));
+                        let confirmation = match confirm_supersede {
+                            Some(value) => value.clone(),
+                            None => {
+                                use std::io::IsTerminal;
+                                if !std::io::stdin().is_terminal() {
+                                    return Err(format!("non-interactive supersede requires --confirm-supersede {expected:?}"));
+                                }
+                                eprint!("Type {expected:?} to discard this tail: ");
+                                std::io::stderr().flush().map_err(err)?;
+                                let mut line = String::new();
+                                std::io::stdin().read_line(&mut line).map_err(err)?;
+                                line.trim_end_matches(['\r', '\n']).to_owned()
+                            }
+                        };
+                        if confirmation != expected { return Err("supersede confirmation did not match".into()); }
+                        Ok(())
+                    }).map_err(err)?;
+                    Ok(json!({"discarded_object_ids": discarded}))
+                }
                 Tape::ImportJournals { from } => {
                     backend.import_journals(&mut mounted, from).map_err(err)?;
                     Ok(json!({"imported_from":from}))
@@ -1262,8 +1293,8 @@ fn complete_init(
         observation,
         decision,
     } = plan;
-    let action = remanence_api::maybe_write_tape_init_bootstrap(
-        &mut DriveHandleSink(drive),
+    let action = remanence_api::maybe_write_tape_init_bootstrap_on_drive(
+        drive,
         &decision,
         remanence_api::TapeInitWriteOptions::default(),
         uuid,
@@ -1485,6 +1516,34 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn supersede_tail_routes_and_parses_exact_confirmation() {
+        use clap::Parser;
+        let args = [
+            "rem",
+            "tape",
+            "supersede-tail",
+            "--device",
+            "/dev/sg-test",
+            "--acknowledge-tape",
+            "HAND",
+            "--confirm-supersede",
+            "SUPERSEDE HAND",
+        ];
+        assert!(super::selected(
+            &args
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        ));
+        let cli = super::Cli::try_parse_from(args).unwrap();
+        assert!(
+            matches!(cli.command, super::Command::Tape { command: super::Tape::SupersedeTail {
+            acknowledge_tape, confirm_supersede: Some(confirmation)
+        } } if acknowledge_tape == "HAND" && confirmation == "SUPERSEDE HAND")
+        );
+    }
+
     use super::*;
     /// Help is syntax, not a search for the word in option values or operands.
     #[test]
