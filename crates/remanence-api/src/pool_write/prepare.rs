@@ -322,6 +322,14 @@ pub(crate) fn prepare_pool_object(
             )?],
             PreparedPoolSource::Paths,
         ),
+        WriteObjectSource::PreparedPath(source) => {
+            if Path::new(&source.0.spec.path) != request.archive_path {
+                return Err(PoolWriteError::InvalidInput(
+                    "prepared archive path changed".into(),
+                ));
+            }
+            (vec![source.0.clone()], PreparedPoolSource::Paths)
+        }
         WriteObjectSource::Streamed(streamed) => {
             if !matches!(request.representation, PoolWriteRepresentation::Plaintext) {
                 return Err(PoolWriteError::InvalidInput(
@@ -578,7 +586,7 @@ pub(crate) fn prepare_canonical_plaintext_pool_object(
     }
     let source_path = match &request.source {
         WriteObjectSource::Path(path) => path,
-        WriteObjectSource::Streamed(_) => {
+        WriteObjectSource::Streamed(_) | WriteObjectSource::PreparedPath(_) => {
             return Err(PoolWriteError::InvalidInput(
                 "canonical plaintext REM objects require a completed spool".to_string(),
             ));
@@ -1455,7 +1463,10 @@ pub(crate) fn encrypted_write_report(
         logical_size_bytes,
         manifest_sha256: encrypted.plaintext_layout.manifest_sha256,
     };
-    let parity_state = if object_close.highest_protected_ordinal > 0 {
+    // The first open parity epoch has a zero protection watermark until its
+    // checkpoint barrier. Writer context, not that watermark, identifies parity.
+    let has_parity = unprotected_context.is_none();
+    let parity_state = if has_parity {
         Some(remanence_parity::ObjectParityState::from_ordinals(
             object_close.first_parity_data_ordinal,
             object_close.data_block_count,
@@ -1468,16 +1479,14 @@ pub(crate) fn encrypted_write_report(
         object_id: prepared.options.object_id.clone(),
         tape_uuid,
         tape_file_number: object_close.tape_file_number,
-        first_parity_data_ordinal: (object_close.highest_protected_ordinal > 0)
-            .then_some(object_close.first_parity_data_ordinal),
+        first_parity_data_ordinal: has_parity.then_some(object_close.first_parity_data_ordinal),
         data_block_count: object_close.data_block_count,
-        protected_until_ordinal: (object_close.highest_protected_ordinal > 0)
-            .then_some(object_close.highest_protected_ordinal),
+        protected_until_ordinal: has_parity.then_some(object_close.highest_protected_ordinal),
         parity_state,
         plaintext_digest: encrypted.envelope.plaintext.digest,
         stored_digest: encrypted.envelope.stored_digest,
     };
-    let tape_file_bundle = if object_close.highest_protected_ordinal > 0 {
+    let tape_file_bundle = if has_parity {
         let mut bundle = object_close.committed_bundle()?;
         for entry in &mut bundle.entries {
             if entry.kind == TapeFileKind::Object

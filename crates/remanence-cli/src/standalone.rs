@@ -77,10 +77,14 @@ enum Command {
         pool: Option<String>,
         #[arg(long)]
         recipient: Vec<PathBuf>,
+        #[arg(long, alias = "tape-uuid")]
+        tape: Option<String>,
     },
     Get {
         object: String,
         #[arg(long)]
+        version: Option<Uuid>,
+        #[arg(long, alias = "dest")]
         out: PathBuf,
         #[arg(long)]
         private_key: Option<PathBuf>,
@@ -447,9 +451,35 @@ where
         }
     };
     let mut observed = vec![];
-    let result = dispatch(&cli, &env, enumeration, factory, &mut observed, errors);
+    let mut output = PutOutput {
+        out,
+        json: cli.json,
+        receipts: Vec::new(),
+        summary: None,
+        tape_continuation: false,
+    };
+    let result = dispatch(
+        &cli,
+        &env,
+        enumeration,
+        factory,
+        &mut observed,
+        errors,
+        &mut output,
+    );
+    if let Err(error) = &result {
+        if matches!(cli.command, Command::Put { .. }) && output.summary.is_none() {
+            let _ = output.finish(Some(&(PathBuf::new(), error.clone())), "");
+        }
+    }
+    let receipts = std::mem::take(&mut output.receipts);
+    let summary = output.summary.take();
+    drop(output);
     let value = match &result {
         Ok(v) => json!({"ok":true,"result":v}),
+        Err(e) if matches!(cli.command, Command::Put { .. }) => {
+            json!({"ok":false,"status":"failed","error":e,"result":{"receipts":receipts,"summary":summary}})
+        }
         Err(e) => json!({"ok":false,"status":"failed","error":e}),
     };
     if cli.json {
@@ -459,12 +489,13 @@ where
         let _ = writeln!(out, "{value}");
     } else {
         match &result {
-            Ok(v) => {
+            Ok(v) if !matches!(cli.command, Command::Put { .. }) => {
                 let _ = writeln!(out, "{}", serde_json::to_string_pretty(v).unwrap());
             }
             Err(e) => {
                 let _ = writeln!(errors, "error: {e}");
             }
+            Ok(_) => {}
         }
     }
     if result.is_ok() {
@@ -554,6 +585,7 @@ fn dispatch<F, E>(
     factory: &mut F,
     observed: &mut Vec<Value>,
     errors: &mut dyn Write,
+    output: &mut PutOutput<'_>,
 ) -> Result<Value, String>
 where
     F: FnMut(&Path) -> Result<Box<dyn SgTransport>, IoErrorKind>,
@@ -840,12 +872,27 @@ where
             paths,
             pool,
             recipient,
+            tape: guard,
         } => {
+            backend.reconcile_checkpoints().map_err(err)?;
             let tape = backend
                 .catalog_index()
                 .get_tape(&uuid)
                 .map_err(err)?
                 .ok_or("loaded tape is not catalogued; use tape adopt")?;
+            if let Some(guard) = guard {
+                if !Uuid::parse_str(guard)
+                    .map(|u| *u.as_bytes() == uuid)
+                    .unwrap_or(false)
+                    && tape.voltag.as_deref() != Some(guard.as_str())
+                {
+                    return Err(format!(
+                        "requested tape {guard} differs from loaded tape {} ({})",
+                        tape.voltag.as_deref().unwrap_or("unlabelled"),
+                        Uuid::from_bytes(uuid)
+                    ));
+                }
+            }
             let loaded = tape
                 .pool_id
                 .ok_or("loaded tape has no pool; use tape assign-pool")?;
@@ -863,64 +910,181 @@ where
                     recipients: crate::pool_ops::read_recipient_files(recipient)?,
                 }
             };
-            let mut files = vec![];
+            let mut objects = Vec::new();
+            let mut failed = None;
             for p in paths {
-                collect_files(
-                    p,
-                    p.file_name()
-                        .map(PathBuf::from)
-                        .ok_or("source has no filename")?,
-                    &mut files,
-                )?;
+                let archive = p
+                    .file_name()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| p.clone());
+                let result = collect_files(p, archive, &mut |source, archive_path, kind| {
+                    if let Some(kind) = kind {
+                        return output.receipt(
+                            json!({"event":"skipped_unsupported","path":archive_path.to_string_lossy(),"kind":kind}),
+                        );
+                    }
+                    let request = remanence_api::WriteObjectToPoolRequest {
+                        pool_id: loaded.clone(),
+                        caller_object_id: format!("put:{}", Uuid::new_v4()),
+                        archive_path: archive_path.clone(),
+                        source: remanence_api::WriteObjectSource::Path(source.into()),
+                        expected_content_sha256: None,
+                        expected_object_id: None,
+                        representation: representation.clone(),
+                        input_kind: remanence_api::WriteObjectInputKind::LogicalFile,
+                    };
+                    match backend
+                        .put_path_version(&mut mounted, request)
+                        .map_err(|error| {
+                            output.tape_continuation = tape_continuation(&error);
+                            format!("{}: {error}", source.display())
+                        })? {
+                        Ok((result, reason)) => {
+                            let mut locator = Vec::new();
+                            crate::pool_ops::print_locator_json_with_recipients(
+                                &result.object,
+                                &loaded,
+                                None,
+                                &mut locator,
+                            );
+                            let locator: Value = serde_json::from_slice(&locator).map_err(err)?;
+                            output.receipt(json!({"event":"written","reason":reason,"path":archive_path.to_string_lossy(),"object_id":Uuid::from_bytes(result.object.object_id),"tape_uuid":Uuid::from_bytes(uuid),"label":tape.voltag,"bytes":result.object.logical_size_bytes}))?;
+                            objects.push(locator);
+                        }
+                        Err(version) => {
+                            let (copy, label) = version
+                                .copies
+                                .first()
+                                .ok_or("committed version has no copy")?;
+                            output.receipt(json!({"event":"already_stored","path":archive_path.to_string_lossy(),"object_id":version.object_id,"tape_uuid":Uuid::from_slice(copy).map_err(err)?,"label":label}))?;
+                        }
+                    }
+                    Ok(())
+                });
+                if let Err(failure) = result {
+                    failed = Some(failure);
+                    break;
+                }
             }
-            if files.is_empty() {
-                return Err("put found no regular files to archive".into());
+            output.finish(failed.as_ref(), &loaded)?;
+            match failed {
+                Some((path, error)) => Err(format!("{}: {error}", path.display())),
+                None => Ok(
+                    json!({"tape":Uuid::from_bytes(uuid),"pool":loaded,"objects":objects,"receipts":output.receipts,"summary":output.summary}),
+                ),
             }
-            let mut objects = vec![];
-            for (source, archive_path) in files {
-                let request = remanence_api::WriteObjectToPoolRequest {
-                    pool_id: loaded.clone(),
-                    caller_object_id: archive_path.to_string_lossy().into_owned(),
-                    archive_path,
-                    source: remanence_api::WriteObjectSource::Path(source),
-                    expected_content_sha256: None,
-                    expected_object_id: None,
-                    representation: representation.clone(),
-                    input_kind: remanence_api::WriteObjectInputKind::LogicalFile,
-                };
-                let result = backend
-                    .write_checkpointed(&mut mounted, request)
-                    .map_err(err)?;
-                let mut locator = Vec::new();
-                crate::pool_ops::print_locator_json_with_recipients(
-                    &result.object,
-                    &loaded,
-                    None,
-                    &mut locator,
-                );
-                objects.push(serde_json::from_slice::<Value>(&locator).map_err(err)?);
-            }
-            Ok(json!({"tape":Uuid::from_bytes(uuid),"pool":loaded,"objects":objects}))
         }
         Command::Get {
             object,
+            version,
             out,
             private_key,
         } => {
+            backend.reconcile_checkpoints().map_err(err)?;
+            let normalized;
+            let object = if Uuid::parse_str(object).is_ok() {
+                object.as_str()
+            } else {
+                normalized = remanence_stream::normalize_archive_path(Path::new(
+                    object.trim_start_matches('/'),
+                ))
+                .map_err(err)?;
+                &normalized
+            };
+            let object_id = if let Ok(id) = Uuid::parse_str(object) {
+                if version.is_some() {
+                    return Err("--version requires an archive path selector".into());
+                }
+                id.to_string()
+            } else {
+                let versions = backend
+                    .catalog_index()
+                    .list_committed_versions_by_path_on_tape(object, &uuid)
+                    .map_err(err)?;
+                let selected = versions
+                    .iter()
+                    .find(|v| version.is_none_or(|id| v.object_id == id.to_string()));
+                if let Some(selected) = selected {
+                    selected.object_id.clone()
+                } else if versions.is_empty()
+                    && version.is_none()
+                    && backend
+                        .catalog_index()
+                        .list_committed_versions_by_path_any_pool(object)
+                        .map_err(err)?
+                        .is_empty()
+                {
+                    backend
+                        .catalog_index()
+                        .get_native_object_by_caller_object_id(object)
+                        .map_err(err)?
+                        .ok_or_else(|| format!("{object} is not catalogued"))?
+                        .object_id
+                } else {
+                    let elsewhere = backend
+                        .catalog_index()
+                        .list_committed_versions_by_path_any_pool(object)
+                        .map_err(err)?;
+                    let mut locations: Vec<_> = elsewhere
+                        .iter()
+                        .filter(|v| version.is_none_or(|id| v.object_id == id.to_string()))
+                        .flat_map(|v| &v.copies)
+                        .map(|(id, label)| {
+                            Ok(format!(
+                                "{} ({})",
+                                label.as_deref().unwrap_or("unlabelled"),
+                                Uuid::from_slice(id).map_err(err)?
+                            ))
+                        })
+                        .collect::<Result<_, String>>()?;
+                    locations.sort();
+                    locations.dedup();
+                    if locations.is_empty() {
+                        return Err(format!(
+                            "{object}: requested version is not catalogued for this path"
+                        ));
+                    }
+                    return Err(format!(
+                        "{object} is not on this tape; it is on {}",
+                        locations.join(", ")
+                    ));
+                }
+            };
             let record = backend
                 .catalog_index()
-                .get_native_object(object)
+                .get_native_object(&object_id)
                 .map_err(err)?
-                .or(backend
-                    .catalog_index()
-                    .get_native_object_by_caller_object_id(object)
-                    .map_err(err)?)
                 .ok_or("object is not catalogued")?;
             let copy = record
                 .copies
                 .iter()
                 .find(|c| c.tape_uuid == uuid && c.status == "committed")
-                .ok_or("object has no committed copy on the loaded tape")?;
+                .ok_or_else(|| {
+                    let locations: Vec<_> = record
+                        .copies
+                        .iter()
+                        .filter(|c| c.status == "committed")
+                        .map(|c| {
+                            let label = backend
+                                .catalog_index()
+                                .get_tape(&c.tape_uuid)
+                                .ok()
+                                .flatten()
+                                .and_then(|t| t.voltag)
+                                .unwrap_or_else(|| "unlabelled".into());
+                            format!(
+                                "{label} ({})",
+                                Uuid::from_slice(&c.tape_uuid)
+                                    .map(|u| u.to_string())
+                                    .unwrap_or_default()
+                            )
+                        })
+                        .collect();
+                    format!(
+                        "{object} is not on this tape; it is on {}",
+                        locations.join(", ")
+                    )
+                })?;
             let locator=json!({"object_id":record.object_id,"caller_object_id":record.caller_object_id,"body_format":record.body_format,"pool_id":copy.pool_id,"tape_uuid":crate::bytes_to_hex(&uuid),"tape_file_number":copy.tape_file_number.to_string(),"first_body_lba":copy.first_body_lba.to_string(),"content_sha256":crate::bytes_to_hex(record.content_hash.as_deref().ok_or("object lacks content hash")?)}).to_string();
             let result = crate::pool_ops::restore_mounted_tape_object(
                 mounted,
@@ -1108,25 +1272,122 @@ where
     backend.finish().map_err(err)?;
     result
 }
+/// Only tape-capacity authority may suggest closing a cartridge; host I/O cannot.
+fn tape_continuation(error: &remanence_api::MountError) -> bool {
+    if matches!(error, remanence_api::MountError::EarlyWarning) {
+        return true;
+    }
+    matches!(error, remanence_api::MountError::PoolWrite(cause) if matches!(cause.as_ref(),
+    remanence_api::PoolWriteError::SelectedTapeInsufficientCapacity { .. }
+    | remanence_api::PoolWriteError::TerminalCloseRequired { .. }
+    | remanence_api::PoolWriteError::Parity(remanence_parity::ParityError::CapacityReserveExceeded {
+        cause: remanence_parity::CapacityReserveCause::TapeCapacity, ..
+    })))
+}
+
+/// Stream receipts before proceeding to another file, retaining them for the envelope.
+struct PutOutput<'a> {
+    out: &'a mut dyn Write,
+    json: bool,
+    receipts: Vec<Value>,
+    summary: Option<Value>,
+    tape_continuation: bool,
+}
+impl PutOutput<'_> {
+    fn receipt(&mut self, receipt: Value) -> Result<(), String> {
+        if self.json {
+            writeln!(self.out, "{receipt}").map_err(err)?;
+        } else {
+            writeln!(
+                self.out,
+                "{:<20} {}{}",
+                receipt["event"].as_str().unwrap_or(""),
+                receipt["path"].as_str().unwrap_or(""),
+                if receipt["event"] == "skipped_unsupported" {
+                    format!(" ({})", receipt["kind"].as_str().unwrap_or(""))
+                } else {
+                    format!(
+                        "  {}  {} ({}){}",
+                        receipt["object_id"].as_str().unwrap_or(""),
+                        receipt["label"].as_str().unwrap_or("unlabelled"),
+                        receipt["tape_uuid"].as_str().unwrap_or(""),
+                        receipt
+                            .get("bytes")
+                            .map(|b| format!("  {b} bytes"))
+                            .unwrap_or_default()
+                    )
+                }
+            )
+            .map_err(err)?;
+        }
+        self.out.flush().map_err(err)?;
+        self.receipts.push(receipt);
+        Ok(())
+    }
+    fn finish(&mut self, failed: Option<&(PathBuf, String)>, pool: &str) -> Result<(), String> {
+        let count = |event| self.receipts.iter().filter(|r| r["event"] == event).count();
+        let (written, already_stored, skipped) = (
+            count("written"),
+            count("already_stored"),
+            count("skipped_unsupported"),
+        );
+        let next = (failed.is_some() && self.tape_continuation).then(|| {
+            format!("finalize this tape, init the next in pool {pool}, and re-run the same put")
+        });
+        let summary = json!({"event":"summary","written":written,"already_stored":already_stored,"skipped":skipped,"failed":failed.map(|(path,error)|json!({"path":path.to_string_lossy(),"error":error})),"next":next});
+        if self.json {
+            writeln!(self.out, "{summary}").map_err(err)?;
+        } else {
+            writeln!(
+                self.out,
+                "Total: {written} written, {already_stored} already_stored, {skipped} skipped{}",
+                failed
+                    .map(|(p, e)| format!(
+                        "; failed {}: {e}; {}",
+                        p.display(),
+                        next.as_deref().unwrap_or("")
+                    ))
+                    .unwrap_or_default()
+            )
+            .map_err(err)?;
+        }
+        self.out.flush().map_err(err)?;
+        self.summary = Some(summary);
+        Ok(())
+    }
+}
+
+/// Walk deterministically without following links; deliver each decision immediately.
 fn collect_files(
     source: &Path,
     archive: PathBuf,
-    files: &mut Vec<(PathBuf, PathBuf)>,
-) -> Result<(), String> {
-    let meta = fs::symlink_metadata(source).map_err(err)?;
-    if meta.is_file() {
-        files.push((source.into(), archive));
-    } else if meta.is_dir() {
+    visit: &mut impl FnMut(&Path, PathBuf, Option<&str>) -> Result<(), String>,
+) -> Result<(), (PathBuf, String)> {
+    use std::os::unix::fs::FileTypeExt;
+    let at = |e| (archive.clone(), err(e));
+    let meta = fs::symlink_metadata(source).map_err(at)?;
+    if meta.is_dir() {
         let mut entries = fs::read_dir(source)
-            .map_err(err)?
+            .map_err(at)?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(err)?;
+            .map_err(at)?;
         entries.sort_by_key(|e| e.file_name());
         for e in entries {
-            collect_files(&e.path(), archive.join(e.file_name()), files)?;
+            collect_files(&e.path(), archive.join(e.file_name()), visit)?;
         }
     } else {
-        return Err(format!("unsupported source type: {}", source.display()));
+        let kind = if meta.is_file() {
+            None
+        } else if meta.file_type().is_symlink() {
+            Some("symlink")
+        } else if meta.file_type().is_fifo() {
+            Some("fifo")
+        } else if meta.file_type().is_socket() {
+            Some("socket")
+        } else {
+            Some("device")
+        };
+        visit(source, archive.clone(), kind).map_err(|e| (archive, e))?;
     }
     Ok(())
 }
@@ -1516,6 +1777,78 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn capacity_failures_preserve_totals_and_name_the_continuation_pool() {
+        assert!(super::tape_continuation(
+            &remanence_api::MountError::EarlyWarning
+        ));
+        for cause in [
+            remanence_api::PoolWriteError::SelectedTapeInsufficientCapacity {
+                object_size: 10,
+                raw_capacity: 9,
+                used: 0,
+            },
+            remanence_api::PoolWriteError::TerminalCloseRequired {
+                detail: "terminal reserve".into(),
+            },
+        ] {
+            let error = remanence_api::MountError::PoolWrite(Box::new(cause));
+            let mut bytes = Vec::new();
+            let mut output = super::PutOutput {
+                out: &mut bytes,
+                json: true,
+                receipts: Vec::new(),
+                summary: None,
+                tape_continuation: false,
+            };
+            output
+                .receipt(serde_json::json!({"event":"written","path":"first"}))
+                .unwrap();
+            output.tape_continuation = super::tape_continuation(&error);
+            output
+                .finish(Some(&("second".into(), error.to_string())), "archive")
+                .unwrap();
+            let summary = output.summary.unwrap();
+            assert_eq!(summary["written"], 1);
+            assert_eq!(summary["failed"]["path"], "second");
+            assert_eq!(
+                summary["next"],
+                "finalize this tape, init the next in pool archive, and re-run the same put"
+            );
+        }
+    }
+
+    /// ENOSPC on the host must retain its path without proposing tape finalization.
+    #[test]
+    fn host_enospc_has_null_continuation() {
+        let error =
+            remanence_api::MountError::PoolWrite(Box::new(remanence_api::PoolWriteError::Io {
+                context: "write spool",
+                path: "/host/spool/object".into(),
+                source: std::io::Error::from_raw_os_error(28),
+            }));
+        let mut bytes = Vec::new();
+        let mut output = super::PutOutput {
+            out: &mut bytes,
+            json: true,
+            receipts: Vec::new(),
+            summary: None,
+            tape_continuation: super::tape_continuation(&error),
+        };
+        output
+            .finish(
+                Some(&("/host/spool/object".into(), error.to_string())),
+                "archive",
+            )
+            .unwrap();
+        let summary = output.summary.unwrap();
+        assert!(summary["next"].is_null());
+        assert!(summary["failed"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("/host/spool/object"));
+    }
+
     #[test]
     fn supersede_tail_routes_and_parses_exact_confirmation() {
         use clap::Parser;

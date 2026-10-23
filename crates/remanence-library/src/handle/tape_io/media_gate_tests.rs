@@ -671,7 +671,7 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
         ),
         // Frozen P1 model-only fault-injection forwarders.
         ("remanence-api/tests/oracle_standalone_mount.rs", DispatchPolicy::Exact { execute_out: 1, execute_none: 2, why: "P1 model fault-injection forwarder" }),
-        ("remanence-cli/tests/standalone_dispatch.rs", DispatchPolicy::Exact { execute_out: 1, execute_none: 1, why: "P5 integration model transport forwarder; no production dispatch" }),
+        ("remanence-cli/tests/standalone_dispatch.rs", DispatchPolicy::Exact { execute_out: 2, execute_none: 2, why: "integration model and source-mutation transport forwarders; no production dispatch" }),
         ("remanence-cli/tests/oracle_standalone_cli.rs", DispatchPolicy::Exact { execute_out: 1, execute_none: 2, why: "P1 model fault-injection forwarder" }),
     ];
 

@@ -7660,7 +7660,8 @@ async fn append_finish_does_not_double_count() {
                 } => {
                     let spool_path = match source {
                         crate::WriteObjectSource::Path(path) => path,
-                        crate::WriteObjectSource::Streamed(_) => {
+                        crate::WriteObjectSource::Streamed(_)
+                        | crate::WriteObjectSource::PreparedPath(_) => {
                             panic!("test expected path-backed append source")
                         }
                     };
@@ -7858,7 +7859,9 @@ async fn overlap_success_response_waits_for_checkpointed_receipt() {
         };
         let streamed = match source {
             crate::WriteObjectSource::Streamed(streamed) => streamed,
-            crate::WriteObjectSource::Path(_) => panic!("expected overlap stream"),
+            crate::WriteObjectSource::Path(_) | crate::WriteObjectSource::PreparedPath(_) => {
+                panic!("expected overlap stream")
+            }
         };
         let received = tokio::task::spawn_blocking(move || streamed.read_all_for_test())
             .await

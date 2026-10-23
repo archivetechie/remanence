@@ -343,11 +343,18 @@ impl StreamedWriteSource {
     }
 }
 
+/// A file prepared once for standalone version comparison and streaming validation.
+/// Fields stay private so only the regular-file preparation funnel can create it.
+#[derive(Debug)]
+pub struct PreparedPathSource(pub(crate) remanence_stream::PreparedFile);
+
 /// Payload source for one pool write.
 #[derive(Debug)]
 pub enum WriteObjectSource {
     /// Completed local file used by the legacy serial and in-process paths.
     Path(PathBuf),
+    /// Prepared local file; the writer still validates every streamed byte.
+    PreparedPath(PreparedPathSource),
     /// Live bounded-ring consumer used only by plaintext overlap appends.
     Streamed(StreamedWriteSource),
 }
@@ -356,6 +363,7 @@ impl WriteObjectSource {
     pub(crate) fn size_bytes(&self) -> Result<u64, PoolWriteError> {
         match self {
             Self::Path(path) => source_file_size(path),
+            Self::PreparedPath(source) => Ok(source.0.spec.size_bytes),
             Self::Streamed(source) => Ok(source.size_bytes),
         }
     }
@@ -363,13 +371,16 @@ impl WriteObjectSource {
     pub(crate) fn content_sha256(&self) -> Result<[u8; 32], PoolWriteError> {
         match self {
             Self::Path(path) => sha256_file(path),
+            Self::PreparedPath(source) => source.0.spec.file_sha256.ok_or_else(|| {
+                PoolWriteError::InvalidInput("prepared regular file has no digest".into())
+            }),
             Self::Streamed(source) => Ok(source.content_sha256),
         }
     }
 
     pub(crate) fn stream_control(&self) -> Option<Arc<crate::append_ring::AppendRingControl>> {
         match self {
-            Self::Path(_) => None,
+            Self::Path(_) | Self::PreparedPath(_) => None,
             Self::Streamed(source) => Some(Arc::clone(&source.control)),
         }
     }

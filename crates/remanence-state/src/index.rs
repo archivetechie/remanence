@@ -46,7 +46,7 @@ use crate::error::StateError;
 use crate::{DriveKey, LabelProvenance, MediaObservation};
 
 /// Current Layer 4 SQLite schema version.
-pub const SCHEMA_VERSION: u32 = 19;
+pub const SCHEMA_VERSION: u32 = 20;
 
 /// Oldest clean-break catalog whose tape table can be inspected safely by the
 /// exact full-catalog erase admission path. Ordinary opens migrate the supported
@@ -1101,6 +1101,21 @@ pub struct NativeObjectCopyRecord {
     /// Exclusive end of the copy's span: `global_start_block + block_count`.
     /// Present exactly when `global_start_block` is.
     pub global_end_block: Option<u64>,
+}
+
+/// A committed version of an archive path, derived from object and copy rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VersionRow {
+    /// Object UUID identifying this version.
+    pub object_id: String,
+    /// Exact member payload length.
+    pub size_bytes: u64,
+    /// SHA-256 of the member bytes.
+    pub file_sha256: Vec<u8>,
+    /// Original object creation timestamp from the checkpoint projection.
+    pub created_at_utc: String,
+    /// Committed tape UUIDs and their optional display labels in the query scope.
+    pub copies: Vec<(Vec<u8>, Option<String>)>,
 }
 
 /// Native object member-file row for catalog-backed partial-file restore.
@@ -5713,6 +5728,82 @@ impl CatalogIndex {
         Ok(files)
     }
 
+    /// Newest committed versions in the copy's pool, independent of tape assignment.
+    pub fn list_committed_versions_by_path(
+        &self,
+        pool_id: &str,
+        archive_path: &str,
+    ) -> Result<Vec<VersionRow>, StateError> {
+        self.committed_versions_by_path(archive_path, Some(pool_id), None)
+    }
+
+    /// Newest versions with a committed copy on the specified cartridge.
+    pub fn list_committed_versions_by_path_on_tape(
+        &self,
+        archive_path: &str,
+        tape_uuid: &[u8; 16],
+    ) -> Result<Vec<VersionRow>, StateError> {
+        self.committed_versions_by_path(archive_path, None, Some(tape_uuid))
+    }
+
+    /// All committed locations for a path, used to explain a wrong-tape lookup.
+    pub fn list_committed_versions_by_path_any_pool(
+        &self,
+        archive_path: &str,
+    ) -> Result<Vec<VersionRow>, StateError> {
+        self.committed_versions_by_path(archive_path, None, None)
+    }
+
+    fn committed_versions_by_path(
+        &self,
+        path: &str,
+        pool: Option<&str>,
+        tape: Option<&[u8; 16]>,
+    ) -> Result<Vec<VersionRow>, StateError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "select o.object_id, f.size_bytes, f.file_sha256, o.created_at_utc,
+                    c.tape_uuid, t.voltag
+             from object_files f join objects o on o.object_id = f.object_id
+             join object_copies c on c.object_id = o.object_id
+             join tapes t on t.tape_uuid = c.tape_uuid
+             where f.path = ?1 and c.status = 'committed'
+               and (?2 is null or c.pool_id = ?2)
+               and (?3 is null or c.tape_uuid = ?3)
+             order by o.created_at_utc desc, o.rowid desc, c.tape_uuid",
+            )
+            .map_err(|e| sqlite_error("prepare committed path versions", e))?;
+        let mut rows = stmt
+            .query(params![path, pool, tape.map(|t| t.as_slice())])
+            .map_err(|e| sqlite_error("query committed path versions", e))?;
+        let mut versions: Vec<VersionRow> = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| sqlite_error("read committed path versions", e))?
+        {
+            let object_id: String = row_get(row, 0, "objects.object_id")?;
+            if versions.last().is_none_or(|v| v.object_id != object_id) {
+                versions.push(VersionRow {
+                    object_id,
+                    size_bytes: row_get::<SqliteU64>(row, 1, "object_files.size_bytes")?.get(),
+                    file_sha256: row_get(row, 2, "object_files.file_sha256")?,
+                    created_at_utc: row_get(row, 3, "objects.created_at_utc")?,
+                    copies: Vec::new(),
+                });
+            }
+            let copy = (
+                row_get(row, 4, "object_copies.tape_uuid")?,
+                row_get(row, 5, "tapes.voltag")?,
+            );
+            let version = versions.last_mut().expect("version inserted above");
+            if !version.copies.contains(&copy) {
+                version.copies.push(copy);
+            }
+        }
+        Ok(versions)
+    }
+
     /// Fetch a native object and its copies by content hash.
     pub fn get_native_object_by_content_hash(
         &self,
@@ -8613,10 +8704,13 @@ fn inspect_checkpoint_projection_tx(
     if !missing {
         return Ok(CheckpointReplayPlan::AlreadyProjected);
     }
-    let next_tape_file_number = SqliteU64::new(record.next_tape_file_number);
-    let later_prefix_visible =
-        last_committed_tape_file.is_some_and(|last| last >= next_tape_file_number);
-    if record_component_visible || later_prefix_visible {
+    // Rebuild can preserve the tape watermark while dropping every row at this
+    // exact boundary (notably without a parity journal). The validated checkpoint
+    // repairs that prefix, including its last file, rather than appending it again.
+    let checkpoint_last_file = SqliteU64::new(expected_last_committed_tape_file);
+    let checkpoint_prefix_visible =
+        last_committed_tape_file.is_some_and(|last| last >= checkpoint_last_file);
+    if record_component_visible || checkpoint_prefix_visible {
         if tape_is_retired {
             Ok(CheckpointReplayPlan::RepairRetired)
         } else {
@@ -13900,7 +13994,11 @@ fn migrate_inner(conn: &Connection) -> Result<(), StateError> {
             "sqlite user_version {current} is newer than supported {SCHEMA_VERSION}"
         )));
     }
-    if current == SCHEMA_VERSION {
+    if current == 19 {
+        conn.execute_batch("create index if not exists object_files_by_path_idx on object_files(path); PRAGMA user_version = 20;")
+            .map_err(|e| sqlite_error("install path lookup index", e))?;
+    }
+    if current == SCHEMA_VERSION || current == 19 {
         conn.execute_batch(TAPE_AUDIT_CURSOR_SCHEMA)
             .map_err(|e| sqlite_error("install replay cursors", e))?;
         return validate_unsigned_structural_schema(conn);
@@ -14435,6 +14533,8 @@ create table if not exists object_files(
   primary key(object_id, file_id)
 );
 
+create index if not exists object_files_by_path_idx on object_files(path);
+
 create index if not exists object_files_path_idx
   on object_files(object_id, path);
 
@@ -14817,6 +14917,92 @@ mod tests {
     };
 
     use super::*;
+
+    /// Existing catalogs receive the lookup index through schema migration.
+    #[test]
+    fn schema_19_without_path_index_migrates_on_open() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("catalog.sqlite");
+        let index = CatalogIndex::open(&path).unwrap();
+        index
+            .conn
+            .execute_batch("drop index object_files_by_path_idx; PRAGMA user_version = 19;")
+            .unwrap();
+        drop(index);
+        let index = CatalogIndex::open(&path).unwrap();
+        assert_eq!(index.schema_version().unwrap(), SCHEMA_VERSION);
+        let present: bool = index.conn.query_row("select exists(select 1 from sqlite_master where type='index' and name='object_files_by_path_idx')", [], |r| r.get(0)).unwrap();
+        assert!(present);
+    }
+
+    #[test]
+    fn path_versions_use_copy_pool_and_rowid_ties_with_legacy_caller_ids() {
+        let mut index = CatalogIndex::open(":memory:").unwrap();
+        for (tape, label) in [([1; 16], "FIRST"), ([2; 16], "SECOND")] {
+            index
+                .provision_tape(ProvisionTapeInput {
+                    tape_uuid: tape,
+                    voltag: label.into(),
+                    block_size: 262144,
+                    parity: ParityConfig::None,
+                    force: false,
+                })
+                .unwrap();
+            index
+                .conn
+                .execute(
+                    "update tapes set pool_id = 'historical' where tape_uuid = ?1",
+                    params![tape.to_vec()],
+                )
+                .unwrap();
+        }
+        for (number, id, tape, status) in [
+            (1, "z-older", [1; 16], "committed"),
+            (2, "a-newer", [2; 16], "committed"),
+            (3, "uncommitted", [2; 16], "missing"),
+        ] {
+            let mut object = append_object_projection(id);
+            object.caller_object_id = Some("photos/a.txt".into());
+            let mut copy = append_copy_projection(id, tape, number);
+            copy.status = status.into();
+            index
+                .upsert_native_object_projection(object, &[copy])
+                .unwrap();
+            index.conn.execute("insert into object_files (object_id,file_id,path,size_bytes,file_sha256,chunk_count) values (?1,?1,'photos/a.txt',?2,?3,?4)", params![id, SqliteU64::new(42), vec![0x41u8;32], SqliteU64::new(1)]).unwrap();
+        }
+        // Reproduce an older catalog whose current assignment differs from copy provenance.
+        index
+            .conn
+            .execute("update tapes set pool_id = 'current'", [])
+            .unwrap();
+        let versions = index
+            .list_committed_versions_by_path("historical", "photos/a.txt")
+            .unwrap();
+        assert_eq!(
+            versions
+                .iter()
+                .map(|v| v.object_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a-newer", "z-older"]
+        );
+        assert_eq!(
+            versions[0].copies,
+            vec![(vec![2; 16], Some("SECOND".into()))]
+        );
+        assert!(index
+            .list_committed_versions_by_path("current", "photos/a.txt")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            index
+                .list_committed_versions_by_path_on_tape("photos/a.txt", &[1; 16])
+                .unwrap()[0]
+                .object_id,
+            "z-older"
+        );
+        let indexed: i64 = index.conn.query_row("select count(*) from sqlite_master where type='index' and name='object_files_by_path_idx'", [], |r|r.get(0)).unwrap();
+        assert_eq!(indexed, 1);
+    }
 
     const MINIMUM_TABLES: &[&str] = &[
         "schema_meta",
@@ -19633,6 +19819,19 @@ mod tests {
             terminal_finalization: None,
             sealed_after_write: false,
         };
+        let bundles = record
+            .objects
+            .iter()
+            .enumerate()
+            .map(|(i, object)| checkpoint_object_bundle(&record, i, object).unwrap())
+            .collect::<Vec<_>>();
+        {
+            let tx = index.conn.transaction().unwrap();
+            assert_eq!(
+                inspect_checkpoint_projection_tx(&tx, &record, &bundles, None).unwrap(),
+                CheckpointReplayPlan::StrictAppend
+            );
+        }
         journal.append(&record).expect("fsync checkpoint record");
         let terminal_record = structured_terminal_checkpoint(&record);
         let mut journal_lease = journal
@@ -19890,9 +20089,41 @@ mod tests {
             terminal_finalization: None,
             sealed_after_write: false,
         };
+        // The old journal shape (no span hints) remains replayable at the exact
+        // watermark even when all object rows have been lost during rebuild.
+        let bundles = vec![checkpoint_object_bundle(&record, 0, &record.objects[0]).unwrap()];
+        let original = index.get_native_object("span-object").unwrap().unwrap();
+        index.conn.execute_batch("delete from object_copies; delete from objects; delete from tape_files; delete from catalog_units;").unwrap();
+        {
+            let tx = index.conn.transaction().unwrap();
+            assert_eq!(
+                inspect_checkpoint_projection_tx(&tx, &record, &bundles, None).unwrap(),
+                CheckpointReplayPlan::Repair
+            );
+        }
         index
             .project_checkpoint_record(&record)
             .expect("replay repairs pre-hint rows without conflicting");
+        let repaired = index.get_native_object("span-object").unwrap().unwrap();
+        assert_eq!(repaired.caller_object_id, original.caller_object_id);
+        assert_eq!(repaired.content_hash, original.content_hash);
+        assert_eq!(repaired.created_at_utc, original.created_at_utc);
+        // Conflicting existing tape-file authority must still refuse repair.
+        index
+            .conn
+            .execute(
+                "update tape_files set object_id='conflict' where kind='object'",
+                [],
+            )
+            .unwrap();
+        assert!(index.project_checkpoint_record(&record).is_err());
+        index
+            .conn
+            .execute(
+                "update tape_files set object_id='span-object' where kind='object'",
+                [],
+            )
+            .unwrap();
 
         let copies = index
             .find_native_object_copies("span-object")

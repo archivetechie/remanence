@@ -625,6 +625,16 @@ pub fn write_to_selected_drive_checkpointed(
 ) -> Result<PoolWriteResult, PoolWriteError> {
     crate::reconcile_checkpoint_journal_projections(state)
         .map_err(|status| PoolWriteError::CheckpointReconciliation(status.message().to_string()))?;
+    write_to_selected_drive_checkpointed_reconciled(state, drive, request, selected)
+}
+
+/// Continue the same admitted writer under an already reconciled exclusive state lock.
+pub(crate) fn write_to_selected_drive_checkpointed_reconciled(
+    state: &mut StateHandle,
+    drive: &mut DriveHandle,
+    request: WriteObjectToPoolRequest,
+    selected: SelectedTape,
+) -> Result<PoolWriteResult, PoolWriteError> {
     let pool_cfg = configured_direct_pool(state, &request.pool_id)?;
     let checkpoint_journal_dir = state.paths().journal_dir.join("checkpoints");
     let parity_journal_path = state.journal_path(selected.tape_uuid);
@@ -673,6 +683,14 @@ pub fn replay_committed_pool_write_from_state(
 ) -> Result<Option<PoolWriteResult>, PoolWriteError> {
     crate::reconcile_checkpoint_journal_projections(state)
         .map_err(|status| PoolWriteError::CheckpointReconciliation(status.message().to_string()))?;
+    replay_committed_pool_write_reconciled(state, request)
+}
+
+/// Check the ordinary replay key after the command has reconciled its state lock.
+pub(crate) fn replay_committed_pool_write_reconciled(
+    state: &mut StateHandle,
+    request: &WriteObjectToPoolRequest,
+) -> Result<Option<PoolWriteResult>, PoolWriteError> {
     let pool_cfg = configured_direct_pool(state, &request.pool_id)?;
     maybe_replay_pool_write(state.catalog_index(), &pool_cfg, request)
 }

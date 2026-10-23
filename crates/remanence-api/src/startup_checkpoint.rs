@@ -179,13 +179,16 @@ pub(crate) fn replay_checkpoint_journal_projections_with_audit(
     Ok(())
 }
 
-/// Reconcile every configured checkpoint journal into the locked local state.
-///
-/// One-shot writers call this before catalog selection and again at the
-/// drive-bound admission boundary. The global replay closes the crash window
-/// in which a checkpoint became durable on tape A but SQLite had not yet made
-/// its Object identities visible before a retry considered tape B.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static RECONCILIATION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Reconcile durable checkpoint authority under the exclusive state lock.
+/// Standalone commands reconcile once; daemon entry points retain their own guard.
 pub fn reconcile_checkpoint_journal_projections(state: &mut StateHandle) -> Result<(), Status> {
+    #[cfg(test)]
+    RECONCILIATION_COUNT.with(|count| count.set(count.get() + 1));
     let checkpoint_dir = state.paths().journal_dir.join("checkpoints");
     let audit_dir = state.paths().audit_dir.clone();
     let audit_append_lock = Arc::new(std::sync::Mutex::new(()));
