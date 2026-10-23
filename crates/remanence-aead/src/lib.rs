@@ -31,7 +31,7 @@ pub use header::{
     REM_OBJECT_MAX_METADATA_FRAME_LEN, REM_OBJECT_METADATA_FRAME_MIN_LEN,
     REM_OBJECT_WRAP_SUITE_XWING,
 };
-pub use inspect::{inspect_bytes, InspectReport};
+pub use inspect::{inspect_bytes, inspect_reader, InspectReport};
 pub use kdf::{
     derive_keys, derive_salt, DerivedKeys, LABEL_METADATA, LABEL_OBJECT, LABEL_PAYLOAD, LABEL_SALT,
 };

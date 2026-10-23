@@ -64,6 +64,12 @@ use crate::handle::DriveHandle;
 /// parity layer (Layer 3c) both consume `&mut dyn BlockSink` and
 /// are oblivious to which implementation they have.
 pub trait BlockSink {
+    /// Physical drive behind a direct sink, when one exists. Terminal owners
+    /// use this to run the shared read-capable admission before emitting a plan.
+    fn append_admission_drive(&mut self) -> Option<&mut DriveHandle> {
+        None
+    }
+
     /// Write one tape block. Mirrors
     /// [`DriveHandle::write_block`](crate::handle::DriveHandle::write_block).
     fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError>;
@@ -411,7 +417,12 @@ pub trait BlockSource: BlockRead {
 pub struct DriveHandleSink<'a>(pub &'a mut DriveHandle);
 
 impl BlockSink for DriveHandleSink<'_> {
+    fn append_admission_drive(&mut self) -> Option<&mut DriveHandle> {
+        Some(self.0)
+    }
+
     fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
+        self.0.check_append_admission()?;
         self.0.write_block(buf)
     }
     fn write_block_batch(
@@ -419,6 +430,7 @@ impl BlockSink for DriveHandleSink<'_> {
         buf: &[u8],
         block_size_bytes: u32,
     ) -> Result<WriteBatchOutcome, TapeIoError> {
+        self.0.check_append_admission()?;
         self.0.write_block_batch(buf, block_size_bytes)
     }
     fn write_block_batch_pipelined(
@@ -427,6 +439,7 @@ impl BlockSink for DriveHandleSink<'_> {
         block_size_bytes: u32,
         cdb: &[u8],
     ) -> Result<WriteBatchOutcome, TapeIoError> {
+        self.0.check_append_admission()?;
         self.0
             .write_block_batch_pipelined(buf, block_size_bytes, cdb)
     }
@@ -501,15 +514,18 @@ impl BlockSink for DriveHandleSink<'_> {
         self.0.position_check_bytes()
     }
     fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError> {
+        self.0.check_append_admission()?;
         self.0.write_filemarks(count)
     }
     fn write_filemarks_immediate(&mut self, count: u32) -> Result<(), TapeIoError> {
+        self.0.check_append_admission()?;
         self.0.write_filemarks_immediate(count)
     }
     fn write_filemarks_pipelined(
         &mut self,
         count: u32,
     ) -> Result<WriteFilemarksOutcome, TapeIoError> {
+        self.0.check_append_admission()?;
         self.0.write_filemarks_pipelined(count)
     }
     fn space_to_end_of_data(&mut self) -> Result<TapePosition, TapeIoError> {
@@ -522,7 +538,7 @@ impl BlockSink for DriveHandleSink<'_> {
             .position_after)
     }
     fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
-        self.0.locate(lba)
+        self.0.locate_admitted_append(lba)
     }
     fn position(&mut self) -> Result<TapePosition, TapeIoError> {
         self.0.position()

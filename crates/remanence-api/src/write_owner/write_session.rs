@@ -74,6 +74,7 @@ pub(super) struct CloseWriteActorInput<'a> {
 pub(super) fn close_write_actor(
     input: CloseWriteActorInput<'_>,
 ) -> Result<CloseWriteActorReply, Status> {
+    input.drive.clear_append_admission();
     let mut diagnostics = CloseWriteActorDiagnostics {
         filemark_write_drain: input.append_commit_diagnostics.filemark_write_drain,
         catalog_journal_fsync: input.append_commit_diagnostics.catalog_journal_fsync,
@@ -228,6 +229,11 @@ impl WriteSessionState<'_> {
                         "write session already active",
                     )));
                 }
+                DriveCommand::SupersedeTail { reply, .. } => {
+                    let _ = reply.send(Err(Status::failed_precondition(
+                        "drive has an active session",
+                    )));
+                }
                 DriveCommand::FinalizeTape { reply, .. } => {
                     let _ = reply.send(Err(Status::failed_precondition(
                         "write session already active",
@@ -265,6 +271,28 @@ impl WriteSessionState<'_> {
                 }
             }
         }
+        if self.pending_batch.is_some() {
+            if let Err(error) = crate::append_admission::abandon_pending_append(
+                self.drive,
+                &self.checkpoint_lease,
+                self.parity_session
+                    .as_mut()
+                    .and_then(|s| s.journal.as_mut()),
+            ) {
+                let _ = fence_failed_parity_raw_write(
+                    self.index,
+                    self.cfg,
+                    &self.selected,
+                    "abandonment",
+                    None,
+                    self.pending_batch.as_ref(),
+                    &error,
+                    Status::unavailable(error.clone()),
+                );
+            }
+            self.pending_batch = None;
+        }
+        self.drive.clear_append_admission();
         self.deferred_close_reply.take()
     }
 
@@ -574,10 +602,28 @@ impl WriteSessionState<'_> {
                             }
                             Err(failure) => {
                                 let quarantine_identities = failure.requires_identity_quarantine();
+                                if failure.fence_handled && !failure.journal_durable {
+                                    if let Err(error) =
+                                        crate::append_admission::abandon_pending_append(
+                                            self.drive,
+                                            &self.checkpoint_lease,
+                                            self.parity_session
+                                                .as_mut()
+                                                .and_then(|s| s.journal.as_mut()),
+                                        )
+                                    {
+                                        tracing::warn!(%error, "fenced batch abandonment marker failed");
+                                    }
+                                }
                                 let status = if failure.journal_durable || failure.fence_handled {
                                     failure.status
                                 } else {
                                     fence_failed_checkpoint_batch(
+                                        self.drive,
+                                        &self.checkpoint_lease,
+                                        self.parity_session
+                                            .as_mut()
+                                            .and_then(|s| s.journal.as_mut()),
                                         self.index,
                                         cfg,
                                         &selected,
@@ -780,6 +826,18 @@ impl WriteSessionState<'_> {
                         ));
                     }
                     if parity_raw_write_attempted {
+                        if let Err(error) = crate::append_admission::abandon_pending_append(
+                            self.drive,
+                            &self.checkpoint_lease,
+                            self.parity_session
+                                .as_mut()
+                                .and_then(|s| s.journal.as_mut()),
+                        ) {
+                            status = Status::unavailable(format!(
+                                "{}; abandonment marker failed: {error}",
+                                status.message()
+                            ));
+                        }
                         let fenced = fence_failed_parity_raw_write(
                             self.index,
                             cfg,
@@ -798,8 +856,36 @@ impl WriteSessionState<'_> {
                         fence_audited_here = true;
                     } else if let Some(batch) = failed_batch.as_ref() {
                         status = fence_failed_checkpoint_batch(
-                            self.index, cfg, &selected, batch, status,
+                            self.drive,
+                            &self.checkpoint_lease,
+                            self.parity_session
+                                .as_mut()
+                                .and_then(|s| s.journal.as_mut()),
+                            self.index,
+                            cfg,
+                            &selected,
+                            batch,
+                            status,
                         );
+                        fence_audited_here = true;
+                    } else if let Err(error) = crate::append_admission::abandon_pending_append(
+                        self.drive,
+                        &self.checkpoint_lease,
+                        self.parity_session
+                            .as_mut()
+                            .and_then(|s| s.journal.as_mut()),
+                    ) {
+                        status = fence_failed_parity_raw_write(
+                            self.index,
+                            cfg,
+                            &selected,
+                            "abandonment",
+                            None,
+                            None,
+                            &error,
+                            status,
+                        )
+                        .0;
                         fence_audited_here = true;
                     }
                 }
@@ -1011,10 +1097,32 @@ impl WriteSessionState<'_> {
             }
             Err(failure) => {
                 let quarantine_identities = failure.requires_identity_quarantine();
+                if failure.fence_handled && !failure.journal_durable {
+                    if let Err(error) = crate::append_admission::abandon_pending_append(
+                        self.drive,
+                        &self.checkpoint_lease,
+                        self.parity_session
+                            .as_mut()
+                            .and_then(|s| s.journal.as_mut()),
+                    ) {
+                        tracing::warn!(%error, "fenced batch abandonment marker failed");
+                    }
+                }
                 let status = if failure.journal_durable || failure.fence_handled {
                     failure.status
                 } else {
-                    fence_failed_checkpoint_batch(self.index, cfg, &selected, batch, failure.status)
+                    fence_failed_checkpoint_batch(
+                        self.drive,
+                        &self.checkpoint_lease,
+                        self.parity_session
+                            .as_mut()
+                            .and_then(|s| s.journal.as_mut()),
+                        self.index,
+                        cfg,
+                        &selected,
+                        batch,
+                        failure.status,
+                    )
                 };
                 self.append_gate.record_failure();
                 if quarantine_identities {
@@ -1176,10 +1284,26 @@ impl WriteSessionState<'_> {
                 }
                 Err(failure) => {
                     let quarantine_identities = failure.requires_identity_quarantine();
+                    if failure.fence_handled && !failure.journal_durable {
+                        if let Err(error) = crate::append_admission::abandon_pending_append(
+                            self.drive,
+                            &self.checkpoint_lease,
+                            self.parity_session
+                                .as_mut()
+                                .and_then(|s| s.journal.as_mut()),
+                        ) {
+                            tracing::warn!(%error, "fenced batch abandonment marker failed");
+                        }
+                    }
                     let status = if failure.journal_durable || failure.fence_handled {
                         failure.status
                     } else {
                         fence_failed_checkpoint_batch(
+                            self.drive,
+                            &self.checkpoint_lease,
+                            self.parity_session
+                                .as_mut()
+                                .and_then(|s| s.journal.as_mut()),
                             self.index,
                             cfg,
                             &selected,
@@ -1255,6 +1379,32 @@ impl WriteSessionState<'_> {
         if requested != session_id {
             let _ = reply.send(Err(Status::not_found("write session not found")));
             return false;
+        }
+        if self.pending_batch.is_some() {
+            if let Err(error) = crate::append_admission::abandon_pending_append(
+                self.drive,
+                &self.checkpoint_lease,
+                self.parity_session
+                    .as_mut()
+                    .and_then(|s| s.journal.as_mut()),
+            ) {
+                let status = fence_failed_parity_raw_write(
+                    self.index,
+                    cfg,
+                    &self.selected,
+                    "abandonment",
+                    None,
+                    self.pending_batch.as_ref(),
+                    &error,
+                    Status::unavailable(error.clone()),
+                )
+                .0;
+                self.pending_batch = None;
+                self.drive.clear_append_admission();
+                let _ = reply.send(Err(status));
+                return true;
+            }
+            self.pending_batch = None;
         }
         let result = close_write_actor(CloseWriteActorInput {
             index: self.index,
@@ -1339,6 +1489,7 @@ pub(super) fn handle_drive_open_write(
     request: OpenWriteActorRequest,
 ) {
     let OpenWriteActorRequest {
+        actor,
         pool_cfg,
         selected,
         target_kind,
@@ -1384,6 +1535,16 @@ pub(super) fn handle_drive_open_write(
             return;
         }
     };
+    if pending_terminal_intent
+        .as_ref()
+        .is_some_and(|intent| intent.manual.is_some())
+    {
+        let _ = reply.send(Err(Status::failed_precondition(format!(
+            "tape {} has an operator-owned terminal finalization in progress; retry FinalizeTape with its original idempotency key",
+            Uuid::from_bytes(tape_uuid)
+        ))));
+        return;
+    }
     let (mut checkpoint_lease, pending_terminal_intent) = if pending_terminal_intent.is_some() {
         let lease = match checkpoint_journal.acquire_exclusive_for_terminal_recovery() {
             Ok(lease) => lease,
@@ -1444,26 +1605,6 @@ pub(super) fn handle_drive_open_write(
             return;
         }
     }
-    let parity_authority = if pending_terminal_intent.is_none()
-        && matches!(
-            selected.parity_config,
-            remanence_parity::ParityConfig::Scheme(_)
-        ) {
-        match validate_parity_actor_authority(
-            cfg,
-            &selected,
-            &checkpoint_lease,
-            &durable_checkpoint_records,
-        ) {
-            Ok(authority) => Some(authority),
-            Err(status) => {
-                let _ = reply.send(Err(status));
-                return;
-            }
-        }
-    } else {
-        None
-    };
 
     if let Err(status) = session_open_short_probe_or_load(
         index,
@@ -1534,7 +1675,8 @@ pub(super) fn handle_drive_open_write(
             drive_config.worm,
             remanence_library::WormMediaState::NotWorm
         );
-        let spec = TerminalFinalizeSpec::resume(&intent, selected.block_size, &pool_cfg);
+        let mut spec = TerminalFinalizeSpec::resume(&intent, selected.block_size, &pool_cfg);
+        spec.actor = actor.clone();
         if let Err(error) =
             index.project_terminal_finalization(TerminalFinalizationProjectionInput {
                 tape_uuid,
@@ -1616,6 +1758,51 @@ pub(super) fn handle_drive_open_write(
         elapsed_ms = crate::diagnostics::duration_ms(actor_open_started.elapsed()),
         "remanence_write_diag",
     );
+
+    let last = durable_checkpoint_records.last();
+    let ctx = crate::append_admission::context(
+        tape_uuid,
+        selected.block_size,
+        last.map_or(0, |r| r.eod_partition),
+        last.map_or(0, |r| r.eod_lba),
+    );
+    let authority = last.map_or(crate::append_admission::AppendAuthority::Fresh, |_| {
+        crate::append_admission::AppendAuthority::Checkpoint { eod: ctx.boundary }
+    });
+    let _admission = match crate::append_admission::admit_append_boundary(drive, authority, ctx) {
+        Ok(admission) => admission,
+        Err(error) => {
+            let status = crate::append_admission::daemon_admission_error(
+                actor.clone(),
+                index,
+                &super::terminal_types::TerminalConfig::terminal_config(cfg),
+                tape_uuid,
+                error,
+            );
+            let _ = reply.send(Err(status));
+            return;
+        }
+    };
+    let parity_authority = if pending_terminal_intent.is_none()
+        && matches!(
+            selected.parity_config,
+            remanence_parity::ParityConfig::Scheme(_)
+        ) {
+        match validate_parity_actor_authority(
+            cfg,
+            &selected,
+            &checkpoint_lease,
+            &durable_checkpoint_records,
+        ) {
+            Ok(authority) => Some(authority),
+            Err(status) => {
+                let _ = reply.send(Err(status));
+                return;
+            }
+        }
+    } else {
+        None
+    };
 
     let opened_at_utc = now_rfc3339().unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
     let objects_committed = 0u64;
@@ -1908,6 +2095,7 @@ pub(crate) fn prepare_drive_for_write(
     session_id: Uuid,
     media_policy: WriteMediaPolicy,
 ) -> Result<(), Status> {
+    drive.clear_append_admission();
     let prepare_started = Instant::now();
     drive
         .reverify_invalidated_state()

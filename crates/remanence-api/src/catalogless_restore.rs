@@ -149,16 +149,8 @@ fn restore(
             } else {
                 stored_path
             };
-            let mut source = FileBlockSource::open(&plain_path, size as usize).map_err(error)?;
-            let blocks = source.block_count();
-            let validated = remanence_format::stream_rem_tar_object_with_manifest_anchor(
-                &mut source,
-                size as usize,
-                blocks,
-                &mut ValidateCanonicalEntrySink,
-                anchor,
-            )
-            .map_err(error)?;
+            let validated = validate_plain_candidate(&plain_path, size, anchor).map_err(error)?;
+            let blocks = std::fs::metadata(&plain_path).map_err(error)?.len() / u64::from(size);
             let object_id = validated
                 .global_pax
                 .get("REMANENCE.object_id")
@@ -218,4 +210,365 @@ fn restore(
         });
     }
     Ok(json!({"terminal_index": terminal, "candidates": outcomes}))
+}
+
+/// Validate candidates through the same canonical reader used by restoration.
+fn validate_plain_candidate(
+    path: &Path,
+    size: u32,
+    anchor: Option<[u8; 32]>,
+) -> Result<remanence_format::RemTarStreamReport, remanence_format::error::FormatError> {
+    let mut source = FileBlockSource::open(path, size as usize)?;
+    let blocks = source.block_count();
+    remanence_format::stream_rem_tar_object_with_manifest_anchor(
+        &mut source,
+        size as usize,
+        blocks,
+        &mut ValidateCanonicalEntrySink,
+        anchor,
+    )
+}
+
+/// Physical evidence beyond the caller's checkpoint. No state rows authorize it.
+#[derive(Clone, Debug, Default)]
+pub struct AppendSuffix {
+    /// Complete plaintext objects or keylessly validated encrypted envelopes.
+    pub objects: Vec<String>,
+    /// Terminal control files that cannot belong to the supplied plan.
+    pub foreign_components: Vec<String>,
+    /// At least one incomplete candidate was present.
+    pub torn_fragment: bool,
+}
+
+/// Scan candidates directly from tape, stopping as soon as refusal is proved.
+/// Physical EOD without a closing filemark proves the final candidate is torn.
+pub(crate) fn scan_append_suffix(
+    drive: &mut DriveHandle,
+    tape_uuid: &[u8; 16],
+    size: u32,
+    start_lba: u64,
+    terminal: Option<&remanence_parity::TerminalTripleWritePlan>,
+    prefix: Option<&remanence_parity::TerminalPrefixPlan>,
+    inspect_all: bool,
+) -> Result<AppendSuffix, crate::append_admission::AdmissionError> {
+    use crate::append_admission::AdmissionError;
+    use remanence_library::TapeIoError;
+    use remanence_parity::TapeFileKind;
+    let mut result = AppendSuffix::default();
+    let mut lba = start_lba;
+    let mut block = vec![0; size as usize];
+    let mut scanned = 0u64;
+    let mut next_progress = 1u64 << 30;
+    loop {
+        let start = lba;
+        let mut head = Vec::new();
+        let mut aligned = true;
+        let mut blocks = 0;
+        let eod = loop {
+            match drive.read_block(&mut block) {
+                Ok(n) => {
+                    if n == 0 {
+                        return Err("zero-length successful read does not prove EOD".into());
+                    }
+                    if head.is_empty() {
+                        head.extend_from_slice(&block[..n]);
+                    }
+                    aligned &= n == size as usize;
+                    blocks += 1;
+                    lba = lba.checked_add(1).ok_or("suffix LBA overflow")?;
+                    if blocks == 1
+                        && remanence_parity::scan::classify_tape_file_head(
+                            &head, tape_uuid, size, false,
+                        ) != TapeFileKind::Object
+                    {
+                        let spaced = drive
+                            .space(1, remanence_library::SpaceKind::Filemarks)
+                            .map_err(AdmissionError::Io)?;
+                        if spaced.position_after.partition != 0
+                            || spaced.position_after.lba <= start
+                        {
+                            return Err("control suffix position mismatch".into());
+                        }
+                        lba = spaced.position_after.lba;
+                        if spaced.units_traversed == 1 {
+                            break false;
+                        }
+                        match drive.read_block(&mut block) {
+                            Err(e) if e.is_physical_eod() => break true,
+                            Err(e) => return Err(AdmissionError::Io(e)),
+                            Ok(_) => return Err("control suffix did not reach physical EOD".into()),
+                        }
+                    }
+                    scanned += n as u64;
+                    if scanned >= next_progress {
+                        eprintln!(
+                            "Inspecting tape suffix: {} GiB read, LBA {lba}",
+                            scanned >> 30
+                        );
+                        next_progress = scanned.saturating_add(1 << 30);
+                    }
+                }
+                Err(TapeIoError::FilemarkEncountered) => {
+                    lba = lba.checked_add(1).ok_or("suffix LBA overflow")?;
+                    break false;
+                }
+                Err(e) if e.is_physical_eod() => break true,
+                Err(e) => return Err(AdmissionError::Io(e)),
+            }
+        };
+        // Only physical EOD without a closing filemark proves truncation.
+        // This applies to every candidate, even an incomplete or corrupt header.
+        if eod && !head.is_empty() {
+            result.torn_fragment = true;
+            return Ok(result);
+        }
+        if !head.is_empty() {
+            let kind =
+                remanence_parity::scan::classify_tape_file_head(&head, tape_uuid, size, false);
+            match kind {
+                TapeFileKind::Object => {
+                    let mut candidate = TapeCandidate::new(drive, start, blocks, size)?;
+                    let classified = if !aligned {
+                        Err("short or unaligned record".to_string())
+                    } else if head.starts_with(b"REMO") {
+                        // The header geometry is checked before accepting even an
+                        // incomplete envelope; unsupported versions never become torn.
+                        let header = head
+                            .get(..128)
+                            .and_then(|b| b.try_into().ok())
+                            .ok_or_else(|| "short envelope header".to_string())
+                            .and_then(|h| remanence_aead::RemObjectHeader::parse(h).map_err(error));
+                        match header {
+                            Ok(h)
+                                if h.chunk_size == size
+                                    && blocks * u64::from(size)
+                                        >= 128 + u64::from(h.key_frame_len) =>
+                            {
+                                match remanence_aead::inspect_reader(&mut candidate) {
+                                    Ok(report) => Ok(Some(report.header.object_id)),
+                                    Err(e) => Err(e.to_string()),
+                                }
+                            }
+                            Ok(h) if h.chunk_size != size => {
+                                Err("envelope geometry differs from tape".into())
+                            }
+                            Ok(_) => {
+                                Err("incomplete key frame cannot prove a valid envelope prefix"
+                                    .into())
+                            }
+                            Err(e) => Err(e),
+                        }
+                    } else {
+                        let mut prefix = ValidateCanonicalEntrySink;
+                        match remanence_format::stream_rem_tar_object_with_manifest_anchor(
+                            &mut candidate,
+                            size as usize,
+                            blocks,
+                            &mut prefix,
+                            None,
+                        ) {
+                            Ok(report) => report
+                                .global_pax
+                                .get("REMANENCE.object_id")
+                                .cloned()
+                                .map(Some)
+                                .ok_or_else(|| "missing object id".into()),
+                            Err(e) => Err(e.to_string()),
+                        }
+                    };
+                    if let Some(error) = candidate.probe_error.take() {
+                        return Err(AdmissionError::Io(TapeIoError::OperationFailed(error)));
+                    }
+                    match classified {
+                        Ok(Some(id)) => result.objects.push(id),
+                        Ok(None) => result.torn_fragment = true,
+                        Err(detail) => result
+                            .foreign_components
+                            .push(format!("unclassifiable at LBA {start}: {detail}")),
+                    }
+                    drive.locate(lba).map_err(AdmissionError::Io)?;
+                }
+                TapeFileKind::TapeIndexReplica => {
+                    let parsed =
+                        remanence_parity::parse_tape_index_replica_header(&head, tape_uuid);
+                    let own = terminal.is_some_and(|plan| {
+                        parsed.as_ref().is_ok_and(|h| {
+                            plan.replicas
+                                .iter()
+                                .any(|p| p == &h.plan && p.component.planned_start_lba == start)
+                        })
+                    });
+                    let planned_start = terminal.is_some_and(|plan| {
+                        plan.replicas
+                            .iter()
+                            .any(|p| p.component.planned_start_lba == start)
+                    });
+                    if !own && (parsed.is_ok() || !planned_start) {
+                        result
+                            .foreign_components
+                            .push(format!("terminal replica at LBA {start}"));
+                    }
+                }
+                TapeFileKind::IndexSeparationExtent => {
+                    let parsed = remanence_parity::parse_index_separation_header(&head, tape_uuid);
+                    let own = terminal.is_some_and(|plan| {
+                        parsed.as_ref().is_ok_and(|h| {
+                            plan.separations
+                                .iter()
+                                .any(|p| p == &h.plan && p.component.planned_start_lba == start)
+                        })
+                    });
+                    let planned_start = terminal.is_some_and(|plan| {
+                        plan.separations
+                            .iter()
+                            .any(|p| p.component.planned_start_lba == start)
+                    });
+                    if !own && (parsed.is_ok() || !planned_start) {
+                        result
+                            .foreign_components
+                            .push(format!("terminal separation at LBA {start}"));
+                    }
+                }
+                TapeFileKind::ParityMap => {
+                    let hash = remanence_parity::parity_map::parse_parity_map_header_block(
+                        &head, tape_uuid,
+                    )
+                    .ok()
+                    .map(|h| h.payload_sha256);
+                    let own = prefix.is_some_and(|p| {
+                        p.committed_bundle.entries.iter().any(|e| {
+                            e.kind == kind
+                                && e.physical_start_hint == Some(start)
+                                && e.canonical_metadata_hash == hash
+                        })
+                    });
+                    if !own {
+                        result
+                            .foreign_components
+                            .push(format!("terminal parity map at LBA {start}"));
+                    }
+                }
+                TapeFileKind::ParitySidecar => {
+                    let hash =
+                        remanence_parity::sidecar::parse_sidecar_header_block(&head, tape_uuid)
+                            .ok()
+                            .map(|h| h.canonical_metadata_hash);
+                    let own = prefix.is_some_and(|p| {
+                        p.committed_bundle.entries.iter().any(|e| {
+                            e.kind == kind
+                                && e.physical_start_hint == Some(start)
+                                && e.canonical_metadata_hash == hash
+                        })
+                    });
+                    if !own {
+                        result
+                            .foreign_components
+                            .push(format!("terminal sidecar at LBA {start}"));
+                    }
+                }
+                _ => result
+                    .foreign_components
+                    .push(format!("unclassifiable at LBA {start}")),
+            }
+        } else if !eod {
+            result.torn_fragment = true;
+        }
+        if eod
+            || (!inspect_all
+                && (!result.objects.is_empty() || !result.foreign_components.is_empty()))
+        {
+            return Ok(result);
+        }
+    }
+}
+
+/// Object-local block/byte view backed by LOCATE and READ, never a disk spool.
+/// The initial walk measures geometry; existing validators then consume this view.
+struct TapeCandidate<'a> {
+    drive: &'a mut DriveHandle,
+    start: u64,
+    len: u64,
+    size: u32,
+    offset: u64,
+    cached_lba: Option<u64>,
+    probe_error: Option<String>,
+    block: Vec<u8>,
+}
+impl<'a> TapeCandidate<'a> {
+    fn new(
+        drive: &'a mut DriveHandle,
+        start: u64,
+        blocks: u64,
+        size: u32,
+    ) -> Result<Self, crate::append_admission::AdmissionError> {
+        let len = blocks
+            .checked_mul(u64::from(size))
+            .ok_or("candidate length overflow")?;
+        drive
+            .locate(start)
+            .map_err(crate::append_admission::AdmissionError::Io)?;
+        Ok(Self {
+            drive,
+            start,
+            len,
+            size,
+            offset: 0,
+            cached_lba: None,
+            probe_error: None,
+            block: vec![0; size as usize],
+        })
+    }
+}
+impl Read for TapeCandidate<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if out.is_empty() || self.offset == self.len {
+            return Ok(0);
+        }
+        let lba = self.start + self.offset / u64::from(self.size);
+        if self.cached_lba != Some(lba) {
+            if self.drive.known_position().is_none_or(|p| p.lba != lba) {
+                if let Err(error) = self.drive.locate(lba) {
+                    self.probe_error = Some(error.to_string());
+                    return Err(std::io::Error::other(error));
+                }
+            }
+            let n = match self.drive.read_block(&mut self.block) {
+                Ok(n) => n,
+                Err(error) => {
+                    self.probe_error = Some(error.to_string());
+                    return Err(std::io::Error::other(error));
+                }
+            };
+            if n != self.size as usize {
+                self.probe_error = Some("candidate geometry changed during rescan".into());
+                return Err(std::io::Error::other("short candidate block"));
+            }
+            self.cached_lba = Some(lba);
+        }
+        let within = (self.offset % u64::from(self.size)) as usize;
+        let n = out.len().min(self.block.len() - within);
+        out[..n].copy_from_slice(&self.block[within..within + n]);
+        self.offset += n as u64;
+        Ok(n)
+    }
+}
+impl Seek for TapeCandidate<'_> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let offset = match pos {
+            SeekFrom::Start(n) => i128::from(n),
+            SeekFrom::Current(n) => i128::from(self.offset) + i128::from(n),
+            SeekFrom::End(n) => i128::from(self.len) + i128::from(n),
+        };
+        if offset < 0 || offset > i128::from(self.len) {
+            return Err(std::io::Error::other("candidate seek outside file"));
+        }
+        self.offset = offset as u64;
+        Ok(self.offset)
+    }
+}
+impl BlockRead for TapeCandidate<'_> {
+    fn read_block(&mut self, out: &mut [u8]) -> Result<usize, remanence_library::TapeIoError> {
+        self.read(out)
+            .map_err(|e| remanence_library::TapeIoError::OperationFailed(e.to_string()))
+    }
 }

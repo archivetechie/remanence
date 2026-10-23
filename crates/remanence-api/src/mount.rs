@@ -186,6 +186,7 @@ impl WriteSessionTarget {
 }
 
 pub(crate) async fn open_write_session(
+    actor: remanence_state::AuditActor,
     state: &ApiState,
     target: WriteSessionTarget,
     library_constraint: Option<String>,
@@ -194,22 +195,24 @@ pub(crate) async fn open_write_session(
     await_critical_task(
         "open_write_session",
         tokio::spawn(async move {
-            open_write_session_critical(state, target, library_constraint).await
+            open_write_session_critical(actor, state, target, library_constraint).await
         }),
     )
     .await
 }
 
 async fn open_write_session_critical(
+    actor: remanence_state::AuditActor,
     state: ApiState,
     target: WriteSessionTarget,
     library_constraint: Option<String>,
 ) -> Result<pb::WriteSession, Status> {
     let pool = state.drive_pool()?.clone();
-    open_write_session_reserved(&state, &pool, target, library_constraint).await
+    open_write_session_reserved(actor, &state, &pool, target, library_constraint).await
 }
 
 async fn open_write_session_reserved(
+    actor: remanence_state::AuditActor,
     state: &ApiState,
     pool: &crate::write_owner::DrivePool,
     target: WriteSessionTarget,
@@ -367,6 +370,7 @@ async fn open_write_session_reserved(
     let open_result: Result<pb::WriteSession, Status> = async {
         drive
             .send(crate::write_owner::DriveCommand::OpenWrite {
+                actor,
                 pool_cfg,
                 selected,
                 target_kind: target.kind(),
@@ -1102,6 +1106,7 @@ async fn recover_automatic_terminal_tape(
     let (reply, response) = oneshot::channel();
     if drive
         .send(crate::write_owner::DriveCommand::OpenWrite {
+            actor: remanence_state::AuditActor::System,
             pool_cfg,
             selected,
             target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPinnedTape,
@@ -2657,6 +2662,61 @@ fn uuid_from_proto(value: &[u8], field: &str) -> Result<Uuid, Status> {
     Uuid::from_slice(value).map_err(|_| Status::invalid_argument(format!("{field} must be a UUID")))
 }
 
+/// Reserve the exact tape and drive for the shared explicit recovery operation.
+/// The spawned owner retains reservations even if the RPC client disconnects.
+pub(crate) async fn supersede_tail(
+    state: &ApiState,
+    request: crate::pb::SupersedeTailRequest,
+    actor: remanence_state::AuditActor,
+) -> Result<crate::pb::SupersedeTailResponse, Status> {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let tape_uuid =
+            crate::catalog_conversion::decode_uuid_bytes(&request.tape_uuid, "tape_uuid")?;
+        let pool = state.drive_pool()?.clone();
+        let _tape_reservation = pool.reserve_tape(tape_uuid)?;
+        let library_serial = resolve_tape_library_serial(&state, &pool, &tape_uuid)?;
+        let (mount, _drive_reservation) =
+            resolve_and_reserve_actor_mount(&state, &pool, &library_serial, &tape_uuid).await?;
+        let drive = pool.drive_tx(&mount.drive_key())?;
+        if let Some(slot) = mount.source_slot {
+            changer_move(&pool, &mount.library_serial, slot, mount.bay).await?;
+        }
+        let (reply, response) = oneshot::channel();
+        let command = crate::write_owner::DriveCommand::SupersedeTail {
+            request,
+            actor,
+            needs_drive_load: mount.needs_drive_load,
+            library_serial: mount.library_serial.clone(),
+            barcode: mount.barcode.clone(),
+            source_slot: mount.source_slot,
+            drive_serial: mount.drive_serial.clone(),
+            reply,
+        };
+        if drive.send(command).await.is_err() {
+            compensate_open_mount(&pool, &mount).await;
+            return Err(Status::unavailable("drive actor is unavailable"));
+        }
+        let result = response
+            .await
+            .map_err(|_| Status::unavailable("drive actor stopped during tail recovery"))?;
+        if let Some(home_slot) = mount.home_slot {
+            let parked = pool.park_cartridge(crate::write_owner::SeatedCartridge {
+                bay: mount.bay,
+                library_serial: mount.library_serial,
+                barcode: mount.barcode,
+                home_slot,
+                tape_uuid: Some(tape_uuid),
+                prior_session_id: None,
+            });
+            schedule_idle_dismount(state.clone(), parked);
+        }
+        result
+    })
+    .await
+    .map_err(|e| Status::internal(e.to_string()))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3459,6 +3519,7 @@ mod tests {
             .reserve_tape(OWNED_TAPE)
             .expect("reserve exact tape for concurrent recovery");
         let busy = open_write_session_reserved(
+            remanence_state::AuditActor::System,
             &state,
             &pool,
             WriteSessionTarget::PinnedTape {
@@ -3484,6 +3545,7 @@ mod tests {
         drop(competing_owner);
 
         let open_error = open_write_session_reserved(
+            remanence_state::AuditActor::System,
             &state,
             &pool,
             WriteSessionTarget::PinnedTape {
@@ -3599,6 +3661,7 @@ mod tests {
         let mut stale_state = ApiState::new_with_pool_configs(stale_index, [pool_config.clone()]);
         stale_state.drive_pool = Some(pool.clone());
         let stale_error = open_write_session_reserved(
+            remanence_state::AuditActor::System,
             &stale_state,
             &pool,
             WriteSessionTarget::PinnedTape {
@@ -3670,6 +3733,7 @@ mod tests {
             )
             .expect("downgrade only the no-companion SQLite projection");
         let no_companion_error = open_write_session_reserved(
+            remanence_state::AuditActor::System,
             &state,
             &pool,
             WriteSessionTarget::PinnedTape {

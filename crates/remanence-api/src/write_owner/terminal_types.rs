@@ -136,6 +136,7 @@ pub(super) struct ManualFinalizeTapeMountRequest {
 
 #[derive(Clone, Debug)]
 pub(super) struct TerminalFinalizeSpec {
+    pub(super) actor: AuditActor,
     pub(super) tape_uuid: TapeUuid,
     pub(super) block_size: u32,
     pub(super) pool_config: Option<TapePoolConfig>,
@@ -147,6 +148,7 @@ pub(super) struct TerminalFinalizeSpec {
 impl TerminalFinalizeSpec {
     pub(super) fn operator(request: &ManualFinalizeTapeActorRequest) -> Self {
         Self {
+            actor: request.actor.clone(),
             tape_uuid: request.tape_uuid,
             block_size: request.block_size,
             pool_config: request.pool_config.clone(),
@@ -176,6 +178,7 @@ impl TerminalFinalizeSpec {
             remanence_state::TerminalFinalizationTrigger::OperatorCloseOut
         );
         Self {
+            actor: AuditActor::System,
             tape_uuid: selected.tape_uuid,
             block_size: selected.block_size,
             pool_config: Some(pool_config.clone()),
@@ -191,6 +194,7 @@ impl TerminalFinalizeSpec {
         pool_config: &TapePoolConfig,
     ) -> Self {
         Self {
+            actor: AuditActor::System,
             tape_uuid: intent.tape_uuid,
             block_size,
             pool_config: Some(pool_config.clone()),

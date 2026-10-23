@@ -1160,6 +1160,9 @@ pub(crate) enum PoolWriteDurability {
 /// Errors returned when verifying a physical tape identity at BOT.
 #[derive(Debug, Error)]
 pub enum TapeIdentityError {
+    /// Transport failure while reading or positioning at BOT.
+    #[error("bootstrap I/O: {0}")]
+    Io(#[from] remanence_library::TapeIoError),
     /// No parseable bootstrap block was present at BOT.
     #[error("absent bootstrap at BOT: {0}")]
     AbsentBootstrap(String),

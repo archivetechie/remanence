@@ -80,6 +80,7 @@ pub(crate) enum DriveCommand {
         reservation: DriveReservation,
     },
     OpenWrite {
+        actor: remanence_state::AuditActor,
         pool_cfg: TapePoolConfig,
         selected: SelectedTape,
         target_kind: pb::write_session::TargetKind,
@@ -121,6 +122,16 @@ pub(crate) enum DriveCommand {
         source_slot: Option<u16>,
         drive_serial: Option<String>,
         reply: oneshot::Sender<Result<pb::TapeIndexVerification, Status>>,
+    },
+    SupersedeTail {
+        request: pb::SupersedeTailRequest,
+        actor: remanence_state::AuditActor,
+        needs_drive_load: bool,
+        library_serial: String,
+        barcode: Option<String>,
+        source_slot: Option<u16>,
+        drive_serial: Option<String>,
+        reply: oneshot::Sender<Result<pb::SupersedeTailResponse, Status>>,
     },
     FinalizeTape {
         request: ManualFinalizeTapeActorRequest,

@@ -1061,6 +1061,7 @@ impl LibraryHandle {
             drive: installed_clone,
             transport: tape_io::media_gate::MediaFencedTransport::new(transport),
             max_write_block_size_bytes: None,
+            append_admission: None,
             position_known: true,
             expected_position: None,
             position_generation: 0,
@@ -1591,6 +1592,7 @@ pub struct DriveHandle {
     expected_position: Option<tape_io::TapePosition>,
     /// Identity generation under which the cached cursor was established.
     position_generation: u64,
+    append_admission: Option<(tape_io::AppendProof, u64, std::sync::Weak<()>)>,
     /// Owned release obligation, discharged before this handle closes.
     removal_guard: Option<MediumRemovalGuard>,
     /// Bytes advanced since the last tripwire READ POSITION.
@@ -1765,6 +1767,7 @@ impl DriveHandle {
             },
             transport,
             max_write_block_size_bytes: None,
+            append_admission: None,
             position_known: true,
             expected_position: None,
             position_generation: 0,

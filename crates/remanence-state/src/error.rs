@@ -72,6 +72,9 @@ pub enum StateError {
     /// A catalog tape provisioning request conflicts with committed tape state.
     #[error("tape provisioning conflict: {0}")]
     TapeProvisionConflict(String),
+    /// The tape is no longer eligible for an append recovery transition.
+    #[error("append recovery precondition failed: {0}")]
+    AppendRecoveryPrecondition(String),
     /// A catalog cache digest does not match its authoritative source.
     #[error("catalog cache digest mismatch: {0}")]
     CatalogCacheDigestMismatch(String),

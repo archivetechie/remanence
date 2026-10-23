@@ -35,7 +35,7 @@ impl pb::write_session_service_server::WriteSessionService for WriteSessionApi {
         &self,
         request: Request<pb::OpenWriteSessionRequest>,
     ) -> Result<Response<pb::WriteSession>, Status> {
-        authorize_request(&request, AuthPermission::Write)?;
+        let actor = authorize_request(&request, AuthPermission::Write)?;
         let request = request.into_inner();
         reject_unimplemented_idempotency(request.idempotency_key.as_ref(), "OpenWriteSession")?;
         if request.recover_session_id.is_some() {
@@ -74,6 +74,7 @@ impl pb::write_session_service_server::WriteSessionService for WriteSessionApi {
                 }
                 let library_serial = self.library_serial_for_pool_target(&target)?;
                 let session = crate::mount::open_write_session(
+                    actor,
                     &self.state,
                     crate::mount::WriteSessionTarget::Pool {
                         pool_id: target.pool_id,
@@ -92,6 +93,7 @@ impl pb::write_session_service_server::WriteSessionService for WriteSessionApi {
         };
         let (tape_uuid, required_pool_id) = validate_tape_target_shape(&target)?;
         let session = crate::mount::open_write_session(
+            actor,
             &self.state,
             crate::mount::WriteSessionTarget::PinnedTape {
                 tape_uuid,

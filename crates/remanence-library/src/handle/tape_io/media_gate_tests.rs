@@ -644,6 +644,14 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
                       has no real device behind it",
             },
         ),
+        (
+            "remanence-api/src/append_admission/tests.rs",
+            DispatchPolicy::Exact {
+                execute_out: 1,
+                execute_none: 1,
+                why: "append-admission exact-sense fixture forwards only to in-memory ModelTransport; no real device",
+            },
+        ),
         // P4 model-only failure and mounted-reader forwarders.
         (
             "remanence-api/src/mount_backend/tests.rs",
@@ -750,4 +758,22 @@ fn collect_rust_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
 
 fn count_occurrences(text: &str, needle: &str) -> usize {
     text.matches(needle).count()
+}
+
+#[test]
+fn fixed_ili_information_is_signed_and_only_current_data_sense() {
+    for (response, key, expected) in [
+        (0x70, 0, Some(-42)),
+        (0x70, 1, Some(-42)),
+        (0x71, 0, None),
+        (0x70, 8, None),
+        (0x70, 6, None),
+    ] {
+        let mut sense = vec![0; 18];
+        sense[0] = response | 0x80;
+        sense[2] = key | 0x20;
+        sense[3..7].copy_from_slice(&(-42i32).to_be_bytes());
+        sense[7] = 10;
+        assert_eq!(super::ili_signed_information(&sense), expected);
+    }
 }

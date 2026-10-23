@@ -1230,6 +1230,7 @@ pub(super) fn finalize_terminal_no_parity(
     manual_request: Option<&ManualFinalizeTapeActorRequest>,
     rewritable: bool,
 ) -> Result<TerminalFinalizeResult, Status> {
+    drive.clear_append_admission();
     let cfg = &cfg.terminal_config();
     let tix_fault = crate::terminal_fault::TerminalFaultPlan::from_env_for_tape(spec.tape_uuid)
         .map_err(|error| {
@@ -1281,6 +1282,16 @@ pub(super) fn finalize_terminal_no_parity(
         record_manual_finalize_request(index, cfg, request)?;
     }
     if intent.progress == remanence_state::TerminalFinalizationProgress::AfterReplicaC {
+        let _admission = admit_terminal_write(
+            &spec.actor,
+            index,
+            cfg,
+            drive,
+            previous,
+            selected,
+            &plan,
+            None,
+        )?;
         drop(source);
         return complete_terminal_finalization_host_only(
             index,
@@ -1378,6 +1389,7 @@ pub(super) fn finalize_terminal_with_parity_journal(
     journal: FileTapeFileJournal,
     rewritable: bool,
 ) -> Result<TerminalFinalizeResult, Status> {
+    drive.clear_append_admission();
     let cfg = &cfg.terminal_config();
     let tix_fault = crate::terminal_fault::TerminalFaultPlan::from_env_for_tape(spec.tape_uuid)
         .map_err(|error| {
@@ -1538,6 +1550,16 @@ pub(super) fn finalize_terminal_with_parity_journal(
         record_manual_finalize_request(index, cfg, request)?;
     }
     if intent.progress == remanence_state::TerminalFinalizationProgress::AfterReplicaC {
+        let _admission = admit_terminal_write(
+            &spec.actor,
+            index,
+            cfg,
+            drive,
+            previous,
+            selected,
+            &plan,
+            Some(&prefix),
+        )?;
         drop(source);
         return complete_terminal_finalization_host_only(
             index,
@@ -1611,6 +1633,24 @@ pub(super) fn finalize_terminal_with_parity_journal(
         let snapshot = prefix_snapshot.as_ref().ok_or_else(|| {
             Status::internal("bounded parity prefix authority snapshot is missing")
         })?;
+        let _admission = if matches!(
+            prefix_evidence,
+            TerminalPrefixReconcileEvidence::Absent
+                | TerminalPrefixReconcileEvidence::TornRewritable
+        ) {
+            Some(admit_terminal_write(
+                &spec.actor,
+                index,
+                cfg,
+                drive,
+                previous,
+                selected,
+                &plan,
+                Some(&prefix),
+            )?)
+        } else {
+            None
+        };
         let mut raw = DriveHandleRawSink::new(drive);
         let mut faulting = crate::terminal_fault::TerminalPrefixFaultSink::new(
             &mut raw,
@@ -1817,6 +1857,12 @@ pub(super) fn finish_terminal_tail(
     tix_fault: Option<&crate::terminal_fault::TerminalFaultPlan>,
 ) -> Result<TerminalFinalizeResult, Status> {
     let cfg = &cfg.terminal_config();
+    let prefix_plan = intent
+        .terminal_prefix
+        .as_ref()
+        .map(TerminalPrefixPlan::try_from)
+        .transpose()
+        .map_err(crate::status_from_state_error)?;
     let mut authority = TerminalTailCatalogAuthority {
         checkpoint,
         parity_journal,
@@ -1826,6 +1872,7 @@ pub(super) fn finish_terminal_tail(
         tix_fault,
         reconciliation: None,
     };
+    let mut admission = None;
     loop {
         let progress = parity_progress_from_state(authority.intent.progress);
         let Some(component_index) = progress.next_component_index() else {
@@ -1836,6 +1883,23 @@ pub(super) fn finish_terminal_tail(
             let mut raw = DriveHandleRawSource::new(drive);
             reconcile_terminal_tail_next(&mut raw, &plan, progress, rewritable)
         };
+        if matches!(
+            evidence,
+            remanence_parity::TerminalComponentReconcileEvidence::Absent
+                | remanence_parity::TerminalComponentReconcileEvidence::TornRewritable
+        ) && admission.is_none()
+        {
+            admission = Some(admit_terminal_write(
+                &authority.spec.actor,
+                authority.index,
+                cfg,
+                drive,
+                previous,
+                selected,
+                &plan,
+                prefix_plan.as_ref(),
+            )?);
+        }
         authority.set_reconciliation(progress, component, evidence);
         let step_result = {
             let mut raw = DriveHandleRawSink::new(drive);
@@ -1941,6 +2005,18 @@ pub(super) fn finish_terminal_tail(
         }
     }
 
+    if drive.check_append_admission().is_err() {
+        let _admission = admit_terminal_write(
+            &authority.spec.actor,
+            authority.index,
+            cfg,
+            drive,
+            previous,
+            selected,
+            &plan,
+            prefix_plan.as_ref(),
+        )?;
+    }
     let completed_intent = authority
         .checkpoint
         .terminal_finalization_intent()
@@ -2269,4 +2345,43 @@ const fn manual_finalize_progress_name(
         Progress::AfterSeparationBc => "after_separation_bc",
         Progress::AfterReplicaC => "after_replica_c",
     }
+}
+
+/// Preserve the terminal reconciler's position while checking the entire suffix
+/// for complete foreign objects before its first destructive operation.
+#[allow(clippy::too_many_arguments)]
+fn admit_terminal_write(
+    actor: &AuditActor,
+    index: &mut CatalogIndex,
+    cfg: &impl super::terminal_types::TerminalConfig,
+    drive: &mut DriveHandle,
+    previous: &remanence_state::CheckpointJournalRecord,
+    selected: &SelectedTape,
+    plan: &TerminalTripleWritePlan,
+    prefix: Option<&TerminalPrefixPlan>,
+) -> Result<crate::append_admission::AppendAdmission, Status> {
+    let mut ctx = crate::append_admission::context(
+        selected.tape_uuid,
+        selected.block_size,
+        previous.eod_partition,
+        previous.eod_lba,
+    );
+    ctx.terminal_prefix = prefix.cloned();
+    ctx.write_position = drive
+        .position()
+        .map_err(|e| Status::unavailable(e.to_string()))?;
+    crate::append_admission::admit_append_boundary(
+        drive,
+        crate::append_admission::AppendAuthority::Terminal { plan },
+        ctx,
+    )
+    .map_err(|error| {
+        crate::append_admission::daemon_admission_error(
+            actor.clone(),
+            index,
+            &cfg.terminal_config(),
+            selected.tape_uuid,
+            error,
+        )
+    })
 }

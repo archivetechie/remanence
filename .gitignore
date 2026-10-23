@@ -61,3 +61,6 @@ fuzz/corpus/
 
 # Reproducible draft deposit archives.
 /dist/
+
+# Isolated Cargo build directories alongside target/.
+/target-*/

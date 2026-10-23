@@ -229,7 +229,7 @@ pub(super) fn open_parity_actor_session(
             .map_err(|err| status_from_parity_error(&err, err.to_string()))?
         };
         drive
-            .locate(0)
+            .locate_admitted_append(0)
             .map_err(|err| Status::unavailable(format!("locate fresh parity BOT: {err}")))?;
         let mut write_attempted = false;
         let opened = {
@@ -276,7 +276,7 @@ pub(super) fn open_parity_actor_session(
             )
         })?;
         drive
-            .locate(checkpoint.eod_lba)
+            .locate_admitted_append(checkpoint.eod_lba)
             .map_err(|err| Status::unavailable(format!("locate parity checkpoint EOD: {err}")))?;
         let plan = summary
             .append_plan(&scheme)
@@ -840,13 +840,24 @@ pub(super) fn perform_checkpoint_barrier(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn fence_failed_checkpoint_batch(
+    drive: &mut remanence_library::DriveHandle,
+    lease: &remanence_state::FileCheckpointJournalLease,
+    journal: Option<&mut FileTapeFileJournal>,
     index: &mut CatalogIndex,
     cfg: &WriteOwnerConfig,
     selected: &SelectedTape,
     batch: &PendingCheckpointBatch,
     status: Status,
 ) -> Status {
+    let status = match crate::append_admission::abandon_pending_append(drive, lease, journal) {
+        Ok(()) => status,
+        Err(error) => Status::unavailable(format!(
+            "{}; abandonment marker failed: {error}",
+            status.message()
+        )),
+    };
     let barcode = index
         .get_tape(&selected.tape_uuid)
         .ok()
@@ -896,7 +907,9 @@ pub(super) fn fence_failed_checkpoint_batch(
 }
 
 pub(super) fn parity_raw_write_fence_reason(error: &str) -> &'static str {
-    if error.contains("partial fixed batch uncommittable") {
+    if error.contains("TailBeyondKnownState") || error.contains("append admission") {
+        "append_admission_refused"
+    } else if error.contains("partial fixed batch uncommittable") {
         "partial_batch"
     } else if error.contains("reset UNIT ATTENTION") {
         "reset_unit_attention"

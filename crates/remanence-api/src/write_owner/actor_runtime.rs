@@ -240,6 +240,7 @@ pub(super) fn drive_loop(
                 &handle,
             ),
             DriveCommand::OpenWrite {
+                actor,
                 pool_cfg,
                 selected,
                 target_kind,
@@ -259,6 +260,7 @@ pub(super) fn drive_loop(
                 drive,
                 &mut snapshot_misses,
                 OpenWriteActorRequest {
+                    actor,
                     pool_cfg,
                     selected,
                     target_kind,
@@ -352,6 +354,94 @@ pub(super) fn drive_loop(
                     source_slot,
                     drive_serial.as_deref(),
                 );
+                let _ = reply.send(result);
+            }
+            DriveCommand::SupersedeTail {
+                request,
+                actor,
+                needs_drive_load,
+                library_serial,
+                barcode,
+                source_slot,
+                drive_serial,
+                reply,
+            } => {
+                let result = (|| {
+                    let tape_uuid = crate::catalog_conversion::decode_uuid_bytes(
+                        &request.tape_uuid,
+                        "tape_uuid",
+                    )?;
+                    super::readiness::session_open_short_probe_or_load(
+                        &mut index,
+                        drive,
+                        super::SessionOpenReadinessContext {
+                            action: "supersede tape tail",
+                            bay,
+                            library_serial: &library_serial,
+                            barcode: barcode.as_deref(),
+                            source_slot,
+                            drive_serial: drive_serial.as_deref(),
+                            needs_drive_load,
+                        },
+                    )?;
+                    let tape = index
+                        .get_tape(&tape_uuid)
+                        .map_err(crate::status_from_state_error)?
+                        .ok_or_else(|| Status::not_found("tape not found"))?;
+                    let (size, _) = crate::pool_write::selected_tape_geometry(
+                        &tape,
+                        tape.pool_id.as_deref().unwrap_or("(unpooled)"),
+                    )
+                    .map_err(|e| Status::failed_precondition(e.to_string()))?;
+                    super::write_session::prepare_drive_for_write(
+                        drive,
+                        &tape_uuid,
+                        size,
+                        Uuid::new_v4(),
+                        super::write_session::WriteMediaPolicy::RewritableObject,
+                    )?;
+                    let generation = drive.identity_generation();
+                    let mut preview = None;
+                    let result = crate::mount_backend::supersede_mounted_tail(
+                        &mut index,
+                        &super::terminal_types::TerminalConfig::terminal_config(&cfg),
+                        drive,
+                        tape_uuid,
+                        generation,
+                        &Uuid::from_bytes(tape_uuid).to_string(),
+                        actor,
+                        |required, found| {
+                            preview = Some(pb::SupersedeTailResponse {
+                                found: found.to_vec(),
+                                required_confirmation: required.into(),
+                                completed: false,
+                            });
+                            match request.confirm_supersede.as_deref() {
+                                None => Err("confirmation required".into()),
+                                Some(value)
+                                    if value == required && request.expected_found == found =>
+                                {
+                                    Ok(())
+                                }
+                                _ => {
+                                    Err("confirmation or physical tail differs from the preview"
+                                        .into())
+                                }
+                            }
+                        },
+                    );
+                    match (result, preview) {
+                        (Ok(_), Some(mut response)) => {
+                            response.completed = true;
+                            Ok(response)
+                        }
+                        (Err(_), Some(response)) if request.confirm_supersede.is_none() => {
+                            Ok(response)
+                        }
+                        (Err(e), _) => Err(e),
+                        _ => Err(Status::internal("supersede did not produce a preview")),
+                    }
+                })();
                 let _ = reply.send(result);
             }
             DriveCommand::FinalizeTape {
@@ -467,6 +557,9 @@ pub(super) fn drain_failed_drive_commands(mut rx: mpsc::Receiver<DriveCommand>, 
             DriveCommand::VerifyTapeIndex { reply, .. } => {
                 let _ = reply.send(Err(Status::internal(message.clone())));
             }
+            DriveCommand::SupersedeTail { reply, .. } => {
+                let _ = reply.send(Err(Status::unavailable("drive actor unavailable")));
+            }
             DriveCommand::FinalizeTape { reply, .. } => {
                 let _ = reply.send(Err(Status::internal(message.clone())));
             }
@@ -507,6 +600,7 @@ pub(super) fn drain_failed_drive_commands(mut rx: mpsc::Receiver<DriveCommand>, 
 }
 
 pub(super) struct OpenWriteActorRequest {
+    pub(super) actor: remanence_state::AuditActor,
     pub(super) pool_cfg: TapePoolConfig,
     pub(super) selected: SelectedTape,
     pub(super) target_kind: pb::write_session::TargetKind,

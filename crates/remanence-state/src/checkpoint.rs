@@ -2298,6 +2298,11 @@ fn terminal_completion_intent(
 }
 
 impl FileCheckpointJournalLease {
+    /// Tape identity protected by this exclusive journal lease.
+    pub fn tape_uuid(&self) -> [u8; 16] {
+        self.tape_uuid
+    }
+
     fn bounded_replay_snapshot(&self) -> Result<CheckpointReplaySnapshot, StateError> {
         let file = File::open(&self.path).map_err(|error| {
             StateError::io_at(

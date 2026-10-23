@@ -206,9 +206,9 @@ pub(crate) fn ensure_selected_tape_accepts_session_write(
     ensure_selected_tape_accepts_write_inner(state, pool_cfg, selected, true)
 }
 
-/// An empty checkpoint authority is admissible only for catalog-fresh media.
-/// This check belongs before any load, position, or write preparation because
-/// treating a known written prefix as fresh could rewrite BOT.
+/// Empty authority permits only an unwritten tape or its sole bootstrap.
+/// Fresh admission still proves the physical bootstrap and classifies its suffix
+/// before any rewrite; a bootstrap projection alone grants no write authority.
 pub(crate) fn ensure_empty_checkpoint_matches_catalog_freshness(
     state: &CatalogIndex,
     selected: &SelectedTape,
@@ -221,7 +221,7 @@ pub(crate) fn ensure_empty_checkpoint_matches_catalog_freshness(
         PoolWriteError::MissingTapeGeometry("selected tape row is missing".into())
     })?;
     if tape.total_committed_ordinals != 0
-        || tape.last_committed_tape_file.is_some()
+        || tape.last_committed_tape_file.is_some_and(|file| file != 0)
         || tape.written_extent_lba.is_some()
     {
         return Err(PoolWriteError::MissingTapeGeometry(format!(
