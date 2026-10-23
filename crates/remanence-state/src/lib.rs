@@ -74,7 +74,7 @@ pub use index::{
     TapeFileRecord, TapeIoFenceInput, TapeIoFenceRecord, TapeJournalIndexInput,
     TapeJournalIndexReport, TapeKindFilter, TapePoolProjectionInput, TapePoolRecord, TapeRecord,
     TerminalFinalizationOutcome, TerminalFinalizationProjection,
-    TerminalFinalizationProjectionInput, WrapMapCacheRecord, DIGEST_ALGORITHM_SHA256,
+    TerminalFinalizationProjectionInput, VersionRow, WrapMapCacheRecord, DIGEST_ALGORITHM_SHA256,
     OBJECT_COPY_REPRESENTATION_ENCRYPTED, OBJECT_COPY_REPRESENTATION_PLAINTEXT,
     OBJECT_COPY_REPRESENTATION_UNKNOWN, SCHEMA_VERSION,
 };

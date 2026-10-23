@@ -5253,3 +5253,118 @@ fn no_parity_tape_bootstrap_carries_no_scheme_record() {
     assert!(parsed.no_parity_flag);
     assert!(parsed.scheme.is_none());
 }
+
+/// Zero protection watermark still belongs to a parity writer.
+#[test]
+fn encrypted_first_epoch_journals_parity_state_and_replays() {
+    for (stripe, size) in [(128, 32 * 1024), (2, 768 * 1024)] {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-direct-encrypted-parity-spool-")
+            .tempdir()
+            .expect("tempdir");
+        let mut state =
+            CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open catalog");
+        let pool_id = "capacity.direct-encrypted";
+        let tape_uuid = [0x71; 16];
+        let block_size = 256 * 1024;
+        let scheme = ParityScheme {
+            id: SchemeId::new_static("direct-encrypted-capacity-test"),
+            data_blocks_per_stripe: stripe,
+            parity_blocks_per_stripe: 1,
+            stripes_per_neighborhood: 1,
+        };
+        state
+            .upsert_tape_pool_projection(remanence_state::TapePoolProjectionInput {
+                pool_id: pool_id.to_string(),
+                display_name: None,
+                copy_class: None,
+                content_class: None,
+                created_at_utc: None,
+            })
+            .expect("project pool");
+        state
+            .provision_tape(remanence_state::ProvisionTapeInput {
+                tape_uuid,
+                voltag: "CAP005L9".into(),
+                block_size,
+                parity: ParityConfig::Scheme(scheme.clone()),
+                force: false,
+            })
+            .expect("provision mocked LTO-9");
+        state
+            .project_tape_pool_membership(tape_uuid, pool_id)
+            .expect("assign tape");
+        let pool_cfg = TapePoolConfig {
+            scheme: None,
+            id: pool_id.into(),
+            display_name: None,
+            copy_class: None,
+            content_class: None,
+            selection_policy: Default::default(),
+            watermark_low: 0.92,
+            watermark_high: 0.97,
+            capacity_cap_bytes: None,
+            block_size_bytes: u64::from(block_size),
+            min_object_size_bytes: 0,
+        };
+        let selected = select_tape_in_pool(&state, &pool_cfg, 32 * 1024, &HashSet::new())
+            .expect("fresh parity tape selects");
+        let payload_path = temp.path().join("payload.bin");
+        std::fs::write(&payload_path, vec![0x5A; size]).expect("write payload");
+        let checkpoint_dir = temp.path().join("checkpoints");
+        let parity_journal_path = temp.path().join("parity.remjournal");
+        let resources =
+            PoolWriteResources::new(64 * 1024 * 1024).expect("one-byte configured spool ceiling");
+        let mut sink = VecBlockSink::new();
+
+        let result = write_to_selected_tape_checkpointed(
+            &mut state,
+            &mut sink,
+            &pool_cfg,
+            WriteObjectToPoolRequest {
+                pool_id: pool_id.into(),
+                source: WriteObjectSource::Path(payload_path),
+                archive_path: PathBuf::from("payload.bin"),
+                caller_object_id: "direct-encrypted-capacity-caller".into(),
+                expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
+                representation: PoolWriteRepresentation::Encrypted {
+                    recipients: vec![test_recipient(0x71, 0), test_recipient(0x72, 1)],
+                },
+            },
+            selected,
+            &checkpoint_dir,
+            &parity_journal_path,
+            &resources,
+        )
+        .expect("encrypted first-epoch object commits");
+        let journal =
+            remanence_state::FileCheckpointJournal::open(&checkpoint_dir, tape_uuid).unwrap();
+        let records = journal.replay().unwrap();
+        assert_eq!(records.len(), 1);
+        let bundle = &records[0].object_tape_file_bundles[0];
+        if stripe == 128 {
+            assert_eq!(bundle.highest_protected_ordinal, 0);
+            assert!(result
+                .write_report()
+                .unwrap()
+                .catalog
+                .object_copy
+                .parity_state
+                .is_some());
+        } else {
+            // Nonzero-watermark bundles were emitted by the preceding writer too.
+            // Their serialized checkpoint schema and replay projection stay identical.
+            assert!(bundle.highest_protected_ordinal > 0);
+        }
+        assert!(records[0].objects[0]
+            .copy
+            .first_parity_data_ordinal
+            .is_some());
+        let id = uuid::Uuid::from_bytes(result.object.object_id).to_string();
+        let expected = state.get_native_object(&id).unwrap().unwrap();
+        state.project_checkpoint_record(&records[0]).unwrap();
+        assert_eq!(state.get_native_object(&id).unwrap().unwrap(), expected);
+    }
+}

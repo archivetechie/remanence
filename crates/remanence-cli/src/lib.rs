@@ -7384,7 +7384,15 @@ fn run_rebuild_catalog_from_journals(
             return ExitCode::from(1);
         }
     };
-    match handle.rebuild_index_from_journals() {
+    let rebuilt = handle
+        .rebuild_index_from_journals()
+        .map_err(|e| e.to_string())
+        .and_then(|report| {
+            remanence_api::reconcile_checkpoint_journal_projections(&mut handle)
+                .map_err(|e| e.to_string())?;
+            Ok(report)
+        });
+    match rebuilt {
         Ok(report) => {
             let _ = writeln!(out, "rebuild-catalog-from-journals ok");
             let _ = writeln!(out, "  tapes: {}", report.tapes_rebuilt);

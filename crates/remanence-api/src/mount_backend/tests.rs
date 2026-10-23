@@ -1832,3 +1832,37 @@ fn clearing_append_recovery_on_sealed_tape_is_a_precise_precondition() {
         "sealed"
     );
 }
+
+/// A source returning to the newest bytes during preparation must never reach media.
+#[test]
+fn prepared_skip_and_command_reconciliation_are_independent_of_file_count() {
+    let root = tempfile::tempdir().unwrap();
+    let mut state = state(root.path());
+    let world = world();
+    let lock = root.path().join("locks");
+    let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
+    let mut mounted = mount.mount(target()).unwrap();
+    crate::startup_checkpoint::RECONCILIATION_COUNT.with(|count| count.set(0));
+    for name in ["first", "second", "third"] {
+        let input = request(root.path(), name);
+        assert!(mount.put_path_version(&mut mounted, input).unwrap().is_ok());
+    }
+    let before = mounted.drive.media_write_dispatch_count();
+    for name in ["first", "second", "third"] {
+        let input = request(root.path(), name);
+        let crate::WriteObjectSource::Path(path) = &input.source else {
+            panic!("path source")
+        };
+        let path = path.clone();
+        std::fs::write(&path, b"changed before preparation").unwrap();
+        let decision = mount
+            .put_path_version_with_preparation(&mut mounted, input, || {
+                std::fs::write(path, name.as_bytes()).unwrap();
+            })
+            .unwrap();
+        assert!(decision.is_err(), "prepared digest must skip");
+    }
+    assert_eq!(mounted.drive.media_write_dispatch_count(), before);
+    crate::startup_checkpoint::RECONCILIATION_COUNT.with(|count| assert_eq!(count.get(), 1));
+    mount.release(mounted);
+}

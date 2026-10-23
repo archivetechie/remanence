@@ -70,6 +70,12 @@ pub enum MountError {
     Blank { path: PathBuf },
     #[error("{0}")]
     Refused(String),
+    /// Preserve typed tape failures until the command chooses continuation advice.
+    #[error("{0}")]
+    PoolWrite(Box<crate::PoolWriteError>),
+    /// A durable terminal projection records hardware early warning.
+    #[error("tape closed after hardware early warning; continue on the next tape")]
+    EarlyWarning,
 }
 fn refusal(error: impl std::fmt::Display) -> MountError {
     MountError::Refused(error.to_string())
@@ -239,6 +245,7 @@ pub struct OperatorMount<'a> {
     context: LockedAuditedDevice,
     path: PathBuf,
     unusable: bool,
+    checkpoints_reconciled: bool,
 }
 impl<'a> OperatorMount<'a> {
     /// Finish after a common read consumer has consumed/released MountedTape.
@@ -381,6 +388,7 @@ impl<'a> OperatorMount<'a> {
             context,
             path: path.into(),
             unusable: false,
+            checkpoints_reconciled: false,
         })
     }
     /// Prepare a BOT initialization decision, then run its write and provisioning
@@ -540,6 +548,126 @@ impl<'a> OperatorMount<'a> {
         self.state.replay_audit_projection().map_err(refusal)?;
         Ok(())
     }
+    /// Reconcile durable checkpoint authority before any standalone catalog decision.
+    pub fn reconcile_checkpoints(&mut self) -> Result<(), MountError> {
+        if !self.checkpoints_reconciled {
+            crate::reconcile_checkpoint_journal_projections(self.state).map_err(refusal)?;
+            self.checkpoints_reconciled = true;
+        }
+        Ok(())
+    }
+
+    /// Decide a standalone file version, then wrap the ordinary admitted writer.
+    /// Preparation is reused so mutations during streaming fail writer validation.
+    pub fn put_path_version(
+        &mut self,
+        mounted: &mut MountedTape,
+        request: WriteObjectToPoolRequest,
+    ) -> Result<Result<(PoolWriteResult, &'static str), remanence_state::VersionRow>, MountError>
+    {
+        self.put_path_version_with_preparation(mounted, request, || {})
+    }
+
+    /// Keep the decision and preparation in one funnel; the hook models a source race.
+    fn put_path_version_with_preparation(
+        &mut self,
+        mounted: &mut MountedTape,
+        mut request: WriteObjectToPoolRequest,
+        before_prepare: impl FnOnce(),
+    ) -> Result<Result<(PoolWriteResult, &'static str), remanence_state::VersionRow>, MountError>
+    {
+        self.require_durable_mount(mounted)?;
+        self.reconcile_checkpoints()?;
+        crate::startup_guard::reject_active_tape_io_fences_on_startup(self.state.catalog_index())
+            .map_err(refusal)?;
+        let path =
+            remanence_stream::normalize_archive_path(&request.archive_path).map_err(refusal)?;
+        request.archive_path = PathBuf::from(&path);
+        let newest = self
+            .state
+            .catalog_index()
+            .list_committed_versions_by_path(&request.pool_id, &path)
+            .map_err(refusal)?
+            .into_iter()
+            .next();
+        let representation_matches = if let Some(version) = &newest {
+            let record = self
+                .state
+                .catalog_index()
+                .get_native_object(&version.object_id)
+                .map_err(refusal)?
+                .ok_or_else(|| refusal("version object disappeared"))?;
+            record.copies.iter().any(|copy| {
+                copy.status == "committed"
+                    && copy.pool_id.as_deref() == Some(request.pool_id.as_str())
+                    && match &request.representation {
+                        crate::PoolWriteRepresentation::Plaintext => {
+                            copy.representation == "plaintext"
+                        }
+                        crate::PoolWriteRepresentation::Encrypted { recipients } => {
+                            let requested: std::collections::BTreeSet<_> = recipients
+                                .iter()
+                                .map(|r| {
+                                    r.recipient_epoch_id
+                                        .iter()
+                                        .map(|b| format!("{b:02x}"))
+                                        .collect::<String>()
+                                })
+                                .collect();
+                            copy.representation == "encrypted"
+                                && copy.recipient_epoch_ids.as_ref().is_some_and(|ids| {
+                                    ids.iter()
+                                        .cloned()
+                                        .collect::<std::collections::BTreeSet<_>>()
+                                        == requested
+                                })
+                        }
+                    }
+            })
+        } else {
+            false
+        };
+        let reason = if newest.is_none() {
+            "new"
+        } else if !representation_matches {
+            "representation_changed"
+        } else {
+            "content_changed"
+        };
+        if let Some(version) = &newest {
+            if representation_matches
+                && request.source.size_bytes().map_err(refusal)? == version.size_bytes
+                && request.source.content_sha256().map_err(refusal)?.as_slice()
+                    == version.file_sha256
+            {
+                return Ok(Err(version.clone()));
+            }
+        }
+        let crate::WriteObjectSource::Path(source) = &request.source else {
+            return Err(refusal("standalone put requires a regular file path"));
+        };
+        before_prepare();
+        let prepared = remanence_stream::prepare_regular_file(
+            source,
+            &request.archive_path,
+            uuid::Uuid::new_v4().to_string(),
+        )
+        .map_err(refusal)?;
+        if let Some(version) = newest {
+            if representation_matches
+                && prepared.spec.size_bytes == version.size_bytes
+                && prepared.spec.file_sha256.as_ref().map(|d| d.as_slice())
+                    == Some(version.file_sha256.as_slice())
+            {
+                return Ok(Err(version));
+            }
+        }
+        request.source =
+            crate::WriteObjectSource::PreparedPath(crate::pool_write::PreparedPathSource(prepared));
+        self.write_checkpointed(mounted, request)
+            .map(|result| Ok((result, reason)))
+    }
+
     /// Durable session and calibration fencing wrap the existing admission funnel.
     pub fn write_checkpointed(
         &mut self,
@@ -547,6 +675,7 @@ impl<'a> OperatorMount<'a> {
         request: WriteObjectToPoolRequest,
     ) -> Result<PoolWriteResult, MountError> {
         self.require_durable_mount(mounted)?;
+        self.reconcile_checkpoints()?;
         self.flush_audit()?;
         crate::startup_guard::reject_active_tape_io_fences_on_startup(self.state.catalog_index())
             .map_err(refusal)?;
@@ -568,7 +697,8 @@ impl<'a> OperatorMount<'a> {
             return Err(refusal("requested pool must equal the loaded tape's pool"));
         }
         if let Some(replay) =
-            crate::replay_committed_pool_write_from_state(self.state, &request).map_err(refusal)?
+            crate::pool_write::replay_committed_pool_write_reconciled(self.state, &request)
+                .map_err(|e| MountError::PoolWrite(Box::new(e)))?
         {
             return Ok(replay);
         }
@@ -580,10 +710,44 @@ impl<'a> OperatorMount<'a> {
             &pool,
             &journals,
         )
-        .map_err(refusal)?;
+        .map_err(|error| match error {
+            crate::pool_write::PinnedTapeError::NotWritable {
+                reason:
+                    crate::pool_write::WritabilityError::InsufficientCapacity {
+                        object_size,
+                        raw_capacity,
+                        used,
+                    },
+                ..
+            } => MountError::PoolWrite(Box::new(
+                crate::PoolWriteError::SelectedTapeInsufficientCapacity {
+                    object_size,
+                    raw_capacity,
+                    used,
+                },
+            )),
+            crate::pool_write::PinnedTapeError::NotWritable { .. }
+                if loaded
+                    .terminal_finalization
+                    .as_ref()
+                    .is_some_and(|terminal| {
+                        terminal.trigger
+                            == remanence_state::TerminalFinalizationTrigger::HardwareEarlyWarning
+                    }) =>
+            {
+                MountError::EarlyWarning
+            }
+            other => refusal(other),
+        })?;
         let selected = match disposition {
             crate::pool_write::PinnedWriteDisposition::Writable(selected) => selected,
-            _ => return Err(refusal("tape requires terminal recovery before writing")),
+            _ => {
+                return Err(MountError::PoolWrite(Box::new(
+                    crate::PoolWriteError::TerminalCloseRequired {
+                        detail: "tape requires terminal recovery before writing".into(),
+                    },
+                )))
+            }
         };
         let id = uuid::Uuid::new_v4();
         self.session(mounted.tape_uuid, id, AuditEvent::SessionOpened)?;
@@ -591,13 +755,13 @@ impl<'a> OperatorMount<'a> {
         let result = (|| {
             mounted.drive.test_unit_ready().map_err(refusal)?;
             mounted.drive.prevent_medium_removal().map_err(refusal)?;
-            crate::write_to_selected_drive_checkpointed(
+            crate::pool_write::write_to_selected_drive_checkpointed_reconciled(
                 self.state,
                 &mut mounted.drive,
                 request,
                 selected,
             )
-            .map_err(refusal)
+            .map_err(|e| MountError::PoolWrite(Box::new(e)))
         })();
         let uncertain = result.is_err() && mounted.drive.media_write_dispatch_count() != before;
         if uncertain {
