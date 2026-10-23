@@ -8,6 +8,8 @@
 //!   generic path and (for the round-trip variant) at a loaded
 //!   scratch tape.
 //!
+//! Set `REM_TEST_LIVE_SCSI=1` to opt in to live hardware access.
+//!
 //! ## Env vars
 //!
 //! - `REM_QUADSTOR_DRIVE_PATH` (required) — the `/dev/sgN` path of
@@ -20,15 +22,12 @@
 //! ## Invocation
 //!
 //! ```text
-//! REM_QUADSTOR_DRIVE_PATH=/dev/sg5 \
+//! REM_TEST_LIVE_SCSI=1 REM_QUADSTOR_DRIVE_PATH=/dev/sg5 \
 //! cargo test -p remanence-library --test quadstor_smoke -- \
 //!   --ignored --test-threads=1 --nocapture
 //! ```
 //!
-//! Without `REM_QUADSTOR_DRIVE_PATH` the test prints a skip
-//! message and returns `Ok(())` rather than failing — there's no
-//! way to assert anything without the hardware, so we don't
-//! pretend to.
+//! Missing hardware prerequisites fail when these ignored tests are selected.
 
 #![cfg(target_os = "linux")]
 
@@ -52,38 +51,17 @@ fn write_loop_enabled() -> bool {
     )
 }
 
-fn skip_if_no_hardware() -> Option<PathBuf> {
-    match drive_path() {
-        Some(p) => {
-            if !p.exists() {
-                eprintln!(
-                    "quadstor_smoke: skipping — REM_QUADSTOR_DRIVE_PATH={p:?} does not exist"
-                );
-                return None;
-            }
-            // Open-check (non-destructive).
-            match OpenOptions::new().read(true).write(true).open(&p) {
-                Ok(_) => Some(p),
-                Err(e) => {
-                    eprintln!(
-                        "quadstor_smoke: skipping — cannot open {p:?}: {e}. \
-                         Need read+write access (tape group + CAP_SYS_RAWIO, \
-                         or root)."
-                    );
-                    None
-                }
-            }
-        }
-        None => {
-            eprintln!(
-                "quadstor_smoke: skipping — REM_QUADSTOR_DRIVE_PATH not set. \
-                 To run: REM_QUADSTOR_DRIVE_PATH=/dev/sgN \
-                 cargo test -p remanence-library --test quadstor_smoke -- \
-                 --ignored --test-threads=1 --nocapture"
-            );
-            None
-        }
-    }
+/// Require explicit opt-in and a usable device before running the selected test.
+fn require_hardware() -> PathBuf {
+    assert_eq!(std::env::var("REM_TEST_LIVE_SCSI").as_deref(), Ok("1"),
+        "run with REM_TEST_LIVE_SCSI=1 cargo test -p remanence-library --test quadstor_smoke -- --ignored --test-threads=1; see module docs for device variables");
+    let path = drive_path().expect("set the drive path documented above for this hardware test");
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap_or_else(|e| panic!("cannot open {path:?}: {e}"));
+    path
 }
 
 fn open_transport(path: &PathBuf) -> Box<dyn SgTransport> {
@@ -102,11 +80,9 @@ fn open_transport(path: &PathBuf) -> Box<dyn SgTransport> {
 /// Verifies the full sg_io + Layer 1 + transport stack works end
 /// to end on real hardware without touching cartridge state.
 #[test]
-#[ignore]
+#[ignore = "requires REM_TEST_LIVE_SCSI=1 and configured scratch hardware; see module docs"]
 fn quadstor_basic_smoke() {
-    let Some(path) = skip_if_no_hardware() else {
-        return;
-    };
+    let path = require_hardware();
     let mut t = open_transport(&path);
 
     // 1. REWIND. The Quadstor VTL accepts REWIND even with no
@@ -191,19 +167,13 @@ fn quadstor_basic_smoke() {
 /// compare. **Destructive: writes to the loaded cartridge.**
 /// Off by default; enable with `REM_QUADSTOR_WRITE_LOOP=1`.
 #[test]
-#[ignore]
+#[ignore = "requires REM_TEST_LIVE_SCSI=1 and configured scratch hardware; see module docs"]
 fn quadstor_write_read_round_trip() {
-    let Some(path) = skip_if_no_hardware() else {
-        return;
-    };
-    if !write_loop_enabled() {
-        eprintln!(
-            "quadstor_write_read_round_trip: skipping — \
-             REM_QUADSTOR_WRITE_LOOP not set to 1. This test writes \
-             to the loaded cartridge; only enable on a scratch tape."
-        );
-        return;
-    }
+    let path = require_hardware();
+    assert!(
+        write_loop_enabled(),
+        "set REM_QUADSTOR_WRITE_LOOP=1 with a scratch cartridge; this test writes tape"
+    );
     let mut t = open_transport(&path);
 
     const N_BLOCKS: usize = 100;

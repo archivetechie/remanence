@@ -145,7 +145,7 @@ enum CliTransportAccess {
     name = "rem",
     version,
     about = "Remanence — library and standalone tape CLI",
-    after_help = "Library operations go through the daemon; a standalone drive is operated directly.\nUse --device PATH with --allow-device SERIAL for standalone media.\nAdditional commands: doctor, diagnostics capture, pool new; tape identify, adopt, restore, assign-pool, rebind, set-generation, import-journals, release."
+    after_help = "Library operations go through the daemon; a standalone drive is operated directly.\nFor a standalone drive: rem setup, then rem put/get/tape; or pass --device PATH --allow-device SERIAL."
 )]
 struct Cli {
     /// Compatibility allowlist for legacy direct-hardware invocations.
@@ -621,17 +621,23 @@ enum RemCommand {
         once: bool,
     },
 
-    /// Initialize tapes after the destructive-safety gauntlet.
+    /// Manage and inspect tapes in a library or standalone drive.
     Tape {
         /// Tape operation to run.
         #[command(subcommand)]
         command: RemTapeCommand,
     },
 
-    /// Archive local files onto tape through the daemon write path.
+    /// Archive local files onto a library or standalone tape.
+    #[command(
+        after_help = "For a standalone drive: rem setup, or pass --device PATH --allow-device SERIAL."
+    )]
     Put(put::PutArgs),
 
-    /// Restore an object from tape through the daemon read path.
+    /// Restore an object from a library or standalone tape.
+    #[command(
+        after_help = "For a standalone drive: rem setup, or pass --device PATH --allow-device SERIAL."
+    )]
     Get(get::GetArgs),
 
     /// Probe, catalog, or restore a dump archive through a format driver.
@@ -1246,7 +1252,7 @@ enum Command {
         drive: String,
     },
 
-    /// Initialize tapes after the destructive-safety gauntlet.
+    /// Manage and inspect tapes in a library or standalone drive.
     Tape {
         /// Tape operation to run.
         #[command(subcommand)]
@@ -1266,11 +1272,11 @@ enum Command {
     #[command(name = "tape-verify-index-client", hide = true)]
     TapeVerifyIndexClient(tape_inventory::TapeInventoryArgs),
 
-    /// Archive local files onto tape through the daemon write path.
+    /// Archive local files through the daemon (daemon-only).
     #[command(name = "put-client", hide = true)]
     PutClient(put::PutArgs),
 
-    /// Restore an object from tape through the daemon read path.
+    /// Restore an object through the daemon (daemon-only).
     #[command(name = "get-client", hide = true)]
     GetClient(get::GetArgs),
 
@@ -1620,6 +1626,9 @@ enum RemTapeCommand {
     Alerts(TapeAlertsAliasArgs),
 
     /// Initialize one tape or a slot range.
+    #[command(
+        after_help = "For a standalone drive: rem setup, or pass --device PATH --allow-device SERIAL."
+    )]
     Init(TapeInitArgs),
 
     /// Poll TEST UNIT READY until already-loaded media is usable.
@@ -1636,6 +1645,9 @@ enum RemTapeCommand {
     Retire(TapeRetireArgs),
 
     /// Permanently finalize an exact reconciled tape through the daemon.
+    #[command(
+        after_help = "For a standalone drive: rem setup, or pass --device PATH --allow-device SERIAL."
+    )]
     Finalize(tape_finalize::TapeFinalizeArgs),
 
     /// Read the bounded terminal-index inventory for one exact tape.
@@ -6142,17 +6154,26 @@ fn daemon_runtime() -> Result<tokio::runtime::Runtime, DaemonClientError> {
         .map_err(|error| DaemonClientError::client(format!("create tokio runtime: {error}")))
 }
 
+/// Connect through the shared daemon funnel, suggesting setup only for implicit routing.
 async fn connect_daemon(endpoint: &str) -> Result<Channel, String> {
+    let explicit_endpoint = std::env::args_os()
+        .take_while(|arg| arg != "--")
+        .any(|arg| arg == "--endpoint" || arg.to_string_lossy().starts_with("--endpoint="));
+    let hint = if explicit_endpoint || Path::new("/etc/rem/config.toml").exists() {
+        ""
+    } else {
+        "; for a standalone drive run `rem setup` or pass --device"
+    };
     if let Some(path) = endpoint.strip_prefix("unix:") {
         return remanence_api::connect_unix(std::path::PathBuf::from(path))
             .await
-            .map_err(|error| format!("connect daemon at {endpoint}: {error}"));
+            .map_err(|error| format!("connect daemon at {endpoint}: {error}{hint}"));
     }
     Channel::from_shared(endpoint.to_string())
         .map_err(|error| format!("invalid daemon endpoint {endpoint:?}: {error}"))?
         .connect()
         .await
-        .map_err(|error| format!("connect daemon at {endpoint}: {error}"))
+        .map_err(|error| format!("connect daemon at {endpoint}: {error}{hint}"))
 }
 
 fn finish_daemon_client_result(

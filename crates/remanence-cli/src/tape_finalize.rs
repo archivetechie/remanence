@@ -29,7 +29,7 @@ const OPERATOR_CLOSE_OUT_TRIGGER: &str = "operator_close_out";
 #[derive(Args, Clone, Debug)]
 pub(crate) struct TapeFinalizeArgs {
     /// Exact Remanence tape UUID. Voltags are not accepted.
-    #[arg(long, value_name = "UUID")]
+    #[arg(long, alias = "tape", value_name = "UUID")]
     pub(crate) tape_uuid: String,
 
     /// Current canonical pool id. Required by the daemon for a pooled tape.
@@ -53,7 +53,7 @@ pub(crate) struct TapeFinalizeArgs {
     pub(crate) json: bool,
 
     /// Explicit acknowledgement of the exact irreversible tape UUID.
-    #[arg(long, value_name = "UUID")]
+    #[arg(long, alias = "acknowledge-tape", value_name = "UUID")]
     pub(crate) ack_tape_uuid: String,
 
     /// Daemon gRPC endpoint URI.

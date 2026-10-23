@@ -11,20 +11,18 @@
 //! Invocation:
 //!
 //! ```text
-//! cargo test --features linux-udev --test watch_live_udev -- \
+//! REM_TEST_LIVE_SCSI=1 cargo test --features linux-udev --test watch_live_udev -- \
 //!   --ignored --test-threads=1 --nocapture
 //! ```
 //!
-//! Without those preconditions the test prints a skip message and
-//! returns `Ok(())` rather than failing — there's no way to assert
-//! something without the harness, so we don't pretend to.
+//! Missing prerequisites fail when this ignored test is selected.
 
 #![cfg(all(target_os = "linux", feature = "linux-udev"))]
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use remanence_library::watch::{HotplugSource, LinuxUdevSource, WatcherError};
+use remanence_library::watch::{HotplugSource, LinuxUdevSource};
 
 fn first_sg_device() -> Option<PathBuf> {
     let sys_dir = PathBuf::from("/sys/class/scsi_generic");
@@ -52,25 +50,10 @@ fn poke_uevent(sg_path: &Path) -> std::io::Result<()> {
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires root + Linux + a real /dev/sg* device"]
 async fn live_udev_delivers_change_event() {
-    // Skip cleanly if preconditions aren't met. The test is gated
-    // `#[ignore]` so this path only runs under `--ignored`.
-    let sg = match first_sg_device() {
-        Some(p) => p,
-        None => {
-            eprintln!("skipped: no /sys/class/scsi_generic/sg* device present");
-            return;
-        }
-    };
-    eprintln!("using sg device: {}", sg.display());
-
-    let mut source = match LinuxUdevSource::new() {
-        Ok(s) => s,
-        Err(WatcherError::SourceUnavailable(msg)) => {
-            eprintln!("skipped: udev unavailable: {msg}");
-            return;
-        }
-        Err(e) => panic!("LinuxUdevSource::new failed: {e}"),
-    };
+    assert_eq!(std::env::var("REM_TEST_LIVE_SCSI").as_deref(), Ok("1"),
+        "run with REM_TEST_LIVE_SCSI=1 cargo test -p remanence-library --features linux-udev --test watch_live_udev -- --ignored");
+    let sg = first_sg_device().expect("a /sys/class/scsi_generic/sg* device is required");
+    let mut source = LinuxUdevSource::new().expect("live udev must be available");
     // Tighten the coalescer so the test doesn't have to wait a full
     // 500ms after the poke before the burst materialises.
     source.set_coalesce_window(Duration::from_millis(50));
@@ -79,13 +62,7 @@ async fn live_udev_delivers_change_event() {
     // Poke after subscribing, so the event isn't missed in the
     // millisecond between MonitorBuilder::listen() and our first
     // recv().
-    if let Err(e) = poke_uevent(&sg) {
-        eprintln!(
-            "skipped: cannot write {}/uevent (not root?): {e}",
-            sg.display()
-        );
-        return;
-    }
+    poke_uevent(&sg).expect("must be able to write the device uevent (requires root)");
 
     // The monitor catches every SCSI hot-plug event on the host, not
     // just ours, so an unrelated burst could plausibly arrive first.

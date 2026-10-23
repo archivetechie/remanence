@@ -3,6 +3,8 @@
 //! `#[ignore]`-gated by default. Runs only when env vars point
 //! at a Quadstor VTL drive that's safe to write to.
 //!
+//! Set `REM_TEST_LIVE_SCSI=1` to opt in to live hardware access.
+//!
 //! ## Env vars
 //!
 //! - `REM_QUADSTOR_PARITY_DRIVE_PATH` (required) — `/dev/sgN`
@@ -24,16 +26,14 @@
 //! ## Invocation
 //!
 //! ```text
-//! REM_QUADSTOR_PARITY_DRIVE_PATH=/dev/sg5 \
+//! REM_TEST_LIVE_SCSI=1 REM_QUADSTOR_PARITY_DRIVE_PATH=/dev/sg5 \
 //! REM_QUADSTOR_PARITY_WRITE_LOOP=1 \
 //! cargo test -p remanence-parity --test quadstor_parity -- \
 //!   --ignored --test-threads=1 --nocapture
 //! ```
 //!
-//! Without the env vars the test prints a skip message and
-//! returns `Ok(())` — there's no way to validate anything
-//! without the hardware.
-//!
+//! Missing hardware prerequisites fail when these ignored tests are selected.
+
 //! ## What it does
 //!
 //! Writes one small parity-protected epoch through `ParitySink`
@@ -203,30 +203,17 @@ fn parse_bay_address(value: &str) -> u16 {
     .unwrap_or_else(|err| panic!("invalid REM_QUADSTOR_PARITY_DRIVE_BAY={value:?}: {err}"))
 }
 
-fn skip_if_no_hardware() -> Option<PathBuf> {
-    match drive_path() {
-        Some(p) if p.exists() => match OpenOptions::new().read(true).write(true).open(&p) {
-            Ok(_) => Some(p),
-            Err(e) => {
-                eprintln!(
-                    "quadstor_parity: skipping — cannot open {p:?}: {e}. Need tape group + \
-                         CAP_SYS_RAWIO or root."
-                );
-                None
-            }
-        },
-        Some(p) => {
-            eprintln!("quadstor_parity: skipping — {p:?} does not exist");
-            None
-        }
-        None => {
-            eprintln!(
-                "quadstor_parity: skipping — REM_QUADSTOR_PARITY_DRIVE_PATH not set. \
-                 See module docs for invocation."
-            );
-            None
-        }
-    }
+/// Require explicit opt-in and a usable device before running the selected test.
+fn require_hardware() -> PathBuf {
+    assert_eq!(std::env::var("REM_TEST_LIVE_SCSI").as_deref(), Ok("1"),
+        "run with REM_TEST_LIVE_SCSI=1 cargo test -p remanence-parity --test quadstor_parity -- --ignored --test-threads=1; see module docs for device variables");
+    let path = drive_path().expect("set the drive path documented above for this hardware test");
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap_or_else(|e| panic!("cannot open {path:?}: {e}"));
+    path
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
@@ -457,18 +444,13 @@ fn synthetic_transport_read_error() -> TapeIoError {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires REM_TEST_LIVE_SCSI=1 and configured scratch hardware; see module docs"]
 fn quadstor_parity_roundtrip() {
-    let Some(path) = skip_if_no_hardware() else {
-        return;
-    };
-    if !write_loop_enabled() {
-        eprintln!(
-            "quadstor_parity_roundtrip: skipping — REM_QUADSTOR_PARITY_WRITE_LOOP not set to 1. \
-             This test writes to the loaded cartridge; only enable on a scratch tape."
-        );
-        return;
-    }
+    let path = require_hardware();
+    assert!(
+        write_loop_enabled(),
+        "set REM_QUADSTOR_PARITY_WRITE_LOOP=1 with a scratch cartridge; this test writes tape"
+    );
 
     let block_size = block_size();
     let scheme = smoke_scheme();
@@ -554,18 +536,13 @@ fn quadstor_parity_roundtrip() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires REM_TEST_LIVE_SCSI=1 and configured scratch hardware; see module docs"]
 fn quadstor_parity_journaled_session() {
-    let Some(path) = skip_if_no_hardware() else {
-        return;
-    };
-    if !write_loop_enabled() {
-        eprintln!(
-            "quadstor_parity_journaled_session: skipping — REM_QUADSTOR_PARITY_WRITE_LOOP not set to 1. \
-             This test writes to the loaded cartridge; only enable on a scratch tape."
-        );
-        return;
-    }
+    let path = require_hardware();
+    assert!(
+        write_loop_enabled(),
+        "set REM_QUADSTOR_PARITY_WRITE_LOOP=1 with a scratch cartridge; this test writes tape"
+    );
 
     let block_size = block_size();
     let scheme = smoke_scheme();
@@ -657,19 +634,13 @@ fn quadstor_parity_journaled_session() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires REM_TEST_LIVE_SCSI=1 and configured scratch hardware; see module docs"]
 fn quadstor_parity_recovers_from_injected_read_fault() {
-    let Some(path) = skip_if_no_hardware() else {
-        return;
-    };
-    if !write_loop_enabled() {
-        eprintln!(
-            "quadstor_parity_recovers_from_injected_read_fault: skipping — \
-             REM_QUADSTOR_PARITY_WRITE_LOOP not set to 1. This test writes \
-             to the loaded cartridge; only enable on a scratch tape."
-        );
-        return;
-    }
+    let path = require_hardware();
+    assert!(
+        write_loop_enabled(),
+        "set REM_QUADSTOR_PARITY_WRITE_LOOP=1 with a scratch cartridge; this test writes tape"
+    );
 
     let block_size = block_size();
     let scheme = smoke_scheme();
@@ -770,15 +741,13 @@ fn quadstor_parity_recovers_from_injected_read_fault() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires REM_TEST_LIVE_SCSI=1 and configured scratch hardware; see module docs"]
 fn quadstor_parity_bounded_resume_append_roundtrip() {
-    let Some(path) = skip_if_no_hardware() else {
-        return;
-    };
-    if !write_loop_enabled() {
-        eprintln!("quadstor_parity_bounded_resume_append_roundtrip: destructive gate is disabled");
-        return;
-    }
+    let path = require_hardware();
+    assert!(
+        write_loop_enabled(),
+        "set REM_QUADSTOR_PARITY_WRITE_LOOP=1 with a scratch cartridge; this test writes tape"
+    );
 
     let block_size = block_size();
     let scheme = smoke_scheme();

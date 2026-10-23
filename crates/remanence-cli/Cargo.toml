@@ -18,6 +18,7 @@ name = "rem-debug"
 path = "src/rem_debug.rs"
 
 [dependencies]
+toml_edit = "0.25"
 remanence-aead    = { path = "../remanence-aead" }
 remanence-chaos   = { path = "../remanence-chaos" }
 remanence-format  = { path = "../remanence-format" }
