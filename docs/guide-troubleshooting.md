@@ -43,7 +43,7 @@ For the daemon under systemd, grant the capability in the unit instead:
 check that `/dev/sg*` nodes exist at all (no HBA, no VTL, or the module
 is not loaded).
 
-<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-library/src/discovery.rs @ 7a7af81d -->
+<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-library/src/discovery.rs @ 4dc2a3c6 -->
 ## A standalone drive is missing or read-only
 
 Start with:
@@ -63,11 +63,16 @@ standalone refusals are:
 | `--device requires explicit --allow-device` | Repeat the serial from `rem drives --json`: `--device /dev/sgN --allow-device SERIAL`. |
 | `--allow-device does not authorize this discovered drive` | The selected path now resolves to another serial, or the allow value is wrong. Rediscover; do not broaden the allowlist blindly. |
 | `device is not an unattached drive; library operations go through the daemon` | A changer claims this drive. Configure and use the library path instead. |
-| `ownership unknown` | Discovery could not prove that no changer owns the drive. Fix the failed probes. If this is a known standalone drive on a partially discoverable host, add its exact serial under `[[standalone_drives]]`. |
+| `ownership unknown` | Discovery could not prove that no changer owns the drive. Fix failed tape/changer probes. Do not join `disk`: non-tape devices are skipped by sysfs type, and disk access does not prove drive ownership. If this is a known standalone drive on a partially discoverable host, add its exact serial under `[[standalone_drives]]`. |
 | `unresolved changer bays prohibit device writes` | A reachable changer has a bay whose drive identity cannot be resolved. Fix that mapping; a standalone serial pin does not override it. |
 | `only permitted for read verbs` with `--allow-unserialized-device` | A drive without a readable serial has only an ephemeral identity. Reads can be explicitly allowed; writes cannot. |
 | State volume is untrusted | Put home-mode state on a local persistent filesystem. `--allow-untrusted-state-volume` is an explicit development override, not a normal archive setup. |
-| Cannot write `/run/lock/rem` | Create it for the `tape` group: `sudo install -d -o root -g tape -m 0770 /run/lock/rem`. |
+| Cannot write `/run/lock/rem`, especially after reboot | Create it with `sudo install -d -o root -g tape -m 0770 /run/lock/rem`. Put `d /run/lock/rem 0770 root tape -` in `/etc/tmpfiles.d/rem.conf` so boot recreates it. |
+| `TailBeyondKnownState` | Tape holds complete data beyond local checkpoint authority, often after restoring old state. Restore newer state or rescue with `rem tape restore --scan --out rescued`. Do not delete journals. Only deliberately discard a rescued suffix with `rem tape supersede-tail --acknowledge-tape LABEL` and its exact confirmation. |
+| Used cartridge refused / `RefuseClobber` | Nonblank media needs `rem tape init --label LABEL --generation L9 --clobber-data`, then `CLOBBER LABEL`. This also applies after retirement. Other identity and committed-copy checks still apply. |
+| Active tape-I/O quarantine | Run `rem tape quarantine list`. Reads remain available; rescue with `rem tape restore --scan --out rescued`. After investigating, use `rem tape quarantine release ID --ack "what was checked"`. Release does not bypass the physical append check. |
+| Tape full / capacity refusal | Written receipts remain committed. Finalize, eject, initialize the next cartridge in the same pool and rerun put. Unchanged committed files skip. An uncertain I/O failure needs quarantine investigation first. |
+| Ran with sudo / home mode refuses root | Never run rem with sudo. Use your normal account with the `tape` group and a capability on the binary. Check which state directory the earlier command used; preserve it before correcting ownership or choosing a config. Root's home state is not your user's state. |
 
 The full setup and first-tape sequence is in [Using a standalone LTO
 drive](guide-standalone-drive.md).

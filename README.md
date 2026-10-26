@@ -35,7 +35,7 @@ to a first physical tape.
 Long-term tape archiving is dominated by proprietary systems whose on-tape
 formats become unreadable when the vendor disappears, and by tools that treat
 tape like a disk. Remanence makes different choices. The object format is publicly
-specified and a plaintext object can be read with stock `tar`. Every tape
+specified and a plaintext object can be read with `bsdtar`. Every tape
 describes itself, so no database is the only copy of the truth. When the
 hardware leaves the software uncertain about physical state, the software
 stops instead of guessing. The reasoning is laid out in

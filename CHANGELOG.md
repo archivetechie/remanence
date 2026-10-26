@@ -4,6 +4,33 @@ Notable changes to Remanence and its published formats. The format
 specifications carry their own revision histories; entries here are
 per-release summaries.
 
+<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_backend.rs crates/remanence-state/src/index.rs crates/remanence-library/src/discovery.rs @ 4dc2a3c6 -->
+## Unreleased
+
+- Operate a manually loaded LTO drive without a daemon: setup, initialize,
+  put/get, finalize, verify and restore. Home mode keeps state in the user's
+  state directory and remembers the drive by serial. Library operations keep
+  their daemon route; direct operations retain identity, ownership and write
+  safety checks.
+- Recover files without the original catalog using a terminal index or a BOT
+  scan. List tape members and restore selected paths. Adoption records tape
+  identity only. Restore preserves modification times; get stages on the
+  destination filesystem.
+- Track standalone file versions by pool and archive path. Unchanged newest
+  content skips; changed content gets a new object UUID. Put prints per-file
+  receipts and tape-full continuation instructions. List catalogued paths and
+  select older versions with get. The catalog migrates to schema 20.
+- Refuse append when tape data extends beyond local checkpoint authority.
+  Rescue it or explicitly confirm supersede-tail. Used cartridges, including
+  retired media, require confirmed clobber. Partition checks and quarantine
+  protect uncertain writes while leaving reads available.
+- Skip non-tape SCSI devices during discovery. Add doctor readiness guidance,
+  destination/tape flag aliases, stable standalone finalize defaults, a home
+  root refusal, and explicit opt-in for tests that issue live SCSI commands.
+- Record operator labels, generation observations and pool-assignment history
+  independently of library identity. Add diagnostics capture and direct-drive
+  ownership configuration.
+
 ## 0.2.0 — 2026-10-15
 
 - First release with prebuilt Linux binaries (`remanence-x86_64-linux.tar.gz`, `rem-recover-x86_64-linux-musl.tar.gz`, `SHA256SUMS`) and build provenance attestation.

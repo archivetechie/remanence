@@ -5,7 +5,7 @@ the other documentation. A reader new to Remanence can start with the
 [formats and objects](#formats-and-objects) section. Names in `code font` are
 literal identifiers, flags, or file names.
 
-<!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-aead/src/header.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/key_frame.rs crates/remanence-aead/src/xwing.rs crates/remanence-parity/src/lib.rs @ bc2f9f90 -->
+<!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-aead/src/header.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/key_frame.rs crates/remanence-aead/src/xwing.rs crates/remanence-parity/src/lib.rs crates/remanence-state/src/index.rs @ 4dc2a3c6 -->
 ## Formats and objects
 
 Remanence uses three formats. REM-OBJECT packages files into one stored unit,
@@ -26,6 +26,12 @@ interpret. Remanence stores a REM-OBJECT as each Object. Remanence's builders
 require a non-empty caller object id, and Remanence gives each object a UUID;
 the format itself treats the object identifier as opaque UTF-8 text.
 
+**version** — one committed REM object for a pool, archive path and content.
+Newest means the latest `created_at_utc` among versions with a committed copy
+in that pool, with object row order breaking ties. It is not a stored version
+number or a latest flag. Get-by-path selects newest on the loaded tape;
+`get --version` selects an object UUID explicitly.
+
 **representation** — the form in which an object's bytes are stored.
 `plaintext` is the readable form (`rem-object-v1`, below). `encrypted` is the
 same object sealed by REM-ENCRYPT (`REMO`, below). Each copy of an object has
@@ -42,7 +48,7 @@ it without understanding the format or holding a key.
 
 **rem-object-v1** — the plaintext REM-OBJECT body: a POSIX pax tar archive with
 `REMANENCE.*` pax headers, chunk-aligned members, and a trailing CBOR
-manifest. Readable with stock `tar`. (tar is the standard Unix archive format;
+manifest. Readable with `bsdtar`. (tar is the standard Unix archive format;
 pax is its extended-header form, used here to carry extra named fields; CBOR is
 a compact binary data format, readable with common libraries.)
 
@@ -405,8 +411,8 @@ the drive itself.
 **IE port / mail slot** — the import/export station where cartridges
 enter and leave the chassis.
 
-**voltag** — volume tag, the barcode on a cartridge as reported by the
-library's scanner. A label, not an identity.
+**voltag** — volume tag, the shell label read by a changer scanner or asserted
+by an operator. See [labels and endpoints](#labels-and-endpoints).
 
 **volume label** — the identifying record traditional tape systems write
 first on a cartridge (the ANSI VOL1 record, the LTFS volume label).
@@ -457,3 +463,34 @@ identical UAs become terminal.
 **VTL** — virtual tape library, software that emulates a tape library
 chassis, its drives, and its cartridges.
 
+<!-- code-anchor: crates/remanence-api/src/mount_backend.rs crates/remanence-library/src/discovery.rs crates/remanence-state/src/index.rs @ 4dc2a3c6 -->
+## Labels and endpoints
+
+**label (voltag)** — the code on a cartridge shell, read by a changer scanner
+or a person. It is not the logical tape identity.
+
+**label provenance (voltag_source)** — `changer` when a scanner reads the
+label, `operator` when a person asserts it. Neither is an identity trust level;
+the bootstrap UUID is the identity in both cases.
+
+**tape UUID** — the UUID in the BOT bootstrap, identifying one logical tape
+independently of its label, pool, library or device path.
+
+**endpoint** — a place a cartridge can be mounted: a library bay or standalone
+drive. An endpoint is not a device path.
+
+**standalone drive** — a drive proven unclaimed by complete discovery, with no
+unresolved changer bays, or pinned as standalone by configuration. A drive
+that no changer claims during incomplete discovery has **ownership unknown**;
+that alone does not authorize writes.
+
+**DriveKey** — a durable endpoint key: `Bay { library_serial, bay }` or
+`Standalone { drive_serial }`. Drive serial comes from VPD page 0x80. Neither
+an OS path nor a sentinel bay stands in for a standalone key.
+
+**MountEndpoint** — `Durable(DriveKey)` or `Ephemeral { sg_path }`. Ephemeral
+endpoints permit authorized reads only.
+
+**append admission** — proof that the tape's physical suffix permits a write
+at the journal-authorized position. Complete data beyond known state produces
+`TailBeyondKnownState`; state rows and fence release do not authorize erasure.

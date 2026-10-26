@@ -121,51 +121,100 @@ Discovery is read-only but still issues SCSI commands, so it needs the
 `tape` group and `CAP_SYS_RAWIO` (see the [quickstart](guide-quickstart.md)
 and [troubleshooting](guide-troubleshooting.md)).
 
-<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_backend.rs crates/remanence-library/src/discovery.rs @ 7a7af81d -->
+<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_backend.rs crates/remanence-library/src/discovery.rs @ 4dc2a3c6 -->
 ## Standalone drives
 
 The standalone interface operates one manually loaded drive directly. It does
 not need `rem-daemon`, a changer, or a `[[libraries]]` entry. The complete
 walkthrough is [Using a standalone LTO drive](guide-standalone-drive.md).
 
-Every command that opens media takes both:
+Library operations go through the daemon; a standalone drive is operated
+directly. Routing is part of the command interface, including help:
 
-```text
---device <SG> --allow-device <DRIVE_SERIAL>
-```
+| Invocation | Route |
+|---|---|
+| Explicit `--device` | Standalone |
+| Standalone-only verb (`setup`, `drives`, `doctor`, `diagnostics`, `list`, `pool new`, or a standalone-only tape verb) | Standalone |
+| Shared verb with `--config` or `--endpoint`, without `--device` | Library/daemon |
+| Shared verb with no explicit device/config/endpoint, no `/etc/rem/config.toml`, and home `[home] drive_serial` set | Standalone |
+| Other shared invocations | Library/daemon |
 
-`--device` selects the current Linux path. `--allow-device` authorizes the
-serial discovered at that path. The command refuses a path that resolves to a
-different serial or to a drive claimed by a library. A complete discovery pass
-must prove standalone ownership before a mutation. If discovery is incomplete,
-an operator can pin a known standalone serial with `[[standalone_drives]]`; an
-unresolved changer bay still blocks writes. `--acknowledge-unknown-ownership`
-and `--allow-unserialized-device` are read-only exceptions and never authorize
-a write.
+Every device verb accepts `--device <SG> --allow-device <SERIAL|PATH>`.
+Setup saves a home serial that supplies both defaults: discovery must find
+exactly one matching path. It never authorizes a different explicit device.
+Ownership and the serial read when opening the drive are still checked.
+Unknown ownership is not permission to write. `[[standalone_drives]]` pins
+known ownership but cannot override an unresolved or positive changer claim.
+
+Global standalone flags are `--config <PATH>`, `--json`, `--reserve`,
+`--allow-untrusted-state-volume`, `--acknowledge-unknown-ownership` and
+`--allow-unserialized-device`. The last two permit reads only. `--reserve`
+adds SCSI RESERVE(6)/RELEASE(6) for the invocation; the state-volume override
+explicitly accepts a filesystem that fails the durability checks. Running
+home mode as root is refused; use the permissions in the standalone guide.
+
+The table omits the device/authorization flags, which all media verbs accept.
 
 | Command | What it does |
 |---|---|
-| `rem doctor [--json]` | Check effective `tape`-group membership, `CAP_SYS_RAWIO` on the running binary, `/run/lock/rem`, state location, and discovered endpoints. |
-| `rem pool new <POOL> [--scheme <SCHEME>] [--block-size <BYTES>]` | Add a pool to home-mode config. The default scheme is `custom:128,4,1`; `--scheme default` selects the block-size-aware library geometry. This command does not take `--device`. |
-| `rem tape init --device <SG> --allow-device <DRIVE_SERIAL> --label <LABEL> [--generation Lx] [--pool <POOL>] [--block-size <BYTES>]` | Initialize the loaded cartridge, mint its tape UUID, write BOT, and catalog it. The default pool is `default`. This is destructive and has no standalone dry-run mode. |
-| `rem tape identify --device <SG> --allow-device <DRIVE_SERIAL>` | Read the loaded tape identity and terminal summary. |
-| `rem tape adopt --device <SG> --allow-device <DRIVE_SERIAL> [--label <LABEL>] [--pool <POOL>]` | Add an existing Remanence tape's bootstrap identity to local state without rewriting it. |
-| `rem put <PATH>... --device <SG> --allow-device <DRIVE_SERIAL> [--pool <POOL>] [--recipient <REMR>]...` | Write files through the checkpointed standalone path. Directories are recursive and each regular file becomes one object. The loaded tape's catalogued pool is authoritative; a supplied pool is a guard and must match. |
-| `rem get <OBJECT> --out <DIR> --device <SG> --allow-device <DRIVE_SERIAL> [--private-key <REMP>]` | Restore a catalogued object from the loaded tape. OBJECT may be its UUID or caller object id. |
-| `rem tape verify [--full] --device <SG> --allow-device <DRIVE_SERIAL>` | Without `--full`, verify the terminal structure. With it, read and verify all sidecar-protected data and parity. |
-| `rem tape restore --out <DIR> [--scan] --device <SG> --allow-device <DRIVE_SERIAL> [--private-key <REMP>]` | Restore without the local object catalog. The normal path uses the terminal index; `--scan` walks from BOT. |
-| `rem tape finalize --tape <UUID> --acknowledge-tape <UUID> --reason <TEXT> --idempotency-key <UUID> --expected-pool <POOL> --device <SG> --allow-device <DRIVE_SERIAL>` | Irreversibly close the exact pooled tape and write its terminal suffix. `--expected-pool` is required for a pooled tape. Reuse the idempotency UUID when retrying the same request. |
-| `rem tape assign-pool [--tape <UUID>] (--pool <POOL> \| --unassign)` | Change catalogued pool assignment. With `--tape`, this is an offline state operation; otherwise it identifies the cartridge loaded in `--device`. |
-| `rem tape set-generation --generation Lx --device <SG> --allow-device <DRIVE_SERIAL>` | Persist an operator generation observation for the loaded tape. |
-| `rem tape rebind --label <LABEL> --previous-uuid <UUID> --device <SG> --allow-device <DRIVE_SERIAL>` | Bind a reused operator label to the loaded tape while naming the previous UUID. |
-| `rem tape import-journals --from <DIR> --device <SG> --allow-device <DRIVE_SERIAL>` | Import matching journal evidence for the loaded tape. |
-| `rem tape release --device <SG> --allow-device <DRIVE_SERIAL>` | Clear a drive medium-removal guard left by an interrupted invocation. It does not clear durable quarantine. |
-| `rem diagnostics capture --out <FILE> [--device <SG> --allow-device <DRIVE_SERIAL>]` | Capture inquiry, mode, and log-page diagnostics without reading tape data or positioning the tape. |
+| `rem setup [--yes] [--device <SG>]` | Run doctor and discovery, display the selected drive and save `[home] drive_serial` after confirmation. Incomplete discovery needs a separate ownership assertion; `--yes` accepts both. |
+| `rem doctor [--json]` | Check effective group, binary capability, locks, state, discovery and fences; print a ready/not-ready verdict and fixes. |
+| `rem drives [--json]` | List discovered endpoints with path, serial, model and ownership. |
+| `rem list [--tape <LABEL\|UUID>] [--path-prefix <PREFIX>] [--json]` | List committed archive paths, version counts, newest UUID and tape locations; no device required. |
+| `rem pool new <POOL> [--scheme <SCHEME>] [--block-size <BYTES>]` | Create a pool. Default scheme is `custom:128,4,1`; `--scheme default` uses the block-size-aware library geometry. |
+| `rem tape init --label <LABEL> [--pool <POOL>] [--generation <GEN>] [--block-size <BYTES>] [--clobber-data [--confirm-clobber "CLOBBER <LABEL>"]]` | Initialize loaded media immediately, with no dry run. Default pool is `default`. Nonblank media, including retired media, requires clobber confirmation; other safety refusals still apply. GEN accepts L5, L6, L7, L8, L9, M8. |
+| `rem tape identify` | Read loaded tape identity and terminal summary. |
+| `rem tape adopt [--label <LABEL>] [--pool <POOL>]` | Import bootstrap identity only; no object rows, no media rewrite. Use restore to list files without the original catalog. |
+| `rem put <PATH>... [--pool <POOL>] [--recipient <REMR>]... [--tape <LABEL\|UUID>] [--allow-plaintext-copy]` | Recursively store regular files, one object per file. Pool must match loaded media. Tape selector guards identity. Plaintext over a newest encrypted version needs explicit `--allow-plaintext-copy`. |
+| `rem get <OBJECT_UUID\|ARCHIVE_PATH> --out <DIR> [--version <OBJECT_UUID>] [--private-key <REMP>]` | Restore the selected object, or newest committed path version on the loaded tape. `--version` selects an older version. Stage on the destination filesystem and restore recorded modification times. |
+| `rem tape verify [--full]` | Check terminal structure, optionally all sidecar-protected data and parity. |
+| `rem tape restore [--out <DIR>] [--list] [--path <MEMBER>]... [--scan] [--private-key <REMP>]` | Catalogless listing or restore. Output is required unless listing. Repeat `--path` to select exact member paths; `--scan` walks from BOT instead of using the terminal index. Encrypted member listing needs a key. |
+| `rem tape finalize --acknowledge-tape <LABEL\|UUID> [--tape <UUID>] [--expected-pool <POOL>] [--reason <TEXT>] [--idempotency-key <UUID>]` | Permanently close the loaded tape. Defaults are its UUID, catalogued pool, reason `finalized with rem`, and a stable UUIDv5 request key derived from the tape UUID and a fixed namespace. |
+| `rem tape assign-pool [--tape <UUID>] (--pool <POOL> \| --unassign)` | With UUID, change assignment offline; otherwise identify loaded media. |
+| `rem tape set-generation --generation <GEN>` | Record generation for loaded media; accepts L5–L9 and M8. |
+| `rem tape rebind --label <LABEL> --previous-uuid <UUID>` | Bind a reused operator label to loaded media, checking the previous UUID. |
+| `rem tape import-journals --from <DIR>` | Validate and import matching checkpoint/parity journal authority for append recovery. |
+| `rem tape supersede-tail --acknowledge-tape <LABEL\|UUID> [--confirm-supersede "SUPERSEDE <LABEL>"]` | List and explicitly discard the suffix beyond local authority, with typed confirmation and audit. Rescue files first. |
+| `rem tape quarantine list` | List local active tape-I/O fences. |
+| `rem tape quarantine release <ID> --ack <TEXT>` | Release a fence with an operator acknowledgement. This does not bypass append admission. |
+| `rem tape release` | Clear medium-removal guard only; quarantine remains. |
+| `rem diagnostics capture --out <FILE.tar> [--device <SG> --allow-device <SERIAL>]` | Capture diagnostics without reading tape data or positioning media. |
 
-`--reserve` adds a SCSI RESERVE(6) for the invocation and releases it on normal
-exit. `--json` wraps results with `supported_endpoint_kinds` and
-`observed_endpoints`, which lets automation retain the discovery facts used by
-the command.
+Aliases accepted by both parsers are `--dest` for `--out`, `--tape-uuid` for
+`--tape`, and `--ack-tape-uuid` for `--acknowledge-tape` on verbs with those
+options. The library parser retains its original canonical spellings and
+accepts the corresponding shorter names. Aliases do not make the library
+finalize defaults or label handling the same as standalone.
+
+Put compares size and SHA-256 against the newest committed version in the
+pool, ordered by creation time and then object row order. Equal newest
+content skips; a change writes a new UUID, even when it matches an older
+version. Receipts are `written`, `already_stored`, `skipped_unsupported`, or
+`refused`; the summary names failures and counts committed files. On capacity
+refusal it tells you to finalize, initialize the next tape in the same pool,
+and rerun put. `--json` streams receipts and a summary, then an envelope with
+all receipts. JSON envelopes carry `supported_endpoint_kinds` and
+`observed_endpoints`.
+
+Reads report active tape-I/O fences and remain available. Writes refuse fences
+on the loaded tape or endpoint. Append admission also checks the physical tail:
+`TailBeyondKnownState` means local state cannot authorize overwriting complete
+data. Restore newer state or rescue with `tape restore --scan` before considering
+supersede-tail.
+
+### Which verification command?
+
+| Command | What it reads | Existing catalog needed? | Daemon? | Duration |
+|---|---|---|---|---|
+| Standalone `tape verify` | Bootstrap and terminal structure/index | No object catalog | No | Usually minutes; positioning dominates |
+| Standalone `tape verify --full` | Full structural walk, all sidecar-protected data and parity | No object catalog | No | Hours on a full tape |
+| Library `tape inventory --tape-uuid <UUID>` | Bootstrap and usable terminal index; BOT walk if no index works | Yes, for tape selection | Yes | Usually minutes; fallback can take much longer |
+| Library `tape verify-index --tape-uuid <UUID>` | Full structural walk, all sidecar-protected data and parity | Yes, for tape selection | Yes | Hours on a full tape |
+
+On a tape without parity, the full structural check does not checksum object
+interiors: there are no sidecar-protected blocks. Inventory is not a content
+verification. Standalone verify still opens local operational state, but does
+not require catalogued object locations.
 
 <!-- code-anchor: crates/remanence-cli/src/lib.rs @ 6ed03ef0 -->
 ## Daemon queries
@@ -207,29 +256,29 @@ or UUID.
 | `rem drive retire <DRIVE> --reason <TEXT>` | Remove a drive from the managed fleet. A retired drive keeps its identity and still appears in `rem top` marked retired, but is excluded from every selection and mount path. Reversible with `reinstate`. |
 | `rem drive reinstate <DRIVE> --reason <TEXT>` | Return a retired drive to service. Records the reason alongside the retirement it reverses. Does not clear `fenced` or restore `actionable` — those are separate judgements. |
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 6ed03ef0 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 4dc2a3c6 -->
 ## Tape lifecycle
 
 Initialization, readiness, quarantine, and retirement run against local
 config/state and real hardware; they are gated by what the code calls the
 destructive-safety gauntlet — a chain of identity, ownership, and
-data-presence checks that each initialization must pass. Finalization is the
-exception: it is daemon-backed so it shares the daemon's tape ownership,
-capacity, fencing, and durable idempotency authority, and it never performs
-local SCSI discovery.
+data-presence checks that each initialization must pass. In library mode,
+finalization and supersede-tail go through the daemon and its tape ownership
+and fencing checks. The CLI performs no local SCSI discovery for these verbs.
 
 | Command | What it does |
 |---|---|
 | `rem-debug --allow <SERIAL> tape bot-probe <BARCODE> --library <SERIAL> --expected-home-slot <ADDR> --json [--config <PATH>]` | Advisory identity-only BOT probe. Under one stable drive handle it verifies readiness, temporarily selects fixed 1 MiB/compression-off read mode, issues exactly one LOCATE(0) and at most one READ, restores the prior drive mode, and parks the cartridge in the exact expected home slot. It never reads past BOT or consults/mutates the catalog. JSON schema is `rem.tape.bot-probe.v1`; a valid native identity uses `physical_disposition="bootstrap_valid"`. See [Importing and recovering Remanence tapes](importing-and-recovering-remanence-tapes.md). |
 | `rem-debug --allow <SERIAL> tape adopt-bootstrap <BARCODE> --library <SERIAL> --expected-home-slot <ADDR> --expected-existing-tape-uuid <UUID> --json [--config <PATH>]` | Re-read and adopt one checksum-valid existing native bootstrap without writing tape. The command holds the exclusive `StateHandle`, performs fresh discovery, verifies the exact UUID/home/library and canonical 1 MiB default-parity geometry, restores drive mode, parks the medium, then records a durable `TapeIdentityAdopted` event and an identity-only catalog row. Exactly bootstrap→filemark→EOD becomes `ready`; every other tail after a valid bootstrap becomes `recovery_required`. The command generates its internal operation UUID; a retry may no-op only while the replayed row remains the exact same identity-only state. JSON schema is `rem.tape.adopt-bootstrap.v1`. See [Importing and recovering Remanence tapes](importing-and-recovering-remanence-tapes.md). |
 | `rem-debug tape recovery-report <SOURCE> [--json] [--tape-uuid <UUID> --block-size <BYTES> --scheme <k,m,S\|none>]` | Produce a read-only recovery report for a tape without using the catalog. `<SOURCE>` is either the SCSI generic path of the drive that holds the tape (for example `/dev/sg3`) or a directory that holds a tape image in the published layout, with files named `tape-file-NNN-*.bin`. It is not a tape UUID, and a single image file is not accepted. The three options are hints used when the tape's bootstrap cannot be read. `--tape-uuid` is the tape's UUID (for example from `rem catalog tapes`); `--block-size` is the tape's fixed block size in bytes (256 KiB, 512 KiB or 1 MiB; KiB and MiB suffixes are accepted); `--scheme` is the parity scheme as three numbers `k,m,S` (data blocks per stripe, parity blocks per stripe, stripes per neighborhood, for the scheme `rs-cauchy-gf256-v1`), or `none` for a tape written without parity. Supply all three or none. When the bootstrap is readable, leave them out. The report performs terminal discovery first, through the same library entry as the daemon's inventory, and walks from BOT only when discovery yields no inventory. What the command prints when it cannot use the bootstrap is under [Recovery report and verification output](#recovery-report-and-verification-output). Bootstrap-derived report fields are null when unreadable; hints are recorded separately under `supplied`, and the scan records when they provided identity and geometry because the bootstrap was treated as unreadable. A valid terminal replica can supply Object identifiers, while BOT fallback without separate host authority reports complete candidates as unknown. It does not adopt the tape or rebuild SQLite. |
-| `rem tape init <TARGET> [--dry-run] [--force] [--clobber-data] [--block-size <BYTES>] [--parity <none\|default>] [--library <SERIAL>]` | Initialize one tape (by barcode or element address) or an inclusive slot range like `0x0400..0x0407`. `--dry-run` runs every check and writes nothing. `--force` overrides only decisions classified as `RequireForce`; `--clobber-data` is the separate, stronger override for tapes that hold data, and is rejected for dry-run and batch init. Fresh media defaults to parity-off; `--parity default` writes the block-size-aware default parity geometry. An idempotent initialization preserves the geometry already recorded at BOT. |
+| `rem tape init <TARGET> [--dry-run] [--force] [--clobber-data [--confirm-clobber "CLOBBER <LABEL>"]] [--block-size <BYTES>] [--parity <none\|default>] [--library <SERIAL>]` | Initialize one tape (by barcode or element address) or an inclusive slot range like `0x0400..0x0407`. `--dry-run` runs every check and writes nothing. `--force` overrides only decisions classified as `RequireForce`; `--clobber-data` is the separate, stronger override for tapes that hold data, and is rejected for dry-run and batch init. Confirm with `--confirm-clobber "CLOBBER <LABEL>"` or type/pipe the same text on stdin. Retired nonblank cartridges need this confirmation too. Fresh media defaults to parity-off; `--parity default` writes the block-size-aware default parity geometry. An idempotent initialization preserves the geometry already recorded at BOT. |
 | `rem tape wait-ready [--barcode <BC> \| --drive-element <ADDR>] [--already-loaded] [--wait] [--timeout 2.5h] [--poll 30s] [--resume <UUID>]` | Poll TEST UNIT READY until already-loaded media is usable. LTO-9 first loads can take hours (media optimization); the 2.5h default timeout exists for that. `--resume` continues a durable readiness operation without moving media. |
 | `rem tape quarantine list [--library <SERIAL>]` | List active media-readiness fences. |
 | `rem tape quarantine show <ID>` | One fence, by quarantine id or operation UUID. |
 | `rem tape quarantine release <ID> --ack <TEXT> [--after-settled-inventory]` | Release a fence after operator root-cause acknowledgement. |
 | `rem tape retire <TARGET> --reason <TEXT> --i-understand-copies-become-unreadable [--dry-run]` | Permanently retire a tape identity in the local catalog. Every copy on that tape becomes unreadable through the catalog. |
 | `rem tape finalize --tape-uuid <UUID> [--expected-pool <ID>] --reason <EXACT> --idempotency-key <UUID> --ack-tape-uuid <UUID> [--wait] [--json] [--endpoint <URI>]` | Irreversibly finalize one exact reconciled tape, including below the automatic low watermark. Voltags are not accepted, the acknowledgement must name the same UUID, and a pooled tape requires its canonical current pool id. The reason is sent exactly as supplied. Without `--wait`, the command submits once and prints the current status; with it, the command polls the read-only status RPC across daemon reconnects until a terminal outcome and never resubmits finalization. JSON uses schema `rem.tape.finalization.v2`; `replica_progress` is historical barrier evidence, not a current media-health observation. A value the daemon does not have is `null`, never `0`: `operation_id` is `null` for a finalization an automatic trigger started, and a BUSY response has `null` `operation_id`, `completed_replicas` and digests. `completed_replicas` `0` is a real value (before replica A). |
+| `rem tape supersede-tail --tape-uuid <UUID> --ack-tape-uuid <UUID> [--confirm-supersede <TEXT>]` | Through the daemon, list and explicitly discard a suffix beyond checkpoint authority using the same append checks. Rescue first; confirm the exact text requested. |
 | `rem tape inventory --tape-uuid <UUID> [--json] [--endpoint <URI>]` | The quick check of a tape's structure. When the terminal index is readable, it reads the first record of the tape and the terminal replicas at the end of the data, and no Object data. If the terminal index cannot be used, it falls back to a walk from the beginning of tape that reads records throughout the prefix; that walk classifies tape files and is not a content verification. `verify-index` below is the whole-tape check. Stream the complete bounded terminal inventory by locating EOD and selecting C, then B, then A. Human output labels every pre-summary row `provisional`; the final summary names the authoritative `attempt_id`. `--json` emits NDJSON events under `rem.tape.inventory.stream.v1` and ends with exactly one `summary` event. Consumers must commit only that summary's selected attempt. Rejected attempts make fallback evidence explicit; no surviving replica triggers a `bot_recovery_started` notice followed by per-tape-file `bot_recovery_progress` events and streamed BOT classifications rather than empty success. Cancellation is honored at those between-file boundaries. During BOT fallback, an exact surviving checkpoint journal can classify matching complete Objects as recovered; later or foreign Objects without that authority remain unknown. In the summary, a selection, count or digest the outcome does not carry is `null`, never `"0"`: BOT-recovery-required has no counts, fast outcomes have no BOT classification counts, and a torn BOT Object's `stored_block_count` is `null`. |
 | `rem tape verify-index --tape-uuid <UUID> [--json] [--endpoint <URI>]` | Verify the tape's structure and, on a tape written with parity, read and checksum all the data that the parity sidecars protect and all the parity shards. On a tape written without parity there is no sidecar-protected content, so this pass does not read or checksum Object interiors; only the structure and the terminal index are verified. It has no shallow option; `rem tape inventory` is the quicker structural check, and it does not verify the protected content. Use `verify-index` for the periodic check of an archive and for any tape that is suspect. Perform a full verification in the sense of REM-PARITY Section 2.2: measure EOD, walk the prefix, compare the canonical map, validate all three replicas and both separation extents, and read every data block that a sidecar protects and every parity shard, checking each against its sidecar's index. A finding about any data block, parity shard, sidecar copy or footer, ParityMap copy or footer, or the bootstrap's trailing fill leaves the tape not complete: the state is `verified_degraded` and `complete` is `false`. `verified` says that the verification ran to the end; `complete` says whether the tape passed. The findings are printed as described under [Recovery report and verification output](#recovery-report-and-verification-output). See [Full verification](guide-full-verification.md) and [Damaged tapes](guide-damaged-tapes.md). Its all-replicas-invalid BOT outcome applies the same checkpoint-assisted recovered/unknown/incomplete classification as inventory. `verified_interior_record_count` is present only for a valid separation extent (`"0"` for a two-record extent) and `null` for an invalid or unknown one; the verified-prefix counts and digests are `null` when recovery is required. |
 
@@ -412,13 +461,13 @@ case where the abort itself failed and the session remains recoverable.
 accepted by the argument parser and rejected by the daemon. Targeting a tape
 with no pool assignment (`allow_unpooled` in the API) is likewise rejected.
 
-<!-- code-anchor: crates/remanence-cli/src/get.rs @ 244bc6de -->
+<!-- code-anchor: crates/remanence-cli/src/get.rs @ 4dc2a3c6 -->
 ## Restoring from tape
 
 In library mode, `rem get` is put's counterpart: it restores an object's
 members from tape through the daemon read path. With `--device` and
 `--allow-device`, it restores a catalogued object from the cartridge already
-loaded in one standalone drive; that form uses `--out` rather than `--dest`.
+loaded in one standalone drive; both `--out` and `--dest` are accepted.
 The daemon path resolves the object format server-side and streams each
 member's payload bytes, so there is no client-side format interpretation.
 Every member is proven before it is
