@@ -122,15 +122,21 @@ Path(sys.argv[1]).write_text("\n".join(samples[:3]) + "\n")
 Path(sys.argv[2]).write_text("\n".join(samples[3:]) + "\n")
 PY
 
+  # Whole-object extraction restores every member; --path alone is reserved
+  # for byte-range extraction. The sampled members are then compared one by one.
   local restore_dir="$workdir/restore"
   mkdir -p "$restore_dir"
+  local restore_json
+  restore_json="$(fieldtest_artifact_path "$SCRIPT_NAME" restore-all "$stamp")"
+  if ! fieldtest_capture_json "$restore_json" "$(fieldtest_rem_bin)" archive extract --object "$object" --dest "$restore_dir" --overwrite; then
+    fieldtest_evidence_record "$SCRIPT_NAME" restore FAIL "failed to extract the multiobject archive" "$restore_json"
+    exit 1
+  fi
   local sample
   while IFS= read -r sample; do
     [[ -n "$sample" ]] || continue
-    local restore_json
-    restore_json="$(fieldtest_artifact_path "$SCRIPT_NAME" "restore-$sample" "$stamp")"
-    if ! fieldtest_capture_json "$restore_json" "$(fieldtest_rem_bin)" archive extract --object "$object" --dest "$restore_dir" --path "$sample" --overwrite; then
-      fieldtest_evidence_record "$SCRIPT_NAME" restore FAIL "failed to restore $sample from multiobject archive" "$restore_json"
+    if [[ ! -f "$restore_dir/$sample" ]]; then
+      fieldtest_evidence_record "$SCRIPT_NAME" restore FAIL "member $sample missing after extraction" "$restore_json"
       exit 1
     fi
     if [[ "$(sha256_file "$restore_dir/$sample")" != "$(sha256_file "$workdir/inputs/$sample")" ]]; then
