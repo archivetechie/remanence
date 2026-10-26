@@ -71,8 +71,10 @@ main() {
       fi
       # tmux kill only HUPs; the daemon survives as an orphan holding the
       # devices (root cause of wedged writes). Kill by process match on OUR
-      # config path and verify it is gone.
-      for _ in 1 2 3 4 5 6 7 8 9 10; do
+      # config path and verify it is gone. A graceful stop may be unloading a
+      # cartridge, which takes the drive tens of seconds; give it a minute
+      # before the hard kill, which would leave the cartridge unthreaded.
+      for _ in $(seq 1 60); do
         pid="$(pgrep -f "rem-daemon --config $(fieldtest_config_path)" | head -1 || true)"
         [[ -n "$pid" ]] || break
         kill "$pid" 2>/dev/null || true

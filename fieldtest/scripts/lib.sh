@@ -1246,6 +1246,24 @@ fi
 # Unload every loaded drive bay back to its home slot (benign robotics).
 # Used before daemon start and after tape inits — `rem tape init` leaves the
 # cartridge in the drive, which exhausts a 2-drive library by the 3rd tape.
+# Prints the SCSI generic path of the drive in a bay (element address such as
+# 0x0001) of the selected library, from the discovery report; empty if unknown.
+fieldtest_drive_sg_for_bay() {
+  local serial="$1" bay="$2"
+  "$(fieldtest_rem_bin)" libraries --json 2>/dev/null | python3 - "$serial" "$bay" <<'PY'
+import json, sys
+serial, bay = sys.argv[1], int(sys.argv[2], 0)
+try:
+    report = json.load(sys.stdin)
+except ValueError:
+    raise SystemExit(0)
+for endpoint in report.get("observed_endpoints", []):
+    if endpoint.get("kind") == "library" and endpoint.get("library_serial") == serial and endpoint.get("bay") == bay:
+        print(endpoint.get("path", ""))
+        break
+PY
+}
+
 fieldtest_drain_drives() {
   local serial="$1"
   local lib_json loaded_drives bay barcode
@@ -1288,6 +1306,22 @@ PY
     "$(fieldtest_rem_bin)" tape wait-ready --config "$(fieldtest_config_path)" --library "$serial" --barcode "$barcode" --json >"$readiness_out" 2>&1
     readiness_rc=$?
     set -e
+    if [[ "$readiness_rc" -ne 0 ]]; then
+      # A daemon stopped between SSC UNLOAD and the changer move leaves the
+      # cartridge unthreaded in the drive, which answers "not ready" until a
+      # LOAD arrives. Issue one and retry once before giving up on the bay.
+      local drive_sg
+      drive_sg="$(fieldtest_drive_sg_for_bay "$serial" "$bay")"
+      if [[ -n "$drive_sg" ]] && command -v sg_start >/dev/null 2>&1; then
+        echo "warn: drive bay $bay ($barcode) is not ready; issuing LOAD to $drive_sg and retrying once" >&2
+        sg_start --load "$drive_sg" >/dev/null 2>&1 || true
+        sleep 5
+        set +e
+        "$(fieldtest_rem_bin)" tape wait-ready --config "$(fieldtest_config_path)" --library "$serial" --barcode "$barcode" --json >"$readiness_out" 2>&1
+        readiness_rc=$?
+        set -e
+      fi
+    fi
     if [[ "$readiness_rc" -ne 0 ]]; then
       echo "warn: skipping drain of drive bay $bay ($barcode) because media is not ready or state is unknown (rc=$readiness_rc); evidence: $readiness_out" >&2
       continue
