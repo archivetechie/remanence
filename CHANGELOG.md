@@ -44,11 +44,13 @@ per-release summaries.
   independently of library identity. Add diagnostics capture and direct-drive
   ownership configuration.
 
-### Fixes
-
-- Use valid READ/WRITE sense residues when the kernel reports no residue,
-  so physical end of data is recognized and partial transfers retain their
-  byte counts in variable and fixed block modes.
+- Fix first-append failures on freshly initialized tapes and catalog-less
+  recovery report failures on real drives whose adapters report no residual.
+  READ/WRITE uses a valid sense residue when the kernel reports no residual;
+  a nonzero kernel residual stays authoritative for partial transfers.
+  The public `TapeIoError::CheckConditionWithResidue` variant carries the
+  corrected byte count in variable and fixed block modes; library error
+  matchers must accept it.
 
 ## 0.2.0 — 2026-10-15
 

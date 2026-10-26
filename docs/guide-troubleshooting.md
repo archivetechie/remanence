@@ -95,6 +95,8 @@ state machine instead of retrying blindly. The states a command reports
 - **Unknown** (exit 40): the transport lost the answer. Nothing can be
   assumed about the drive.
 
+For drive errors with sense residue correction, `bytes_transferred` is the corrected count; the kernel count follows in parentheses as `kernel reported`.
+
 Two practical notes from real hardware. First, an LTO-9 cartridge's first
 load triggers a one-time media optimization pass that can run well over an
 hour; this is documented drive behavior, not a hang, and it is why

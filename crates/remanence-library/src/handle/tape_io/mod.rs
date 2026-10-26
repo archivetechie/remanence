@@ -281,6 +281,16 @@ impl super::DriveHandle {
     }
 }
 
+/// Render corrected and kernel counts without embedding the source display.
+fn format_residue_check_condition(source: &ScsiError, corrected: u32) -> String {
+    match source {
+        ScsiError::CheckCondition { sense, bytes_transferred } => format!(
+            "drive rejected the command: SCSI check condition (bytes_transferred={corrected}; kernel reported {bytes_transferred}): sense={sense:02x?}"
+        ),
+        other => format!("drive rejected the command (bytes_transferred={corrected}): {other}"),
+    }
+}
+
 /// Errors a Layer 3a tape I/O operation can return. Preserves Layer
 /// 2b's dirty-state vocabulary: completion-unknown errors mark the parent
 /// `LibraryHandle` dirty with cause `CompletionUnknown` (via
@@ -307,7 +317,7 @@ pub enum TapeIoError {
 
     /// READ/WRITE CHECK CONDITION with a valid sense residue and no kernel
     /// residue. Physical state is known, as for `CheckCondition`.
-    #[error("drive rejected the command (transferred bytes={bytes_transferred}): {source}")]
+    #[error("{}", format_residue_check_condition(source, *bytes_transferred))]
     CheckConditionWithResidue {
         /// Original sense and kernel-reported transferred-byte count.
         #[source]
@@ -2224,6 +2234,14 @@ impl super::DriveHandle {
     /// bytes; the return value is the number of bytes actually
     /// delivered.
     ///
+    /// Transferred bytes use the kernel residual when nonzero; otherwise a
+    /// valid current sense residue is subtracted in command units (bytes for
+    /// variable mode, blocks times block size for fixed mode), clamped to
+    /// zero through the request size. Missing, invalid or deferred sense
+    /// retains the kernel count. With no kernel residual, a negative
+    /// variable-mode ILI residue keeps the requested byte count and describes
+    /// an oversized record, not a negative transfer.
+    ///
     /// Buffer sizing per IBM LTO SCSI Reference §4.12.1 / Table 17:
     /// in variable-block mode the drive raises CHECK CONDITION with
     /// the ILI bit + VALID + INFORMATION = `requested - actual` in
@@ -2231,8 +2249,7 @@ impl super::DriveHandle {
     /// buffer length. `read_block` distinguishes the two ILI cases:
     ///
     /// - INFORMATION ≥ 0 (block smaller than buffer): a normal
-    ///   short read. Returns `Ok(actual)` where `actual = requested
-    ///   - INFORMATION`.
+    ///   short read. Returns `Ok(actual)` using the transferred-byte rule above.
     /// - INFORMATION < 0 (block larger than buffer): the drive
     ///   consumed the block (the head advanced past it). Returns
     ///   [`TapeIoError::ReadBufferTooSmall { actual, provided }`]

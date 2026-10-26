@@ -3141,7 +3141,7 @@ mod compat_tests {
             let mut sense = vec![0; len];
             sense[0] = 0xf0;
             sense[2] = 0x20;
-            assert_stable_batch_fault_matches_single(sense, 0);
+            assert_stable_batch_fault_matches_single(sense, 0, None);
         }
     }
 
@@ -3153,15 +3153,15 @@ mod compat_tests {
             vec![0xf0, 0, 0x01, 0, 0, 0, 0],
             vec![0x72, 0x01, 0, 0],
         ] {
-            assert_stable_batch_fault_matches_single(sense, 4);
+            assert_stable_batch_fault_matches_single(sense, 4, None);
         }
     }
 
     /// Recovered completions rejected by restore also use the single error policy.
     #[test]
     fn rejected_recovered_batch_completion_matches_single_check_condition() {
-        assert_stable_batch_fault_matches_single(vec![0x72, 1, 0, 0], 0);
-        assert_stable_batch_fault_matches_single(vec![0xf0, 0, 1, 0, 0, 0, 1], 4);
+        assert_stable_batch_fault_matches_single(vec![0x72, 1, 0, 0], 0, None);
+        assert_stable_batch_fault_matches_single(vec![0xf0, 0, 1, 0, 0, 0, 1], 4, Some(3));
     }
 
     #[test]
@@ -3343,7 +3343,11 @@ mod compat_tests {
 
     /// Stable responses yield the exact single-path error, retaining earlier
     /// clean batches and locating only the first record of the failed command.
-    fn assert_stable_batch_fault_matches_single(sense: Vec<u8>, bytes_transferred: u32) {
+    fn assert_stable_batch_fault_matches_single(
+        sense: Vec<u8>,
+        bytes_transferred: u32,
+        corrected_bytes: Option<u32>,
+    ) {
         let fault = || remanence_library::ScsiError::CheckCondition {
             sense: sense.clone(),
             bytes_transferred,
@@ -3381,17 +3385,36 @@ mod compat_tests {
                 }
                 raw.read_record(&mut [0; 4]).unwrap_err()
             };
-            assert!(
-                matches!(&error, ParityError::TapeIo(
-                    TapeIoError::CheckCondition(
-                        remanence_library::ScsiError::CheckCondition { sense: actual, bytes_transferred: bytes }
-                    ) | TapeIoError::CheckConditionWithResidue {
-                        source: remanence_library::ScsiError::CheckCondition { sense: actual, bytes_transferred: bytes },
-                        ..
-                    }
-                ) if actual == &sense && *bytes == bytes_transferred),
-                "{error:?}"
-            );
+            match (&error, corrected_bytes) {
+                (
+                    ParityError::TapeIo(TapeIoError::CheckConditionWithResidue {
+                        source:
+                            remanence_library::ScsiError::CheckCondition {
+                                sense: actual,
+                                bytes_transferred: kernel,
+                            },
+                        bytes_transferred: corrected,
+                    }),
+                    Some(expected),
+                ) => {
+                    assert_eq!(actual, &sense);
+                    assert_eq!(*kernel, bytes_transferred);
+                    assert_eq!(*corrected, expected);
+                }
+                (
+                    ParityError::TapeIo(TapeIoError::CheckCondition(
+                        remanence_library::ScsiError::CheckCondition {
+                            sense: actual,
+                            bytes_transferred: kernel,
+                        },
+                    )),
+                    None,
+                ) => {
+                    assert_eq!(actual, &sense);
+                    assert_eq!(*kernel, bytes_transferred);
+                }
+                _ => panic!("unexpected completion variant: {error:?}"),
+            }
             assert_eq!(log.borrow().iter().filter(|cdb| cdb[0] == 0x08).count(), 3);
             assert_eq!(
                 log.borrow().iter().filter(|cdb| cdb[0] == 0x92).count(),
@@ -3400,6 +3423,56 @@ mod compat_tests {
             format!("{error:?}")
         };
         assert_eq!(observe(true), observe(false));
+    }
+
+    /// READ residues use bytes in variable mode and blocks in fixed mode.
+    #[test]
+    fn read_residue_conversion_preserves_exact_byte_counts() {
+        for (fixed, expected_bytes) in [(false, 7), (true, 4)] {
+            let mut sense = vec![0; 18];
+            sense[0] = 0xf0;
+            sense[2] = 0x08;
+            sense[6] = 1;
+            sense[7] = 10;
+            sense[13] = 5;
+            let mut steps = Vec::new();
+            if fixed {
+                steps.push((0x34, Ok(read_position_long_response(0, 0, 0))));
+            }
+            steps.push((
+                0x08,
+                Err(remanence_library::ScsiError::CheckCondition {
+                    sense: sense.clone(),
+                    bytes_transferred: 8,
+                }),
+            ));
+            let (mut drive, log) = scripted_read_drive(steps, 0);
+            let error = if fixed {
+                drive
+                    .read_block_batch_for_verification(&mut [0; 8], 4, 2, 2)
+                    .unwrap_err()
+            } else {
+                drive.read_block(&mut [0; 8]).unwrap_err()
+            };
+            match error {
+                TapeIoError::CheckConditionWithResidue {
+                    source:
+                        remanence_library::ScsiError::CheckCondition {
+                            sense: actual,
+                            bytes_transferred: kernel,
+                        },
+                    bytes_transferred: corrected,
+                } => {
+                    assert_eq!(actual, sense);
+                    assert_eq!(kernel, 8);
+                    assert_eq!(corrected, expected_bytes);
+                }
+                other => panic!("expected corrected CHECK CONDITION, got {other:?}"),
+            }
+            let log = log.borrow();
+            let read = log.iter().find(|cdb| cdb[0] == 0x08).unwrap();
+            assert_eq!(read[1] & 1 != 0, fixed);
+        }
     }
 
     #[test]

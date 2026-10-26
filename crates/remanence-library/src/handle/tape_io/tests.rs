@@ -291,6 +291,45 @@ fn tape_outcome_extracts_sense_from_check_condition() {
     }
 }
 
+/// Audit classification preserves sense and distinguishes the two byte counts.
+#[test]
+fn tape_outcome_extracts_sense_from_corrected_residue() {
+    let sense = vec![
+        0xf0, 0x00, 0x08, 0x00, 0x04, 0x00, 0x00, 0x58, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x30,
+        0x00, 0x64, 0x02, 0x20, 0x00, 0x06, 0x01, 0x41, 0x4f, 0x58, 0x30, 0x33, 0x32, 0x4c, 0x00,
+        0x00, 0x00,
+    ];
+    let error = TapeIoError::CheckConditionWithResidue {
+        source: ScsiError::CheckCondition {
+            sense: sense.clone(),
+            bytes_transferred: 262_144,
+        },
+        bytes_transferred: 0,
+    };
+    let expected = format!("drive rejected the command: SCSI check condition (bytes_transferred=0; kernel reported 262144): sense={sense:02x?}");
+    assert_eq!(error.to_string(), expected);
+    let source = std::error::Error::source(&error).unwrap();
+    assert!(matches!(
+        source.downcast_ref::<ScsiError>(),
+        Some(ScsiError::CheckCondition {
+            bytes_transferred: 262_144,
+            ..
+        })
+    ));
+    match tape_outcome(&error, false) {
+        AuditOutcome::ScsiError {
+            sense: actual,
+            summary,
+            dirty,
+        } => {
+            assert_eq!(actual, Some(sense));
+            assert_eq!(summary, expected);
+            assert!(!dirty);
+        }
+        other => panic!("expected ScsiError outcome, got {other:?}"),
+    }
+}
+
 #[test]
 fn tape_outcome_marks_dirty_when_caller_says() {
     let e = TapeIoError::Transport(ScsiError::TransportError {

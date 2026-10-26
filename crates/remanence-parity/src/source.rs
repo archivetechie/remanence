@@ -1194,6 +1194,25 @@ mod erasure_tests {
         })
     }
 
+    /// A corrected MEDIUM ERROR completion remains eligible for reconstruction.
+    #[test]
+    fn is_erasure_accepts_medium_error_with_corrected_residue() {
+        let mut sense = vec![0; 32];
+        sense[0] = 0xf0;
+        sense[2] = 0x03;
+        sense[3..7].copy_from_slice(&262_144u32.to_be_bytes());
+        sense[7] = 24;
+        sense[12] = 0x11;
+        let error = TapeIoError::CheckConditionWithResidue {
+            source: ScsiError::CheckCondition {
+                sense,
+                bytes_transferred: 262_144,
+            },
+            bytes_transferred: 0,
+        };
+        assert!(is_erasure(&error));
+    }
+
     #[test]
     fn is_erasure_rejects_not_ready_entirely() {
         for asc in [0x00u8, 0x04, 0x3A, 0x3E, 0x53, 0x3B, 0x44, 0x52] {

@@ -1098,6 +1098,7 @@ pub struct VecBlockSource {
     /// `locate`, adjusted by `space`.
     cursor: u64,
     read_batch_blocks: u32,
+    eod_kernel_bytes: Option<u32>,
 }
 
 impl Default for VecBlockSource {
@@ -1157,6 +1158,7 @@ impl VecBlockSource {
             calls: Vec::new(),
             cursor: 0,
             read_batch_blocks: 1,
+            eod_kernel_bytes: None,
         }
     }
 
@@ -1168,6 +1170,13 @@ impl VecBlockSource {
             "VecBlockSource read batch size must be nonzero"
         );
         self.read_batch_blocks = read_batch_blocks;
+        self
+    }
+
+    /// Emit corrected zero-transfer EOD with the supplied kernel byte count.
+    /// The default fixture continues to emit `CheckCondition`.
+    pub fn with_eod_residue_for_test(mut self, kernel_bytes: u32) -> Self {
+        self.eod_kernel_bytes = Some(kernel_bytes);
         self
     }
 
@@ -1218,6 +1227,18 @@ impl BlockRead for VecBlockSource {
                     requested: buf.len(),
                     returned: 0,
                 });
+                if let Some(kernel_bytes) = self.eod_kernel_bytes {
+                    let mut sense = synth_blank_check_eod_sense();
+                    sense[0] |= 0x80;
+                    sense[3..7].copy_from_slice(&kernel_bytes.to_be_bytes());
+                    return Err(TapeIoError::CheckConditionWithResidue {
+                        source: remanence_scsi::ScsiError::CheckCondition {
+                            sense,
+                            bytes_transferred: kernel_bytes,
+                        },
+                        bytes_transferred: 0,
+                    });
+                }
                 // EOD per IBM §5.2.15 / Annex B Table B.9:
                 // sense key 0x08 BLANK CHECK + ASC/ASCQ 00/05.
                 Err(TapeIoError::CheckCondition(
@@ -1695,6 +1716,26 @@ mod tests {
         assert_eq!(outcome.position_after.lba, 1);
         assert!(!outcome.early_warning);
         assert!(!outcome.end_of_medium);
+    }
+
+    /// The optional EOD fixture preserves the kernel count and the cursor.
+    #[test]
+    fn vec_source_eod_with_corrected_residue() {
+        let mut source = VecBlockSource::new(vec![vec![1]]).with_eod_residue_for_test(262_144);
+        assert_eq!(source.read_block(&mut [0; 1]).unwrap(), 1);
+        let error = source.read_block(&mut [0; 1]).unwrap_err();
+        assert!(error.is_physical_eod());
+        assert!(matches!(
+            error,
+            TapeIoError::CheckConditionWithResidue {
+                source: remanence_scsi::ScsiError::CheckCondition {
+                    bytes_transferred: 262_144,
+                    ..
+                },
+                bytes_transferred: 0,
+            }
+        ));
+        assert_eq!(source.cursor(), 1);
     }
 
     #[test]
