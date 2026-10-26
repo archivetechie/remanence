@@ -2694,7 +2694,7 @@ enum RemArchiveCommand {
     /// List foreign formats linked into this binary distribution.
     Formats,
 
-    /// Derive or inspect canonical REM-ENCRYPT recipient-key files.
+    /// Generate, derive or inspect canonical REM-ENCRYPT recipient-key files.
     Recipient {
         /// Recipient-key operation to run.
         #[command(subcommand)]
@@ -3373,7 +3373,7 @@ enum ArchiveCommand {
     /// List foreign formats linked into this binary distribution.
     Formats,
 
-    /// Derive or inspect canonical REM-ENCRYPT recipient-key files.
+    /// Generate, derive or inspect canonical REM-ENCRYPT recipient-key files.
     Recipient {
         /// Recipient-key operation to run.
         #[command(subcommand)]
@@ -3431,6 +3431,9 @@ enum ArchiveCommand {
 
 #[derive(Subcommand, Debug)]
 enum ArchiveRecipientCommand {
+    /// Generate a private recovery key and its slot-0 public recipient file.
+    Keygen(ArchiveRecipientKeygenArgs),
+
     /// Derive a canonical REMR public file from a canonical REMP private file.
     Derive(ArchiveRecipientDeriveArgs),
 
@@ -3439,6 +3442,21 @@ enum ArchiveRecipientCommand {
 }
 
 #[derive(Args, Debug)]
+struct ArchiveRecipientKeygenArgs {
+    /// New private-key file (created with mode 0600).
+    #[arg(long, value_name = "FILE.remp")]
+    out: PathBuf,
+
+    /// Recovery label: at most 32 printable ASCII bytes.
+    #[arg(long, value_name = "TEXT", default_value = "")]
+    label: String,
+
+    /// New public-key file; defaults to --out with extension .remr.
+    #[arg(long, value_name = "FILE.remr")]
+    public: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
 struct ArchiveRecipientDeriveArgs {
     /// Canonical REMP private-key file containing the X-Wing seed.
     #[arg(long, value_name = "REMP")]
@@ -4891,6 +4909,7 @@ fn run_archive_recipient(
     err: &mut dyn Write,
 ) -> ExitCode {
     let result = match command {
+        ArchiveRecipientCommand::Keygen(args) => keygen_recipient_report(args),
         ArchiveRecipientCommand::Derive(args) => derive_recipient_report(args),
         ArchiveRecipientCommand::Inspect(args) => inspect_recipient_report(args),
     };
@@ -4904,12 +4923,96 @@ fn run_archive_recipient(
     match write_json_with_capabilities(&mut *out, &report)
         .and_then(|()| writeln!(out).map_err(serde_json::Error::io))
     {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            if matches!(command, ArchiveRecipientCommand::Keygen(_))
+                && std::io::IsTerminal::is_terminal(&std::io::stderr())
+            {
+                let _ = writeln!(err, "A lost private file cannot be recovered.");
+            }
+            ExitCode::SUCCESS
+        }
         Err(error) => {
             let _ = writeln!(err, "error: write recipient-key report: {error}");
             ExitCode::from(1)
         }
     }
+}
+
+/// Create both recipient files exclusively before writing any key material.
+fn keygen_recipient_report(args: &ArchiveRecipientKeygenArgs) -> Result<Value, String> {
+    let public_path = args
+        .public
+        .clone()
+        .unwrap_or_else(|| args.out.with_extension("remr"));
+    for path in [&args.out, &public_path] {
+        match fs::symlink_metadata(path) {
+            Ok(_) => {
+                return Err(format!(
+                    "refusing to overwrite existing key file {}",
+                    path.display()
+                ))
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("check key file {}: {error}", path.display())),
+        }
+    }
+    let private = RecipientPrivateKey::generate(&args.label)
+        .map_err(|error| format!("generate recipient key: {error}"))?;
+    let public = private
+        .public_key(0)
+        .map_err(|error| format!("derive recipient public key: {error}"))?;
+    let public_bytes = public
+        .serialize()
+        .map_err(|error| format!("serialize recipient public-key file: {error}"))?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut private_file = options
+        .open(&args.out)
+        .map_err(|error| format!("create private-key file {}: {error}", args.out.display()))?;
+    let mut public_file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&public_path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            drop(private_file);
+            let _ = fs::remove_file(&args.out);
+            return Err(format!(
+                "create public-key file {}: {error}",
+                public_path.display()
+            ));
+        }
+    };
+    let written = (|| -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            private_file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        private_file.write_all(&private.serialize())?;
+        private_file.sync_all()?;
+        public_file.write_all(&public_bytes)?;
+        public_file.sync_all()
+    })();
+    if let Err(error) = written {
+        drop(private_file);
+        drop(public_file);
+        let _ = fs::remove_file(&args.out);
+        let _ = fs::remove_file(&public_path);
+        return Err(format!("write recipient key files: {error}"));
+    }
+    Ok(json!({
+        "private": args.out,
+        "public": public_path,
+        "epoch_id": bytes_to_hex(&private.recipient_epoch_id),
+        "label": private.epoch_label,
+    }))
 }
 
 fn derive_recipient_report(args: &ArchiveRecipientDeriveArgs) -> Result<Value, String> {
@@ -16912,6 +17015,224 @@ mod tests {
                 "ranged-ciphertext-extract"
             ])
         );
+    }
+
+    /// Exercise key generation through the CLI without hardware discovery.
+    fn generate_test_recipient(path: &Path, label: &str) -> Value {
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "recipient",
+            "keygen",
+            "--out",
+            path.to_str().unwrap(),
+            "--label",
+            label,
+        ]);
+        assert_eq!(code, ExitCode::SUCCESS, "{stderr}");
+        serde_json::from_str(&stdout).unwrap()
+    }
+
+    #[test]
+    fn archive_recipient_keygen_inspects_and_protects_private_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("primary.remp");
+        let report = generate_test_recipient(&path, &"a".repeat(32));
+        assert_eq!(report["private"], path.to_str().unwrap());
+        assert_eq!(
+            report["public"],
+            path.with_extension("remr").to_str().unwrap()
+        );
+        assert_eq!(report["label"], "a".repeat(32));
+        assert_ne!(report["epoch_id"], "00".repeat(16));
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let bytes = zeroize::Zeroizing::new(fs::read(&path).unwrap());
+        let private = RecipientPrivateKey::parse(&bytes).unwrap();
+        assert_eq!(
+            report["epoch_id"],
+            bytes_to_hex(&private.recipient_epoch_id)
+        );
+        assert_eq!(
+            fs::read(path.with_extension("remr")).unwrap(),
+            private.public_key(0).unwrap().serialize().unwrap()
+        );
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "recipient",
+            "inspect",
+            "--public-key",
+            path.with_extension("remr").to_str().unwrap(),
+        ]);
+        assert_eq!(code, ExitCode::SUCCESS, "{stderr}");
+        let inspected: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(inspected["recipient_epoch_id"], report["epoch_id"]);
+        assert_eq!(inspected["epoch_label"], report["label"]);
+        assert_eq!(inspected["slot_index"], 0);
+
+        let other_path = root.path().join("other.remp");
+        let public_path = root.path().join("custom-public.remr");
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "recipient",
+            "keygen",
+            "--out",
+            other_path.to_str().unwrap(),
+            "--public",
+            public_path.to_str().unwrap(),
+        ]);
+        assert_eq!(code, ExitCode::SUCCESS, "{stderr}");
+        let other: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(other["label"], "");
+        assert_eq!(other["public"], public_path.to_str().unwrap());
+        assert_ne!(other["epoch_id"], report["epoch_id"]);
+        assert!(public_path.is_file());
+        assert!(!other_path.with_extension("remr").exists());
+    }
+
+    #[test]
+    fn archive_recipient_keygen_refuses_existing_paths_and_invalid_labels() {
+        let root = tempfile::tempdir().unwrap();
+        let private = root.path().join("key.remp");
+        let public = root.path().join("key.remr");
+        for existing in [&private, &public] {
+            fs::write(existing, b"keep these bytes").unwrap();
+            let (code, stdout, stderr) = invoke_without_discovery(&[
+                "rem",
+                "archive",
+                "recipient",
+                "keygen",
+                "--out",
+                private.to_str().unwrap(),
+                "--public",
+                public.to_str().unwrap(),
+            ]);
+            assert_eq!(code, ExitCode::from(1));
+            assert!(stdout.is_empty());
+            assert!(stderr.contains("refusing to overwrite"), "{stderr}");
+            assert_eq!(fs::read(existing).unwrap(), b"keep these bytes");
+            let absent = if existing == &private {
+                &public
+            } else {
+                &private
+            };
+            assert!(!absent.exists());
+            fs::remove_file(existing).unwrap();
+        }
+        for label in [
+            "a".repeat(33),
+            "non-ascii-λ".to_string(),
+            "line\nbreak".to_string(),
+        ] {
+            let (code, stdout, stderr) = invoke_without_discovery(&[
+                "rem",
+                "archive",
+                "recipient",
+                "keygen",
+                "--out",
+                private.to_str().unwrap(),
+                "--label",
+                &label,
+            ]);
+            assert_eq!(code, ExitCode::from(1));
+            assert!(stdout.is_empty());
+            assert!(stderr.contains("0 to 32 printable ASCII bytes"), "{stderr}");
+            assert!(!private.exists());
+            assert!(!public.exists());
+        }
+        // Identical destinations must not leave a partial private key behind.
+        let (code, _, _) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "recipient",
+            "keygen",
+            "--out",
+            private.to_str().unwrap(),
+            "--public",
+            private.to_str().unwrap(),
+        ]);
+        assert_eq!(code, ExitCode::from(1));
+        assert!(!private.exists());
+    }
+
+    #[test]
+    fn archive_recipient_keygen_build_extract_round_trip() {
+        let root = tempfile::tempdir().unwrap();
+        let primary = root.path().join("primary.remp");
+        let recovery = root.path().join("recovery.remp");
+        generate_test_recipient(&primary, "primary");
+        generate_test_recipient(&recovery, "recovery");
+        // Writers require two distinct epochs in ascending slot order.
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "recipient",
+            "derive",
+            "--private-key",
+            recovery.to_str().unwrap(),
+            "--slot-index",
+            "1",
+        ]);
+        assert_eq!(code, ExitCode::SUCCESS, "{stderr}");
+        let report: Value = serde_json::from_str(&stdout).unwrap();
+        fs::write(
+            recovery.with_extension("remr"),
+            BASE64_STANDARD
+                .decode(report["canonical_public_key_base64"].as_str().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        let source = root.path().join("source");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        for (name, bytes) in [
+            ("notes.txt", b"notes".as_slice()),
+            ("nested/data.bin", &[0, 255, 1]),
+            ("empty", &[]),
+        ] {
+            fs::write(source.join(name), bytes).unwrap();
+        }
+        let object = root.path().join("tree.rem-object");
+        let (code, _, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "build",
+            "--inputs",
+            source.to_str().unwrap(),
+            "--out",
+            object.to_str().unwrap(),
+            "--recipient",
+            primary.with_extension("remr").to_str().unwrap(),
+            "--recipient",
+            recovery.with_extension("remr").to_str().unwrap(),
+        ]);
+        assert_eq!(code, ExitCode::SUCCESS, "{stderr}");
+        let restored = root.path().join("restored");
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "extract",
+            "--object",
+            object.to_str().unwrap(),
+            "--dest",
+            restored.to_str().unwrap(),
+            "--private-key",
+            primary.to_str().unwrap(),
+        ]);
+        assert_eq!(code, ExitCode::SUCCESS, "{stderr}");
+        let report: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(report["files_written"], 3);
+        for name in ["notes.txt", "nested/data.bin", "empty"] {
+            assert_eq!(
+                fs::read(source.join(name)).unwrap(),
+                fs::read(restored.join(name)).unwrap()
+            );
+        }
     }
 
     #[test]

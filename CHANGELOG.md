@@ -7,6 +7,10 @@ per-release summaries.
 <!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_backend.rs crates/remanence-state/src/index.rs crates/remanence-library/src/discovery.rs @ 4dc2a3c6 -->
 ## Unreleased
 
+- Generate private recovery keys and public recipient files with
+  `rem archive recipient keygen`; protect private files with mode `0600` and
+  refuse existing output paths.
+
 - Operate a manually loaded LTO drive without a daemon: setup, initialize,
   put/get, finalize, verify and restore. Home mode keeps state in the user's
   state directory and remembers the drive by serial. Library operations keep

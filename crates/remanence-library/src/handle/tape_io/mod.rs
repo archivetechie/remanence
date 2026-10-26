@@ -320,7 +320,7 @@ pub enum TapeIoError {
     #[error("malformed MODE response: {0}")]
     MalformedModeResponse(String),
     /// Initialization cannot safely proceed on a partitioned cartridge.
-    #[error("this cartridge has {count} partitions (LTFS formats tapes this way); Remanence needs a single-partition cartridge. To repartition it, erasing everything on it, run: `mt -f {device} mkpartition 0`")]
+    #[error("this cartridge has {count} partitions (LTFS formats tapes this way); Remanence needs a single-partition cartridge. Install mt-st (`sudo apt install mt-st` on Debian/Ubuntu or `sudo dnf install mt-st` on Fedora). To repartition it, erasing everything on it, run: `sudo mt -f {device} stsetoptions can-partitions`, then `mt -f {device} mkpartition 0`. Re-run `rem tape init`; add --clobber-data only if it still reports data at the beginning")]
     MultiPartitionMedium {
         /// Number of configured partitions.
         count: u16,
