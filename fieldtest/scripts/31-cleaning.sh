@@ -14,15 +14,18 @@ EOF
 }
 
 first_drive_serial() {
+  # FIELD_CLEAN_DRIVE_INDEX selects which listed drive is cleaned (default 0).
   local drive_list="$1"
-  python3 - "$drive_list" <<'PY'
+  python3 - "$drive_list" "${FIELD_CLEAN_DRIVE_INDEX:-0}" <<'PY'
 import json,sys
 from pathlib import Path
 payload=json.loads(Path(sys.argv[1]).read_text())
-for drive in payload.get("data", {}).get("drives", []):
-    print(drive.get("serial",""))
+drives=payload.get("data", {}).get("drives", [])
+index=int(sys.argv[2])
+if 0 <= index < len(drives):
+    print(drives[index].get("serial",""))
     raise SystemExit(0)
-raise SystemExit("no drives available")
+raise SystemExit(f"no drive at index {index} (the daemon lists {len(drives)})")
 PY
 }
 
