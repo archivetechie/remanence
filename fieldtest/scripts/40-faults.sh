@@ -172,7 +172,20 @@ retire_rebind() {
     "$(fieldtest_script_dir)/03-bringup.sh" >/dev/null 2>&1 || true
     exit 1
   fi
-  new_uuid="$(sed -nE 's/^[[:space:]]*uuid:[[:space:]]*([0-9a-fA-F-]+).*/\1/p' "$reinit_txt" | head -n 1)"
+  new_uuid="$(python3 - "$reinit_txt" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+try:
+    payload = json.loads(Path(sys.argv[1]).read_text())
+except (OSError, ValueError):
+    raise SystemExit(0)
+match = re.search(r"^\s*uuid:\s*([0-9a-fA-F-]+)", payload.get("stdout", ""), re.MULTILINE)
+print(match.group(1) if match else "")
+PY
+)"
   "$(fieldtest_script_dir)/03-bringup.sh" >/dev/null 2>&1 || true
   after_json="$(fieldtest_artifact_path "$SCRIPT_NAME" catalog "$stamp")"
   fieldtest_capture_json "$after_json" "$(fieldtest_rem_bin)" catalog --endpoint "$(fieldtest_rem_endpoint)" tapes --json || true
@@ -229,21 +242,28 @@ crash_clean() {
   op_ref="$workdir/clean.json"
   drive_list_json="$workdir/drive-list.json"
   fieldtest_capture_json "$drive_list_json" "$(fieldtest_rem_bin)" drive --endpoint "$(fieldtest_rem_endpoint)" list --foreign --retired --json
-  drive_serial="$(python3 - "$drive_list_json" <<'PY'
+  # FIELD_CLEAN_DRIVE_INDEX selects which listed drive is cleaned (default 0), so a
+  # drive cleaned earlier in the day, which the cleaning cadence guard would refuse,
+  # can be left alone.
+  drive_serial="$(python3 - "$drive_list_json" "${FIELD_CLEAN_DRIVE_INDEX:-0}" <<'PY'
 import json,sys
 from pathlib import Path
 payload=json.loads(Path(sys.argv[1]).read_text())
 drives=payload.get("data", {}).get("drives", [])
-print(drives[0].get("serial","") if drives else "")
+index=int(sys.argv[2])
+print(drives[index].get("serial","") if 0 <= index < len(drives) else "")
 PY
 )"
+  [[ -n "$drive_serial" ]] || { echo "error: no drive at index ${FIELD_CLEAN_DRIVE_INDEX:-0} in the daemon drive list" >&2; exit 1; }
   fieldtest_capture_json "$op_ref" "$(fieldtest_rem_bin)" drive --endpoint "$(fieldtest_rem_endpoint)" clean "$drive_serial" --json || true
   daemon_pid="$(tmux display-message -p -t remfield:rem '#{pane_pid}' 2>/dev/null || true)"
   [[ -n "$daemon_pid" ]] || { echo "error: no remfield tmux daemon found" >&2; exit 1; }
   kill -9 "$daemon_pid" || true
   "$(fieldtest_script_dir)/03-bringup.sh" >/dev/null 2>&1 || true
-  fieldtest_capture_json "$workdir/alarm.json" "$(fieldtest_rem_bin)" alarms --endpoint "$(fieldtest_rem_endpoint)" --all --json || true
-  fieldtest_evidence_record "$SCRIPT_NAME" crash-clean PASS "daemon was restarted after a mid-clean crash and reconciliation evidence was captured" "$workdir/alarm.json"
+  local alarm_json
+  alarm_json="$(fieldtest_artifact_path "$SCRIPT_NAME" crash-clean-alarms "$(fieldtest_timestamp_id)")"
+  fieldtest_capture_json "$alarm_json" "$(fieldtest_rem_bin)" alarms --endpoint "$(fieldtest_rem_endpoint)" --all --json || true
+  fieldtest_evidence_record "$SCRIPT_NAME" crash-clean PASS "daemon was restarted after a mid-clean crash on $drive_serial and reconciliation evidence was captured" "$alarm_json"
   rm -rf -- "$workdir"
 }
 
