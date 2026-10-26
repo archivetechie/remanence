@@ -87,11 +87,11 @@ PY
 )"
       first="$(fieldtest_artifact_path "$SCRIPT_NAME" "tapealert-$drive_serial-first" "$stamp")"
       second="$(fieldtest_artifact_path "$SCRIPT_NAME" "tapealert-$drive_serial-second" "$stamp")"
-      if ! fieldtest_capture_json "$first" "$(fieldtest_rem_bin)" tape alerts --bay "$element_addr" --config "$(fieldtest_config_path)" --library "$serial"; then
+      if ! fieldtest_capture_json "$first" "$(fieldtest_rem_debug_bin)" tape alerts --bay "$element_addr" --config "$(fieldtest_config_path)" --library "$serial"; then
         fieldtest_evidence_record "$SCRIPT_NAME" "tapealert-$drive_serial" FAIL "first tape alert read failed" "$first"
         exit 1
       fi
-      if ! fieldtest_capture_json "$second" "$(fieldtest_rem_bin)" tape alerts --bay "$element_addr" --config "$(fieldtest_config_path)" --library "$serial"; then
+      if ! fieldtest_capture_json "$second" "$(fieldtest_rem_debug_bin)" tape alerts --bay "$element_addr" --config "$(fieldtest_config_path)" --library "$serial"; then
         fieldtest_evidence_record "$SCRIPT_NAME" "tapealert-$drive_serial" FAIL "second tape alert read failed" "$second"
         exit 1
       fi
