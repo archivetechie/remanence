@@ -10,7 +10,8 @@ of hardware testing.
 <!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-library/src/discovery.rs @ 4dc2a3c6 -->
 ## What you need
 
-You need Linux, Rust 1.88 or newer, an LTO drive and a compatible rewritable
+You need Linux, a C compiler (`build-essential` on Debian/Ubuntu, `gcc` on
+Fedora), Rust 1.88 or newer (rustup), an LTO drive and a compatible rewritable
 cartridge. No published binary has standalone mode yet; build from source:
 
 ```sh
@@ -29,9 +30,17 @@ sudo install -d -o root -g tape -m 0770 /run/lock/rem
 sudo setcap cap_sys_rawio+ep "$(realpath target/release/rem)"
 ```
 
-Log out and back in after adding the group. Repeat `setcap` after rebuilding;
-a rebuild replaces the executable and can remove its capability. To recreate
-the lock directory after each reboot, put this line in
+Log out and back in after adding the group. From the directory containing your
+checkout, restore the command path:
+
+```sh
+cd remanence
+export PATH="$PWD/target/release:$PATH"
+```
+
+Repeat `setcap` after rebuilding; a rebuild replaces the executable and can
+remove its capability. To recreate the lock directory after each reboot, put
+this line in
 `/etc/tmpfiles.d/rem.conf`:
 
 ```text
@@ -80,7 +89,7 @@ is free text you choose, unique in your catalog. It is not the tape's identity:
 that is the UUID written in the bootstrap at the beginning of tape (BOT).
 The label does not have to end in a generation code.
 
-Accepted `--generation` values are `L5`, `L6`, `L7`, `L8`, `L9` and `M8`.
+Supported `--generation` values are `L5`, `L6`, `L7`, `L8`, `L9` and `M8`.
 Use the cartridge's generation, compatible with your drive. For example, on
 an LTO-6 drive with an LTO-6 cartridge, use this **instead**:
 
@@ -88,9 +97,36 @@ an LTO-6 drive with an LTO-6 cartridge, use this **instead**:
 rem tape init --label HOME01 --generation L6
 ```
 
-Remanence checks the supplied generation against a usable drive density
-observation. It disables drive compression. LTO-9 media can take an hour or
+The drive's measured density wins and is recorded. Without `--generation`,
+a label ending in a generation code must agree with it. Remanence disables
+drive compression. LTO-9 media can take an hour or
 more on their first load while the drive optimizes them.
+
+**Cartridges formatted with LTFS.** Init refuses these with `has 2 partitions`
+before checking for old data. Repartitioning erases everything on the cartridge;
+rescue any files you need first. Install `mt-st` (`sudo apt install mt-st` on
+Debian/Ubuntu or `sudo dnf install mt-st` on Fedora). Use the `/dev/sgN` path
+from `rem drives --json` to find the matching non-rewinding tape node:
+
+```sh
+ls /sys/class/scsi_generic/sgN/device/scsi_tape/
+```
+
+Replace `sgN` with your drive's name. A listed `stN` maps to `/dev/nstN`
+(for example, `st0` maps to `/dev/nst0`). Use that non-rewinding node in
+both commands below:
+
+```sh
+sudo mt -f /dev/nst0 stsetoptions can-partitions
+mt -f /dev/nst0 mkpartition 0
+rem tape init --label HOME01 --generation L9
+```
+
+Use your cartridge's generation in the init command. The Linux `st` driver
+requires `can-partitions` for `mkpartition`; setting this option requires
+administrative privilege, even when your account can access the tape node.
+Setting an already enabled option is safe. Add `--clobber-data` only if init
+still reports data at BOT. Run rem as your normal user.
 
 A used cartridge is refused by default, including a retired cartridge that
 still holds its old bootstrap. If its contents may be destroyed, use:
@@ -100,9 +136,10 @@ rem tape init --label HOME01 --generation L9 --clobber-data
 ```
 
 Type `CLOBBER HOME01` when asked. For a non-interactive invocation, add
-`--confirm-clobber "CLOBBER HOME01"`. Clobber confirmation does not bypass
-identity conflicts, committed-copy checks, write protection, or partition
-safety checks. Rescue anything you need before erasing it.
+`--confirm-clobber "CLOBBER HOME01"`. Clobber also erases a Remanence tape whose
+files are still in your catalog; run `rem list --tape HOME01` first. It does
+not bypass write protection, partition, label/identity-swap or cross-pool
+checks. Rescue anything you need before erasing it.
 
 ## 3. Put files on tape
 
@@ -150,7 +187,10 @@ checks all sidecar-protected data and parity; it can take hours. Finalize retrie
 use the same automatically generated per-tape request key.
 
 Wait for the command to exit before ejecting. Use the drive button, or the
-matching non-rewinding tape node (check which `/dev/nstN` belongs to your drive):
+matching non-rewinding tape node. Install `mt-st` and find the drive's `nstN`
+with `ls /sys/class/scsi_generic/sgN/device/scsi_tape/` as in step 2. Replace
+`sgN` with the name from `rem drives --json` and `/dev/nst0` below with the
+matching tape node:
 
 ```sh
 mt -f /dev/nst0 eject
@@ -272,7 +312,41 @@ rem tape restore --scan --path Documents/notes.txt --out recovered-scan
 ```
 
 Restores use `candidate-<n>/` subdirectories, with identity in `manifest.json`
-and the report. Modification times are restored after validation.
+and the report. A folder put stores one object per file, so each file lands in
+its own candidate directory. Several versions of one path produce several
+candidates. Inspect each `manifest.json` and choose the candidates you need;
+`--path` limits restoration to named paths but can still return several versions.
+Modification times are restored after validation.
+
+To merge selected candidates into `merged/`, use Python 3. This example selects
+all candidates in `recovered/` and refuses duplicate paths rather than choosing
+a version. If duplicates exist, change `candidates` to the directories you want
+and use a fresh merge destination:
+
+```sh
+python3 - <<'MERGE'
+import json, shutil
+from pathlib import Path
+candidates = sorted(Path("recovered").glob("candidate-*"))
+files = {}
+for candidate in candidates:
+    manifest = candidate / "manifest.json"
+    payload = candidate / json.loads(manifest.read_text())["payload"]
+    for source in payload.rglob("*"):
+        if source == manifest or not source.is_file():
+            continue
+        relative = source.relative_to(payload)
+        if relative in files:
+            raise SystemExit(f"Choose one candidate for {relative}")
+        files[relative] = source
+output = Path("merged")
+output.mkdir()  # Refuse an existing destination.
+for relative, source in files.items():
+    target = output / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+MERGE
+```
 
 `tape adopt` imports identity only. It does not import object rows and
 cannot make `rem list` or get-by-path work on a new machine. Use catalogless
@@ -287,8 +361,9 @@ rem tape adopt --label HOME01 --pool default
 > A finalized plaintext tape needs nothing from the original machine to restore
 > its files. You still need compatible hardware and a reader. Keep the state
 > directory to make listing, normal restore and interrupted-write recovery
-> easier; restore the whole directory to the same path. Keep matching private
-> keys separately for encrypted files: the tape cannot replace a lost key.
+> easier; restore the whole directory to the same path. Keep the matching
+> `.remp` private files separately for encrypted files, including the recovery
+> key in a separate safe place.
 > Never restore an older state directory over a newer one without reading the
 > `TailBeyondKnownState` refusal and its recovery instructions above. Keep source
 > copies while the formats remain under review; see [status](status.md).
@@ -300,26 +375,35 @@ recipient keys, so loss of one private key need not destroy access. One matching
 private key is enough to restore. Keep a working key and a recovery key in
 separate safe places.
 
-Key creation is not yet a `rem` command; it is planned with key-custody tooling.
-Today, obtain canonical REMP private-key files from your custodian or key
-registry, and derive their REMR public records with `rem archive recipient
-derive`. Follow the [key-file reference](reference-cli.md#recipient-key-file-formats)
-for the formats. Derive prints JSON; decode `canonical_public_key_base64`
-to save a `.remr` file. SSH and age keys are not substitutes.
-For example, with provisioned `primary.remp` and `recovery.remp` files and
-Python 3 installed:
+Create a working key locally:
 
 ```sh
-rem archive recipient derive --private-key primary.remp --slot-index 0 > primary-public.json
+rem archive recipient keygen --out primary.remp --label primary
+```
+
+This creates `primary.remp` (the private file, mode `0600`) and `primary.remr`
+(the public file, slot 0). Both paths must be new. `--public FILE.remr` chooses
+a different public path. Labels contain at most 32 printable ASCII bytes.
+Keep the private file in a safe place and back it up separately; a lost private
+file cannot be recovered. Keep the public file on the machine that writes tapes.
+It can be copied without exposing the private key. SSH and age keys are not
+substitutes for these [key-file formats](reference-cli.md#recipient-key-file-formats).
+
+Create the recovery key, then derive its public record for slot 1. Keygen uses
+slot 0; writers need distinct epochs in ascending slot order. With Python 3:
+
+```sh
+rem archive recipient keygen --out recovery.remp --label recovery
 rem archive recipient derive --private-key recovery.remp --slot-index 1 > recovery-public.json
 python3 - <<'KEYS'
 import base64, json
 from pathlib import Path
-for name in ("primary", "recovery"):
-    record = json.loads(Path(f"{name}-public.json").read_text())
-    Path(f"{name}.remr").write_bytes(base64.b64decode(record["canonical_public_key_base64"]))
+record = json.loads(Path("recovery-public.json").read_text())
+Path("recovery.remr").write_bytes(base64.b64decode(record["canonical_public_key_base64"]))
 KEYS
 ```
+
+Keep `recovery.remp` in a separate safe place from `primary.remp` and the tape.
 
 With those two public records:
 

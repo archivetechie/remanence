@@ -117,7 +117,7 @@ path still refuses it.
 
 | Hardware | Evidence and limits |
 |---|---|
-| QuadStor VTL | Library integration and failure-recovery tests. The standalone-view harness lane exercises a virtual drive without a visible changer; that lane is pending qualification. It does not establish real standalone-drive support. |
+| QuadStor VTL | Library integration and failure-recovery tests. A VTL configuration that exposes a drive without a changer is pending qualification. It does not establish real standalone-drive support. |
 | HPE MSL3040 with LTO-9 drives | Physical library reads, writes and recovery testing. Physical test time is episodic. |
 | HP Ultrium 7 | INQUIRY/VPD captures for discovery and identity; these captures do not establish full media read/write coverage. |
 | Real hardware below LTO-7 | No testing. Accepted L5/L6 generation values are not a hardware qualification. |

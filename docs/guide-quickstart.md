@@ -14,9 +14,9 @@ library operated through `rem-daemon`.
 <!-- code-anchor: Cargo.toml crates/remanence-cli/Cargo.toml crates/remanence-api/build.rs crates/remanence-cli/src/archive_ingest.rs @ 6ed03ef0 -->
 ## Build
 
-You need Rust 1.88 or newer. The workspace builds on stock Linux with no
-system packages; the protobuf definitions are compiled in-process, so
-`protoc` is not needed:
+You need Linux, a C compiler (`build-essential` on Debian/Ubuntu, `gcc` on
+Fedora) and Rust 1.88 or newer (rustup). The protobuf definitions are compiled
+in-process, so `protoc` is not needed:
 
 ```sh
 git clone https://github.com/archivetechie/remanence
@@ -118,14 +118,10 @@ running the X-Wing post-quantum/classical hybrid KEM (ML-KEM-768
 combined with X25519). Writers require 2-8 distinct, nonzero recipient epochs in
 ascending slot order.
 
-Remanence consumes canonical REMR public-key files and REMP private-key
-files; key-pair provisioning belongs to the custodian/key-registry tooling,
-not this CLI. A registry can materialize its persistent raw 32-byte seed as a
-temporary canonical REMP file, then ask Remanence to derive the matching REMR
-record with `rem archive recipient derive`; `rem archive recipient inspect`
-validates a supplied REMR record. Neither command generates or prints a
-private seed. Assuming two custodians supplied `primary.remr` and
-`recovery.remr`, build the encrypted object directly:
+Create private REMP and public REMR files with `rem archive recipient keygen`.
+Follow the [encryption steps](guide-standalone-drive.md#encryption) to generate
+`primary.remp`/`primary.remr` and `recovery.remp`/`recovery.remr`, assign the
+recovery public record slot 1, and store the private files safely. Then build:
 
 ```sh
 rem archive build --inputs src --out demo-enc.rem-object \
@@ -180,7 +176,8 @@ export PATH="$PWD/target/release:$PATH"
 
 Complete the [permissions steps](guide-standalone-drive.md#what-you-need),
 including the persistent `/run/lock/rem` rule, and log in again after joining
-`tape`. Never run rem with sudo. No daemon is needed.
+`tape`. After logging in, return to the checkout with `cd remanence` and repeat
+`export PATH="$PWD/target/release:$PATH"`. Never run rem with sudo. No daemon is needed.
 
 On a host without `/etc/rem/config.toml`, setup saves your selected drive's
 serial in the home config. Insert a blank LTO-9 cartridge, write HOME01 on its
@@ -203,14 +200,21 @@ rem tape restore --path Documents/notes.txt --out recovered
 ```
 
 Replace `Documents/notes.txt` with a path from the listing. Use `--generation L6`
-for an LTO-6 cartridge in a compatible drive; accepted values are L5–L9 and M8.
+for an LTO-6 cartridge in a compatible drive; supported values are L5–L9 and M8.
 Initialization writes immediately and has no standalone dry run. Used media
-needs `--clobber-data` and the exact `CLOBBER HOME01` confirmation.
+needs `--clobber-data` and the exact `CLOBBER HOME01` confirmation. An LTFS
+cartridge first needs repartitioning: install `mt-st`, find the matching `nstN`
+with `ls /sys/class/scsi_generic/sgN/device/scsi_tape/` (`stN` maps to
+`/dev/nstN`), then run
+`sudo mt -f /dev/nstN stsetoptions can-partitions` and
+`mt -f /dev/nstN mkpartition 0`. This erases the cartridge. Follow
+[step 2](guide-standalone-drive.md#2-initialize-a-cartridge), rerun init, and
+add clobber only if it still reports data at BOT.
 
 Compare your restored file before shelving the tape. Finalization permanently
 closes it to new objects. When verification exits, eject with the drive button
-or `mt -f /dev/nst0 eject`, using the tape node for this drive. The
-[standalone guide](guide-standalone-drive.md) covers tape-full continuation,
+or `mt -f /dev/nst0 eject` from `mt-st`, using the `nstN` found through the
+sysfs lookup above for this drive. The [standalone guide](guide-standalone-drive.md) covers tape-full continuation,
 second copies, old versions, crash recovery and encryption keys.
 
 <!-- code-anchor: crates/remanence-library/src/discovery.rs crates/remanence-cli/src/lib.rs Makefile @ 6ed03ef0 -->

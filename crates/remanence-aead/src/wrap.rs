@@ -395,6 +395,23 @@ pub struct RecipientPrivateKey {
 }
 
 impl RecipientPrivateKey {
+    /// Generate a recovery key and nonzero epoch id from the OS entropy source.
+    pub fn generate(epoch_label: impl Into<String>) -> Result<Self> {
+        let epoch_label = epoch_label.into();
+        validate_label(&epoch_label).map_err(|_| {
+            RemObjectAeadError::InvalidInput(
+                "recipient label must contain 0 to 32 printable ASCII bytes".to_string(),
+            )
+        })?;
+        let mut epoch_id = [0; 16];
+        while epoch_id == [0; 16] {
+            OsEntropy.fill(&mut epoch_id)?;
+        }
+        let mut seed = Zeroizing::new([0; XWING_SEED_LEN]);
+        OsEntropy.fill(&mut seed[..])?;
+        Self::new(epoch_id, epoch_label, *seed)
+    }
+
     /// Construct a recipient secret from its canonical 32-byte X-Wing seed.
     pub fn new(
         recipient_epoch_id: [u8; 16],

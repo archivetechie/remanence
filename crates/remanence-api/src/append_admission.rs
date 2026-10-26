@@ -40,7 +40,7 @@ pub(crate) struct AppendContext {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AdmissionError {
-    #[error("TailBeyondKnownState: tape {tape_uuid}, expected EOD LBA {expected_eod_lba}, found {found:?}. Rescue the data with `rem tape restore --scan`, or restore a newer copy of the state directory. To deliberately discard this tail, use `rem tape supersede-tail --tape-uuid <uuid> --ack-tape-uuid <uuid>` (library), or `rem tape supersede-tail --device <path> --acknowledge-tape <label|uuid>` (standalone).")]
+    #[error("TailBeyondKnownState: tape {tape_uuid}, expected EOD LBA {expected_eod_lba}, found {found:?}. Rescue the data with `rem tape restore --scan`, or restore a newer copy of the state directory. To deliberately discard this tail, use `rem tape supersede-tail --tape-uuid <uuid> --ack-tape-uuid <uuid>` (library), or `rem tape supersede-tail --acknowledge-tape <label|uuid>` (standalone home mode; for an explicit device add `--device <path> --allow-device <serial>`).")]
     TailBeyondKnownState {
         tape_uuid: uuid::Uuid,
         expected_eod_lba: u64,

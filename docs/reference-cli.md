@@ -117,9 +117,10 @@ The `--json` output carries the same decoding in structured form
 | `rem drives [--json]` | Discover drive endpoints, including unattached drives proved to be standalone. JSON reports `path`, serial, endpoint kind, and ownership. |
 | `rem watch [--coalesce-window <DURATION>]` | Stream coalesced udev hot-plug events for SCSI tape/changer subsystems (default window 500ms). Requires a build with the `linux-udev` feature. |
 
-Discovery is read-only but still issues SCSI commands, so it needs the
-`tape` group and `CAP_SYS_RAWIO` (see the [quickstart](guide-quickstart.md)
-and [troubleshooting](guide-troubleshooting.md)).
+Discovery needs read/write access to the tape and changer sg nodes, usually
+through the `tape` group. Writes need `CAP_SYS_RAWIO`; changer inventory can
+also need it for filtered SCSI commands. See the [quickstart](guide-quickstart.md)
+and [troubleshooting](guide-troubleshooting.md).
 
 <!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_backend.rs crates/remanence-library/src/discovery.rs @ 4dc2a3c6 -->
 ## Standalone drives
@@ -135,8 +136,8 @@ directly. Routing is part of the command interface, including help:
 |---|---|
 | Explicit `--device` | Standalone |
 | Standalone-only verb (`setup`, `drives`, `doctor`, `diagnostics`, `list`, `pool new`, or a standalone-only tape verb) | Standalone |
-| Shared verb with `--config` or `--endpoint`, without `--device` | Library/daemon |
-| Shared verb with no explicit device/config/endpoint, no `/etc/rem/config.toml`, and home `[home] drive_serial` set | Standalone |
+| Shared verb with `--config`, `--endpoint`, `--library` or `--after-settled-inventory`, without `--device` | Library/daemon |
+| Shared verb with none of those routing flags, no `/etc/rem/config.toml`, and home `[home] drive_serial` set | Standalone |
 | Other shared invocations | Library/daemon |
 
 Every device verb accepts `--device <SG> --allow-device <SERIAL|PATH>`.
@@ -162,7 +163,7 @@ The table omits the device/authorization flags, which all media verbs accept.
 | `rem drives [--json]` | List discovered endpoints with path, serial, model and ownership. |
 | `rem list [--tape <LABEL\|UUID>] [--path-prefix <PREFIX>] [--json]` | List committed archive paths, version counts, newest UUID and tape locations; no device required. |
 | `rem pool new <POOL> [--scheme <SCHEME>] [--block-size <BYTES>]` | Create a pool. Default scheme is `custom:128,4,1`; `--scheme default` uses the block-size-aware library geometry. |
-| `rem tape init --label <LABEL> [--pool <POOL>] [--generation <GEN>] [--block-size <BYTES>] [--clobber-data [--confirm-clobber "CLOBBER <LABEL>"]]` | Initialize loaded media immediately, with no dry run. Default pool is `default`. Nonblank media, including retired media, requires clobber confirmation; other safety refusals still apply. GEN accepts L5, L6, L7, L8, L9, M8. |
+| `rem tape init --label <LABEL> [--pool <POOL>] [--generation <GEN>] [--block-size <BYTES>] [--clobber-data [--confirm-clobber "CLOBBER <LABEL>"]]` | Initialize loaded media immediately, with no dry run. Default pool is `default`. Nonblank media, including retired media, requires clobber confirmation; other safety refusals still apply. Supported GEN values are L5–L9 and M8. The drive's measured density wins and is recorded. Without `--generation`, a label ending in a generation code must agree with it. |
 | `rem tape identify` | Read loaded tape identity and terminal summary. |
 | `rem tape adopt [--label <LABEL>] [--pool <POOL>]` | Import bootstrap identity only; no object rows, no media rewrite. Use restore to list files without the original catalog. |
 | `rem put <PATH>... [--pool <POOL>] [--recipient <REMR>]... [--tape <LABEL\|UUID>] [--allow-plaintext-copy]` | Recursively store regular files, one object per file. Pool must match loaded media. Tape selector guards identity. Plaintext over a newest encrypted version needs explicit `--allow-plaintext-copy`. |
@@ -171,7 +172,7 @@ The table omits the device/authorization flags, which all media verbs accept.
 | `rem tape restore [--out <DIR>] [--list] [--path <MEMBER>]... [--scan] [--private-key <REMP>]` | Catalogless listing or restore. Output is required unless listing. Repeat `--path` to select exact member paths; `--scan` walks from BOT instead of using the terminal index. Encrypted member listing needs a key. |
 | `rem tape finalize --acknowledge-tape <LABEL\|UUID> [--tape <UUID>] [--expected-pool <POOL>] [--reason <TEXT>] [--idempotency-key <UUID>]` | Permanently close the loaded tape. Defaults are its UUID, catalogued pool, reason `finalized with rem`, and a stable UUIDv5 request key derived from the tape UUID and a fixed namespace. |
 | `rem tape assign-pool [--tape <UUID>] (--pool <POOL> \| --unassign)` | With UUID, change assignment offline; otherwise identify loaded media. |
-| `rem tape set-generation --generation <GEN>` | Record generation for loaded media; accepts L5–L9 and M8. |
+| `rem tape set-generation --generation <GEN>` | Record generation for loaded media; supported values are L5–L9 and M8. |
 | `rem tape rebind --label <LABEL> --previous-uuid <UUID>` | Bind a reused operator label to loaded media, checking the previous UUID. |
 | `rem tape import-journals --from <DIR>` | Validate and import matching checkpoint/parity journal authority for append recovery. |
 | `rem tape supersede-tail --acknowledge-tape <LABEL\|UUID> [--confirm-supersede "SUPERSEDE <LABEL>"]` | List and explicitly discard the suffix beyond local authority, with typed confirmation and audit. Rescue files first. |
@@ -499,6 +500,7 @@ None of these touch tape; they are the easiest way to exercise the format.
 | Command | What it does |
 |---|---|
 | `rem archive capabilities` | Print a one-line JSON list of this build's REM-OBJECT capabilities (e.g. `rem-object-envelope`, `wrap-suite-hpke-v1`, `ranged-ciphertext-extract`) with zero hardware discovery. `wrap-suite-hpke-v1` names the HPKE Base-mode construction; the KEM it runs is the X-Wing hybrid (see [reference-tape-layout.md](reference-tape-layout.md#the-encrypted-envelope-remo)), not a plain X25519 KEM despite the string. Useful for scripts probing what a given binary supports before calling it. |
+| `rem archive recipient keygen --out <FILE.remp> [--label <TEXT>] [--public <FILE.remr>]` | Generate a private REMP file with mode `0600` and a slot-0 REMR public file. The public path defaults to the private path with extension `.remr`. Refuse existing paths and labels outside 0–32 printable ASCII bytes. Print JSON with `private`, `public`, `epoch_id` (hex), and `label`; print a private-file recovery warning on a terminal. |
 | `rem archive recipient derive --private-key <REMP> --slot-index <0..255>` | Parse a canonical private recipient file, derive its X-Wing public key, and print the canonical REMR file as standard base64 with its epoch identity. This hardware-free registry integration command never prints the private seed. |
 | `rem archive recipient inspect --public-key <REMR>` | Parse and cryptographically validate a canonical public recipient file, then print its slot, epoch id, label, and 1216-byte X-Wing public-key size as JSON. |
 | `rem archive build --inputs <PATH>... --out <FILE> [--recipient <REMR>]...` | Build a portable object and print a JSON build report. Capture keeps `user.*` xattrs by default, reports other dropped names per entry, and emits one warning with the drop count. `--full-fidelity-xattrs` is the explicit non-portable keep-all opt-in and cannot be combined with `--rules` or `--map`. Omitting `--recipient` writes the plaintext `rem-object-v1` body. Repeating it 2-8 times with distinct, nonzero epochs in ascending slot order writes the HPKE envelope; the presence of recipients is the encryption switch. `--map`/`--source-root`/`--map-sha256` accept a planner-emitted source map instead of `--inputs`. `--scan-only` classifies inputs and reports without writing. `--rules` applies an ingest ruleset; `--manifest-out` (requires `--rules`) writes the member manifest JSON. |
