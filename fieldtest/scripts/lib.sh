@@ -1249,12 +1249,17 @@ fi
 # Prints the SCSI generic path of the drive in a bay (element address such as
 # 0x0001) of the selected library, from the discovery report; empty if unknown.
 fieldtest_drive_sg_for_bay() {
-  local serial="$1" bay="$2"
-  "$(fieldtest_rem_bin)" libraries --json 2>/dev/null | python3 - "$serial" "$bay" <<'PY'
+  local serial="$1" bay="$2" report
+  report="$(mktemp)"
+  "$(fieldtest_rem_bin)" libraries --json >"$report" 2>/dev/null || {
+    rm -f "$report"; return 0
+  }
+  python3 - "$report" "$serial" "$bay" <<'PY'
 import json, sys
-serial, bay = sys.argv[1], int(sys.argv[2], 0)
+from pathlib import Path
+serial, bay = sys.argv[2], int(sys.argv[3], 0)
 try:
-    report = json.load(sys.stdin)
+    report = json.loads(Path(sys.argv[1]).read_text())
 except ValueError:
     raise SystemExit(0)
 for endpoint in report.get("observed_endpoints", []):
@@ -1262,6 +1267,7 @@ for endpoint in report.get("observed_endpoints", []):
         print(endpoint.get("path", ""))
         break
 PY
+  rm -f "$report"
 }
 
 fieldtest_drain_drives() {
