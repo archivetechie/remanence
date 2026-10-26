@@ -204,8 +204,8 @@ for an LTO-6 cartridge in a compatible drive; supported values are L5–L9 and M
 Initialization writes immediately and has no standalone dry run. Used media
 needs `--clobber-data` and the exact `CLOBBER HOME01` confirmation. An LTFS
 cartridge first needs repartitioning: install `mt-st`, find the matching `nstN`
-with `ls /sys/class/scsi_generic/sgN/device/scsi_tape/` (`stN` maps to
-`/dev/nstN`), then run
+with `ls /sys/class/scsi_generic/sgN/device/scsi_tape/`. The listing includes
+the node name; use `/dev/<the listed nstN>` (for example `/dev/nst0`). Then run
 `sudo mt -f /dev/nstN stsetoptions can-partitions` and
 `mt -f /dev/nstN mkpartition 0`. This erases the cartridge. Follow
 [step 2](guide-standalone-drive.md#2-initialize-a-cartridge), rerun init, and

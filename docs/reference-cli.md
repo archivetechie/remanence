@@ -159,7 +159,7 @@ The table omits the device/authorization flags, which all media verbs accept.
 | Command | What it does |
 |---|---|
 | `rem setup [--yes] [--device <SG>]` | Run doctor and discovery, display the selected drive and save `[home] drive_serial` after confirmation. Incomplete discovery needs a separate ownership assertion; `--yes` accepts both. |
-| `rem doctor [--json]` | Check effective group, binary capability, locks, state, discovery and fences; print a ready/not-ready verdict and fixes. |
+| `rem doctor [--json]` | Check effective group, binary capability, locks, state, discovery, fences and the memory-lock limit; the memory-lock check is advisory (marked `!`, never blocks readiness). Print a ready/not-ready verdict and fixes. |
 | `rem drives [--json]` | List discovered endpoints with path, serial, model and ownership. |
 | `rem list [--tape <LABEL\|UUID>] [--path-prefix <PREFIX>] [--json]` | List committed archive paths, version counts, newest UUID and tape locations; no device required. |
 | `rem pool new <POOL> [--scheme <SCHEME>] [--block-size <BYTES>]` | Create a pool. Default scheme is `custom:128,4,1`; `--scheme default` uses the block-size-aware library geometry. |

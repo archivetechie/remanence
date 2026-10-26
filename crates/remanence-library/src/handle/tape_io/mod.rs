@@ -320,7 +320,7 @@ pub enum TapeIoError {
     #[error("malformed MODE response: {0}")]
     MalformedModeResponse(String),
     /// Initialization cannot safely proceed on a partitioned cartridge.
-    #[error("this cartridge has {count} partitions (LTFS formats tapes this way); Remanence needs a single-partition cartridge. Install mt-st (`sudo apt install mt-st` on Debian/Ubuntu or `sudo dnf install mt-st` on Fedora). To repartition it, erasing everything on it, run: `sudo mt -f {device} stsetoptions can-partitions`, then `mt -f {device} mkpartition 0`. Re-run `rem tape init`; add --clobber-data only if it still reports data at the beginning")]
+    #[error("this cartridge has {count} partitions (LTFS formats tapes this way); Remanence needs a single-partition cartridge. Install mt-st (`sudo apt install mt-st` on Debian/Ubuntu or `sudo dnf install mt-st` on Fedora). To repartition it, erasing everything on it, run: `sudo mt -f {device} stsetoptions can-partitions`, then `mt -f {device} mkpartition 0` (find N with `ls /sys/class/scsi_generic/<sg>/device/scsi_tape/`). Re-run `rem tape init`; add --clobber-data only if it still reports data at the beginning")]
     MultiPartitionMedium {
         /// Number of configured partitions.
         count: u16,
@@ -2845,7 +2845,7 @@ impl super::DriveHandle {
                             .map(|n| format!("/dev/nst{n}"))
                     })
                 })
-                .unwrap_or_else(|| "/dev/nstN for this drive".into());
+                .unwrap_or_else(|| "/dev/nstN".into());
             return Err(TapeIoError::MultiPartitionMedium { count, device });
         }
         Ok(())

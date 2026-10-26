@@ -581,6 +581,17 @@ impl Drop for LockedSlabPermit {
     }
 }
 
+#[cfg(test)]
+type TestReadBufferLock = fn(&ReadBuffer) -> std::io::Result<()>;
+
+#[cfg(test)]
+thread_local! {
+    // Pipeline allocation runs on the caller thread, including reservoir growth.
+    static TEST_READ_BUFFER_LOCK: std::cell::Cell<Option<TestReadBufferLock>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
 /// Allocate a slab, permitting resource-related lock failures only at the minimum.
 fn allocate_locked_slab(
     manager: &Arc<IoMemoryReservation>,
@@ -588,6 +599,10 @@ fn allocate_locked_slab(
     allow_unlocked: bool,
 ) -> Result<(ReadBuffer, LockedSlabPermit), String> {
     allocate_locked_slab_with(manager, bytes, allow_unlocked, |buffer| {
+        #[cfg(test)]
+        if let Some(lock) = TEST_READ_BUFFER_LOCK.get() {
+            return lock(buffer);
+        }
         // SAFETY: `buffer` is a live allocation for the duration of this call;
         // `mlock` neither takes ownership nor writes through the pointer.
         let result = unsafe { libc::mlock(buffer.as_slice().as_ptr().cast(), buffer.len()) };
@@ -2660,6 +2675,97 @@ mod tests {
             handoff_validation_error(|handoff| handoff.records_read = 0),
             "tape operation failed: fixed read batch stopped before object boundary: records_read=0 filemark=false"
         );
+    }
+
+    /// Exercise real pipeline fallback and the process-wide warning without host lock limits.
+    #[test]
+    fn read_pipeline_unlocked_minimum_completes_and_warns_once() {
+        const CHILD_ENV: &str = "REMANENCE_TEST_UNLOCKED_PIPELINE_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // A fresh test process owns the production Once and warning sink.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "read_core::tests::read_pipeline_unlocked_minimum_completes_and_warns_once",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .expect("run isolated pipeline test");
+            assert!(
+                output.status.success(),
+                "isolated pipeline test fails:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+
+        struct LockOverrideGuard;
+        impl Drop for LockOverrideGuard {
+            fn drop(&mut self) {
+                TEST_READ_BUFFER_LOCK.set(None);
+            }
+        }
+        TEST_READ_BUFFER_LOCK.set(Some(|_| Err(io::Error::from_raw_os_error(libc::ENOMEM))));
+        let _lock_override = LockOverrideGuard;
+        static WARNINGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        set_read_reservoir_warning_sink(|message| {
+            WARNINGS.lock().unwrap().push(message.to_string());
+        });
+
+        let blocks: Vec<_> = (0u8..16).map(|value| vec![value; 4]).collect();
+        let expected_payload: Vec<_> = blocks.iter().flatten().copied().collect();
+        for _ in 0..2 {
+            let mut source = VecBlockSource::new(blocks.clone()).with_read_batch_blocks_for_test(2);
+            let expected_position = source.position().unwrap();
+            let manager = IoMemoryReservation::new(64).unwrap();
+            let (result, events) = capture_read_diag(|| {
+                run_read_pipeline(
+                    &mut source,
+                    4,
+                    blocks.len() as u64,
+                    expected_position,
+                    ReadPipelineConfig {
+                        reservoir_bytes: 32,
+                        high_pct: 50,
+                        low_pct: 25,
+                        ranged_frontier: false,
+                        proof_cadence_bytes: 8,
+                        terminal: None,
+                    },
+                    Arc::clone(&manager),
+                    |handoffs| {
+                        let mut payload = Vec::new();
+                        for _ in &blocks {
+                            let mut block = [0; 4];
+                            assert_eq!(handoffs.read_block(&mut block)?, block.len());
+                            payload.extend_from_slice(&block);
+                        }
+                        Ok(payload)
+                    },
+                )
+            });
+            assert_eq!(
+                result.expect("unlocked pipeline completes"),
+                expected_payload
+            );
+            assert_eq!(manager.granted(), 0);
+            assert_eq!(events.len(), 2);
+            let open = &events[0];
+            assert_read_diag_schema(open);
+            assert_eq!(open["phase"], "open");
+            assert!(diag_u64(open, "minimum_slabs") > 0);
+            assert_eq!(
+                diag_u64(open, "minimum_slabs_unlocked"),
+                diag_u64(open, "minimum_slabs")
+            );
+            assert_eq!(diag_u64(open, "minimum_slabs_locked"), 0);
+            let warnings = WARNINGS.lock().unwrap();
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains("read reservoir uses unlocked buffers"));
+        }
     }
 
     /// Inject every supported fallback errno so coverage is independent of host limits.

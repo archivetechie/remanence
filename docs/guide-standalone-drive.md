@@ -112,9 +112,9 @@ from `rem drives --json` to find the matching non-rewinding tape node:
 ls /sys/class/scsi_generic/sgN/device/scsi_tape/
 ```
 
-Replace `sgN` with your drive's name. A listed `stN` maps to `/dev/nstN`
-(for example, `st0` maps to `/dev/nst0`). Use that non-rewinding node in
-both commands below:
+Replace `sgN` with your drive's name. The listing includes the node name;
+use `/dev/<the listed nstN>` (for example `/dev/nst0`). Use that
+non-rewinding node in both commands below:
 
 ```sh
 sudo mt -f /dev/nst0 stsetoptions can-partitions
@@ -402,6 +402,9 @@ record = json.loads(Path("recovery-public.json").read_text())
 Path("recovery.remr").write_bytes(base64.b64decode(record["canonical_public_key_base64"]))
 KEYS
 ```
+
+Keygen also writes a slot-0 `recovery.remr`; the derive and Python steps
+replace it with the slot-1 record.
 
 Keep `recovery.remp` in a separate safe place from `primary.remp` and the tape.
 

@@ -70,7 +70,7 @@ standalone refusals are:
 | Cannot write `/run/lock/rem`, especially after reboot | Create it with `sudo install -d -o root -g tape -m 0770 /run/lock/rem`. Put `d /run/lock/rem 0770 root tape -` in `/etc/tmpfiles.d/rem.conf` so boot recreates it. |
 | `TailBeyondKnownState` | Tape holds complete data beyond local checkpoint authority, often after restoring old state. Restore newer state or rescue with `rem tape restore --scan --out rescued`. Do not delete journals. Only deliberately discard a rescued suffix with `rem tape supersede-tail --acknowledge-tape LABEL` and its exact confirmation. |
 | `holds … data at the beginning` | Nonblank media needs `rem tape init --label LABEL --generation <yours> --clobber-data`, then `CLOBBER LABEL`. For non-interactive use, pass `--confirm-clobber "CLOBBER LABEL"`. This also applies after retirement. Clobber also erases a Remanence tape whose files are still in your catalog; run `rem list --tape LABEL` first. It does not bypass write protection, partition, label/identity-swap or cross-pool checks. |
-| `has 2 partitions` | LTFS media needs repartitioning, which erases the cartridge. Install `mt-st` with `sudo apt install mt-st` (Debian/Ubuntu) or `sudo dnf install mt-st` (Fedora). Find `nstN` with `ls /sys/class/scsi_generic/sgN/device/scsi_tape/` using the drive's sg name; a listed `stN` maps to `/dev/nstN`. Run `sudo mt -f /dev/nstN stsetoptions can-partitions`, then `mt -f /dev/nstN mkpartition 0`. Re-run `rem tape init --label LABEL --generation <yours>`; add `--clobber-data` only if it still reports data at BOT. See [step 2](guide-standalone-drive.md#2-initialize-a-cartridge). |
+| `has 2 partitions` | LTFS media needs repartitioning, which erases the cartridge. Install `mt-st` with `sudo apt install mt-st` (Debian/Ubuntu) or `sudo dnf install mt-st` (Fedora). Find `nstN` with `ls /sys/class/scsi_generic/sgN/device/scsi_tape/` using the drive's sg name. The listing includes the node name; use `/dev/<the listed nstN>` (for example `/dev/nst0`). Run `sudo mt -f /dev/nstN stsetoptions can-partitions`, then `mt -f /dev/nstN mkpartition 0`. Re-run `rem tape init --label LABEL --generation <yours>`; add `--clobber-data` only if it still reports data at BOT. See [step 2](guide-standalone-drive.md#2-initialize-a-cartridge). |
 | Active tape-I/O quarantine | Run `rem tape quarantine list`. Reads remain available; rescue with `rem tape restore --scan --out rescued`. After investigating, use `rem tape quarantine release ID --ack "what was checked"`. Release does not bypass the physical append check. |
 | Tape full / capacity refusal | Written receipts remain committed. Finalize, eject, initialize the next cartridge in the same pool and rerun put. Unchanged committed files skip. An uncertain I/O failure needs quarantine investigation first. |
 | Ran with sudo / home mode refuses root | Never run rem with sudo. Use your normal account with the `tape` group and a capability on the binary. Check which state directory the earlier command used; preserve it before correcting ownership or choosing a config. Root's home state is not your user's state. |
@@ -156,7 +156,6 @@ layers — seeing one does not imply the others tripped too.
 | Message | Cause and fix |
 |---|---|
 | `error: load config ...` | TOML parse or validation failure. Unknown keys are hard errors; all paths must be absolute; `listen` requires `[daemon.tls]`; `tape_io.legacy_single_block`/`tape_io.pipelined_submission` are not accepted keys and fail to load with a specific message; the pipelined path is the only path for streaming reads and writes, so delete the key. (Full verification reads one block per command and does not use it.) |
-| `read reservoir uses unlocked buffers` | The soft `RLIMIT_MEMLOCK` limit or lock permission prevents locking minimum read slabs. Reads continue, but tape data may be swapped. Check the limit, slab size, and count in the warning; raise the limit with `ulimit -l`, `LimitMEMLOCK=` for the daemon unit, or a `security/limits.d` entry for the user. `rem doctor` reports the limit and configured minimum without blocking readiness. |
 | `daemon.io_memory_ceiling must be non-zero` / `... exceeds daemon.io_memory_ceiling` (on `spool_tmpfs_ram_budget` or `tape_io.read_reservoir_bytes`) | The shared I/O memory budget is zero, or a per-purpose reservation exceeds it. `io_memory_ceiling` (default 24 GiB) is the hard cap shared by the append spool and every drive's read reservoir. |
 | `tape_io reservoir watermarks require 0 < read_reservoir_low_pct < read_reservoir_high_pct <= 100` | Watermark percentages misordered or out of range. |
 | `tape_io.staging_ring_buffers` validation failure | Must be in `2..=16`. |
@@ -167,19 +166,29 @@ layers — seeing one does not imply the others tripped too.
 | `error: discover libraries: ...` | Same permission gates as the CLI (tape group + `CAP_SYS_RAWIO`, via systemd `AmbientCapabilities` for a service). |
 | `error: acquire daemon state ownership ...` | Another daemon or offline state-mutating command holds `<state_dir>/state.lock`. Stop the other owner; do not delete the lock file or point a second daemon at the same state directory. The kernel releases the lock when its owner exits. |
 
-Two non-fatal, stderr-only warnings worth recognizing (they don't stop
-startup): `daemon.io_memory_ceiling=... exceeds startup MemAvailable=...;
-the fixed ceiling remains authoritative` and `daemon.io_memory_ceiling=...
-exceeds LimitMEMLOCK=...; minimum read reservoirs will refuse to start if
-they cannot be locked` — both are sanity checks against the host's actual
-memory/mlock limits, checked once at startup; the ceiling itself is what
-the daemon actually enforces at runtime.
-
 `rem-daemon` acquires `<state_dir>/state.lock` before opening API state and
 holds that kernel `flock` for its lifetime. Offline state-mutating commands use
 the same lock, so another daemon or maintenance command receives the ownership
 error above even if it uses a different socket path. The Unix-socket liveness
 probe remains a separate check for a stale or already-listening socket.
+
+<!-- code-anchor: crates/remanence-api/src/read_core.rs crates/remanence-daemon/src/entry.rs @ c6beb285 -->
+## Non-fatal warnings
+
+Read-reservoir warnings apply to both `rem` and the daemon. Reads continue
+when minimum slabs fall back to unlocked memory.
+
+| Message | Cause and fix |
+|---|---|
+| `read reservoir uses unlocked buffers` | The soft `RLIMIT_MEMLOCK` limit or lock permission prevents locking minimum read slabs. Reads continue, but tape data may be swapped. Check the limit, slab size, and count in the warning; raise the limit with `ulimit -l`, `LimitMEMLOCK=` for the daemon unit, or a `security/limits.d` entry for the user. `rem doctor` reports the limit and configured minimum without blocking readiness. |
+
+The daemon also prints two non-fatal startup warnings to stderr:
+`daemon.io_memory_ceiling=... exceeds startup MemAvailable=...;
+the fixed ceiling remains authoritative` and `daemon.io_memory_ceiling=...
+exceeds LimitMEMLOCK=...; reads fall back to unlocked buffers when minimum
+read reservoirs cannot be locked`. Both check the host's memory and lock
+limits once at startup; the ceiling itself is what the daemon enforces at
+runtime.
 
 <!-- code-anchor: crates/remanence-api/src/pool_write.rs crates/remanence-parity/src/error.rs crates/remanence-api/src/pool_write/selection.rs crates/remanence-api/src/write_admission.rs @ 1dd451b2 -->
 ## Writes are refused
@@ -272,6 +281,8 @@ Strings worth grepping for, mapped to the sections above:
 | `has insecure permissions` | TLS key mode |
 | `read-only mode` | daemon started with `read_only = true` |
 | `acquire daemon state ownership` | another daemon or offline state owner holds `state.lock`; stop that owner |
+| `read reservoir uses unlocked buffers` | non-fatal memory-lock fallback; see warnings above |
+| `remanence_read_reservoir` (as `target`) | read-reservoir memory-lock warning and remedy |
 | `remanence_read_diag` (as `target`) | read-pipeline reservoir/backpressure diagnostics, see above |
 
 <!-- code-anchor: none -->
