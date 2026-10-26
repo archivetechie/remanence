@@ -40,13 +40,9 @@ pub(crate) fn raw_read_error_proves_damage(error: &ParityError) -> bool {
 pub fn tape_error_is_current_medium_damage(error: &TapeIoError) -> bool {
     #[cfg(target_os = "linux")]
     {
-        matches!(
-            error,
-            TapeIoError::CheckCondition(
-                remanence_library::scsi::ScsiError::CheckCondition { sense, .. },
-            ) if decode_sense(sense)
-                .is_some_and(|decoded| !decoded.is_deferred() && decoded.key == 0x03)
-        )
+        error.check_condition_transfer().is_some_and(|(sense, _)| {
+            decode_sense(sense).is_some_and(|decoded| !decoded.is_deferred() && decoded.key == 0x03)
+        })
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1664,13 +1660,7 @@ fn classify_read_boundary(err: &TapeIoError) -> Option<RawReadBoundary> {
 
     #[cfg(target_os = "linux")]
     {
-        let TapeIoError::CheckCondition(remanence_library::scsi::ScsiError::CheckCondition {
-            sense,
-            ..
-        }) = err
-        else {
-            return None;
-        };
+        let (sense, _) = err.check_condition_transfer()?;
         let decoded = decode_sense(sense)?;
 
         // IBM LTO SCSI Reference GA32-0928-08 §4.12.1: a READ that
@@ -1703,6 +1693,32 @@ fn classify_read_boundary(err: &TapeIoError) -> Option<RawReadBoundary> {
 
 #[cfg(test)]
 mod compat_tests {
+    #[test]
+    fn sense_residue_boundary_and_damage_classifiers_accept_corrected_error() {
+        for (key, bytes, eod, damage) in [
+            (8, 0, true, false),
+            (8, 1, false, false),
+            (3, 0, false, true),
+        ] {
+            let mut sense = vec![0; 18];
+            sense[0] = 0xf0;
+            sense[2] = key;
+            sense[13] = 5;
+            let error = TapeIoError::CheckConditionWithResidue {
+                source: remanence_library::ScsiError::CheckCondition {
+                    sense,
+                    bytes_transferred: 262_144,
+                },
+                bytes_transferred: bytes,
+            };
+            assert_eq!(
+                classify_read_boundary(&error) == Some(RawReadBoundary::EndOfData),
+                eod
+            );
+            assert_eq!(tape_error_is_current_medium_damage(&error), damage);
+        }
+    }
+
     #[test]
     fn fixed_read_boundary_requires_exact_current_zero_transfer_eod() {
         for (response, key, ascq, bytes, accepted) in [
@@ -3366,9 +3382,14 @@ mod compat_tests {
                 raw.read_record(&mut [0; 4]).unwrap_err()
             };
             assert!(
-                matches!(&error, ParityError::TapeIo(TapeIoError::CheckCondition(
-                remanence_library::ScsiError::CheckCondition { sense: actual, bytes_transferred: bytes }
-            )) if actual == &sense && *bytes == bytes_transferred),
+                matches!(&error, ParityError::TapeIo(
+                    TapeIoError::CheckCondition(
+                        remanence_library::ScsiError::CheckCondition { sense: actual, bytes_transferred: bytes }
+                    ) | TapeIoError::CheckConditionWithResidue {
+                        source: remanence_library::ScsiError::CheckCondition { sense: actual, bytes_transferred: bytes },
+                        ..
+                    }
+                ) if actual == &sense && *bytes == bytes_transferred),
                 "{error:?}"
             );
             assert_eq!(log.borrow().iter().filter(|cdb| cdb[0] == 0x08).count(), 3);

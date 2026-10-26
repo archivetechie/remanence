@@ -44,6 +44,12 @@ per-release summaries.
   independently of library identity. Add diagnostics capture and direct-drive
   ownership configuration.
 
+### Fixes
+
+- Use valid READ/WRITE sense residues when the kernel reports no residue,
+  so physical end of data is recognized and partial transfers retain their
+  byte counts in variable and fixed block modes.
+
 ## 0.2.0 — 2026-10-15
 
 - First release with prebuilt Linux binaries (`remanence-x86_64-linux.tar.gz`, `rem-recover-x86_64-linux-musl.tar.gz`, `SHA256SUMS`) and build provenance attestation.

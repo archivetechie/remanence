@@ -16,6 +16,10 @@ pub mod media_gate;
 pub mod model;
 /// Media readiness classification for TEST UNIT READY probes.
 pub mod readiness;
+mod transfer;
+
+use transfer::map_transfer_scsi;
+pub(crate) use transfer::transfer_bytes_from_sense;
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant, SystemTime};
@@ -72,8 +76,8 @@ fn completion_unknown_check_condition(sense: Vec<u8>, bytes_transferred: u32) ->
 struct ResidualClaimMismatch;
 
 /// Validate the one-sided claim that complete fixed records fit inside the
-/// byte count reported by the transport. Data-out stacks that report no
-/// residual pass vacuously because `bytes_transferred == dxfer_len`.
+/// completion byte count, including the sense residue when the kernel reports
+/// no residue.
 fn validate_residual_claim(
     records_claimed: u32,
     block_size_bytes: u32,
@@ -121,12 +125,32 @@ pub(super) struct AppendProof {
 }
 
 impl TapeIoError {
+    /// Sense and transferred bytes for a known CHECK CONDITION. READ/WRITE
+    /// completions use the sense residue when the kernel reports no residue.
+    /// The source `ScsiError` retains its kernel-reported count.
+    pub fn check_condition_transfer(&self) -> Option<(&[u8], u32)> {
+        match self {
+            Self::CheckCondition(ScsiError::CheckCondition {
+                sense,
+                bytes_transferred,
+            }) => Some((sense, *bytes_transferred)),
+            Self::CheckConditionWithResidue {
+                source: ScsiError::CheckCondition { sense, .. },
+                bytes_transferred,
+            } => Some((sense, *bytes_transferred)),
+            _ => None,
+        }
+    }
+
     /// Only a current, zero-transfer BLANK CHECK 00/05 proves physical EOD.
     pub fn is_physical_eod(&self) -> bool {
-        matches!(self, Self::CheckCondition(ScsiError::CheckCondition {
-            sense, bytes_transferred: 0,
-        }) if !sense_is_deferred(sense)
-            && decode_sense(sense).is_some_and(|s| s.key == 8 && s.asc == 0 && s.ascq == 5 && !s.filemark))
+        self.check_condition_transfer()
+            .is_some_and(|(sense, bytes)| {
+                bytes == 0
+                    && !sense_is_deferred(sense)
+                    && decode_sense(sense)
+                        .is_some_and(|s| s.key == 8 && s.asc == 0 && s.ascq == 5 && !s.filemark)
+            })
     }
 }
 
@@ -280,6 +304,18 @@ pub enum TapeIoError {
     /// signal. Caller should consult the sense bytes.
     #[error("drive rejected the command: {0}")]
     CheckCondition(ScsiError),
+
+    /// READ/WRITE CHECK CONDITION with a valid sense residue and no kernel
+    /// residue. Physical state is known, as for `CheckCondition`.
+    #[error("drive rejected the command (transferred bytes={bytes_transferred}): {source}")]
+    CheckConditionWithResidue {
+        /// Original sense and kernel-reported transferred-byte count.
+        #[source]
+        source: ScsiError,
+        /// Requested bytes minus sense residue, converted from blocks for
+        /// FIXED commands and clamped to the requested byte range.
+        bytes_transferred: u32,
+    },
 
     /// The drive returned a target status such as BUSY or RESERVATION
     /// CONFLICT without CHECK CONDITION. The target did not accept the
@@ -567,6 +603,7 @@ fn sense_is_deferred(sense: &[u8]) -> bool {
 fn tape_outcome(err: &TapeIoError, dirty: bool) -> AuditOutcome {
     let sense = match err {
         TapeIoError::CheckCondition(inner)
+        | TapeIoError::CheckConditionWithResidue { source: inner, .. }
         | TapeIoError::Transport(inner)
         | TapeIoError::DataProtect(inner)
         | TapeIoError::StateInvalidatingReset(inner) => extract_sense(inner),
@@ -574,6 +611,7 @@ fn tape_outcome(err: &TapeIoError, dirty: bool) -> AuditOutcome {
         TapeIoError::HardEndOfMedium { sense } => Some(sense.clone()),
         TapeIoError::GoodWriteTripwire { cause, .. } => match cause.as_ref() {
             TapeIoError::CheckCondition(inner)
+            | TapeIoError::CheckConditionWithResidue { source: inner, .. }
             | TapeIoError::Transport(inner)
             | TapeIoError::DataProtect(inner)
             | TapeIoError::StateInvalidatingReset(inner) => extract_sense(inner),
@@ -1469,6 +1507,12 @@ impl super::DriveHandle {
                 sense,
                 bytes_transferred,
             }) => {
+                let completion_bytes = transfer_bytes_from_sense(
+                    &sense,
+                    bytes_transferred,
+                    len_u32,
+                    Some(block_size_bytes),
+                );
                 if is_reset_unit_attention(&sense) {
                     self.invalidate_for_reset_unit_attention();
                 }
@@ -1500,7 +1544,7 @@ impl super::DriveHandle {
                             if validate_residual_claim(
                                 records_written,
                                 block_size_bytes,
-                                bytes_transferred,
+                                completion_bytes,
                             )
                             .is_err()
                             {
@@ -1530,8 +1574,7 @@ impl super::DriveHandle {
                 }
 
                 if sense_is_current_recovered_without_terminal_flags(&sense) {
-                    if validate_residual_claim(records, block_size_bytes, bytes_transferred)
-                        .is_err()
+                    if validate_residual_claim(records, block_size_bytes, completion_bytes).is_err()
                     {
                         let mapped = completion_unknown_check_condition(sense, bytes_transferred);
                         self.finish_tape_error(op, &mapped);
@@ -1563,7 +1606,7 @@ impl super::DriveHandle {
                         return Err(mapped);
                     }
                 };
-                if validate_residual_claim(records_written, block_size_bytes, bytes_transferred)
+                if validate_residual_claim(records_written, block_size_bytes, completion_bytes)
                     .is_err()
                 {
                     let mapped = completion_unknown_check_condition(sense, bytes_transferred);
@@ -1703,6 +1746,12 @@ impl super::DriveHandle {
                 sense,
                 bytes_transferred,
             }) => {
+                let completion_bytes = transfer_bytes_from_sense(
+                    &sense,
+                    bytes_transferred,
+                    len_u32,
+                    Some(block_size_bytes),
+                );
                 if sense_is_deferred(&sense) {
                     let mapped = completion_unknown_check_condition(sense, bytes_transferred);
                     self.fire_tape_started(operation, cdb);
@@ -1711,10 +1760,14 @@ impl super::DriveHandle {
                 }
                 if is_reset_unit_attention(&sense) {
                     self.invalidate_for_reset_unit_attention();
-                    let mapped = map_scsi(ScsiError::CheckCondition {
-                        sense,
-                        bytes_transferred,
-                    });
+                    let mapped = map_transfer_scsi(
+                        ScsiError::CheckCondition {
+                            sense,
+                            bytes_transferred,
+                        },
+                        len_u32,
+                        Some(block_size_bytes),
+                    );
                     self.fire_tape_started(operation, cdb);
                     self.defer_pipeline_error_audit(operation, &mapped);
                     return Err(mapped);
@@ -1755,7 +1808,7 @@ impl super::DriveHandle {
                         return Err(mapped);
                     };
                     let bytes_written = records_written.saturating_mul(block_size_bytes);
-                    if validate_residual_claim(records_written, block_size_bytes, bytes_transferred)
+                    if validate_residual_claim(records_written, block_size_bytes, completion_bytes)
                         .is_err()
                     {
                         self.pipeline_diagnostics.residual_claim_mismatches = self
@@ -1790,8 +1843,7 @@ impl super::DriveHandle {
                     }
                     Ok(outcome)
                 } else if sense_is_current_recovered_without_terminal_flags(&sense) {
-                    if validate_residual_claim(records, block_size_bytes, bytes_transferred)
-                        .is_err()
+                    if validate_residual_claim(records, block_size_bytes, completion_bytes).is_err()
                     {
                         let mapped = completion_unknown_check_condition(sense, bytes_transferred);
                         self.fire_tape_started(operation, cdb);
@@ -1827,7 +1879,7 @@ impl super::DriveHandle {
                             if validate_residual_claim(
                                 records_written,
                                 block_size_bytes,
-                                bytes_transferred,
+                                completion_bytes,
                             )
                             .is_ok() =>
                         {
@@ -1916,7 +1968,11 @@ impl super::DriveHandle {
                 "unclean verification batch: transferred {} of {transfer_len} bytes, sense {:?}",
                 transfer.bytes_transferred, transfer.sense,
             ))),
-            Err(error) => Err(map_scsi(error)),
+            Err(error) => Err(map_transfer_scsi(
+                error,
+                transfer_len,
+                Some(block_size_bytes),
+            )),
         };
         match &result {
             Ok(_) => self.finish_tape_success(op, started.elapsed()),
@@ -2039,6 +2095,12 @@ impl super::DriveHandle {
                 sense,
                 bytes_transferred,
             }) => {
+                let completion_bytes = transfer_bytes_from_sense(
+                    &sense,
+                    bytes_transferred,
+                    transfer_len,
+                    Some(block_size_bytes),
+                );
                 if is_reset_unit_attention(&sense) {
                     self.invalidate_for_reset_unit_attention();
                 }
@@ -2049,10 +2111,14 @@ impl super::DriveHandle {
                 }
                 if sense_has_current_ili(&sense) {
                     self.mark_position_unknown();
-                    let mapped = map_scsi(ScsiError::CheckCondition {
-                        sense,
-                        bytes_transferred,
-                    });
+                    let mapped = map_transfer_scsi(
+                        ScsiError::CheckCondition {
+                            sense,
+                            bytes_transferred,
+                        },
+                        transfer_len,
+                        Some(block_size_bytes),
+                    );
                     self.finish_tape_error(op, &mapped);
                     return Err(mapped);
                 }
@@ -2066,7 +2132,7 @@ impl super::DriveHandle {
                             return Err(mapped);
                         }
                     };
-                    if validate_residual_claim(records_read, block_size_bytes, bytes_transferred)
+                    if validate_residual_claim(records_read, block_size_bytes, completion_bytes)
                         .is_err()
                     {
                         let mapped = completion_unknown_check_condition(sense, bytes_transferred);
@@ -2104,7 +2170,7 @@ impl super::DriveHandle {
                     }
                     let records_read =
                         fixed_records_transferred_from_sense(&sense, records).unwrap_or(records);
-                    if validate_residual_claim(records_read, block_size_bytes, bytes_transferred)
+                    if validate_residual_claim(records_read, block_size_bytes, completion_bytes)
                         .is_err()
                     {
                         let mapped = completion_unknown_check_condition(sense, bytes_transferred);
@@ -2134,10 +2200,14 @@ impl super::DriveHandle {
                     self.record_pipeline_accounting(completed_at);
                     return Ok(outcome);
                 }
-                let mapped = map_scsi(ScsiError::CheckCondition {
-                    sense,
-                    bytes_transferred,
-                });
+                let mapped = map_transfer_scsi(
+                    ScsiError::CheckCondition {
+                        sense,
+                        bytes_transferred,
+                    },
+                    transfer_len,
+                    Some(block_size_bytes),
+                );
                 self.finish_tape_error(op, &mapped);
                 Err(mapped)
             }
@@ -2224,7 +2294,11 @@ impl super::DriveHandle {
                 // CHECK CONDITION with ILI + VALID, the sense's
                 // INFORMATION field tells us the on-tape vs host
                 // buffer size delta.
-                if let ScsiError::CheckCondition { ref sense, .. } = e {
+                if let ScsiError::CheckCondition {
+                    ref sense,
+                    bytes_transferred,
+                } = e
+                {
                     if is_reset_unit_attention(sense) {
                         self.invalidate_for_reset_unit_attention();
                     }
@@ -2236,12 +2310,12 @@ impl super::DriveHandle {
                     }
                     if let Some(signed_info) = ili_signed_information(sense) {
                         if signed_info >= 0 {
-                            // Block smaller than buffer — normal short
-                            // read. Use the sense INFORMATION field as the
-                            // spec source, then clamp to the host buffer so
-                            // malformed sense cannot report stale bytes.
-                            let actual_usize = ((len_u32 as i64) - signed_info).max(0) as usize;
-                            let actual_usize = actual_usize.min(buf.len());
+                            // A short record uses the kernel count when it
+                            // reports residue, otherwise the sense residue.
+                            let actual_usize =
+                                (transfer_bytes_from_sense(sense, bytes_transferred, len_u32, None)
+                                    as usize)
+                                    .min(buf.len());
                             if let Err(error) =
                                 self.advance_known_single_read_position(actual_usize)
                             {
@@ -2273,7 +2347,7 @@ impl super::DriveHandle {
                 } else {
                     self.mark_position_unknown();
                 }
-                let mapped = map_scsi(e);
+                let mapped = map_transfer_scsi(e, len_u32, None);
                 self.finish_tape_error(op, &mapped);
                 Err(mapped)
             }
@@ -2366,7 +2440,8 @@ impl super::DriveHandle {
                 // VOLUME OVERFLOW). Otherwise reconstruct the
                 // CheckCondition and map normally.
                 if let Some(signal) = write_eom_signal(&sense) {
-                    let bytes_written = bytes_transferred;
+                    let bytes_written =
+                        transfer_bytes_from_sense(&sense, bytes_transferred, len_u32, None);
                     match self.read_position_inline() {
                         Ok(position_after) => {
                             self.finish_tape_success(op, started.elapsed());
@@ -2394,16 +2469,24 @@ impl super::DriveHandle {
                             requested: len_u32,
                             limit,
                         },
-                        None => TapeIoError::CheckCondition(ScsiError::CheckCondition {
-                            sense,
-                            bytes_transferred,
-                        }),
+                        None => map_transfer_scsi(
+                            ScsiError::CheckCondition {
+                                sense,
+                                bytes_transferred,
+                            },
+                            len_u32,
+                            None,
+                        ),
                     }
                 } else {
-                    map_scsi(ScsiError::CheckCondition {
-                        sense,
-                        bytes_transferred,
-                    })
+                    map_transfer_scsi(
+                        ScsiError::CheckCondition {
+                            sense,
+                            bytes_transferred,
+                        },
+                        len_u32,
+                        None,
+                    )
                 };
                 self.finish_tape_error(op, &mapped);
                 Err(mapped)
@@ -2485,7 +2568,8 @@ impl super::DriveHandle {
                     self.invalidate_for_reset_unit_attention();
                 }
                 if let Some(signal) = write_eom_signal(&sense) {
-                    let bytes_written = bytes_transferred;
+                    let bytes_written =
+                        transfer_bytes_from_sense(&sense, bytes_transferred, len_u32, None);
                     if bytes_written != len_u32 {
                         let mapped = TapeIoError::PartialBatchUncommittable {
                             requested_records: 1,
@@ -2514,16 +2598,24 @@ impl super::DriveHandle {
                             requested: len_u32,
                             limit,
                         },
-                        None => TapeIoError::CheckCondition(ScsiError::CheckCondition {
-                            sense,
-                            bytes_transferred,
-                        }),
+                        None => map_transfer_scsi(
+                            ScsiError::CheckCondition {
+                                sense,
+                                bytes_transferred,
+                            },
+                            len_u32,
+                            None,
+                        ),
                     }
                 } else {
-                    map_scsi(ScsiError::CheckCondition {
-                        sense,
-                        bytes_transferred,
-                    })
+                    map_transfer_scsi(
+                        ScsiError::CheckCondition {
+                            sense,
+                            bytes_transferred,
+                        },
+                        len_u32,
+                        None,
+                    )
                 };
                 self.finish_tape_error(op, &mapped);
                 Err(mapped)
@@ -3924,6 +4016,8 @@ fn units_traversed_from_space_residual(count: i64, residual: i64) -> i64 {
 mod media_gate_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod transfer_tests;
 
 /// Decode the page's Additional Partitions Defined field, including block descriptors.
 fn medium_partition_count(data: &[u8]) -> Result<u16, TapeIoError> {

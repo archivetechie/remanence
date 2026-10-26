@@ -3546,10 +3546,8 @@ fn fixed_read_ili_withholds_data_invalidates_cursor_and_blocks_cached_reuse() {
     );
     let mut buffer = [0xa5; 16];
 
-    assert!(matches!(
-        drive.read_block_batch(&mut buffer, 4, 4, 4),
-        Err(TapeIoError::CheckCondition(_))
-    ));
+    let error = drive.read_block_batch(&mut buffer, 4, 4, 4).unwrap_err();
+    assert_eq!(error.check_condition_transfer().unwrap().1, 8);
     assert!(drive.expected_position.is_none());
     assert!(!drive.position_known);
     assert!(matches!(
@@ -3589,10 +3587,8 @@ fn fixed_read_ili_before_any_record_also_invalidates_and_stops() {
     );
     let mut buffer = [0xa5; 16];
 
-    assert!(matches!(
-        drive.read_block_batch(&mut buffer, 4, 4, 4),
-        Err(TapeIoError::CheckCondition(_))
-    ));
+    let error = drive.read_block_batch(&mut buffer, 4, 4, 4).unwrap_err();
+    assert_eq!(error.check_condition_transfer().unwrap().1, 0);
     assert!(drive.expected_position.is_none());
     assert!(matches!(
         drive.read_block_batch(&mut buffer, 4, 4, 4),

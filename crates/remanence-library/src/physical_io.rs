@@ -219,10 +219,7 @@ fn classify_read_boundary(err: &TapeIoError) -> Option<PhysicalReadBoundary> {
 
     #[cfg(target_os = "linux")]
     {
-        let TapeIoError::CheckCondition(crate::scsi::ScsiError::CheckCondition { sense, .. }) = err
-        else {
-            return None;
-        };
+        let (sense, _) = err.check_condition_transfer()?;
         let decoded = decode_sense(sense)?;
 
         if decoded.filemark
@@ -233,7 +230,7 @@ fn classify_read_boundary(err: &TapeIoError) -> Option<PhysicalReadBoundary> {
         {
             return Some(PhysicalReadBoundary::Filemark);
         }
-        if decoded.key == 0x08 && decoded.asc == 0x00 && decoded.ascq == 0x05 {
+        if err.is_physical_eod() {
             return Some(PhysicalReadBoundary::EndOfData);
         }
         None

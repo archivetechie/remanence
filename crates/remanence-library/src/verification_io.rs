@@ -184,6 +184,18 @@ impl VerificationContext {
         let bytes = match result {
             Ok(o) => u64::from(o.bytes_transferred),
             Err(ScsiError::CheckCondition {
+                sense,
+                bytes_transferred,
+            }) if opcode == 8 => {
+                let block_size = fixed.then(|| (buf.len() as u64 / requested.max(1)) as u32);
+                u64::from(crate::handle::tape_io::transfer_bytes_from_sense(
+                    sense,
+                    *bytes_transferred,
+                    buf.len() as u32,
+                    block_size,
+                ))
+            }
+            Err(ScsiError::CheckCondition {
                 bytes_transferred, ..
             }) => u64::from(*bytes_transferred),
             _ => 0,
@@ -329,7 +341,15 @@ pub(crate) fn exact_recovered(result: &Result<TransferOutcome, ScsiError>, size:
         Err(ScsiError::CheckCondition {
             sense,
             bytes_transferred,
-        }) => (sense.as_slice(), *bytes_transferred),
+        }) => (
+            sense.as_slice(),
+            crate::handle::tape_io::transfer_bytes_from_sense(
+                sense,
+                *bytes_transferred,
+                size as u32,
+                None,
+            ),
+        ),
         Ok(outcome) => {
             return outcome.bytes_transferred as usize == size
                 && size > 0
@@ -406,6 +426,35 @@ mod tests {
             &Ok(TransferOutcome::clean(32)),
         );
     }
+    #[test]
+    fn sense_residue_verification_accounting_uses_command_units() {
+        for fixed in [false, true] {
+            let context = VerificationContext::default();
+            let session = context.begin();
+            let mut sense = vec![0; 18];
+            sense[0] = 0xf0;
+            sense[2] = 8;
+            sense[3..7].copy_from_slice(&(if fixed { 1u32 } else { 4u32 }).to_be_bytes());
+            sense[13] = 5;
+            let cdb = if fixed {
+                remanence_scsi::read_write::build_read_fixed_cdb(1)
+            } else {
+                remanence_scsi::read_write::build_read_variable_cdb(4)
+            };
+            context.dispatch(
+                &cdb,
+                &[0; 4],
+                &Err(ScsiError::CheckCondition {
+                    sense,
+                    bytes_transferred: 4,
+                }),
+            );
+            let report = session.finish();
+            assert_eq!(report.total.bytes, 0);
+            assert_eq!(report.total.records_confirmed, 0);
+        }
+    }
+
     #[test]
     fn nested_scopes_ranges_backward_seeks_and_drop_are_passive() {
         let context = VerificationContext::default();
