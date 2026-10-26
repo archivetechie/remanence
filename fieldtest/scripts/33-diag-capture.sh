@@ -64,6 +64,12 @@ main() {
     fieldtest_evidence_record "$SCRIPT_NAME" tools FAIL "missing sg3_utils tools: ${missing[*]} (install sg3_utils)"
     exit 1
   fi
+  # READ ATTRIBUTE (0x8C) is outside the kernel's unprivileged SG_IO allowlist,
+  # unlike INQUIRY, LOG SENSE and MODE SENSE. A copy of sg_read_attr in the kit's
+  # bin/ with cap_sys_rawio (same treatment as rem) makes MAM readable without
+  # root; otherwise MAM is recorded as SKIP with the remedy.
+  SG_READ_ATTR="${SG_READ_ATTR:-$(fieldtest_bin_dir)/sg_read_attr}"
+  [[ -x "$SG_READ_ATTR" ]] || SG_READ_ATTR="sg_read_attr"
 
   local stamp libs_json
   stamp="$(fieldtest_timestamp_id)"
@@ -159,23 +165,44 @@ capture_device() {
   fieldtest_capture_text "$dir/opcodes.json" sg_opcodes "$dev" || true
   fieldtest_capture_text "$dir/opcodes-hex.json" sg_opcodes -H "$dev" || true
 
+  # TapeAlert ordering probe: the TapeAlert Response page (0x12) is documented
+  # as persistent while 0x2E clears on read on some drives. Read 0x12, then 0x2E
+  # twice, then 0x12 again, in that order, so the evidence shows what cleared.
+  if [[ $role == drive ]]; then
+    date -u +%Y-%m-%dT%H:%M:%SZ >"$dir/log-tapealert-order.txt"
+    fieldtest_capture_text "$dir/log-0x12-before.json" sg_logs -p 0x12 "$dev" || true
+    sg_logs -p 0x12 -r "$dev" >"$dir/log-0x12-before.bin" 2>/dev/null || true
+    fieldtest_capture_text "$dir/log-0x2e-first.json" sg_logs -p 0x2e "$dev" || true
+    sg_logs -p 0x2e -r "$dev" >"$dir/log-0x2e-first.bin" 2>/dev/null || true
+    fieldtest_capture_text "$dir/log-0x2e-second.json" sg_logs -p 0x2e "$dev" || true
+    fieldtest_capture_text "$dir/log-0x12-after.json" sg_logs -p 0x12 "$dev" || true
+  fi
+
   # LOG SENSE: supported pages and subpages, everything decoded, everything in hex,
   # then one raw file per page so a parser can be tested against exact bytes.
+  # The discovered list is joined with the pages HPE LTO drives and MSL changers
+  # are known to serve, because some changer firmware refuses page 0x00.
   fieldtest_capture_text "$dir/log-supported.json" sg_logs -p 0x00 "$dev" || true
   fieldtest_capture_text "$dir/log-supported-subpages.json" sg_logs -p 0x00,0xff "$dev" || true
   fieldtest_capture_text "$dir/log-all.json" sg_logs -A "$dev" || true
   fieldtest_capture_text "$dir/log-all-hex.json" sg_logs -A -H "$dev" || true
   mkdir -p "$dir/log-raw"
+  local known_pages
+  if [[ $role == drive ]]; then
+    known_pages="0x02 0x03 0x06 0x0c 0x0d,0x01 0x11 0x12 0x14 0x16 0x17 0x17,0x01 0x17,0x02 0x18 0x1a 0x1b 0x30 0x31 0x32 0x33 0x34 0x37 0x37,0x10 0x37,0x20 0x37,0x40 0x37,0x50 0x37,0x60 0x37,0x80 0x37,0x90 0x37,0xa0 0x38 0x39 0x3a 0x3b 0x3c 0x3d 0x3e"
+  else
+    known_pages="0x07 0x0d 0x2e 0x30 0x34 0x36 0x38 0x3a 0x3b 0x3e"
+  fi
   local pages
   pages="$(
-    python3 - "$dir/log-supported.json" "$dir/log-supported-subpages.json" <<'PY'
+    python3 - "$known_pages" "$dir/log-supported.json" "$dir/log-supported-subpages.json" <<'PY'
 import json
 import re
 import sys
 from pathlib import Path
 
 pages = []
-for f in sys.argv[1:]:
+for f in sys.argv[2:]:
     try:
         text = json.loads(Path(f).read_text()).get("stdout", "")
     except Exception:
@@ -185,6 +212,11 @@ for f in sys.argv[1:]:
         key = (page, sub)
         if key not in pages:
             pages.append(key)
+for spec in sys.argv[1].split():
+    page, _, sub = spec.partition(",")
+    key = (page.lower(), sub.lower())
+    if key not in pages:
+        pages.append(key)
 for page, sub in pages:
     print(f"{page} {sub}")
 PY
@@ -251,13 +283,19 @@ capture_mam() {
   fi
   local mam="$dir/mam"
   mkdir -p "$mam"
-  fieldtest_capture_text "$mam/attributes.json" sg_read_attr "$dev" || true
-  fieldtest_capture_text "$mam/attributes-hex.json" sg_read_attr -H "$dev" || true
-  sg_read_attr -r "$dev" >"$mam/attributes.bin" 2>/dev/null || true
+  if ! fieldtest_capture_text "$mam/attributes.json" "$SG_READ_ATTR" "$dev"; then
+    if grep -qiE "not permitted|EPERM|Operation not permitted" "$mam/attributes.json"; then
+      fieldtest_evidence_record "$SCRIPT_NAME" "mam-$dev_serial" SKIP "READ ATTRIBUTE refused without cap_sys_rawio; copy sg_read_attr into $(fieldtest_bin_dir)/ and setcap it like rem, then rerun --mam-only" "$mam/attributes.json" \
+        "{\"device\":\"$dev\",\"bay\":\"$bay\"}"
+      return 0
+    fi
+  fi
+  fieldtest_capture_text "$mam/attributes-hex.json" "$SG_READ_ATTR" -H "$dev" || true
+  "$SG_READ_ATTR" -r "$dev" >"$mam/attributes.bin" 2>/dev/null || true
   local sa
   for sa in 1 2 3 5; do
-    fieldtest_capture_text "$mam/service-action-$sa.json" sg_read_attr --sa="$sa" "$dev" || true
-    fieldtest_capture_text "$mam/service-action-$sa-hex.json" sg_read_attr --sa="$sa" -H "$dev" || true
+    fieldtest_capture_text "$mam/service-action-$sa.json" "$SG_READ_ATTR" --sa="$sa" "$dev" || true
+    fieldtest_capture_text "$mam/service-action-$sa-hex.json" "$SG_READ_ATTR" --sa="$sa" -H "$dev" || true
   done
   fieldtest_capture_text "$mam/log-0x17.json" sg_logs -p 0x17 "$dev" || true
   fieldtest_capture_text "$mam/log-0x17-sub1.json" sg_logs -p 0x17,0x01 "$dev" || true
