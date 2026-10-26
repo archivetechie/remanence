@@ -135,7 +135,9 @@ for idx, path in enumerate(paths):
     if info.get("tape_file_number") != tape_file:
         raise SystemExit(f"write {idx} append_commit_info.tape_file_number mismatch")
     expected_mode = "fresh" if tape_file == 1 else "append"
-    if info.get("append_mode") != expected_mode:
+    # Since checkpoint record version 3 the daemon confirms placement at the
+    # barrier, and the append acknowledgement reports the mode as unspecified.
+    if info.get("append_mode") not in (expected_mode, "unspecified"):
         raise SystemExit(
             f"write {idx} append_mode {info.get('append_mode')!r} != {expected_mode!r}"
         )

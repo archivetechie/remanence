@@ -365,7 +365,7 @@ async fn write_command(endpoint: &str, args: WriteArgs, no_wait: bool) -> AppRes
     let started = Instant::now();
     let open_started = Instant::now();
     let session_id = open_write_session(
-        channel,
+        channel.clone(),
         &mut write_client,
         &args.pool,
         library_uuid,
@@ -395,6 +395,10 @@ async fn write_command(endpoint: &str, args: WriteArgs, no_wait: bool) -> AppRes
         })
         .await?;
     let close_ms = duration_ms(close_started.elapsed());
+
+    let mut record = record;
+    let mut catalog_client = pb::catalog_client::CatalogClient::new(channel.clone());
+    fill_committed_placement(&mut catalog_client, &mut record).await;
 
     let seconds = started.elapsed().as_secs_f64();
     let bytes = metadata.len();
@@ -437,7 +441,7 @@ async fn write_many_command(endpoint: &str, args: WriteManyArgs, no_wait: bool) 
 
     let open_started = Instant::now();
     let session_id = open_write_session(
-        channel,
+        channel.clone(),
         &mut write_client,
         &args.pool,
         library_uuid,
@@ -446,7 +450,7 @@ async fn write_many_command(endpoint: &str, args: WriteManyArgs, no_wait: bool) 
     .await?;
     let open_ms = duration_ms(open_started.elapsed());
 
-    let mut object_records = Vec::new();
+    let mut pending: Vec<(pb::ObjectRecord, u64, PhaseTimings)> = Vec::new();
     for idx in 0..args.count {
         let append_input = AppendInput::generated(
             idx,
@@ -458,11 +462,9 @@ async fn write_many_command(endpoint: &str, args: WriteManyArgs, no_wait: bool) 
         match append_object(&mut write_client, &session_id, append_input).await {
             Ok(record) => {
                 let transfer_ms = duration_ms(transfer_started.elapsed());
-                object_records.push(write_many_object_json(
-                    &record,
-                    &args.pool,
+                pending.push((
+                    record,
                     idx,
-                    bytes_per_object,
                     PhaseTimings {
                         open_ms: (idx == 0).then_some(open_ms),
                         transfer_ms: Some(transfer_ms),
@@ -475,10 +477,15 @@ async fn write_many_command(endpoint: &str, args: WriteManyArgs, no_wait: bool) 
                 let close_started = Instant::now();
                 let close_result = close_write_session(&mut write_client, &session_id).await;
                 let close_ms = duration_ms(close_started.elapsed());
-                if let Some(last_record) = object_records.last_mut() {
-                    last_record["close_ms"] = json!(close_ms);
-                }
-                for record in object_records {
+                for record in write_many_records_json(
+                    &channel,
+                    pending,
+                    &args.pool,
+                    bytes_per_object,
+                    Some(close_ms),
+                )
+                .await
+                {
                     print_json_line(record)?;
                 }
                 print_json_line(write_many_error_json(
@@ -515,10 +522,15 @@ async fn write_many_command(endpoint: &str, args: WriteManyArgs, no_wait: bool) 
     let close_started = Instant::now();
     let close_result = close_write_session(&mut write_client, &session_id).await;
     let close_ms = duration_ms(close_started.elapsed());
-    if let Some(last_record) = object_records.last_mut() {
-        last_record["close_ms"] = json!(close_ms);
-    }
-    for record in object_records {
+    for record in write_many_records_json(
+        &channel,
+        pending,
+        &args.pool,
+        bytes_per_object,
+        Some(close_ms),
+    )
+    .await
+    {
         print_json_line(record)?;
     }
     print_json_line(write_many_summary_json(
@@ -1238,6 +1250,77 @@ fn write_result_json(
     })
 }
 
+/// The daemon confirms placement at the checkpoint barrier, so an append
+/// acknowledgement may carry no committed copy. After the session closes the
+/// catalog holds the placement; copy it into the record and mirror the tape
+/// and file into the commit info when the acknowledgement left them unset.
+async fn fill_committed_placement(
+    catalog_client: &mut pb::catalog_client::CatalogClient<Channel>,
+    record: &mut pb::ObjectRecord,
+) {
+    let placed = record
+        .copies
+        .first()
+        .is_some_and(|copy| !copy.tape_uuid.is_empty());
+    if !placed {
+        if let Ok(object_id) = uuid_slice(&record.object_id, "object_id") {
+            if let Ok(committed) = fetch_object(catalog_client, Uuid::from_bytes(object_id)).await {
+                if committed
+                    .copies
+                    .iter()
+                    .any(|copy| !copy.tape_uuid.is_empty())
+                {
+                    record.copies = committed.copies;
+                }
+            }
+        }
+    }
+    let Some(copy) = record.copies.first().cloned() else {
+        return;
+    };
+    let info = record
+        .append_commit_info
+        .get_or_insert_with(Default::default);
+    if info.tape_uuid.is_empty() {
+        info.tape_uuid = copy.tape_uuid.clone();
+    }
+    if info.tape_file_number.is_none() {
+        info.tape_file_number = Some(copy.tape_file_number);
+    }
+    if info.first_body_lba == 0 {
+        info.first_body_lba = copy.first_body_lba;
+    }
+}
+
+/// Build the per-object records of a write-many run after its session closed,
+/// filling committed placement from the catalog; the last record carries the
+/// close timing.
+async fn write_many_records_json(
+    channel: &Channel,
+    pending: Vec<(pb::ObjectRecord, u64, PhaseTimings)>,
+    pool_id: &str,
+    bytes_per_object: u64,
+    close_ms: Option<f64>,
+) -> Vec<Value> {
+    let mut catalog_client = pb::catalog_client::CatalogClient::new(channel.clone());
+    let last = pending.len().checked_sub(1);
+    let mut values = Vec::with_capacity(pending.len());
+    for (position, (mut record, idx, mut timings)) in pending.into_iter().enumerate() {
+        fill_committed_placement(&mut catalog_client, &mut record).await;
+        if Some(position) == last {
+            timings.close_ms = close_ms;
+        }
+        values.push(write_many_object_json(
+            &record,
+            pool_id,
+            idx,
+            bytes_per_object,
+            timings,
+        ));
+    }
+    values
+}
+
 fn write_many_object_json(
     record: &pb::ObjectRecord,
     pool_id: &str,
@@ -1558,7 +1641,7 @@ mod tests {
                 append_mode: pb::AppendMode::Append as i32,
                 tape_uuid: vec![0x44; 16],
                 voltag: None,
-                tape_file_number: 3,
+                tape_file_number: Some(3),
                 first_body_lba: 9,
                 position_before_lba: None,
                 position_after_lba: None,
@@ -1655,7 +1738,7 @@ mod tests {
                 append_mode: pb::AppendMode::Append as i32,
                 tape_uuid: vec![0x55; 16],
                 voltag: Some("AOX030L9".to_string()),
-                tape_file_number: 8,
+                tape_file_number: Some(8),
                 first_body_lba: 99,
                 position_before_lba: None,
                 position_after_lba: None,
