@@ -11,7 +11,7 @@ use std::io::Write;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use remanence_format::{
@@ -56,6 +56,8 @@ struct ReadDiagRecord {
     block_size_bytes: u64,
     batch_records: u64,
     minimum_slabs: u64,
+    minimum_slabs_locked: u64,
+    minimum_slabs_unlocked: u64,
     maximum_slabs: u64,
     effective_reservoir_bytes: u64,
     reservoir_high_watermark: u64,
@@ -78,6 +80,8 @@ fn emit_read_diag(record: ReadDiagRecord) {
         block_size_bytes = record.block_size_bytes,
         batch_records = record.batch_records,
         minimum_slabs = record.minimum_slabs,
+        minimum_slabs_locked = record.minimum_slabs_locked,
+        minimum_slabs_unlocked = record.minimum_slabs_unlocked,
         maximum_slabs = record.maximum_slabs,
         effective_reservoir_bytes = record.effective_reservoir_bytes,
         reservoir_high_watermark = record.reservoir_high_watermark,
@@ -503,42 +507,104 @@ impl ReadPipelineConfig {
     }
 }
 
+/// Operator remedy shared by the fallback warning and host diagnostics.
+pub const READ_MEMLOCK_REMEDY: &str = "raise the lock limit with ulimit -l, LimitMEMLOCK= for the daemon unit, or a security/limits.d entry for the user";
+
+static READ_FALLBACK_WARNING: Once = Once::new();
+static READ_WARNING_SINK: OnceLock<fn(&str)> = OnceLock::new();
+
+/// Register the CLI's stderr warning sink before starting read pipelines.
+pub fn set_read_reservoir_warning_sink(sink: fn(&str)) {
+    let _ = READ_WARNING_SINK.set(sink);
+}
+
+/// Read the process soft lock limit; `None` denotes an unlimited limit.
+pub fn read_memlock_soft_limit() -> std::io::Result<Option<u64>> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes only to this live rlimit value.
+    if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((limit.rlim_cur != libc::RLIM_INFINITY).then_some(limit.rlim_cur))
+}
+
+/// Format the limit consistently in operator warnings and doctor output.
+pub fn read_memlock_limit_detail(limit: &std::io::Result<Option<u64>>) -> String {
+    match limit {
+        Ok(Some(bytes)) => format!("{bytes} bytes"),
+        Ok(None) => "unlimited".to_string(),
+        Err(error) => format!("unavailable ({error})"),
+    }
+}
+
+/// Report the first reservoir's fallback count once for both operator sinks.
+fn warn_unlocked_minimum_once(
+    once: &Once,
+    slab_bytes: usize,
+    unlocked_slabs: usize,
+    limit: impl FnOnce() -> std::io::Result<Option<u64>>,
+    operator_warning: impl FnOnce(&str),
+) {
+    if unlocked_slabs == 0 {
+        return;
+    }
+    once.call_once(|| {
+        let limit = read_memlock_limit_detail(&limit());
+        let message = format!(
+            "read reservoir uses unlocked buffers: RLIMIT_MEMLOCK soft limit={limit}; cannot lock {unlocked_slabs} minimum slabs of {slab_bytes} bytes each; tape data may be swapped; {READ_MEMLOCK_REMEDY}"
+        );
+        tracing::warn!(target: "remanence_read_reservoir", "{message}");
+        operator_warning(&message);
+    });
+}
+
+/// Keep memory accounting for every slab and unlock only successful locks.
 #[derive(Debug)]
 struct LockedSlabPermit {
     _permit: IoMemoryPermit,
     address: usize,
     len: usize,
+    locked: bool,
     unlock: unsafe extern "C" fn(*const libc::c_void, usize) -> libc::c_int,
 }
 
 impl Drop for LockedSlabPermit {
     fn drop(&mut self) {
-        // SAFETY: the permit is retained alongside its reservoir slab and is
-        // dropped before the channels that own the live buffer allocation.
-        let _ = unsafe { (self.unlock)(self.address as *const libc::c_void, self.len) };
+        if self.locked {
+            // SAFETY: the permit is retained alongside its reservoir slab and is
+            // dropped before the channels that own the live buffer allocation.
+            let _ = unsafe { (self.unlock)(self.address as *const libc::c_void, self.len) };
+        }
     }
 }
 
+/// Allocate a slab, permitting resource-related lock failures only at the minimum.
 fn allocate_locked_slab(
     manager: &Arc<IoMemoryReservation>,
     bytes: usize,
+    allow_unlocked: bool,
 ) -> Result<(ReadBuffer, LockedSlabPermit), String> {
-    allocate_locked_slab_with(manager, bytes, |buffer| {
+    allocate_locked_slab_with(manager, bytes, allow_unlocked, |buffer| {
         // SAFETY: `buffer` is a live allocation for the duration of this call;
         // `mlock` neither takes ownership nor writes through the pointer.
         let result = unsafe { libc::mlock(buffer.as_slice().as_ptr().cast(), buffer.len()) };
         if result == 0 {
             Ok(())
         } else {
-            Err(std::io::Error::last_os_error().to_string())
+            Err(std::io::Error::last_os_error())
         }
     })
 }
 
+/// Preserve the reservation on fallback and roll it back on all refused allocations.
 fn allocate_locked_slab_with(
     manager: &Arc<IoMemoryReservation>,
     bytes: usize,
-    lock: impl FnOnce(&ReadBuffer) -> Result<(), String>,
+    allow_unlocked: bool,
+    lock: impl FnOnce(&ReadBuffer) -> std::io::Result<()>,
 ) -> Result<(ReadBuffer, LockedSlabPermit), String> {
     let permit = manager
         .try_reserve(u64::try_from(bytes).map_err(|_| "reservoir slab size exceeds u64")?)
@@ -547,12 +613,28 @@ fn allocate_locked_slab_with(
     if !buffer.is_page_aligned() || buffer.capacity() != bytes {
         return Err("read reservoir slab construction lost page alignment".to_string());
     }
-    lock(&buffer)
-        .map_err(|err| format!("mlock read reservoir slab (check LimitMEMLOCK): {err}"))?;
+    let locked = match lock(&buffer) {
+        Ok(()) => true,
+        Err(error)
+            if allow_unlocked
+                && matches!(
+                    error.raw_os_error(),
+                    Some(libc::ENOMEM | libc::EPERM | libc::EAGAIN)
+                ) =>
+        {
+            false
+        }
+        Err(error) => {
+            return Err(format!(
+                "mlock read reservoir slab (check LimitMEMLOCK): {error}"
+            ))
+        }
+    };
     let slab = LockedSlabPermit {
         _permit: permit,
         address: buffer.as_slice().as_ptr() as usize,
         len: buffer.len(),
+        locked,
         unlock: libc::munlock,
     };
     Ok((buffer, slab))
@@ -649,7 +731,7 @@ fn run_read_pipeline<T: Send>(
     let reservoir = ReservoirState::new(effective_capacity_bytes, config.high_pct, config.low_pct);
     let mut locked = Vec::with_capacity(max_slabs.min(minimum_slabs + 1));
     for _ in 0..minimum_slabs {
-        let (buffer, permit) = allocate_locked_slab(&manager, batch_bytes)
+        let (buffer, permit) = allocate_locked_slab(&manager, batch_bytes, true)
             .map_err(|err| FormatError::invalid(format!("refuse read pipeline start: {err}")))?;
         free_tx
             .try_send(buffer)
@@ -665,6 +747,20 @@ fn run_read_pipeline<T: Send>(
         "allocated buffers exceed delivery capacity"
     );
 
+    let minimum_slabs_locked = locked.iter().filter(|slab| slab.locked).count();
+    let minimum_slabs_unlocked = minimum_slabs - minimum_slabs_locked;
+    warn_unlocked_minimum_once(
+        &READ_FALLBACK_WARNING,
+        batch_bytes,
+        minimum_slabs_unlocked,
+        read_memlock_soft_limit,
+        |message| {
+            if let Some(sink) = READ_WARNING_SINK.get() {
+                sink(message);
+            }
+        },
+    );
+
     let diag_session_id = NEXT_READ_DIAG_SESSION_ID.fetch_add(1, Ordering::Relaxed);
     let diag_base = ReadDiagRecord {
         phase: "open",
@@ -672,6 +768,8 @@ fn run_read_pipeline<T: Send>(
         block_size_bytes: block_size as u64,
         batch_records: u64::from(batch_records),
         minimum_slabs: minimum_slabs as u64,
+        minimum_slabs_locked: minimum_slabs_locked as u64,
+        minimum_slabs_unlocked: minimum_slabs_unlocked as u64,
         maximum_slabs: max_slabs as u64,
         effective_reservoir_bytes: effective_capacity_bytes,
         reservoir_high_watermark: reservoir.high_bytes.load(Ordering::Acquire),
@@ -776,7 +874,7 @@ fn run_read_pipeline<T: Send>(
                     Err(std::sync::mpsc::TryRecvError::Empty)
                         if allocated < max_slabs && !growth_disabled =>
                     {
-                        match allocate_locked_slab(&manager, batch_bytes) {
+                        match allocate_locked_slab(&manager, batch_bytes, false) {
                             Ok((buffer, permit)) => {
                                 locked.push(permit);
                                 allocated += 1;
@@ -1586,7 +1684,7 @@ mod tests {
         }
     }
 
-    fn capture_read_diag<T>(run: impl FnOnce() -> T) -> (T, Vec<Value>) {
+    fn capture_read_events<T>(run: impl FnOnce() -> T) -> (T, Vec<Value>) {
         let writer = SharedLogWriter::default();
         let bytes = Arc::clone(&writer.0);
         let subscriber = tracing_subscriber::fmt()
@@ -1606,11 +1704,21 @@ mod tests {
         let events = output
             .lines()
             .map(|line| serde_json::from_str(line).expect("diagnostic line is JSON"))
-            .filter(|event: &Value| {
-                event.get("target").and_then(Value::as_str) == Some("remanence_read_diag")
-            })
             .collect();
         (result, events)
+    }
+
+    fn capture_read_diag<T>(run: impl FnOnce() -> T) -> (T, Vec<Value>) {
+        let (result, events) = capture_read_events(run);
+        (
+            result,
+            events
+                .into_iter()
+                .filter(|event| {
+                    event.get("target").and_then(Value::as_str) == Some("remanence_read_diag")
+                })
+                .collect(),
+        )
     }
 
     fn diag_u64(event: &Value, key: &str) -> u64 {
@@ -1632,6 +1740,8 @@ mod tests {
             "free_wait_us",
             "maximum_slabs",
             "minimum_slabs",
+            "minimum_slabs_locked",
+            "minimum_slabs_unlocked",
             "occupancy_bytes",
             "park_cycles",
             "park_us",
@@ -1650,6 +1760,10 @@ mod tests {
             .filter(|key| !matches!(*key, "timestamp" | "level" | "target"))
             .collect::<BTreeSet<_>>();
         assert_eq!(actual, expected, "version 1 diagnostic key set changed");
+        assert_eq!(
+            diag_u64(event, "minimum_slabs"),
+            diag_u64(event, "minimum_slabs_locked") + diag_u64(event, "minimum_slabs_unlocked")
+        );
         assert_eq!(
             event.get("target").and_then(Value::as_str),
             Some("remanence_read_diag")
@@ -1670,6 +1784,8 @@ mod tests {
             "free_wait_us",
             "maximum_slabs",
             "minimum_slabs",
+            "minimum_slabs_locked",
+            "minimum_slabs_unlocked",
             "occupancy_bytes",
             "park_cycles",
             "park_us",
@@ -2546,18 +2662,93 @@ mod tests {
         );
     }
 
+    /// Inject every supported fallback errno so coverage is independent of host limits.
     #[test]
-    fn reservoir_permit_rolls_back_when_mlock_fails() {
-        let manager = IoMemoryReservation::new(4096).expect("manager");
-        let err =
-            allocate_locked_slab_with(
-                &manager,
-                4096,
-                |_| Err("injected mlock failure".to_string()),
-            )
-            .expect_err("minimum slab must refuse swappable fallback");
-        assert!(err.contains("LimitMEMLOCK"), "{err}");
-        assert_eq!(manager.granted(), 0, "failed mlock must roll permit back");
+    fn minimum_reservoir_keeps_unlocked_slab_and_permit() {
+        use std::sync::atomic::AtomicUsize;
+        static UNLOCK_CALLS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn record_unlock(_: *const libc::c_void, _: usize) -> libc::c_int {
+            UNLOCK_CALLS.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+        for errno in [libc::ENOMEM, libc::EPERM, libc::EAGAIN] {
+            let manager = IoMemoryReservation::new(4096).expect("manager");
+            let (buffer, mut slab) = allocate_locked_slab_with(&manager, 4096, true, |_| {
+                Err(io::Error::from_raw_os_error(errno))
+            })
+            .expect("minimum slab falls back");
+            assert!(!slab.locked);
+            assert_eq!(buffer.len(), 4096);
+            assert!(buffer.is_page_aligned());
+            assert_eq!(manager.granted(), 4096);
+            assert!(manager.try_reserve(1).is_none());
+            slab.unlock = record_unlock;
+            drop(slab);
+            assert_eq!(UNLOCK_CALLS.load(Ordering::Relaxed), 0);
+            assert_eq!(manager.granted(), 0);
+            drop(buffer);
+        }
+    }
+
+    /// Unexpected errors refuse minimum slabs; growth refuses every lock error.
+    #[test]
+    fn reservoir_permit_rolls_back_on_refused_lock() {
+        for (allow_unlocked, errno) in [
+            (true, libc::EINVAL),
+            (true, libc::EIO),
+            (false, libc::ENOMEM),
+            (false, libc::EPERM),
+            (false, libc::EAGAIN),
+        ] {
+            let manager = IoMemoryReservation::new(4096).expect("manager");
+            let error = allocate_locked_slab_with(&manager, 4096, allow_unlocked, |_| {
+                Err(io::Error::from_raw_os_error(errno))
+            })
+            .expect_err("lock failure refuses slab");
+            assert!(error.contains("LimitMEMLOCK"), "{error}");
+            assert_eq!(manager.granted(), 0);
+        }
+    }
+
+    /// Zero fallback leaves the guard available; concurrent fallbacks report only once.
+    #[test]
+    fn reservoir_fallback_warning_once() {
+        let once = Once::new();
+        let messages = Mutex::new(Vec::new());
+        warn_unlocked_minimum_once(
+            &once,
+            4096,
+            0,
+            || panic!("no fallback"),
+            |_| panic!("no warning"),
+        );
+        let (_, events) = capture_read_events(|| {
+            let dispatch = tracing::dispatcher::get_default(Clone::clone);
+            std::thread::scope(|scope| {
+                for _ in 0..8 {
+                    scope.spawn(|| {
+                        tracing::dispatcher::with_default(&dispatch, || {
+                            warn_unlocked_minimum_once(
+                                &once,
+                                4096,
+                                4,
+                                || Ok(Some(65536)),
+                                |message| {
+                                    messages.lock().unwrap().push(message.to_string());
+                                },
+                            )
+                        })
+                    });
+                }
+            });
+        });
+        let messages = messages.into_inner().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["target"], "remanence_read_reservoir");
+        assert_eq!(events[0]["level"], "WARN");
+        assert_eq!(events[0]["message"], messages[0]);
+        assert_eq!(messages[0], format!("read reservoir uses unlocked buffers: RLIMIT_MEMLOCK soft limit=65536 bytes; cannot lock 4 minimum slabs of 4096 bytes each; tape data may be swapped; {READ_MEMLOCK_REMEDY}"));
     }
 
     #[test]
@@ -2584,6 +2775,7 @@ mod tests {
             _permit: permit,
             address,
             len: buffer.len(),
+            locked: true,
             unlock: record_unlock,
         };
 
