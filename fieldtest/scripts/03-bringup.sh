@@ -40,7 +40,9 @@ start_daemon() {
   # BEFORE the daemon takes device ownership — a 2-drive library with
   # occupied drives can't serve writes.
   fieldtest_drain_drives "$(fieldtest_selected_library_serial)" || true
-  tmux new-session -d -s "$session" -n rem
+  # Close the work-lock descriptor for the tmux server: a server started here
+  # would otherwise inherit fd 9 and hold the kit lock for its whole life.
+  tmux new-session -d -s "$session" -n rem 9>&-
   tmux pipe-pane -o -t "$session":rem "cat >> \"$log_file\""
   tmux send-keys -t "$session":rem "exec $(printf '%q' "$(fieldtest_rem_daemon_bin)") --config $(printf '%q' "$config")" C-m
 }
