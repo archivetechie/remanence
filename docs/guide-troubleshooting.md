@@ -156,6 +156,7 @@ layers — seeing one does not imply the others tripped too.
 | Message | Cause and fix |
 |---|---|
 | `error: load config ...` | TOML parse or validation failure. Unknown keys are hard errors; all paths must be absolute; `listen` requires `[daemon.tls]`; `tape_io.legacy_single_block`/`tape_io.pipelined_submission` are not accepted keys and fail to load with a specific message; the pipelined path is the only path for streaming reads and writes, so delete the key. (Full verification reads one block per command and does not use it.) |
+| `read reservoir uses unlocked buffers` | The soft `RLIMIT_MEMLOCK` limit or lock permission prevents locking minimum read slabs. Reads continue, but tape data may be swapped. Check the limit, slab size, and count in the warning; raise the limit with `ulimit -l`, `LimitMEMLOCK=` for the daemon unit, or a `security/limits.d` entry for the user. `rem doctor` reports the limit and configured minimum without blocking readiness. |
 | `daemon.io_memory_ceiling must be non-zero` / `... exceeds daemon.io_memory_ceiling` (on `spool_tmpfs_ram_budget` or `tape_io.read_reservoir_bytes`) | The shared I/O memory budget is zero, or a per-purpose reservation exceeds it. `io_memory_ceiling` (default 24 GiB) is the hard cap shared by the append spool and every drive's read reservoir. |
 | `tape_io reservoir watermarks require 0 < read_reservoir_low_pct < read_reservoir_high_pct <= 100` | Watermark percentages misordered or out of range. |
 | `tape_io.staging_ring_buffers` validation failure | Must be in `2..=16`. |

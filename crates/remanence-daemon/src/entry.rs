@@ -501,7 +501,7 @@ fn warn_io_memory_sanity(ceiling: u64) {
             && ceiling > limit.rlim_cur
         {
             eprintln!(
-                "rem-daemon: warning daemon.io_memory_ceiling={ceiling} exceeds LimitMEMLOCK={}; minimum read reservoirs will refuse to start if they cannot be locked",
+                "rem-daemon: warning daemon.io_memory_ceiling={ceiling} exceeds LimitMEMLOCK={}; reads fall back to unlocked buffers when minimum read reservoirs cannot be locked",
                 limit.rlim_cur
             );
         }

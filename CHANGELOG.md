@@ -10,6 +10,9 @@ per-release summaries.
 - Generate private recovery keys and public recipient files with
   `rem archive recipient keygen`; protect private files with mode `0600` and
   refuse existing output paths.
+- Read reservoirs keep minimum slabs unlocked when memory-lock limits or
+  permissions prevent locking. A process warning, read diagnostics, and an
+  advisory `rem doctor` check report the fallback and lock-limit remedy.
 
 - Operate a manually loaded LTO drive without a daemon: setup, initialize,
   put/get, finalize, verify and restore. Home mode keeps state in the user's

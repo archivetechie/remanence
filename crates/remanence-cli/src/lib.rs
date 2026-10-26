@@ -4071,6 +4071,10 @@ pub fn main_entry() -> ExitCode {
 
 /// Run the operator CLI with the foreign formats linked by a distribution.
 pub fn main_entry_with_registry(registry: ForeignFormatRegistry) -> ExitCode {
+    remanence_api::read_core::set_read_reservoir_warning_sink(|message| {
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr().lock(), "warning: {message}");
+    });
     let args: Vec<_> = std::env::args_os().collect();
     if let Some(help) = standalone::shared_help(&args) {
         println!("{help}");

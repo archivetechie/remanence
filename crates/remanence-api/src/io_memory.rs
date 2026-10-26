@@ -1,8 +1,8 @@
 //! Atomic daemon-wide reservation of pipeline I/O memory.
 //!
 //! Reservations precede allocation.  The RAII permit rolls the reservation
-//! back on every allocation or `mlock` failure path and when the owning
-//! stream/spool closes.
+//! back on refused allocations and when the owning stream/spool closes.
+//! Unlocked read-reservoir slabs retain their reservations.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

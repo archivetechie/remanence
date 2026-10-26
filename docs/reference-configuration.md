@@ -102,9 +102,9 @@ memory; leaving 2 GiB or more above the ceiling is a reasonable margin. Set
 systemd `LimitMEMLOCK` to at least the ceiling. This is a safe upper bound,
 because only read-reservoir slabs are locked into memory.
 
-Read-reservoir slabs are locked into memory (`mlock`), so the kernel never
-swaps them out. A tmpfs spool is counted against the ceiling but is not
-guaranteed to stay in RAM: tmpfs pages are file-backed and can be swapped
+Successfully locked read-reservoir slabs stay in RAM. Minimum slabs that
+fall back to unlocked memory can be swapped out. A tmpfs spool is counted
+against the ceiling but is not guaranteed to stay in RAM: tmpfs pages are file-backed and can be swapped
 under memory pressure. The reservation bounds the spool's size, not its
 residency.
 
@@ -347,6 +347,18 @@ these settings.
 | `read_reservoir_low_pct` | integer 1..=99 | `25` | Resume READ submission after occupancy drains to this percentage. Must be less than `read_reservoir_high_pct`. |
 | `position_check_bytes` | byte size | `1073741824` (1 GiB) | Cadence of mid-stream READ POSITION drift tripwires. `0` disables mid-stream checks (boundary checks remain). |
 | `position_check_bytes_ranged` | byte size > 0 | `"256MiB"` | Proof cadence for hash-less ranged reads, effectively clamped to half the active reservoir. |
+
+Read reservoirs use `mlock` to keep tape data in RAM and avoid swap-related
+page faults in the hot loop. Locking supports throughput; SG_IO correctness
+does not depend on it. If `mlock` returns `ENOMEM`, `EPERM`, or `EAGAIN` for a
+minimum slab, the read keeps that slab and its memory reservation unlocked.
+Other lock errors refuse startup. Growth above the minimum stops on any lock
+failure and continues with the existing buffers. The first fallback in each
+process warns that tape data may be swapped and reports the soft
+`RLIMIT_MEMLOCK` limit, slab size, and unlocked minimum count. Raise the limit
+with `ulimit -l`, `LimitMEMLOCK=` for the daemon unit, or a `security/limits.d`
+entry for the user. `rem doctor` reports a low limit as an advisory warning.
+Read diagnostics include `minimum_slabs_locked` and `minimum_slabs_unlocked`.
 
 Two different points enforce these constraints. Config *loading* rejects
 `high_pct ≤ low_pct` (or either out of `1..=100`/`1..=99`), a zero or

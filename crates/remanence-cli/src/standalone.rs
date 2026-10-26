@@ -657,7 +657,7 @@ where
             json!({"ok":false,"status":"failed","error":format!("finalization outcome: {}", v["outcome"].as_str().unwrap_or("unknown")),"result":v})
         }
         Ok(v) if doctor_not_ready => {
-            json!({"ok":false,"error":format!("not ready: {}", v["checks"].as_array().unwrap().iter().filter(|c| c["ok"] != true).map(|c| c["name"].as_str().unwrap_or("unknown")).collect::<Vec<_>>().join(", ")),"result":v})
+            json!({"ok":false,"error":format!("not ready: {}", v["checks"].as_array().unwrap().iter().filter(|c| !doctor_check_ready(c)).map(|c| c["name"].as_str().unwrap_or("unknown")).collect::<Vec<_>>().join(", ")),"result":v})
         }
         Ok(v) => json!({"ok":true,"result":v}),
         Err(e) if matches!(cli.command, Command::Put { .. }) => {
@@ -2500,6 +2500,39 @@ fn summarize_terminal(
         ),
     }
 }
+/// Estimate the largest configured minimum before device-specific batch clamping.
+fn memlock_check(
+    config: &remanence_state::RemConfig,
+    limit: std::io::Result<Option<u64>>,
+) -> Value {
+    let block_size = config
+        .tape_pools
+        .iter()
+        .map(|pool| pool.block_size_bytes)
+        .max()
+        .unwrap_or(remanence_state::DEFAULT_TAPE_BLOCK_SIZE_BYTES);
+    let minimum = u128::from(block_size)
+        * u128::from(config.tape_io.read_batch_blocks.max(1))
+        * u128::from(config.tape_io.staging_ring_buffers);
+    let ok = match &limit {
+        Ok(None) => true,
+        Ok(Some(bytes)) => u128::from(*bytes) >= minimum,
+        Err(_) => false,
+    };
+    let detail = format!("RLIMIT_MEMLOCK soft limit={}; configured minimum reservoir={minimum} bytes (block size={block_size} bytes, before device batch clamping)",
+        remanence_api::read_core::read_memlock_limit_detail(&limit));
+    let mut check = json!({"name":"memlock", "ok":ok, "severity":"warning", "detail":detail});
+    if !ok {
+        check["fix"] = json!(remanence_api::read_core::READ_MEMLOCK_REMEDY);
+    }
+    check
+}
+
+/// Advisory checks expose remedies without preventing setup or drive readiness.
+fn doctor_check_ready(check: &Value) -> bool {
+    check["ok"] == true || check["severity"] == "warning"
+}
+
 /// Report effective group membership and the executable's file capability, not a different binary.
 fn doctor(env: &Environment, config: &remanence_state::RemConfig) -> Value {
     if let Some(checks) = &env.doctor_checks {
@@ -2544,6 +2577,7 @@ fn doctor(env: &Environment, config: &remanence_state::RemConfig) -> Value {
         value
     };
     let checks = vec![
+        memlock_check(config, remanence_api::read_core::read_memlock_soft_limit()),
         check(
             "tape group",
             tape_group,
@@ -2611,7 +2645,7 @@ fn doctor(env: &Environment, config: &remanence_state::RemConfig) -> Value {
             })
         })
         .collect();
-    json!({"ready":checks.iter().all(|c| c["ok"] == true),"checks":checks,"fixes":fixes,"tape_group":tape_group,"cap_sys_rawio_on_this_binary":cap_sys_rawio,"binary":binary,"state_dir":config.daemon.state_dir,"lock_dir":env.locks,"lock_dir_writable":lock_writable.is_ok(),"lock_error":lock_writable.err(),"drives":[]})
+    json!({"ready":checks.iter().all(doctor_check_ready),"checks":checks,"fixes":fixes,"tape_group":tape_group,"cap_sys_rawio_on_this_binary":cap_sys_rawio,"binary":binary,"state_dir":config.daemon.state_dir,"lock_dir":env.locks,"lock_dir_writable":lock_writable.is_ok(),"lock_error":lock_writable.err(),"drives":[]})
 }
 /// Add discovery readiness after host permission and state checks have run.
 fn finish_doctor_discovery(health: &mut Value, report: &DiscoveryReport) {
@@ -2634,7 +2668,7 @@ fn finish_doctor_discovery(health: &mut Value, report: &DiscoveryReport) {
         .as_array()
         .unwrap()
         .iter()
-        .all(|c| c["ok"] == true));
+        .all(doctor_check_ready));
     health["drives"] = json!(remanence_api::observed_endpoint_json(report));
 }
 
@@ -2701,6 +2735,8 @@ fn render_doctor(value: &Value, out: &mut dyn Write) -> Result<(), String> {
             vec![
                 if check["ok"] == true {
                     "✓".into()
+                } else if check["severity"] == "warning" {
+                    "!".into()
                 } else {
                     "✗".into()
                 },
@@ -3176,6 +3212,58 @@ mod tests {
         }
     }
 
+    /// Inject boundary limits and nondefault settings so host privileges cannot mask a failure.
+    #[test]
+    fn doctor_memlock_limit_is_advisory_and_uses_configured_minimum() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let env = Environment {
+            xdg: root.path().join("state"),
+            system_config: root.path().join("etc"),
+            locks: root.path().join("locks"),
+            test_input: true,
+            euid: 1000,
+            doctor_checks: None,
+        };
+        let mut config: remanence_state::RemConfig =
+            toml::from_str(&default_home_config(&env.xdg)).unwrap();
+        config.tape_io.read_batch_blocks = 3;
+        config.tape_io.staging_ring_buffers = 2;
+        for pool in &mut config.tape_pools {
+            pool.block_size_bytes = 512 * 1024;
+        }
+        assert!(
+            !config.tape_pools.is_empty(),
+            "fixture needs a configured block size"
+        );
+        let minimum = 3 * 2 * 512 * 1024;
+        for (limit, ok) in [
+            (Some(65536), false),
+            (Some(minimum - 1), false),
+            (Some(minimum), true),
+            (None, true),
+        ] {
+            let check = memlock_check(&config, Ok(limit));
+            assert_eq!(check["ok"], ok);
+            assert!(doctor_check_ready(&check));
+            assert!(check["detail"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("minimum reservoir={minimum} bytes")));
+            assert_eq!(check.get("fix").is_some(), !ok);
+        }
+        let check = memlock_check(
+            &config,
+            Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+        );
+        assert_eq!(check["ok"], false);
+        assert!(doctor_check_ready(&check));
+        assert!(check["detail"].as_str().unwrap().contains("unavailable"));
+        assert!(!doctor_check_ready(
+            &json!({"name":"capability", "ok":false})
+        ));
+    }
+
     /// All passing host checks plus a discovered standalone drive yield a successful doctor envelope.
     #[test]
     fn ready_doctor_exits_zero() {
@@ -3188,7 +3276,8 @@ mod tests {
             locks: root.path().join("locks"),
             test_input: true,
             euid: 1000,
-            doctor_checks: Some(json!({"checks":[{"name":"host", "ok":true}],"fixes":{}})),
+            doctor_checks: Some(json!({"checks":[{"name":"host", "ok":true},
+                {"name":"memlock", "ok":false, "severity":"warning", "detail":"RLIMIT_MEMLOCK soft limit=65536 bytes"}],"fixes":{}})),
         };
         let world = std::sync::Arc::new(std::sync::Mutex::new(VirtualWorld::single_drive(
             "LIB", 0x100, "DRIVE", 0x400, 0,
