@@ -151,7 +151,7 @@ capture_host() {
 # $1 dir, $2 device, $3 role, $4 with_diag
 capture_device() {
   local dir="$1" dev="$2" role="$3" with_diag="$4"
-  fieldtest_capture_text "$dir/inquiry.json" sg_inq -a "$dev" || true
+  fieldtest_capture_text "$dir/inquiry.json" sg_inq -d "$dev" || true
   fieldtest_capture_text "$dir/inquiry-hex.json" sg_inq -H "$dev" || true
   if command -v sg_vpd >/dev/null 2>&1; then
     fieldtest_capture_text "$dir/vpd-all.json" sg_vpd --all "$dev" || true
