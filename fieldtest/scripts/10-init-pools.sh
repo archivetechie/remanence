@@ -757,7 +757,7 @@ main() {
           require_init_policy_refusal_before_escalation "${data_barcodes[$idx]}" "$force_out" "refuse-clobber"
           init_level="clobber-data"
           init_out="$clobber_out"
-          if ! fieldtest_capture_text "$clobber_out" "$(fieldtest_rem_bin)" --allow "$serial" tape init "${data_barcodes[$idx]}" --config "$(fieldtest_config_path)" --library "$serial" --clobber-data; then
+          if ! fieldtest_capture_text "$clobber_out" "$(fieldtest_rem_bin)" --allow "$serial" tape init "${data_barcodes[$idx]}" --config "$(fieldtest_config_path)" --library "$serial" --clobber-data --confirm-clobber "CLOBBER ${data_barcodes[$idx]}"; then
             stop_init_escalation_if_readiness_blocked "${data_barcodes[$idx]}" "$clobber_out"
             if grep -q "needs-explicit-rebuild" "$clobber_out"; then
               fieldtest_evidence_record "$SCRIPT_NAME" "init-${data_barcodes[$idx]}" FAIL \
@@ -771,7 +771,7 @@ main() {
       elif init_requires_clobber_refusal "$plain_out"; then
         init_level="clobber-data"
         init_out="$clobber_out"
-        if ! fieldtest_capture_text "$clobber_out" "$(fieldtest_rem_bin)" --allow "$serial" tape init "${data_barcodes[$idx]}" --config "$(fieldtest_config_path)" --library "$serial" --clobber-data; then
+        if ! fieldtest_capture_text "$clobber_out" "$(fieldtest_rem_bin)" --allow "$serial" tape init "${data_barcodes[$idx]}" --config "$(fieldtest_config_path)" --library "$serial" --clobber-data --confirm-clobber "CLOBBER ${data_barcodes[$idx]}"; then
           stop_init_escalation_if_readiness_blocked "${data_barcodes[$idx]}" "$clobber_out"
           if grep -q "needs-explicit-rebuild" "$clobber_out"; then
             fieldtest_evidence_record "$SCRIPT_NAME" "init-${data_barcodes[$idx]}" FAIL \
