@@ -4272,11 +4272,12 @@ where
     )
 }
 
+/// Dispatch commands with one buffered input reader for archive data and confirmations.
 fn run_with_mode<F>(
     cli: ParsedCli,
     mode: CliMode,
     discover_fn: F,
-    input: &mut dyn Read,
+    input: &mut dyn io::BufRead,
     out: &mut dyn Write,
     err: &mut dyn Write,
     registry: &ForeignFormatRegistry,
@@ -4354,7 +4355,7 @@ where
             };
             return run_drive_client_command(endpoint, *json, &command, out, err);
         }
-        Command::TapeSupersedeClient(args) => return tape_supersede::run(args, out, err),
+        Command::TapeSupersedeClient(args) => return tape_supersede::run(args, input, out, err),
         Command::TapeFinalizeClient(args) => return tape_finalize::run(args, out, err),
         Command::TapeInventoryClient(args) => return tape_inventory::run_inventory(args, out, err),
         Command::TapeVerifyIndexClient(args) => {
@@ -4761,7 +4762,7 @@ where
             unreachable!("daemon client command dispatched pre-discovery")
         }
         Command::Tape { command } => {
-            return run_tape_command(&report, &command, out, err);
+            return run_tape_command(&report, &command, input, out, err);
         }
         Command::Archive { command } => {
             let command = command.as_ref();
@@ -8835,6 +8836,7 @@ impl TapeInitStateOps for DryRunTapeInitState {
 fn run_tape_command(
     report: &DiscoveryReport,
     command: &TapeCommand,
+    input: &mut dyn io::BufRead,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
@@ -8851,7 +8853,7 @@ fn run_tape_command(
             unreachable!("tape terminal-index-drill dispatched pre-discovery")
         }
         TapeCommand::Alerts(args) => run_tape_alerts(report, args, out, err),
-        TapeCommand::Init(args) => run_tape_init(report, args, out, err),
+        TapeCommand::Init(args) => run_tape_init(report, args, input, out, err),
         TapeCommand::WaitReady(args) => run_tape_wait_ready(report, args, out, err),
         TapeCommand::Quarantine { .. } => {
             unreachable!("tape quarantine dispatched pre-discovery")
@@ -10907,6 +10909,7 @@ fn bootstrap_tail_name(tail: &remanence_api::BootstrapTailClassification) -> &'s
 fn run_tape_init(
     report: &DiscoveryReport,
     args: &TapeInitArgs,
+    input: &mut dyn io::BufRead,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
@@ -10952,7 +10955,7 @@ fn run_tape_init(
             policy: &policy,
             args,
         };
-        return run_tape_init_candidates(&mut state, candidates, &ctx, out, err);
+        return run_tape_init_candidates(&mut state, candidates, &ctx, input, out, err);
     }
 
     let mut state = match remanence_state::StateHandle::open_with_config(paths, config.clone()) {
@@ -10976,13 +10979,14 @@ fn run_tape_init(
         policy: &policy,
         args,
     };
-    run_tape_init_candidates(&mut state, candidates, &ctx, out, err)
+    run_tape_init_candidates(&mut state, candidates, &ctx, input, out, err)
 }
 
 fn run_tape_init_candidates<S: TapeInitStateOps>(
     state: &mut S,
     candidates: Vec<TapeInitCandidate>,
     ctx: &TapeInitRunContext<'_>,
+    input: &mut dyn io::BufRead,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
@@ -10992,7 +10996,7 @@ fn run_tape_init_candidates<S: TapeInitStateOps>(
     let mut non_readiness_failures = 0usize;
     let count = candidates.len();
     for candidate in candidates {
-        match run_one_tape_init(state, ctx, candidate.clone(), err) {
+        match run_one_tape_init(state, ctx, candidate.clone(), input, err) {
             Ok(result) => {
                 print_tape_init_result(&result, out);
                 if result.success {
@@ -11221,6 +11225,7 @@ fn run_one_tape_init<S: TapeInitStateOps>(
     state: &mut S,
     ctx: &TapeInitRunContext<'_>,
     candidate: TapeInitCandidate,
+    input: &mut dyn io::BufRead,
     err: &mut dyn Write,
 ) -> Result<TapeInitRunResult, String> {
     let voltag = candidate
@@ -11264,9 +11269,7 @@ fn run_one_tape_init<S: TapeInitStateOps>(
     run_tape_init_hardware(
         library,
         state,
-        ctx.config,
-        ctx.policy,
-        ctx.args,
+        ctx,
         TapeInitHardwarePlan {
             candidate,
             voltag,
@@ -11275,6 +11278,7 @@ fn run_one_tape_init<S: TapeInitStateOps>(
             fresh_block_size,
             drive_element,
         },
+        input,
         err,
     )
 }
@@ -11351,12 +11355,17 @@ fn drive_can_write_tape(bay: &DriveBay, tape_generation: remanence_api::LtoGen) 
 fn run_tape_init_hardware<S: TapeInitStateOps>(
     library: &Library,
     state: &mut S,
-    config: &remanence_state::RemConfig,
-    policy: &StaticAllowlist,
-    args: &TapeInitArgs,
+    ctx: &TapeInitRunContext<'_>,
     plan: TapeInitHardwarePlan,
+    input: &mut dyn io::BufRead,
     err: &mut dyn Write,
 ) -> Result<TapeInitRunResult, String> {
+    let TapeInitRunContext {
+        config,
+        policy,
+        args,
+        ..
+    } = *ctx;
     let TapeInitHardwarePlan {
         candidate,
         voltag,
@@ -11651,7 +11660,7 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
             &decision,
             args.confirm_clobber.as_deref(),
             ClobberInputPolicy::Library,
-            &mut io::stdin().lock(),
+            input,
             err,
         ) {
             Ok(confirmed) => confirmed,
@@ -11780,10 +11789,9 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
 fn run_tape_init_hardware<S: TapeInitStateOps>(
     _library: &Library,
     _state: &mut S,
-    _config: &remanence_state::RemConfig,
-    _policy: &StaticAllowlist,
-    _args: &TapeInitArgs,
+    _ctx: &TapeInitRunContext<'_>,
     _plan: TapeInitHardwarePlan,
+    _input: &mut dyn io::BufRead,
     _err: &mut dyn Write,
 ) -> Result<TapeInitRunResult, String> {
     Err("tape init requires Linux SG_IO drive access in v0.1".to_string())
@@ -11895,6 +11903,7 @@ enum ClobberInputPolicy {
     Standalone { is_terminal: bool },
 }
 
+/// Require exact clobber confirmation from an argument or the supplied reader.
 fn confirm_clobber_data(
     voltag: &str,
     decision: &remanence_api::InitDecision,
@@ -11926,9 +11935,14 @@ fn confirm_clobber_data(
     );
     let _ = writeln!(err, "type {expected:?} to continue:");
     let mut line = String::new();
-    input
+    let bytes_read = input
         .read_line(&mut line)
         .map_err(|error| format!("read clobber confirmation: {error}"))?;
+    if bytes_read == 0 && matches!(policy, ClobberInputPolicy::Library) {
+        return Err(format!(
+            "no clobber confirmation received; non-interactive clobber requires --confirm-clobber {expected:?}; no write attempted"
+        ));
+    }
     let answer = match policy {
         ClobberInputPolicy::Library => line.trim(),
         ClobberInputPolicy::Standalone { .. } => line.trim_end_matches(['\r', '\n']),
@@ -19732,47 +19746,57 @@ mod tests {
         ));
     }
 
+    /// Simulate blank or used BOT data and validate every bootstrap write.
+    #[cfg(target_os = "linux")]
+    struct BootstrapTransport {
+        inner: FixtureTransport,
+        written_bytes: u32,
+        used: bool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl SgTransport for BootstrapTransport {
+        fn execute_in(
+            &mut self,
+            cdb: &[u8],
+            buf: &mut [u8],
+        ) -> Result<remanence_library::transport::TransferOutcome, ScsiError> {
+            if cdb[0] == 0x08 {
+                if self.used {
+                    buf.fill(0x42);
+                    return Ok(remanence_library::transport::TransferOutcome::clean(
+                        buf.len() as u32,
+                    ));
+                }
+                return Err(readiness_check_condition(0x08, 0x00, 0x05));
+            }
+            self.inner.execute_in(cdb, buf)
+        }
+
+        fn execute_out(
+            &mut self,
+            cdb: &[u8],
+            buf: &[u8],
+        ) -> Result<remanence_library::transport::TransferOutcome, ScsiError> {
+            assert_eq!(cdb[0], 0x0a, "only bootstrap WRITE is expected");
+            assert_eq!(buf.len(), 262144);
+            remanence_parity::bootstrap::parse_bootstrap_block(buf)
+                .expect("CLI sends a valid bootstrap block");
+            Ok(remanence_library::transport::TransferOutcome::clean(
+                self.written_bytes,
+            ))
+        }
+
+        fn execute_none(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
+            self.inner.execute_none(cdb)
+        }
+    }
+
     /// Exercise CLI parsing, hardware init, and real catalog provisioning with a
     /// blank fixture tape whose WRITE returns GOOD with a controlled byte count.
     #[cfg(target_os = "linux")]
     #[test]
     fn tape_init_cli_rejects_short_good_bootstrap_without_provisioning() {
-        struct BootstrapTransport {
-            inner: FixtureTransport,
-            written_bytes: u32,
-        }
-
-        impl SgTransport for BootstrapTransport {
-            fn execute_in(
-                &mut self,
-                cdb: &[u8],
-                buf: &mut [u8],
-            ) -> Result<remanence_library::transport::TransferOutcome, ScsiError> {
-                if cdb[0] == 0x08 {
-                    return Err(readiness_check_condition(0x08, 0x00, 0x05));
-                }
-                self.inner.execute_in(cdb, buf)
-            }
-
-            fn execute_out(
-                &mut self,
-                cdb: &[u8],
-                buf: &[u8],
-            ) -> Result<remanence_library::transport::TransferOutcome, ScsiError> {
-                assert_eq!(cdb[0], 0x0a, "only bootstrap WRITE is expected");
-                assert_eq!(buf.len(), 262144);
-                remanence_parity::bootstrap::parse_bootstrap_block(buf)
-                    .expect("CLI sends a valid bootstrap block");
-                Ok(remanence_library::transport::TransferOutcome::clean(
-                    self.written_bytes,
-                ))
-            }
-
-            fn execute_none(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
-                self.inner.execute_none(cdb)
-            }
-        }
-
         for (written_bytes, additional_partitions) in [(262143, 0), (262144, 0), (0, 1)] {
             let temp = tempfile::tempdir().expect("temp state directory");
             let config_path = write_retire_test_config(temp.path());
@@ -19837,6 +19861,7 @@ pool_id = "init-test"
                     filemark_position,
                 ]),
                 written_bytes,
+                used: false,
             });
             let log = RecordingLog::new();
             let transport_log = log.clone();
@@ -19929,6 +19954,191 @@ pool_id = "init-test"
                     "{stderr}"
                 );
                 assert!(stderr.contains("written_bytes=262143"), "{stderr}");
+            }
+        }
+    }
+
+    /// Library init reads injected confirmation and writes only after an exact match.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tape_init_cli_clobber_consumes_dispatch_input() {
+        for mode in [CliMode::Rem, CliMode::Debug] {
+            for (text, explicit, succeeds, message) in [
+                ("WRONG\n", None, false, "did not match"),
+                ("", None, false, "no clobber confirmation received"),
+                ("CLOBBER RMT001L9\n", None, true, ""),
+                ("WRONG\n", Some("CLOBBER RMT001L9"), true, ""),
+            ] {
+                let temp = tempfile::tempdir().expect("temp state directory");
+                let config_path = write_retire_test_config(temp.path());
+                let mut config_text = fs::read_to_string(&config_path).expect("read test config");
+                config_text.push_str(
+                    r#"
+[[libraries]]
+serial = "LIB-INIT-CLOBBER"
+[[tape_pools]]
+id = "init-test"
+block_size = "256KiB"
+[[tape_pool_rules]]
+prefix = "RMT"
+pool_id = "init-test"
+"#,
+                );
+                fs::write(&config_path, config_text).expect("write init config");
+
+                let mut library = fake_library("LIB-INIT-CLOBBER");
+                library.changer_sg = PathBuf::from("/fixture/changer");
+                library.drive_bays = vec![DriveBay {
+                    element_address: 1,
+                    accessible: true,
+                    exception: None,
+                    installed: Some(InstalledDrive {
+                        serial: "DRV-INIT-CLOBBER".into(),
+                        identity_source: IdentitySource::DvcidInline,
+                        vendor: Some("HPE".into()),
+                        product: Some("Ultrium 9-SCSI".into()),
+                        revision: Some("R3G3".into()),
+                        sg_path: Some(PathBuf::from("/fixture/drive")),
+                        sysfs_path: None,
+                    }),
+                    loaded: true,
+                    loaded_tape: Some("RMT001L9".into()),
+                    source_slot: None,
+                }];
+                let mut mode_page = vec![0u8; 28];
+                mode_page[0] = 27;
+                mode_page[1] = 0x98;
+                mode_page[2] = 0x10;
+                mode_page[3] = 8;
+                mode_page[12] = 0x0f;
+                mode_page[13] = 14;
+                let mut position = vec![0u8; 32];
+                position[8..16].copy_from_slice(&1u64.to_be_bytes());
+                let mut filemark_position = position.clone();
+                filemark_position[8..16].copy_from_slice(&2u64.to_be_bytes());
+                let mut changer = Some(FixtureTransport::new().with_responses([
+                    changer_inquiry_response(),
+                    vpd80_response("LIB-INIT-CLOBBER"),
+                ]));
+                let mut drive = Some(BootstrapTransport {
+                    inner: FixtureTransport::new().with_responses([
+                        lto9_inquiry_response(),
+                        vpd80_response("DRV-INIT-CLOBBER"),
+                        vec![11, 0, 0, 0, 0x11, 6, 1, 0, 0, 0, 0, 0],
+                        vec![0, 0x10, 0, 0, 0, 1],
+                        mode_page,
+                        vec![0u8; 32], // LOCATE(0) for BOT classification.
+                        position,
+                        filemark_position,
+                    ]),
+                    written_bytes: 262144,
+                    used: true,
+                });
+                let log = RecordingLog::new();
+                let transport_log = log.clone();
+                TEST_CLI_TRANSPORT_FACTORY.with(|slot| {
+                    assert!(slot.borrow().is_none());
+                    *slot.borrow_mut() = Some(Box::new(move |path| {
+                        let transport: Box<dyn SgTransport> = match path.to_str().unwrap() {
+                            "/fixture/changer" => {
+                                Box::new(changer.take().expect("open changer once"))
+                            }
+                            "/fixture/drive" => Box::new(drive.take().expect("open drive once")),
+                            _ => panic!("unexpected device path: {path:?}"),
+                        };
+                        Ok(Box::new(RecordingTransport::with_log(
+                            transport,
+                            transport_log.clone(),
+                        )))
+                    }));
+                });
+                let mut argv = vec![
+                    "rem",
+                    "tape",
+                    "init",
+                    "RMT001L9",
+                    "--library",
+                    "LIB-INIT-CLOBBER",
+                    "--parity",
+                    "none",
+                    "--config",
+                    config_path.to_str().unwrap(),
+                    "--clobber-data",
+                ];
+                if let Some(confirmation) = explicit {
+                    argv.extend(["--confirm-clobber", confirmation]);
+                }
+                let cli = match mode {
+                    CliMode::Rem => Cli::try_parse_from(&argv).unwrap().into(),
+                    CliMode::Debug => {
+                        argv.extend(["--allow", "LIB-INIT-CLOBBER"]);
+                        DebugCli::try_parse_from(&argv).unwrap().into()
+                    }
+                };
+                let mut input = Cursor::new(text.as_bytes());
+                let mut out = Vec::new();
+                let mut err = Vec::new();
+                let code = run_with_mode(
+                    cli,
+                    mode,
+                    || {
+                        Ok(DiscoveryReport {
+                            unattached_drives: vec![],
+                            complete: true,
+                            incomplete_evidence: vec![],
+                            libraries: vec![library],
+                            warnings: vec![],
+                        })
+                    },
+                    &mut input,
+                    &mut out,
+                    &mut err,
+                    &ForeignFormatRegistry::default(),
+                );
+                let stdout = String::from_utf8(out).unwrap();
+                let stderr = String::from_utf8(err).unwrap();
+                TEST_CLI_TRANSPORT_FACTORY.with(|slot| {
+                    assert!(
+                        slot.borrow_mut().take().is_none(),
+                        "fixture transport is required: {stderr}"
+                    );
+                });
+                assert_eq!(code == ExitCode::SUCCESS, succeeds, "{stdout}\n{stderr}");
+                assert_eq!(
+                    input.position(),
+                    if explicit.is_some() {
+                        0
+                    } else {
+                        text.len() as u64
+                    }
+                );
+                assert_eq!(
+                    stderr.contains("type \"CLOBBER RMT001L9\" to continue:"),
+                    explicit.is_none(),
+                    "{stderr}"
+                );
+                let log = log.borrow();
+                for opcode in [0x0a, 0x10] {
+                    assert_eq!(
+                        log.iter().filter(|cdb| cdb[0] == opcode).count(),
+                        usize::from(succeeds),
+                        "{stderr}"
+                    );
+                }
+                let catalog = remanence_state::CatalogIndex::open_read_only(
+                    temp.path().join("index/rem-state.sqlite"),
+                )
+                .unwrap();
+                assert_eq!(
+                    catalog.get_tape_by_voltag("RMT001L9").unwrap().is_some(),
+                    succeeds
+                );
+                if succeeds {
+                    assert!(stdout.contains("wrote-bootstrap"), "{stdout}");
+                } else {
+                    assert!(stderr.contains(message), "{stderr}");
+                    assert!(stdout.is_empty(), "{stdout}");
+                }
             }
         }
     }
@@ -24916,6 +25126,51 @@ blob Project/Render Files/
 #[cfg(test)]
 mod clobber_confirmation_tests {
     use super::*;
+
+    /// Library EOF names the non-interactive form without authorizing a write.
+    #[test]
+    fn library_confirmation_rejects_end_of_input() {
+        let decision = remanence_api::InitDecision::RefuseClobber {
+            reason: remanence_api::TapeInitError::CatalogIndicatesWritten,
+        };
+        let error = confirm_clobber_data(
+            "TEST",
+            &decision,
+            None,
+            ClobberInputPolicy::Library,
+            &mut io::empty(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert_eq!(error, "no clobber confirmation received; non-interactive clobber requires --confirm-clobber \"CLOBBER TEST\"; no write attempted");
+    }
+
+    /// Explicit confirmation bypasses input and stderr prompts for both policies.
+    #[test]
+    fn explicit_clobber_confirmation_bypasses_input_and_prompt() {
+        let decision = remanence_api::InitDecision::RefuseClobber {
+            reason: remanence_api::TapeInitError::CatalogIndicatesWritten,
+        };
+        for policy in [
+            ClobberInputPolicy::Library,
+            ClobberInputPolicy::Standalone { is_terminal: false },
+            ClobberInputPolicy::Standalone { is_terminal: true },
+        ] {
+            let mut input = Cursor::new(b"WRONG\n");
+            let mut err = Vec::new();
+            assert!(confirm_clobber_data(
+                "TEST",
+                &decision,
+                Some("CLOBBER TEST"),
+                policy,
+                &mut input,
+                &mut err
+            )
+            .unwrap());
+            assert_eq!(input.position(), 0);
+            assert!(err.is_empty());
+        }
+    }
 
     /// Library automation retains its piped exact confirmation contract.
     #[test]

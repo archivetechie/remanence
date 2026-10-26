@@ -13,6 +13,11 @@ per-release summaries.
 - Read reservoirs keep minimum slabs unlocked when memory-lock limits or
   permissions prevent locking. A process warning, read diagnostics, and an
   advisory `rem doctor` check report the fallback and lock-limit remedy.
+- Library `tape init --clobber-data` reads the typed `CLOBBER <label>`
+  confirmation from standard input and completes; end of input is refused
+  with the non-interactive form, `--confirm-clobber "CLOBBER <label>"`.
+  `rem tape supersede-tail` reads its confirmation the same way. Neither
+  command can wait forever on a second standard-input lock any more.
 
 - Operate a manually loaded LTO drive without a daemon: setup, initialize,
   put/get, finalize, verify and restore. Home mode keeps state in the user's

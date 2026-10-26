@@ -1511,6 +1511,7 @@ fn used_cartridge_requires_exact_clobber_confirmation() {
         let (code, out, errors) = f.run(&args, true);
         assert_eq!(code == ExitCode::SUCCESS, succeeds, "{out}\n{errors}");
         if succeeds {
+            assert!(errors.is_empty(), "{errors}");
             assert!(f.writes() > before);
             assert!(f.index().get_tape_by_voltag("USED").unwrap().is_some());
         } else {

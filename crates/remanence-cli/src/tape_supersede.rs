@@ -1,7 +1,7 @@
 //! Explicit daemon-backed tail recovery with a read-only physical preview.
 use clap::Args;
 use remanence_api::pb;
-use std::io::{IsTerminal, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::process::ExitCode;
 
 #[derive(Args, Debug)]
@@ -16,7 +16,13 @@ pub(crate) struct TapeSupersedeArgs {
     endpoint: String,
 }
 
-pub(crate) fn run(args: &TapeSupersedeArgs, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+/// Read typed recovery confirmation through the reader held by CLI dispatch.
+pub(crate) fn run(
+    args: &TapeSupersedeArgs,
+    input: &mut dyn BufRead,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
     let result = (|| -> Result<(), String> {
         let tape = uuid::Uuid::parse_str(&args.tape_uuid).map_err(|e| e.to_string())?;
         let ack = uuid::Uuid::parse_str(&args.ack_tape_uuid).map_err(|e| e.to_string())?;
@@ -55,9 +61,7 @@ pub(crate) fn run(args: &TapeSupersedeArgs, out: &mut dyn Write, err: &mut dyn W
                 .map_err(|e| e.to_string())?;
                 err.flush().map_err(|e| e.to_string())?;
                 let mut line = String::new();
-                std::io::stdin()
-                    .read_line(&mut line)
-                    .map_err(|e| e.to_string())?;
+                input.read_line(&mut line).map_err(|e| e.to_string())?;
                 line.trim_end_matches(['\r', '\n']).to_owned()
             }
         };
@@ -126,6 +130,7 @@ mod tests {
                 confirm_supersede: None,
                 endpoint: "invalid://must-not-connect".into(),
             },
+            &mut std::io::empty(),
             &mut out,
             &mut err,
         );
