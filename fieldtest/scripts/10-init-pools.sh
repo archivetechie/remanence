@@ -659,6 +659,15 @@ JSON
   rm -rf "$tmpdir"
 }
 
+init_already_recorded() {
+  # True when this kit's evidence already holds a PASS init record for the
+  # barcode, i.e. an earlier run of this script initialized it today.
+  local barcode="$1" records
+  records="$(fieldtest_records_path)"
+  [[ -f "$records" ]] || return 1
+  grep -F "\"script\":\"$SCRIPT_NAME\"" "$records" | grep -F "\"test_id\":\"init-$barcode\"" | grep -F '"status":"PASS"' | grep -Fq "\"summary\":\"initialized $barcode"
+}
+
 main() {
   if [[ "${1:-}" == --selftest ]]; then
     init_pools_selftest
@@ -726,6 +735,13 @@ main() {
     fi
     fieldtest_require_allowlisted "${data_barcodes[$idx]}"
     init_base="init-${data_barcodes[$idx]}"
+    # Rerun guard: a barcode this kit already initialized is skipped unless
+    # FIELD_INIT_ALLOW_REINIT=1, so a rerun of this script never walks the
+    # escalation ladder over a tape that only needs leaving alone.
+    if [[ "${FIELD_INIT_ALLOW_REINIT:-0}" != 1 ]] && init_already_recorded "${data_barcodes[$idx]}"; then
+      fieldtest_evidence_record "$SCRIPT_NAME" "init-${data_barcodes[$idx]}" SKIP "already initialized by this kit (records.jsonl); set FIELD_INIT_ALLOW_REINIT=1 to re-initialize"
+      continue
+    fi
     dry_run_out="$(fieldtest_artifact_path "$SCRIPT_NAME" "${init_base}-dry-run" "$stamp")"
     plain_out="$(fieldtest_artifact_path "$SCRIPT_NAME" "${init_base}-plain" "$stamp")"
     force_out="$(fieldtest_artifact_path "$SCRIPT_NAME" "${init_base}-force" "$stamp")"
