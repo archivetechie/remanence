@@ -1,36 +1,27 @@
 # Using a standalone LTO drive
 
-Remanence can operate one LTO drive directly. You do not need a tape library,
-a changer, or a running `rem-daemon`. This is the shortest route from a drive
-on a Linux workstation to a self-describing Remanence tape.
+With one manually loaded LTO drive, `rem` writes and restores tapes directly.
+There is no daemon to start. You insert the cartridges yourself.
 
-The standalone path is not a reduced tape format. It uses the same objects,
-parity, journals, audit records, catalog, write fences, and terminal index as a
-library deployment. The difference is media handling: you insert and remove
-cartridges yourself, and each command names the drive it may open.
+Remanence is alpha software. Keep another copy of your files and test a restore
+on your drive. See [tested hardware](status.md#tested-hardware) for the limits
+of hardware testing.
 
-Remanence is alpha software. Keep another copy of every file, and test restore
-on your own drive before treating a tape as useful.
-
-<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-library/src/discovery.rs @ 7a7af81d -->
+<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-library/src/discovery.rs @ 4dc2a3c6 -->
 ## What you need
 
-- Linux and Rust 1.88 or newer.
-- A supported standalone LTO drive exposed through a Linux SCSI generic path
-  such as `/dev/sg3`.
-- Membership in the `tape` group.
-- `CAP_SYS_RAWIO` on the `rem` binary.
-- A cartridge whose contents may be overwritten for the initialization step.
-
-Build the release binaries:
+You need Linux, Rust 1.88 or newer, an LTO drive and a compatible rewritable
+cartridge. No published binary has standalone mode yet; build from source:
 
 ```sh
 git clone https://github.com/archivetechie/remanence
 cd remanence
 cargo build --release
+export PATH="$PWD/target/release:$PATH"
 ```
 
-Grant hardware access. Log out and back in after adding the group:
+Your account needs the `tape` group and the binary needs `CAP_SYS_RAWIO`.
+Use sudo for these installation steps, but never run rem with sudo:
 
 ```sh
 sudo usermod -aG tape "$USER"
@@ -38,264 +29,320 @@ sudo install -d -o root -g tape -m 0770 /run/lock/rem
 sudo setcap cap_sys_rawio+ep "$(realpath target/release/rem)"
 ```
 
-Rebuilding replaces the executable and drops its file capability, so repeat
-the `setcap` command after every rebuild. If you install `rem` somewhere else,
-set the capability on that installed file instead.
-
-`/run` is normally recreated at boot. Until an installation package provides
-a tmpfiles rule, recreate `/run/lock/rem` after reboot if `rem doctor` reports
-that it is missing or unwritable.
-
-Run the built binary directly in the commands below, or put
-`target/release` on your `PATH`:
-
-```sh
-export PATH="$PWD/target/release:$PATH"
-```
-
-## 1. Find the drive
-
-Discovery is read-only:
-
-```sh
-rem drives --json
-rem doctor --json
-```
-
-`rem drives` lists tape endpoints. Find the entry with `kind` and `ownership`
-set to `standalone`, then note its `path` and `serial`. `rem doctor` checks the
-effective `tape` group, the capability on the executable that is actually
-running, the device-lock directory, and the state directory.
-
-For the rest of this guide, substitute the values from discovery:
-
-```sh
-DRIVE=/dev/sg3
-DRIVE_SERIAL=HU1234ABC5
-```
-
-The path is where the drive happens to be attached now. The serial is its
-durable identity. Every hardware command repeats both values:
-
-```sh
-rem --device "$DRIVE" --allow-device "$DRIVE_SERIAL" ...
-```
-
-This repetition is intentional. `--device` selects an OS path;
-`--allow-device` authorizes the serial that discovery must find at that path.
-If the path is later reused by another device, the command refuses it.
-
-## 2. Understand home-mode state
-
-On a machine without `/etc/rem/config.toml`, the first standalone command
-creates a private configuration and state tree at:
+Log out and back in after adding the group. Repeat `setcap` after rebuilding;
+a rebuild replaces the executable and can remove its capability. To recreate
+the lock directory after each reboot, put this line in
+`/etc/tmpfiles.d/rem.conf`:
 
 ```text
-${XDG_STATE_HOME:-$HOME/.local/state}/rem/
+d /run/lock/rem 0770 root tape -
 ```
 
-It includes a `default` tape pool, journals, an audit log, a rebuildable SQLite
-catalog, and the durable calibration state. There is no daemon to start.
+Standalone `put` stores one regular file per object and does not need
+`bsdtar`. Install `bsdtar` (`libarchive-tools` on Debian/Ubuntu) for the local
+archive walkthrough and for extracting objects that contain packed wrappers.
 
-The default pool uses `custom:128,4,1` parity. At the default 256 KiB block
-size it protects against a contiguous loss of 1 MiB while keeping the parity
-written for a small home archive modest. A library-sized archive can create a
-pool with the block-size-aware default geometry instead:
+## 1. Set up the drive
 
 ```sh
-rem pool new archive --scheme default
+rem setup
+rem doctor
+rem drives --json
 ```
 
-If `/etc/rem/config.toml` already exists, standalone commands use it. Pass
-`--config <PATH>` to use another existing config file. Do not point two running
-processes at the same state tree; the state lock will refuse the second owner.
+Setup shows the drive model, serial and current device path, then asks before
+saving the serial. If discovery is incomplete, it separately asks whether the
+drive belongs to no library on this host. Confirm only if you know that is true.
+With several drives, use `rem setup --device /dev/sg3` to select one.
 
-Back up the state tree along with your ordinary system backups. The tape is
-still self-describing, but keeping the catalog and journals makes normal
-restore and interrupted-write recovery faster.
+On a host without `/etc/rem/config.toml`, home state lives at
+`${XDG_STATE_HOME:-$HOME/.local/state}/rem/`. Setup saves `[home] drive_serial`
+in its `config.toml`. Later commands rediscover the path by serial; a changed
+`/dev/sgN` number does not change the authorized drive. The home config includes
+a `default` pool with `custom:128,4,1` parity and a 256 KiB block size.
 
-## 3. Initialize a cartridge
+These short commands assume that home setup. An explicit `--config` or
+`--endpoint` selects the library route for shared verbs. To select a standalone
+drive explicitly, use `rem --device /dev/sg3 --allow-device SERIAL` before the
+verb, replacing the path and serial with discovery's values. The saved serial
+does not authorize an explicitly supplied device.
 
-Insert a cartridge and wait for the drive to finish loading it. Initialization
-writes at the beginning of tape. Unlike library-mode `rem tape init`, the
-standalone command has no dry-run option, so check the physical cartridge
-before pressing Enter.
+## 2. Initialize a cartridge
 
-Choose a label that is unique in your local catalog. The label is operator
-metadata for a standalone cartridge; the tape UUID written at BOT is the
-durable identity.
+Insert a cartridge and wait for it to load. Write `HOME01` on its shell, then:
 
 ```sh
-rem --device "$DRIVE" --allow-device "$DRIVE_SERIAL" \
-  tape init --label HOME01L9 --generation L9
+rem tape init --label HOME01 --generation L9
 ```
 
-The command waits for ready media, checks write protection and existing BOT
-content, disables drive compression, writes the bootstrap, and records the
-tape in the `default` pool. Copy the `tape_uuid` from its output. You will need
-that exact UUID when you finalize the tape.
+Initialization writes immediately; standalone init has no dry run. The label
+is free text you choose, unique in your catalog. It is not the tape's identity:
+that is the UUID written in the bootstrap at the beginning of tape (BOT).
+The label does not have to end in a generation code.
 
-If the drive reports a usable density code, Remanence checks it against
-`--generation`. If it cannot determine the generation, the explicit `L9`
-value supplies the missing observation. Use the generation that matches your
-cartridge.
-
-## 4. Write files
-
-Write one file or walk a directory recursively:
+Accepted `--generation` values are `L5`, `L6`, `L7`, `L8`, `L9` and `M8`.
+Use the cartridge's generation, compatible with your drive. For example, on
+an LTO-6 drive with an LTO-6 cartridge, use this **instead**:
 
 ```sh
-rem --device "$DRIVE" --allow-device "$DRIVE_SERIAL" \
-  put "$HOME/Documents"
+rem tape init --label HOME01 --generation L6
 ```
 
-Each regular file becomes one independently restorable REM-OBJECT. The result
-prints an `object_id` for every committed object. Save the output or copy the
-IDs you care about.
+Remanence checks the supplied generation against a usable drive density
+observation. It disables drive compression. LTO-9 media can take an hour or
+more on their first load while the drive optimizes them.
 
-To produce stable machine-readable output:
+A used cartridge is refused by default, including a retired cartridge that
+still holds its old bootstrap. If its contents may be destroyed, use:
 
 ```sh
-rem --json --device "$DRIVE" --allow-device "$DRIVE_SERIAL" \
-  put "$HOME/Documents" > home-write.json
+rem tape init --label HOME01 --generation L9 --clobber-data
 ```
 
-The command writes through the same checkpointed writer used by the daemon.
-It records the write session and calibration fence before the first media
-write, checkpoints each committed object, and quarantines an uncertain write
-instead of guessing where the drive stopped.
+Type `CLOBBER HOME01` when asked. For a non-interactive invocation, add
+`--confirm-clobber "CLOBBER HOME01"`. Clobber confirmation does not bypass
+identity conflicts, committed-copy checks, write protection, or partition
+safety checks. Rescue anything you need before erasing it.
 
-For encrypted objects, repeat `--recipient` with two or more REMR public-key
-files:
+## 3. Put files on tape
 
 ```sh
-rem --device "$DRIVE" --allow-device "$DRIVE_SERIAL" \
-  put private-file --recipient primary.remr --recipient recovery.remr
+rem put "$HOME/Documents"
 ```
 
-Keep the matching private keys somewhere other than the tape.
+Directories are walked recursively. Each regular file gets a receipt:
+`written` or `already_stored`, with its object UUID and tape label/UUID.
+Symlinks and special files get `skipped_unsupported`; they are not backed up.
+The final `Total:` line counts the results and names any failed file.
+`--json` emits receipts as JSON lines and a final result envelope.
 
-## 5. Restore before finalizing
-
-Pick an `object_id` from the write result and restore it while the cartridge is
-still loaded:
+## 4. List the files and get one back
 
 ```sh
-rem --device "$DRIVE" --allow-device "$DRIVE_SERIAL" \
-  get <OBJECT_ID> --out restored
+rem list
+rem list --tape HOME01 --path-prefix Documents/
+rem get Documents/notes.txt --out restored
 ```
 
-`--out` is a destination directory. For an encrypted object, add
-`--private-key <REMP>` with a matching private-key file. Compare the restored
-file with its source before continuing.
+Replace `Documents/notes.txt` with a path printed by `rem list`. A directory
+input keeps its last path component: `$HOME/Documents/notes.txt` is stored as
+`Documents/notes.txt`. Listing uses only the local catalog and needs no drive.
+Get reads the newest committed version on the loaded tape. It tells you which
+tapes hold a path if it is known elsewhere but absent here.
 
-This `get` path uses the local catalog. After finalization, the whole tape can
-also be restored without that catalog; see [Recovery on another
-machine](#recovery-on-another-machine).
+Compare the restored file with the source. Get stages its data on the output
+filesystem and restores recorded modification times after validation.
 
-## 6. Finalize and verify the tape
+## 5. Finalize, verify and eject
 
-Objects are checkpointed as they are written, but a removable archival tape
-is not complete until finalization writes its three terminal-index replicas.
-Finalization is irreversible: no more objects can be appended afterward.
-
-Set `TAPE_UUID` to the value printed by `tape init`, then generate a request
-UUID. Keep the same request UUID if you retry the same finalization:
+Finalization writes three copies of the closing index, so another machine can
+find the files without your catalog. It permanently closes the tape to new
+objects. Only the acknowledgement is required:
 
 ```sh
-TAPE_UUID=<TAPE_UUID_FROM_INIT>
-FINALIZE_REQUEST=$(cat /proc/sys/kernel/random/uuid)
-
-rem --device "$DRIVE" --allow-device "$DRIVE_SERIAL" \
-  tape finalize \
-  --tape "$TAPE_UUID" \
-  --acknowledge-tape "$TAPE_UUID" \
-  --expected-pool default \
-  --reason "home archive complete" \
-  --idempotency-key "$FINALIZE_REQUEST"
+rem tape finalize --acknowledge-tape HOME01
+rem tape verify
+rem tape verify --full
 ```
 
-Run a quick terminal-index check, then a full protected-content verification:
+The first verification checks structure and the terminal index. `--full` also
+checks all sidecar-protected data and parity; it can take hours. Finalize retries
+use the same automatically generated per-tape request key.
+
+Wait for the command to exit before ejecting. Use the drive button, or the
+matching non-rewinding tape node (check which `/dev/nstN` belongs to your drive):
 
 ```sh
-rem --device "$DRIVE" --allow-device "$DRIVE_SERIAL" tape verify
-rem --device "$DRIVE" --allow-device "$DRIVE_SERIAL" tape verify --full
+mt -f /dev/nst0 eject
 ```
 
-The full pass reads all data and parity protected by the sidecars and can take
-hours on a large tape. Do not remove the cartridge while a command is running.
-When the command exits, Remanence releases its software lock and medium-removal
-guard; eject the cartridge with the drive's normal controls.
-
-If a process was killed and the drive still refuses eject, run:
+If an interrupted command leaves the medium-removal guard set:
 
 ```sh
-rem --device "$DRIVE" --allow-device "$DRIVE_SERIAL" tape release
+rem tape release
 ```
 
-`tape release` clears the drive's removal guard. It does not clear a durable
-tape-I/O quarantine or declare an uncertain write safe.
+This releases the eject guard, not a quarantine fence.
+
+## When the tape fills
+
+Put stops with a nonzero exit status. Its summary names the failed file and
+prints `finalize this tape, init the next in pool default, and re-run the same
+put`. Files with `written` receipts are committed. The failed file is not a
+successful backup; files not yet visited remain to be written.
+
+For an ordinary capacity refusal, finalize and eject the first tape as above.
+Insert a fresh cartridge and continue in the same pool:
+
+```sh
+rem tape init --label HOME02 --generation L9 --pool default
+rem put "$HOME/Documents"
+```
+
+Already stored files skip, including files on HOME01. Changed and remaining
+files write to HOME02. A single file does not span cartridges. If the failure
+reports uncertain I/O or a fence, follow the crash procedure below before
+trying to finalize.
+
+## Two copies
+
+A pool is one set of copies. To make an independent second set, insert another
+cartridge and use a second pool:
+
+```sh
+rem pool new offsite
+rem tape init --label OFFSITE01 --generation L9 --pool offsite
+rem put "$HOME/Documents" --pool offsite
+rem tape finalize --acknowledge-tape OFFSITE01
+rem tape verify --full
+```
+
+Eject it and keep it offsite. Repeating put in the original pool skips unchanged
+files; it does not create a second copy there.
+
+## Backing up again later
+
+Load an open tape in the same pool, or initialize a new one if the old tape is
+finalized, then run the same put. A changed file creates a new version. An
+unchanged file skips only when its size and SHA-256 match the newest committed
+version in that pool. Changing A to B and back to A creates three versions.
+
+Keep put receipts if you need to select exact older versions. `rem list` shows
+version counts and the newest UUID, not every historical UUID. Filtering with
+`--tape HOME01` shows the newest version on that tape. For an older version,
+use its object UUID from a saved receipt, load the tape named there, and run:
+
+```sh
+rem get Documents/notes.txt --version <OBJECT_UUID> --out restored-old
+```
+
+## After a crash or a killed write
+
+A fence records a write whose completion is uncertain. Writes to that tape or
+drive refuse until the cause is understood. Reads still work and report active
+fences, so start with inspection and rescue:
+
+```sh
+rem tape quarantine list
+rem tape identify
+rem tape restore --scan --out rescued
+```
+
+After checking the hardware and preserving the data, release the named fence
+with a description of what you checked:
+
+```sh
+rem tape quarantine release <ID> --ack "checked drive and rescued readable files"
+```
+
+Release records your acknowledgement; it does not prove that the append point
+is safe. Every append checks the physical tail. `TailBeyondKnownState` means
+complete data exists beyond the position your local state knows. Restore a
+newer state backup, or rescue with `--scan`. Do not delete journals to make the
+refusal go away.
+
+If you deliberately discard that suffix after rescuing it, run:
+
+```sh
+rem tape supersede-tail --acknowledge-tape HOME01
+```
+
+The command lists what it discards and asks for `SUPERSEDE HOME01`. For a
+non-interactive run, add `--confirm-supersede "SUPERSEDE HOME01"`. This is an
+audited destructive decision, not a routine retry step.
 
 ## Recovery on another machine
 
-A finalized tape can restore without the original SQLite catalog. Install
-Remanence, discover and authorize the drive, insert the cartridge, and run:
+Build Remanence, set permissions and run setup on the new machine. Insert the
+tape. A finalized tape needs no original catalog:
 
 ```sh
-rem --device "$DRIVE" --allow-device "$DRIVE_SERIAL" \
-  tape restore --out recovered
+rem tape restore --list
+rem tape restore --path Documents/notes.txt --out recovered
 ```
 
-This reads the on-tape bootstrap and terminal index. Add `--private-key
-<REMP>` for encrypted objects. If the terminal index is unavailable, `--scan`
-walks from BOT instead:
+Use the exact member path from the listing. Repeat `--path` for more files, or
+omit it to restore everything. Add `--private-key recovery.remp` for encrypted
+objects, including listing encrypted members. If the terminal index is absent
+or unusable, walk from BOT:
 
 ```sh
-rem --device "$DRIVE" --allow-device "$DRIVE_SERIAL" \
-  tape restore --scan --out recovered
+rem tape restore --scan --list
+rem tape restore --scan --path Documents/notes.txt --out recovered-scan
 ```
 
-To add a Remanence tape from another installation to the local catalog rather
-than immediately restoring it, use `tape adopt` with the loaded cartridge:
+Restores use `candidate-<n>/` subdirectories, with identity in `manifest.json`
+and the report. Modification times are restored after validation.
+
+`tape adopt` imports identity only. It does not import object rows and
+cannot make `rem list` or get-by-path work on a new machine. Use catalogless
+restore to find and recover files:
 
 ```sh
-rem --device "$DRIVE" --allow-device "$DRIVE_SERIAL" \
-  tape adopt --label HOME01L9 --pool default
+rem tape adopt --label HOME01 --pool default
 ```
 
-Adoption reads the bootstrap and records its existing UUID. It does not
-rewrite the tape.
+## What to keep besides the tape
+
+> A finalized plaintext tape needs nothing from the original machine to restore
+> its files. You still need compatible hardware and a reader. Keep the state
+> directory to make listing, normal restore and interrupted-write recovery
+> easier; restore the whole directory to the same path. Keep matching private
+> keys separately for encrypted files: the tape cannot replace a lost key.
+> Never restore an older state directory over a newer one without reading the
+> `TailBeyondKnownState` refusal and its recovery instructions above. Keep source
+> copies while the formats remain under review; see [status](status.md).
+
+## Encryption
+
+Plaintext is the default. Encrypted writes require two to eight distinct
+recipient keys, so loss of one private key need not destroy access. One matching
+private key is enough to restore. Keep a working key and a recovery key in
+separate safe places.
+
+Key creation is not yet a `rem` command; it is planned with key-custody tooling.
+Today, obtain canonical REMP private-key files from your custodian or key
+registry, and derive their REMR public records with `rem archive recipient
+derive`. Follow the [key-file reference](reference-cli.md#recipient-key-file-formats)
+for the formats. Derive prints JSON; decode `canonical_public_key_base64`
+to save a `.remr` file. SSH and age keys are not substitutes.
+For example, with provisioned `primary.remp` and `recovery.remp` files and
+Python 3 installed:
+
+```sh
+rem archive recipient derive --private-key primary.remp --slot-index 0 > primary-public.json
+rem archive recipient derive --private-key recovery.remp --slot-index 1 > recovery-public.json
+python3 - <<'KEYS'
+import base64, json
+from pathlib import Path
+for name in ("primary", "recovery"):
+    record = json.loads(Path(f"{name}-public.json").read_text())
+    Path(f"{name}.remr").write_bytes(base64.b64decode(record["canonical_public_key_base64"]))
+KEYS
+```
+
+With those two public records:
+
+```sh
+rem put private-file --recipient primary.remr --recipient recovery.remr
+```
+
+A plaintext put refuses if the newest version is encrypted. Supply recipients
+again, or use `--allow-plaintext-copy` only if you intend to store plaintext.
 
 ## Ownership refusals
 
-Remanence writes to an unattached drive only when discovery can prove that no
-reachable changer claims it. If another SCSI device could not be probed, the
-drive may appear with `ownership: unknown`; writes then fail closed.
-
-On a host where partial discovery is expected, pin the drive's VPD page 0x80
-serial in the selected config:
+Discovery skips disks and other non-tape devices using their sysfs type.
+Do not join `disk` to fix tape discovery. A failed tape/changer probe or an
+unresolved changer bay can leave ownership unknown. Fix that probe, or pin a
+known standalone serial in the selected config:
 
 ```toml
 [[standalone_drives]]
 serial = "HU1234ABC5"
 ```
 
-This is an operator assertion that the serial is a standalone drive. It does
-not turn a library bay into one. An unresolved bay in a visible changer still
-blocks standalone writes until its ownership can be established.
-
-`--acknowledge-unknown-ownership` permits read-only work when ownership is
-unknown. It never authorizes initialization, writes, finalization, or other
-mutations. A drive without a readable serial is likewise read-only and needs
-`--allow-unserialized-device`; Remanence will not write through an ephemeral
-device identity.
-
-## When to move to a library
-
-The direct workflow is intentionally one drive and one loaded cartridge per
-invocation. It does not select media, operate a changer, queue concurrent
-requests, or run as a network service. Once manual cartridge handling becomes
-the limiting part of your archive, keep the tapes and move the same config,
-catalog, and formats behind `rem-daemon` and a configured library. The normal
-library path adds robotics, pool-based media selection, long-running drive
-actors, and gRPC access; it does not require a different on-tape format.
+A pin cannot override a changer claim or an unresolved bay.
+`--acknowledge-unknown-ownership` allows reads only. A drive without a readable
+serial also needs `--allow-unserialized-device` for reads and cannot be written.
+See [troubleshooting](guide-troubleshooting.md) for refusal messages.

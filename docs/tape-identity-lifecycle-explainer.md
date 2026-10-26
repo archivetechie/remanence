@@ -1,19 +1,22 @@
 # Tape identity and the retire operation
 
-A tape cartridge in a Remanence library is known by two identifiers. This document
-explains what each one means, why Remanence refuses to write when they disagree,
+A Remanence tape cartridge is known by a shell label and a logical tape UUID.
+This document explains what each one means, why Remanence refuses to write when they disagree,
 and how an operator ends the life of a tape identity deliberately with
 `rem tape retire`, so that a cartridge can be recycled or replaced without
 emptying the catalog. It is an explainer; nothing here is normative.
 
 ---
 
+<!-- code-anchor: crates/remanence-state/src/index.rs crates/remanence-api/src/mount_backend.rs @ 4dc2a3c6 -->
 ## 1. A tape has two names, and they mean different things
 
-Every cartridge in the library carries two identifiers:
+A cartridge has two names:
 
 - The barcode (voltag), for example `RMJ101L9`, is a sticker on the plastic shell.
-  The robot's scanner reads it and operators read it. It names the physical object.
+  A changer scanner is one reader of the label; the operator is another.
+  A standalone label can be free text written on the shell. The catalog records
+  provenance as `changer` or `operator`; neither replaces BOT identity.
   It can be peeled off, replaced, or (through human error) duplicated, and it
   survives erasure of the tape.
 - The BOT uuid, for example `5e8f8d3b-…`, is a UUID inside the bootstrap block that
@@ -148,6 +151,7 @@ thing and BOT says another. Only the operator's intent separates them. For that 
 the way out is an explicit action performed by an operator (or by a script an operator
 wrote), and the default stays refusal.
 
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-api/src/tape_init.rs @ 4dc2a3c6 -->
 ## 4. Retire: declaring a tape identity dead
 
 `rem tape retire` is the explicit action. In words: the operator declares that logical
@@ -190,12 +194,11 @@ transaction; the audit event (effect 4) is appended after that transaction commi
 After `retire`, what `rem tape init RMJ101L9` does depends on what the medium carries:
 
 - Blank media: the barcode is free, so this is a plain fresh init.
-- Media still carrying the retired uuid's old bootstrap and data: init recognizes that
-  this medium's previous life was retired and proceeds as a fresh init without asking
-  for the `CLOBBER` confirmation. The operator already gave that confirmation by
-  retiring the tape, and asking twice for the same intent adds friction without adding
-  safety. The init overwrites the medium, so any bytes that should survive must be read
-  off it first, read-only.
+- Media still carrying the retired UUID's old bootstrap and data: retirement
+  changes the catalog, but does not erase the cartridge. Re-initialization needs
+  `--clobber-data` and the exact `CLOBBER RMJ101L9` confirmation, supplied on
+  stdin or with `--confirm-clobber "CLOBBER RMJ101L9"`. Append admission refuses
+  nonblank media as a fresh tape. Rescue any bytes you need before confirming.
 - Media carrying a uuid the catalog has never seen (for example uuid Y in Scenario A):
   retiring X does not make Y writable. Init returns `NeedsExplicitRebuild` and does
   not write.
@@ -204,8 +207,9 @@ After `retire`, what `rem tape init RMJ101L9` does depends on what the medium ca
   of tapes.
 
 So in Scenario A the sequence retire, then init, works for cartridges that come back
-blank or still carry X. A cartridge re-initialized by another tool under a new uuid Y
-needs the explicit rebuild path.
+blank; cartridges still carrying X also need confirmed clobber. A cartridge
+re-initialized by another tool under a new uuid Y needs the explicit rebuild
+path.
 
 The flow for a recycled tape, with and without `retire`:
 
@@ -215,7 +219,8 @@ WITHOUT RETIRE                          WITH RETIRE
 rem tape init  → refused ✗             rem tape retire RMJ101L9 \
 catalog reset  → active catalog,           --reason recycled \
                  audit log and             --i-understand-copies-become-unreadable ✓
-                 journals cleared          rem tape init RMJ101L9      ✓
+                 journals cleared          rem tape init RMJ101L9 --clobber-data
+                                           (confirm CLOBBER RMJ101L9)   ✓
                  (inputs archived)     (catalog, audit, journals:
 rerun the workload                      intact; audit gained a record)
 ```

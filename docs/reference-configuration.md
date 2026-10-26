@@ -1,6 +1,6 @@
 # Configuration reference
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-daemon/src/entry.rs @ 1dd451b2 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-daemon/src/entry.rs @ 4dc2a3c6 -->
 ## The config file
 
 Remanence reads a single TOML file. `rem-daemon` and library-oriented
@@ -12,8 +12,8 @@ home-mode config at `${XDG_STATE_HOME:-$HOME/.local/state}/rem/config.toml`
 with state beside it and a `default` tape pool. Every table rejects unknown
 keys, so a typo is a hard error rather than a silently ignored setting.
 
-Four sections are required — `[daemon]`, `[journal]`, `[audit]`, `[index]` —
-plus `[cache]`. Everything else may be omitted and takes the defaults listed
+Five sections are required: `[daemon]`, `[journal]`, `[audit]`, `[index]`
+and `[cache]`. Everything else may be omitted and takes the defaults listed
 below. All path values must be absolute.
 
 A minimal working config:
@@ -191,13 +191,36 @@ serial = "DEC91001xx"
 serial = "DEC91002xx"
 ```
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-cli/src/standalone.rs @ 7a7af81d -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-cli/src/standalone.rs @ 4dc2a3c6 -->
+## `[home]`
+
+`rem setup` saves a default drive here in the generated home config:
+
+```toml
+[home]
+drive_serial = "HU1234ABC5"
+```
+
+`drive_serial` is an optional VPD page 0x80 serial. Each invocation discovers
+its current path and requires exactly one match. This saved serial authorizes
+the implicit device only; an explicit `--device` still needs `--allow-device`.
+A `[[standalone_drives]]` entry asserts ownership and is separate from this
+selection.
+
+An explicit device routes to standalone. Standalone-only verbs also route
+directly. Shared verbs such as put, get, init and finalize use the saved home
+drive only with no explicit `--config` or `--endpoint` and no
+`/etc/rem/config.toml`. Otherwise they use the library/daemon route. Help uses
+the same rule. See the [CLI routing table](reference-cli.md#standalone-drives).
+
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-cli/src/standalone.rs @ 4dc2a3c6 -->
 ## `[[standalone_drives]]`
 
 An optional list of drive serials the operator asserts are standalone. Normal
 complete discovery proves this automatically when no changer claims a drive.
-The pin is for hosts where some unrelated SCSI device cannot be probed and the
-discovery report therefore cannot prove non-ownership.
+The pin is for hosts where a tape/changer probe fails and discovery cannot
+prove non-ownership. Non-tape sysfs types are skipped without making discovery
+incomplete.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
@@ -210,8 +233,9 @@ serial = "HU1234ABC5"
 
 This entry never maps the drive to a library bay and does not override a
 positive or unresolved changer claim. Standalone writes still refuse when a
-visible library has an unresolved drive bay. The per-command
-`--allow-device <SERIAL>` authorization is also still required.
+visible library has an unresolved drive bay. Authorization is still required:
+either the saved `[home] drive_serial` for
+an implicit device or `--allow-device <SERIAL>` for an explicit one.
 
 <!-- code-anchor: crates/remanence-state/src/config.rs @ 244bc6de -->
 ## `[[tape_pools]]` and `[[tape_pool_rules]]`
@@ -371,7 +395,7 @@ the config file.
 Hardware integration tests read additional `REM_QUADSTOR_*` variables; they
 are documented in the test modules and are never read by production code.
 
-<!-- code-anchor: crates/remanence-state/src/paths.rs crates/remanence-state/src/lock.rs crates/remanence-daemon/src/lib.rs crates/remanence-state/src/calibration.rs @ 1dd451b2 -->
+<!-- code-anchor: crates/remanence-state/src/paths.rs crates/remanence-state/src/lock.rs crates/remanence-daemon/src/lib.rs crates/remanence-state/src/calibration.rs @ 4dc2a3c6 -->
 ## What ends up on disk
 
 For the minimal config above, a running daemon owns:
@@ -395,9 +419,27 @@ For the minimal config above, a running daemon owns:
                                  rebuilt or reset
 ```
 
-Home mode creates the same classes of state under
-`${XDG_STATE_HOME:-$HOME/.local/state}/rem/`, but no socket or running daemon
-is required. Direct standalone commands acquire the state lock for one
+Home mode uses a different generated layout under
+`${XDG_STATE_HOME:-$HOME/.local/state}/rem/`:
+
+```text
+config.toml                     generated config, default pool, saved home serial
+state.lock                      invocation ownership lock
+journals/                       tape-file journals
+journals/checkpoints/           checkpoint histories
+index/rem-state.sqlite          rebuildable catalog
+cache/tapes/                    tape catalog cache
+audit/                          audit segments
+calibration/control.remcalibration
+                                durable calibration state
+```
+
+No socket or running daemon is required. Back up the entire state directory
+and restore it to the same absolute path. An older backup cannot authorize
+append over newer tape data: `TailBeyondKnownState` refuses that operation.
+Restore newer state or use catalogless `tape restore --scan` to rescue files.
+
+Direct standalone commands acquire the state lock for one
 invocation, append audit and journal evidence, update the catalog projection,
 and release the lock when they exit.
 

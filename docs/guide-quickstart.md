@@ -168,37 +168,50 @@ with `bsdtar`. For streaming and partial retrieval,
 `archive extract-stream` and `archive covering-range` use the same
 `--private-key` epoch-selection contract.
 
-<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_backend.rs @ 7a7af81d -->
+<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_backend.rs @ 4dc2a3c6 -->
 ## First physical tape with one drive
 
-If you have a standalone LTO drive, you do not need to configure or run the
-daemon. The direct `rem` path discovers the drive, creates home-mode state
-under `${XDG_STATE_HOME:-$HOME/.local/state}/rem`, initializes a manually
-loaded cartridge, and uses the same checkpointed object writer and tape format
-as the library path.
-
-The short sequence is:
+No published binary has standalone mode yet. Build from source using the
+commands above, then put the release directory on your path:
 
 ```sh
-rem drives --json
-rem doctor --json
-
-rem --device /dev/sg3 --allow-device HU1234ABC5 \
-  tape init --label HOME01L9 --generation L9
-
-rem --device /dev/sg3 --allow-device HU1234ABC5 \
-  put /path/to/files
-
-rem --device /dev/sg3 --allow-device HU1234ABC5 \
-  get <OBJECT_ID_FROM_PUT> --out restored
+export PATH="$PWD/target/release:$PATH"
 ```
 
-Initialization writes to the cartridge immediately; the standalone command
-has no dry-run option. Before ejecting an archival tape, finalize it to write
-the terminal index and run verification. The complete walkthrough, including
-permissions, finalization, encrypted writes, catalogless recovery, and the
-ownership checks behind `--allow-device`, is in
-[Using a standalone LTO drive](guide-standalone-drive.md).
+Complete the [permissions steps](guide-standalone-drive.md#what-you-need),
+including the persistent `/run/lock/rem` rule, and log in again after joining
+`tape`. Never run rem with sudo. No daemon is needed.
+
+On a host without `/etc/rem/config.toml`, setup saves your selected drive's
+serial in the home config. Insert a blank LTO-9 cartridge, write HOME01 on its
+shell, and run:
+
+```sh
+rem setup
+rem doctor
+rem drives --json
+rem tape init --label HOME01 --generation L9
+rem put "$HOME/Documents"
+rem list
+rem list --tape HOME01 --path-prefix Documents/
+rem get Documents/notes.txt --out restored
+rem tape finalize --acknowledge-tape HOME01
+rem tape verify
+rem tape verify --full
+rem tape restore --list
+rem tape restore --path Documents/notes.txt --out recovered
+```
+
+Replace `Documents/notes.txt` with a path from the listing. Use `--generation L6`
+for an LTO-6 cartridge in a compatible drive; accepted values are L5–L9 and M8.
+Initialization writes immediately and has no standalone dry run. Used media
+needs `--clobber-data` and the exact `CLOBBER HOME01` confirmation.
+
+Compare your restored file before shelving the tape. Finalization permanently
+closes it to new objects. When verification exits, eject with the drive button
+or `mt -f /dev/nst0 eject`, using the tape node for this drive. The
+[standalone guide](guide-standalone-drive.md) covers tape-full continuation,
+second copies, old versions, crash recovery and encryption keys.
 
 <!-- code-anchor: crates/remanence-library/src/discovery.rs crates/remanence-cli/src/lib.rs Makefile @ 6ed03ef0 -->
 ## Talking to a library (requires hardware)

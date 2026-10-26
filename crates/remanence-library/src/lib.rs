@@ -84,7 +84,7 @@ pub use transport::{
 pub fn drive_mapping_message(warning: &DiscoveryWarning) -> Option<String> {
     match warning {
         DiscoveryWarning::DriveMappingUnavailable { library, bays } => Some(format!(
-            "changer {library}, bays {bays:?}: this changer did not report drive identities; see the hardware-support page"
+            "changer {library}, bays {bays:?}: this changer did not report drive identities; see docs/status.md#tested-hardware"
         )),
         _ => None,
     }

@@ -405,14 +405,18 @@ You want Remanence if:
   You can write the orchestrator, and Remanence's API is designed to be easy to
   integrate with.
 
+<!-- code-anchor: crates/remanence-cli/src/standalone.rs @ 4dc2a3c6 -->
+One manually loaded tape drive also works. `rem setup`, `rem put` and
+`rem get` operate it directly, without a daemon; finalization makes its index
+available for catalogless restore. Start with the
+[standalone-drive guide](guide-standalone-drive.md).
+
 You probably want something else if:
 
 - You want a turnkey backup product. Bareos is the open-source default; the
   commercial vendors all do this well.
 - You want LTFS-style "mount the tape and use it like a disk." LTFS itself is the
   right choice there.
-- You have one tape drive, no library, and you want to write a directory to it.
-  `tar -cf /dev/nst0 mydir` does that, and you do not need a daemon.
 
 ---
 

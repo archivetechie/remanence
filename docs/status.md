@@ -1,4 +1,4 @@
-<!-- code-anchor: Cargo.toml crates proto/layer5.proto @ 1dd451b2 -->
+<!-- code-anchor: Cargo.toml crates proto/layer5.proto @ 4dc2a3c6 -->
 # What works, and what does not
 
 This page is for someone deciding whether Remanence is ready for a particular
@@ -111,6 +111,29 @@ that field.
 **Appending to a parity tape is session-only.** A committed parity tape can
 accept further objects through a write session, but the single-object write
 path still refuses it.
+
+<!-- code-anchor: crates/remanence-library/src/lib.rs crates/remanence-cli/src/standalone.rs crates/remanence-library/tests @ 4dc2a3c6 -->
+## Tested hardware
+
+| Hardware | Evidence and limits |
+|---|---|
+| QuadStor VTL | Library integration and failure-recovery tests. The standalone-view harness lane exercises a virtual drive without a visible changer; that lane is pending qualification. It does not establish real standalone-drive support. |
+| HPE MSL3040 with LTO-9 drives | Physical library reads, writes and recovery testing. Physical test time is episodic. |
+| HP Ultrium 7 | INQUIRY/VPD captures for discovery and identity; these captures do not establish full media read/write coverage. |
+| Real hardware below LTO-7 | No testing. Accepted L5/L6 generation values are not a hardware qualification. |
+| Autoloader | No testing. |
+| Real standalone drive | No testing yet. Model tests and a VTL view do not substitute for a physical standalone drive. |
+
+A hardware report that cannot be reproduced stays open once a
+`rem diagnostics capture --out diagnostics.tar` tarball is attached. For a
+specific standalone drive, add `--device /dev/sgN --allow-device SERIAL`.
+Include the failing command and its output with the capture.
+
+`DriveMappingUnavailable` means the changer does not report the identities
+needed to map its drive bays. It is a discovery limitation, not permission to
+treat those drives as standalone. Unresolved bays block standalone writes;
+an ownership pin cannot bypass that refusal. Report the changer model and
+attach the diagnostic capture so its mapping can be investigated.
 
 ## Maturity
 
