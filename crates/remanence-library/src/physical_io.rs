@@ -212,6 +212,7 @@ enum PhysicalReadBoundary {
     EndOfData,
 }
 
+/// A boundary with bytes transferred is not an end-of-data boundary.
 fn classify_read_boundary(err: &TapeIoError) -> Option<PhysicalReadBoundary> {
     if matches!(err, TapeIoError::FilemarkEncountered) {
         return Some(PhysicalReadBoundary::Filemark);
@@ -251,6 +252,35 @@ mod tests {
             sense,
             bytes_transferred: 0,
         })
+    }
+
+    /// Construct a completion with separate corrected and kernel counts.
+    fn check_condition_with_residue(sense: Vec<u8>, bytes_transferred: u32) -> TapeIoError {
+        TapeIoError::CheckConditionWithResidue {
+            source: crate::scsi::ScsiError::CheckCondition {
+                sense,
+                bytes_transferred: 262_144,
+            },
+            bytes_transferred,
+        }
+    }
+
+    /// Corrected zero-transfer EOD is a boundary; transferred data fails closed.
+    #[test]
+    fn classifies_corrected_residue_end_of_data_boundary() {
+        let sense = vec![
+            0xf0, 0x00, 0x08, 0x00, 0x04, 0x00, 0x00, 0x58, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05,
+            0x30, 0x00, 0x64, 0x02, 0x20, 0x00, 0x06, 0x01, 0x41, 0x4f, 0x58, 0x30, 0x33, 0x32,
+            0x4c, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(
+            classify_read_boundary(&check_condition_with_residue(sense.clone(), 0)),
+            Some(PhysicalReadBoundary::EndOfData)
+        );
+        assert_eq!(
+            classify_read_boundary(&check_condition_with_residue(sense, 1)),
+            None
+        );
     }
 
     #[test]

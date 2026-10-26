@@ -207,7 +207,7 @@ Each phase has a `counts` object with the same fields as `total`:
 | `other` | Every other dispatched command, including configuration and readiness commands. |
 | `records_requested` | Records requested by READ commands, including retries. |
 | `records_confirmed` | Records returned by exact, clean transfers or accepted self-corrected single reads. An unclean batch is not confirmed; its successful single-record retries are. |
-| `bytes` | Bytes the transport reports transferring, including configuration responses, failed or unconfirmed transfers, and retries. A transport error without a byte count contributes no known bytes. This is not the tape's stored data size. |
+| `bytes` | Transferred bytes after sense residue correction when applicable, including configuration responses, failed or unconfirmed transfers, and retries. A transport error without a byte count contributes no known bytes. This is not the tape's stored data size. |
 | `hardware_batch_fallbacks` | Unclean hardware batches for which the reader starts a single-record retry. A failed repositioning attempt still counts. |
 | `algorithmic_fallback_epochs` | Epochs needing at least one unbuffered data read. These are counted in `fallback_data`, separately from hardware retries. |
 | `recovered_reads` | Accepted reads for which the drive reports that it corrected an error. |

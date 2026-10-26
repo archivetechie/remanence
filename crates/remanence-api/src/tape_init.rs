@@ -1099,6 +1099,7 @@ mod tests {
         Data(Vec<u8>),
         Filemark,
         Eod,
+        EodWithResidue,
         Error(String),
     }
 
@@ -1153,9 +1154,46 @@ mod tests {
                         },
                     ))
                 }
+                ScriptRead::EodWithResidue => Err(TapeIoError::CheckConditionWithResidue {
+                    source: remanence_library::scsi::ScsiError::CheckCondition {
+                        sense: vec![
+                            0xf0, 0x00, 0x08, 0x00, 0x04, 0x00, 0x00, 0x58, 0x00, 0x00, 0x00, 0x00,
+                            0x00, 0x05, 0x30, 0x00, 0x64, 0x02, 0x20, 0x00, 0x06, 0x01, 0x41, 0x4f,
+                            0x58, 0x30, 0x33, 0x32, 0x4c, 0x00, 0x00, 0x00,
+                        ],
+                        bytes_transferred: 262_144,
+                    },
+                    bytes_transferred: 0,
+                }),
                 ScriptRead::Error(detail) => Err(TapeIoError::OperationFailed(detail)),
             }
         }
+    }
+
+    /// Both initialization classifiers accept a corrected EOD completion.
+    #[test]
+    fn blank_check_eod_and_sense_key_accept_corrected_residue() {
+        let mut source = ScriptedSource::new([ScriptRead::EodWithResidue]);
+        let error = source.read_block(&mut [0; 1]).unwrap_err();
+        assert_eq!(sense_key_asc(&error), Some((0x08, 0x00, 0x05)));
+        assert!(is_blank_check_eod(&error));
+    }
+
+    /// Adoption recognizes the exact bootstrap tail with corrected EOD.
+    #[test]
+    fn adoption_recheck_accepts_corrected_residue_eod() {
+        let mut source = ScriptedSource::new([
+            ScriptRead::Data(canonical_adoption_block(ADOPTION_UUID)),
+            ScriptRead::Filemark,
+            ScriptRead::EodWithResidue,
+        ]);
+        let result = classify_bootstrap_adoption_from_source(&mut source);
+        assert_eq!(result.payload.unwrap().tape_uuid, ADOPTION_UUID);
+        assert_eq!(
+            result.tail,
+            BootstrapTailClassification::ExactBootstrapFilemarkEod
+        );
+        assert_eq!(source.calls, ["locate", "read", "read", "read"]);
     }
 
     impl BlockSource for ScriptedSource {
