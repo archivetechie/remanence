@@ -1337,6 +1337,7 @@ parts = [
     f'socket_path = "{home / "rem.sock"}"',
     f'spool_dir = "{home / "spool"}"',
     'spool_tmpfs_ram_budget = "64GiB"',
+    'io_memory_ceiling = "96GiB"',
     "",
     "[[libraries]]",
     f'serial = "{selected}"',
