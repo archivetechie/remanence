@@ -62,10 +62,11 @@ PY
 build_object() {
   local object="$1" manifest="$2" inputs_dir="$3" key_file="${4:-}"
   if [[ -n "$key_file" ]]; then
-    "$(fieldtest_rem_bin)" --allow "$(fieldtest_selected_library_serial)" archive build \
+    # The encrypted representation is sealed to a recipient public file; the
+    # matching private file (the same stem with .remp) opens it on restore.
+    "$(fieldtest_rem_bin)" archive build \
       --inputs "$inputs_dir/random.bin" --inputs "$inputs_dir/zeros.bin" \
-      --out "$object" --encrypt --key-file "$key_file" \
-      --key-id 00112233445566778899aabbccddeeff
+      --out "$object" --recipient "$key_file"
   else
     "$(fieldtest_rem_bin)" archive build \
       --inputs "$inputs_dir/random.bin" --inputs "$inputs_dir/zeros.bin" \
@@ -135,12 +136,13 @@ main() {
   fieldtest_evidence_record "$SCRIPT_NAME" range PASS "1 MiB range extracted from plain object" "$workdir/range.json"
 
   local key_file encrypted_object encrypted_manifest encrypted_locator restored_encrypted encrypted_sha
-  key_file="$workdir/key.bin"
-  python3 - "$key_file" <<'PY'
-from pathlib import Path
-import os, sys
-Path(sys.argv[1]).write_bytes(os.urandom(32))
-PY
+  # A fresh recipient key pair for this run: key.remp (private, mode 0600) and
+  # key.remr (public). The build seals to the public file.
+  key_file="$workdir/key.remr"
+  if ! "$(fieldtest_rem_bin)" archive recipient keygen --out "$workdir/key.remp" --public "$key_file" --label fieldtest >"$workdir/keygen.json" 2>"$workdir/keygen.err"; then
+    fieldtest_evidence_record "$SCRIPT_NAME" keygen FAIL "recipient keygen failed" "$workdir/keygen.err"
+    exit 1
+  fi
   encrypted_object="$workdir/encrypted.rem-object"
   encrypted_manifest="$workdir/encrypted-manifest.json"
   build_object "$encrypted_object" "$encrypted_manifest" "$workdir/inputs" "$key_file"
