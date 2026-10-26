@@ -124,19 +124,68 @@ rebuild_catalog() {
   rm -rf -- "$workdir"
 }
 
+catalog_tape_uuid() {
+  # Prints the UUID the catalog holds for a barcode, preferring a row that is
+  # not retired; empty when the barcode is absent or the capture failed.
+  python3 - "$1" "$2" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    payload = json.loads(Path(sys.argv[1]).read_text())
+except (OSError, ValueError):
+    raise SystemExit(0)
+rows = [t for t in payload.get("data", {}).get("tapes", []) if t.get("voltag") == sys.argv[2]]
+live = [t for t in rows if str(t.get("state", "")).lower() != "retired"]
+for row in live or rows:
+    print(row.get("tape_uuid", ""))
+    break
+PY
+}
+
 retire_rebind() {
   # retire + re-init are local (direct state/SCSI) verbs: daemon stopped
-  # around them, restarted for the catalog verification.
-  local serial barcode
+  # around them, restarted for the catalog verification. A retired barcode
+  # that still holds data re-initializes only through the confirmed clobber
+  # route, so the re-init carries the typed confirmation on the command line
+  # and the leg asserts that the catalog shows the barcode under a fresh UUID
+  # once the daemon is back.
+  local serial barcode stamp before_json retire_json reinit_txt after_json old_uuid new_uuid after_uuid
   serial="$(fieldtest_selected_library_serial)"
   barcode="$(fieldtest_allowlist_barcodes | head -n 1)"
   fieldtest_require_allowlisted "$barcode"
+  stamp="$(fieldtest_timestamp_id)"
+  before_json="$(fieldtest_artifact_path "$SCRIPT_NAME" catalog-before "$stamp")"
+  fieldtest_capture_json "$before_json" "$(fieldtest_rem_bin)" catalog --endpoint "$(fieldtest_rem_endpoint)" tapes --json || true
+  old_uuid="$(catalog_tape_uuid "$before_json" "$barcode")"
   "$(fieldtest_script_dir)/03-bringup.sh" --stop >/dev/null 2>&1 || true
-  fieldtest_capture_json "$(fieldtest_artifact_path "$SCRIPT_NAME" retire "$(fieldtest_timestamp_id)")" "$(fieldtest_rem_bin)" tape retire "$barcode" --reason recycled --i-understand-copies-become-unreadable --json --config "$(fieldtest_config_path)"
-  fieldtest_capture_json "$(fieldtest_artifact_path "$SCRIPT_NAME" reinit "$(fieldtest_timestamp_id)")" "$(fieldtest_rem_bin)" --allow "$serial" tape init "$barcode" --config "$(fieldtest_config_path)" --library "$serial"
+  retire_json="$(fieldtest_artifact_path "$SCRIPT_NAME" retire "$stamp")"
+  if ! fieldtest_capture_json "$retire_json" "$(fieldtest_rem_bin)" tape retire "$barcode" --reason recycled --i-understand-copies-become-unreadable --json --config "$(fieldtest_config_path)"; then
+    fieldtest_evidence_record "$SCRIPT_NAME" retire-rebind FAIL "tape retire failed for $barcode" "$retire_json"
+    "$(fieldtest_script_dir)/03-bringup.sh" >/dev/null 2>&1 || true
+    exit 1
+  fi
+  reinit_txt="$(fieldtest_artifact_path "$SCRIPT_NAME" reinit "$stamp")"
+  if ! fieldtest_capture_text "$reinit_txt" "$(fieldtest_rem_bin)" --allow "$serial" tape init "$barcode" --config "$(fieldtest_config_path)" --library "$serial" --clobber-data --confirm-clobber "CLOBBER $barcode"; then
+    fieldtest_evidence_record "$SCRIPT_NAME" retire-rebind FAIL "confirmed clobber re-init failed for retired $barcode" "$reinit_txt"
+    "$(fieldtest_script_dir)/03-bringup.sh" >/dev/null 2>&1 || true
+    exit 1
+  fi
+  new_uuid="$(sed -nE 's/^[[:space:]]*uuid:[[:space:]]*([0-9a-fA-F-]+).*/\1/p' "$reinit_txt" | head -n 1)"
   "$(fieldtest_script_dir)/03-bringup.sh" >/dev/null 2>&1 || true
-  fieldtest_capture_json "$(fieldtest_artifact_path "$SCRIPT_NAME" catalog "$(fieldtest_timestamp_id)")" "$(fieldtest_rem_bin)" catalog --endpoint "$(fieldtest_rem_endpoint)" tapes --json
-  fieldtest_evidence_record "$SCRIPT_NAME" retire-rebind PASS "retired and then re-initialized allowlisted tape $barcode (daemon restarted; catalog re-verified)"
+  after_json="$(fieldtest_artifact_path "$SCRIPT_NAME" catalog "$stamp")"
+  fieldtest_capture_json "$after_json" "$(fieldtest_rem_bin)" catalog --endpoint "$(fieldtest_rem_endpoint)" tapes --json || true
+  if [[ -z "$new_uuid" || "$new_uuid" == "$old_uuid" ]]; then
+    fieldtest_evidence_record "$SCRIPT_NAME" retire-rebind FAIL "re-init of retired $barcode did not report a fresh UUID (before: ${old_uuid:-none}, after: ${new_uuid:-none})" "$reinit_txt"
+    exit 1
+  fi
+  after_uuid="$(catalog_tape_uuid "$after_json" "$barcode")"
+  if [[ "$after_uuid" != "$new_uuid" ]]; then
+    fieldtest_evidence_record "$SCRIPT_NAME" retire-rebind FAIL "catalog shows $barcode as ${after_uuid:-absent}, not the fresh UUID $new_uuid, after the daemon restart" "$after_json"
+    exit 1
+  fi
+  fieldtest_evidence_record "$SCRIPT_NAME" retire-rebind PASS "retired $barcode (uuid ${old_uuid:-unknown}) and re-initialized it through the confirmed clobber route as $new_uuid; catalog re-verified after daemon restart" "$after_json"
 }
 
 wrong_tape() {
