@@ -40,6 +40,21 @@ PortalSlot.element_address         as Slot.element_address
 DriveAssignment.library_serial     an assignment is always to a named library
 DriveAssignment.bay                an assignment is always to a specific bay
 
+# ---------------------------------------------------------------------------
+# Endpoint discovery and explicit tail recovery, decided 2026-10-26.
+# Derivation: observed_endpoint_json / ApiState::observed_endpoints, the
+# Catalog supersede_tail handler, and the drive-owner confirmation callback.
+# Keep endpoint strings wire-compatible until released-client compatibility
+# can be established; the v0.2.0 tag was unavailable for inspection, and the
+# current downstream generated bindings do not yet contain ObservedEndpoint.
+# ---------------------------------------------------------------------------
+ObservedEndpoint.kind                  discovery always emits library, standalone or unknown, never empty; retain string compatibility, and readers must treat empty as unspecified, not as a discovered kind
+ObservedEndpoint.ownership             discovery emits library, standalone or unknown (library rows default to library), never empty; retain string compatibility, and readers must treat empty as unspecified, never as standalone ownership
+SupersedeTailRequest.tape_uuid          required; the RPC handler refuses empty or non-16-byte values via decode_uuid_bytes before dispatch
+SupersedeTailRequest.ack_tape_uuid      required; the RPC handler refuses empty or non-16-byte values via decode_uuid_bytes and rejects an acknowledgment unequal to tape_uuid
+SupersedeTailResponse.completed        every response sets it; false is the read-only preview without completed recovery, true is successful mutation, and errors return RPC status rather than an unknown boolean
+SupersedeTailResponse.required_confirmation every response carries the nonempty SUPERSEDE phrase generated for the tape label or UUID, including after completion; empty means no confirmation supplied and must not authorize recovery
+
 # Objects area, decided 2026-08-06. Derived from `objects` / `object_files`.
 ObjectRecord.object_id        primary key of the objects table
 FileRecord.object_id          object_files.object_id is NOT NULL, half the primary key
