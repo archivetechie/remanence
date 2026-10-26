@@ -39,7 +39,6 @@ CancelOperationRequest.force
 CancelOperationRequest.operation_id
 CancelOperationResponse.detail
 CartridgeFacts.block_size_bytes
-CartridgeFacts.cartridge_generation
 CartridgeFacts.recording_format
 CartridgeFacts.voltag
 CartridgeFacts.written_extent_lba
