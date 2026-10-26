@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::Arc;
 
-use remanence_library::scsi::{decode_sense, ScsiError};
+use remanence_library::scsi::decode_sense;
+#[cfg(test)]
+use remanence_library::scsi::ScsiError;
 use remanence_library::{BlockSource, SpaceKind, SpaceResult, TapeIoError, TapePosition};
 
 use crate::error::ParityError;
@@ -1170,13 +1172,10 @@ fn parity_error_to_tape_io_error(err: ParityError) -> TapeIoError {
 /// Same reasoning applies to NOT_READY: Annex B Table B.3
 /// entries are drive-state codes, not per-block faults.
 fn is_erasure(err: &TapeIoError) -> bool {
-    match err {
-        TapeIoError::CheckCondition(ScsiError::CheckCondition { sense, .. }) => {
-            decode_sense(sense).is_some_and(|decoded| decoded.key == 0x03)
-        }
-        TapeIoError::Transport(_) => true,
-        _ => false,
+    if let Some((sense, _)) = err.check_condition_transfer() {
+        return decode_sense(sense).is_some_and(|decoded| decoded.key == 0x03);
     }
+    matches!(err, TapeIoError::Transport(_))
 }
 
 #[cfg(test)]

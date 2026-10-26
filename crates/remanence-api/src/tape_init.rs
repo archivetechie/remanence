@@ -993,22 +993,16 @@ fn is_blank_check_eod(err: &remanence_library::TapeIoError) -> bool {
 }
 
 fn sense_key_asc(err: &remanence_library::TapeIoError) -> Option<(u8, u8, u8)> {
-    match err {
-        remanence_library::TapeIoError::CheckCondition(
-            remanence_library::scsi::ScsiError::CheckCondition { sense, .. },
-        ) => {
-            let response_code = sense.first()? & 0x7F;
-            if response_code != 0x70 && response_code != 0x71 {
-                return None;
-            }
-            Some((
-                sense.get(2)? & 0x0F,
-                sense.get(12).copied().unwrap_or(0),
-                sense.get(13).copied().unwrap_or(0),
-            ))
-        }
-        _ => None,
+    let (sense, _) = err.check_condition_transfer()?;
+    let response_code = sense.first()? & 0x7F;
+    if response_code != 0x70 && response_code != 0x71 {
+        return None;
     }
+    Some((
+        sense.get(2)? & 0x0F,
+        sense.get(12).copied().unwrap_or(0),
+        sense.get(13).copied().unwrap_or(0),
+    ))
 }
 
 fn parity_config_from_bootstrap(payload: &BootstrapPayload) -> ParityConfig {
