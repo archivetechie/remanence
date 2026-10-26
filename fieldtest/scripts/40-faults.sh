@@ -119,8 +119,22 @@ rebuild_catalog() {
   "$(fieldtest_script_dir)/03-bringup.sh" >/dev/null 2>&1 || true
   local restored="$workdir/restored.rem-object"
   fieldtest_capture_io_json "$workdir/read.json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$locator")" --out "$restored"
-  fieldtest_capture_json "$workdir/history.json" "$(fieldtest_rem_bin)" drive --endpoint "$(fieldtest_rem_endpoint)" history "$serial" --events --snapshots --json
-  fieldtest_evidence_record "$SCRIPT_NAME" rebuild PASS "catalog rebuilt from journals and a pre-rebuild object was restored" "$workdir/rebuild.txt"
+  # Drive history is keyed by drive serial; take the first managed drive.
+  local history_serial
+  fieldtest_capture_json "$workdir/drive-list.json" "$(fieldtest_rem_bin)" drive --endpoint "$(fieldtest_rem_endpoint)" list --json
+  history_serial="$(python3 - "$workdir/drive-list.json" <<'PY'
+import json,sys
+from pathlib import Path
+payload=json.loads(Path(sys.argv[1]).read_text())
+drives=payload.get("data", {}).get("drives", [])
+print(drives[0].get("serial","") if drives else "")
+PY
+)"
+  if [[ -n "$history_serial" ]]; then
+    fieldtest_capture_json "$workdir/history.json" "$(fieldtest_rem_bin)" drive --endpoint "$(fieldtest_rem_endpoint)" history "$history_serial" --events --snapshots --json
+  fi
+  cp -f -- "$workdir/rebuild.txt" "$(fieldtest_artifact_path "$SCRIPT_NAME" rebuild "$(fieldtest_timestamp_id)")"
+  fieldtest_evidence_record "$SCRIPT_NAME" rebuild PASS "catalog rebuilt from journals and a pre-rebuild object was restored" "$(fieldtest_latest_artifact_path "$SCRIPT_NAME" rebuild 2>/dev/null || echo "$workdir/rebuild.txt")"
   rm -rf -- "$workdir"
 }
 
