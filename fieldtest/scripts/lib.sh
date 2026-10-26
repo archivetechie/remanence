@@ -437,6 +437,7 @@ fieldtest_capture_text() {
   local outfile="$1"
   shift
   local tmp_out tmp_err rc cmd_display
+  mkdir -p "$(dirname -- "$outfile")"
   tmp_out="$(mktemp)"
   tmp_err="$(mktemp)"
   cmd_display="$(printf '%q ' "$@")"
