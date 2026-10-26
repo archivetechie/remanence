@@ -7,12 +7,13 @@ per-release summaries.
 <!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_backend.rs crates/remanence-state/src/index.rs crates/remanence-library/src/discovery.rs @ 4dc2a3c6 -->
 ## Unreleased
 
-- Generate private recovery keys and public recipient files with
+- Generate private key files and public recipient files with
   `rem archive recipient keygen`; protect private files with mode `0600` and
   refuse existing output paths.
 - Read reservoirs keep minimum slabs unlocked when memory-lock limits or
-  permissions prevent locking. A process warning, read diagnostics, and an
-  advisory `rem doctor` check report the fallback and lock-limit remedy.
+  permissions prevent locking. A once-per-process warning and an advisory
+  `rem doctor` check give the lock-limit remedy; read diagnostics count locked
+  and unlocked minimum slabs.
 - Library `tape init --clobber-data` reads the typed `CLOBBER <label>`
   confirmation from standard input and completes; end of input is refused
   with the non-interactive form, `--confirm-clobber "CLOBBER <label>"`.

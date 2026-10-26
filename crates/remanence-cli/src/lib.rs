@@ -3431,7 +3431,7 @@ enum ArchiveCommand {
 
 #[derive(Subcommand, Debug)]
 enum ArchiveRecipientCommand {
-    /// Generate a private recovery key and its slot-0 public recipient file.
+    /// Generate a private key file and its slot-0 public recipient file.
     Keygen(ArchiveRecipientKeygenArgs),
 
     /// Derive a canonical REMR public file from a canonical REMP private file.
@@ -3447,7 +3447,7 @@ struct ArchiveRecipientKeygenArgs {
     #[arg(long, value_name = "FILE.remp")]
     out: PathBuf,
 
-    /// Recovery label: at most 32 printable ASCII bytes.
+    /// Label stored in both files: at most 32 printable ASCII bytes.
     #[arg(long, value_name = "TEXT", default_value = "")]
     label: String,
 
@@ -4093,6 +4093,10 @@ pub fn debug_main_entry() -> ExitCode {
 
 /// Run the break-glass CLI with the foreign formats linked by a distribution.
 pub fn debug_main_entry_with_registry(registry: ForeignFormatRegistry) -> ExitCode {
+    remanence_api::read_core::set_read_reservoir_warning_sink(|message| {
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr().lock(), "warning: {message}");
+    });
     let cli = DebugCli::parse();
     run_cli(cli.into(), CliMode::Debug, registry)
 }
@@ -4949,14 +4953,12 @@ fn keygen_recipient_report(args: &ArchiveRecipientKeygenArgs) -> Result<Value, S
         .public
         .clone()
         .unwrap_or_else(|| args.out.with_extension("remr"));
-    for path in [&args.out, &public_path] {
+    if public_path == args.out {
+        return Err("private and public key paths must differ".into());
+    }
+    for (flag, path) in [("--out", &args.out), ("--public", &public_path)] {
         match fs::symlink_metadata(path) {
-            Ok(_) => {
-                return Err(format!(
-                    "refusing to overwrite existing key file {}",
-                    path.display()
-                ))
-            }
+            Ok(_) => return Err(format!("{flag} {} already exists", path.display())),
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => return Err(format!("check key file {}: {error}", path.display())),
         }
@@ -5013,8 +5015,8 @@ fn keygen_recipient_report(args: &ArchiveRecipientKeygenArgs) -> Result<Value, S
         return Err(format!("write recipient key files: {error}"));
     }
     Ok(json!({
-        "private": args.out,
-        "public": public_path,
+        "private": args.out.display().to_string(),
+        "public": public_path.display().to_string(),
         "epoch_id": bytes_to_hex(&private.recipient_epoch_id),
         "label": private.epoch_label,
     }))
@@ -17133,7 +17135,15 @@ mod tests {
             ]);
             assert_eq!(code, ExitCode::from(1));
             assert!(stdout.is_empty());
-            assert!(stderr.contains("refusing to overwrite"), "{stderr}");
+            let flag = if existing == &private {
+                "--out"
+            } else {
+                "--public"
+            };
+            assert!(
+                stderr.contains(&format!("{flag} {} already exists", existing.display())),
+                "{stderr}"
+            );
             assert_eq!(fs::read(existing).unwrap(), b"keep these bytes");
             let absent = if existing == &private {
                 &public
@@ -17164,19 +17174,57 @@ mod tests {
             assert!(!private.exists());
             assert!(!public.exists());
         }
-        // Identical destinations must not leave a partial private key behind.
-        let (code, _, _) = invoke_without_discovery(&[
-            "rem",
-            "archive",
-            "recipient",
-            "keygen",
-            "--out",
-            private.to_str().unwrap(),
-            "--public",
-            private.to_str().unwrap(),
-        ]);
-        assert_eq!(code, ExitCode::from(1));
-        assert!(!private.exists());
+        // Both explicit and default public destinations must differ from --out.
+        for args in [
+            vec![
+                "--out",
+                private.to_str().unwrap(),
+                "--public",
+                private.to_str().unwrap(),
+            ],
+            vec!["--out", public.to_str().unwrap()],
+        ] {
+            let mut command = vec!["rem", "archive", "recipient", "keygen"];
+            command.extend(args);
+            let (code, stdout, stderr) = invoke_without_discovery(&command);
+            assert_eq!(code, ExitCode::from(1));
+            assert!(stdout.is_empty());
+            assert!(
+                stderr.contains("private and public key paths must differ"),
+                "{stderr}"
+            );
+            assert!(!private.exists());
+            assert!(!public.exists());
+        }
+    }
+
+    /// Receipts accept filesystem paths that cannot be represented as UTF-8.
+    #[cfg(unix)]
+    #[test]
+    fn archive_recipient_keygen_receipt_handles_non_utf8_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let private = root
+            .path()
+            .join(std::ffi::OsString::from_vec(b"key-\xff.remp".to_vec()));
+        let public = root
+            .path()
+            .join(std::ffi::OsString::from_vec(b"key-\xfe.remr".to_vec()));
+        let report = keygen_recipient_report(&ArchiveRecipientKeygenArgs {
+            out: private.clone(),
+            public: Some(public.clone()),
+            label: String::new(),
+        })
+        .expect("keygen receipt");
+        assert_eq!(report["private"], private.display().to_string());
+        assert_eq!(report["public"], public.display().to_string());
+        let private_bytes = zeroize::Zeroizing::new(fs::read(private).unwrap());
+        let key = RecipientPrivateKey::parse(&private_bytes).unwrap();
+        assert_eq!(
+            fs::read(public).unwrap(),
+            key.public_key(0).unwrap().serialize().unwrap()
+        );
     }
 
     #[test]

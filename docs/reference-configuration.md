@@ -104,9 +104,9 @@ because only read-reservoir slabs are locked into memory.
 
 Successfully locked read-reservoir slabs stay in RAM. Minimum slabs that
 fall back to unlocked memory can be swapped out. A tmpfs spool is counted
-against the ceiling but is not guaranteed to stay in RAM: tmpfs pages are file-backed and can be swapped
-under memory pressure. The reservation bounds the spool's size, not its
-residency.
+against the ceiling but is not guaranteed to stay in RAM: tmpfs pages are
+file-backed and can be swapped under memory pressure. The reservation
+bounds the spool's size, not its residency.
 
 At startup the daemon reads `MemAvailable` and `RLIMIT_MEMLOCK` once and logs
 a warning if either looks too small. The ceiling is the limit the daemon
@@ -348,6 +348,17 @@ these settings.
 | `position_check_bytes` | byte size | `1073741824` (1 GiB) | Cadence of mid-stream READ POSITION drift tripwires. `0` disables mid-stream checks (boundary checks remain). |
 | `position_check_bytes_ranged` | byte size > 0 | `"256MiB"` | Proof cadence for hash-less ranged reads, effectively clamped to half the active reservoir. |
 
+Two different points enforce these constraints. Config *loading* rejects
+`high_pct ≤ low_pct` (or either out of `1..=100`/`1..=99`), a zero or
+out-of-range `staging_ring_buffers`, and a `read_reservoir_bytes` that is
+zero or exceeds `io_memory_ceiling` — these fail at daemon startup or CLI
+config load, before anything touches hardware. A reservoir smaller than
+the minimum staging pool (`staging_ring_buffers × read_batch_blocks ×
+block_size`) is instead caught later, the first time a read pipeline
+actually starts (`"read reservoir N bytes is smaller than minimum pool M
+bytes"`) — a config that passes validation can still refuse the first
+read if these two settings are mismatched.
+
 Read reservoirs use `mlock` to keep tape data in RAM and avoid swap-related
 page faults in the hot loop. Locking supports throughput; SG_IO correctness
 does not depend on it. If `mlock` returns `ENOMEM`, `EPERM`, or `EAGAIN` for a
@@ -359,17 +370,6 @@ process warns that tape data may be swapped and reports the soft
 with `ulimit -l`, `LimitMEMLOCK=` for the daemon unit, or a `security/limits.d`
 entry for the user. `rem doctor` reports a low limit as an advisory warning.
 Read diagnostics include `minimum_slabs_locked` and `minimum_slabs_unlocked`.
-
-Two different points enforce these constraints. Config *loading* rejects
-`high_pct ≤ low_pct` (or either out of `1..=100`/`1..=99`), a zero or
-out-of-range `staging_ring_buffers`, and a `read_reservoir_bytes` that is
-zero or exceeds `io_memory_ceiling` — these fail at daemon startup or CLI
-config load, before anything touches hardware. A reservoir smaller than
-the minimum staging pool (`staging_ring_buffers × read_batch_blocks ×
-block_size`) is instead caught later, the first time a read pipeline
-actually starts (`"read reservoir N bytes is smaller than minimum pool M
-bytes"`) — a config that passes validation can still refuse the first
-read if these two settings are mismatched.
 
 <!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-state/src/paths.rs crates/remanence-state/src/checkpoint.rs crates/remanence-api/src/lib.rs @ 1dd451b2 -->
 ## `[journal]`, `[audit]`, `[index]`, `[cache]` (required)
