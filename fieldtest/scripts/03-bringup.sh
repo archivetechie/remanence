@@ -70,14 +70,14 @@ main() {
       fieldtest_init_layout
       local session pid
       session="remfield"
-      if tmux has-session -t "$session" 2>/dev/null; then
-        tmux kill-session -t "$session" || true
-      fi
-      # tmux kill only HUPs; the daemon survives as an orphan holding the
-      # devices (root cause of wedged writes). Kill by process match on OUR
-      # config path and verify it is gone. A graceful stop may be unloading a
-      # cartridge, which takes the drive tens of seconds; give it a minute
-      # before the hard kill, which would leave the cartridge unthreaded.
+      # Ask the daemon to stop before the tmux session goes: killing the
+      # session first closes its terminal, and the daemon's shutdown messages
+      # (including an unthreaded-cartridge error) are then lost. A graceful
+      # stop may be unloading a cartridge, which takes the drive tens of
+      # seconds; give it a minute before the hard kill, which would leave the
+      # cartridge unthreaded. Kill by process match on OUR config path and
+      # verify it is gone, because tmux kill only HUPs and an orphan holding
+      # the devices was the root cause of wedged writes.
       for _ in $(seq 1 60); do
         pid="$(pgrep -f "rem-daemon --config $(fieldtest_config_path)" | head -1 || true)"
         [[ -n "$pid" ]] || break
@@ -92,6 +92,9 @@ main() {
       if pgrep -f "rem-daemon --config $(fieldtest_config_path)" >/dev/null 2>&1; then
         fieldtest_evidence_record "$SCRIPT_NAME" stop FAIL "rem-daemon would not die; investigate manually"
         exit 1
+      fi
+      if tmux has-session -t "$session" 2>/dev/null; then
+        tmux kill-session -t "$session" || true
       fi
       rm -f -- "$(fieldtest_socket_path)"
       fieldtest_evidence_record "$SCRIPT_NAME" stop PASS "daemon stopped and verified gone"
