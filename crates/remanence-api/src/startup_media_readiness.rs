@@ -59,11 +59,47 @@ pub(crate) fn ensure_media_readiness_admitted(
             library_robotics,
         )
         .map_err(status_from_state_error)?;
-    if conflicts.is_empty() {
-        Ok(())
-    } else {
-        Err(media_readiness_conflict_status(action, &conflicts))
+    let Some(first) = conflicts.first() else {
+        return Ok(());
+    };
+    let status = media_readiness_conflict_status(action, &conflicts);
+    if library_robotics
+        && !conflicts.iter().any(|record| {
+            media_readiness_fence_names_target(record, library_serial, drive_element, barcode)
+        })
+    {
+        // Every conflict is a fence on some other drive. Robot moves in the
+        // library stay refused while such a fence is active, so the request
+        // waits for it even when other drive bays are idle.
+        return Err(Status::failed_precondition(format!(
+            "{}; robot moves in library {library_serial} are refused while that fence is active, so this request needs operation {} to finish first, even when other drive bays are idle",
+            status.message(),
+            first.operation_id,
+        )));
     }
+    Err(status)
+}
+
+/// Whether a fence names the requested drive or cartridge itself, as opposed
+/// to blocking the request only because the request needs the library robot.
+fn media_readiness_fence_names_target(
+    record: &MediaReadinessOperationRecord,
+    library_serial: &str,
+    drive_element: Option<u16>,
+    barcode: Option<&str>,
+) -> bool {
+    let same_drive = drive_element
+        .is_some_and(|bay| record.endpoint == remanence_state::DriveKey::new(library_serial, bay));
+    let same_barcode = barcode
+        .map(str::trim)
+        .filter(|barcode| !barcode.is_empty())
+        .is_some_and(|barcode| {
+            record
+                .barcode
+                .as_deref()
+                .is_some_and(|other| other.trim().eq_ignore_ascii_case(barcode))
+        });
+    same_drive || same_barcode
 }
 
 /// Reconcile active media-readiness fences against the current selected-library

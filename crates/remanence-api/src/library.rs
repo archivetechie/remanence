@@ -1094,7 +1094,22 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
 
         let pool = self.state.drive_pool()?.clone();
         let drive_key = record.endpoint.clone();
-        let reservation = pool.reserve_drive(&drive_key)?;
+        // One caller at a time holds a fenced drive: the wait below keeps the
+        // reservation until it ends. A second caller is often a client whose
+        // open the same fence refused because that open needs the library
+        // robot, so the refusal names the serialization, not only the drive.
+        let reservation = pool.reserve_drive(&drive_key).map_err(|error| {
+            if error.code() == tonic::Code::FailedPrecondition
+                && error.message() == format!("{} is busy", drive_key.label())
+            {
+                Status::failed_precondition(format!(
+                    "{} is busy: another caller holds this drive while media-readiness operation {operation_id} is unresolved. Robot moves in library {library_serial} are refused until that operation finishes, even when other drive bays are idle; retry when operation {operation_id} finishes",
+                    drive_key.label()
+                ))
+            } else {
+                error
+            }
+        })?;
         let drive_tx = pool.drive_tx(&drive_key)?;
         let handle = self
             .state
@@ -2240,6 +2255,74 @@ mod tests {
             .reserve_drive(&crate::drive_pool::DriveKey::new("DEC418146K_LL02", 1))
             .expect_err("atomic bay reservation must still reject a second open");
         assert_eq!(second.code(), tonic::Code::FailedPrecondition);
+    }
+
+    /// A pool open that needs the robot is refused by another drive's
+    /// readiness fence, and a client that then resumes that fence finds the
+    /// drive held by the first waiter. The refusal names the library-wide
+    /// serialization, not just a busy drive.
+    #[tokio::test]
+    async fn resume_of_a_held_fenced_drive_names_the_robot_serialization() {
+        let mut state = state_with_snapshot();
+        let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
+        let (drive_tx, _drive_rx) = tokio::sync::mpsc::channel(1);
+        let pool = crate::write_owner::DrivePool::new_for_library(
+            "DEC418146K_LL02",
+            changer_tx,
+            HashMap::from([(1, drive_tx)]),
+            Arc::new(HashMap::from([(1, AtomicBool::new(false))])),
+        );
+        state.drive_pool = Some(pool.clone());
+        let operation_id = Uuid::from_u128(0x5eed);
+        state
+            .index_write()
+            .expect("open writable catalog")
+            .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+                operation_id,
+                run_id: None,
+                endpoint: crate::drive_pool::DriveKey::new("DEC418146K_LL02", 1),
+                changer_sg: None,
+                drive_sg: None,
+                drive_serial: Some("8031BDC7D1".to_string()),
+                barcode: Some("S30002L9".to_string()),
+                source_slot: Some(0x040a),
+                media_generation: Some(9),
+                phase: "session_open_short_probe".to_string(),
+                state: "becoming_ready".to_string(),
+                dirty_scope: Some("drive+tape".to_string()),
+                deadline_at_utc: None,
+                evidence_path: None,
+            })
+            .expect("record session-open readiness fence");
+        let _first_waiter = pool
+            .reserve_drive(&crate::drive_pool::DriveKey::new("DEC418146K_LL02", 1))
+            .expect("first waiter holds the fenced drive");
+
+        let error = state
+            .library_service()
+            .resume_media_readiness(Request::new(pb::ResumeMediaReadinessRequest {
+                operation_id: operation_id.as_bytes().to_vec(),
+                timeout_seconds: 60,
+                poll_interval_seconds: 1,
+            }))
+            .await
+            .expect_err("a second waiter must not take the held drive");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        let message = error.message();
+        assert!(
+            message.starts_with("DEC418146K_LL02 drive bay 0x0001 is busy: "),
+            "{message}"
+        );
+        assert!(message.contains(&operation_id.to_string()), "{message}");
+        assert!(
+            message.contains("Robot moves in library DEC418146K_LL02 are refused"),
+            "{message}"
+        );
+        assert!(
+            message.contains("even when other drive bays are idle"),
+            "{message}"
+        );
     }
 
     #[tokio::test]

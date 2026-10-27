@@ -127,6 +127,16 @@ per-release summaries.
 - When a catalog rebuild keeps a tape's committed-file watermark but loses the
   rows at a checkpoint's exact boundary, checkpoint replay repairs that prefix,
   including its last file, rather than treating it as a new append.
+- Refusals that come from the library's media-readiness serialization name
+  it. While a drive has an active media-readiness fence, robot moves in its
+  library are refused, so an open that needs the robot fails with the fence's
+  operation id even when other bays are idle, and the refusal says so.
+  `ResumeMediaReadiness` on a fenced drive that another caller holds returns
+  `<drive> is busy: another caller holds this drive while media-readiness
+  operation <id> is unresolved ...` instead of a bare busy drive. The
+  `OpenWriteSession` and `ResumeMediaReadiness` proto comments and the write
+  path in the architecture overview document bay selection and this
+  serialization. Bay selection and admission behaviour are unchanged.
 
 - Tests that issue live SCSI commands run only with `REM_TEST_LIVE_SCSI=1`;
   otherwise device open and enumeration refuse inside test binaries and their
