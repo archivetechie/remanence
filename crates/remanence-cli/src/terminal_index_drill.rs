@@ -582,6 +582,40 @@ impl<S: RawTapeSource> RawTapeSource for InstrumentedSource<S> {
         result
     }
 
+    fn position_report(&mut self) -> Result<remanence_parity::raw::RawPositionReport, ParityError> {
+        let report = self.inner.position_report()?;
+        self.cursor = (!report.logical_object_number_unknown).then_some(report.position);
+        Ok(report)
+    }
+
+    fn read_forward_records(
+        &mut self,
+        buf: &mut [u8],
+        size: u32,
+        count: u32,
+    ) -> remanence_parity::raw::RawForwardReadBatch {
+        let use_single = !self.unreadable_lbas.is_empty() || !self.replacement_records.is_empty();
+        #[cfg(test)]
+        let use_single = use_single || self.single_record_batches;
+        if use_single {
+            return remanence_parity::raw::RawForwardReadBatch {
+                batch: remanence_parity::raw::read_records_default(self, buf, size, count, count),
+                unconfirmed_boundary: false,
+            };
+        }
+        let before = self.cursor;
+        let result = self.inner.read_forward_records(buf, size, count);
+        if let Some(before) = before {
+            self.read_lbas
+                .extend((0..result.batch.records_read).map(|n| before.lba + u64::from(n)));
+        }
+        self.cursor = match result.batch.end {
+            remanence_parity::raw::RawReadEnd::Complete => result.batch.position_after,
+            _ => None,
+        };
+        result
+    }
+
     fn position(&mut self) -> Result<PhysicalPositionHint, remanence_parity::ParityError> {
         let position = self.inner.position()?;
         self.cursor = Some(position);

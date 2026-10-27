@@ -561,42 +561,47 @@ pub(crate) fn handle_drive_verify_tape_index(
 ) -> Result<pb::TapeIndexVerification, Status> {
     let io = drive.begin_verification_io();
     let _verification = drive.verification_context().verification();
-    if let Some((handle, _)) = &operation {
-        crate::tape_verification::check_cancelled(handle)?;
-    }
-    session_open_short_probe_or_load(
-        index,
-        drive,
-        SessionOpenReadinessContext {
-            action: "fully verify terminal tape index",
-            bay,
-            library_serial,
+    let mut route_status = remanence_parity::VerificationRouteStatus {
+        route: cfg.verification_route,
+        fell_back: false,
+        fallback_reason: None,
+    };
+    let mut result = (|| {
+        if let Some((handle, _)) = &operation {
+            crate::tape_verification::check_cancelled(handle)?;
+        }
+        session_open_short_probe_or_load(
+            index,
+            drive,
+            SessionOpenReadinessContext {
+                action: "fully verify terminal tape index",
+                bay,
+                library_serial,
+                barcode,
+                source_slot,
+                drive_serial,
+                needs_drive_load,
+            },
+        )?;
+        if let Some((handle, _)) = &operation {
+            crate::tape_verification::check_cancelled(handle)?;
+        }
+        session_open_reject_tape_io_fences(
+            index,
+            &tape_uuid,
             barcode,
-            source_slot,
-            drive_serial,
-            needs_drive_load,
-        },
-    )?;
-    if let Some((handle, _)) = &operation {
-        crate::tape_verification::check_cancelled(handle)?;
-    }
-    session_open_reject_tape_io_fences(
-        index,
-        &tape_uuid,
-        barcode,
-        "fully verify terminal tape index",
-    )?;
-    let context = drive.verification_context();
-    let _control = operation.as_ref().map(|(handle, progress)| {
-        let progress = progress.clone();
-        context.control(
-            handle.cancel_flag(),
-            std::sync::Arc::new(move |phase, bytes, file| {
-                progress.publish(phase, bytes, file);
-            }),
-        )
-    });
-    let result = (|| {
+            "fully verify terminal tape index",
+        )?;
+        let context = drive.verification_context();
+        let _control = operation.as_ref().map(|(handle, progress)| {
+            let progress = progress.clone();
+            context.control(
+                handle.cancel_flag(),
+                std::sync::Arc::new(move |phase, bytes, file| {
+                    progress.publish(phase, bytes, file);
+                }),
+            )
+        });
         let prepared = prepare_catalog_recovery_read(index, drive, &tape_uuid)?;
         let hints = &prepared.hints;
         let block_size = hints.block_size;
@@ -610,16 +615,25 @@ pub(crate) fn handle_drive_verify_tape_index(
                 &tape_uuid,
                 block_size,
                 remanence_parity::ScanMode::Recovery(hints),
+                cfg.verification_route,
+                |status| {
+                    route_status = status;
+                    if let Some((_, progress)) = &operation {
+                        progress.route(status);
+                    }
+                },
             )
             .map_err(status_from_terminal_index_verification_error)?
         };
         let mut report = terminal_verification_to_proto(tape_uuid, outcome);
-        let io = io.finish();
-        log_verification_io(&io);
-        report.io = Some(verification_io_to_proto(io));
         prepared.append_provenance(&mut report.detail);
         Ok(report)
     })();
+    let io = io.finish();
+    log_verification_io(&io, route_status);
+    if let Ok(report) = &mut result {
+        report.io = Some(verification_io_to_proto(io));
+    }
     // A late cancel suppresses a verdict, never an unrelated error.
     match result {
         Ok(_)
@@ -1020,7 +1034,10 @@ pub(crate) const fn terminal_replica_failure_name(
 }
 
 /// Emit the passive phase split on the drive actor after collection finishes.
-fn log_verification_io(io: &remanence_library::verification_io::VerificationIo) {
+fn log_verification_io(
+    io: &remanence_library::verification_io::VerificationIo,
+    route: remanence_parity::VerificationRouteStatus,
+) {
     use remanence_library::verification_io::VerificationPhase;
     for (phase, counts) in VerificationPhase::ALL
         .into_iter()
@@ -1040,6 +1057,9 @@ fn log_verification_io(io: &remanence_library::verification_io::VerificationIo) 
         tracing::info!(
             target: "remanence_verify_diag",
             phase,
+            route = route.route.name(),
+            one_pass_fell_back = route.fell_back,
+            fallback_reason = route.fallback_reason.unwrap_or(""),
             elapsed_ms = counts.elapsed_ms,
             command_ms = counts.command_ms,
             max_command_ms = counts.max_command_ms,
@@ -1101,5 +1121,50 @@ pub fn verification_io_to_proto(
             .collect(),
         recovered_lbas: io.recovered_lbas,
         recovered_unknown_addresses: io.recovered_unknown_addresses,
+    }
+}
+
+#[cfg(test)]
+mod route_log_tests {
+    use super::*;
+
+    /// The diagnostic event identifies the current route and a discarded attempt.
+    #[test]
+    fn verification_log_records_route_and_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("verification.log");
+        let file = std::fs::File::create(&path).unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || file.try_clone().unwrap())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for (route, fell_back) in [
+                (remanence_parity::VerificationRoute::OnePass, false),
+                (remanence_parity::VerificationRoute::Walk, true),
+            ] {
+                log_verification_io(
+                    &Default::default(),
+                    remanence_parity::VerificationRouteStatus {
+                        route,
+                        fell_back,
+                        fallback_reason: fell_back.then_some("tape_io"),
+                    },
+                );
+            }
+        });
+        let log = std::fs::read_to_string(path).unwrap();
+        assert!(
+            log.lines().any(|line| line.contains("route=\"one_pass\"")
+                && line.contains("one_pass_fell_back=false")),
+            "{log}"
+        );
+        assert!(
+            log.lines().any(|line| line.contains("route=\"walk\"")
+                && line.contains("one_pass_fell_back=true")
+                && line.contains("fallback_reason=\"tape_io\"")),
+            "{log}"
+        );
     }
 }

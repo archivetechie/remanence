@@ -5,6 +5,13 @@
 //! absolute reads. It never classifies or walks Object files. Replica payloads
 //! are decoded through the existing fixed-slot streaming codec.
 
+mod one_pass;
+#[cfg(any(test, feature = "test-support"))]
+pub use one_pass::verify_terminal_index_one_pass_budget_for_test;
+pub use one_pass::{
+    verify_terminal_index_full_with_route, VerificationRoute, VerificationRouteStatus,
+};
+
 #[cfg(test)]
 use crate::bot_recovery::{
     recover_terminal_inventory_from_bot, reject_readable_foreign_bot_bootstrap,
@@ -878,29 +885,7 @@ fn verify_terminal_index_full_inner<V: ProtectedPass>(
         .phase(remanence_library::verification_io::VerificationPhase::Walk);
 
     match verify_terminal_index_strict::<V>(source, tape_uuid, block_size, mode) {
-        Ok(complete) => {
-            let replicas = complete
-                .replicas
-                .map(|summary| TerminalReplicaEvidence::Valid { summary });
-            let separations = complete
-                .separation_interior_records
-                .map(|interior_record_count| TerminalSeparationEvidence::Valid {
-                    interior_record_count,
-                });
-            Ok(TerminalIndexVerificationOutcome::VerifiedComplete(
-                Box::new(TerminalIndexVerification {
-                    edition: complete.edition,
-                    selected_payload: complete.replicas[2],
-                    replicas,
-                    separations,
-                    measured_eod: complete.measured_eod,
-                    verified_prefix_tape_file_count: complete.verified_prefix_tape_file_count,
-                    verified_prefix_record_count: complete.verified_prefix_record_count,
-                    measured_tape_file_count: complete.measured_tape_file_count,
-                    protected: complete.protected,
-                }),
-            ))
-        }
+        Ok(complete) => Ok(complete_outcome(complete)),
         Err(error) if verification_error_is_physical_damage(&error) => {
             verify_terminal_index_after_damage::<V>(
                 source,
@@ -913,6 +898,29 @@ fn verify_terminal_index_full_inner<V: ProtectedPass>(
         }
         Err(error) => Err(error),
     }
+}
+
+/// Construct the common complete verdict from accepted physical evidence.
+fn complete_outcome(complete: TerminalIndexCompleteEvidence) -> TerminalIndexVerificationOutcome {
+    let replicas = complete
+        .replicas
+        .map(|summary| TerminalReplicaEvidence::Valid { summary });
+    let separations = complete
+        .separation_interior_records
+        .map(|interior_record_count| TerminalSeparationEvidence::Valid {
+            interior_record_count,
+        });
+    TerminalIndexVerificationOutcome::VerifiedComplete(Box::new(TerminalIndexVerification {
+        edition: complete.edition,
+        selected_payload: complete.replicas[2],
+        replicas,
+        separations,
+        measured_eod: complete.measured_eod,
+        verified_prefix_tape_file_count: complete.verified_prefix_tape_file_count,
+        verified_prefix_record_count: complete.verified_prefix_record_count,
+        measured_tape_file_count: complete.measured_tape_file_count,
+        protected: complete.protected,
+    }))
 }
 
 fn verification_error_is_physical_damage(error: &TerminalIndexVerificationError) -> bool {
@@ -1277,6 +1285,17 @@ fn verify_terminal_index_after_damage<V: ProtectedPass>(
 fn walked_verification_scheme(
     walked: &ScanWalkResult,
 ) -> Result<Option<crate::model::ParityScheme>, String> {
+    verification_scheme(
+        &walked.bootstrap_candidates,
+        walked.bootstrap_recovery_hints.as_ref(),
+    )
+}
+
+/// Shared scheme selection for walked and observed bootstrap evidence.
+pub(crate) fn verification_scheme(
+    candidates: &[crate::scan::ScanBootstrapCandidate],
+    hints: Option<&crate::scan::ScanRecoveryHints>,
+) -> Result<Option<crate::model::ParityScheme>, String> {
     let scheme_of_record = |record: &crate::bootstrap::ParitySchemeRecord| {
         let scheme = crate::model::ParityScheme {
             id: crate::model::SchemeId::new_owned(record.id.clone()),
@@ -1287,7 +1306,7 @@ fn walked_verification_scheme(
         scheme.validate().map_err(|error| error.to_string())?;
         Ok(Some(scheme))
     };
-    if let Some(candidate) = walked.bootstrap_candidates.first() {
+    if let Some(candidate) = candidates.first() {
         if candidate.payload.no_parity_flag {
             return Ok(None);
         }
@@ -1296,7 +1315,7 @@ fn walked_verification_scheme(
             None => Err("the bootstrap records no scheme".to_string()),
         };
     }
-    match &walked.bootstrap_recovery_hints {
+    match hints {
         Some(hints) => match &hints.scheme {
             crate::ParityConfig::Scheme(scheme) => Ok(Some(scheme.clone())),
             crate::ParityConfig::None => Ok(None),
@@ -1655,7 +1674,7 @@ fn verify_terminal_index_strict<V: ProtectedPass>(
         tape_uuid,
         block_size,
         layout,
-        ReplicaRowCheck::AgainstMeasured(&walked.map.entries()[..measured.prefix_len]),
+        ReplicaRowCheck::AgainstMeasured(measured.prefix),
     )?;
     let separation_interior_records = verify_terminal_separations(
         source,
@@ -1670,7 +1689,7 @@ fn verify_terminal_index_strict<V: ProtectedPass>(
         block_size,
         &walked,
         &edition,
-        &rows,
+        &rows[0],
         vec![],
     )?;
     Ok(TerminalIndexCompleteEvidence {
@@ -1738,17 +1757,17 @@ fn plan_terminal_verification(
 }
 
 /// Counts established by checking the walked map against the terminal layout.
-struct MeasuredPrefixEvidence {
+struct MeasuredPrefixEvidence<'a> {
     expected_file_count: u64,
-    prefix_len: usize,
+    prefix: &'a [TapeFileMapEntry],
     verified_prefix_record_count: u64,
 }
 
 /// Check truncation, damage, terminal geometry and prefix counts without tape I/O.
-fn check_measured_prefix(
-    walked: &ScanWalkResult,
+fn check_measured_prefix<'a>(
+    walked: &'a ScanWalkResult,
     layout: &TerminalTailLayout,
-) -> Result<MeasuredPrefixEvidence, TerminalIndexVerificationError> {
+) -> Result<MeasuredPrefixEvidence<'a>, TerminalIndexVerificationError> {
     if let Some(truncation) = walked.truncation.as_ref() {
         return Err(TerminalIndexVerificationError::PrefixTruncated {
             tape_file_number: truncation.tape_file_number,
@@ -1798,7 +1817,7 @@ fn check_measured_prefix(
 
     Ok(MeasuredPrefixEvidence {
         expected_file_count,
-        prefix_len,
+        prefix: physical_prefix,
         verified_prefix_record_count,
     })
 }
@@ -1807,8 +1826,6 @@ fn check_measured_prefix(
 #[derive(Clone, Copy)]
 enum ReplicaRowCheck<'a> {
     AgainstMeasured(&'a [TapeFileMapEntry]),
-    // Reserved for verification that measures the prefix after reading the index.
-    #[allow(dead_code)]
     CollectOnly,
 }
 
@@ -1816,10 +1833,10 @@ enum ReplicaRowCheck<'a> {
 struct TerminalReplicaSetEvidence {
     edition: TapeIndexEditionPlan,
     replicas: [TapeIndexReplicaPayloadSummary; 3],
-    rows: Vec<TapeIndexReplicaMapEntry>,
+    rows: [Vec<TapeIndexReplicaMapEntry>; 3],
 }
 
-/// Validate all replicas, retaining the first replica's structural rows.
+/// Validate all replicas, retaining every replica's structural rows.
 /// With CollectOnly, a row disagreement followed by a payload fault reports the
 /// payload fault. The strict path therefore keeps AgainstMeasured so the first
 /// disagreeing row fails inside the streaming callback before later payload faults.
@@ -1833,7 +1850,7 @@ fn verify_terminal_replicas(
     let mut replica_summaries = Vec::with_capacity(usize::from(TERMINAL_INDEX_REPLICA_COUNT));
     let mut edition: Option<TapeIndexEditionPlan> = None;
     // Retain the structural rows to scope the protected-content pass.
-    let mut rows: Vec<TapeIndexReplicaMapEntry> = Vec::new();
+    let mut rows: [Vec<TapeIndexReplicaMapEntry>; 3] = Default::default();
     for ordinal in 1..=TERMINAL_INDEX_REPLICA_COUNT {
         let envelope = validate_member_envelope(source, tape_uuid, block_size, layout, ordinal)
             .map_err(|error| member_error_to_verification(ordinal, error))?;
@@ -1881,9 +1898,7 @@ fn verify_terminal_replicas(
                 }
             }
         })?;
-        if rows.is_empty() {
-            rows = replica_rows_seen;
-        }
+        rows[usize::from(ordinal - 1)] = replica_rows_seen;
         if let ReplicaRowCheck::AgainstMeasured(physical_prefix) = row_check {
             check_measured_row_count(ordinal, entry_index, physical_prefix.len())?;
         }
@@ -1913,7 +1928,7 @@ fn verify_terminal_replicas(
 }
 
 /// Compare one canonical row at its stream index, allocating only on disagreement.
-fn check_row_against_measured(
+pub(crate) fn check_row_against_measured(
     entry: &TapeIndexReplicaMapEntry,
     entry_index: usize,
     physical_prefix: &[TapeFileMapEntry],
@@ -1952,7 +1967,6 @@ fn check_measured_row_count(
 /// Compare collected rows without I/O, using the streaming check's first mismatch.
 /// CollectOnly validates the payload before this check, so a later payload fault
 /// takes precedence over a row disagreement; strict verification checks rows inline.
-#[allow(dead_code)] // Used when the prefix is measured after replica collection.
 fn check_rows_against_measured(
     ordinal: u16,
     rows: &[TapeIndexReplicaMapEntry],
@@ -2788,6 +2802,7 @@ pub fn verify_terminal_index_step1_for_test(
 
 #[cfg(test)]
 mod tests {
+    mod one_pass_tests;
     use super::*;
     use crate::raw::RawReadOutcome;
     use crate::tape_index_replica::{
@@ -2871,11 +2886,15 @@ mod tests {
         Filemark,
     }
 
+    #[derive(Clone)]
     struct RecordingSource {
         records: Vec<Record>,
         cursor: usize,
         read_lbas: Vec<u64>,
         eod_calls: u64,
+        duplicate_at: Option<usize>,
+        duplicated: bool,
+        spaced_from: Vec<u64>,
         read_fault: Option<(u64, TestReadFault)>,
         configure_fault: Option<TestReadFault>,
         locate_fault: Option<(u64, TestReadFault)>,
@@ -2883,6 +2902,7 @@ mod tests {
 
     #[derive(Clone, Copy)]
     enum TestReadFault {
+        Cancelled,
         Medium,
         DeferredFixedMedium,
         DeferredDescriptorMedium,
@@ -2893,6 +2913,7 @@ mod tests {
     impl TestReadFault {
         fn error(self) -> ParityError {
             ParityError::TapeIo(match self {
+                Self::Cancelled => TapeIoError::Cancelled,
                 Self::Medium => TapeIoError::CheckCondition(
                     remanence_library::scsi::ScsiError::CheckCondition {
                         sense: vec![0x72, 0x03, 0x11, 0x00],
@@ -2937,6 +2958,9 @@ mod tests {
                 cursor: 0,
                 read_lbas: Vec::new(),
                 eod_calls: 0,
+                duplicate_at: None,
+                duplicated: false,
+                spaced_from: Vec::new(),
                 read_fault: None,
                 configure_fault: None,
                 locate_fault: None,
@@ -3001,6 +3025,7 @@ mod tests {
             &mut self,
             count: i64,
         ) -> Result<crate::SpaceFilemarksOutcome, ParityError> {
+            self.spaced_from.push(self.cursor as u64);
             let mut spaced = 0i64;
             if count >= 0 {
                 while self.cursor < self.records.len() && spaced < count {
@@ -3069,12 +3094,89 @@ mod tests {
             }
         }
 
+        fn read_forward_records(
+            &mut self,
+            buf: &mut [u8],
+            size: u32,
+            count: u32,
+        ) -> crate::raw::RawForwardReadBatch {
+            if self.duplicate_at == Some(self.cursor) && !self.duplicated {
+                self.duplicated = true;
+                let Record::Block(bytes) = &self.records[self.cursor - 1] else {
+                    unreachable!()
+                };
+                buf[..size as usize].copy_from_slice(bytes);
+                return crate::raw::RawForwardReadBatch {
+                    batch: crate::raw::RawReadBatch {
+                        records_read: 1,
+                        position_after: Some(PhysicalPositionHint::new(self.cursor as u64)),
+                        end: crate::raw::RawReadEnd::Complete,
+                    },
+                    unconfirmed_boundary: false,
+                };
+            }
+            let count = if self.duplicate_at.is_some() {
+                1
+            } else {
+                count
+            };
+            crate::raw::RawForwardReadBatch {
+                batch: crate::raw::read_records_default(self, buf, size, count, count),
+                unconfirmed_boundary: false,
+            }
+        }
+
         fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
             Ok(PhysicalPositionHint::new(
                 u64::try_from(self.cursor)
                     .map_err(|_| ParityError::Invariant("test cursor does not fit u64"))?,
             ))
         }
+    }
+
+    /// Every terminal fixture that invokes full verification also runs a fresh routed source.
+    fn verify_terminal_index_full(
+        source: &mut RecordingSource,
+        uuid: &[u8; 16],
+        size: u32,
+    ) -> Result<TerminalIndexVerificationOutcome, TerminalIndexVerificationError> {
+        let mut fresh = source.clone();
+        fresh.cursor = 0;
+        fresh.read_lbas.clear();
+        let walk = super::verify_terminal_index_full(source, uuid, size);
+        let mut fallback = false;
+        let mut reason = None;
+        let observed = verify_terminal_index_full_with_route(
+            &mut crate::raw::CancellableRawSource(fresh),
+            uuid,
+            size,
+            None,
+            ScanMode::Standard,
+            VerificationRoute::OnePass,
+            |status| {
+                fallback |= status.fell_back;
+                reason = status.fallback_reason;
+            },
+        );
+        if let (Ok(walk), Ok(observed)) = (&walk, &observed) {
+            assert_eq!(walk, observed);
+            if walk.is_complete_tape() {
+                assert!(!fallback);
+            }
+        }
+        assert_eq!(format!("{walk:?}"), format!("{observed:?}"));
+        println!(
+            "terminal fixture route: {} reason={}",
+            if fallback {
+                "fallback"
+            } else if observed.is_ok() {
+                "success"
+            } else {
+                "fault"
+            },
+            reason.unwrap_or("none")
+        );
+        walk
     }
 
     struct TripleFixture {
@@ -3216,7 +3318,7 @@ mod tests {
         )
         .unwrap();
         let deferred =
-            check_rows_against_measured(1, &collected.rows, physical_prefix).unwrap_err();
+            check_rows_against_measured(1, &collected.rows[0], physical_prefix).unwrap_err();
         let streaming = verify_terminal_replicas(
             &mut RecordingSource::new(fixture.records),
             &TAPE_UUID,
@@ -3636,6 +3738,7 @@ mod tests {
             block_size: BLOCK_SIZE,
             scheme: crate::ParityConfig::None,
         };
+        let mut fresh = source.clone();
         let outcome = verify_terminal_index_full_with_scan_mode(
             &mut source,
             &TAPE_UUID,
@@ -3644,6 +3747,20 @@ mod tests {
             ScanMode::Recovery(&hints),
         )
         .expect("supplied values permit verification");
+        let mut fallback = false;
+        let routed = verify_terminal_index_full_with_route(
+            &mut fresh,
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            None,
+            ScanMode::Recovery(&hints),
+            VerificationRoute::OnePass,
+            |status| fallback |= status.fell_back,
+        )
+        .unwrap();
+        assert_eq!(outcome, routed);
+        assert!(!fallback);
+        println!("terminal fixture route: direct walk, no_parity");
         assert!(!outcome.is_complete_tape());
         assert!(!outcome.protected().prefix_damage.is_empty());
         assert!(outcome

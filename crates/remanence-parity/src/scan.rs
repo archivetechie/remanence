@@ -9,9 +9,8 @@
 //! Terminal replica/separation magic is structurally reserved: damaged terminal
 //! framing remains typed control evidence so it cannot consume Object ordinals.
 
-// The file reader is exercised independently until verification selects it.
-#[allow(dead_code)]
-mod forward_file;
+// The walk and one-pass verification share the same classification ladder.
+pub(crate) mod forward_file;
 use forward_file::{
     FileObservation, ForwardFileReader, HeadProvenance, ObservedClassificationSource,
 };
@@ -966,6 +965,7 @@ where
         mode,
         control,
         bootstrap_observer,
+        None,
     )
 }
 
@@ -978,6 +978,7 @@ fn reconstruct_with_reader<F>(
     mode: ScanMode<'_>,
     control: &mut F,
     bootstrap_observer: &mut dyn FnMut(&ScanBootstrapCandidate),
+    mut observer: Option<&mut dyn PrefixObserver>,
 ) -> Result<ScanReconstructionOutcome, ParityError>
 where
     F: FnMut(&ScanWalkProgress) -> ScanWalkControl,
@@ -1022,23 +1023,43 @@ where
         } else {
             source.position()?
         };
+        if let Some(observer) = observer.as_ref() {
+            if file_start.lba >= observer.end_lba() {
+                if file_start.lba != observer.end_lba() {
+                    return Err(filemark_scan_error("measured prefix runs past replica A"));
+                }
+                break;
+            }
+        }
+        let file_number = builder.next_tape_file_number()?;
+        let (first_blocks, tail_blocks) = match observer.as_deref_mut() {
+            Some(observer) => observer.start_file(file_number)?,
+            None => (1, 1),
+        };
         let at_bot = builder.next_tape_file_number()? == 0 && file_start.lba == 0;
         // Supplied values judge only tape file 0's record at LBA 0 (REM-PARITY 8.4).
         let bot_hints = match mode {
             ScanMode::Recovery(hints) if at_bot => Some(hints),
             _ => None,
         };
+        let read_through = observer
+            .as_ref()
+            .is_none_or(|observer| observer.read_through(file_number));
         let mut observation = reader
             .as_mut()
             .map(|reader| {
+                reader.read_through = read_through;
                 reader.read_file(
                     source,
                     builder.next_tape_file_number()?,
                     file_start,
                     provenance,
-                    1,
-                    1,
-                    &mut |_, _| Ok(()),
+                    first_blocks,
+                    tail_blocks,
+                    &mut |position, bytes| match observer.as_deref_mut() {
+                        Some(observer) => observer.block(file_number, position, bytes),
+                        None => Ok(()),
+                    },
                 )
             })
             .transpose()?;
@@ -1156,6 +1177,9 @@ where
                     &mut damaged_regions,
                 )? {
                     bootstrap_observer(&candidate);
+                    if let Some(observer) = observer.as_deref_mut() {
+                        observer.bootstrap(&candidate);
+                    }
                     bootstrap_candidates.push(candidate);
                 }
                 if observation
@@ -1226,6 +1250,19 @@ where
                 }
             }
         }
+        if let Some(observer) = observer.as_deref_mut() {
+            let observation = observation.take().expect("prefix uses forward reader");
+            let moved = observer.finish_file(
+                source,
+                observation,
+                builder.entries(),
+                &bootstrap_candidates,
+            )?;
+            if moved {
+                source.locate_physical(forward_head)?;
+                provenance = HeadProvenance::Locate;
+            }
+        }
     }
 
     if !saw_file && truncation.is_none() {
@@ -1240,6 +1277,70 @@ where
         bootstrap_candidates,
         damaged_regions,
     }))
+}
+
+/// Route-owned consumers receive borrowed blocks and one owned file observation.
+pub(crate) trait PrefixObserver {
+    fn bootstrap(&mut self, candidate: &ScanBootstrapCandidate);
+    fn end_lba(&self) -> u64;
+    fn read_through(&self, file: u64) -> bool;
+    fn start_file(&mut self, file: u64) -> Result<(usize, usize), ParityError>;
+    fn block(
+        &mut self,
+        file: u64,
+        position: PhysicalPositionHint,
+        bytes: &[u8],
+    ) -> Result<(), ParityError>;
+    /// Return whether missing observations required live positioning.
+    fn finish_file(
+        &mut self,
+        source: &mut dyn RawTapeSource,
+        observation: FileObservation,
+        measured: &[TapeFileMapEntry],
+        candidates: &[ScanBootstrapCandidate],
+    ) -> Result<bool, ParityError>;
+}
+
+/// Measure only through the accepted terminal start, using the walk's classifier.
+pub(crate) fn scan_observed_prefix(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    mode: ScanMode<'_>,
+    observer: &mut dyn PrefixObserver,
+    final_parity_map: Option<DecodedParityMapTapeFile>,
+) -> Result<ScanWalkResult, ParityError> {
+    let ScanReconstructionOutcome::Complete(mut reconstructed) = reconstruct_with_reader(
+        source,
+        true,
+        tape_uuid,
+        block_size,
+        mode,
+        &mut |_| ScanWalkControl::Continue,
+        &mut |_| {},
+        Some(observer),
+    )?
+    else {
+        unreachable!("unconditional prefix reader")
+    };
+    if let Some(directory) = &final_parity_map {
+        if let Some(reconciled) = reconcile_measured_sidecars(&reconstructed.map, directory)? {
+            match ScopedFilemarkMap::validate_against_final_parity_map(reconciled, directory) {
+                Ok(confirmed) => reconstructed.map = confirmed.map,
+                Err(ParityError::FilemarkMapDigestMismatch { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(ScanWalkResult {
+        final_parity_map: final_parity_map.map(Box::new),
+        bootstrap_recovery_hints: reconstructed.bootstrap_recovery_hints,
+        map: reconstructed.map,
+        truncation: reconstructed.truncation,
+        truncation_candidate_kind: reconstructed.truncation_candidate_kind,
+        bootstrap_candidates: reconstructed.bootstrap_candidates,
+        damaged_regions: reconstructed.damaged_regions,
+    })
 }
 
 /// Select the walk's measurement for files without sequential position proof.
@@ -1369,6 +1470,7 @@ pub fn forward_file_scan_for_test(
         mode,
         &mut |_| ScanWalkControl::Continue,
         &mut |_| {},
+        None,
     )?
     else {
         unreachable!("unconditional reader")

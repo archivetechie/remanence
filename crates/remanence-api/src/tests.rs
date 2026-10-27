@@ -6889,6 +6889,7 @@ async fn drive_target_read_open_uses_virtual_world_actor_and_proves_bot_identity
         managed_library_serials: Arc::new(HashSet::from([LIBRARY_SERIAL.to_string()])),
         cleaning: remanence_state::CleaningConfig::default(),
         tape_io: remanence_state::TapeIoConfig::default(),
+        verification_route: remanence_parity::VerificationRoute::Walk,
         io_memory: crate::io_memory::IoMemoryReservation::new(
             remanence_state::DEFAULT_IO_MEMORY_CEILING_BYTES,
         )

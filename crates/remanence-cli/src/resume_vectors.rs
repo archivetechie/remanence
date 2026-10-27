@@ -351,6 +351,58 @@ impl<'a> ReadTrace<'a> {
     }
 }
 impl RawTapeSource for ReadTrace<'_> {
+    fn verification_context(&self) -> remanence_library::verification_io::VerificationContext {
+        self.raw.verification_context()
+    }
+    fn position_report(&mut self) -> Result<remanence_parity::raw::RawPositionReport, ParityError> {
+        self.raw.position_report()
+    }
+    fn read_records(
+        &mut self,
+        buf: &mut [u8],
+        size: u32,
+        count: u32,
+        remaining: u32,
+    ) -> remanence_parity::raw::RawReadBatch {
+        let before = match self.raw.position() {
+            Ok(position) => position,
+            Err(error) => {
+                return remanence_parity::raw::RawReadBatch {
+                    records_read: 0,
+                    position_after: None,
+                    end: remanence_parity::raw::RawReadEnd::Error(error),
+                }
+            }
+        };
+        let batch = self.raw.read_records(buf, size, count, remaining);
+        self.lbas
+            .extend((0..batch.records_read).map(|n| before.lba + u64::from(n)));
+        batch
+    }
+    fn read_forward_records(
+        &mut self,
+        buf: &mut [u8],
+        size: u32,
+        count: u32,
+    ) -> remanence_parity::raw::RawForwardReadBatch {
+        let before = match self.raw.position() {
+            Ok(position) => position,
+            Err(error) => {
+                return remanence_parity::raw::RawForwardReadBatch {
+                    batch: remanence_parity::raw::RawReadBatch {
+                        records_read: 0,
+                        position_after: None,
+                        end: remanence_parity::raw::RawReadEnd::Error(error),
+                    },
+                    unconfirmed_boundary: false,
+                }
+            }
+        };
+        let batch = self.raw.read_forward_records(buf, size, count);
+        self.lbas
+            .extend((0..batch.batch.records_read).map(|n| before.lba + u64::from(n)));
+        batch
+    }
     fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
         self.end_of_data_locates += 1;
         self.raw.locate_end_of_data()

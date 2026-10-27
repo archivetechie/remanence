@@ -98,64 +98,101 @@ pub(super) fn map_transfer_scsi(
     }
 }
 
+/// Typed crediting result for a fixed verification READ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerificationReadCompletion {
+    /// The completion is io error.
+    IoError,
+    /// The completion is wrong length.
+    WrongLength,
+    /// The completion is unclean read.
+    UncleanRead,
+    /// The completion is unconfirmed boundary.
+    UnconfirmedBoundary,
+    /// The completion is medium error.
+    MediumError,
+    /// The completion is recovered error.
+    RecoveredError,
+    /// The completion is filemark.
+    Filemark,
+    /// The completion is end of data.
+    EndOfData,
+}
+
+impl VerificationReadCompletion {
+    /// Stable diagnostic label.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::IoError => "io_error",
+            Self::WrongLength => "wrong_length",
+            Self::UncleanRead => "unclean_read",
+            Self::UnconfirmedBoundary => "unconfirmed_boundary",
+            Self::MediumError => "medium_error",
+            Self::RecoveredError => "recovered_error",
+            Self::Filemark => "filemark",
+            Self::EndOfData => "end_of_data",
+        }
+    }
+}
+
 /// Decode boundary/error completions without the verification reader's LOCATE redo.
 /// Only complete records in a current, aligned filemark/EOD response are credited.
 pub fn verification_read_completion(
     error: &TapeIoError,
     size: u32,
     requested: u32,
-) -> (u32, &'static str) {
+) -> (u32, VerificationReadCompletion) {
     if size == 0 || requested == 0 {
-        return (0, "io_error");
+        return (0, VerificationReadCompletion::IoError);
     }
     let source = match error {
         TapeIoError::CheckCondition(source) => source,
         TapeIoError::CheckConditionWithResidue { source, .. } => source,
         TapeIoError::GoodReadLengthMismatch { .. } | TapeIoError::ReadBufferTooSmall { .. } => {
-            return (0, "wrong_length")
+            return (0, VerificationReadCompletion::WrongLength)
         }
         TapeIoError::OperationFailed(message)
             if message.starts_with("unclean verification batch:") =>
         {
-            return (0, "unclean_read")
+            return (0, VerificationReadCompletion::UncleanRead)
         }
-        _ => return (0, "io_error"),
+        _ => return (0, VerificationReadCompletion::IoError),
     };
     let ScsiError::CheckCondition {
         sense,
         bytes_transferred: kernel_bytes,
     } = source
     else {
-        return (0, "io_error");
+        return (0, VerificationReadCompletion::IoError);
     };
     let Some(sense) = decode_sense(sense) else {
-        return (0, "io_error");
+        return (0, VerificationReadCompletion::IoError);
     };
     if sense.is_deferred() {
         return (
             0,
             if (sense.key == 0 && sense.filemark && !sense.ili && !sense.eom) || sense.key == 8 {
-                "unconfirmed_boundary"
+                VerificationReadCompletion::UnconfirmedBoundary
             } else {
-                "io_error"
+                VerificationReadCompletion::IoError
             },
         );
     }
     if sense.ili {
-        return (0, "wrong_length");
+        return (0, VerificationReadCompletion::WrongLength);
     }
     if sense.key == 3 {
-        return (0, "medium_error");
+        return (0, VerificationReadCompletion::MediumError);
     }
     if sense.key == 1 {
-        return (0, "recovered_error");
+        return (0, VerificationReadCompletion::RecoveredError);
     }
     let boundary = if sense.key == 0 && sense.filemark && !sense.eom {
-        "filemark"
+        VerificationReadCompletion::Filemark
     } else if sense.key == 8 {
-        "end_of_data"
+        VerificationReadCompletion::EndOfData
     } else {
-        return (0, "io_error");
+        return (0, VerificationReadCompletion::IoError);
     };
     // Some hosts omit the kernel residual. Otherwise both independent counts
     // must confirm the same whole-block prefix; buffer capacity is not evidence.
@@ -163,7 +200,9 @@ pub fn verification_read_completion(
         ScsiError::CheckCondition { sense: bytes, .. } if sense.valid => information(bytes),
         _ => None,
     };
-    let records = residue.and_then(|r| u64::from(requested).checked_sub(r));
+    let records = residue
+        .filter(|&r| r >= 1)
+        .and_then(|r| u64::from(requested).checked_sub(r));
     if let Some(records) = records {
         let full_bytes = u64::from(size) * u64::from(requested);
         let kernel_bytes = u64::from(*kernel_bytes);
@@ -173,7 +212,7 @@ pub fn verification_read_completion(
             return (records as u32, boundary);
         }
     }
-    (0, "unconfirmed_boundary")
+    (0, VerificationReadCompletion::UnconfirmedBoundary)
 }
 
 #[cfg(test)]
@@ -196,7 +235,7 @@ mod tests {
                 (4, 2, true, None),
                 (12, 2, true, None),
                 (20, 2, true, None),
-                (16, 0, true, Some(4)),
+                (16, 0, true, None),
             ] {
                 let mut sense = vec![0; 18];
                 sense[0] = if valid { 0xf0 } else { 0x70 };
@@ -212,11 +251,11 @@ mod tests {
                     (
                         expected.unwrap_or(0),
                         if expected.is_none() {
-                            "unconfirmed_boundary"
+                            VerificationReadCompletion::UnconfirmedBoundary
                         } else if flags == 8 {
-                            "end_of_data"
+                            VerificationReadCompletion::EndOfData
                         } else {
-                            "filemark"
+                            VerificationReadCompletion::Filemark
                         }
                     ),
                     "kernel={kernel}, residue={residue}, valid={valid}"
@@ -241,9 +280,9 @@ mod tests {
                     bytes_transferred: 12,
                 };
                 let expected = if response == 0xf0 && kernel != 8 {
-                    (3, "filemark")
+                    (3, VerificationReadCompletion::Filemark)
                 } else {
-                    (0, "unconfirmed_boundary")
+                    (0, VerificationReadCompletion::UnconfirmedBoundary)
                 };
                 assert_eq!(verification_read_completion(&error, 4, 4), expected);
             }

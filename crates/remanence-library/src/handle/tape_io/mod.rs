@@ -17,7 +17,7 @@ pub mod model;
 /// Media readiness classification for TEST UNIT READY probes.
 pub mod readiness;
 mod transfer;
-pub use transfer::verification_read_completion;
+pub use transfer::{verification_read_completion, VerificationReadCompletion};
 
 use transfer::map_transfer_scsi;
 pub(crate) use transfer::transfer_bytes_from_sense;
@@ -951,7 +951,15 @@ impl super::DriveHandle {
     /// success; transport errors do, same as any other Layer 3a
     /// method.
     pub fn position(&mut self) -> Result<TapePosition, TapeIoError> {
-        self.position_report().map(|report| report.position)
+        self.position_report().and_then(|report| {
+            if report.logical_object_number_unknown {
+                Err(TapeIoError::OperationFailed(
+                    "READ POSITION reports unknown logical object number".into(),
+                ))
+            } else {
+                Ok(report.position)
+            }
+        })
     }
 
     /// Issue READ POSITION and preserve the long-form validity and file fields.
@@ -2030,17 +2038,20 @@ impl super::DriveHandle {
             remaining_records_in_file,
             true,
         )
+        .1
     }
 
     /// Strict forward file READ. The file reader verifies position at the
     /// filemark, so successful batches carry arithmetic positions without a
     /// periodic READ POSITION. Completion validation is shared with verification.
+    /// The first result is the issued record count, including on CHECK CONDITION;
+    /// zero means no READ command reaches the transport.
     pub fn read_block_batch_for_file_verification(
         &mut self,
         buf: &mut [u8],
         block_size_bytes: u32,
         requested_records: u32,
-    ) -> Result<ReadBatchOutcome, TapeIoError> {
+    ) -> (u32, Result<ReadBatchOutcome, TapeIoError>) {
         self.read_verification_batch(
             buf,
             block_size_bytes,
@@ -2057,73 +2068,83 @@ impl super::DriveHandle {
         requested_records: u32,
         remaining_records_in_file: u32,
         periodic_position_check: bool,
-    ) -> Result<ReadBatchOutcome, TapeIoError> {
-        self.ensure_data_command_state_valid(true)?;
-        if block_size_bytes == 0 || requested_records == 0 || remaining_records_in_file == 0 {
-            return Err(TapeIoError::InvalidRequest(ScsiError::InvalidInput(
-                "verification batch requires nonzero block size and record counts",
-            )));
-        }
-        let records = requested_records
-            .min(remaining_records_in_file)
-            .min(self.effective_read_batch_blocks_for(block_size_bytes));
-        let transfer_len = fixed_batch_len_bytes("verification batch", records, block_size_bytes)?;
-        if buf.len() < transfer_len as usize {
-            return Err(TapeIoError::InvalidRequest(ScsiError::InvalidInput(
-                "verification batch buffer is smaller than the selected transfer",
-            )));
-        }
-        self.seed_expected_position()?;
-        let op = AuditOp::TapeRead {
-            bay: self.bay_address(),
-            len: transfer_len,
-        };
-        let cdb = remanence_scsi::read_write::build_read_fixed_cdb(records);
-        self.fire_tape_started(op, &cdb);
-        self.transport.set_timeout_for(TimeoutClass::TapeIo);
-        let started = Instant::now();
-        let result = self
-            .transport
-            .execute_in(&cdb, &mut buf[..transfer_len as usize]);
-        let result = match result {
-            Ok(transfer)
-                if transfer.bytes_transferred == transfer_len && transfer.sense.is_none() =>
-            {
-                let position = if periodic_position_check {
-                    self.advance_expected_position(records, 0, u64::from(transfer_len))
-                } else {
-                    self.advance_expected_position_arithmetic(records, 0, u64::from(transfer_len))
+    ) -> (u32, Result<ReadBatchOutcome, TapeIoError>) {
+        let mut issued = 0;
+        let result = (|| {
+            self.ensure_data_command_state_valid(true)?;
+            if block_size_bytes == 0 || requested_records == 0 || remaining_records_in_file == 0 {
+                return Err(TapeIoError::InvalidRequest(ScsiError::InvalidInput(
+                    "verification batch requires nonzero block size and record counts",
+                )));
+            }
+            let records = requested_records
+                .min(remaining_records_in_file)
+                .min(self.effective_read_batch_blocks_for(block_size_bytes));
+            let transfer_len =
+                fixed_batch_len_bytes("verification batch", records, block_size_bytes)?;
+            if buf.len() < transfer_len as usize {
+                return Err(TapeIoError::InvalidRequest(ScsiError::InvalidInput(
+                    "verification batch buffer is smaller than the selected transfer",
+                )));
+            }
+            self.seed_expected_position()?;
+            let op = AuditOp::TapeRead {
+                bay: self.bay_address(),
+                len: transfer_len,
+            };
+            let cdb = remanence_scsi::read_write::build_read_fixed_cdb(records);
+            self.fire_tape_started(op, &cdb);
+            self.transport.set_timeout_for(TimeoutClass::TapeIo);
+            let started = Instant::now();
+            issued = records;
+            let result = self
+                .transport
+                .execute_in(&cdb, &mut buf[..transfer_len as usize]);
+            let result = match result {
+                Ok(transfer)
+                    if transfer.bytes_transferred == transfer_len && transfer.sense.is_none() =>
+                {
+                    let position = if periodic_position_check {
+                        self.advance_expected_position(records, 0, u64::from(transfer_len))
+                    } else {
+                        self.advance_expected_position_arithmetic(
+                            records,
+                            0,
+                            u64::from(transfer_len),
+                        )
                         .map(|position| {
                             PositionAfter::Computed(ComputedPosition::from_position(position))
                         })
-                };
-                position.map(|position| {
-                    ReadBatchOutcome::from_position_evidence(
-                        records,
-                        transfer.bytes_transferred,
-                        false,
-                        position,
-                    )
-                })
-            }
-            Ok(transfer) => Err(TapeIoError::OperationFailed(format!(
+                    };
+                    position.map(|position| {
+                        ReadBatchOutcome::from_position_evidence(
+                            records,
+                            transfer.bytes_transferred,
+                            false,
+                            position,
+                        )
+                    })
+                }
+                Ok(transfer) => Err(TapeIoError::OperationFailed(format!(
                 "unclean verification batch: transferred {} of {transfer_len} bytes, sense {:?}",
                 transfer.bytes_transferred, transfer.sense,
             ))),
-            Err(error) => Err(map_transfer_scsi(
-                error,
-                transfer_len,
-                Some(block_size_bytes),
-            )),
-        };
-        match &result {
-            Ok(_) => self.finish_tape_success(op, started.elapsed()),
-            Err(error) => {
-                self.mark_position_unknown();
-                self.finish_tape_error(op, error);
+                Err(error) => Err(map_transfer_scsi(
+                    error,
+                    transfer_len,
+                    Some(block_size_bytes),
+                )),
+            };
+            match &result {
+                Ok(_) => self.finish_tape_success(op, started.elapsed()),
+                Err(error) => {
+                    self.mark_position_unknown();
+                    self.finish_tape_error(op, error);
+                }
             }
-        }
-        result
+            result
+        })();
+        (issued, result)
     }
 
     /// Whether verification may arrange a LOCATE and one single-record fallback
@@ -3660,8 +3681,15 @@ impl super::DriveHandle {
     }
 
     fn read_position_inline_with_cdb(&mut self, cdb: &[u8]) -> Result<TapePosition, TapeIoError> {
-        self.read_position_report_with_cdb(cdb)
-            .map(|report| report.position)
+        self.read_position_report_with_cdb(cdb).and_then(|report| {
+            if report.logical_object_number_unknown {
+                Err(TapeIoError::OperationFailed(
+                    "READ POSITION reports unknown logical object number".into(),
+                ))
+            } else {
+                Ok(report.position)
+            }
+        })
     }
 
     fn read_position_report_with_cdb(
@@ -3675,7 +3703,11 @@ impl super::DriveHandle {
                 let bytes = (outcome.bytes_transferred as usize).min(buf.len());
                 match parse_read_position_long(&buf[..bytes]) {
                     Ok(position) => {
-                        self.record_device_position(position.position);
+                        if position.logical_object_number_unknown {
+                            self.mark_position_unknown();
+                        } else {
+                            self.record_device_position(position.position);
+                        }
                         Ok(position)
                     }
                     Err(err) => {

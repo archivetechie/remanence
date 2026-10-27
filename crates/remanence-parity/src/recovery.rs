@@ -984,6 +984,9 @@ impl DirectoryCache {
         *self = match read_final_sidecar_directory(source, &scoped_map.map, tape_uuid, block_size) {
             Ok(Some(directory)) => Self::Loaded(directory),
             Ok(None) | Err(ParityError::FilemarkMapDigestMismatch { .. }) => Self::Absent,
+            Err(ParityError::TapeIo(remanence_library::TapeIoError::Cancelled)) => {
+                return Err(remanence_library::TapeIoError::Cancelled.into());
+            }
             Err(_) => Self::Failed,
         };
         source.locate_physical(resume)?;

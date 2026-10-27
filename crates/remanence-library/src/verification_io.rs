@@ -25,10 +25,12 @@ pub enum VerificationPhase {
     FallbackData,
     /// Structural recovery from BOT.
     BotRecovery,
+    /// Forward measurement and observations of eligible prefix files.
+    OnePassPrefix,
 }
 impl VerificationPhase {
     /// Stable diagnostic names, in report order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Setup,
         Self::Walk,
         Self::ParityMap,
@@ -36,6 +38,7 @@ impl VerificationPhase {
         Self::ProtectedData,
         Self::FallbackData,
         Self::BotRecovery,
+        Self::OnePassPrefix,
     ];
     /// Wire/JSON name.
     pub fn name(self) -> &'static str {
@@ -47,6 +50,7 @@ impl VerificationPhase {
             Self::ProtectedData => "protected_data",
             Self::FallbackData => "fallback_data",
             Self::BotRecovery => "bot_recovery",
+            Self::OnePassPrefix => "one_pass_prefix",
         }
     }
 }
@@ -104,7 +108,7 @@ pub struct VerificationIo {
     /// Counts over every phase.
     pub total: IoCounts,
     /// Counts indexed by VerificationPhase::ALL.
-    pub phases: [IoCounts; 7],
+    pub phases: [IoCounts; VerificationPhase::ALL.len()],
     /// Monotonic elapsed time, including setup.
     pub elapsed_ms: u64,
     /// Protected LOCATE targets before the preceding protected read end.
@@ -129,8 +133,8 @@ struct State {
     position: Option<u64>,
     protected_end: Option<u64>,
     phase_started: Option<Instant>,
-    phase_elapsed: [Duration; 7],
-    phase_commands: [Duration; 7],
+    phase_elapsed: [Duration; VerificationPhase::ALL.len()],
+    phase_commands: [Duration; VerificationPhase::ALL.len()],
     command_elapsed: Duration,
 }
 
@@ -467,8 +471,8 @@ impl VerificationContext {
             state.position = None;
             state.protected_end = None;
             state.phase_started = Some(started);
-            state.phase_elapsed = [Duration::ZERO; 7];
-            state.phase_commands = [Duration::ZERO; 7];
+            state.phase_elapsed = [Duration::ZERO; VerificationPhase::ALL.len()];
+            state.phase_commands = [Duration::ZERO; VerificationPhase::ALL.len()];
             state.command_elapsed = Duration::ZERO;
         }
         VerificationIoSession { context, started }

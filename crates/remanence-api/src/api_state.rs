@@ -62,6 +62,7 @@ pub struct ApiState {
     pub(crate) checkpoint_max_bytes: u64,
     pub(crate) checkpoint_max_objects: u64,
     pub(crate) checkpoint_max_age_seconds: u64,
+    pub(crate) verification_route: remanence_parity::VerificationRoute,
     pub(crate) default_library_serial: Option<Arc<String>>,
     pub(crate) library_snapshot: Option<Arc<RwLock<Arc<LibrarySnapshot>>>>,
     pub(crate) live_status: Arc<LiveStatusState>,
@@ -166,6 +167,7 @@ impl ApiState {
         state.checkpoint_max_bytes = config.daemon.checkpoint_max_bytes;
         state.checkpoint_max_objects = config.daemon.checkpoint_max_objects;
         state.checkpoint_max_age_seconds = config.daemon.checkpoint_max_age_seconds;
+        state.verification_route = config.verification.route;
         Ok(state)
     }
 
@@ -231,6 +233,7 @@ impl ApiState {
             checkpoint_max_bytes: remanence_state::DEFAULT_CHECKPOINT_MAX_BYTES,
             checkpoint_max_objects: remanence_state::DEFAULT_CHECKPOINT_MAX_OBJECTS,
             checkpoint_max_age_seconds: remanence_state::DEFAULT_CHECKPOINT_MAX_AGE_SECONDS,
+            verification_route: remanence_parity::VerificationRoute::Walk,
             default_library_serial: None,
             library_snapshot: None,
             live_status: Arc::new(LiveStatusState::new(live_status_interval)),
@@ -395,6 +398,7 @@ impl ApiState {
             managed_library_serials: Arc::new(managed_library_serials),
             cleaning: config.cleaning.clone(),
             tape_io: config.tape_io.clone(),
+            verification_route: config.verification.route,
             io_memory: Arc::clone(&io_memory),
             write_admissions: crate::write_owner::WriteAdmissionCoordinator::default(),
             checkpoint_journal_dir: config.journal.dir.join("checkpoints"),
@@ -450,6 +454,7 @@ impl ApiState {
         state.checkpoint_max_bytes = config.daemon.checkpoint_max_bytes;
         state.checkpoint_max_objects = config.daemon.checkpoint_max_objects;
         state.checkpoint_max_age_seconds = config.daemon.checkpoint_max_age_seconds;
+        state.verification_route = config.verification.route;
         state.default_library_serial = default_library_serial;
         state.library_snapshot = Some(library_snapshot);
         state.drive_idle_unload_seconds = config.daemon.drive_idle_unload_seconds;

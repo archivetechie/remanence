@@ -3897,6 +3897,7 @@ fn test_write_owner_config(
         managed_library_serials: Arc::new(HashSet::from([serial])),
         cleaning: remanence_state::CleaningConfig::default(),
         tape_io: remanence_state::TapeIoConfig::default(),
+        verification_route: remanence_parity::VerificationRoute::Walk,
         io_memory: crate::io_memory::IoMemoryReservation::new(
             remanence_state::DEFAULT_IO_MEMORY_CEILING_BYTES,
         )
@@ -6065,6 +6066,7 @@ async fn changer_move_succeeds_and_publishes_snapshot_when_catalog_observation_f
         managed_library_serials: Arc::new(HashSet::from([library.serial.clone()])),
         cleaning: remanence_state::CleaningConfig::default(),
         tape_io: remanence_state::TapeIoConfig::default(),
+        verification_route: remanence_parity::VerificationRoute::Walk,
         io_memory: test_io_memory(),
         write_admissions: WriteAdmissionCoordinator::default(),
         checkpoint_journal_dir: temp.path().join("checkpoints"),
@@ -9429,6 +9431,15 @@ pub(crate) async fn daemon_append_recovery_roundtrip(
 fn verification_walk_cancellation_has_no_verdict_and_can_restart() {
     use remanence_library::verification_io::VerificationPhase;
     use std::sync::atomic::{AtomicBool, Ordering};
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("verification.log");
+    let file = std::fs::File::create(&path).unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || file.try_clone().unwrap())
+        .finish();
+    let _log = tracing::subscriber::set_default(subscriber);
     with_catalog_recovery_tape_options(
         ParityConfig::None,
         None,
@@ -9486,6 +9497,20 @@ fn verification_walk_cancellation_has_no_verdict_and_can_restart() {
             .is_ok());
         },
     );
+    let log = std::fs::read_to_string(path).unwrap();
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.contains("phase=\"total\""))
+            .count(),
+        2,
+        "cancelled and completed attempts both log: {log}"
+    );
+    assert!(log
+        .lines()
+        .filter(|line| line.contains("phase=\"total\""))
+        .all(|line| line.contains("route=\"walk\"")
+            && line.contains("one_pass_fell_back=false")
+            && line.contains("fallback_reason=\"\"")));
 }
 
 /// Transport-triggered cancellation goes through the real drive actor and mount owner.

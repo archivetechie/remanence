@@ -28,7 +28,11 @@ pub(crate) fn start(
     state.record_request_received(actor, id, KIND, &tape_uuid, None)?;
     let handle = state.operations.register(id, KIND);
     let progress = Progress::new(handle.clone(), tape_uuid);
-    progress.publish(VerificationPhase::Setup, 0, None);
+    progress.route(remanence_parity::VerificationRouteStatus {
+        route: state.verification_route,
+        fell_back: false,
+        fallback_reason: None,
+    });
     let state = state.clone();
     let (tx, rx) = oneshot::channel();
     tokio::spawn(async move {
@@ -150,6 +154,8 @@ struct ProgressState {
     bay: String,
     started: Instant,
     last: Option<(VerificationPhase, Instant)>,
+    latest: (VerificationPhase, u64, Option<u64>),
+    route: remanence_parity::VerificationRouteStatus,
 }
 impl Progress {
     pub(crate) fn new(handle: OperationHandle, tape_uuid: [u8; 16]) -> Self {
@@ -160,7 +166,21 @@ impl Progress {
             bay: "unknown".into(),
             started: Instant::now(),
             last: None,
+            latest: (VerificationPhase::Setup, 0, None),
+            route: remanence_parity::VerificationRouteStatus {
+                route: remanence_parity::VerificationRoute::Walk,
+                fell_back: false,
+                fallback_reason: None,
+            },
         })))
+    }
+    pub(crate) fn route(&self, route: remanence_parity::VerificationRouteStatus) {
+        let mut state = self.0.lock().unwrap();
+        state.route = route;
+        state.last = None;
+        let (phase, bytes, file) = state.latest;
+        drop(state);
+        self.publish(phase, bytes, file);
     }
     pub(crate) fn mounted(&self, serial: Option<&str>, bay: u16) {
         let mut state = self.0.lock().unwrap();
@@ -170,6 +190,7 @@ impl Progress {
     pub(crate) fn publish(&self, phase: VerificationPhase, bytes: u64, tape_file: Option<u64>) {
         let mut state = self.0.lock().unwrap();
         let now = Instant::now();
+        state.latest = (phase, bytes, tape_file);
         if state.last.is_some_and(|(previous, at)| {
             previous == phase && now.duration_since(at) < Duration::from_secs(5)
         }) {
@@ -183,6 +204,16 @@ impl Progress {
                 ("drive_serial", &state.drive_serial),
                 ("bay", &state.bay),
                 ("phase", phase.name()),
+                ("route", state.route.route.name()),
+                ("fallback_reason", state.route.fallback_reason.unwrap_or("")),
+                (
+                    "one_pass_fell_back",
+                    if state.route.fell_back {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                ),
                 (
                     "tape_file",
                     &tape_file
@@ -202,6 +233,50 @@ impl Progress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Route changes bypass throttling and persist with ordinary phase progress.
+    #[tokio::test]
+    async fn verification_progress_records_route_and_fallback() {
+        use remanence_parity::{VerificationRoute, VerificationRouteStatus};
+        use tokio_stream::StreamExt;
+        let registry = crate::operations::OperationRegistry::default();
+        let id = Uuid::new_v4();
+        let handle = registry.register(id, KIND);
+        let progress = Progress::new(handle.clone(), [1; 16]);
+        progress.route(VerificationRouteStatus {
+            route: VerificationRoute::OnePass,
+            fell_back: false,
+            fallback_reason: None,
+        });
+        progress.publish(VerificationPhase::Setup, 100, Some(1)); // throttled, but retained
+        progress.route(VerificationRouteStatus {
+            route: VerificationRoute::Walk,
+            fell_back: true,
+            fallback_reason: Some("tape_io"),
+        });
+        progress.publish(VerificationPhase::ProtectedData, 123, Some(2));
+        handle.publish_state(pb::OperationState::Cancelled, &[]);
+        let events = registry.watch(&id).unwrap().collect::<Vec<_>>().await;
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].as_ref().unwrap().progress["route"], "one_pass");
+        assert_eq!(
+            events[0].as_ref().unwrap().progress["one_pass_fell_back"],
+            "false"
+        );
+        assert_eq!(events[1].as_ref().unwrap().progress["bytes_read"], "100");
+        assert_eq!(events[1].as_ref().unwrap().progress["tape_file"], "1");
+        for event in &events[1..3] {
+            assert_eq!(event.as_ref().unwrap().progress["route"], "walk");
+            assert_eq!(
+                event.as_ref().unwrap().progress["fallback_reason"],
+                "tape_io"
+            );
+            assert_eq!(
+                event.as_ref().unwrap().progress["one_pass_fell_back"],
+                "true"
+            );
+        }
+    }
 
     /// Repeated scoped work restores accounting without publishing a false parent phase.
     #[tokio::test]
@@ -255,6 +330,9 @@ mod tests {
                 "drive_serial",
                 "bay",
                 "phase",
+                "route",
+                "one_pass_fell_back",
+                "fallback_reason",
                 "tape_file",
                 "bytes_read",
                 "elapsed_ms",

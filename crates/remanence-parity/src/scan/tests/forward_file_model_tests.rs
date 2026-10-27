@@ -21,6 +21,7 @@ enum Fault {
     },
     Disagree,
     UnconfirmedHead,
+    UnconfirmedBody,
 }
 
 /// Leave record contents and motion to the model, adding wire-level fault evidence.
@@ -128,6 +129,20 @@ impl SgTransport for WireFault {
             }
             result
         };
+        if fixed && before > 0 && matches!(self.fault, Fault::UnconfirmedBody) {
+            if let Err(ScsiError::CheckCondition {
+                mut sense,
+                bytes_transferred,
+            }) = result
+            {
+                self.boundary = true;
+                sense[0] &= 0x7f;
+                return Err(ScsiError::CheckCondition {
+                    sense,
+                    bytes_transferred,
+                });
+            }
+        }
         match result {
             Err(ScsiError::InvalidInput("fixed READ encountered non-fixed-size block"))
                 if fixed =>
@@ -461,6 +476,51 @@ fn unconfirmed_head_is_classified_by_single_read_before_spacing() {
         MeasureCurrentFileOutcome::Complete(MeasuredTapeFile {
             block_count: 1,
             position_after: PhysicalPositionHint::new(2)
+        })
+    );
+}
+
+/// An unconfirmed boundary after a good head uses spacing and keeps the head.
+#[test]
+fn non_head_unconfirmed_boundary_requires_unclean_read_spacing() {
+    let records = vec![
+        Record::Block(block(7)),
+        Record::Block(block(8)),
+        Record::Filemark,
+    ];
+    let (mut drive, _) = drive(&records, Fault::UnconfirmedBody);
+    let mut source = DriveHandleRawSource::new(&mut drive);
+    source.configure_fixed_block_size(BLOCK_SIZE).unwrap();
+    source
+        .locate_physical(PhysicalPositionHint::new(0))
+        .unwrap();
+    let mut seen = Vec::new();
+    let observation = ForwardFileReader::new(BLOCK_SIZE, 4)
+        .unwrap()
+        .read_file(
+            &mut source,
+            0,
+            PhysicalPositionHint::new(0),
+            HeadProvenance::Locate,
+            1,
+            1,
+            &mut |_, bytes| {
+                seen.push(bytes[0]);
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(seen, [7]);
+    assert_eq!(observation.head_outcome, HeadOutcome::Block);
+    assert_eq!(
+        observation.requires_spacing,
+        Some(SpacingReason::UncleanRead)
+    );
+    assert_eq!(
+        observation.measure(&mut source).unwrap(),
+        MeasureCurrentFileOutcome::Complete(MeasuredTapeFile {
+            block_count: 2,
+            position_after: PhysicalPositionHint::new(3)
         })
     );
 }

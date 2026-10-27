@@ -35,6 +35,10 @@ impl DataObservation {
         Self { tag, payload }
     }
 
+    pub(super) fn is_present(self) -> bool {
+        self.tag != 5
+    }
+
     pub(super) fn crc(self) -> Option<u64> {
         (self.tag == 0).then_some(self.payload)
     }
@@ -141,6 +145,7 @@ impl Drop for PendingEpoch {
 #[derive(Default)]
 pub(super) struct ForwardPass {
     epochs: Box<[PendingEpoch]>,
+    active: std::ops::Range<usize>,
     budget: usize,
     pub(super) used: usize,
     pub(super) payload: usize,
@@ -243,6 +248,87 @@ impl ForwardPass {
             self.used -= total;
             self.payload -= payload;
             epoch.stopped = true;
+        }
+    }
+
+    /// Reserve complete overlap runs under the same global pending budget.
+    pub(super) fn begin_object(&mut self, object: &TapeFileMapEntry) -> Result<(), ParityError> {
+        self.active = 0..0;
+        for (index, epoch) in self
+            .epochs
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, epoch)| !epoch.stopped)
+        {
+            let Some((_, lo, hi)) = overlap(object, epoch.start, epoch.end)? else {
+                continue;
+            };
+            let charge = usize::try_from(hi - lo)
+                .ok()
+                .and_then(|n| n.checked_mul(9))
+                .and_then(|n| n.checked_add(size_of::<PendingRun>()));
+            let Some(charge) = charge.filter(|&n| n <= self.budget - self.used) else {
+                epoch.stopped = true;
+                continue;
+            };
+            if self.active.is_empty() {
+                self.active.start = index;
+            }
+            self.active.end = index + 1;
+            let n = (hi - lo) as usize;
+            self.used += charge;
+            self.payload += n * 9;
+            self.high_water = self.high_water.max(self.used);
+            self.payload_high_water = self.payload_high_water.max(self.payload);
+            epoch.runs = Some(Box::new(PendingRun {
+                file: object.tape_file_number,
+                tags: vec![5; n].into_boxed_slice(),
+                payloads: vec![0; n].into_boxed_slice(),
+                next: epoch.runs.take(),
+            }));
+        }
+        Ok(())
+    }
+
+    /// Retract every observation from a file whose read-derived addresses lack proof.
+    pub(super) fn discard_object(&mut self, file: u64) {
+        for epoch in &mut self.epochs {
+            let mut run = epoch.runs.as_deref_mut();
+            while let Some(current) = run {
+                if current.file == file {
+                    current.tags.fill(5);
+                    current.payloads.fill(0);
+                }
+                run = current.next.as_deref_mut();
+            }
+        }
+    }
+
+    /// Fill only previously reserved slots; no block bytes outlive this callback.
+    pub(super) fn observe(&mut self, object: &TapeFileMapEntry, offset: u64, bytes: &[u8]) {
+        let Some(ordinal) = object
+            .first_parity_data_ordinal
+            .and_then(|first| first.checked_add(offset))
+        else {
+            return;
+        };
+        for epoch in &mut self.epochs[self.active.clone()] {
+            if ordinal < epoch.start || ordinal >= epoch.end {
+                continue;
+            }
+            if let Some(run) = epoch
+                .runs
+                .as_mut()
+                .filter(|run| run.file == object.tape_file_number)
+            {
+                let first = object.first_parity_data_ordinal.unwrap().max(epoch.start);
+                let offset = (ordinal - first) as usize;
+                if offset < run.len() {
+                    let observation = DataObservation::from_probe(Probe::Block(bytes));
+                    run.tags[offset] = observation.tag;
+                    run.payloads[offset] = observation.payload;
+                }
+            }
         }
     }
 

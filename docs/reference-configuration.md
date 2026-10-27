@@ -293,6 +293,33 @@ pool_id = "archive-a"
 ```
 
 <!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-api/src/lib.rs @ 244bc6de -->
+## `[verification]`
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `route` | `"walk"` or `"one_pass"` | `"walk"` | Full-verification route used by the daemon. |
+
+The `one_pass` route validates the terminal replicas and separations, then
+measures the prefix in file order. It reads through a file only when full
+verification reads every block. Other files use filemark spacing. A file that
+requires spacing contributes no streamed observations to protected-content
+checks; those checks reread its blocks. Provisional results are accepted only
+after the measured prefix agrees with every replica.
+
+Any attempt error except cancellation discards the provisional results and runs
+the walk route from the start. Cancellation propagates immediately. Device and
+transport faults propagate when the walk encounters them.
+
+The verification log event and operation progress record `route`,
+`one_pass_fell_back`, and `fallback_reason`, including on verification errors.
+Initial progress shows the configured route. On fallback, `route` becomes
+`walk`. Replica rows with no parity sidecar select `walk` directly, with
+`one_pass_fell_back=false` and `fallback_reason=no_parity`.
+
+Forward prefix reads use the `one_pass_prefix` I/O phase. Index-first terminal
+reads use `walk_terminal`; directory reads use `parity_map`. The standalone
+`rem tape verify --full` command keeps the walk route.
+
 ## `[drives]`
 
 Drive-stewardship settings. The whole section is optional.

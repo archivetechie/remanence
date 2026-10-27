@@ -88,7 +88,7 @@ elif a[:2] == ["tape", "verify-index"]:
                 "command_latency_buckets": [str(x*n) for x in (2,2,2,2,1,1)]}
     phases = [{"phase": name, "counts": counts(elapsed, command, size)} for name, elapsed, command, size in (
         ("walk_terminal", 398000, 394000, 36000000000), ("parity_map", 27500, 27000, 1000000000),
-        ("sidecar", 184000, 175000, 2000000000), ("protected_data", 266000, 135000, 36000000000))]
+        ("sidecar", 184000, 175000, 2000000000), ("protected_data", 266000, 135000, 36000000000), ("one_pass_prefix", 1000, 900, 1000000))]
     phases.insert(0, {"phase": "setup", "counts": counts(0,0,0,0)})
     if mode == "rotated-log":
         (home / "log/rem-daemon.log").rename(home / "log/rem-daemon.rotated")
@@ -140,7 +140,7 @@ with tempfile.TemporaryDirectory(prefix="verify-throughput-test-") as temp:
     first = next(evidence.glob("verify-split-*.tsv"))
     baseline = first.read_text()
     rows = list(csv.DictReader(baseline.splitlines(), delimiter="\t"))
-    assert [r["phase"] for r in rows] == ["walk_terminal", "parity_map", "sidecar", "protected_data", "total"]
+    assert [r["phase"] for r in rows] == ["walk_terminal", "parity_map", "sidecar", "protected_data", "one_pass_prefix", "total"]
     assert rows[3]["between_s"] == "131.000" and rows[-1]["elapsed_s"] == "875.000"
     assert rows[0]["commands"] == "10" and rows[0]["ge10s"] == "1"
     assert rows[3]["MB_per_s"] == "135.338"
@@ -155,7 +155,7 @@ with tempfile.TemporaryDirectory(prefix="verify-throughput-test-") as temp:
     assert not list((home / "spool").iterdir())
     for path in evidence.glob("verify-diag-*.jsonl"):
         lines = path.read_text().splitlines()
-        assert len(lines) == 5 and "excluded-start-line" not in path.read_text()
+        assert len(lines) == 6 and "excluded-start-line" not in path.read_text()
         assert json.loads(lines[-1])["line"] == "INFO remanence_verify_diag phase=total"
     calls = [json.loads(x) for x in (home / "calls.jsonl").read_text().splitlines()]
     assert sum(c[0] == "remfield-io" and "read" in c for c in calls) == 2

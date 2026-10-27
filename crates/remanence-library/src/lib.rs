@@ -50,9 +50,9 @@ pub use handle::tape_io::{
     MediaWriteFenceError, NoCalibrationControl, PipelinedReadDiagnostics,
     PipelinedWriteDiagnostics, PositionAfter, ReadBatchOutcome, ReadBuffer, ReadBufferHandoff,
     ReadDelivery, ReadHandoffOutcome, ReadTerminalFlags, SequencedHandoff, SpaceKind, SpaceResult,
-    TapeConfig, TapeIoError, TapePosition, TapePositionReport, WormMediaState, WriteBatchOutcome,
-    WriteFilemarksOutcome, WriteOutcome, WriteUnpositionedOutcome,
-    MEDIA_READINESS_MAX_INITIALIZING_LOADS,
+    TapeConfig, TapeIoError, TapePosition, TapePositionReport, VerificationReadCompletion,
+    WormMediaState, WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome,
+    WriteUnpositionedOutcome, MEDIA_READINESS_MAX_INITIALIZING_LOADS,
 };
 pub use handle::{
     ChangerHandle, DirtyCause, DriveHandle, LibraryHandle, RemovalLockGuard, TapeIoRuntimeConfig,
