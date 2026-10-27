@@ -415,6 +415,8 @@ impl FilemarkMap {
 
     /// Convert a tape-file position to a physical block-position hint by
     /// summing preceding tape-file records plus their trailing filemarks.
+    /// Each prior file occupies `block_count + 1` LBAs; blocks within a file
+    /// occupy consecutive LBAs before its trailing filemark.
     pub fn physical_position(
         &self,
         position: TapeFilePosition,
@@ -445,6 +447,36 @@ impl FilemarkMap {
             .checked_add(position.block_within_file)
             .ok_or_else(|| filemark_map_error("physical position overflows u64"))?;
         Ok(PhysicalPositionHint::new(lba))
+    }
+
+    /// Return the first physical block of a nonempty run wholly inside one file.
+    /// Validate the last LBA so callers can add any offset below `count`.
+    pub fn physical_run(
+        &self,
+        tape_file_number: u64,
+        first_block: u64,
+        count: u64,
+    ) -> Result<PhysicalPositionHint, ParityError> {
+        let entry = self.entry(tape_file_number)?;
+        if count == 0
+            || first_block
+                .checked_add(count)
+                .is_none_or(|end| end > entry.block_count)
+        {
+            return Err(filemark_map_error(format!(
+                "run at block {first_block} with count {count} is outside tape file {tape_file_number} with block_count {}",
+                entry.block_count
+            )));
+        }
+        let first = self.physical_position(TapeFilePosition {
+            tape_file_number,
+            block_within_file: first_block,
+        })?;
+        first
+            .lba
+            .checked_add(count - 1)
+            .ok_or_else(|| filemark_map_error("physical run overflows u64"))?;
+        Ok(first)
     }
 
     /// Return the physical append point immediately after this committed
@@ -1411,6 +1443,63 @@ mod tests {
                 block_within_file: 2,
             }
         );
+    }
+
+    #[test]
+    fn physical_runs_match_each_block_and_reject_file_crossings() {
+        let map = sample_map();
+        for entry in map.entries() {
+            for start in 0..entry.block_count {
+                for count in 1..=entry.block_count - start {
+                    let first = map
+                        .physical_run(entry.tape_file_number, start, count)
+                        .unwrap();
+                    for offset in 0..count {
+                        let block = map
+                            .physical_position(TapeFilePosition {
+                                tape_file_number: entry.tape_file_number,
+                                block_within_file: start + offset,
+                            })
+                            .unwrap();
+                        assert_eq!(block.partition, first.partition);
+                        assert_eq!(block.lba, first.lba + offset);
+                    }
+                }
+            }
+        }
+        for (file, start, count) in [(1, 0, 0), (1, 3, 1), (1, 2, 2), (1, u64::MAX, 2), (3, 0, 1)] {
+            assert!(map.physical_run(file, start, count).is_err());
+        }
+    }
+
+    #[test]
+    fn physical_run_checks_bounds_near_the_lba_limit() {
+        let map = FilemarkMap::new(vec![
+            TapeFileMapEntry::bootstrap(0, 1),
+            TapeFileMapEntry::object(1, u64::MAX - 2, 0),
+        ])
+        .unwrap();
+        assert_eq!(
+            map.physical_run(1, u64::MAX - 3, 1).unwrap().lba,
+            u64::MAX - 1
+        );
+        assert!(map.physical_run(1, u64::MAX - 3, 2).is_err());
+        assert!(map.physical_run(1, u64::MAX - 3, 4).is_err());
+
+        // Bypass map validation to exercise the run's own LBA overflow check.
+        let map = FilemarkMap {
+            entries: vec![
+                TapeFileMapEntry::bootstrap(0, 1),
+                TapeFileMapEntry::object(1, u64::MAX, 0),
+            ],
+            tape_file_count: 2,
+        };
+        assert_eq!(map.physical_run(1, u64::MAX - 2, 1).unwrap().lba, u64::MAX);
+        assert!(matches!(
+            map.physical_run(1, u64::MAX - 2, 2),
+            Err(ParityError::FilemarkMapReconstruct(message))
+                if message == "physical run overflows u64"
+        ));
     }
 
     #[test]

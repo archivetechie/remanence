@@ -12,6 +12,7 @@ pub const CRC64_XZ_CHECK_VALUE: u64 = 0x995D_C9BB_DF19_39FA;
 pub const CRC64_XZ_REFLECTED_POLY: u64 = 0xC96C_5795_D787_0F42;
 
 const CRC64_XZ_TABLE: [u64; 256] = build_crc64_xz_table();
+static CRC64_XZ_SLICES: [[u64; 256]; 8] = build_crc64_xz_slices();
 
 /// Advance one reflected CRC-64/XZ bit step.
 pub const fn crc64_xz_bit_step(crc: u64) -> u64 {
@@ -39,13 +40,46 @@ pub fn crc64_xz_update(crc: u64, byte: u8) -> u64 {
     (crc >> 8) ^ CRC64_XZ_TABLE[index]
 }
 
-/// Compute CRC-64/XZ over `bytes`.
-pub fn crc64_xz(bytes: &[u8]) -> u64 {
-    let mut crc = u64::MAX;
-    for &byte in bytes {
+/// Advance the internal, pre-final-XOR CRC-64/XZ state over a byte slice.
+pub fn crc64_xz_update_slice(mut crc: u64, bytes: &[u8]) -> u64 {
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        let word = crc ^ u64::from_le_bytes(chunk.try_into().unwrap());
+        crc = CRC64_XZ_SLICES[7][(word & 0xff) as usize]
+            ^ CRC64_XZ_SLICES[6][((word >> 8) & 0xff) as usize]
+            ^ CRC64_XZ_SLICES[5][((word >> 16) & 0xff) as usize]
+            ^ CRC64_XZ_SLICES[4][((word >> 24) & 0xff) as usize]
+            ^ CRC64_XZ_SLICES[3][((word >> 32) & 0xff) as usize]
+            ^ CRC64_XZ_SLICES[2][((word >> 40) & 0xff) as usize]
+            ^ CRC64_XZ_SLICES[1][((word >> 48) & 0xff) as usize]
+            ^ CRC64_XZ_SLICES[0][(word >> 56) as usize];
+    }
+    for &byte in chunks.remainder() {
         crc = crc64_xz_update(crc, byte);
     }
-    crc ^ u64::MAX
+    crc
+}
+
+/// Compute CRC-64/XZ over `bytes` using eight table slices.
+pub fn crc64_xz(bytes: &[u8]) -> u64 {
+    crc64_xz_update_slice(u64::MAX, bytes) ^ u64::MAX
+}
+
+/// Each successive slice advances a table entry by one zero byte.
+const fn build_crc64_xz_slices() -> [[u64; 256]; 8] {
+    let mut tables = [[0; 256]; 8];
+    tables[0] = CRC64_XZ_TABLE;
+    let mut slice = 1;
+    while slice < 8 {
+        let mut byte = 0;
+        while byte < 256 {
+            let crc = tables[slice - 1][byte];
+            tables[slice][byte] = (crc >> 8) ^ tables[0][(crc & 0xff) as usize];
+            byte += 1;
+        }
+        slice += 1;
+    }
+    tables
 }
 
 const fn build_crc64_xz_table() -> [u64; 256] {
@@ -61,6 +95,65 @@ const fn build_crc64_xz_table() -> [u64; 256] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Byte-at-a-time table implementation serves as the slice reference.
+    fn crc64_xz_bytewise(bytes: &[u8]) -> u64 {
+        bytes.iter().copied().fold(u64::MAX, crc64_xz_update) ^ u64::MAX
+    }
+
+    /// Deterministic pseudorandom input keeps alignment and split coverage repeatable.
+    fn random_word(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    #[test]
+    fn slices_match_bytewise_for_lengths_alignments_and_incremental_splits() {
+        let mut random = 0x8a51_c742_19db_e630;
+        let buffer: Vec<u8> = (0..4104).map(|_| random_word(&mut random) as u8).collect();
+        // Each start offset and length covers every end offset modulo eight.
+        for start in 0..8 {
+            for len in 0..=4096 {
+                let bytes = &buffer[start..start + len];
+                let expected = crc64_xz_bytewise(bytes);
+                assert_eq!(crc64_xz(bytes), expected, "start={start}, len={len}");
+                let a = random_word(&mut random) as usize % (len + 1);
+                let b = random_word(&mut random) as usize % (len + 1);
+                let (a, b) = (a.min(b), a.max(b));
+                let crc = crc64_xz_update_slice(u64::MAX, &bytes[..a]);
+                let crc = crc64_xz_update_slice(crc, &bytes[a..b]);
+                let crc = crc64_xz_update_slice(crc, &bytes[b..]);
+                assert_eq!(crc ^ u64::MAX, expected);
+            }
+        }
+    }
+
+    /// Run explicitly with --release --ignored --nocapture; throughput is informational.
+    #[test]
+    #[ignore = "one-off CRC throughput measurement"]
+    fn crc_throughput() {
+        use std::{hint::black_box, time::Instant};
+        let mut random = 0x8a51_c742_19db_e630;
+        let buffer: Vec<u8> = (0..256 * 1024)
+            .map(|_| random_word(&mut random) as u8)
+            .collect();
+        for (name, checksum) in [
+            ("bytewise", crc64_xz_bytewise as fn(&[u8]) -> u64),
+            ("slice-by-8", crc64_xz as fn(&[u8]) -> u64),
+        ] {
+            let start = Instant::now();
+            for _ in 0..1024 {
+                black_box(checksum(black_box(&buffer)));
+            }
+            let seconds = start.elapsed().as_secs_f64();
+            println!(
+                "{name}: {:.1} MB/s ({seconds:.3} s)",
+                buffer.len() as f64 * 1024.0 / seconds / 1e6
+            );
+        }
+    }
 
     fn crc64_xz_bitwise(bytes: &[u8]) -> u64 {
         let mut crc = u64::MAX;

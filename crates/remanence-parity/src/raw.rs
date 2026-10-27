@@ -506,8 +506,10 @@ pub(crate) struct ReadRun<'a> {
     next: Option<PhysicalPositionHint>,
     located: bool,
     single: bool,
+    // Storage stays initialized across fills; only `consumed..valid` is readable.
     buffer: Vec<u8>,
     consumed: usize,
+    valid: usize,
     pending_end: Option<RawReadEnd>,
     pending_data: Vec<u8>,
 }
@@ -523,6 +525,7 @@ impl<'a> ReadRun<'a> {
             single: false,
             buffer: Vec::new(),
             consumed: 0,
+            valid: 0,
             pending_end: None,
             pending_data: Vec::new(),
         }
@@ -530,8 +533,7 @@ impl<'a> ReadRun<'a> {
     /// Set the suffix length after reading and validating a single header.
     pub(crate) fn after_header(&mut self, remaining: u64) {
         assert_eq!(
-            self.consumed,
-            self.buffer.len(),
+            self.consumed, self.valid,
             "header must not have unread prefetch"
         );
         self.remaining = remaining;
@@ -554,7 +556,7 @@ impl RawTapeSource for ReadRun<'_> {
     }
     fn locate_physical(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
         if self.next != Some(hint) {
-            self.buffer.clear();
+            self.valid = 0;
             self.consumed = 0;
             self.pending_end = None;
             self.pending_data.clear();
@@ -568,14 +570,14 @@ impl RawTapeSource for ReadRun<'_> {
     }
     fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
         self.next = None;
-        self.buffer.clear();
+        self.valid = 0;
         self.pending_end = None;
         self.pending_data.clear();
         self.source.locate_end_of_data()
     }
     fn space_filemarks(&mut self, count: i64) -> Result<SpaceFilemarksOutcome, ParityError> {
         self.next = None;
-        self.buffer.clear();
+        self.valid = 0;
         self.pending_end = None;
         self.pending_data.clear();
         self.source.space_filemarks(count)
@@ -590,8 +592,8 @@ impl RawTapeSource for ReadRun<'_> {
         let position = self
             .next
             .ok_or(ParityError::Invariant("read run requires a locate"))?;
-        if self.consumed == self.buffer.len() && self.pending_end.is_none() {
-            self.buffer.clear();
+        if self.consumed == self.valid && self.pending_end.is_none() {
+            self.valid = 0;
             self.consumed = 0;
             if !self.located {
                 self.source.locate_physical(position)?;
@@ -602,11 +604,16 @@ impl RawTapeSource for ReadRun<'_> {
                     .remaining
                     .min(u64::from(remanence_library::DEFAULT_TAPE_IO_BATCH_BLOCKS))
                     as u32;
-                self.buffer
-                    .resize(count as usize * self.block_size as usize, 0);
-                let batch =
-                    self.source
-                        .read_records(&mut self.buffer, self.block_size, count, count);
+                let fill_bytes = count as usize * self.block_size as usize;
+                if self.buffer.len() < fill_bytes {
+                    self.buffer.resize(fill_bytes, 0);
+                }
+                let batch = self.source.read_records(
+                    &mut self.buffer[..fill_bytes],
+                    self.block_size,
+                    count,
+                    count,
+                );
                 let confirmed = if batch.records_read <= count
                     && batch.position_after
                         == Some(device_position_after(
@@ -625,24 +632,25 @@ impl RawTapeSource for ReadRun<'_> {
                 }
                 if !matches!(batch.end, RawReadEnd::Complete) {
                     if confirmed != batch.records_read || confirmed == count {
-                        self.buffer.clear();
+                        self.valid = 0;
                         self.next = None;
                         return Err(ParityError::Invariant("invalid terminal batch prefix"));
                     }
-                    if matches!(batch.end, RawReadEnd::WrongLength { .. }) {
+                    if let RawReadEnd::WrongLength { bytes, .. } = &batch.end {
+                        // Only the reported terminal bytes belong to this fill.
+                        let copied = (*bytes).min(self.block_size as usize);
                         self.pending_data.extend_from_slice(
-                            &self.buffer
-                                [confirmed_bytes..confirmed_bytes + self.block_size as usize],
+                            &self.buffer[confirmed_bytes..confirmed_bytes + copied],
                         );
                     }
                     self.pending_end = Some(batch.end);
                 }
-                self.buffer.truncate(confirmed_bytes);
+                self.valid = confirmed_bytes;
             }
         }
-        if self.consumed < self.buffer.len() {
+        if self.consumed < self.valid {
             let end = self.consumed + buf.len();
-            buf.copy_from_slice(&self.buffer[self.consumed..end]);
+            buf.copy_from_slice(&self.buffer[..self.valid][self.consumed..end]);
             self.consumed = end;
             self.remaining -= 1;
             let position_after = device_position_after(position, 1, "read run delivery")?;
@@ -3668,6 +3676,41 @@ mod compat_tests {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    /// A short terminal record after a full fill must not expose the retained suffix.
+    #[test]
+    fn reused_fill_delivers_only_confirmed_prefix_and_terminal_bytes() {
+        let count = remanence_library::DEFAULT_TAPE_IO_BATCH_BLOCKS as usize;
+        let mut records: Vec<Vec<u8>> = (0..count + 1).map(|n| vec![n as u8; 4]).collect();
+        records.push(vec![0xa1, 0xa2]);
+        let mut blocks = remanence_library::VecBlockSource::new(records);
+        let mut source = BlockSourceRawTapeSource::new(&mut blocks);
+        source.configure_fixed_block_size(4).unwrap();
+        let mut run = ReadRun::new(&mut source, 4, (count + 2) as u64);
+        run.locate_physical(PhysicalPositionHint::new(0)).unwrap();
+        let mut block = [0; 4];
+        let mut allocation = std::ptr::null();
+        for n in 0..=count {
+            assert!(matches!(
+                run.read_record(&mut block).unwrap(),
+                RawReadOutcome::Block { bytes: 4, .. }
+            ));
+            assert_eq!(block, [n as u8; 4]);
+            if n == 0 {
+                allocation = run.buffer.as_ptr();
+            }
+            assert_eq!(run.buffer.as_ptr(), allocation);
+            assert_eq!(run.buffer.len(), count * 4);
+        }
+        assert_eq!(run.valid, 4);
+        assert_eq!(run.pending_data, [0xa1, 0xa2]);
+        block.fill(0x5a);
+        assert!(matches!(
+            run.read_record(&mut block).unwrap(),
+            RawReadOutcome::Block { bytes: 2, .. }
+        ));
+        assert_eq!(block, [0xa1, 0xa2, 0x5a, 0x5a]);
+    }
 
     /// A batch adapter that consumes a good prefix and loses its cursor at a
     /// boundary/fault, as a drive may. Singles still read the original image.

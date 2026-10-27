@@ -290,8 +290,8 @@ impl ProtectedContentVerification {
 }
 
 /// What a probe of one block found.
-enum Probe {
-    Block(Vec<u8>),
+enum Probe<'a> {
+    Block(&'a [u8]),
     /// The read failed with a medium error.
     Unreadable,
     /// A record shorter or longer than one block (REM-PARITY 3.5).
@@ -300,7 +300,7 @@ enum Probe {
     Boundary(&'static str),
 }
 
-impl Probe {
+impl Probe<'_> {
     /// Why a record that is not a block failed, for a data block or a shard.
     fn failure(&self) -> Option<BlockFailureReason> {
         match self {
@@ -331,6 +331,7 @@ struct SequentialReader<'a> {
     source: &'a mut dyn RawTapeSource,
     block_size: u32,
     next: Option<PhysicalPositionHint>,
+    block: Vec<u8>,
 }
 
 impl<'a> SequentialReader<'a> {
@@ -339,19 +340,22 @@ impl<'a> SequentialReader<'a> {
             source,
             block_size,
             next: None,
+            block: Vec::new(),
         }
     }
 
-    fn read(&mut self, physical: PhysicalPositionHint) -> Result<Probe, ParityError> {
+    fn read(&mut self, physical: PhysicalPositionHint) -> Result<Probe<'_>, ParityError> {
         if self.next != Some(physical) {
             self.next = None;
             self.source.locate_physical(physical)?;
         }
-        let mut block = vec![0u8; self.block_size as usize];
-        match read_fixed_record(self.source, &mut block) {
+        if self.block.is_empty() {
+            self.block.resize(self.block_size as usize, 0);
+        }
+        match read_fixed_record(self.source, &mut self.block) {
             Ok(FixedRecordRead::Block { position_after }) => {
                 self.next = Some(position_after);
-                Ok(Probe::Block(block))
+                Ok(Probe::Block(&self.block))
             }
             Ok(FixedRecordRead::WrongLength { measured_bytes }) => {
                 self.next = None;
@@ -380,7 +384,7 @@ impl<'a> SequentialReader<'a> {
         scoped_map: &ScopedFilemarkMap,
         sidecar: &TapeFileMapEntry,
         block_within_file: u64,
-    ) -> Result<Probe, ParityError> {
+    ) -> Result<Probe<'_>, ParityError> {
         let physical = scoped_map.map.physical_position(TapeFilePosition {
             tape_file_number: sidecar.tape_file_number,
             block_within_file,
@@ -408,16 +412,16 @@ fn read_copy(
     start: u64,
     kind: SidecarCopyKind,
 ) -> Result<CopyProbe, ParityError> {
+    let block_size = reader.block_size;
     let block0 = match reader.read_sidecar_block(scoped_map, sidecar, start)? {
-        Probe::Block(block) => block,
+        Probe::Block(block) => block.to_vec(),
         Probe::Unreadable => return Ok(CopyProbe::Unreadable),
-        other => return Ok(CopyProbe::Invalid(other.detail(reader.block_size))),
+        other => return Ok(CopyProbe::Invalid(other.detail(block_size))),
     };
     let header = match parse_sidecar_header_block(&block0, tape_uuid) {
         Ok(header) => header,
         Err(error) => return Ok(CopyProbe::Invalid(error.to_string())),
     };
-    let block_size = reader.block_size;
     let next = reader.next.take();
     let mut run = crate::raw::ReadRun::new(
         reader.source,
@@ -443,9 +447,9 @@ fn read_copy(
             ));
         }
         match reader.read_sidecar_block(scoped_map, sidecar, block_within_file)? {
-            Probe::Block(block) => blocks.push(block),
+            Probe::Block(block) => blocks.push(block.to_vec()),
             Probe::Unreadable => return Ok(CopyProbe::Unreadable),
-            other => return Ok(CopyProbe::Invalid(other.detail(reader.block_size))),
+            other => return Ok(CopyProbe::Invalid(other.detail(block_size))),
         }
     }
     let decoded = match parse_sidecar_index_blocks(&blocks, tape_uuid) {
@@ -563,7 +567,7 @@ fn verify_sidecar_cached(
     };
     let (footer_state, footer) = match footer_probe {
         Probe::Unreadable => (SidecarComponentState::Unreadable, None),
-        Probe::Block(block) => match parse_sidecar_footer_block(&block, tape_uuid) {
+        Probe::Block(block) => match parse_sidecar_footer_block(block, tape_uuid) {
             Err(error) => (
                 SidecarComponentState::Invalid {
                     detail: error.to_string(),
@@ -730,6 +734,11 @@ fn verify_sidecar_cached(
         let Some((first, overlap_start, overlap_end)) = forward::overlap(entry, start, end)? else {
             continue;
         };
+        let first_physical = scoped_map.map.physical_run(
+            entry.tape_file_number,
+            overlap_start - first,
+            overlap_end - overlap_start,
+        )?;
         let buffered = observations.next_if(|run| run.file == entry.tape_file_number);
         let buffered_len = buffered.map_or(0, |run| run.len() as u64);
         let mut run = crate::raw::ReadRun::new(
@@ -744,7 +753,10 @@ fn verify_sidecar_cached(
                 tape_file_number: entry.tape_file_number,
                 block_within_file: ordinal - first,
             };
-            let physical = scoped_map.map.physical_position(position)?;
+            let physical = PhysicalPositionHint {
+                lba: first_physical.lba + (ordinal - overlap_start),
+                ..first_physical
+            };
             let offset = (ordinal - overlap_start) as usize;
             // Observations carry no physical cursor. The first unbuffered read
             // (if any) locates from the live source's actual metadata position.
@@ -804,12 +816,16 @@ fn verify_sidecar_cached(
         }
     };
     if let Some((header_blocks, stripes, parity_per_stripe)) = geometry {
-        let mut run = crate::raw::ReadRun::new(
-            reader.source,
-            block_size,
-            (u64::from(stripes) * u64::from(parity_per_stripe))
-                .min(sidecar.block_count.saturating_sub(header_blocks)),
-        );
+        let shard_count = (u64::from(stripes) * u64::from(parity_per_stripe))
+            .min(sidecar.block_count.saturating_sub(header_blocks));
+        let first_physical = (shard_count != 0)
+            .then(|| {
+                scoped_map
+                    .map
+                    .physical_run(sidecar.tape_file_number, header_blocks, shard_count)
+            })
+            .transpose()?;
+        let mut run = crate::raw::ReadRun::new(reader.source, block_size, shard_count);
         let mut reader = SequentialReader::new(&mut run, block_size);
         for parity_index in 0..parity_per_stripe {
             for stripe_index in 0..stripes {
@@ -823,10 +839,11 @@ fn verify_sidecar_cached(
                 if sidecar_block >= sidecar.block_count {
                     break;
                 }
-                let physical = scoped_map.map.physical_position(TapeFilePosition {
-                    tape_file_number: sidecar.tape_file_number,
-                    block_within_file: sidecar_block,
-                })?;
+                let first_physical = first_physical.expect("a shard lies in the validated run");
+                let physical = PhysicalPositionHint {
+                    lba: first_physical.lba + (sidecar_block - header_blocks),
+                    ..first_physical
+                };
                 let probe = reader.read(physical)?;
                 let reason = match &probe {
                     Probe::Block(block) => match index.filter(|_| usable) {

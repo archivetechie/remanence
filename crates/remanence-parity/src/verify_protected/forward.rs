@@ -2,7 +2,7 @@
 //! metadata, comparison and finding construction remain in the verifier.
 
 use super::{BlockFailureReason, ParityError, Probe, ScopedFilemarkMap, SequentialReader};
-use crate::filemark_map::{TapeFileKind, TapeFileMapEntry, TapeFilePosition};
+use crate::filemark_map::{TapeFileKind, TapeFileMapEntry};
 use crate::sidecar::data_shard_crc64;
 use std::mem::size_of;
 
@@ -16,9 +16,9 @@ pub(super) struct DataObservation {
 }
 
 impl DataObservation {
-    pub(super) fn from_probe(probe: Probe) -> Self {
+    pub(super) fn from_probe(probe: Probe<'_>) -> Self {
         let (tag, payload) = match probe {
-            Probe::Block(block) => (0, data_shard_crc64(&block)),
+            Probe::Block(block) => (0, data_shard_crc64(block)),
             Probe::WrongLength(length) => (1, length),
             Probe::Boundary("filemark where a block belongs") => (2, 0),
             Probe::Boundary(_) => (3, 0),
@@ -273,14 +273,17 @@ impl ForwardPass {
                 payloads: vec![0; n].into_boxed_slice(),
                 next: None,
             });
+            let first_physical =
+                map.map
+                    .physical_run(object.tape_file_number, lo - first, hi - lo)?;
             let mut run = crate::raw::ReadRun::new(reader.source, reader.block_size, hi - lo);
             run.continue_at(reader.next.take());
             let mut forward = SequentialReader::new(&mut run, reader.block_size);
             for ordinal in lo..hi {
-                let physical = map.map.physical_position(TapeFilePosition {
-                    tape_file_number: object.tape_file_number,
-                    block_within_file: ordinal - first,
-                })?;
+                let physical = crate::raw::PhysicalPositionHint {
+                    lba: first_physical.lba + (ordinal - lo),
+                    ..first_physical
+                };
                 let observed = DataObservation::from_probe(forward.read(physical)?);
                 let offset = (ordinal - lo) as usize;
                 pending.tags[offset] = observed.tag;
