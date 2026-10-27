@@ -7,6 +7,10 @@ per-release summaries.
 <!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_backend.rs crates/remanence-state/src/index.rs crates/remanence-library/src/discovery.rs @ 638210f7 -->
 ## Unreleased
 
+- Full verification reads each parity sidecar forward once, retains up to
+  64 MiB of metadata, and applies the recovery acquisition to those blocks.
+  Shards retain CRC observations only; unretained positions are read directly.
+
 - `rem tape verify-index` waits for media readiness before retrying verification
   (`--ready-wait`, default `15m`; `0` returns the refusal). Standalone
   `rem tape verify --full` prints the I/O report and per-phase timing in JSON

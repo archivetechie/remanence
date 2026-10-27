@@ -2,7 +2,6 @@
 //! returned positions; it never calls position/LOCATE/SPACE to observe a read.
 use super::*;
 use remanence_parity::raw::RawReadBatch;
-use remanence_parity::sidecar::parse_sidecar_header_block;
 use remanence_parity::verify_protected::{
     verify_protected_budget_for_test, verify_protected_step1_for_test,
 };
@@ -29,6 +28,8 @@ struct Counter<S> {
     reads: Vec<(u64, Phase)>,
     late_data: Vec<u64>,
     configured: bool,
+    forward_sidecars: bool,
+    sidecar_locates: BTreeMap<u64, usize>,
     setup: bool,
 }
 
@@ -119,6 +120,22 @@ impl<S: RawTapeSource> RawTapeSource for Counter<S> {
                 }
             }
             TapeFileKind::ParitySidecar => {
+                if self.forward_sidecars {
+                    let start = self.files.iter().find(|(f, _, _)| *f == file).unwrap().1;
+                    assert!(
+                        self.reads
+                            .iter()
+                            .filter(|(lba, _)| start <= *lba && *lba < self.parity_ends[&file])
+                            .all(|(lba, _)| *lba < hint.lba),
+                        "backward sidecar LOCATE to {hint:?}"
+                    );
+                    let locates = self.sidecar_locates.entry(file).or_default();
+                    *locates += 1;
+                    assert!(
+                        *locates <= 1,
+                        "sidecar {file} has more than one entry LOCATE"
+                    );
+                }
                 self.started.insert(file);
                 self.active = Some(file);
                 Phase::Sidecar
@@ -186,14 +203,19 @@ fn counter<S: RawTapeSource>(
         .filter(|e| e.kind == TapeFileKind::ParitySidecar)
     {
         let file = &vector.image.files[sidecar.tape_file_number as usize];
-        let header = parse_sidecar_header_block(
-            &file.bytes[..BLOCK as usize],
-            &vector.written.inputs.tape_uuid,
-        )
-        .unwrap();
         parity_ends.insert(
             sidecar.tape_file_number,
-            file.start_record as u64 + header.shard_index_block_count + header.parity_block_count,
+            file.start_record as u64
+                + if setup {
+                    sidecar.block_count
+                } else {
+                    let header = remanence_parity::sidecar::parse_sidecar_header_block(
+                        &file.bytes[..BLOCK as usize],
+                        &vector.written.inputs.tape_uuid,
+                    )
+                    .unwrap();
+                    header.shard_index_block_count + header.parity_block_count
+                },
         );
         for object in map
             .entries()
@@ -239,6 +261,8 @@ fn counter<S: RawTapeSource>(
         reads: vec![],
         late_data: vec![],
         configured: false,
+        forward_sidecars: setup,
+        sidecar_locates: BTreeMap::new(),
         setup,
     }
 }
@@ -348,14 +372,20 @@ fn four_epoch_transport_counts_by_phase_and_pending_high_water() {
             assert!(total <= budget.unwrap());
         }
         let report = io.finish();
-        assert_eq!(report.total.single_read, 24);
+        assert_eq!(
+            report.total.single_read,
+            if name == "Step1" { 24 } else { 12 }
+        );
         assert_eq!(report.total.batch_read, 18);
-        assert_eq!(report.total.records_requested, 286);
-        assert_eq!(report.total.records_confirmed, 286);
+        let records = if name == "Step1" { 286 } else { 274 };
+        assert_eq!(report.total.records_requested, records);
+        assert_eq!(report.total.records_confirmed, records);
         assert_eq!(report.total.other, if name == "Step1" { 8 } else { 10 });
         assert_eq!(
             report.total.bytes,
-            286 * u64::from(BLOCK) + report.total.read_position * 32 + report.total.other / 2 * 34
+            records * u64::from(BLOCK)
+                + report.total.read_position * 32
+                + report.total.other / 2 * 34
         );
         assert_eq!(report.total.hardware_batch_fallbacks, 0);
 
@@ -421,8 +451,8 @@ fn four_epoch_transport_counts_by_phase_and_pending_high_water() {
         full_counts,
         vec![
             [[0, 0, 0], [1, 0, 1], [29, 0, 29], [5, 0, 5]],
-            [[2, 0, 3], [4, 0, 4], [28, 0, 28], [0, 0, 0]],
-            [[2, 0, 3], [2, 0, 2], [28, 0, 28], [4, 0, 4]],
+            [[2, 0, 3], [4, 0, 4], [4, 0, 4], [0, 0, 0]],
+            [[2, 0, 3], [2, 0, 2], [4, 0, 4], [4, 0, 4]],
         ]
     );
     assert_eq!(full_counts[1][Phase::Fallback as usize], [0; 3]);
