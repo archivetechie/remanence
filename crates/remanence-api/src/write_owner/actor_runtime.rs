@@ -339,6 +339,8 @@ pub(super) fn drive_loop(
                 let _ = reply.send(result);
             }
             DriveCommand::VerifyTapeIndex {
+                handle,
+                progress,
                 tape_uuid,
                 needs_drive_load,
                 library_serial,
@@ -358,6 +360,7 @@ pub(super) fn drive_loop(
                     barcode.as_deref(),
                     source_slot,
                     drive_serial.as_deref(),
+                    Some((&handle, progress)),
                 );
                 let _ = reply.send(result);
             }

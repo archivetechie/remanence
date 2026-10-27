@@ -68,7 +68,12 @@ pub(crate) fn prepare_catalog_recovery_read(
     let mut source = DriveHandleRawSource::new(drive);
     source
         .locate_physical(PhysicalPositionHint::new(0))
-        .map_err(|error| Status::unavailable(format!("locate BOT: {error}")))?;
+        .map_err(|error| match error {
+            remanence_parity::ParityError::TapeIo(remanence_library::TapeIoError::Cancelled) => {
+                Status::cancelled("tape verification cancelled")
+            }
+            error => Status::unavailable(format!("locate BOT: {error}")),
+        })?;
     let mut block = vec![0; block_size as usize];
     let read = source.read_record(&mut block);
     // A record whose measured length differs from the supplied size is refused
@@ -86,6 +91,9 @@ pub(crate) fn prepare_catalog_recovery_read(
         Err(ParityError::TapeIo(error)) if tape_error_is_current_medium_damage(&error) => {
             prepared.bootstrap_unreadable_reason = Some(format!("read BOT: {error}"));
             return Ok(prepared);
+        }
+        Err(ParityError::TapeIo(remanence_library::TapeIoError::Cancelled)) => {
+            return Err(Status::cancelled("tape verification cancelled"))
         }
         Err(error) => return Err(Status::unavailable(format!("read BOT: {error}"))),
     }
@@ -133,16 +141,25 @@ pub(crate) fn prepare_drive_for_fixed_read(
     session_id: Uuid,
 ) -> Result<(), Status> {
     let started = Instant::now();
-    let current_cfg = drive
-        .read_config()
-        .map_err(|err| Status::internal(format!("read drive config: {err}")))?;
+    let current_cfg = drive.read_config().map_err(|err| match err {
+        remanence_library::TapeIoError::Cancelled => {
+            Status::cancelled("tape verification cancelled")
+        }
+        err => Status::internal(format!("read drive config: {err}")),
+    })?;
     let target_cfg = crate::drive_mode::fixed_uncompressed_target(current_cfg, block_size);
-    drive
-        .write_config(target_cfg)
-        .map_err(|err| Status::internal(format!("set fixed read config: {err}")))?;
-    let verified = drive
-        .read_config()
-        .map_err(|err| Status::internal(format!("verify fixed read config: {err}")))?;
+    drive.write_config(target_cfg).map_err(|err| match err {
+        remanence_library::TapeIoError::Cancelled => {
+            Status::cancelled("tape verification cancelled")
+        }
+        err => Status::internal(format!("set fixed read config: {err}")),
+    })?;
+    let verified = drive.read_config().map_err(|err| match err {
+        remanence_library::TapeIoError::Cancelled => {
+            Status::cancelled("tape verification cancelled")
+        }
+        err => Status::internal(format!("verify fixed read config: {err}")),
+    })?;
     if verified.block_size != target_cfg.block_size {
         return Err(Status::failed_precondition(format!(
             "fixed read mode verification mismatch: expected {:?}, got {:?}",
@@ -259,6 +276,9 @@ pub(crate) fn status_from_terminal_inventory_read_error(
     error: remanence_parity::TerminalInventoryReadError,
 ) -> Status {
     match error {
+        remanence_parity::TerminalInventoryReadError::Cancelled => {
+            Status::cancelled("tape verification cancelled")
+        }
         remanence_parity::TerminalInventoryReadError::BlockSize(_) => {
             Status::failed_precondition(format!("read terminal tape inventory: {error}"))
         }
@@ -486,6 +506,9 @@ pub(crate) fn status_from_bot_structural_recovery_error(
     error: remanence_parity::BotStructuralRecoveryError,
 ) -> Status {
     match &error {
+        remanence_parity::BotStructuralRecoveryError::Cancelled => {
+            Status::cancelled("tape verification cancelled")
+        }
         remanence_parity::BotStructuralRecoveryError::Scan { .. } => {
             Status::unavailable(format!("BOT structural tape recovery failed: {error}"))
         }
@@ -531,9 +554,16 @@ pub(crate) fn handle_drive_verify_tape_index(
     barcode: Option<&str>,
     source_slot: Option<u16>,
     drive_serial: Option<&str>,
+    operation: Option<(
+        &crate::operations::OperationHandle,
+        crate::tape_verification::Progress,
+    )>,
 ) -> Result<pb::TapeIndexVerification, Status> {
     let io = drive.begin_verification_io();
     let _verification = drive.verification_context().verification();
+    if let Some((handle, _)) = &operation {
+        crate::tape_verification::check_cancelled(handle)?;
+    }
     session_open_short_probe_or_load(
         index,
         drive,
@@ -547,33 +577,60 @@ pub(crate) fn handle_drive_verify_tape_index(
             needs_drive_load,
         },
     )?;
+    if let Some((handle, _)) = &operation {
+        crate::tape_verification::check_cancelled(handle)?;
+    }
     session_open_reject_tape_io_fences(
         index,
         &tape_uuid,
         barcode,
         "fully verify terminal tape index",
     )?;
-    let prepared = prepare_catalog_recovery_read(index, drive, &tape_uuid)?;
-    let hints = &prepared.hints;
-    let block_size = hints.block_size;
-
-    let outcome = {
-        let mut source = DriveHandleRawSource::new(drive);
-        bot_recovery::verify_terminal_index_with_checkpoint_authority(
-            &mut source,
-            &cfg.checkpoint_journal_dir,
-            &tape_uuid,
-            block_size,
-            remanence_parity::ScanMode::Recovery(hints),
+    let context = drive.verification_context();
+    let _control = operation.as_ref().map(|(handle, progress)| {
+        let progress = progress.clone();
+        context.control(
+            handle.cancel_flag(),
+            std::sync::Arc::new(move |phase, bytes, file| {
+                progress.publish(phase, bytes, file);
+            }),
         )
-        .map_err(status_from_terminal_index_verification_error)?
-    };
-    let mut report = terminal_verification_to_proto(tape_uuid, outcome);
-    let io = io.finish();
-    log_verification_io(&io);
-    report.io = Some(verification_io_to_proto(io));
-    prepared.append_provenance(&mut report.detail);
-    Ok(report)
+    });
+    let result = (|| {
+        let prepared = prepare_catalog_recovery_read(index, drive, &tape_uuid)?;
+        let hints = &prepared.hints;
+        let block_size = hints.block_size;
+
+        let outcome = {
+            let mut source =
+                remanence_parity::raw::CancellableRawSource(DriveHandleRawSource::new(drive));
+            bot_recovery::verify_terminal_index_with_checkpoint_authority(
+                &mut source,
+                &cfg.checkpoint_journal_dir,
+                &tape_uuid,
+                block_size,
+                remanence_parity::ScanMode::Recovery(hints),
+            )
+            .map_err(status_from_terminal_index_verification_error)?
+        };
+        let mut report = terminal_verification_to_proto(tape_uuid, outcome);
+        let io = io.finish();
+        log_verification_io(&io);
+        report.io = Some(verification_io_to_proto(io));
+        prepared.append_provenance(&mut report.detail);
+        Ok(report)
+    })();
+    // A late cancel suppresses a verdict, never an unrelated error.
+    match result {
+        Ok(_)
+            if operation
+                .as_ref()
+                .is_some_and(|(handle, _)| handle.is_cancelled()) =>
+        {
+            Err(Status::cancelled("tape verification cancelled"))
+        }
+        result => result,
+    }
 }
 
 /// Project physical verification into the daemon's wire report, including all
@@ -790,6 +847,9 @@ pub(crate) fn status_from_terminal_index_verification_error(
     error: remanence_parity::TerminalIndexVerificationError,
 ) -> Status {
     match error {
+        remanence_parity::TerminalIndexVerificationError::Cancelled => {
+            Status::cancelled("tape verification cancelled")
+        }
         remanence_parity::TerminalIndexVerificationError::Source { .. }
         | remanence_parity::TerminalIndexVerificationError::PrefixWalk { .. } => {
             Status::unavailable(format!("full terminal index verification failed: {error}"))

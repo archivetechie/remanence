@@ -38,11 +38,33 @@ pub(crate) struct TapeInventoryArgs {
 #[derive(Args, Clone, Debug)]
 pub(crate) struct TapeVerifyIndexArgs {
     #[command(flatten)]
-    inventory: TapeInventoryArgs,
+    inventory: TapeVerificationTargetArgs,
 
     /// Wait for a media-readiness fence. Accepts ms/s/m/h; 0 returns the refusal.
     #[arg(long, value_name = "DURATION", default_value = "15m", value_parser = crate::parse_wait_duration_arg)]
     ready_wait: std::time::Duration,
+
+    /// Start a watchable verification and print its operation UUID.
+    #[arg(long, conflicts_with = "result")]
+    detach: bool,
+
+    /// Fetch a retained verification verdict by operation UUID.
+    #[arg(long, value_name = "OPERATION_ID", conflicts_with = "tape_uuid")]
+    result: Option<String>,
+}
+
+/// Verification can address either an exact tape or a retained operation.
+#[derive(Args, Clone, Debug)]
+pub(crate) struct TapeVerificationTargetArgs {
+    /// Exact tape UUID; voltags are refused.
+    #[arg(long, value_name = "UUID", required_unless_present = "result")]
+    tape_uuid: Option<String>,
+    /// Emit stable CLI-shaped JSON.
+    #[arg(long)]
+    pub(crate) json: bool,
+    /// Daemon gRPC endpoint URI.
+    #[arg(long, value_name = "URI", default_value = DEFAULT_DAEMON_ENDPOINT)]
+    endpoint: String,
 }
 
 impl TapeInventoryArgs {
@@ -693,11 +715,14 @@ pub(crate) fn run_verify_index(
     err: &mut dyn Write,
 ) -> ExitCode {
     let args = &verify_args.inventory;
-    let tape_uuid = match args.exact_tape_uuid() {
-        Ok(tape_uuid) => tape_uuid,
+    let tape_uuid = match args.tape_uuid.as_deref().map(Uuid::parse_str).transpose() {
+        Ok(value) => value.map(|id| *id.as_bytes()),
         Err(error) => {
             return finish_daemon_client_result(
-                Err(DaemonClientError::client(error)),
+                Err(DaemonClientError::client(format!(
+                    "invalid tape_uuid {:?}: {error}",
+                    args.tape_uuid.as_deref().unwrap_or_default()
+                ))),
                 args.json,
                 err,
             )
@@ -710,25 +735,57 @@ pub(crate) fn run_verify_index(
             .block_on(connect_daemon(&args.endpoint))
             .map_err(DaemonClientError::client)?;
         runtime.block_on(crate::observe_daemon(&channel, args.json))?;
-        let client = pb::catalog_client::CatalogClient::new(channel.clone());
-        let verification = runtime.block_on(verify_with_readiness(
-            || {
-                let mut client = client.clone();
-                async move {
-                    client
-                        .verify_tape_index(pb::VerifyTapeIndexRequest {
-                            tape_uuid: tape_uuid.to_vec(),
-                        })
-                        .await
-                        .map(tonic::Response::into_inner)
-                }
-            },
-            &mut crate::media_readiness::DaemonReadinessClient::new(channel),
-            verify_args.ready_wait,
-            err,
-        ))?;
-        let fast_inventory =
-            validate_verification(&verification, tape_uuid).map_err(DaemonClientError::client)?;
+        let mut client = pb::catalog_client::CatalogClient::new(channel.clone());
+        if verify_args.detach {
+            let tape_uuid =
+                tape_uuid.ok_or_else(|| DaemonClientError::client("--tape-uuid is required"))?;
+            let operation = runtime
+                .block_on(
+                    client.start_tape_verification(pb::StartTapeVerificationRequest {
+                        tape_uuid: tape_uuid.to_vec(),
+                    }),
+                )
+                .map_err(DaemonClientError::status)?
+                .into_inner();
+            crate::print_operation_ref(operation, args.json, out)
+                .map_err(DaemonClientError::client)?;
+            return Ok(true);
+        }
+        let verification = if let Some(operation_id) = &verify_args.result {
+            let operation_id = Uuid::parse_str(operation_id)
+                .map_err(|e| DaemonClientError::client(format!("invalid operation_id: {e}")))?;
+            runtime
+                .block_on(client.get_tape_verification(pb::GetOperationRequest {
+                    operation_id: operation_id.as_bytes().to_vec(),
+                }))
+                .map_err(DaemonClientError::status)?
+                .into_inner()
+        } else {
+            let tape_uuid =
+                tape_uuid.ok_or_else(|| DaemonClientError::client("--tape-uuid is required"))?;
+            runtime.block_on(verify_with_readiness(
+                || {
+                    let mut client = client.clone();
+                    async move {
+                        client
+                            .verify_tape_index(pb::VerifyTapeIndexRequest {
+                                tape_uuid: tape_uuid.to_vec(),
+                            })
+                            .await
+                            .map(tonic::Response::into_inner)
+                    }
+                },
+                &mut crate::media_readiness::DaemonReadinessClient::new(channel),
+                verify_args.ready_wait,
+                err,
+            ))?
+        };
+        let response_tape_uuid = Uuid::from_slice(&verification.tape_uuid).map_err(|e| {
+            DaemonClientError::client(format!("invalid verification tape_uuid: {e}"))
+        })?;
+        let expected_tape_uuid = tape_uuid.unwrap_or(*response_tape_uuid.as_bytes());
+        let fast_inventory = validate_verification(&verification, expected_tape_uuid)
+            .map_err(DaemonClientError::client)?;
         print_verification(&verification, fast_inventory, args.json, out)
             .map_err(DaemonClientError::client)?;
         Ok(pb::TapeIndexVerificationState::try_from(verification.state)
@@ -2230,7 +2287,7 @@ mod tests {
         for after_readiness in [true, false] {
             for stays_busy in [true, false] {
                 let mut readiness = FakeReadiness::initializing_then_ready();
-                let busy = tonic::Status::failed_precondition("drive bay 0x0100 is busy");
+                let busy = tonic::Status::failed_precondition("drive bay 0x0100 is busy; held by: drive DRIVE001 held by tape_verification 00000000-0000-0000-0000-000000000001");
                 let mut replies = Vec::new();
                 if after_readiness {
                     replies.push(Err(readiness_refusal()));
@@ -2305,6 +2362,34 @@ mod tests {
                 invalid,
             ])
             .is_err());
+        }
+    }
+
+    /// A retained result needs only its operation ID; start needs an exact tape.
+    #[test]
+    fn verification_operation_modes_parse() {
+        use clap::Parser;
+        let id = "00000000-0000-0000-0000-000000000001";
+        for arguments in [
+            vec!["rem", "tape", "verify-index", "--result", id],
+            vec!["rem", "tape", "verify-index", "--tape-uuid", id, "--detach"],
+        ] {
+            assert!(crate::Cli::try_parse_from(arguments).is_ok());
+        }
+        for arguments in [
+            vec!["rem", "tape", "verify-index", "--detach"],
+            vec!["rem", "tape", "verify-index", "--result", id, "--detach"],
+            vec![
+                "rem",
+                "tape",
+                "verify-index",
+                "--result",
+                id,
+                "--tape-uuid",
+                id,
+            ],
+        ] {
+            assert!(crate::Cli::try_parse_from(arguments).is_err());
         }
     }
 

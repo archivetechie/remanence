@@ -7,6 +7,11 @@ per-release summaries.
 <!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_backend.rs crates/remanence-state/src/index.rs crates/remanence-library/src/discovery.rs @ 638210f7 -->
 ## Unreleased
 
+- Full tape verification runs as a watchable, cancellable daemon operation.
+  `rem tape verify-index --detach` starts it and `--result <UUID>` fetches its
+  retained verdict. Drive refusals name reservation holders; completed verdicts
+  record catalog freshness and replay from audit journals.
+
 - Full verification reads each parity sidecar forward once, retains up to
   64 MiB of metadata, and applies the recovery acquisition to those blocks.
   Shards retain CRC observations only; unretained positions are read directly.

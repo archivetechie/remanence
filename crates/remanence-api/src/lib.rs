@@ -125,6 +125,7 @@ mod startup_checkpoint;
 mod startup_guard;
 mod startup_media_readiness;
 mod tape_init;
+mod tape_verification;
 mod terminal_fault;
 mod write_admission;
 mod write_owner;

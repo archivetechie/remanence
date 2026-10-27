@@ -2864,6 +2864,9 @@ fn batched_parity_post_motion_projection_failure_sets_dirty_after_retryable_spoo
 
 fn capacity_tape_record() -> TapeRecord {
     TapeRecord {
+        last_verified_at_utc: None,
+        last_verification_state: None,
+        last_verified_edition_digest: None,
         tape_uuid: vec![0x71; 16],
         voltag: Some("CAP005L9".into()),
         voltag_source: Some(remanence_state::LabelProvenance::Changer),
@@ -2890,6 +2893,9 @@ fn capacity_tape_record() -> TapeRecord {
 #[test]
 fn selected_tape_geometry_rejects_partial_parity_columns() {
     let partial = TapeRecord {
+        last_verified_at_utc: None,
+        last_verification_state: None,
+        last_verified_edition_digest: None,
         data_blocks_per_stripe: Some(16),
         ..capacity_tape_record()
     };
@@ -2906,6 +2912,9 @@ fn selected_tape_geometry_rejects_partial_parity_columns() {
 #[test]
 fn physical_extent_projection_prefers_authority_and_fails_closed_on_legacy_overflow() {
     let authoritative = TapeRecord {
+        last_verified_at_utc: None,
+        last_verification_state: None,
+        last_verified_edition_digest: None,
         written_extent_lba: Some(73),
         last_committed_tape_file: Some(u64::MAX),
         total_committed_ordinals: u64::MAX,
@@ -2917,12 +2926,18 @@ fn physical_extent_projection_prefers_authority_and_fails_closed_on_legacy_overf
     assert_eq!(tape_physical_used_blocks(&empty).unwrap(), 0);
 
     let ordinal_only = TapeRecord {
+        last_verified_at_utc: None,
+        last_verification_state: None,
+        last_verified_edition_digest: None,
         total_committed_ordinals: 9,
         ..capacity_tape_record()
     };
     assert_eq!(tape_physical_used_blocks(&ordinal_only).unwrap(), 20);
 
     let with_file_count = TapeRecord {
+        last_verified_at_utc: None,
+        last_verification_state: None,
+        last_verified_edition_digest: None,
         total_committed_ordinals: 9,
         last_committed_tape_file: Some(3),
         ..capacity_tape_record()
@@ -2930,12 +2945,18 @@ fn physical_extent_projection_prefers_authority_and_fails_closed_on_legacy_overf
     assert_eq!(tape_physical_used_blocks(&with_file_count).unwrap(), 17);
 
     let ordinal_overflow = TapeRecord {
+        last_verified_at_utc: None,
+        last_verification_state: None,
+        last_verified_edition_digest: None,
         total_committed_ordinals: u64::MAX,
         ..capacity_tape_record()
     };
     assert!(tape_physical_used_blocks(&ordinal_overflow).is_err());
 
     let file_count_overflow = TapeRecord {
+        last_verified_at_utc: None,
+        last_verification_state: None,
+        last_verified_edition_digest: None,
         last_committed_tape_file: Some(u64::MAX),
         ..capacity_tape_record()
     };
@@ -2961,10 +2982,16 @@ fn selector_fit_uses_barrier_proved_physical_extent_at_the_boundary() {
     let usable = watermark_floor_bytes(capacity, cfg.watermark_high).expect("usable bytes");
     let boundary_lba = usable / cfg.block_size_bytes;
     let full = TapeRecord {
+        last_verified_at_utc: None,
+        last_verification_state: None,
+        last_verified_edition_digest: None,
         written_extent_lba: Some(boundary_lba),
         ..capacity_tape_record()
     };
     let fitting = TapeRecord {
+        last_verified_at_utc: None,
+        last_verification_state: None,
+        last_verified_edition_digest: None,
         tape_uuid: vec![0x72; 16],
         written_extent_lba: Some(boundary_lba - 1),
         ..capacity_tape_record()

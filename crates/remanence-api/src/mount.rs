@@ -417,6 +417,12 @@ async fn open_write_session_reserved(
         elapsed_ms = crate::diagnostics::duration_ms(open_elapsed),
         "remanence_write_diag",
     );
+    pool.set_holder(
+        &mount.drive_key(),
+        mount.drive_serial.as_deref(),
+        "write session",
+        session_id,
+    );
     pool.record_session(
         session_id,
         crate::write_owner::MountedSession {
@@ -504,6 +510,11 @@ async fn tape_inventory_critical(
     let library_serial = resolve_tape_library_serial(&state, &pool, &tape_uuid)?;
     let (mount, drive_reservation) =
         resolve_and_reserve_actor_mount(&state, &pool, &library_serial, &tape_uuid).await?;
+    pool.set_internal_holder(
+        &mount.drive_key(),
+        mount.drive_serial.as_deref(),
+        "inventory",
+    );
     let drive = pool.drive_tx(&mount.drive_key())?;
     if let Some(slot) = mount.source_slot {
         if let Err(error) = changer_move(&pool, &mount.library_serial, slot, mount.bay).await {
@@ -554,11 +565,15 @@ async fn tape_inventory_critical(
 pub(crate) async fn verify_tape_index(
     state: &ApiState,
     tape_uuid: TapeUuid,
+    handle: crate::operations::OperationHandle,
+    progress: crate::tape_verification::Progress,
 ) -> Result<pb::TapeIndexVerification, Status> {
     let state = state.clone();
     await_critical_task(
         "verify_tape_index",
-        tokio::spawn(async move { verify_tape_index_critical(state, tape_uuid).await }),
+        tokio::spawn(async move {
+            verify_tape_index_critical(state, tape_uuid, handle, progress).await
+        }),
     )
     .await
 }
@@ -566,6 +581,8 @@ pub(crate) async fn verify_tape_index(
 async fn verify_tape_index_critical(
     state: ApiState,
     tape_uuid: TapeUuid,
+    handle: crate::operations::OperationHandle,
+    progress: crate::tape_verification::Progress,
 ) -> Result<pb::TapeIndexVerification, Status> {
     let pool = state.drive_pool()?.clone();
     let _tape_reservation = pool.reserve_tape(tape_uuid)?;
@@ -584,6 +601,14 @@ async fn verify_tape_index_critical(
     let library_serial = resolve_tape_library_serial(&state, &pool, &tape_uuid)?;
     let (mount, drive_reservation) =
         resolve_and_reserve_actor_mount(&state, &pool, &library_serial, &tape_uuid).await?;
+    crate::tape_verification::check_cancelled(&handle)?;
+    progress.mounted(mount.drive_serial.as_deref(), mount.bay);
+    pool.set_holder(
+        &mount.drive_key(),
+        mount.drive_serial.as_deref(),
+        "tape_verification",
+        handle.op_id_uuid(),
+    );
     let drive = pool.drive_tx(&mount.drive_key())?;
     if let Some(slot) = mount.source_slot {
         if let Err(error) = changer_move(&pool, &mount.library_serial, slot, mount.bay).await {
@@ -594,6 +619,8 @@ async fn verify_tape_index_critical(
     let (reply, response) = oneshot::channel();
     if drive
         .send(crate::write_owner::DriveCommand::VerifyTapeIndex {
+            handle,
+            progress,
             tape_uuid,
             needs_drive_load: mount.needs_drive_load,
             library_serial: mount.library_serial.clone(),
@@ -869,6 +896,12 @@ async fn run_manual_finalize_worker(
     let library_serial = resolve_tape_library_serial(&state, &pool, &tape_uuid)?;
     let (mount, drive_reservation) =
         resolve_and_reserve_actor_mount(&state, &pool, library_serial.as_str(), &tape_uuid).await?;
+    pool.set_holder(
+        &mount.drive_key(),
+        mount.drive_serial.as_deref(),
+        "finalize_tape",
+        actor_request.candidate_operation_id,
+    );
     let drive = pool.drive_tx(&mount.drive_key())?;
     if let Some(slot) = mount.source_slot {
         if let Err(error) = changer_move(&pool, &mount.library_serial, slot, mount.bay).await {
@@ -1262,6 +1295,12 @@ async fn open_read_session_on_mount(
         }
     };
     let session_id = uuid_from_proto(&session.session_id, "session_id")?;
+    pool.set_holder(
+        &mount.drive_key(),
+        mount.drive_serial.as_deref(),
+        "read session",
+        session_id,
+    );
     pool.record_session(
         session_id,
         crate::write_owner::MountedSession {
@@ -1773,6 +1812,12 @@ async fn dismount_reserved_cartridge(
     reason: DismountReason,
     reservation: crate::write_owner::DriveReservation,
 ) -> Result<crate::write_owner::DriveReservation, Status> {
+    let holder_kind = match reason {
+        DismountReason::Evicted => "eviction_dismount",
+        DismountReason::Shutdown => "shutdown_dismount",
+        DismountReason::IdleTimeout => "parked_dismount",
+    };
+    pool.set_internal_holder(&seated.drive_key(), None, holder_kind);
     ensure_seated_cartridge_media_readiness_admitted(state, seated, reason)?;
     ensure_seated_cartridge_matches_snapshot(state, seated)?;
 
@@ -1934,6 +1979,7 @@ fn schedule_idle_dismount(state: ApiState, parked: crate::write_owner::ParkedCar
                     continue;
                 }
             };
+            pool.set_internal_holder(&parked.seated.drive_key(), None, "parked_dismount");
             if !pool.parked_is_current(&parked) {
                 drop(reservation);
                 return;
@@ -2366,7 +2412,24 @@ async fn resolve_and_reserve_actor_mount(
     const ATTEMPTS: usize = 2;
     for attempt in 0..ATTEMPTS {
         let busy_bays = pool.busy_bays(library_serial);
-        let plan = resolve_actor_mount(state, library_serial, tape_uuid, &busy_bays)?;
+        let plan =
+            resolve_actor_mount(state, library_serial, tape_uuid, &busy_bays).map_err(|error| {
+                if error.code() == tonic::Code::FailedPrecondition
+                    && (error.message().contains("busy")
+                        || error.message().contains("no free drive"))
+                {
+                    let specific = busy_bays
+                        .iter()
+                        .copied()
+                        .find(|bay| error.message() == format!("drive bay 0x{bay:04x} is busy"));
+                    pool.append_holders(error, |key| {
+                        key.library_serial() == Some(library_serial)
+                            && specific.is_none_or(|bay| key.bay() == Some(bay))
+                    })
+                } else {
+                    error
+                }
+            })?;
         let bay = match &plan {
             ActorMountPlan::Ready(mount) | ActorMountPlan::Evict { mount, .. } => mount.bay,
         };
@@ -2401,7 +2464,8 @@ async fn resolve_and_reserve_actor_mount(
             },
             Err(err)
                 if err.code() == tonic::Code::FailedPrecondition
-                    && err.message() == format!("{} is busy", drive_key.label())
+                    && err.message().split("; held by: ").next()
+                        == Some(format!("{} is busy", drive_key.label()).as_str())
                     && attempt + 1 < ATTEMPTS =>
             {
                 continue;
@@ -2445,6 +2509,14 @@ fn resolve_actor_mount(
     mount.library_serial = library_serial.to_string();
     mount.barcode = barcode;
     enrich_actor_mount_from_catalog(&index, library_serial, mount)?;
+    if mount.drive_serial.is_none() {
+        mount.drive_serial = library
+            .drive_bays
+            .iter()
+            .find(|drive| drive.element_address == mount.bay)
+            .and_then(|drive| drive.installed.as_ref())
+            .map(|drive| drive.serial.clone());
+    }
     if let ActorMountPlan::Evict { seated, .. } = &mut plan {
         seated.library_serial = library_serial.to_string();
     }
@@ -2767,6 +2839,11 @@ pub(crate) async fn supersede_tail(
         let library_serial = resolve_tape_library_serial(&state, &pool, &tape_uuid)?;
         let (mount, _drive_reservation) =
             resolve_and_reserve_actor_mount(&state, &pool, &library_serial, &tape_uuid).await?;
+        pool.set_internal_holder(
+            &mount.drive_key(),
+            mount.drive_serial.as_deref(),
+            "supersede_tail",
+        );
         let drive = pool.drive_tx(&mount.drive_key())?;
         if let Some(slot) = mount.source_slot {
             changer_move(&pool, &mount.library_serial, slot, mount.bay).await?;
@@ -3202,6 +3279,315 @@ mod tests {
             drive_rxs,
             changer_rx,
         }
+    }
+
+    /// RPC lifecycle retains the exact actor verdict, releases ownership and replays freshness.
+    /// Busy diagnostics preserve the bay-full refusal when no reservation caused it.
+    #[tokio::test]
+    async fn bay_full_refusal_has_no_false_holder_list() {
+        let harness = three_bay_two_pool_harness(
+            vec![
+                drive_bay(0x0101, true, Some("FTA001L9")),
+                drive_bay(0x0102, true, Some("OTHER2")),
+                drive_bay(0x0103, true, Some("OTHER3")),
+            ],
+            vec![slot(0x0402, "FTB001L9")],
+        );
+        let error =
+            resolve_and_reserve_actor_mount(&harness.state, &harness.pool, "LIB001", &POOL_TAPE_B)
+                .await
+                .unwrap_err();
+        assert_eq!(
+            error.message(),
+            "no free drive bay available to load cartridge FTB001L9"
+        );
+    }
+
+    /// Inventory and tail recovery publish their internal identity before actor work.
+    #[tokio::test]
+    async fn inventory_and_supersede_tail_reservations_name_holders() {
+        let mut harness = three_bay_two_pool_harness(
+            vec![
+                drive_bay(0x0101, true, Some("FTA001L9")),
+                drive_bay(0x0102, false, None),
+                drive_bay(0x0103, false, None),
+            ],
+            vec![slot(0x0402, "FTB001L9")],
+        );
+        for kind in ["inventory", "supersede_tail"] {
+            let state = harness.state.clone();
+            let task = tokio::spawn(async move {
+                if kind == "inventory" {
+                    let (tx, _rx) = mpsc::channel(1);
+                    tape_inventory_critical(state, POOL_TAPE_A, tx).await
+                } else {
+                    supersede_tail(
+                        &state,
+                        pb::SupersedeTailRequest {
+                            tape_uuid: POOL_TAPE_A.to_vec(),
+                            ..Default::default()
+                        },
+                        remanence_state::AuditActor::System,
+                    )
+                    .await
+                    .map(|_| ())
+                }
+            });
+            let command = harness
+                .drive_rxs
+                .get_mut(&0x0101)
+                .unwrap()
+                .recv()
+                .await
+                .unwrap();
+            let error = harness
+                .pool
+                .reserve_drive(&crate::drive_pool::DriveKey::new("LIB001", 0x0101))
+                .unwrap_err();
+            assert!(
+                error.message().contains(&format!("held by {kind}")),
+                "{error}"
+            );
+            assert!(!error.message().contains("admission or cleanup"));
+            match command {
+                crate::write_owner::DriveCommand::TapeInventory { reply, .. } => {
+                    reply.send(Ok(())).unwrap()
+                }
+                crate::write_owner::DriveCommand::SupersedeTail { reply, .. } => reply
+                    .send(Ok(pb::SupersedeTailResponse::default()))
+                    .unwrap(),
+                _ => panic!("unexpected actor command"),
+            }
+            task.await.unwrap().unwrap();
+            assert!(harness.pool.busy_bays("LIB001").is_empty());
+        }
+    }
+
+    /// The timer retains its named holder through both halves of dismount.
+    #[tokio::test]
+    async fn parked_dismount_reservation_names_holder() {
+        let mut harness = dismount_harness(1);
+        let parked = harness.pool.park_cartridge(harness.seated.clone());
+        schedule_idle_dismount(harness.state.clone(), parked);
+        let command = tokio::time::timeout(Duration::from_secs(3), harness.drive_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let error = harness
+            .pool
+            .reserve_drive(&harness.seated.drive_key())
+            .unwrap_err();
+        assert!(
+            error.message().contains("held by parked_dismount"),
+            "{error}"
+        );
+        let crate::write_owner::DriveCommand::Unload { reply } = command else {
+            panic!("unload")
+        };
+        reply.send(Ok(Duration::ZERO)).unwrap();
+        let crate::write_owner::ChangerCommand::Move { reply, .. } =
+            harness.changer_rx.recv().await.unwrap()
+        else {
+            panic!("move")
+        };
+        let error = harness
+            .pool
+            .reserve_drive(&harness.seated.drive_key())
+            .unwrap_err();
+        assert!(error.message().contains("held by parked_dismount"));
+        reply.send(Ok(())).unwrap();
+    }
+
+    #[tokio::test]
+    async fn verification_operation_result_cancel_release_and_replay() {
+        use crate::pb::catalog_server::Catalog;
+        use tokio_stream::StreamExt;
+        let mut harness = three_bay_two_pool_harness(
+            vec![
+                drive_bay(0x0101, true, Some("FTA001L9")),
+                drive_bay(0x0102, false, None),
+                drive_bay(0x0103, false, None),
+            ],
+            vec![slot(0x0402, "FTB001L9")],
+        );
+        let service = harness.state.catalog_service();
+        let expected = pb::TapeIndexVerification {
+            tape_uuid: POOL_TAPE_A.to_vec(),
+            state: pb::TapeIndexVerificationState::VerifiedComplete as i32,
+            edition_digest: Some(vec![7; 32]),
+            ..Default::default()
+        };
+        for cancelled in [true, false] {
+            let operation = service
+                .start_tape_verification(tonic::Request::new(pb::StartTapeVerificationRequest {
+                    tape_uuid: POOL_TAPE_A.to_vec(),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let id = Uuid::from_slice(&operation.operation_id).unwrap();
+            let mut watch = harness.state.operations.watch(&id).unwrap();
+            let command = harness
+                .drive_rxs
+                .get_mut(&0x0101)
+                .unwrap()
+                .recv()
+                .await
+                .unwrap();
+            let crate::write_owner::DriveCommand::VerifyTapeIndex { handle, reply, .. } = command
+            else {
+                panic!("verification command")
+            };
+            assert_eq!(
+                service
+                    .get_tape_verification(tonic::Request::new(pb::GetOperationRequest {
+                        operation_id: operation.operation_id.clone()
+                    }))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
+            let refusal = harness
+                .pool
+                .reserve_drive(&crate::drive_pool::DriveKey::new("LIB001", 0x0101))
+                .unwrap_err();
+            assert!(refusal
+                .message()
+                .contains(&format!("tape_verification {id}")));
+            let other_reservations = [0x0102, 0x0103].map(|bay| {
+                harness
+                    .pool
+                    .reserve_drive(&crate::drive_pool::DriveKey::new("LIB001", bay))
+                    .unwrap()
+            });
+            let read_refusal = open_read_session(
+                &harness.state,
+                ReadSessionTarget::Tape {
+                    tape_uuid: POOL_TAPE_B,
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                read_refusal
+                    .message()
+                    .contains(&format!("tape_verification {id}")),
+                "{read_refusal}"
+            );
+            assert!(read_refusal.message().contains("DRV0101"));
+            let write_refusal = open_write_session(
+                remanence_state::AuditActor::System,
+                &harness.state,
+                WriteSessionTarget::PinnedTape {
+                    tape_uuid: POOL_TAPE_B,
+                    required_pool_id: POOL_B.into(),
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                write_refusal
+                    .message()
+                    .contains(&format!("tape_verification {id}")),
+                "{write_refusal}"
+            );
+            assert!(write_refusal.message().contains("DRV0101"));
+            drop(other_reservations);
+            if cancelled {
+                harness.state.operations.request_cancel(&id).unwrap();
+                assert!(handle.is_cancelled());
+                // A late cancellation still suppresses an actor's completed verdict.
+                reply.send(Ok(expected.clone())).unwrap();
+            } else {
+                reply.send(Ok(expected.clone())).unwrap();
+            }
+            let terminal = loop {
+                let status = watch.next().await.unwrap().unwrap();
+                if crate::operations::is_terminal(&status) {
+                    break status;
+                }
+            };
+            assert_eq!(
+                terminal.state,
+                if cancelled {
+                    pb::OperationState::Cancelled
+                } else {
+                    pb::OperationState::Succeeded
+                } as i32
+            );
+            assert!(harness.pool.busy_bays("LIB001").is_empty());
+            harness
+                .state
+                .record_cancel_requested(remanence_state::AuditActor::System, id, None, true)
+                .unwrap();
+            let durable = harness
+                .state
+                .index()
+                .unwrap()
+                .get_operation(&id.to_string())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                durable.state,
+                if cancelled {
+                    "cancelled_before_dispatch"
+                } else {
+                    "finished"
+                }
+            );
+            let tape = harness
+                .state
+                .index()
+                .unwrap()
+                .get_tape(&POOL_TAPE_A)
+                .unwrap()
+                .unwrap();
+            let fetched = service
+                .get_tape_verification(tonic::Request::new(pb::GetOperationRequest {
+                    operation_id: operation.operation_id,
+                }))
+                .await;
+            if cancelled {
+                assert!(tape.last_verified_at_utc.is_none());
+                assert_eq!(fetched.unwrap_err().code(), tonic::Code::FailedPrecondition);
+            } else {
+                assert!(tape.last_verified_at_utc.is_some());
+                assert_eq!(fetched.unwrap().into_inner(), expected);
+            }
+        }
+        let unary = tokio::spawn(async move {
+            service
+                .verify_tape_index(tonic::Request::new(pb::VerifyTapeIndexRequest {
+                    tape_uuid: POOL_TAPE_A.to_vec(),
+                }))
+                .await
+        });
+        let command = harness
+            .drive_rxs
+            .get_mut(&0x0101)
+            .unwrap()
+            .recv()
+            .await
+            .unwrap();
+        let crate::write_owner::DriveCommand::VerifyTapeIndex { reply, .. } = command else {
+            panic!("verification command")
+        };
+        reply.send(Ok(expected.clone())).unwrap();
+        assert_eq!(unary.await.unwrap().unwrap().into_inner(), expected);
+        let records =
+            remanence_state::FileAuditLog::replay(harness.state.audit_dir.as_ref()).unwrap();
+        assert!(records
+            .iter()
+            .any(|r| r.event == remanence_state::AuditEvent::CancelledBeforeDispatch));
+        let mut index = harness.state.index_write().unwrap();
+        index
+            .rebuild_from_authoritative_sources(&records, &[])
+            .unwrap();
+        let tape = index.get_tape(&POOL_TAPE_A).unwrap().unwrap();
+        assert_eq!(tape.last_verified_edition_digest, Some(vec![7; 32]));
     }
 
     fn spawn_pool_open(

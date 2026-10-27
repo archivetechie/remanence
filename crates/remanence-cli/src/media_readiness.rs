@@ -276,6 +276,23 @@ async fn watch_media_readiness_operation(
 mod tests {
     use super::*;
 
+    #[test]
+    fn holder_suffix_does_not_expand_busy_retry_policy() {
+        assert!(drive_bay_busy(
+            "drive bay 0x0100 is busy; held by: drive A held by tape_verification 1"
+        ));
+        for message in [
+            "no free drive bay available to load cartridge X",
+            "all drives are busy",
+            "drives are busy",
+        ] {
+            assert!(!drive_bay_busy(message));
+            assert!(!drive_bay_busy(&format!(
+                "{message}; held by: drive A held by tape_verification 1"
+            )));
+        }
+    }
+
     /// Admission, robotics and verification refusals identify the same operation.
     #[test]
     fn parses_daemon_readiness_refusals() {

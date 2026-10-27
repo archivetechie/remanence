@@ -8108,6 +8108,7 @@ fn verify_index_unreadable_bootstrap_uses_catalog_hints() {
                 Some("RECOVERY001"),
                 None,
                 Some("DRV-RECOVERY"),
+                None,
             )
             .expect("verify-index proceeds with unreadable BOT");
             let io = report.io.as_ref().expect("recovery-required I/O");
@@ -8247,6 +8248,7 @@ fn catalog_recovery_paths_refuse_readable_bootstrap_disagreement() {
                 Some("RECOVERY001"),
                 None,
                 Some("DRV-RECOVERY"),
+                None,
             )
             .expect_err("verify-index rejects disagreement");
             assert!(error.message().contains(mismatch), "{error}");
@@ -8379,6 +8381,7 @@ fn assert_catalog_recovery_refusal(
         Some("RECOVERY001"),
         None,
         Some("DRV-RECOVERY"),
+        None,
     )
     .expect_err("verify refusal");
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
@@ -8537,6 +8540,7 @@ fn catalog_recovery_terminal_tail_retains_bootstrap_provenance() {
                     Some("RECOVERY001"),
                     None,
                     Some("DRV-RECOVERY"),
+                    None,
                 )
                 .expect("verification reports damaged BOT with surviving replicas");
                 let io = verification.io.as_ref().expect("degraded I/O");
@@ -9417,5 +9421,506 @@ pub(crate) async fn daemon_append_recovery_roundtrip(
             &world.lock().unwrap().tapes["HAND"].records[..durable.len()],
             durable.as_slice()
         );
+    }
+}
+
+/// Cancellation in the terminal walk aborts and leaves the loaded drive reusable.
+#[test]
+fn verification_walk_cancellation_has_no_verdict_and_can_restart() {
+    use remanence_library::verification_io::VerificationPhase;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    with_catalog_recovery_tape_options(
+        ParityConfig::None,
+        None,
+        append_recovery_terminal_tail,
+        false,
+        false,
+        |index, cfg, drive| {
+            let context = drive.verification_context();
+            let flag = Arc::new(AtomicBool::new(false));
+            let token = flag.clone();
+            let control = context.control(
+                flag.clone(),
+                Arc::new(move |phase, _, _| {
+                    if phase == VerificationPhase::Walk {
+                        token.store(true, Ordering::SeqCst);
+                    }
+                }),
+            );
+            let cancelled = handle_drive_verify_tape_index(
+                0x0100,
+                index,
+                cfg,
+                drive,
+                RANGE_TAPE_UUID,
+                false,
+                "LIB-RECOVERY",
+                Some("RECOVERY001"),
+                None,
+                Some("DRV-RECOVERY"),
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(cancelled.code(), tonic::Code::Cancelled);
+            assert!(flag.load(Ordering::SeqCst));
+            assert!(index
+                .get_tape(&RANGE_TAPE_UUID)
+                .unwrap()
+                .unwrap()
+                .last_verified_at_utc
+                .is_none());
+            drop(control);
+            assert!(handle_drive_verify_tape_index(
+                0x0100,
+                index,
+                cfg,
+                drive,
+                RANGE_TAPE_UUID,
+                false,
+                "LIB-RECOVERY",
+                Some("RECOVERY001"),
+                None,
+                Some("DRV-RECOVERY"),
+                None
+            )
+            .is_ok());
+        },
+    );
+}
+
+/// Transport-triggered cancellation goes through the real drive actor and mount owner.
+struct VerificationCancelTransport {
+    inner: ModelTransport,
+    registry: crate::operations::OperationRegistry,
+    trigger: Arc<Mutex<Option<(Uuid, &'static str)>>>,
+    fired: Arc<AtomicBool>,
+}
+impl VerificationCancelTransport {
+    fn before(&self, cdb: &[u8]) -> Result<bool, remanence_library::ScsiError> {
+        let Some((id, phase)) = *self.trigger.lock().unwrap() else {
+            return Ok(false);
+        };
+        let matches = if phase == "readiness" || phase == "refusal" {
+            cdb.first() == Some(&0)
+        } else if phase == "load" {
+            cdb.first() == Some(&0x1b)
+        } else if phase == "setup" {
+            cdb.first() == Some(&0x05)
+        } else {
+            self.registry
+                .latest(&id)
+                .is_some_and(|s| s.progress.get("phase").is_some_and(|p| p == phase))
+        };
+        if matches && !self.fired.swap(true, Ordering::SeqCst) {
+            self.registry.request_cancel(&id).unwrap();
+            if phase == "refusal" {
+                return Err(remanence_library::ScsiError::CheckCondition {
+                    sense: readiness_fixed_sense(5, 0x20, 0),
+                    bytes_transferred: 0,
+                });
+            }
+            if phase == "setup" {
+                return Err(remanence_library::ScsiError::InvalidResponse {
+                    offset: 0,
+                    detail: "injected transport response failure",
+                });
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+}
+impl SgTransport for VerificationCancelTransport {
+    fn execute_in(
+        &mut self,
+        cdb: &[u8],
+        buf: &mut [u8],
+    ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError> {
+        self.before(cdb)?;
+        self.inner.execute_in(cdb, buf)
+    }
+    fn execute_none(&mut self, cdb: &[u8]) -> Result<(), remanence_library::ScsiError> {
+        let cancelled_here = self.before(cdb)?;
+        self.inner.execute_none(cdb)?;
+        if cdb.first() == Some(&0) {
+            if cancelled_here {
+                // The first TUR reaches the model, then requires another readiness probe.
+                return Err(remanence_library::ScsiError::CheckCondition {
+                    sense: readiness_fixed_sense(6, 0x28, 0),
+                    bytes_transferred: 0,
+                });
+            }
+            if !self.fired.load(Ordering::SeqCst)
+                && self
+                    .trigger
+                    .lock()
+                    .unwrap()
+                    .is_some_and(|(_, phase)| phase == "load")
+            {
+                // Changer inventory has the tape, but it needs LOAD before becoming ready.
+                return Err(remanence_library::ScsiError::CheckCondition {
+                    sense: readiness_fixed_sense(2, 0x3a, 0),
+                    bytes_transferred: 0,
+                });
+            }
+        }
+        Ok(())
+    }
+    fn execute_out(
+        &mut self,
+        cdb: &[u8],
+        buf: &[u8],
+    ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError> {
+        self.before(cdb)?;
+        self.inner.execute_out(cdb, buf)
+    }
+    fn set_timeout_for(&mut self, class: remanence_library::TimeoutClass) {
+        self.inner.set_timeout_for(class);
+    }
+}
+
+struct VerificationActorHarness {
+    _temp: tempfile::TempDir,
+    state: crate::ApiState,
+    tape_uuid: [u8; 16],
+    tx: mpsc::Sender<DriveCommand>,
+    trigger: Arc<Mutex<Option<(Uuid, &'static str)>>>,
+    fired: Arc<AtomicBool>,
+    world: Arc<Mutex<VirtualWorld>>,
+}
+impl VerificationActorHarness {
+    /// Build a complete protected tape entirely through in-memory transports.
+    fn new() -> Self {
+        Self::with_tape_in_slot(false)
+    }
+
+    /// A slotted cartridge exercises mount ownership and the needs-drive-load path.
+    fn with_tape_in_slot(needs_drive_load: bool) -> Self {
+        let inputs = crate::tape_image_vectors::inputs("a4-minimal");
+        let tape_uuid = inputs.tape_uuid;
+        let block_size = inputs.block_size;
+        let parity = ParityConfig::Scheme(inputs.scheme.clone());
+        let (_, image) = crate::tape_image_vectors::write_model(inputs).unwrap();
+        let mut tape = VirtualTape::empty(64 * 1024 * 1024, block_size);
+        for file in image.files {
+            tape.written_bytes += file.bytes.len() as u64;
+            tape.records.extend(
+                file.bytes
+                    .chunks_exact(block_size as usize)
+                    .map(|b| Record::Block(b.to_vec())),
+            );
+            if file.filemark_record.is_some() {
+                tape.records.push(Record::Filemark);
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("catalog.sqlite");
+        let mut index = CatalogIndex::open(&path).unwrap();
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "VERIFY001L9".into(),
+                block_size,
+                parity,
+                force: false,
+            })
+            .unwrap();
+        let mut state = crate::ApiState::new(index);
+        let mut world = VirtualWorld::single_drive("LIB-VERIFY", 0x100, "DRV-VERIFY", 0x400, 1);
+        if needs_drive_load {
+            world.put_tape_in_slot(0x400, "VERIFY001L9", tape);
+        } else {
+            world.put_tape_in_drive(0x100, "VERIFY001L9", None, tape);
+        }
+        let world = Arc::new(Mutex::new(world));
+        let model = world.lock().unwrap().library_snapshot();
+        let trigger = Arc::new(Mutex::new(None));
+        let fired = Arc::new(AtomicBool::new(false));
+        let mut library = model
+            .open_with(&remanence_library::StaticAllowlist::new(["LIB-VERIFY"]), {
+                let world = world.clone();
+                let trigger = trigger.clone();
+                let fired = fired.clone();
+                let registry = state.operations.clone();
+                move |path| {
+                    let role = world.lock().unwrap().role_for_path(path).unwrap();
+                    Ok(Box::new(VerificationCancelTransport {
+                        inner: ModelTransport::new(world.clone(), role),
+                        registry: registry.clone(),
+                        trigger: trigger.clone(),
+                        fired: fired.clone(),
+                    }))
+                }
+            })
+            .unwrap();
+        let snapshot = library_snapshot_cell(library.library().clone());
+        state.library_snapshot = Some(snapshot.clone());
+        state.default_library_serial = Some(Arc::new("LIB-VERIFY".into()));
+        state.drive_idle_unload_seconds = 0;
+        let mut cfg =
+            test_write_owner_config(path, state.audit_dir.as_ref().clone(), &library, snapshot);
+        cfg.checkpoint_journal_dir = temp.path().join("checkpoints");
+        let drive = library.open_drive(0x100, &cfg.policy).unwrap();
+        let tx = spawn_drive_actor(0x100, drive, cfg.clone());
+        let changer = spawn_changer_actor(library.into_changer(), cfg);
+        state.drive_pool = Some(DrivePool::new_for_library(
+            "LIB-VERIFY",
+            changer,
+            HashMap::from([(0x100, tx.clone())]),
+            Arc::new(HashMap::from([(0x100, AtomicBool::new(false))])),
+        ));
+        world.lock().unwrap().command_log.clear();
+        Self {
+            _temp: temp,
+            state,
+            tape_uuid,
+            tx,
+            trigger,
+            fired,
+            world,
+        }
+    }
+
+    /// Readiness-only cancellation must not create even a completed readiness row.
+    fn assert_unfenced_and_released(&self) {
+        let connection = rusqlite::Connection::open(self.state.index_path.as_ref()).unwrap();
+        let count: i64 = connection
+            .query_row("select count(*) from media_readiness_ops", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "media_readiness_ops");
+        self.assert_no_active_fence_and_released();
+    }
+
+    /// A successful LOAD may retain ready evidence, but cannot leave admission fenced.
+    fn assert_no_active_fence_and_released(&self) {
+        assert!(self
+            .state
+            .index()
+            .unwrap()
+            .list_active_media_readiness_operations(None)
+            .unwrap()
+            .is_empty());
+        let connection = rusqlite::Connection::open(self.state.index_path.as_ref()).unwrap();
+        let count: i64 = connection
+            .query_row("select count(*) from tape_io_fences", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "tape_io_fences");
+        let pool = self.state.drive_pool().unwrap();
+        assert!(pool.busy_bays("LIB-VERIFY").is_empty());
+        drop(pool.reserve_tape(self.tape_uuid).unwrap());
+    }
+
+    async fn verify_again(&self) {
+        *self.trigger.lock().unwrap() = None;
+        let (_, rx) =
+            crate::tape_verification::start(&self.state, AuditActor::System, self.tape_uuid)
+                .unwrap();
+        let report = rx.await.unwrap().unwrap();
+        assert_eq!(
+            report.state,
+            pb::TapeIndexVerificationState::VerifiedComplete as i32,
+            "{}",
+            report.detail
+        );
+    }
+}
+
+#[tokio::test]
+async fn verification_cancel_before_first_drive_command_leaves_no_fence() {
+    let harness = VerificationActorHarness::new();
+    let id = Uuid::new_v4();
+    let handle = harness.state.operations.register(id, "tape_verification");
+    harness.state.operations.request_cancel(&id).unwrap();
+    let pool = harness.state.drive_pool().unwrap();
+    let reservation = pool
+        .reserve_drive(&DriveKey::new("LIB-VERIFY", 0x100))
+        .unwrap();
+    let tape_reservation = pool.reserve_tape(harness.tape_uuid).unwrap();
+    let (reply, rx) = oneshot::channel();
+    harness
+        .tx
+        .send(DriveCommand::VerifyTapeIndex {
+            progress: crate::tape_verification::Progress::new(handle.clone(), harness.tape_uuid),
+            handle,
+            tape_uuid: harness.tape_uuid,
+            needs_drive_load: false,
+            library_serial: "LIB-VERIFY".into(),
+            barcode: Some("VERIFY001L9".into()),
+            source_slot: None,
+            drive_serial: Some("DRV-VERIFY".into()),
+            reply,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        rx.await.unwrap().unwrap_err().code(),
+        tonic::Code::Cancelled
+    );
+    assert!(harness.world.lock().unwrap().command_log.is_empty());
+    drop(reservation);
+    drop(tape_reservation);
+    harness.assert_unfenced_and_released();
+    let handle = harness
+        .state
+        .operations
+        .register(Uuid::new_v4(), "tape_verification");
+    harness
+        .state
+        .operations
+        .request_cancel(&handle.op_id_uuid())
+        .unwrap();
+    let error = crate::mount::verify_tape_index(
+        &harness.state,
+        harness.tape_uuid,
+        handle.clone(),
+        crate::tape_verification::Progress::new(handle, harness.tape_uuid),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Cancelled);
+    assert!(harness.world.lock().unwrap().command_log.is_empty());
+    harness.assert_unfenced_and_released();
+    harness.verify_again().await;
+}
+
+#[tokio::test]
+async fn verification_cancel_during_readiness_leaves_no_fence() {
+    let harness = VerificationActorHarness::new();
+    let (operation, rx) =
+        crate::tape_verification::start(&harness.state, AuditActor::System, harness.tape_uuid)
+            .unwrap();
+    let id = Uuid::from_slice(&operation.operation_id).unwrap();
+    *harness.trigger.lock().unwrap() = Some((id, "readiness"));
+    assert_eq!(
+        rx.await.unwrap().unwrap_err().code(),
+        tonic::Code::Cancelled
+    );
+    assert!(harness.fired.load(Ordering::SeqCst));
+    assert_eq!(
+        harness
+            .world
+            .lock()
+            .unwrap()
+            .command_log
+            .iter()
+            .map(|command| command.opcode)
+            .collect::<Vec<_>>(),
+        vec![0, 0]
+    );
+    assert_eq!(
+        harness.state.operations.latest(&id).unwrap().state,
+        pb::OperationState::Cancelled as i32
+    );
+    harness.assert_unfenced_and_released();
+    harness.verify_again().await;
+}
+
+/// Cancellation during LOAD must allow its readiness tail to finish before releasing ownership.
+#[tokio::test]
+async fn verification_cancel_during_load_leaves_no_active_fence() {
+    let harness = VerificationActorHarness::with_tape_in_slot(true);
+    let (operation, rx) =
+        crate::tape_verification::start(&harness.state, AuditActor::System, harness.tape_uuid)
+            .unwrap();
+    let id = Uuid::from_slice(&operation.operation_id).unwrap();
+    *harness.trigger.lock().unwrap() = Some((id, "load"));
+    assert_eq!(
+        rx.await.unwrap().unwrap_err().code(),
+        tonic::Code::Cancelled
+    );
+    assert!(harness.fired.load(Ordering::SeqCst));
+    let commands = harness.world.lock().unwrap().command_log.clone();
+    let readiness_commands: Vec<_> = commands
+        .iter()
+        .filter(|command| matches!(command.opcode, 0 | 0x1b))
+        .map(|command| command.opcode)
+        .collect();
+    assert_eq!(readiness_commands, vec![0, 0x1b, 0]);
+    assert_eq!(
+        harness.state.operations.latest(&id).unwrap().state,
+        pb::OperationState::Cancelled as i32
+    );
+    // LOAD always records readiness history; cancellation must not turn it into a fence.
+    let connection = rusqlite::Connection::open(harness.state.index_path.as_ref()).unwrap();
+    let rows: Vec<(String, String)> = connection
+        .prepare("select state, dirty_scope from media_readiness_ops")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(rows, vec![("ready".into(), "none".into())]);
+    harness.assert_no_active_fence_and_released();
+    harness.verify_again().await;
+}
+
+#[tokio::test]
+async fn verification_cancel_during_protected_pass_through_drive_actor() {
+    let harness = VerificationActorHarness::new();
+    let (operation, rx) =
+        crate::tape_verification::start(&harness.state, AuditActor::System, harness.tape_uuid)
+            .unwrap();
+    let id = Uuid::from_slice(&operation.operation_id).unwrap();
+    *harness.trigger.lock().unwrap() = Some((id, "protected_data"));
+    assert_eq!(
+        rx.await.unwrap().unwrap_err().code(),
+        tonic::Code::Cancelled
+    );
+    assert!(harness.fired.load(Ordering::SeqCst));
+    assert_eq!(
+        harness.state.operations.latest(&id).unwrap().state,
+        pb::OperationState::Cancelled as i32
+    );
+    assert!(harness
+        .state
+        .index()
+        .unwrap()
+        .get_tape(&harness.tape_uuid)
+        .unwrap()
+        .unwrap()
+        .last_verified_at_utc
+        .is_none());
+    harness.assert_unfenced_and_released();
+    harness.verify_again().await;
+}
+
+#[tokio::test]
+async fn verification_concurrent_cancel_preserves_readiness_refusal_and_transport_error() {
+    for phase in ["refusal", "setup"] {
+        let harness = VerificationActorHarness::new();
+        let (operation, rx) =
+            crate::tape_verification::start(&harness.state, AuditActor::System, harness.tape_uuid)
+                .unwrap();
+        let id = Uuid::from_slice(&operation.operation_id).unwrap();
+        *harness.trigger.lock().unwrap() = Some((id, phase));
+        let error = rx.await.unwrap().unwrap_err();
+        assert!(harness.fired.load(Ordering::SeqCst));
+        if phase == "refusal" {
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            let index = harness.state.index().unwrap();
+            let fences = index.list_active_media_readiness_operations(None).unwrap();
+            assert_eq!(fences.len(), 1);
+            assert!(
+                error
+                    .message()
+                    .contains(&fences[0].operation_id.to_string()),
+                "{error}"
+            );
+        } else {
+            assert_eq!(error.code(), tonic::Code::Internal);
+            assert!(error
+                .message()
+                .contains("injected transport response failure"));
+        }
+        assert_eq!(
+            harness.state.operations.latest(&id).unwrap().state,
+            pb::OperationState::Failed as i32
+        );
+        assert!(harness
+            .state
+            .drive_pool()
+            .unwrap()
+            .busy_bays("LIB-VERIFY")
+            .is_empty());
     }
 }

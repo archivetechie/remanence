@@ -2146,7 +2146,8 @@ fn completion_unknown(err: &ScsiError) -> bool {
         ScsiError::Io(_) => true,
         #[cfg(target_os = "linux")]
         ScsiError::CheckCondition { .. } | ScsiError::UnexpectedStatus { .. } => false,
-        ScsiError::InvalidInput(_)
+        ScsiError::Cancelled
+        | ScsiError::InvalidInput(_)
         | ScsiError::Truncated { .. }
         | ScsiError::InvalidResponse { .. } => false,
     }

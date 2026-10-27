@@ -64,12 +64,21 @@ pub(crate) struct ParkedState {
 /// Shared actor/pool lifecycle maps used by timer-driven close-and-park.
 #[derive(Clone, Default)]
 pub(crate) struct DrivePoolLifecycle {
+    holders: Arc<Mutex<HashMap<DriveKey, String>>>,
     pub(crate) sessions: Arc<Mutex<HashMap<Uuid, MountedSession>>>,
     pub(crate) parked: Arc<Mutex<ParkedState>>,
     pub(crate) timer_park_tx: Option<mpsc::UnboundedSender<ParkedCartridge>>,
 }
 
 impl DrivePoolLifecycle {
+    /// Publish the actor's real session identity before readiness and tape setup.
+    pub(crate) fn set_holder(&self, drive: &DriveKey, serial: Option<&str>, kind: &str, id: Uuid) {
+        self.holders
+            .lock()
+            .unwrap()
+            .insert(drive.clone(), holder_label(drive, serial, kind, id));
+    }
+
     pub(crate) fn with_timer_park_sender(
         timer_park_tx: mpsc::UnboundedSender<ParkedCartridge>,
     ) -> Self {
@@ -80,11 +89,34 @@ impl DrivePoolLifecycle {
     }
 }
 
+/// Render the reservation identity consistently for pool and actor updates.
+fn holder_label(drive: &DriveKey, serial: Option<&str>, kind: &str, id: Uuid) -> String {
+    format!("{} held by {kind} {id}", holder_drive_label(drive, serial))
+}
+
+/// Identify a serialized drive or its library bay in reservation messages.
+fn holder_drive_label(drive: &DriveKey, serial: Option<&str>) -> String {
+    match (serial, drive) {
+        (Some(serial), _) => format!("drive {serial}"),
+        (
+            None,
+            DriveKey::Bay {
+                library_serial,
+                bay,
+            },
+        ) => {
+            format!("bay 0x{bay:04x} of library {library_serial}")
+        }
+        (None, DriveKey::Standalone { .. }) => drive.label(),
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct DrivePool {
     changers: Arc<HashMap<String, mpsc::Sender<ChangerCommand>>>,
     drives: Arc<HashMap<DriveKey, mpsc::Sender<DriveCommand>>>,
     reservations: Arc<HashMap<DriveKey, AtomicBool>>,
+    holders: Arc<Mutex<HashMap<DriveKey, String>>>,
     pub(crate) sessions: Arc<Mutex<HashMap<Uuid, MountedSession>>>,
     tape_reservations: Arc<Mutex<HashSet<TapeUuid>>>,
     parked: Arc<Mutex<ParkedState>>,
@@ -139,11 +171,66 @@ impl DrivePool {
             changers: Arc::new(changers),
             drives: Arc::new(drives),
             reservations,
+            holders: lifecycle.holders,
             sessions: lifecycle.sessions,
             tape_reservations: Arc::new(Mutex::new(HashSet::new())),
             parked: lifecycle.parked,
             shutting_down: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub(crate) fn set_holder(&self, drive: &DriveKey, serial: Option<&str>, kind: &str, id: Uuid) {
+        self.holders
+            .lock()
+            .unwrap()
+            .insert(drive.clone(), holder_label(drive, serial, kind, id));
+    }
+
+    pub(crate) fn set_library_holder(&self, library: &str, kind: &str, id: Uuid) {
+        for drive in self
+            .reservations
+            .keys()
+            .filter(|drive| drive.library_serial() == Some(library))
+        {
+            self.set_holder(drive, None, kind, id);
+        }
+    }
+
+    /// Identify internal work that has no operation or session UUID.
+    pub(crate) fn set_internal_holder(&self, drive: &DriveKey, serial: Option<&str>, kind: &str) {
+        self.holders.lock().unwrap().insert(
+            drive.clone(),
+            format!("{} held by {kind}", holder_drive_label(drive, serial)),
+        );
+    }
+
+    /// Preserve refusal semantics and include only reservations in its scope.
+    pub(crate) fn append_holders(
+        &self,
+        error: Status,
+        include: impl Fn(&DriveKey) -> bool,
+    ) -> Status {
+        let holders = self.holders.lock().unwrap();
+        let mut labels = self
+            .reservations
+            .iter()
+            .filter(|(key, reserved)| include(key) && reserved.load(Ordering::SeqCst))
+            .filter_map(|(key, _)| holders.get(key).cloned())
+            .collect::<Vec<_>>();
+        labels.sort();
+        if labels.is_empty() {
+            error
+        } else {
+            Status::new(
+                error.code(),
+                format!("{}; held by: {}", error.message(), labels.join(", ")),
+            )
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn busy_error(&self) -> Status {
+        self.append_holders(Status::failed_precondition("all drives are busy"), |_| true)
     }
 
     pub(crate) fn operates_library(&self, library_serial: &str) -> bool {
@@ -181,12 +268,23 @@ impl DrivePool {
             .into_iter()
             .find(|drive| {
                 self.reservations.get(drive).is_some_and(|reservation| {
-                    reservation
+                    if reservation
                         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                         .is_ok()
+                    {
+                        self.holders.lock().unwrap().remove(drive);
+                        true
+                    } else {
+                        false
+                    }
                 })
             })
-            .ok_or_else(|| Status::failed_precondition("all drives are busy"))
+            .ok_or_else(|| {
+                self.append_holders(
+                    Status::failed_precondition("all drives are busy"),
+                    |drive| drive.library_serial() == Some(library_serial),
+                )
+            })
     }
 
     pub(crate) fn reserve_drive(&self, drive: &DriveKey) -> Result<DriveReservation, Status> {
@@ -210,15 +308,24 @@ impl DrivePool {
             .ok_or_else(|| Status::not_found(format!("{} not available", drive.label())))?;
         reservation
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .map_err(|_| Status::failed_precondition(format!("{} is busy", drive.label())))?;
+            .map_err(|_| {
+                self.append_holders(
+                    Status::failed_precondition(format!("{} is busy", drive.label())),
+                    |key| key == drive,
+                )
+            })?;
+        self.holders.lock().unwrap().remove(drive);
         Ok(DriveReservation {
             drive: drive.clone(),
             reservations: self.reservations.clone(),
+            holders: self.holders.clone(),
             armed: true,
         })
     }
 
     pub(crate) fn release(&self, drive: &DriveKey) {
+        let mut holders = self.holders.lock().unwrap();
+        holders.remove(drive);
         if let Some(reservation) = self.reservations.get(drive) {
             reservation.store(false, Ordering::SeqCst);
         }
@@ -256,12 +363,15 @@ impl DrivePool {
                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
+                self.holders.lock().unwrap().remove(&drive);
                 acquired.push(drive);
             } else {
                 for acquired_drive in acquired {
                     self.release(&acquired_drive);
                 }
-                return Err(Status::failed_precondition("drives are busy"));
+                return Err(
+                    self.append_holders(Status::failed_precondition("drives are busy"), &include)
+                );
             }
         }
         Ok(())
@@ -484,6 +594,7 @@ impl DrivePool {
 pub(crate) struct DriveReservation {
     drive: DriveKey,
     reservations: Arc<HashMap<DriveKey, AtomicBool>>,
+    holders: Arc<Mutex<HashMap<DriveKey, String>>>,
     armed: bool,
 }
 
@@ -496,6 +607,8 @@ impl DriveReservation {
 impl Drop for DriveReservation {
     fn drop(&mut self) {
         if self.armed {
+            let mut holders = self.holders.lock().unwrap();
+            holders.remove(&self.drive);
             if let Some(reservation) = self.reservations.get(&self.drive) {
                 reservation.store(false, Ordering::SeqCst);
             }
@@ -593,6 +706,28 @@ mod tests {
             ])),
             DrivePoolLifecycle::default(),
         )
+    }
+
+    /// A specific drive never names holders in another library or bay.
+    #[test]
+    fn busy_refusals_scope_holders_and_preserve_original_text() {
+        let pool = test_pool();
+        let a = DriveKey::new("LIB-A", 0x0100);
+        let b = DriveKey::new("LIB-B", 0x0100);
+        let _a = pool.reserve_drive(&a).unwrap();
+        let _b = pool.reserve_drive(&b).unwrap();
+        pool.set_internal_holder(&a, None, "inventory");
+        pool.set_internal_holder(&b, None, "supersede_tail");
+        let error = pool.reserve_drive(&a).unwrap_err();
+        assert!(error
+            .message()
+            .starts_with(&format!("{} is busy; held by: ", a.label())));
+        assert!(error.message().contains("inventory"));
+        assert!(!error.message().contains("supersede_tail"));
+        let error = pool.reserve_library_exclusive("LIB-B").unwrap_err();
+        assert!(error.message().starts_with("drives are busy; held by: "));
+        assert!(error.message().contains("supersede_tail"));
+        assert!(!error.message().contains("inventory"));
     }
 
     #[test]

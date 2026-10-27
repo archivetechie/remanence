@@ -204,3 +204,5 @@ VerificationIo.recovered_unknown_addresses  measured diagnostic; zero is an obse
 VerificationIoCounts.elapsed_ms     zero is honest when a phase never runs or spends less than one millisecond
 VerificationIoCounts.command_ms     zero is honest when a phase never runs or its commands total less than one millisecond
 VerificationIoCounts.max_command_ms zero is honest when a phase never runs or no command lasts one millisecond
+
+StartTapeVerificationRequest.tape_uuid  required exact 16-byte tape identity; an empty value is refused

@@ -454,6 +454,7 @@ impl LibraryServiceApi {
             return Err(err);
         }
         let operation_id = Uuid::new_v4();
+        pool.set_library_holder(&library_serial, operation_kind, operation_id);
         if let Err(err) = self.state.record_library_request_received(
             actor,
             operation_id,
@@ -1105,16 +1106,25 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
                 .unwrap_or_default();
         let reservation = pool.reserve_drive(&drive_key).map_err(|error| {
             if error.code() == tonic::Code::FailedPrecondition
-                && error.message() == format!("{} is busy", drive_key.label())
+                && error.message().split("; held by: ").next() == Some(format!("{} is busy", drive_key.label()).as_str())
             {
-                Status::failed_precondition(format!(
+                pool.append_holders(Status::failed_precondition(format!(
                     "{} is busy: another caller holds this drive while media-readiness operation {operation_id} is unresolved{fence_sense}. Robot moves in library {library_serial} are refused until that operation finishes, even when other drive bays are idle; retry when operation {operation_id} finishes",
                     drive_key.label()
-                ))
+                )), |key| key == &drive_key)
             } else {
                 error
             }
         })?;
+        pool.set_holder(
+            &drive_key,
+            drive_bay
+                .installed
+                .as_ref()
+                .map(|drive| drive.serial.as_str()),
+            "media_readiness_wait",
+            operation_id,
+        );
         let drive_tx = pool.drive_tx(&drive_key)?;
         let handle = self
             .state

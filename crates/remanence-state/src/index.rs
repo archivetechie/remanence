@@ -46,7 +46,7 @@ use crate::error::StateError;
 use crate::{DriveKey, LabelProvenance, MediaObservation};
 
 /// Current Layer 4 SQLite schema version.
-pub const SCHEMA_VERSION: u32 = 20;
+pub const SCHEMA_VERSION: u32 = 21;
 
 /// Oldest clean-break catalog whose tape table can be inspected safely by the
 /// exact full-catalog erase admission path. Ordinary opens migrate the supported
@@ -1248,6 +1248,12 @@ pub struct ForeignArchiveProjectionInput {
 /// One tape row from the rebuildable catalog projection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TapeRecord {
+    /// Completion timestamp of the most recent full verification verdict.
+    pub last_verified_at_utc: Option<String>,
+    /// TapeIndexVerificationState numeric value; absent until a verdict exists.
+    pub last_verification_state: Option<i32>,
+    /// Terminal edition checked by the verification, when available.
+    pub last_verified_edition_digest: Option<Vec<u8>>,
     /// Remanence tape UUID.
     pub tape_uuid: Vec<u8>,
     /// Operator-facing voltag when known.
@@ -2491,7 +2497,8 @@ impl CatalogIndex {
                                     where media_readiness_ops.barcode = tapes.voltag
                                       and media_readiness_ops.state not in ('ready', 'released')
                                       and coalesce(media_readiness_ops.dirty_scope, 'drive+tape') <> 'none'),
-                        tapes.voltag_source, tapes.cartridge_generation, tapes.generation_source
+                        tapes.voltag_source, tapes.cartridge_generation, tapes.generation_source,
+                        tapes.last_verified_at_utc, tapes.last_verification_state, tapes.last_verified_edition_digest
                  from tapes
                  where tapes.voltag = ?1
                  order by hex(tapes.tape_uuid)",
@@ -5359,7 +5366,7 @@ impl CatalogIndex {
                     finalization_trigger, finalization_operation_id,
                     finalization_edition_digest, finalization_layout_digest,
                     completed_replicas, finalization_outcome,
-                    voltag_source, cartridge_generation, generation_source
+                    voltag_source, cartridge_generation, generation_source, last_verified_at_utc, last_verification_state, last_verified_edition_digest
              from tapes{where_clause}
              order by hex(tapes.tape_uuid)"
         );
@@ -5509,7 +5516,7 @@ impl CatalogIndex {
                         finalization_trigger, finalization_operation_id,
                         finalization_edition_digest, finalization_layout_digest,
                         completed_replicas, finalization_outcome,
-                    voltag_source, cartridge_generation, generation_source
+                    voltag_source, cartridge_generation, generation_source, last_verified_at_utc, last_verification_state, last_verified_edition_digest
                  from tapes
                  where tapes.tape_uuid = ?1",
             )
@@ -5555,7 +5562,7 @@ impl CatalogIndex {
                         finalization_trigger, finalization_operation_id,
                         finalization_edition_digest, finalization_layout_digest,
                         completed_replicas, finalization_outcome,
-                    voltag_source, cartridge_generation, generation_source
+                    voltag_source, cartridge_generation, generation_source, last_verified_at_utc, last_verification_state, last_verified_edition_digest
                  from tapes
                  where tapes.voltag = ?1",
             )
@@ -7593,6 +7600,13 @@ fn reprovision_tape_tx(
 }
 
 fn clear_rebuildable_tables(tx: &rusqlite::Transaction<'_>) -> Result<(), StateError> {
+    // Verification values are rebuilt from audit, so their replay cursor resets
+    // with those values. Assignment and label cursors retain their own authority.
+    tx.execute(
+        "delete from tape_audit_cursors where field = 'verification'",
+        [],
+    )
+    .map_err(|err| sqlite_error("clear verification replay cursor", err))?;
     for table in [
         "catalog_units",
         "object_copies",
@@ -9721,6 +9735,14 @@ fn project_operation_record(
     let Some(state) = operation_state_for_event(&record.event) else {
         return Ok(());
     };
+    // Cancellation can race terminal publication after its audit append. A late
+    // request remains an audit fact but cannot reopen a completed operation.
+    if matches!(record.event, AuditEvent::CancelRequested) {
+        let terminal: bool = tx.query_row("select exists(select 1 from operations where operation_id = ?1 and state in ('finished','failed','cancelled_before_dispatch','completed_after_cancel','completion_unknown'))", [operation_id.to_string()], |row| row.get(0)).map_err(|e| sqlite_error("check terminal cancellation race", e))?;
+        if terminal {
+            return Ok(());
+        }
+    }
     let operation_kind = detail_text(record, "operation_kind")
         .unwrap_or_else(|| {
             if matches!(record.event, AuditEvent::OperationStarted) {
@@ -10146,6 +10168,34 @@ fn project_catalog_evidence_record(
     divergences: &mut Vec<String>,
 ) -> Result<(), StateError> {
     match record.event {
+        AuditEvent::OperationFinished
+            if detail_text(record, "operation_kind").as_deref() == Some("tape_verification") =>
+        {
+            let tape_uuid = audit_tape_uuid(record).ok_or_else(|| {
+                StateError::IndexCorrupt("verification audit has no tape UUID".into())
+            })?;
+            if !audit_intent_is_new(tx, &tape_uuid, "verification", record)? {
+                return Ok(());
+            }
+            let state = detail_i64(record, "verification_state")
+                .filter(|state| (2..=4).contains(state))
+                .ok_or_else(|| {
+                    StateError::IndexCorrupt("verification audit has no valid verdict".into())
+                })?;
+            let digest = match record.detail.get("edition_digest") {
+                Some(ciborium::value::Value::Bytes(bytes)) if bytes.len() == 32 => {
+                    Some(bytes.as_slice())
+                }
+                None => None,
+                _ => {
+                    return Err(StateError::IndexCorrupt(
+                        "verification audit has invalid edition digest".into(),
+                    ))
+                }
+            };
+            tx.execute("update tapes set last_verified_at_utc = ?2, last_verification_state = ?3, last_verified_edition_digest = ?4 where tape_uuid = ?1", params![tape_uuid.as_slice(), record.timestamp_utc, state, digest]).map_err(|e| sqlite_error("project tape verification", e))?;
+            remember_audit_intent(tx, &tape_uuid, "verification", record)?;
+        }
         AuditEvent::TapeLabelRebound => replay_label_rebind(tx, record)?,
         AuditEvent::TapeIdentityAdopted => {
             project_tape_identity_adopted_record(tx, record, divergences)?;
@@ -12984,6 +13034,15 @@ fn tape_from_row(row: &rusqlite::Row<'_>) -> Result<TapeRecord, StateError> {
         }
     };
     Ok(TapeRecord {
+        last_verified_at_utc: row
+            .get("last_verified_at_utc")
+            .map_err(|e| sqlite_error("read verification time", e))?,
+        last_verification_state: row
+            .get("last_verification_state")
+            .map_err(|e| sqlite_error("read verification state", e))?,
+        last_verified_edition_digest: row
+            .get("last_verified_edition_digest")
+            .map_err(|e| sqlite_error("read verification edition", e))?,
         tape_uuid: row_get(row, 0, "tapes.tape_uuid")?,
         voltag: row_get(row, 1, "tapes.voltag")?,
         voltag_source: parse_label_source(
@@ -13782,6 +13841,9 @@ fn legacy_catalog_reset_tape_from_row(row: &rusqlite::Row<'_>) -> Result<TapeRec
             )
         })?;
     Ok(TapeRecord {
+        last_verified_at_utc: None,
+        last_verification_state: None,
+        last_verified_edition_digest: None,
         tape_uuid: row_get(row, 0, "tapes.tape_uuid")?,
         voltag: row_get(row, 1, "tapes.voltag")?,
         voltag_source: Some(LabelProvenance::Changer),
@@ -14151,8 +14213,31 @@ fn migrate(conn: &Connection) -> Result<(), StateError> {
     result
 }
 
+/// Add verification projection fields without replaying historical backfills.
+fn migrate_verification_columns(conn: &Connection) -> Result<(), StateError> {
+    ensure_column(
+        conn,
+        "tapes",
+        "last_verified_at_utc",
+        "last_verified_at_utc text",
+    )?;
+    ensure_column(
+        conn,
+        "tapes",
+        "last_verification_state",
+        "last_verification_state integer",
+    )?;
+    ensure_column(
+        conn,
+        "tapes",
+        "last_verified_edition_digest",
+        "last_verified_edition_digest blob",
+    )?;
+    Ok(())
+}
+
 fn migrate_inner(conn: &Connection) -> Result<(), StateError> {
-    let current = conn
+    let mut current = conn
         .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
         .map_err(|err| sqlite_error("read sqlite user_version", err))?;
     if current > SCHEMA_VERSION {
@@ -14163,8 +14248,19 @@ fn migrate_inner(conn: &Connection) -> Result<(), StateError> {
     if current == 19 {
         conn.execute_batch("create index if not exists object_files_by_path_idx on object_files(path); PRAGMA user_version = 20;")
             .map_err(|e| sqlite_error("install path lookup index", e))?;
+        conn.execute_batch(TAPE_AUDIT_CURSOR_SCHEMA)
+            .map_err(|e| sqlite_error("install replay cursors", e))?;
+        current = 20;
     }
-    if current == SCHEMA_VERSION || current == 19 {
+    if current == 20 {
+        conn.execute_batch(TAPE_AUDIT_CURSOR_SCHEMA)
+            .map_err(|e| sqlite_error("install replay cursors", e))?;
+        migrate_verification_columns(conn)?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(|e| sqlite_error("update verification schema version", e))?;
+        return validate_unsigned_structural_schema(conn);
+    }
+    if current == SCHEMA_VERSION {
         conn.execute_batch(TAPE_AUDIT_CURSOR_SCHEMA)
             .map_err(|e| sqlite_error("install replay cursors", e))?;
         return validate_unsigned_structural_schema(conn);
@@ -14279,6 +14375,7 @@ fn migrate_inner(conn: &Connection) -> Result<(), StateError> {
         "assignment_generation integer not null default 0",
     )?;
     ensure_column(conn, "tapes", "kind", "kind text not null default 'data'")?;
+    migrate_verification_columns(conn)?;
     ensure_column(
         conn,
         "tapes",
@@ -14447,6 +14544,25 @@ fn validate_unsigned_structural_schema(conn: &Connection) -> Result<(), StateErr
         if !table_sql.contains(type_check.as_str()) || !table_sql.contains(length_check.as_str()) {
             return Err(StateError::IndexMigrationFailed(format!(
                 "{table}.{column} lacks canonical unsigned BLOB constraints; rebuild the catalog from its authoritative journals and audit log"
+            )));
+        }
+    }
+    for (column, expected) in [
+        ("last_verified_at_utc", "TEXT"),
+        ("last_verification_state", "INTEGER"),
+        ("last_verified_edition_digest", "BLOB"),
+    ] {
+        let declared: Option<String> = conn
+            .query_row(
+                "select type from pragma_table_info('tapes') where name = ?1",
+                [column],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| sqlite_error("inspect verification column", e))?;
+        if !declared.is_some_and(|value| value.eq_ignore_ascii_case(expected)) {
+            return Err(StateError::IndexMigrationFailed(format!(
+                "tapes.{column} is missing or has an invalid type"
             )));
         }
     }
@@ -15084,7 +15200,139 @@ mod tests {
 
     use super::*;
 
-    /// Existing catalogs receive the lookup index through schema migration.
+    /// Verification columns migrate while exact erase accepts the prior schema.
+    #[test]
+    fn verification_schema_migration_and_exact_erase_columns() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("catalog.sqlite");
+        let index = CatalogIndex::open(&path).unwrap();
+        index.conn.execute_batch("alter table tapes drop column last_verified_at_utc; alter table tapes drop column last_verification_state; alter table tapes drop column last_verified_edition_digest; PRAGMA user_version = 20;").unwrap();
+        drop(index);
+        assert!(CatalogIndex::read_legacy_catalog_reset_erase_source(&path).is_ok());
+        let index = CatalogIndex::open(&path).unwrap();
+        assert_eq!(index.schema_version().unwrap(), SCHEMA_VERSION);
+        for column in [
+            "last_verified_at_utc",
+            "last_verification_state",
+            "last_verified_edition_digest",
+        ] {
+            assert!(table_column_exists(&index.conn, "tapes", column).unwrap());
+        }
+        index
+            .conn
+            .execute_batch("PRAGMA user_version = 20; alter table tapes drop column block_size;")
+            .unwrap();
+        drop(index);
+        assert!(CatalogIndex::read_legacy_catalog_reset_erase_source(&path).is_err());
+    }
+
+    /// Upgrading recent catalogs must not rerun generation or assignment backfills.
+    #[test]
+    fn schema_20_verification_upgrade_does_not_backfill_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("catalog.sqlite");
+        let mut index = CatalogIndex::open(&path).unwrap();
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: [9; 16],
+                voltag: "VERIFY009L9".into(),
+                block_size: 262144,
+                parity: remanence_parity::ParityConfig::None,
+                force: false,
+            })
+            .unwrap();
+        index
+            .conn
+            .execute_batch(
+                "update tapes set cartridge_generation = null, generation_source = null;
+            drop table tape_audit_cursors;
+            drop table tape_assignment_replay_baselines;
+            alter table tapes drop column last_verified_at_utc;
+            alter table tapes drop column last_verification_state;
+            alter table tapes drop column last_verified_edition_digest;
+            PRAGMA user_version = 20;",
+            )
+            .unwrap();
+        drop(index);
+        let index = CatalogIndex::open(&path).unwrap();
+        assert_eq!(index.schema_version().unwrap(), 21);
+        let tape = index.get_tape(&[9; 16]).unwrap().unwrap();
+        assert!(tape.cartridge_generation.is_none());
+        assert!(tape.generation_source.is_none());
+        assert!(tape.last_verified_at_utc.is_none());
+        for table in [
+            "tape_audit_cursors",
+            "tape_assignment_replay_baselines",
+            "tape_pool_assignments",
+        ] {
+            let count: i64 = index
+                .conn
+                .query_row(&format!("select count(*) from {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table}");
+        }
+    }
+
+    #[test]
+    fn verification_audit_rebuilds_verdict_and_ignores_failures() {
+        let tape_uuid = [7; 16];
+        let tape_id = Uuid::from_bytes(tape_uuid).to_string();
+        let provision = catalog_evidence_record(
+            1,
+            AuditEvent::TapeProvisioned,
+            "tape",
+            &tape_id,
+            detail(&[
+                ("voltag", CborValue::Text("TEST001L9".into())),
+                ("block_size", CborValue::Integer(262144.into())),
+                ("geometry", CborValue::Text("no-parity".into())),
+            ]),
+        );
+        let verdict = catalog_evidence_record(
+            2,
+            AuditEvent::OperationFinished,
+            "tape",
+            &tape_id,
+            detail(&[
+                (
+                    "operation_kind",
+                    CborValue::Text("tape_verification".into()),
+                ),
+                ("verification_state", CborValue::Integer(2.into())),
+                ("edition_digest", CborValue::Bytes(vec![8; 32])),
+            ]),
+        );
+        let mut records = vec![provision, verdict];
+        let mut index = CatalogIndex::open(":memory:").unwrap();
+        index
+            .rebuild_from_authoritative_sources(&records, &[])
+            .unwrap();
+        let expected = index.get_tape(&tape_uuid).unwrap().unwrap();
+        assert_eq!(
+            expected.last_verified_at_utc,
+            Some(records[1].timestamp_utc.clone())
+        );
+        assert_eq!(expected.last_verification_state, Some(2));
+        assert_eq!(expected.last_verified_edition_digest, Some(vec![8; 32]));
+        for event in [
+            AuditEvent::OperationFailed,
+            AuditEvent::CancelledBeforeDispatch,
+        ] {
+            let mut failure = records[1].clone();
+            failure.event = event;
+            index.project_audit_record(&failure).unwrap();
+            records.push(failure);
+        }
+        assert_eq!(index.get_tape(&tape_uuid).unwrap().unwrap(), expected);
+        let mut rebuilt = CatalogIndex::open(":memory:").unwrap();
+        rebuilt
+            .rebuild_from_authoritative_sources(&records, &[])
+            .unwrap();
+        assert_eq!(rebuilt.get_tape(&tape_uuid).unwrap().unwrap(), expected);
+    }
+
     #[test]
     fn schema_19_without_path_index_migrates_on_open() {
         let root = tempfile::tempdir().unwrap();
@@ -15092,13 +15340,17 @@ mod tests {
         let index = CatalogIndex::open(&path).unwrap();
         index
             .conn
-            .execute_batch("drop index object_files_by_path_idx; PRAGMA user_version = 19;")
+            .execute_batch("drop index object_files_by_path_idx; drop table tape_audit_cursors; drop table tape_assignment_replay_baselines; PRAGMA user_version = 19;")
             .unwrap();
         drop(index);
         let index = CatalogIndex::open(&path).unwrap();
         assert_eq!(index.schema_version().unwrap(), SCHEMA_VERSION);
         let present: bool = index.conn.query_row("select exists(select 1 from sqlite_master where type='index' and name='object_files_by_path_idx')", [], |r| r.get(0)).unwrap();
         assert!(present);
+        assert!(index.table_exists("tape_audit_cursors").unwrap());
+        assert!(index
+            .table_exists("tape_assignment_replay_baselines")
+            .unwrap());
     }
 
     #[test]

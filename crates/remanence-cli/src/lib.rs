@@ -1371,6 +1371,14 @@ enum DaemonClientCommand {
 
 #[derive(Subcommand, Debug)]
 enum OperationClientCommand {
+    /// Watch operation progress until it terminates.
+    Watch { operation_id: String },
+    /// Request cooperative cancellation.
+    Cancel {
+        operation_id: String,
+        #[arg(long)]
+        force: bool,
+    },
     /// Get one operation status by UUID.
     Get {
         /// Operation UUID.
@@ -5443,6 +5451,21 @@ fn run_operation_client_command(
             observe_daemon(&channel, json_output).await?;
             let mut client = pb::daemon_client::DaemonClient::new(channel);
             match command {
+                OperationClientCommand::Watch { operation_id } => {
+                    let operation_id = parse_uuid_bytes(operation_id, "operation_id").map_err(DaemonClientError::from)?;
+                    let mut stream = client.watch_operation(pb::GetOperationRequest { operation_id }).await.map_err(drive_status_error)?.into_inner();
+                    while let Some(status) = stream.message().await.map_err(drive_status_error)? {
+                        print_operation(status, json_output, out).map_err(DaemonClientError::from)?;
+                    }
+                    Ok(())
+                }
+                OperationClientCommand::Cancel { operation_id, force } => {
+                    let operation_id = parse_uuid_bytes(operation_id, "operation_id").map_err(DaemonClientError::from)?;
+                    let response = client.cancel_operation(pb::CancelOperationRequest { operation_id, idempotency_key: None, force: *force }).await.map_err(drive_status_error)?.into_inner();
+                    if json_output {
+                        print_json_envelope("rem.operation.cancel.v1", "item", json!({"resulting_state": operation_state_name(response.resulting_state), "detail": response.detail}), out).map_err(DaemonClientError::from)
+                    } else { writeln!(out, "{}: {}", operation_state_name(response.resulting_state), response.detail).map_err(|e| DaemonClientError::client(e.to_string())) }
+                }
                 OperationClientCommand::Get { operation_id } => {
                     let operation_id = parse_uuid_bytes(operation_id, "operation_id")
                         .map_err(DaemonClientError::from)?;
@@ -6590,14 +6613,15 @@ fn print_tape_line(tape: &pb::Tape, out: &mut dyn Write) {
     let pool = or_dash(tape.pool_id.as_deref());
     let _ = writeln!(
         out,
-        "{tape_uuid}  {voltag}  {}  kind={}  state={}  pool={pool}  last_file={}",
+        "{tape_uuid}  {voltag}  {}  kind={}  state={}  pool={pool}  last_file={}  last_verified_at={}",
         // A tape nobody has read yet has no body format and no committed tape
         // file. It used to print an empty format and last_file=0 -- which reads
         // as "tape file 0 is committed", the first one, rather than "none are".
         or_dash(tape.body_format.as_deref()),
         or_dash(tape.kind.as_deref()),
         tape_state_name(tape.state),
-        or_dash_display(tape.last_committed_tape_file)
+        or_dash_display(tape.last_committed_tape_file),
+        timestamp_text(tape.last_verified_at.as_ref()).unwrap_or_else(|| "-".into())
     );
 }
 
@@ -7118,6 +7142,9 @@ fn tape_json(tape: &pb::Tape) -> Value {
         "assignment_generation": tape.assignment_generation,
         "state": tape_state_name(tape.state),
         "updated_at": timestamp_value(tape.updated_at.as_ref()),
+        "last_verified_at": timestamp_value(tape.last_verified_at.as_ref()),
+        "last_verification_state": tape.last_verification_state.and_then(|state| pb::TapeIndexVerificationState::try_from(state).ok()).map(|state| state.as_str_name().trim_start_matches("TAPE_INDEX_VERIFICATION_STATE_").to_ascii_lowercase()),
+        "last_verified_edition_digest": tape.last_verified_edition_digest.as_deref().map(bytes_to_hex),
         "pool_id": tape.pool_id,
         "correlation_rollups": tape.correlation_rollups.iter().map(correlation_rollup_json).collect::<Vec<_>>(),
     })
@@ -18117,6 +18144,43 @@ mod tests {
             ),
             ambiguous_fixture
         );
+    }
+
+    #[test]
+    fn tape_json_names_verification_state_and_digest() {
+        let tape = pb::Tape {
+            last_verification_state: Some(pb::TapeIndexVerificationState::VerifiedComplete as i32),
+            last_verified_edition_digest: Some(vec![0xab; 32]),
+            ..Default::default()
+        };
+        let rendered = tape_json(&tape);
+        assert_eq!(rendered["last_verification_state"], "verified_complete");
+        assert_eq!(rendered["last_verified_edition_digest"], "ab".repeat(32));
+        assert!(tape_json(&pb::Tape::default())["last_verification_state"].is_null());
+    }
+
+    #[test]
+    fn operation_cancel_force_is_opt_in() {
+        for force in [false, true] {
+            let mut args = vec![
+                "rem",
+                "operation",
+                "cancel",
+                "00000000-0000-4000-8000-000000000001",
+            ];
+            if force {
+                args.push("--force");
+            }
+            let cli = Cli::try_parse_from(args).unwrap();
+            let RemCommand::Operation {
+                command: OperationClientCommand::Cancel { force: parsed, .. },
+                ..
+            } = cli.command
+            else {
+                panic!("cancel command")
+            };
+            assert_eq!(parsed, force);
+        }
     }
 
     #[test]

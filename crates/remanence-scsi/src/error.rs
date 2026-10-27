@@ -5,6 +5,9 @@ use thiserror::Error;
 /// Top-level error for all SCSI operations.
 #[derive(Debug, Error)]
 pub enum ScsiError {
+    /// A cooperative operation stops before dispatching a command.
+    #[error("tape verification cancelled")]
+    Cancelled,
     /// A response was shorter than the SCSI spec requires.
     #[error("response too short: got {got} bytes, need at least {need}")]
     Truncated {
