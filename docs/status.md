@@ -121,12 +121,15 @@ killed write, a refused wrong tape, a retired and re-initialized cartridge and
 a catalog rebuild. It also found the following limitations, which are not yet
 fixed.
 
-**Concurrent write sessions can collide on one drive.** On a library with
-several drives, a second write session opened while the first is running can
-be assigned the drive bay that the first session holds instead of an idle
-drive, and it then fails because the bay is busy. Open write sessions one at a
-time until this is fixed. In the same window, a restore running beside a write
-session on another pool completed normally.
+**A readiness fence on one drive refuses a second write session.** On a
+library with several drives, the daemon gives a second write session an idle
+drive rather than the bay the first session holds. While any drive has a
+media-readiness fence, such as the one a cold load leaves until the drive
+reports ready, the daemon refuses every request in that library that needs the
+robot, and the clients' resume calls then find the fenced drive busy because
+only one caller at a time waits on it. Open write sessions one at a time until
+this is fixed. In the same window, a restore running beside a write session on
+another pool completed normally.
 
 **A drive that asks for a LOAD is polled instead of loaded.** When a cartridge
 is in a drive but not threaded, the drive reports that it is not ready and

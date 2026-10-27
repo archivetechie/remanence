@@ -103,27 +103,37 @@ manual dispatch. *Not confirmed:* whether to run them before a release.
 
 ## 6. The release workflow
 
-A `v*` tag starts `.github/workflows/release.yml`, which needs no input. It:
+A `v*` tag starts `.github/workflows/release.yml`, which needs no input. A
+manual run of the workflow on a branch builds and verifies the same files as a
+preview and publishes nothing; its `eligibility.json` records that publication
+is forbidden. A manual run on a tag behaves like the tag push. The workflow:
 
-1. checks that the tag is `v` plus the workspace version;
+1. checks that every workspace package has the same version and, on a tag,
+   that the tag is `v` plus that version;
 2. runs `tools/release_evidence.py gate`, which requires an annotated tag on
    the checked-out commit, that commit's ancestry in `origin/main`, a
    GitHub-verified tag signature, and a successful `ci.yml` push run on `main`
    for the exact commit, and writes `eligibility.json`;
-3. runs `cargo test --workspace --locked` and
-   `cargo clippy --workspace --all-targets --locked -- -D warnings` with Rust
-   1.95.0;
-4. builds `rem`, `rem-debug` and `rem-daemon`, and `rem-recover` for
-   `x86_64-unknown-linux-musl`;
-5. packages `remanence-x86_64-linux.tar.gz` and
-   `rem-recover-x86_64-linux-musl.tar.gz`, each with `LICENSE-APACHE-2.0` and
-   `THIRD-PARTY-LICENSES.html` from `cargo about` 0.9.1;
+3. runs `cargo fmt --all --check`,
+   `cargo clippy --workspace --all-targets --locked -- -D warnings` and
+   `cargo test --workspace --locked` with Rust 1.95.0;
+4. builds `rem`, `rem-debug`, `rem-daemon` and `rem-recover` for
+   `x86_64-unknown-linux-musl` and checks that each is statically linked;
+5. packages `remanence-<version>-x86_64-unknown-linux-musl.tar.gz`, with the
+   four binaries under `bin/`, `README.md`, `LICENSING.md`,
+   `LICENSE-APACHE-2.0`, `THIRD-PARTY-LICENSES.html` from `cargo about` 0.9.1
+   and `docs/`, and `rem-recover-x86_64-linux-musl.tar.gz`, with `rem-recover`,
+   `LICENSE-APACHE-2.0` and `THIRD-PARTY-LICENSES.html`;
 6. writes `build-remanence-linux.json`, `release-manifest.json` and
    `SHA256SUMS` with `tools/release_evidence.py record` and `manifest`;
-7. attests the files listed in `SHA256SUMS`; and
-8. creates the GitHub release with the two archives, the three JSON files,
-   `THIRD-PARTY-LICENSES.html` and `SHA256SUMS`, using GitHub's generated
-   notes.
+7. in a separate verify job on a clean runner, checks the files against
+   `SHA256SUMS`, unpacks the archive, and runs each binary in an otherwise
+   empty root, where `rem`, `rem-debug` and `rem-daemon` must print the tag's
+   version, or on a preview the workspace version, with `--version`;
+8. on a tag only, attests the files listed in `SHA256SUMS`; and
+9. on a tag only, creates the GitHub release with the two archives, the three
+   JSON files, `THIRD-PARTY-LICENSES.html` and `SHA256SUMS`, using GitHub's
+   generated notes.
 
 - [ ] Watch the run to completion. *Not confirmed:* what to do when it fails
   part-way. Re-running the workflow suits a transient failure; a failure in
