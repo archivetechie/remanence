@@ -3111,6 +3111,548 @@ fn session_open_loads_immediate_for_already_loaded_initialization_required() {
     );
 }
 
+/// A cartridge left unthreaded in its drive (daemon killed between SSC UNLOAD
+/// and the changer move), modelled by the virtual world: TEST UNIT READY
+/// answers 02/04/02 until an SSC LOAD arrives.
+fn unthreaded_cartridge_world(
+    library_serial: &str,
+) -> (Arc<Mutex<VirtualWorld>>, remanence_library::LibraryHandle) {
+    let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
+        library_serial,
+        0x0100,
+        "DRV-UNTHREADED",
+        0x0400,
+        2,
+    )));
+    {
+        let mut world = world.lock().expect("world lock");
+        world.put_tape_in_drive(0x0100, "UNT001L9", Some(0x0400), VirtualTape::default());
+        world.leave_cartridge_unthreaded(0x0100);
+    }
+    let library = open_model_library(Arc::clone(&world));
+    (world, library)
+}
+
+fn record_unthreaded_readiness_operation(
+    index: &mut CatalogIndex,
+    library_serial: &str,
+    operation_id: Uuid,
+) {
+    index
+        .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+            operation_id,
+            run_id: None,
+            endpoint: remanence_state::DriveKey::new(library_serial.to_string(), 0x0100),
+            changer_sg: None,
+            drive_sg: None,
+            drive_serial: Some("DRV-UNTHREADED".to_string()),
+            barcode: Some("UNT001L9".to_string()),
+            source_slot: Some(0x0400),
+            media_generation: Some(9),
+            phase: "readiness_poll".to_string(),
+            state: "media_initializing".to_string(),
+            dirty_scope: Some("drive+tape".to_string()),
+            deadline_at_utc: None,
+            evidence_path: None,
+        })
+        .expect("record readiness operation");
+}
+
+fn drive_load_commands(world: &Arc<Mutex<VirtualWorld>>) -> usize {
+    world
+        .lock()
+        .expect("world lock")
+        .command_log
+        .iter()
+        .filter(|command| {
+            command.opcode == 0x1b
+                && matches!(
+                    command.role,
+                    remanence_chaos::model::DeviceRole::Drive { bay: 0x0100 }
+                )
+        })
+        .count()
+}
+
+/// (phase, state, opcode, sense key, ASC, ASCQ) of every recorded transition.
+type ReadinessTransitionRow = (
+    Option<String>,
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+);
+
+fn readiness_transition_rows(index_path: &Path, operation_id: Uuid) -> Vec<ReadinessTransitionRow> {
+    let conn = rusqlite::Connection::open(index_path).expect("open catalog sqlite");
+    let mut stmt = conn
+        .prepare(
+            "select phase, state, last_cdb_opcode, last_sense_key, last_asc, last_ascq
+             from media_readiness_transitions where operation_id = ?1
+             order by transition_id",
+        )
+        .expect("prepare transition query");
+    stmt.query_map([operation_id.to_string()], |row| {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+        ))
+    })
+    .expect("query transitions")
+    .collect::<Result<Vec<_>, _>>()
+    .expect("read transitions")
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn drive_wait_ready_sends_one_load_for_an_unthreaded_cartridge() {
+    let temp = tempfile::Builder::new()
+        .prefix("remanence-wait-ready-unthreaded-")
+        .tempdir()
+        .expect("tempdir");
+    let index_path = temp.path().join("rem-state.sqlite");
+    let mut index = CatalogIndex::open(&index_path).expect("open test index");
+    let (world, mut library) = unthreaded_cartridge_world("LIB-UNTHREAD");
+    let policy = remanence_library::StaticAllowlist::new(["LIB-UNTHREAD"]);
+    let mut drive = library.open_drive(0x0100, &policy).expect("drive opens");
+    let operation_id = Uuid::new_v4();
+    record_unthreaded_readiness_operation(&mut index, "LIB-UNTHREAD", operation_id);
+    let registry = crate::operations::OperationRegistry::default();
+    let handle = registry.register(operation_id, "media_readiness_wait");
+
+    handle_drive_wait_ready(
+        &mut index,
+        &mut drive,
+        DriveReadinessPoll {
+            bay: 0x0100,
+            operation_id,
+            family: MediaFamily::Lto9OrLater,
+            options: remanence_library::MediaReadinessWaitOptions {
+                wait: true,
+                timeout: StdDuration::from_secs(9_000),
+                poll_interval: StdDuration::from_secs(30),
+            },
+            cartridge_in_drive: true,
+            phase: "grpc_wait_ready",
+        },
+        &handle,
+    );
+
+    assert_eq!(drive_load_commands(&world), 1, "exactly one SSC LOAD");
+    let record = index
+        .media_readiness_operation(operation_id)
+        .expect("lookup operation")
+        .expect("operation exists");
+    assert_eq!(record.state, "ready", "{record:?}");
+    assert!(index
+        .list_active_media_readiness_operations(Some("LIB-UNTHREAD"))
+        .expect("active fences")
+        .is_empty());
+    let rows = readiness_transition_rows(&index_path, operation_id);
+    assert_eq!(
+        rows.iter()
+            .map(|(phase, state, opcode, ..)| (phase.as_deref(), state.as_str(), *opcode))
+            .collect::<Vec<_>>(),
+        vec![
+            (Some("grpc_wait_ready"), "media_initializing", Some(0x00)),
+            (
+                Some("initializing_command_load"),
+                "pre_ready_loading",
+                Some(0x1b)
+            ),
+            (Some("grpc_wait_ready"), "ready", Some(0x00)),
+        ]
+    );
+    assert_eq!(
+        (rows[1].3, rows[1].4, rows[1].5),
+        (Some(0x02), Some(0x04), Some(0x02)),
+        "the LOAD attempt records the sense that asked for it"
+    );
+    assert!(
+        !world.lock().expect("world lock").drive_states[&0x0100].initializing_command_required,
+        "the LOAD threaded the cartridge"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn drive_wait_ready_never_repeats_a_load_or_loads_without_inventory_evidence() {
+    let options = remanence_library::MediaReadinessWaitOptions {
+        wait: true,
+        timeout: StdDuration::from_millis(200),
+        poll_interval: StdDuration::from_secs(30),
+    };
+    for (already_loaded, cartridge_in_drive) in [(true, true), (false, false)] {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-wait-ready-load-bound-")
+            .tempdir()
+            .expect("tempdir");
+        let index_path = temp.path().join("rem-state.sqlite");
+        let mut index = CatalogIndex::open(&index_path).expect("open test index");
+        let (world, mut library) = unthreaded_cartridge_world("LIB-LOADBOUND");
+        let policy = remanence_library::StaticAllowlist::new(["LIB-LOADBOUND"]);
+        let mut drive = library.open_drive(0x0100, &policy).expect("drive opens");
+        let operation_id = Uuid::new_v4();
+        record_unthreaded_readiness_operation(&mut index, "LIB-LOADBOUND", operation_id);
+        if already_loaded {
+            // An earlier wait on this operation already sent its LOAD.
+            index
+                .record_media_readiness_transition(
+                    crate::startup_media_readiness::media_readiness_initializing_load_transition(
+                        operation_id,
+                        &MediaReadiness::BecomingReady {
+                            ascq: 0x02,
+                            media_initializing: true,
+                        },
+                    ),
+                )
+                .expect("record earlier LOAD attempt");
+        }
+        let registry = crate::operations::OperationRegistry::default();
+        let handle = registry.register(operation_id, "media_readiness_wait");
+
+        handle_drive_wait_ready(
+            &mut index,
+            &mut drive,
+            DriveReadinessPoll {
+                bay: 0x0100,
+                operation_id,
+                family: MediaFamily::Lto9OrLater,
+                options,
+                cartridge_in_drive,
+                phase: "grpc_wait_ready",
+            },
+            &handle,
+        );
+
+        assert_eq!(
+            drive_load_commands(&world),
+            0,
+            "already_loaded={already_loaded} cartridge_in_drive={cartridge_in_drive}"
+        );
+        let record = index
+            .media_readiness_operation(operation_id)
+            .expect("lookup operation")
+            .expect("operation exists");
+        assert_eq!(record.state, "timeout_unknown", "{record:?}");
+        assert_eq!(
+            (record.last_sense_key, record.last_asc, record.last_ascq),
+            (Some(0x02), Some(0x04), Some(0x02)),
+            "the fence keeps the drive's not-ready reason"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn startup_reconcile_loads_an_unthreaded_cartridge_once_and_clears_the_fence() {
+    let temp = tempfile::Builder::new()
+        .prefix("remanence-startup-unthreaded-")
+        .tempdir()
+        .expect("tempdir");
+    let index_path = temp.path().join("rem-state.sqlite");
+    let mut index = CatalogIndex::open(&index_path).expect("open test index");
+    let (world, mut library) = unthreaded_cartridge_world("LIB-STARTLOAD");
+    let policy = remanence_library::StaticAllowlist::new(["LIB-STARTLOAD"]);
+    let snapshot = library.library().clone();
+    assert_eq!(
+        snapshot.drive_bays[0].loaded_tape.as_deref(),
+        Some("UNT001L9"),
+        "changer inventory places the cartridge in the drive"
+    );
+    let mut opened_drives = vec![(
+        0x0100,
+        library.open_drive(0x0100, &policy).expect("drive opens"),
+    )];
+    let operation_id = Uuid::new_v4();
+    record_unthreaded_readiness_operation(&mut index, "LIB-STARTLOAD", operation_id);
+
+    let reconciled = crate::startup_media_readiness::reconcile_library_media_readiness_on_startup(
+        &mut index,
+        &snapshot,
+        &mut opened_drives,
+    )
+    .expect("startup reconcile");
+
+    assert_eq!(reconciled, 1);
+    assert_eq!(drive_load_commands(&world), 1, "exactly one SSC LOAD");
+    assert!(index
+        .list_active_media_readiness_operations(Some("LIB-STARTLOAD"))
+        .expect("active fences")
+        .is_empty());
+    let rows = readiness_transition_rows(&index_path, operation_id);
+    assert_eq!(
+        rows.iter()
+            .map(|(phase, state, opcode, ..)| (phase.as_deref(), state.as_str(), *opcode))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                Some("startup_reconcile_tur"),
+                "media_initializing",
+                Some(0x00)
+            ),
+            (
+                Some("initializing_command_load"),
+                "pre_ready_loading",
+                Some(0x1b)
+            ),
+            (Some("startup_reconcile_tur"), "ready", Some(0x00)),
+        ]
+    );
+}
+
+/// Reopening the catalog preserves the write-ahead LOAD budget across startup.
+#[cfg(target_os = "linux")]
+#[test]
+fn startup_reconcile_never_repeats_recorded_load_across_restart() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let index_path = temp.path().join("state.sqlite");
+    let operation_id = Uuid::new_v4();
+    {
+        let mut index = CatalogIndex::open(&index_path).expect("open catalog");
+        record_unthreaded_readiness_operation(&mut index, "LIB-RESTART", operation_id);
+        index
+            .record_media_readiness_transition(
+                crate::startup_media_readiness::media_readiness_initializing_load_transition(
+                    operation_id,
+                    &MediaReadiness::BecomingReady {
+                        ascq: 2,
+                        media_initializing: true,
+                    },
+                ),
+            )
+            .expect("record LOAD attempt");
+    }
+    let (world, library) = unthreaded_cartridge_world("LIB-RESTART");
+    drop(library);
+    for _ in 0..2 {
+        let mut index = CatalogIndex::open(&index_path).expect("reopen catalog");
+        let mut library = open_model_library(Arc::clone(&world));
+        let snapshot = library.library().clone();
+        let policy = remanence_library::StaticAllowlist::new(["LIB-RESTART"]);
+        let mut drives = vec![(0x0100, library.open_drive(0x0100, &policy).expect("drive"))];
+        assert_eq!(
+            crate::startup_media_readiness::reconcile_library_media_readiness_on_startup(
+                &mut index,
+                &snapshot,
+                &mut drives,
+            )
+            .expect("reconcile"),
+            1
+        );
+        assert_eq!(
+            drive_load_commands(&world),
+            0,
+            "recorded attempt consumes the LOAD budget"
+        );
+        assert_eq!(
+            index
+                .media_readiness_operation(operation_id)
+                .expect("record")
+                .unwrap()
+                .state,
+            "media_initializing"
+        );
+    }
+    let rows = readiness_transition_rows(&index_path, operation_id);
+    assert_eq!(rows.iter().filter(|row| row.2 == Some(0x1b)).count(), 1);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.0.as_deref() == Some("startup_reconcile_tur"))
+            .count(),
+        2
+    );
+}
+
+/// RPC inventory evidence reaches the actor's LOAD gate for an unlabelled fence.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn resume_readiness_rpc_without_inventory_sends_no_load() {
+    use crate::pb::library_service_server::LibraryService;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut index = CatalogIndex::open(temp.path().join("state.sqlite")).expect("catalog");
+    let operation_id = Uuid::new_v4();
+    // An unlabelled fence reaches the loaded flag instead of the barcode guard.
+    index
+        .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+            operation_id,
+            run_id: None,
+            endpoint: remanence_state::DriveKey::new("LIB001".to_string(), 0x0100),
+            changer_sg: None,
+            drive_sg: None,
+            drive_serial: Some("DRV-UNTHREADED".to_string()),
+            barcode: None,
+            source_slot: None,
+            media_generation: Some(9),
+            phase: "readiness_poll".to_string(),
+            state: "media_initializing".to_string(),
+            dirty_scope: Some("drive+tape".to_string()),
+            deadline_at_utc: None,
+            evidence_path: None,
+        })
+        .expect("record unlabelled fence");
+    let (world, mut library) = unthreaded_cartridge_world("LIB001");
+    let mut snapshot = library.library().clone();
+    snapshot.drive_bays[0].loaded = false;
+    snapshot.drive_bays[0].loaded_tape = None;
+    let policy = remanence_library::StaticAllowlist::new(["LIB001"]);
+    let mut drive = library.open_drive(0x0100, &policy).expect("drive");
+    let mut state = crate::ApiState::new(index);
+    state.default_library_serial = Some(Arc::new("LIB001".to_string()));
+    state.library_snapshot = Some(Arc::new(RwLock::new(Arc::new(
+        crate::live_status::LibrarySnapshot {
+            report: DiscoveryReport {
+                libraries: vec![snapshot],
+                unattached_drives: vec![],
+                complete: true,
+                incomplete_evidence: vec![],
+                warnings: vec![],
+            },
+            captured_at: OffsetDateTime::UNIX_EPOCH,
+        },
+    ))));
+    let (drive_tx, mut drive_rx) = mpsc::channel(1);
+    let (changer_tx, _changer_rx) = mpsc::channel(1);
+    state.drive_pool = Some(DrivePool::new(
+        changer_tx,
+        HashMap::from([(0x0100, drive_tx)]),
+        Arc::new(HashMap::from([(0x0100, AtomicBool::new(false))])),
+    ));
+    let service = crate::LibraryServiceApi {
+        state: state.clone(),
+    };
+    service
+        .resume_media_readiness(tonic::Request::new(pb::ResumeMediaReadinessRequest {
+            operation_id: operation_id.as_bytes().to_vec(),
+            timeout_seconds: 1,
+            poll_interval_seconds: 1,
+        }))
+        .await
+        .expect("resume RPC");
+    let DriveCommand::WaitReady {
+        operation_id,
+        family,
+        options,
+        cartridge_in_drive,
+        handle,
+        reservation,
+    } = drive_rx.try_recv().expect("RPC dispatches wait")
+    else {
+        panic!("readiness command")
+    };
+    assert!(!cartridge_in_drive, "RPC forwards empty inventory");
+    handle_drive_wait_ready(
+        &mut state.index_write().expect("actor index"),
+        &mut drive,
+        DriveReadinessPoll {
+            bay: 0x0100,
+            operation_id,
+            family,
+            options,
+            cartridge_in_drive,
+            phase: "grpc_wait_ready",
+        },
+        &handle,
+    );
+    drop(reservation);
+    assert_eq!(drive_load_commands(&world), 0);
+    assert_eq!(
+        state
+            .index()
+            .unwrap()
+            .media_readiness_operation(operation_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        "timeout_unknown"
+    );
+}
+
+/// Not-ready polling publishes the same sense in the daemon log and watch stream.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn readiness_poll_logs_sense_and_publishes_shared_progress_keys() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut index = CatalogIndex::open(temp.path().join("state.sqlite")).expect("catalog");
+    let operation_id = Uuid::new_v4();
+    record_unthreaded_readiness_operation(&mut index, "LIB-LOG", operation_id);
+    let (_world, mut library) = unthreaded_cartridge_world("LIB-LOG");
+    let policy = remanence_library::StaticAllowlist::new(["LIB-LOG"]);
+    let mut drive = library.open_drive(0x0100, &policy).expect("drive");
+    let registry = crate::operations::OperationRegistry::default();
+    let handle = registry.register(operation_id, "media_readiness_wait");
+    let log_path = temp.path().join("daemon.log");
+    let log = std::fs::File::create(&log_path).expect("log file");
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || log.try_clone().expect("clone log writer"))
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        handle_drive_wait_ready(
+            &mut index,
+            &mut drive,
+            DriveReadinessPoll {
+                bay: 0x0100,
+                operation_id,
+                family: MediaFamily::Lto9OrLater,
+                options: remanence_library::MediaReadinessWaitOptions {
+                    wait: true,
+                    timeout: StdDuration::ZERO,
+                    poll_interval: StdDuration::ZERO,
+                },
+                cartridge_in_drive: false,
+                phase: "grpc_wait_ready",
+            },
+            &handle,
+        );
+    });
+    let log = std::fs::read_to_string(log_path).expect("read daemon log");
+    for text in [
+        "media-readiness fence remains active: drive not ready",
+        "02/04/02",
+        "initializing command required",
+        "sense=",
+        "sense_name=",
+        "LIB-LOG",
+        "grpc_wait_ready",
+    ] {
+        assert!(log.contains(text), "missing {text}: {log}");
+    }
+    let keys = remanence_library::MEDIA_READINESS_SENSE_PROGRESS_KEYS;
+    assert_eq!(keys, ("sense", "sense_name"));
+    let mut stream = registry.watch(&operation_id).expect("watch");
+    let mut observed = false;
+    while let Some(status) = tokio::time::timeout(StdDuration::from_secs(1), stream.next())
+        .await
+        .expect("watch completes")
+    {
+        let status = status.expect("status");
+        if status
+            .progress
+            .get("state")
+            .is_some_and(|state| state == "timeout_unknown")
+            && status.state == pb::OperationState::Running as i32
+        {
+            assert_eq!(
+                status.progress.get(keys.0).map(String::as_str),
+                Some("02/04/02")
+            );
+            assert_eq!(
+                status.progress.get(keys.1).map(String::as_str),
+                Some("initializing command required")
+            );
+            observed = true;
+        }
+    }
+    assert!(observed, "watch includes the not-ready observation");
+}
+
 fn changer_inquiry_response() -> Vec<u8> {
     include_bytes!("../../../../fixtures/inquiry/changer-msl-g3.bin").to_vec()
 }

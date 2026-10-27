@@ -76,6 +76,9 @@ pub(crate) enum DriveCommand {
         operation_id: Uuid,
         family: MediaFamily,
         options: MediaReadinessWaitOptions,
+        /// Changer inventory showed a cartridge in the drive when the wait
+        /// was admitted; the wait may then send its initializing SSC LOAD.
+        cartridge_in_drive: bool,
         handle: crate::operations::OperationHandle,
         reservation: DriveReservation,
     },

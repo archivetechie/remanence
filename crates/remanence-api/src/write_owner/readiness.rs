@@ -72,27 +72,17 @@ pub(crate) fn session_open_short_probe_or_load(
 }
 
 pub(crate) fn handle_drive_wait_ready(
-    bay: u16,
     index: &mut CatalogIndex,
     drive: &mut DriveHandle,
-    operation_id: Uuid,
-    family: MediaFamily,
-    options: MediaReadinessWaitOptions,
+    request: DriveReadinessPoll<'_>,
     handle: &crate::operations::OperationHandle,
 ) {
+    let bay = request.bay;
     handle.publish_state(
         pb::OperationState::Running,
         &[("phase", "readiness_poll"), ("state", "starting")],
     );
-    let result = poll_drive_media_readiness(
-        index,
-        drive,
-        operation_id,
-        family,
-        options,
-        handle,
-        "grpc_wait_ready",
-    );
+    let result = poll_drive_media_readiness(index, drive, request, handle);
 
     match result {
         Ok(poll) if poll.readiness.is_ready() => handle.publish_state(
@@ -129,19 +119,66 @@ pub(crate) fn handle_drive_wait_ready(
     }
 }
 
+/// Durable state and sense triple of the last not-ready observation a wait
+/// logged; the wait logs again only when either changes.
+type LoggedReadiness = (&'static str, Option<(u8, u8, u8)>);
+
+/// One drive-actor readiness wait: which operation it serves and whether
+/// changer inventory shows the cartridge physically in the drive.
+pub(crate) struct DriveReadinessPoll<'a> {
+    pub(crate) bay: u16,
+    pub(crate) operation_id: Uuid,
+    pub(crate) family: MediaFamily,
+    pub(crate) options: MediaReadinessWaitOptions,
+    /// Changer inventory shows a cartridge in this drive. Only then may the
+    /// wait send its SSC LOAD for an initializing-command request.
+    pub(crate) cartridge_in_drive: bool,
+    pub(crate) phase: &'a str,
+}
+
+/// Poll a drive's media readiness for a durable operation, recording every
+/// observation, and send at most one SSC LOAD per operation when the drive
+/// answers `NOT READY / INITIALIZING COMMAND REQUIRED` (`02/04/02`) for a
+/// cartridge changer inventory places in the drive.
+///
+/// The LOAD budget comes from the operation's durable history, so a resumed
+/// wait (a client's `ResumeMediaReadiness` after startup reconciliation, or
+/// a second resume) does not repeat a LOAD the operation already sent; a
+/// `ready` observation re-arms it. The attempt is recorded as a
+/// `pre_ready_loading` transition before the LOAD reaches the drive.
 pub(crate) fn poll_drive_media_readiness(
     index: &mut CatalogIndex,
     drive: &mut DriveHandle,
-    operation_id: Uuid,
-    family: MediaFamily,
-    options: MediaReadinessWaitOptions,
+    request: DriveReadinessPoll<'_>,
     handle: &crate::operations::OperationHandle,
-    phase: &str,
 ) -> Result<MediaReadinessPoll, String> {
-    drive.wait_for_media_readiness(
+    let DriveReadinessPoll {
+        bay,
+        operation_id,
+        family,
+        options,
+        cartridge_in_drive,
+        phase,
+    } = request;
+    let load_budget = if cartridge_in_drive {
+        crate::startup_media_readiness::media_readiness_initializing_load_budget(
+            index,
+            operation_id,
+        )
+        .map_err(|error| format!("count media readiness LOAD attempts: {error}"))?
+    } else {
+        0
+    };
+    let endpoint = drive
+        .library_serial()
+        .map(|serial| format!("library={serial} drive=0x{bay:04x}"))
+        .unwrap_or_else(|| format!("drive=0x{bay:04x}"));
+    let mut last_logged: Option<LoggedReadiness> = None;
+    drive.wait_for_media_readiness_with_initializing_load(
         family,
         None,
         options,
+        load_budget,
         || {
             handle
                 .is_cancelled()
@@ -164,14 +201,73 @@ pub(crate) fn poll_drive_media_readiness(
                 } else {
                     session_open_readiness_state(&poll.readiness)
                 };
-                handle.publish_state(
-                    pb::OperationState::Running,
-                    &[
-                        ("phase", "readiness_poll"),
-                        ("state", state),
-                        ("attempts", attempts.as_str()),
-                        ("elapsed_seconds", elapsed_seconds.as_str()),
-                    ],
+                let observed = (state, poll.readiness.sense());
+                if !poll.readiness.is_ready() && last_logged != Some(observed) {
+                    crate::startup_media_readiness::log_media_readiness_not_ready(
+                        operation_id,
+                        endpoint.as_str(),
+                        phase,
+                        state,
+                        &poll.readiness,
+                    );
+                }
+                last_logged = Some(observed);
+                let sense = crate::startup_media_readiness::media_readiness_sense_progress(
+                    &poll.readiness,
+                );
+                let mut progress = vec![
+                    ("phase", "readiness_poll"),
+                    ("state", state),
+                    ("attempts", attempts.as_str()),
+                    ("elapsed_seconds", elapsed_seconds.as_str()),
+                ];
+                progress.extend(sense.iter().map(|(key, value)| (*key, value.as_str())));
+                handle.publish_state(pb::OperationState::Running, &progress);
+                Ok(())
+            }
+            MediaReadinessWaitEvent::InitializingLoad(poll) => {
+                index
+                    .record_media_readiness_transition(
+                        crate::startup_media_readiness::media_readiness_initializing_load_transition(
+                            operation_id,
+                            &poll.readiness,
+                        ),
+                    )
+                    .map_err(|error| format!("record media readiness LOAD attempt: {error}"))?;
+                tracing::warn!(
+                    operation_id = %operation_id,
+                    endpoint = endpoint.as_str(),
+                    phase,
+                    detail = %poll.readiness,
+                    "drive asks for an initializing command; sending one SSC LOAD"
+                );
+                let sense = crate::startup_media_readiness::media_readiness_sense_progress(
+                    &poll.readiness,
+                );
+                let mut progress = vec![
+                    ("phase", crate::startup_media_readiness::INITIALIZING_LOAD_PHASE),
+                    ("state", "pre_ready_loading"),
+                ];
+                progress.extend(sense.iter().map(|(key, value)| (*key, value.as_str())));
+                handle.publish_state(pb::OperationState::Running, &progress);
+                Ok(())
+            }
+            MediaReadinessWaitEvent::InitializingLoadFailed { readiness, detail } => {
+                index
+                    .record_media_readiness_transition(
+                        crate::startup_media_readiness::media_readiness_initializing_load_failed_transition(
+                            operation_id,
+                            readiness,
+                            detail,
+                        ),
+                    )
+                    .map_err(|error| format!("record media readiness LOAD failure: {error}"))?;
+                tracing::warn!(
+                    operation_id = %operation_id,
+                    endpoint = endpoint.as_str(),
+                    phase,
+                    detail,
+                    "initializing SSC LOAD failed"
                 );
                 Ok(())
             }
@@ -203,9 +299,10 @@ pub(crate) fn session_open_admission_error_message(
         .iter()
         .map(|record| {
             format!(
-                "operation={} state={} {} barcode={} quarantine={}",
+                "operation={} state={}{} {} barcode={} quarantine={}",
                 record.operation_id,
                 record.state,
+                crate::startup_media_readiness::media_readiness_record_sense_suffix(record),
                 match &record.endpoint {
                     remanence_state::DriveKey::Bay { bay, .. } => format!("drive=0x{bay:04x}"),
                     remanence_state::DriveKey::Standalone { .. } =>
@@ -342,9 +439,8 @@ pub(crate) fn session_open_readiness_requires_immediate_load(
     readiness: &MediaReadiness,
 ) -> bool {
     match readiness {
-        MediaReadiness::BecomingReady { ascq: 0x02, .. } => true,
         MediaReadiness::NoMedium { .. } => ctx.needs_drive_load,
-        _ => false,
+        readiness => readiness.requires_initializing_command(),
     }
 }
 
@@ -454,6 +550,13 @@ pub(crate) fn record_session_open_readiness_fence_on_operation(
         );
     }
     let state = session_open_readiness_state(readiness);
+    crate::startup_media_readiness::log_media_readiness_not_ready(
+        operation_id,
+        format!("library={} drive=0x{:04x}", ctx.library_serial, ctx.bay).as_str(),
+        phase,
+        state,
+        readiness,
+    );
     Status::failed_precondition(session_open_readiness_error_message(
         ctx,
         operation_id,
@@ -671,6 +774,9 @@ pub(crate) fn session_open_readiness_evidence(
 pub(crate) fn session_open_readiness_summary(readiness: &MediaReadiness) -> String {
     match readiness {
         MediaReadiness::Ready => "ready".to_string(),
+        MediaReadiness::BecomingReady { ascq: 0x02, .. } => {
+            "drive asks for an initializing command on TEST UNIT READY sense 02/04/02; the cartridge sits unthreaded in the drive until an SSC LOAD arrives".to_string()
+        }
         MediaReadiness::BecomingReady {
             ascq,
             media_initializing,

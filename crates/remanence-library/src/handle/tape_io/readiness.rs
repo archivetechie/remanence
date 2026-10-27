@@ -118,6 +118,9 @@ impl std::fmt::Display for MediaReadiness {
         match self {
             Self::Ready => f.write_str("drive ready"),
             Self::NoMedium { .. } => f.write_str("no cartridge in the drive"),
+            Self::BecomingReady { ascq: 0x02, .. } => {
+                f.write_str("drive needs an initializing command (SSC LOAD)")
+            }
             Self::BecomingReady { .. } => f.write_str("drive becoming ready"),
             Self::UnitAttention { .. } | Self::RepeatedUnitAttention { .. } => {
                 f.write_str("drive reported a change; retry readiness checks")
@@ -156,6 +159,11 @@ pub struct MediaReadinessWaitOptions {
     pub poll_interval: Duration,
 }
 
+/// SSC LOAD commands one media-readiness operation may send when the drive
+/// asks for an initializing command (`02/04/02`). The budget re-arms only after
+/// the operation records a `ready` observation.
+pub const MEDIA_READINESS_MAX_INITIALIZING_LOADS: u32 = 1;
+
 /// One durable observation from a media-readiness polling epoch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaReadinessPoll {
@@ -176,6 +184,20 @@ pub enum MediaReadinessWaitEvent<'a> {
     Poll(&'a MediaReadinessPoll),
     /// Cancellation detected before another TEST UNIT READY was issued.
     Cancelled(&'a str),
+    /// The drive asked for an initializing command (`02/04/02`) and the wait
+    /// is about to send its SSC LOAD (IMMED). The callback records the
+    /// attempt before the command reaches the drive; an error stops the wait
+    /// without sending it.
+    InitializingLoad(&'a MediaReadinessPoll),
+    /// The SSC LOAD failed. `readiness` classifies the failure and `detail`
+    /// carries the drive error. A retryable classification keeps polling; any
+    /// other ends the wait with that classification.
+    InitializingLoadFailed {
+        /// Readiness classification of the LOAD failure.
+        readiness: &'a MediaReadiness,
+        /// Display text of the drive error.
+        detail: &'a str,
+    },
 }
 
 /// Apply the common fast-to-steady polling schedule used by readiness waits.
@@ -195,6 +217,37 @@ impl MediaReadiness {
     /// True when the medium is ready for subsequent tape commands.
     pub fn is_ready(&self) -> bool {
         matches!(self, Self::Ready)
+    }
+
+    /// True when the drive reports `NOT READY / LOGICAL UNIT NOT READY,
+    /// INITIALIZING COMMAND REQUIRED` (`02/04/02`). A cartridge sits in the
+    /// drive unthreaded, for example after an SSC UNLOAD that no changer move
+    /// followed, and the drive stays not ready until a host sends SSC LOAD.
+    pub fn requires_initializing_command(&self) -> bool {
+        matches!(self, Self::BecomingReady { ascq: 0x02, .. })
+    }
+
+    /// Sense key, ASC and ASCQ behind this classification, when the drive
+    /// returned decodable sense data.
+    pub fn sense(&self) -> Option<(u8, u8, u8)> {
+        match self {
+            Self::BecomingReady { ascq, .. } | Self::TerminalNotReady { ascq, .. } => {
+                Some((0x02, 0x04, *ascq))
+            }
+            Self::NoMedium { ascq } => Some((0x02, 0x3a, *ascq)),
+            Self::UnitAttention { asc, ascq } | Self::RepeatedUnitAttention { asc, ascq } => {
+                Some((0x06, *asc, *ascq))
+            }
+            Self::CheckCondition { key, asc, ascq } => Some((*key, *asc, *ascq)),
+            Self::Ready
+            | Self::UndecodedCheckCondition { .. }
+            | Self::TargetBusy { .. }
+            | Self::ReservationConflict
+            | Self::TaskAborted
+            | Self::UnexpectedStatus { .. }
+            | Self::TransportUnknown { .. }
+            | Self::InvalidRequest { .. } => None,
+        }
     }
 
     /// True for states that can be polled again without operator action.
@@ -221,6 +274,51 @@ impl MediaReadiness {
             | Self::UnexpectedStatus { .. }
             | Self::InvalidRequest { .. } => 30,
         }
+    }
+}
+
+/// Name of an additional sense code and qualifier that readiness probes
+/// report, as the SPC additional sense table words it, in lower case.
+///
+/// Returns `None` for codes outside the readiness vocabulary; callers then
+/// show the raw `KK/AA/QQ` triple alone.
+pub fn media_readiness_sense_name(asc: u8, ascq: u8) -> Option<&'static str> {
+    Some(match (asc, ascq) {
+        (0x04, 0x00) => "not ready, cause not reportable",
+        (0x04, 0x01) => "becoming ready",
+        (0x04, 0x02) => "initializing command required",
+        (0x04, 0x03) => "manual intervention required",
+        (0x04, 0x04) => "format in progress",
+        (0x04, 0x07) => "operation in progress",
+        (0x04, 0x12) => "offline",
+        (0x04, 0x20) => "logical unit reset required",
+        (0x04, 0x21) => "hard reset required",
+        (0x04, 0x22) => "power cycle required",
+        (0x28, 0x00) => "not ready to ready change, medium may have changed",
+        (0x29, 0x00) => "power on, reset, or bus device reset occurred",
+        (0x29, 0x01) => "power on occurred",
+        (0x29, 0x02) => "SCSI bus reset occurred",
+        (0x29, 0x03) => "bus device reset function occurred",
+        (0x29, 0x04) => "device internal reset",
+        (0x2a, 0x01) => "mode parameters changed",
+        (0x30, 0x00) => "incompatible medium installed",
+        (0x30, 0x03) => "cleaning cartridge installed",
+        (0x3a, 0x00) => "medium not present",
+        (0x3a, 0x01) => "medium not present, tray closed",
+        (0x3a, 0x02) => "medium not present, tray open",
+        (0x3a, 0x04) => "medium not present, medium auxiliary memory accessible",
+        (0x53, 0x00) => "media load or eject failed",
+        _ => return None,
+    })
+}
+
+/// `KK/AA/QQ` label of a sense triple, followed by its name in parentheses
+/// when [`media_readiness_sense_name`] knows it. Quarantine listings, daemon
+/// logs and operation progress print this form.
+pub fn media_readiness_sense_label(sense_key: u8, asc: u8, ascq: u8) -> String {
+    match media_readiness_sense_name(asc, ascq) {
+        Some(name) => format!("{sense_key:02x}/{asc:02x}/{ascq:02x} ({name})"),
+        None => format!("{sense_key:02x}/{asc:02x}/{ascq:02x}"),
     }
 }
 
@@ -387,6 +485,33 @@ mod tests {
 
         assert_eq!(readiness, MediaReadiness::ReservationConflict);
         assert_eq!(readiness.design_exit_code(), 50);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn initializing_command_required_is_named_and_flagged() {
+        let readiness = classify_media_readiness_error(
+            check_condition(0x02, 0x04, 0x02),
+            MediaFamily::Lto9OrLater,
+        );
+
+        assert!(readiness.requires_initializing_command());
+        assert!(readiness.is_retryable_wait());
+        assert_eq!(readiness.sense(), Some((0x02, 0x04, 0x02)));
+        assert_eq!(
+            media_readiness_sense_name(0x04, 0x02),
+            Some("initializing command required")
+        );
+        assert_eq!(
+            media_readiness_sense_label(0x02, 0x04, 0x02),
+            "02/04/02 (initializing command required)"
+        );
+        assert_eq!(media_readiness_sense_label(0x03, 0x11, 0x00), "03/11/00");
+        assert!(!MediaReadiness::BecomingReady {
+            ascq: 0x01,
+            media_initializing: true
+        }
+        .requires_initializing_command());
     }
 
     #[test]

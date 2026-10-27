@@ -1670,6 +1670,35 @@ impl CatalogIndex {
             .ok_or_else(|| StateError::IndexCorrupt("media readiness operation vanished".into()))
     }
 
+    /// Count the SSC LOAD attempts recorded for a media-readiness operation
+    /// since its most recent `ready` transition.
+    ///
+    /// Every path that sends LOAD on behalf of an operation first records a
+    /// `pre_ready_loading` transition carrying opcode `1Bh`; this counts those
+    /// write-ahead rows. Readiness waits use it to bound the LOADs one
+    /// operation sends, so a resumed or restarted wait does not repeat one.
+    pub fn media_readiness_load_attempts_since_ready(
+        &self,
+        operation_id: Uuid,
+    ) -> Result<u32, StateError> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "select count(*) from media_readiness_transitions
+                 where operation_id = ?1
+                   and last_cdb_opcode = 27
+                   and state = 'pre_ready_loading'
+                   and transition_id > coalesce(
+                       (select max(transition_id) from media_readiness_transitions
+                         where operation_id = ?1 and state = 'ready'),
+                       0)",
+                params![operation_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|err| sqlite_error("count media readiness LOAD attempts", err))?;
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
     /// Fetch a durable media-readiness operation by id.
     pub fn media_readiness_operation(
         &self,
@@ -16966,6 +16995,76 @@ mod tests {
                 .expect("transition count after ready"),
             3
         );
+    }
+
+    #[test]
+    fn media_readiness_load_attempts_count_write_ahead_loads_since_ready() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-readiness-load-attempts")
+            .tempdir()
+            .expect("tempdir");
+        let mut index = CatalogIndex::open(temp.path().join("state.sqlite")).expect("open");
+        let operation_id = Uuid::new_v4();
+        index
+            .record_media_readiness_operation(MediaReadinessOperationInput {
+                operation_id,
+                run_id: None,
+                endpoint: DriveKey::new("LIB-A".to_string(), 0x0001),
+                changer_sg: None,
+                drive_sg: None,
+                drive_serial: Some("DRV1".to_string()),
+                barcode: Some("AOX031L9".to_string()),
+                source_slot: None,
+                media_generation: Some(9),
+                phase: "readiness_poll".to_string(),
+                state: "planned".to_string(),
+                dirty_scope: Some("drive+tape".to_string()),
+                deadline_at_utc: None,
+                evidence_path: None,
+            })
+            .expect("record operation");
+        let transition = |state: &str, opcode: Option<u8>| MediaReadinessTransitionInput {
+            operation_id,
+            phase: Some("test".to_string()),
+            state: state.to_string(),
+            dirty_scope: Some("drive+tape".to_string()),
+            last_cdb_opcode: opcode,
+            last_sense_raw: None,
+            last_sense_key: None,
+            last_asc: None,
+            last_ascq: None,
+            last_host_status: None,
+            last_driver_status: None,
+            target_status: None,
+            transport_class: None,
+            cancel_source: None,
+            signal: None,
+            evidence_path: None,
+            last_error_json: None,
+            quarantine_id: None,
+        };
+        let count = |index: &CatalogIndex| {
+            index
+                .media_readiness_load_attempts_since_ready(operation_id)
+                .expect("count LOAD attempts")
+        };
+
+        assert_eq!(count(&index), 0);
+        index
+            .record_media_readiness_transition(transition("media_initializing", Some(0x00)))
+            .expect("TUR transition");
+        index
+            .record_media_readiness_transition(transition("pre_ready_loading", Some(0x1b)))
+            .expect("LOAD write-ahead");
+        assert_eq!(count(&index), 1, "the write-ahead row counts");
+        index
+            .record_media_readiness_transition(transition("ready", Some(0x00)))
+            .expect("ready transition");
+        assert_eq!(count(&index), 0, "a ready observation re-arms the budget");
+        index
+            .record_media_readiness_transition(transition("pre_ready_loading", Some(0x1b)))
+            .expect("second LOAD write-ahead");
+        assert_eq!(count(&index), 1);
     }
 
     #[test]

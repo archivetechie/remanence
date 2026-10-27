@@ -36,7 +36,7 @@ use super::{
     PIPELINE_RAMP_OBSERVATION_SECONDS, PIPELINE_STEADY_THRESHOLD_PERCENT,
     PIPELINE_STEADY_WINDOW_SECONDS,
 };
-use crate::error::{AuditEvent, AuditOp, AuditOutcome};
+use crate::error::{AuditEvent, AuditOp, AuditOutcome, DriveOpError};
 use crate::transport::TimeoutClass;
 
 use media_gate::MediaDispatchError;
@@ -53,9 +53,15 @@ pub use model::{
 };
 pub use readiness::{
     classify_media_readiness_error, classify_media_readiness_error_ref,
-    media_readiness_poll_interval, MediaFamily, MediaReadiness, MediaReadinessPoll,
-    MediaReadinessWaitEvent, MediaReadinessWaitOptions,
+    media_readiness_poll_interval, media_readiness_sense_label, media_readiness_sense_name,
+    MediaFamily, MediaReadiness, MediaReadinessPoll, MediaReadinessWaitEvent,
+    MediaReadinessWaitOptions, MEDIA_READINESS_MAX_INITIALIZING_LOADS,
 };
+
+/// Pause between the TEST UNIT READY that asked for an initializing command
+/// and the SSC LOAD the readiness wait sends, matching the settle the
+/// session-open and initialization LOAD paths use.
+const INITIALIZING_LOAD_SETTLE: Duration = Duration::from_secs(1);
 
 #[cfg(not(test))]
 fn sleep_media_readiness_poll(duration: Duration) {
@@ -1132,11 +1138,52 @@ impl super::DriveHandle {
     /// invoked for every observation and cancellation before this method
     /// returns, allowing higher layers to durably record fences and publish
     /// progress without reimplementing the polling rules.
+    ///
+    /// This form never sends SSC LOAD; see
+    /// [`Self::wait_for_media_readiness_with_initializing_load`].
     pub fn wait_for_media_readiness(
         &mut self,
         family: MediaFamily,
         initial: Option<MediaReadiness>,
         options: MediaReadinessWaitOptions,
+        cancellation: impl FnMut() -> Option<String>,
+        event: impl for<'a> FnMut(MediaReadinessWaitEvent<'a>) -> Result<(), String>,
+    ) -> Result<MediaReadinessPoll, String> {
+        self.wait_for_media_readiness_with_initializing_load(
+            family,
+            initial,
+            options,
+            0,
+            cancellation,
+            event,
+        )
+    }
+
+    /// Poll TEST UNIT READY like [`Self::wait_for_media_readiness`], and send
+    /// up to `load_budget` SSC LOAD (IMMED) commands while the drive answers
+    /// `NOT READY / INITIALIZING COMMAND REQUIRED` (`02/04/02`).
+    ///
+    /// A drive holding an unthreaded cartridge, for example after an SSC
+    /// UNLOAD that no changer move followed, answers `02/04/02` until a host
+    /// sends LOAD; polling alone never ends that state. Callers pass a
+    /// non-zero budget only when changer inventory shows the cartridge
+    /// physically in this drive, and derive the budget from the operation's
+    /// durable history so that a resumed operation does not repeat the LOAD
+    /// (see [`MEDIA_READINESS_MAX_INITIALIZING_LOADS`]).
+    ///
+    /// The LOAD is sent only in waiting mode (`options.wait`). Before it the
+    /// loop emits [`MediaReadinessWaitEvent::InitializingLoad`] so the caller
+    /// can record the attempt, and after it the loop probes TEST UNIT READY
+    /// again at once. A failed LOAD emits
+    /// [`MediaReadinessWaitEvent::InitializingLoadFailed`]; the wait keeps
+    /// polling when the failure classifies as a retryable readiness state and
+    /// otherwise returns that classification.
+    pub fn wait_for_media_readiness_with_initializing_load(
+        &mut self,
+        family: MediaFamily,
+        initial: Option<MediaReadiness>,
+        options: MediaReadinessWaitOptions,
+        load_budget: u32,
         mut cancellation: impl FnMut() -> Option<String>,
         mut event: impl for<'a> FnMut(MediaReadinessWaitEvent<'a>) -> Result<(), String>,
     ) -> Result<MediaReadinessPoll, String> {
@@ -1145,6 +1192,7 @@ impl super::DriveHandle {
         let started = Instant::now();
         let mut attempts = 0_u64;
         let mut initial = initial;
+        let mut loads_remaining = load_budget;
         let mut unit_attention_seen = BTreeSet::<(u8, u8)>::new();
         loop {
             if let Some(reason) = cancellation() {
@@ -1165,8 +1213,10 @@ impl super::DriveHandle {
                 }
             }
             let elapsed = started.elapsed();
+            let load_now =
+                options.wait && loads_remaining > 0 && readiness.requires_initializing_command();
             let terminal = readiness.is_ready() || !options.wait || !readiness.is_retryable_wait();
-            let timed_out = !terminal && elapsed >= options.timeout;
+            let timed_out = !terminal && !load_now && elapsed >= options.timeout;
             let poll = MediaReadinessPoll {
                 readiness,
                 attempts,
@@ -1174,6 +1224,37 @@ impl super::DriveHandle {
                 timed_out,
             };
             event(MediaReadinessWaitEvent::Poll(&poll))?;
+            if load_now {
+                sleep_media_readiness_poll(INITIALIZING_LOAD_SETTLE);
+                if let Some(reason) = cancellation() {
+                    event(MediaReadinessWaitEvent::Cancelled(reason.as_str()))?;
+                    return Err(format!("media readiness interrupted by {reason}"));
+                }
+                event(MediaReadinessWaitEvent::InitializingLoad(&poll))?;
+                loads_remaining -= 1;
+                // A LOAD is a new load boundary: the drive may report the
+                // same unit attention it reported before the cartridge was
+                // threaded, which is not a repeat within this epoch.
+                unit_attention_seen.clear();
+                if let Err(error) = self.load_immediate() {
+                    let DriveOpError::ScsiError(scsi) = &error;
+                    let failure = classify_media_readiness_error_ref(scsi, family);
+                    let detail = error.to_string();
+                    event(MediaReadinessWaitEvent::InitializingLoadFailed {
+                        readiness: &failure,
+                        detail: detail.as_str(),
+                    })?;
+                    if !failure.is_retryable_wait() {
+                        return Ok(MediaReadinessPoll {
+                            readiness: failure,
+                            attempts,
+                            elapsed: started.elapsed(),
+                            timed_out: false,
+                        });
+                    }
+                }
+                continue;
+            }
             if terminal || timed_out {
                 return Ok(poll);
             }

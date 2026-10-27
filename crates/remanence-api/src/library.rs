@@ -1097,13 +1097,18 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         // One caller at a time holds a fenced drive: the wait below keeps the
         // reservation until it ends. A second caller is often a client whose
         // open the same fence refused because that open needs the library
-        // robot, so the refusal names the serialization, not only the drive.
+        // robot, so the refusal names the serialization, not only the drive,
+        // and the fence's last sense when it has one.
+        let fence_sense =
+            crate::startup_media_readiness::media_readiness_record_sense_label(&record)
+                .map(|label| format!(", sense={label}"))
+                .unwrap_or_default();
         let reservation = pool.reserve_drive(&drive_key).map_err(|error| {
             if error.code() == tonic::Code::FailedPrecondition
                 && error.message() == format!("{} is busy", drive_key.label())
             {
                 Status::failed_precondition(format!(
-                    "{} is busy: another caller holds this drive while media-readiness operation {operation_id} is unresolved. Robot moves in library {library_serial} are refused until that operation finishes, even when other drive bays are idle; retry when operation {operation_id} finishes",
+                    "{} is busy: another caller holds this drive while media-readiness operation {operation_id} is unresolved{fence_sense}. Robot moves in library {library_serial} are refused until that operation finishes, even when other drive bays are idle; retry when operation {operation_id} finishes",
                     drive_key.label()
                 ))
             } else {
@@ -1131,6 +1136,7 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
                 timeout: Duration::from_secs(u64::from(request.timeout_seconds)),
                 poll_interval: Duration::from_secs(u64::from(request.poll_interval_seconds)),
             },
+            cartridge_in_drive: drive_bay.loaded,
             handle: handle.clone(),
             reservation,
         };
@@ -2294,6 +2300,19 @@ mod tests {
                 evidence_path: None,
             })
             .expect("record session-open readiness fence");
+        state
+            .index_write()
+            .expect("open writable catalog")
+            .record_media_readiness_transition(
+                crate::startup_media_readiness::media_readiness_initializing_load_transition(
+                    operation_id,
+                    &remanence_library::MediaReadiness::BecomingReady {
+                        ascq: 0x02,
+                        media_initializing: true,
+                    },
+                ),
+            )
+            .expect("record the fence's last sense");
         let _first_waiter = pool
             .reserve_drive(&crate::drive_pool::DriveKey::new("DEC418146K_LL02", 1))
             .expect("first waiter holds the fenced drive");
@@ -2321,6 +2340,10 @@ mod tests {
         );
         assert!(
             message.contains("even when other drive bays are idle"),
+            "{message}"
+        );
+        assert!(
+            message.contains("is unresolved, sense=02/04/02 (initializing command required). "),
             "{message}"
         );
     }

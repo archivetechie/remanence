@@ -429,6 +429,11 @@ fn media_readiness_admission_helper_blocks_active_fence() {
     assert!(err.message().contains("mrq-test"), "{err}");
     assert!(err.message().contains("AOX032L9"), "{err}");
     assert!(err.message().contains("media_initializing"), "{err}");
+    assert!(
+        err.message()
+            .contains("state=media_initializing sense=02/04/01 (becoming ready)"),
+        "the fence names the drive's not-ready reason: {err}"
+    );
 
     ensure_media_readiness_admitted(
         &index,

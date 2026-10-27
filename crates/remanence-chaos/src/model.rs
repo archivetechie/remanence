@@ -298,6 +298,13 @@ pub struct VirtualDriveState {
     pub cleaning_cycle_ops_remaining: Option<u64>,
     /// Whether the drive has already reported flag 20 for the current dirty cycle.
     pub dirty_alert_reported: bool,
+    /// The cartridge in this bay sits unthreaded, as after an SSC UNLOAD
+    /// that no changer move followed: TEST UNIT READY and media commands
+    /// answer NOT READY / INITIALIZING COMMAND REQUIRED (`02/04/02`) until an
+    /// SSC LOAD threads it. Moving the cartridge out of the bay clears it.
+    pub initializing_command_required: bool,
+    /// Opt in to SSC UNLOAD leaving a seated cartridge unthreaded.
+    pub unload_leaves_unthreaded: bool,
 }
 
 impl VirtualWorld {
@@ -395,6 +402,24 @@ impl VirtualWorld {
         self.tapes.insert(barcode.clone(), tape);
         self.drive_bays.insert(bay, Some(barcode));
         self.drive_source_slots.insert(bay, source_slot);
+    }
+
+    /// Leave the cartridge in `bay` unthreaded, as a daemon killed between
+    /// SSC UNLOAD and the changer move does: the drive then answers NOT
+    /// READY / INITIALIZING COMMAND REQUIRED until an SSC LOAD arrives.
+    pub fn leave_cartridge_unthreaded(&mut self, bay: u16) {
+        self.drive_states
+            .entry(bay)
+            .or_default()
+            .initializing_command_required = true;
+    }
+
+    fn awaits_initializing_command(&self, bay: u16) -> bool {
+        self.drive_bays.get(&bay).is_some_and(Option::is_some)
+            && self
+                .drive_states
+                .get(&bay)
+                .is_some_and(|state| state.initializing_command_required)
     }
 
     /// Loaded barcode in `bay`, if any.
@@ -720,6 +745,9 @@ impl ModelTransport {
         f: impl FnOnce(&mut VirtualTape) -> Result<R, ScsiError>,
     ) -> Result<R, ScsiError> {
         let bay = self.drive_bay()?;
+        if world.awaits_initializing_command(bay) {
+            return Err(check_condition(initializing_command_required_sense(), 0));
+        }
         let barcode = world
             .drive_bays
             .get(&bay)
@@ -865,6 +893,9 @@ impl ModelTransport {
     fn test_unit_ready(&self) -> Result<(), ScsiError> {
         let bay = self.drive_bay()?;
         let world = self.world.lock().expect("virtual world lock");
+        if world.awaits_initializing_command(bay) {
+            return Err(check_condition(initializing_command_required_sense(), 0));
+        }
         match world.drive_bays.get(&bay) {
             Some(Some(barcode)) if world.tapes.contains_key(barcode) => Ok(()),
             Some(_) => Err(check_condition(no_medium_sense(), 0)),
@@ -1102,6 +1133,11 @@ impl ModelTransport {
             let Some(barcode) = world.drive_bays[&bay].clone() else {
                 return Err(ScsiError::InvalidInput("load requested with empty bay"));
             };
+            world
+                .drive_states
+                .entry(bay)
+                .or_default()
+                .initializing_command_required = false;
             let expired = world
                 .tapes
                 .get(&barcode)
@@ -1139,6 +1175,14 @@ impl ModelTransport {
             }
             Ok(())
         } else {
+            let mut world = self.world.lock().expect("virtual world lock");
+            let bay = self.drive_bay()?;
+            if world.loaded_barcode(bay).is_some() {
+                let state = world.drive_states.entry(bay).or_default();
+                if state.unload_leaves_unthreaded {
+                    state.initializing_command_required = true;
+                }
+            }
             self.position = 0;
             Ok(())
         }
@@ -1539,10 +1583,14 @@ fn take_from_element(world: &mut VirtualWorld, element: u16) -> Result<String, S
         return Ok(barcode);
     }
     if let Some(entry) = world.drive_bays.get_mut(&element) {
-        world.drive_source_slots.insert(element, None);
-        return entry
+        let barcode = entry
             .take()
-            .ok_or(ScsiError::InvalidInput("source bay is empty"));
+            .ok_or(ScsiError::InvalidInput("source bay is empty"))?;
+        world.drive_source_slots.insert(element, None);
+        if let Some(state) = world.drive_states.get_mut(&element) {
+            state.initializing_command_required = false;
+        }
+        return Ok(barcode);
     }
     Err(ScsiError::InvalidInput("unknown source element"))
 }
@@ -1678,6 +1726,10 @@ fn no_medium_sense() -> Vec<u8> {
     fixed_sense(0x02, 0x3a, 0x00, None, 0x00)
 }
 
+fn initializing_command_required_sense() -> Vec<u8> {
+    fixed_sense(0x02, 0x04, 0x02, None, 0x00)
+}
+
 fn eom_sense(key: u8, residual: i64) -> Vec<u8> {
     fixed_sense(key, 0x00, 0x00, Some(residual), 0x40)
 }
@@ -1725,6 +1777,61 @@ mod tests {
             world.lock().unwrap().loaded_barcode(0x0100),
             Some("TAPE001")
         );
+    }
+
+    /// The dismount pair removes the unthreaded cartridge and clears its state.
+    #[test]
+    fn unload_then_move_recovers_unthreaded_cartridge() {
+        let world = world();
+        {
+            let mut world = world.lock().unwrap();
+            world
+                .drive_states
+                .get_mut(&0x0100)
+                .unwrap()
+                .unload_leaves_unthreaded = true;
+        }
+        let mut changer = ModelTransport::new(Arc::clone(&world), DeviceRole::Changer);
+        let mut drive = ModelTransport::new(Arc::clone(&world), DeviceRole::Drive { bay: 0x0100 });
+        let move_cdb = |src: u16, dst: u16| {
+            let mut cdb = [0u8; 12];
+            cdb[0] = 0xa5;
+            cdb[4..6].copy_from_slice(&src.to_be_bytes());
+            cdb[6..8].copy_from_slice(&dst.to_be_bytes());
+            cdb
+        };
+        changer
+            .execute_none(&move_cdb(0x0400, 0x0100))
+            .expect("seat cartridge");
+        drive
+            .execute_none(&remanence_scsi::load_unload::build_cdb(false))
+            .expect("SSC UNLOAD");
+        let error = drive
+            .execute_none(&[0; 6])
+            .expect_err("unthreaded cartridge is not ready");
+        let ScsiError::CheckCondition { sense, .. } = error else {
+            panic!("sense required")
+        };
+        assert_eq!((sense[2] & 0xf, sense[12], sense[13]), (2, 4, 2));
+        assert_eq!(
+            world.lock().unwrap().loaded_barcode(0x0100),
+            Some("TAPE001")
+        );
+        changer
+            .execute_none(&move_cdb(0x0100, 0x0400))
+            .expect("move home completes dismount");
+        {
+            let world = world.lock().unwrap();
+            assert_eq!(world.loaded_barcode(0x0100), None);
+            assert!(!world.drive_states[&0x0100].initializing_command_required);
+            assert_eq!(world.slots[0].barcode.as_deref(), Some("TAPE001"));
+        }
+        changer
+            .execute_none(&move_cdb(0x0400, 0x0100))
+            .expect("seat cartridge again");
+        drive
+            .execute_none(&[0; 6])
+            .expect("cartridge is ready after the dismount pair");
     }
 
     #[test]

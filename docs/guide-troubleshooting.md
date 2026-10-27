@@ -120,9 +120,13 @@ until the fence is cleared. You will see messages like:
 run `rem tape quarantine show <id>` or wait-ready/resume before retrying
 ```
 
-Inspect with `rem tape quarantine list` / `show <id>`. If the fence's
-operation can still be resumed, resume it. Otherwise, once you have
-verified the physical state (inventory settled, cartridge where the
+Inspect with `rem tape quarantine list` / `show <id>`. Both print the
+drive's last sense with its name, for example `sense=02/04/02 (initializing
+command required)`; a drive that reports `02/04/02` is covered under [A drive
+stays not ready after a daemon crash](#a-drive-stays-not-ready-after-a-daemon-crash).
+
+If the fence's operation can still be resumed, resume it. Otherwise, once you
+have verified the physical state (inventory settled, cartridge where the
 library says it is), release it explicitly:
 
 ```sh
@@ -136,18 +140,30 @@ mid-uncertainty.
 <!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs @ 638210f7 -->
 ## A drive stays not ready after a daemon crash
 
-A daemon that is killed while it unloads a cartridge can stop after the
-drive has unthreaded the tape and before the changer has moved it. The
-cartridge stays in the drive, and the drive answers NOT READY until it
-receives a LOAD. Remanence reads that answer as a cartridge becoming ready,
-so the restarted daemon reconciles a media-readiness fence for the drive
-and keeps polling it without end.
+A drive that answers `02/04/02` holds a cartridge it has not threaded. This
+happens when a process is killed between the SSC UNLOAD of a dismount and
+the changer move home, or when the changer move fails after a successful
+UNLOAD: the drive has unthreaded the tape, the changer has not moved it, and
+the cartridge stays in the drive. The drive answers NOT READY until it
+receives a LOAD, and polling alone never ends that state. Remanence reads
+that answer as a cartridge becoming ready, so a restarted daemon reconciles
+a media-readiness fence for the drive.
 
-The signs are:
+Readiness waits (daemon readiness operations, startup reconciliation, `rem
+tape wait-ready --wait`) send one SSC LOAD when changer inventory shows the
+cartridge in the drive. They record the attempt in the operation before the
+LOAD and send no second one until the drive has reported ready, also across
+a restart. The daemon finishes every dismount it starts before it exits on
+SIGTERM, SIGINT or SIGHUP, so give a stopping daemon time for a rewind, an
+unload and a move before any hard kill.
+
+When that LOAD fails, was already spent, or is never sent because changer
+inventory does not show the cartridge in the drive, the fence stays. The
+signs are:
 
 - `rem tape quarantine list` shows a fence for that cartridge in state
-  `media_initializing`, updated at every poll, and the drive never comes
-  ready.
+  `media_initializing` with `sense=02/04/02 (initializing command
+  required)`, updated at every poll, and the drive never comes ready.
 - `rem top --once` shows the bay busy with the cartridge mounted and no
   I/O.
 - Writes and restores that need the drive wait on the fence.
@@ -157,8 +173,8 @@ cartridge, which can last over an hour. A cartridge that has been loaded
 before, and a stall that began with a daemon kill or crash, point to the
 unthreaded case instead.
 
-A LOAD resolves it. `rem tape wait-ready` only polls and does not issue
-one today, so send it with `sg_start` from sg3_utils:
+A LOAD resolves it. When the readiness wait's own LOAD has not, send one by
+hand with `sg_start` from sg3_utils:
 
 ```sh
 rem libraries --json      # the observed_endpoints entry for the library serial and bay gives /dev/sgN

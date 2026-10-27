@@ -1,9 +1,32 @@
 //! Reusable Layer 5 daemon process entrypoint.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
+
+/// Emit process diagnostics even when the controlling terminal closes.
+macro_rules! stderr_message {
+    ($($arg:tt)*) => {{
+        let _ = writeln!(std::io::stderr().lock(), $($arg)*);
+    }};
+}
+
+/// Keep tracing usable when stderr returns EIO or another write error.
+struct BestEffortWriter<W>(W);
+
+impl<W: Write> Write for BestEffortWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let _ = self.0.write_all(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let _ = self.0.flush();
+        Ok(())
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -22,14 +45,45 @@ struct Args {
     socket: Option<PathBuf>,
 }
 
-/// Resolve when SIGINT or SIGTERM arrives.
-async fn shutdown_signal() {
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("install SIGTERM handler");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term.recv() => {}
-    }
+/// Install the graceful-shutdown signal handlers and return a future that
+/// resolves when SIGINT, SIGTERM or SIGHUP arrives.
+///
+/// The graceful path closes write sessions and dismounts every seated
+/// cartridge: SSC UNLOAD, then the changer move home. A process that dies
+/// between those two commands leaves the cartridge unthreaded in the drive,
+/// and the drive answers NOT READY / INITIALIZING COMMAND REQUIRED until a
+/// host sends LOAD. SIGHUP is handled for that reason: a closing terminal or
+/// multiplexer session sends it, and its default action ends the process at
+/// once, wherever the dismount stands. Handled, it starts the same graceful
+/// shutdown as SIGTERM.
+///
+/// The handlers stay installed for the life of the process, so a repeated
+/// stop request (another SIGTERM, SIGINT or SIGHUP) does not cut a dismount
+/// short; the daemon exits once the shutdown pass has finished every move it
+/// started. SIGKILL or a failed changer move can leave a cartridge unthreaded, so a
+/// supervisor's stop timeout must cover a rewind, an unload and a changer
+/// move, which together can take more than a minute on LTO-9.
+fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()> + Send + 'static> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut hangup = signal(SignalKind::hangup())?;
+    Ok(report_shutdown_signal(async move {
+        tokio::select! {
+            _ = interrupt.recv() => "SIGINT",
+            _ = terminate.recv() => "SIGTERM",
+            _ = hangup.recv() => "SIGHUP",
+        }
+    }))
+}
+
+/// Complete the shutdown notification even when its diagnostic cannot be written.
+async fn report_shutdown_signal(signal: impl std::future::Future<Output = &'static str>) {
+    let name = signal.await;
+    stderr_message!(
+        "rem-daemon: {name} received; closing sessions and finishing every cartridge dismount before exit"
+    );
 }
 
 /// Run the daemon with the foreign formats linked by a distribution.
@@ -43,7 +97,7 @@ pub async fn main_entry_with_registry(
     let config = match remanence_state::load_config(&args.config) {
         Ok(config) => config,
         Err(error) => {
-            eprintln!("error: load config {}: {error}", args.config.display());
+            stderr_message!("error: load config {}: {error}", args.config.display());
             return ExitCode::from(1);
         }
     };
@@ -56,7 +110,7 @@ pub async fn main_entry_with_registry(
     let _state_lock = match remanence_state::StateLockGuard::acquire(&config.daemon.state_dir) {
         Ok(lock) => lock,
         Err(error) => {
-            eprintln!(
+            stderr_message!(
                 "error: acquire daemon state ownership {}: {error}",
                 config.daemon.state_dir.display()
             );
@@ -71,7 +125,7 @@ pub async fn main_entry_with_registry(
     let index = match remanence_state::CatalogIndex::open(&config.index.sqlite_path) {
         Ok(index) => index,
         Err(error) => {
-            eprintln!(
+            stderr_message!(
                 "error: open index {}: {error}",
                 config.index.sqlite_path.display()
             );
@@ -82,7 +136,7 @@ pub async fn main_entry_with_registry(
         match remanence_api::ApiState::new_with_config(index, &config) {
             Ok(state) => state,
             Err(error) => {
-                eprintln!("error: replay checkpoint journals: {error}");
+                stderr_message!("error: replay checkpoint journals: {error}");
                 return ExitCode::from(1);
             }
         }
@@ -90,7 +144,7 @@ pub async fn main_entry_with_registry(
         let report = match remanence_library::discover() {
             Ok(report) => report,
             Err(error) => {
-                eprintln!("error: discover libraries: {error}");
+                stderr_message!("error: discover libraries: {error}");
                 return ExitCode::from(1);
             }
         };
@@ -98,7 +152,7 @@ pub async fn main_entry_with_registry(
             if let Some(message) = remanence_library::drive_mapping_message(warning)
                 .or_else(|| warning.informational_message())
             {
-                eprintln!("rem-daemon: {message}");
+                stderr_message!("rem-daemon: {message}");
             }
         }
         let mut policy = remanence_library::StaticAllowlist::new(
@@ -111,13 +165,13 @@ pub async fn main_entry_with_registry(
         }
         let spool_dir = config.daemon.spool_dir_or_default();
         if let Err(error) = create_private_spool_dir(&spool_dir) {
-            eprintln!("error: create spool dir {}: {error}", spool_dir.display());
+            stderr_message!("error: create spool dir {}: {error}", spool_dir.display());
             return ExitCode::from(1);
         }
         let reconciliation = match reconcile_spool_orphans(&spool_dir) {
             Ok(evidence) => evidence,
             Err(error) => {
-                eprintln!(
+                stderr_message!(
                     "error: reconcile append spool {} before accepting writes: {error}",
                     spool_dir.display()
                 );
@@ -125,7 +179,7 @@ pub async fn main_entry_with_registry(
             }
         };
         if !reconciliation.is_empty() {
-            eprintln!(
+            stderr_message!(
                 "rem-daemon: append spool orphan reconciliation spool_dir={} removed_count={} removed_bytes={} evidence={}",
                 spool_dir.display(),
                 reconciliation.len(),
@@ -138,7 +192,7 @@ pub async fn main_entry_with_registry(
         let spool_budget = match resolve_spool_budget(&config.daemon, &spool_dir) {
             Ok(budget) => budget,
             Err(error) => {
-                eprintln!(
+                stderr_message!(
                     "error: configure spool dir {}: {error}",
                     spool_dir.display()
                 );
@@ -146,7 +200,7 @@ pub async fn main_entry_with_registry(
             }
         };
         if spool_budget.is_tmpfs {
-            eprintln!(
+            stderr_message!(
                 "rem-daemon: tmpfs append spool {} effective_budget_bytes={} available_ram_budget_bytes={}",
                 spool_dir.display(),
                 spool_budget.effective_bytes,
@@ -163,7 +217,7 @@ pub async fn main_entry_with_registry(
         ) {
             Ok(state) => state,
             Err(error) => {
-                eprintln!("error: start drive pool: {error}");
+                stderr_message!("error: start drive pool: {error}");
                 return ExitCode::from(1);
             }
         }
@@ -176,14 +230,14 @@ pub async fn main_entry_with_registry(
             let addr = match listen.parse() {
                 Ok(addr) => addr,
                 Err(error) => {
-                    eprintln!("error: parse daemon.listen {listen:?}: {error}");
+                    stderr_message!("error: parse daemon.listen {listen:?}: {error}");
                     return ExitCode::from(1);
                 }
             };
             let tls = match crate::load_server_tls(tls) {
                 Ok(tls) => tls,
                 Err(error) => {
-                    eprintln!("error: load daemon TLS material: {error}");
+                    stderr_message!("error: load daemon TLS material: {error}");
                     return ExitCode::from(1);
                 }
             };
@@ -193,19 +247,26 @@ pub async fn main_entry_with_registry(
     };
 
     if let Some(listener) = &tls_listener {
-        eprintln!(
+        stderr_message!(
             "rem-daemon: configured mTLS listener on tcp:{}",
             listener.addr
         );
     }
-    eprintln!(
+    stderr_message!(
         "rem-daemon: serving local Layer 5 API on unix:{}",
         socket_path.display()
     );
-    match crate::serve(state, &socket_path, tls_listener, shutdown_signal()).await {
+    let shutdown = match shutdown_signal() {
+        Ok(shutdown) => shutdown,
+        Err(error) => {
+            stderr_message!("error: install shutdown signal handlers: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    match crate::serve(state, &socket_path, tls_listener, shutdown).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("error: serve: {error}");
+            stderr_message!("error: serve: {error}");
             ExitCode::from(1)
         }
     }
@@ -216,10 +277,112 @@ fn init_tracing() {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_writer(std::io::stderr)
+        .with_writer(|| BestEffortWriter(std::io::stderr()))
         .json()
         .flatten_event(true)
         .try_init();
+}
+
+#[cfg(test)]
+mod signal_tests {
+    use super::*;
+
+    /// Complete the shutdown notification with a closed pty master in a child process.
+    #[test]
+    fn closed_stderr_does_not_panic_shutdown() {
+        const CHILD: &str = "REM_TEST_CLOSED_STDERR";
+        if std::env::var_os(CHILD).is_some() {
+            let runtime = tokio::runtime::Runtime::new().expect("runtime");
+            runtime.block_on(async {
+                // Supply the notification directly; signal delivery has separate coverage.
+                let shutdown = report_shutdown_signal(std::future::ready("SIGHUP"));
+                let (mut master, mut slave) = (-1, -1);
+                // SAFETY: both output pointers are valid; null selects default pty settings.
+                assert_eq!(
+                    unsafe {
+                        libc::openpty(
+                            &mut master,
+                            &mut slave,
+                            std::ptr::null_mut(),
+                            std::ptr::null(),
+                            std::ptr::null(),
+                        )
+                    },
+                    0,
+                    "open terminal pair"
+                );
+                // SAFETY: this isolated child owns these descriptors. Closing the master
+                // hangs up stderr's slave without changing the parent test's terminal.
+                unsafe {
+                    assert_eq!(libc::dup2(slave, 2), 2);
+                    assert_eq!(libc::close(slave), 0);
+                    assert_eq!(libc::close(master), 0);
+                }
+                let error = std::io::stderr()
+                    .write_all(b"terminal probe")
+                    .expect_err("pty is closed");
+                assert_eq!(error.raw_os_error(), Some(libc::EIO));
+                init_tracing();
+                tracing::error!("cartridge stays unthreaded in the drive");
+                stderr_message!("error: cartridge stays unthreaded in the drive");
+                tokio::time::timeout(std::time::Duration::from_secs(5), shutdown)
+                    .await
+                    .expect("shutdown resolves with closed stderr");
+            });
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "entry::signal_tests::closed_stderr_does_not_panic_shutdown",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("run isolated shutdown test");
+        assert!(output.status.success(), "child fails: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "child runs the shutdown test: {output:?}"
+        );
+    }
+
+    /// A hung-up pty reports EIO rather than a short successful write.
+    #[test]
+    fn tracing_writer_tolerates_terminal_eio() {
+        struct HungUp;
+        impl Write for HungUp {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
+            }
+        }
+        let mut writer = BestEffortWriter(HungUp);
+        writer.write_all(b"shutdown error").expect("ignore EIO");
+        writer.flush().expect("ignore flush EIO");
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(|| BestEffortWriter(HungUp))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!("cartridge stays unthreaded in the drive");
+        });
+    }
+
+    #[tokio::test]
+    async fn sighup_requests_the_graceful_shutdown() {
+        let shutdown = shutdown_signal().expect("install shutdown signal handlers");
+        // SAFETY: raise has no memory-safety preconditions. The handlers
+        // installed above replace the default SIGHUP action for the rest of
+        // the process, so the signal reaches the shutdown future instead of
+        // ending the test process.
+        let raised = unsafe { libc::raise(libc::SIGHUP) };
+        assert_eq!(raised, 0, "raise SIGHUP");
+        tokio::time::timeout(std::time::Duration::from_secs(5), shutdown)
+            .await
+            .expect("SIGHUP resolves the graceful shutdown future");
+    }
 }
 
 #[cfg(test)]
@@ -297,7 +460,7 @@ fn reconcile_spool_orphans(path: &Path) -> std::io::Result<Vec<SpoolOrphanEviden
     }
     evidence.sort_by(|left, right| left.name.cmp(&right.name));
     if !evidence.is_empty() {
-        eprintln!(
+        stderr_message!(
             "rem-daemon: append spool orphan evidence spool_dir={} orphan_count={} orphan_bytes={} action=remove_before_budget_reaccount evidence={}",
             path.display(),
             evidence.len(),
@@ -482,7 +645,7 @@ fn warn_io_memory_sanity(ceiling: u64) {
     {
         if let Some(available) = read_mem_available_bytes() {
             if ceiling > available {
-                eprintln!(
+                stderr_message!(
                     "rem-daemon: warning daemon.io_memory_ceiling={ceiling} exceeds startup MemAvailable={available}; the fixed ceiling remains authoritative"
                 );
             }
@@ -500,7 +663,7 @@ fn warn_io_memory_sanity(ceiling: u64) {
             && limit.rlim_cur != libc::RLIM_INFINITY
             && ceiling > limit.rlim_cur
         {
-            eprintln!(
+            stderr_message!(
                 "rem-daemon: warning daemon.io_memory_ceiling={ceiling} exceeds LimitMEMLOCK={}; reads fall back to unlocked buffers when minimum read reservoirs cannot be locked",
                 limit.rlim_cur
             );

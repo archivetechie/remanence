@@ -20,7 +20,7 @@ use uuid::Uuid;
 use super::actor_protocol::ReadResumeTarget;
 use super::actor_protocol::{ChangerCommand, DriveCommand};
 use super::read_session::handle_drive_open_read;
-use super::readiness::handle_drive_wait_ready;
+use super::readiness::{handle_drive_wait_ready, DriveReadinessPoll};
 use super::reconcile::handle_reconcile;
 use super::robotics::{
     clear_library_snapshot_persist_alarm, handle_robotics, observe_refreshed_library,
@@ -228,15 +228,20 @@ pub(super) fn drive_loop(
                 operation_id,
                 family,
                 options,
+                cartridge_in_drive,
                 handle,
                 reservation: _reservation,
             } => handle_drive_wait_ready(
-                bay,
                 &mut index,
                 drive,
-                operation_id,
-                family,
-                options,
+                DriveReadinessPoll {
+                    bay,
+                    operation_id,
+                    family,
+                    options,
+                    cartridge_in_drive,
+                    phase: "grpc_wait_ready",
+                },
                 &handle,
             ),
             DriveCommand::OpenWrite {

@@ -2,7 +2,9 @@
 
 use super::*;
 use crate::error::{AuditOp, AuditOutcome, RescanError};
-use crate::handle::tape_io::{MediaFamily, MediaReadiness};
+use crate::handle::tape_io::{
+    MediaFamily, MediaReadiness, MediaReadinessWaitEvent, MediaReadinessWaitOptions,
+};
 use crate::model::{DriveBay, ElementLayout, IePort, InstalledDrive, Slot};
 use crate::transport::{FixtureTransport, RecordingLog, RecordingTransport, TransferOutcome};
 use crate::StaticAllowlist;
@@ -5812,6 +5814,331 @@ fn drive_handle_probe_media_readiness_classifies_lto9_initializing() {
         )),
         "readiness probe issued a forbidden media/config command: {log:02x?}"
     );
+}
+
+/// Drive model for an unthreaded cartridge: TEST UNIT READY answers NOT
+/// READY / INITIALIZING COMMAND REQUIRED (02/04/02) until an SSC LOAD
+/// arrives. With `load_threads` false the LOAD is accepted but the drive
+/// keeps asking, which pins the bound on LOAD attempts.
+#[cfg(target_os = "linux")]
+struct NeedsInitializingLoad<T> {
+    inner: T,
+    threaded: bool,
+    load_threads: bool,
+    tur_count: u32,
+}
+
+#[cfg(target_os = "linux")]
+impl<T: crate::transport::SgTransport> crate::transport::SgTransport for NeedsInitializingLoad<T> {
+    fn execute_in(&mut self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
+        self.inner.execute_in(cdb, buf)
+    }
+
+    fn execute_none(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
+        self.inner.execute_none(cdb)?;
+        match cdb.first().copied() {
+            Some(0x00) => {
+                self.tur_count += 1;
+                if self.threaded {
+                    Ok(())
+                } else {
+                    Err(ScsiError::CheckCondition {
+                        sense: readiness_fixed_sense(0x02, 0x04, 0x02),
+                        bytes_transferred: 0,
+                    })
+                }
+            }
+            Some(0x1b) if cdb.get(4).is_some_and(|byte| byte & 0x01 != 0) => {
+                if self.load_threads {
+                    self.threaded = true;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn execute_out(&mut self, cdb: &[u8], buf: &[u8]) -> Result<TransferOutcome, ScsiError> {
+        self.inner.execute_out(cdb, buf)
+    }
+
+    fn set_timeout_for(&mut self, class: TimeoutClass) {
+        self.inner.set_timeout_for(class)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn needs_initializing_load_handle(
+    library_serial: &str,
+    load_threads: bool,
+) -> (LibraryHandle, RecordingLog) {
+    let lib = open_drive_test_lib(library_serial);
+    let policy = StaticAllowlist::new([library_serial]);
+    let log: RecordingLog = RecordingLog::new();
+    let log_cl = log.clone();
+    let mut changer_slot = Some(vec![
+        changer_inquiry_response(),
+        vpd80_response(library_serial),
+    ]);
+    let mut drive_slot = Some(vec![lto9_inquiry(), vpd80_response("DRV_A")]);
+    let factory: Box<dyn FnMut(&Path) -> Result<Box<dyn SgTransport>, IoErrorKind>> =
+        Box::new(move |path: &Path| {
+            let drained = |what: &str| IoErrorKind {
+                kind: "Other",
+                message: format!("{what} drained"),
+                raw_os_error: None,
+            };
+            if path == Path::new("/dev/sg-mock") {
+                let inner = FixtureTransport::new()
+                    .with_responses(changer_slot.take().ok_or_else(|| drained("changer"))?);
+                Ok(
+                    Box::new(RecordingTransport::with_log(inner, log_cl.clone()))
+                        as Box<dyn SgTransport>,
+                )
+            } else if path == Path::new("/dev/sg-drive-mock") {
+                let inner = FixtureTransport::new()
+                    .with_responses(drive_slot.take().ok_or_else(|| drained("drive"))?);
+                let drive = NeedsInitializingLoad {
+                    inner,
+                    threaded: false,
+                    load_threads,
+                    tur_count: 0,
+                };
+                Ok(
+                    Box::new(RecordingTransport::with_log(drive, log_cl.clone()))
+                        as Box<dyn SgTransport>,
+                )
+            } else {
+                Err(IoErrorKind {
+                    kind: "NotFound",
+                    message: format!("unknown path {path:?}"),
+                    raw_os_error: None,
+                })
+            }
+        });
+    let handle = lib.open_with(&policy, factory).expect("library opens");
+    (handle, log)
+}
+
+#[cfg(target_os = "linux")]
+fn readiness_control_cdbs(log: &RecordingLog) -> Vec<(u8, u8, u8)> {
+    log.borrow()
+        .iter()
+        .filter(|cdb| matches!(cdb.first(), Some(0x00 | 0x1b)))
+        .map(|cdb| (cdb[0], cdb[1], cdb[4]))
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn readiness_wait_sends_one_load_when_drive_asks_for_initializing_command() {
+    use std::time::Duration;
+    let (mut handle, log) = needs_initializing_load_handle("LIB_INIT01", true);
+    let policy = StaticAllowlist::new(["LIB_INIT01"]);
+    let mut events = Vec::new();
+    let poll = {
+        let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
+        drive
+            .wait_for_media_readiness_with_initializing_load(
+                MediaFamily::Lto9OrLater,
+                None,
+                MediaReadinessWaitOptions {
+                    wait: true,
+                    timeout: Duration::from_secs(60),
+                    poll_interval: Duration::from_secs(30),
+                },
+                crate::MEDIA_READINESS_MAX_INITIALIZING_LOADS,
+                || None,
+                |event| {
+                    events.push(match event {
+                        MediaReadinessWaitEvent::Poll(poll) => {
+                            format!("poll:{:?}", poll.readiness.sense())
+                        }
+                        MediaReadinessWaitEvent::InitializingLoad(poll) => {
+                            format!("load:{:?}", poll.readiness.sense())
+                        }
+                        MediaReadinessWaitEvent::InitializingLoadFailed { detail, .. } => {
+                            format!("load-failed:{detail}")
+                        }
+                        MediaReadinessWaitEvent::Cancelled(reason) => format!("cancel:{reason}"),
+                    });
+                    Ok(())
+                },
+            )
+            .expect("readiness wait completes")
+    };
+
+    assert!(poll.readiness.is_ready(), "{poll:?}");
+    assert!(!poll.timed_out);
+    assert_eq!(
+        readiness_control_cdbs(&log),
+        vec![(0x00, 0x00, 0x00), (0x1b, 0x01, 0x01), (0x00, 0x00, 0x00)],
+        "one TUR, one LOAD IMMED, one TUR"
+    );
+    assert_eq!(
+        events,
+        vec![
+            "poll:Some((2, 4, 2))".to_string(),
+            "load:Some((2, 4, 2))".to_string(),
+            "poll:None".to_string(),
+        ]
+    );
+}
+
+/// Recording is a write-ahead boundary in the same trace as the drive commands.
+#[cfg(target_os = "linux")]
+#[test]
+fn readiness_wait_records_attempt_before_load_in_scsi_order() {
+    let (mut handle, log) = needs_initializing_load_handle("LIB_RECORD", true);
+    let policy = StaticAllowlist::new(["LIB_RECORD"]);
+    let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
+    log.borrow_mut().clear();
+    let poll = drive
+        .wait_for_media_readiness_with_initializing_load(
+            MediaFamily::Lto9OrLater,
+            None,
+            MediaReadinessWaitOptions {
+                wait: true,
+                timeout: std::time::Duration::from_secs(1),
+                poll_interval: std::time::Duration::ZERO,
+            },
+            1,
+            || None,
+            |event| {
+                if matches!(event, MediaReadinessWaitEvent::InitializingLoad(_)) {
+                    // FF marks the recorder in the transport's ordered trace.
+                    log.borrow_mut().push(vec![0xff]);
+                }
+                Ok(())
+            },
+        )
+        .expect("wait completes");
+    assert!(poll.readiness.is_ready());
+    assert_eq!(
+        log.borrow().iter().map(|cdb| cdb[0]).collect::<Vec<_>>(),
+        vec![0x00, 0xff, 0x1b, 0x00]
+    );
+}
+
+/// A failed attempt record prevents the state-changing command.
+#[cfg(target_os = "linux")]
+#[test]
+fn readiness_wait_recorder_failure_prevents_load() {
+    let (mut handle, log) = needs_initializing_load_handle("LIB_RECORD_FAIL", true);
+    let policy = StaticAllowlist::new(["LIB_RECORD_FAIL"]);
+    let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
+    let error = drive
+        .wait_for_media_readiness_with_initializing_load(
+            MediaFamily::Lto9OrLater,
+            None,
+            MediaReadinessWaitOptions {
+                wait: true,
+                timeout: std::time::Duration::from_secs(1),
+                poll_interval: std::time::Duration::ZERO,
+            },
+            1,
+            || None,
+            |event| {
+                if matches!(event, MediaReadinessWaitEvent::InitializingLoad(_)) {
+                    return Err("attempt recorder unavailable".to_string());
+                }
+                Ok(())
+            },
+        )
+        .expect_err("record failure stops the wait");
+    assert_eq!(error, "attempt recorder unavailable");
+    assert_eq!(readiness_control_cdbs(&log), vec![(0x00, 0x00, 0x00)]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn readiness_wait_bounds_initializing_loads_to_its_budget() {
+    use std::time::Duration;
+    let policy = StaticAllowlist::new(["LIB_INIT02"]);
+    let options = MediaReadinessWaitOptions {
+        wait: true,
+        timeout: Duration::from_millis(50),
+        poll_interval: Duration::from_millis(10),
+    };
+
+    // The drive keeps asking after the LOAD: the wait sends exactly one and
+    // then polls until its deadline.
+    let (mut handle, log) = needs_initializing_load_handle("LIB_INIT02", false);
+    let poll = {
+        let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
+        drive
+            .wait_for_media_readiness_with_initializing_load(
+                MediaFamily::Lto9OrLater,
+                None,
+                options,
+                crate::MEDIA_READINESS_MAX_INITIALIZING_LOADS,
+                || None,
+                |_| Ok(()),
+            )
+            .expect("readiness wait completes")
+    };
+    assert!(poll.timed_out, "{poll:?}");
+    assert!(poll.readiness.requires_initializing_command());
+    let loads = readiness_control_cdbs(&log)
+        .into_iter()
+        .filter(|(opcode, ..)| *opcode == 0x1b)
+        .count();
+    assert_eq!(loads, 1, "one LOAD per budget");
+
+    // A spent budget and the plain wait never send LOAD at all.
+    for use_plain_wait in [false, true] {
+        let (mut handle, log) = needs_initializing_load_handle("LIB_INIT02", true);
+        let poll = {
+            let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
+            if use_plain_wait {
+                drive.wait_for_media_readiness(
+                    MediaFamily::Lto9OrLater,
+                    None,
+                    options,
+                    || None,
+                    |_| Ok(()),
+                )
+            } else {
+                drive.wait_for_media_readiness_with_initializing_load(
+                    MediaFamily::Lto9OrLater,
+                    None,
+                    options,
+                    0,
+                    || None,
+                    |_| Ok(()),
+                )
+            }
+            .expect("readiness wait completes")
+        };
+        assert!(poll.timed_out, "{poll:?}");
+        assert!(
+            readiness_control_cdbs(&log)
+                .iter()
+                .all(|(opcode, ..)| *opcode == 0x00),
+            "no LOAD without budget"
+        );
+    }
+
+    // A single observation (no wait) is read-only even with budget.
+    let (mut handle, log) = needs_initializing_load_handle("LIB_INIT02", true);
+    let poll = {
+        let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
+        drive
+            .wait_for_media_readiness_with_initializing_load(
+                MediaFamily::Lto9OrLater,
+                None,
+                MediaReadinessWaitOptions {
+                    wait: false,
+                    ..options
+                },
+                crate::MEDIA_READINESS_MAX_INITIALIZING_LOADS,
+                || None,
+                |_| Ok(()),
+            )
+            .expect("readiness observation completes")
+    };
+    assert!(poll.readiness.requires_initializing_command());
+    assert_eq!(readiness_control_cdbs(&log), vec![(0x00, 0x00, 0x00)]);
 }
 
 #[test]

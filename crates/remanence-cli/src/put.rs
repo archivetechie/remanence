@@ -802,7 +802,22 @@ async fn wait_for_media_readiness_operation(
             .get("state")
             .map(String::as_str)
             .unwrap_or("unknown");
-        let _ = writeln!(err, "media readiness operation {operation_id}: {readiness}");
+        let reason = match (
+            status
+                .progress
+                .get(remanence_library::MEDIA_READINESS_SENSE_PROGRESS_KEYS.0),
+            status
+                .progress
+                .get(remanence_library::MEDIA_READINESS_SENSE_PROGRESS_KEYS.1),
+        ) {
+            (Some(sense), Some(name)) => format!(" sense={sense} ({name})"),
+            (Some(sense), None) => format!(" sense={sense}"),
+            _ => String::new(),
+        };
+        let _ = writeln!(
+            err,
+            "media readiness operation {operation_id}: {readiness}{reason}"
+        );
         match state {
             pb::OperationState::Succeeded => return Ok(()),
             pb::OperationState::Failed
