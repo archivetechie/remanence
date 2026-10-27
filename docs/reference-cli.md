@@ -12,15 +12,19 @@ disaster-recovery binary from its own crate `crates/rem-recover`:
   directly against one explicitly selected and authorized drive. It also
   works against local state or local files and cannot issue arbitrary SCSI
   commands.
-- **`rem-debug`** is the break-glass CLI. It contains everything `rem` has
-  plus direct SCSI robotics (`move`, `load`, `unload`, `export`, `import`,
-  `rescan`, `lock`, `unlock`), direct tape read/write commands, destructive
-  catalog maintenance, and development helpers. Every state-changing
-  `rem-debug` invocation must name the target library in a `--allow
-  <SERIAL>` allowlist; without it the command refuses to run. This exists
-  because a partitioned chassis can expose another system's partition on
-  the same host, and a mistyped element address must not be able to touch
-  it.
+- **`rem-debug`** is the break-glass CLI. It shares the discovery, local
+  tape-lifecycle and local archive commands with `rem`, and adds direct SCSI
+  robotics (`move`, `load`, `unload`, `export`, `import`, `rescan`, `lock`,
+  `unlock`), direct tape read/write commands, destructive catalog
+  maintenance, and development helpers. It has neither the standalone-drive
+  commands nor the daemon client commands; those exist only in `rem`.
+  [rem-debug extras](#rem-debug-extras) lists exactly which commands each
+  binary has. The robotics, the direct tape-path `archive` commands, `dev`,
+  `tape bot-probe` and `tape adopt-bootstrap` must name the target library
+  in a `--allow <SERIAL>` allowlist; without it the command refuses to run.
+  This exists because a partitioned chassis can expose another system's
+  partition on the same host, and a mistyped element address must not be
+  able to touch it.
 - **`rem-daemon`** is the long-running Layer 5 service. It takes only
   `--config <PATH>` (default `/etc/rem/config.toml`) and `--socket <PATH>`
   (overrides the config's socket path).
@@ -33,7 +37,9 @@ disaster-recovery binary from its own crate `crates/rem-recover`:
 `rem` and `rem-debug` are two separate binaries built from the same
 `remanence-cli` crate. `rem` has a bounded direct-hardware surface for one
 standalone drive; `rem-debug` carries the broader break-glass library and SCSI
-surface.
+surface. For library and daemon commands, `rem` accepts `--allow` and
+`--allow-derived` as hidden compatibility flags and ignores them; for the
+standalone-drive commands it rejects them as unexpected arguments.
 
 Conventions shared across both CLIs:
 
@@ -54,8 +60,9 @@ Conventions shared across both CLIs:
   `KiB`/`MiB`/`GiB`-style suffixes (powers of 1024).
 
 Both binaries print full usage with `--help` at every level, and `--version`
-(also `rem-daemon --version`) prints the package version. This page lists the
-commands and their main options; `--help` is the complete list.
+(also `rem-daemon --version`) prints the package version. `rem-recover` prints
+usage with `--help` and has no `--version` flag. This page lists the commands
+and their main options; `--help` is the complete list.
 
 ### Placeholders
 
@@ -227,7 +234,7 @@ All of these speak gRPC to `rem-daemon` and take `--endpoint` and `--json`.
 |---|---|
 | `rem daemon health` / `rem daemon version` | Liveness and version of the daemon and API. |
 | `rem op list` / `rem op get <UUID>` | Enumerate or inspect tracked daemon operations. |
-| `rem catalog tapes [--pool <POOL>]` | List cataloged tapes, optionally per pool. |
+| `rem catalog tapes [--pool <POOL>] [--kind data\|cleaning\|all]` | List cataloged tapes, optionally per pool. `--kind` defaults to `data`; `all` includes data and cleaning tapes. |
 | `rem catalog tape <TAPE_UUID>` | One tape's catalog record. |
 | `rem catalog tape-files <TAPE_UUID>` | Tape files recorded for one tape. |
 | `rem catalog pools` / `rem catalog pool <POOL_ID>` | Tape pool definitions and membership. |
@@ -235,6 +242,7 @@ All of these speak gRPC to `rem-daemon` and take `--endpoint` and `--json`.
 | `rem catalog unit <UNIT_ID>` / `rem catalog entries <UNIT_ID>` | One unit, or the entries inside it. |
 | `rem top [--once] [--json]` | Live TUI over daemon state; `--once` takes a single snapshot. In the TUI, `l` cycles the focused library when more than one is configured, `s` toggles the slot view, `p`/space pauses, and `?` shows help. |
 | `rem alarms [--all]` / `rem alarms ack <CONDITION_KEY>` | List standing alarms (with `--all`, cleared ones too) or acknowledge one. |
+| `rem audit query --since <RFC3339> --until <RFC3339> [--filter <K=V>]...` | Stream audit-log entries in the half-open interval from `--since` (inclusive) to `--until` (exclusive). Each `--filter` is an exact-match `key=value` filter; repeat it for several fields. `--json` prints one JSON object per entry. |
 
 Note: `GetLiveStatus` also carries an advisory `drive_assignments`
 projection (per-bay busy/idle state, keyed `(library_serial, bay)`) for
@@ -252,11 +260,15 @@ or UUID.
 | `rem drive list [--foreign] [--retired]` | List cataloged drives. |
 | `rem drive show <DRIVE>` | One drive's stewardship record. |
 | `rem drive history <DRIVE> [--events] [--snapshots]` | Lifecycle history, optionally with observational events and health snapshots. |
-| `rem drive alerts <DRIVE>` | Active TapeAlert flags. (`rem tape alerts` is a deprecated alias.) |
+| `rem drive alerts <DRIVE>` | Active TapeAlert flags. `rem tape alerts <DRIVE>` is a deprecated alias with the same arguments; it has no `--bay`. Reading the TapeAlert page directly by drive bay is `rem-debug tape alerts --bay <BAY>`. |
 | `rem drive poll <DRIVE>` / `rem drive clean <DRIVE>` | Poll health now, or run a cleaning cycle now. |
-| `rem drive annotate <DRIVE> ...` | Record purchase date, warranty, cost, and notes. |
-| `rem drive retire <DRIVE> --reason <TEXT>` | Remove a drive from the managed fleet. A retired drive keeps its identity and still appears in `rem top` marked retired, but is excluded from every selection and mount path. Reversible with `reinstate`. |
-| `rem drive reinstate <DRIVE> --reason <TEXT>` | Return a retired drive to service. Records the reason alongside the retirement it reverses. Does not clear `fenced` or restore `actionable` — those are separate judgements. |
+| `rem drive annotate <DRIVE> [--purchase-date <YYYY-MM-DD>] [--warranty-until <YYYY-MM-DD>] [--cost <TEXT>] [--note <TEXT>] [--notes-set <TEXT>] [--allow-derived-identity]` | Record the purchase date, the warranty end date, a display-only cost string, and notes. `--note` appends a timestamped note; `--notes-set` replaces the notes. |
+| `rem drive retire <DRIVE> --reason <TEXT> [--allow-derived-identity]` | Remove a drive from the managed fleet. A retired drive keeps its identity and still appears in `rem top` marked retired, but is excluded from every selection and mount path. Reversible with `reinstate`. |
+| `rem drive reinstate <DRIVE> --reason <TEXT> [--allow-derived-identity]` | Return a retired drive to service. Records the reason alongside the retirement it reverses. Does not clear `fenced` or restore `actionable` — those are separate judgements. |
+| `rem drive load --library <SERIAL> --bay <BAY> (--barcode <BARCODE> \| --slot <SLOT>) [--no-wait]` | Through the daemon, load a tape into a drive bay and wait for completion. The tape is named by barcode, found in the current slot inventory, or by its source slot address. `--library` takes a library serial or UUID. With `--no-wait` the command returns when LOAD completes, without waiting for the cartridge to become ready. |
+
+`--allow-derived-identity` permits changing a drive row whose identity was
+derived rather than read from the device.
 
 <!-- code-anchor: crates/remanence-cli/src/lib.rs @ 4dc2a3c6 -->
 ## Tape lifecycle
@@ -274,7 +286,7 @@ and fencing checks. The CLI performs no local SCSI discovery for these verbs.
 | `rem-debug --allow <SERIAL> tape adopt-bootstrap <BARCODE> --library <SERIAL> --expected-home-slot <ADDR> --expected-existing-tape-uuid <UUID> --json [--config <PATH>]` | Re-read and adopt one checksum-valid existing native bootstrap without writing tape. The command holds the exclusive `StateHandle`, performs fresh discovery, verifies the exact UUID/home/library and canonical 1 MiB default-parity geometry, restores drive mode, parks the medium, then records a durable `TapeIdentityAdopted` event and an identity-only catalog row. Exactly bootstrap→filemark→EOD becomes `ready`; every other tail after a valid bootstrap becomes `recovery_required`. The command generates its internal operation UUID; a retry may no-op only while the replayed row remains the exact same identity-only state. JSON schema is `rem.tape.adopt-bootstrap.v1`. See [Importing and recovering Remanence tapes](importing-and-recovering-remanence-tapes.md). |
 | `rem-debug tape recovery-report <SOURCE> [--json] [--tape-uuid <UUID> --block-size <BYTES> --scheme <k,m,S\|none>]` | Produce a read-only recovery report for a tape without using the catalog. `<SOURCE>` is either the SCSI generic path of the drive that holds the tape (for example `/dev/sg3`) or a directory that holds a tape image in the published layout, with files named `tape-file-NNN-*.bin`. It is not a tape UUID, and a single image file is not accepted. The three options are hints used when the tape's bootstrap cannot be read. `--tape-uuid` is the tape's UUID (for example from `rem catalog tapes`); `--block-size` is the tape's fixed block size in bytes (256 KiB, 512 KiB or 1 MiB; KiB and MiB suffixes are accepted); `--scheme` is the parity scheme as three numbers `k,m,S` (data blocks per stripe, parity blocks per stripe, stripes per neighborhood, for the scheme `rs-cauchy-gf256-v1`), or `none` for a tape written without parity. Supply all three or none. When the bootstrap is readable, leave them out. The report performs terminal discovery first, through the same library entry as the daemon's inventory, and walks from BOT only when discovery yields no inventory. What the command prints when it cannot use the bootstrap is under [Recovery report and verification output](#recovery-report-and-verification-output). Bootstrap-derived report fields are null when unreadable; hints are recorded separately under `supplied`, and the scan records when they provided identity and geometry because the bootstrap was treated as unreadable. A valid terminal replica can supply Object identifiers, while BOT fallback without separate host authority reports complete candidates as unknown. It does not adopt the tape or rebuild SQLite. |
 | `rem tape init <TARGET> [--dry-run] [--force] [--clobber-data [--confirm-clobber "CLOBBER <LABEL>"]] [--block-size <BYTES>] [--parity <none\|default>] [--library <SERIAL>]` | Initialize one tape (by barcode or element address) or an inclusive slot range like `0x0400..0x0407`. `--dry-run` runs every check and writes nothing. `--force` overrides only decisions classified as `RequireForce`; `--clobber-data` is the separate, stronger override for tapes that hold data, and is rejected for dry-run and batch init. Confirm with `--confirm-clobber "CLOBBER <LABEL>"` or type/pipe the same text on stdin. Retired nonblank cartridges need this confirmation too. Fresh media defaults to parity-off; `--parity default` writes the block-size-aware default parity geometry. An idempotent initialization preserves the geometry already recorded at BOT. |
-| `rem tape wait-ready [--barcode <BC> \| --drive-element <ADDR>] [--already-loaded] [--wait] [--timeout 2.5h] [--poll 30s] [--resume <UUID>]` | Poll TEST UNIT READY until already-loaded media is usable. LTO-9 first loads can take hours (media optimization); the 2.5h default timeout exists for that. `--resume` continues a durable readiness operation without moving media. |
+| `rem tape wait-ready [--barcode <BARCODE> \| --drive-element <ADDR>] [--already-loaded] [--wait] [--timeout <DURATION>] [--poll <DURATION>] [--resume <UUID>] [--library <SERIAL>]` | Poll TEST UNIT READY until already-loaded media is usable. LTO-9 first loads can take hours (media optimization); the default timeout of 2.5h exists for that, and the default poll interval is 30s. `--resume` continues a durable readiness operation without moving media. `--library` selects a configured library. |
 | `rem tape quarantine list [--library <SERIAL>]` | List active media-readiness fences. |
 | `rem tape quarantine show <ID>` | One fence, by quarantine id or operation UUID. |
 | `rem tape quarantine release <ID> --ack <TEXT> [--after-settled-inventory]` | Release a fence after operator root-cause acknowledgement. |
@@ -484,6 +496,8 @@ sha256.
 | `rem get <OBJECT> --dest <DIR> [--overwrite]` | Restore all members of an object into a directory. OBJECT is an object UUID by default; `--caller-id` selects by the caller id recorded at put time, `--sha256` by content hash. The daemon mounts the copy's tape as needed, and a media-readiness fence is watched to completion (`--no-wait` fails fast). |
 | `rem get <OBJECT> --dest <DIR> --tape <UUID>` | Read from the copy on a specific tape instead of the first cataloged copy — for exercising a particular cartridge, or steering away from one. |
 | `rem get <OBJECT> --dest <DIR> --path <MEMBER>` | Restore only the named member. |
+| `rem get ... [--stream-chunk-bytes <BYTES>] [--no-wait]` | Suggested read-stream chunk size (default 1 MiB), and `--no-wait` to fail fast instead of watching a media-readiness load. |
+| `rem archive verify --library <SERIAL> --drive <BAY> --locator <JSON> --expected-sha256 <HEX>` | Through the daemon, read one object from the tape currently loaded in drive bay `--drive` and compare the bytes read with the expected payload SHA-256, restoring nothing. `--library` takes a library serial or UUID. The locator is the JSON that `rem-debug archive write --json` prints. This form has no `--private-key` option; `rem-debug archive verify` is the direct form that takes one. |
 
 On a digest mismatch nothing is published: the temporary file is kept for
 forensics and the error names both hashes and both honest explanations —
@@ -506,18 +520,18 @@ None of these touch tape; they are the easiest way to exercise the format.
 | `rem archive recipient keygen --out <FILE.remp> [--label <TEXT>] [--public <FILE.remr>]` | Generate a private REMP file with mode `0600` and a slot-0 REMR public file. The public path defaults to the private path with extension `.remr`. Refuse existing paths and labels outside 0–32 printable ASCII bytes. Print JSON with `private`, `public`, `epoch_id` (hex), and `label`; print a private-file recovery warning on a terminal. |
 | `rem archive recipient derive --private-key <REMP> --slot-index <0..255>` | Parse a canonical private recipient file, derive its X-Wing public key, and print the canonical REMR file as standard base64 with its epoch identity. This hardware-free registry integration command never prints the private seed. |
 | `rem archive recipient inspect --public-key <REMR>` | Parse and cryptographically validate a canonical public recipient file, then print its slot, epoch id, label, and 1216-byte X-Wing public-key size as JSON. |
-| `rem archive build --inputs <PATH>... --out <FILE> [--recipient <REMR>]...` | Build a portable object and print a JSON build report. Capture keeps `user.*` xattrs by default, reports other dropped names per entry, and emits one warning with the drop count. `--full-fidelity-xattrs` is the explicit non-portable keep-all opt-in and cannot be combined with `--rules` or `--map`. Omitting `--recipient` writes the plaintext `rem-object-v1` body. Repeating it 2-8 times with distinct, nonzero epochs in ascending slot order writes the HPKE envelope; the presence of recipients is the encryption switch. `--map`/`--source-root`/`--map-sha256` accept a planner-emitted source map instead of `--inputs`. `--scan-only` classifies inputs and reports without writing. `--rules` applies an ingest ruleset; `--manifest-out` (requires `--rules`) writes the member manifest JSON. |
+| `rem archive build --inputs <PATH>... --out <FILE> [--recipient <REMR>]...` | Build a portable object and print a JSON build report. Capture keeps `user.*` xattrs by default, reports other dropped names per entry, and emits one warning with the drop count. `--full-fidelity-xattrs` is the explicit non-portable keep-all opt-in and cannot be combined with `--rules` or `--map`. Omitting `--recipient` writes the plaintext `rem-object-v1` body. Repeating it 2-8 times with distinct, nonzero epochs in ascending slot order writes the HPKE envelope; the presence of recipients is the encryption switch. `--map`/`--source-root`/`--map-sha256` accept a planner-emitted source map instead of `--inputs`. `--scan-only` classifies inputs and reports without writing. `--rules` applies an ingest ruleset; `--manifest-out` (requires `--rules`) writes the member manifest JSON. `--no-index` skips the generated `.remwrap.idx` siblings of blob wrappers. `--blob-suggest-ratio` (default 0.9), `--blob-suggest-count` (default 100) and `--sanity-ceiling-count` (default 10000) set the scan's blob-suggestion and sanity-ceiling thresholds. `--object-id`, `--caller-object-id`, `--manifest-file-id` and `--timestamp` record the supplied values instead of fresh UUIDs and the current time. `--chunk-size` sets the block/chunk size (default 256KiB). There is no `--encrypt` flag. |
 | `rem archive reseal --object <FILE> --private-key <REMP> --recipient <REMR> <REMR>... --out <FILE> [--staging-dir <DIR>]` | Open one envelope with a matching recipient private key and fully re-seal the same authenticated plaintext to a new ordered set of 2-8 distinct recipients. Unlike build/write's repeatable flag, reseal takes its 2-8 paths as one `--recipient` value list. It verifies the new stored digest before an atomic no-replace publish; staging happens next to the destination unless `--staging-dir` is supplied. Input and output are both encrypted envelopes. |
-| `rem archive inspect --object <FILE>` | Inspect a plaintext body or parse and validate an envelope header/key frame without a key. Encrypted output reports `format_version` and `recipient_epochs`; it cannot expose encrypted manifest members. |
-| `rem archive extract --object <FILE> --dest <DIR> [--private-key <REMP>]` | Extract a whole object. `--private-key` is required for an encrypted object and rejected for plaintext. `--path` plus `--range <START:LEN>` extracts a member byte range; `--blob-entry`/`--blob-member` restores a single member from a blob wrapper (REM-OBJECT Core Format Appendix E describes the wrapper and the range read this performs). |
+| `rem archive inspect --object <FILE> [--chunk-size <BYTES>]` | Inspect a plaintext body or parse and validate an envelope header/key frame without a key. Encrypted output reports `format_version` and `recipient_epochs`; it cannot expose encrypted manifest members. `--chunk-size` (default 256KiB) is the block/chunk size of a plaintext object. |
+| `rem archive extract --object <FILE> --dest <DIR> [--private-key <REMP>] [--overwrite] [--path <MEMBER> --range <START:LEN>]` | Extract a whole object. `--private-key` is required for an encrypted object and rejected for plaintext. `--path` and `--range` together extract a byte range of one member. `--path` without `--range` is rejected with `--path, --first-chunk-lba, and --file-size-bytes require --range`; to restore one whole member by path, give a range that covers it, such as `--range 0:<size>`. `--first-chunk-lba <LBA>` and `--file-size-bytes <BYTES>` optionally give the member's first object-local block and full size for a range read, from the build report or catalog row. `--blob-entry`/`--blob-member` restores a single member from a blob wrapper (REM-OBJECT Core Format Appendix E describes the wrapper and the range read this performs). `--overwrite` replaces existing files; `--xattr-namespace <PREFIX>` (repeatable) restores an additional xattr namespace besides `user.`; `--no-unwrap` keeps wrapper entries literal; `--chunk-size` (default 256KiB) is the block/chunk size of a plaintext object. |
 | `rem archive extract-stream --private-key <REMP> [--range <START:LEN> --authenticated-prefix <FILE> --stored-range-start <BYTE>]` | Stream-decrypt an envelope from stdin to stdout with per-chunk authentication and bounded memory. With the three ranged flags together, re-authenticate the header/key-frame/metadata prefix and decrypt only the covering ciphertext frames beginning at `--stored-range-start`. |
 | `rem archive covering-range --private-key <REMP> --object-id <ID> --file-id <ID> --range <START:LEN>` | Authenticate an envelope header/key-frame/metadata prefix from stdin and print the smallest covering stored-ciphertext range (`stored_range_start`, `stored_range_len`, `first_chunk`, `chunk_count`). See [`reference-extract-stream-protocol.md`](reference-extract-stream-protocol.md). |
-| `rem restore --object <FILE> --dest <DIR> [--private-key <REMP>]` | Top-level native-restore alias with the same key contract as `extract`. |
+| `rem restore --object <FILE> --dest <DIR> [--private-key <REMP>]` | Top-level alias of `rem archive extract`, with the same flags and the same key contract. |
 | `rem archive list` | List native objects from the local catalog (no tape access). |
 | `rem archive formats` | Print JSON describing the foreign-format adapters linked into this binary; stock Remanence returns an empty list. |
 | `rem archive probe --format <ID> --dump <FILE>` | Ask a registered foreign-format adapter to identify a dump without streaming it. |
 | `rem archive scan --format <ID> --dump <FILE>` | Catalog normalized entries from a foreign-format dump. |
-| `rem archive restore --format <ID> --dump <FILE> --dest <DIR> [--overwrite]` | Restore a foreign-format dump into a directory. |
+| `rem archive restore --format <ID> --dump <FILE> --dest <DIR> [--overwrite] [--xattr-namespace <PREFIX>]...` | Restore a foreign-format dump into a directory. `--xattr-namespace` (repeatable) restores an additional xattr namespace besides `user.`. |
 | `rem archive recover --format <ID> --dump <FILE> --dest <DIR>` | Best-effort recovery of a damaged dump into sparse partial files. |
 
 These commands are generic, but the stock Remanence binaries register no
@@ -591,11 +605,11 @@ when the record is parsed.
 
 | Operation | Seal/open key input | Result |
 |---|---|---|
-| `archive build`, `archive write` | no recipient flags | Plaintext `rem-object-v1` body. |
-| `archive build`, `archive write` | `--recipient <REMR>` repeated 2-8 times | REM-ENCRYPT 1.0 with on-tape `format_version = 2`. Epoch ids must be distinct and nonzero and slot order ascending. |
+| `archive build`, `rem-debug archive write` | no recipient flags | Plaintext `rem-object-v1` body. |
+| `archive build`, `rem-debug archive write` | `--recipient <REMR>` repeated 2-8 times | REM-ENCRYPT 1.0 with on-tape `format_version = 2`. Epoch ids must be distinct and nonzero and slot order ascending. |
 | `archive reseal` | one matching `--private-key <REMP>` plus one `--recipient` list containing 2-8 new REMR files | Full re-seal for recipient rotation. |
-| `archive inspect`, `archive export-object` | none | Keyless envelope inspection, or opaque stored-byte export. |
-| `archive extract`, `restore`, `archive read`, `archive verify` | `--private-key <REMP>` for encrypted input | The private key's epoch id selects its matching key-frame slot. |
+| `archive inspect`, `rem-debug archive export-object` | none | Keyless envelope inspection, or opaque stored-byte export. |
+| `archive extract`, `restore`, `rem-debug archive read`, `rem-debug archive verify` | `--private-key <REMP>` for encrypted input | The private key's epoch id selects its matching key-frame slot. |
 | `archive extract-stream`, `archive covering-range` | `--private-key <REMP>` | Encrypted streaming or bounded ranged open. |
 
 The flags `--encrypt`, `--key-file`, `--key-id`, and `--registry-key` do not
@@ -631,7 +645,37 @@ it never substitutes labels from the new retry request.
 <!-- code-anchor: crates/remanence-cli/src/rem_debug.rs crates/remanence-cli/src/lib.rs crates/remanence-cli/src/freeze_drill.rs @ bc2f9f90 -->
 ## rem-debug extras
 
-Everything above exists in `rem-debug` too. What `rem-debug` adds:
+`rem-debug` has only part of the surface above. It shares discovery
+(`libraries`, `library`, `watch`), `rebuild-catalog-from-journals`, the local
+tape-lifecycle commands (`tape init`, `tape wait-ready`, `tape quarantine
+list`/`show`/`release`, `tape retire`) and the local `archive` commands
+(`capabilities`, `formats`, `recipient`, `build`, `reseal`, `inspect`,
+`extract`, `extract-stream`, `covering-range`, `list`, and the foreign-format
+`probe`, `scan`, `restore` and `recover`). It has none of the standalone-drive
+commands, no top-level `restore`, and none of the daemon client commands
+(`daemon`, `op`, the `catalog` queries, `audit`, `drive`, `alarms`, `top`,
+`put`, `get`, `tape finalize`, `tape supersede-tail`, `tape inventory`, `tape
+verify-index`). It refuses the daemon client commands with an error saying
+they are available through `rem`. Its top-level help also lists
+`tape-supersede-client`; that is the daemon client for `tape supersede-tail`,
+and it is refused in the same way.
+
+Some names mean different things in the two binaries. `rem-debug catalog` is
+local catalog maintenance (`reset-preflight`, `reset`), not the daemon catalog
+queries. `rem-debug tape alerts` reads the drive directly by `--bay`, while
+`rem tape alerts <DRIVE>` is the daemon alias of `rem drive alerts`. `rem
+archive verify` verifies through the daemon (see [Restoring from
+tape](#restoring-from-tape)); `rem-debug archive verify` reads the tape
+directly.
+
+In the other direction, `rem` refuses the robotics, `dev`, and the direct
+tape-path `archive write`, `archive read` and `archive export-object` with an
+error saying they are available through `rem-debug`. It has no `tape
+bot-probe`, `tape adopt-bootstrap`, `tape recovery-report`, `tape
+freeze-drill`, `tape terminal-index-drill`, `catalog reset` or `catalog
+reset-preflight`.
+
+What `rem-debug` adds:
 
 Robotics (direct SCSI against the changer; all require `--allow <SERIAL>`):
 
@@ -649,13 +693,13 @@ journals):
 
 | Command | What it does |
 |---|---|
-| `rem-debug archive write --library <SERIAL> --file <PATH> --pool <POOL> [--recipient <REMR>]... [--json]` | Break-glass direct write of one local file to a pool-selected tape. It applies the same positive `NotWorm` admission as daemon-owned Object writes before MODE SELECT; write-protected, WORM, and unknown media fail closed. Repeating `--recipient` 2-8 times writes the encrypted envelope; omitting it writes plaintext. The locator includes `format_version` and `recipient_epochs`. |
+| `rem-debug archive write --library <SERIAL> --file <PATH> --pool <POOL> [--archive-path <PATH>] [--caller-object-id <ID>] [--recipient <REMR>]... [--json]` | Break-glass direct write of one local file to a pool-selected tape. `--archive-path` overrides the in-archive path (default: the file's basename); `--caller-object-id` records an opaque caller object id (default: a fresh UUID). It applies the same positive `NotWorm` admission as daemon-owned Object writes before MODE SELECT; write-protected, WORM, and unknown media fail closed. Repeating `--recipient` 2-8 times writes the encrypted envelope; omitting it writes plaintext. The locator includes `format_version` and `recipient_epochs`. |
 | `rem-debug archive read --library <SERIAL> --locator <JSON> --out <PATH> [--private-key <REMP>]` | Read an object by locator; an encrypted copy requires the matching private key. |
-| `rem-debug archive export-object ...` | Export the complete stored object bytes (including envelope) by locator. |
+| `rem-debug archive export-object --library <SERIAL> --locator <JSON> --out <PATH>` | Export the complete stored object bytes (including envelope) by locator. |
 | `rem-debug archive verify --library <SERIAL> --locator <JSON> --expected-sha256 <HEX> [--private-key <REMP>]` | Stream and hash an object on tape against an expected digest, restoring nothing; encrypted copies require the matching private key. |
-| `rem-debug archive probe/scan/restore/recover --format <ID> --tape <SERIAL> --bay <BAY> [--rewind]` | Run a registered foreign-format adapter directly against a mounted tape instead of a dump file. |
-| `rem-debug tape alerts --bay <BAY>` | Read the loaded drive's TapeAlert LOG SENSE page directly. |
-| `rem-debug tape terminal-index-drill --device <SG> --tape-uuid <UUID> --block-size <BYTES> --damage-plan <PLAN> [--full-verify] --report <PATH>` | Run one read-only live-SG terminal-index verification leg and write schema `rem.tape.terminal-index-drill.v1`. Replica plans are `none`, `a`, `b`, `c`, `ab`, `ac`, `bc`, `abc`, and `disagreement`; the latter substitutes a locally valid conflicting A edition and requires the fail-closed typed `TerminalIndexReplicaConflict` refusal with no selected replica, while `abc` executes BOT structural recovery. Gap plans are `gap-ab-header`, `gap-ab-footer`, `gap-bc-header`, and `gap-bc-footer`; each replaces the named record with a fixed `0xd7` block above the transport, requires `--full-verify`, and reports typed degraded separation evidence. Reports name the mechanism and exact injected LBAs. All injection occurs in the reader above the transport and never rewrites media. Full verification otherwise requires `--damage-plan none`. In the report's `full_verify` object, `outcome` names what the terminal suffix did and `complete` names what the tape did: `outcome: "verified_complete"` with `complete: false` means that the terminal suffix validated and the protected content did not, and `complete` is `true` only when both hold. See [Full verification](guide-full-verification.md). |
+| `rem-debug archive probe/scan/restore/recover --format <ID> --tape <SERIAL> --bay <BAY> [--rewind]` | Run a registered foreign-format adapter directly against a mounted tape instead of a dump file. `--tape` takes the serial of the library that holds the tape, and `--bay` the drive bay; that library must be on `--allow`. `restore` and `recover` also take `--dest <DIR>`, as with a dump file. |
+| `rem-debug tape alerts --bay <BAY> [--library <SERIAL>]` | Read the loaded drive's TapeAlert LOG SENSE page directly. `--library` selects a configured library when more than one is present. `rem tape alerts` has no `--bay`; it is the daemon alias that takes a drive serial or UUID. |
+| `rem-debug tape terminal-index-drill --device <SG> --tape-uuid <UUID> --block-size <BYTES> --report <PATH> [--damage-plan <PLAN>] [--reconcile-outcome <OUTCOME>] [--full-verify]` | Run one read-only live-SG terminal-index verification leg and write schema `rem.tape.terminal-index-drill.v1`. `--damage-plan` defaults to `none`. `--reconcile-outcome` forces one no-write reconciliation refusal: `torn-worm` makes the next component readable at its proved start only as a torn WORM tail, and `unproved-start` makes the next component's immutable start unprovable. Replica plans are `none`, `a`, `b`, `c`, `ab`, `ac`, `bc`, `abc`, and `disagreement`; the latter substitutes a locally valid conflicting A edition and requires the fail-closed typed `TerminalIndexReplicaConflict` refusal with no selected replica, while `abc` executes BOT structural recovery. Gap plans are `gap-ab-header`, `gap-ab-footer`, `gap-bc-header`, and `gap-bc-footer`; each replaces the named record with a fixed `0xd7` block above the transport, requires `--full-verify`, and reports typed degraded separation evidence. Reports name the mechanism and exact injected LBAs. All injection occurs in the reader above the transport and never rewrites media. Full verification otherwise requires `--damage-plan none`. In the report's `full_verify` object, `outcome` names what the terminal suffix did and `complete` names what the tape did: `outcome: "verified_complete"` with `complete: false` means that the terminal suffix validated and the protected content did not, and `complete` is `true` only when both hold. See [Full verification](guide-full-verification.md). |
 
 Destructive maintenance:
 
@@ -663,12 +707,15 @@ Destructive maintenance:
 |---|---|
 | `rem-debug catalog reset-preflight [--preserve-tape-voltag <VOLTAG>]... [--allow-erase-tape-voltag <VOLTAG>]...` | Read-only admission for a scoped catalog reset. It enumerates every data and cleaning tape, rejects any bound label outside the two exact selector sets, and returns a source-bound token plus `source_schema_version`. A catalog of schema 16 or 17 is inspectable only when the preservation set is empty and every bound tape is explicitly allowed to be erased; such a catalog is never migrated and never accepted for preservation. |
 | `rem-debug catalog reset --i-understand-this-erases-the-catalog [--expected-preflight-token <SHA256>] [--preserve-tape-voltag <VOLTAG>]... [--allow-erase-tape-voltag <VOLTAG>]...` | Destructively reset local catalog state from the configured paths. Any scoped reset requires the exact current preflight token and repeats selector and source-schema admission under the exclusive state lock before mutation. |
-| `rem-debug dev write-dump-to-tape --dump <PATH> --tape <SERIAL> --bay <BAY> --i-understand-this-overwrites-the-loaded-tape` | Overwrite the loaded scratch tape with raw dump bytes (test fixture setup). |
-| `rem-debug tape freeze-drill --allow <SERIAL> --device </dev/sgN> --block-size <BYTES> --damage-plan <PLAN> --report <PATH.json> [--data-mib <MIB>] [--default-index-separation] [--yes-i-know-scratch] [--allow-derived <SERIAL>]` | Run one destructive REM-PARITY freeze criterion 4 fault-injected scratch-tape round-trip: write drill objects through a full terminal-index finalization, then inject a chosen read-side medium-error damage plan and verify recovery. `--damage-plan` is one of `bootstrap-copy0`, `sidecar-head`, `object-span`, `terminal-replica-c`, or `combined` (the maximal conforming set). `--yes-i-know-scratch` permits overwriting the tape when BOT cannot be read; `--default-index-separation` uses the production 1 GiB separation extent instead of the compact drill profile. Writes a stable JSON report to `--report`. |
+| `rem-debug dev write-dump-to-tape --dump <PATH> --tape <SERIAL> --bay <BAY> --i-understand-this-overwrites-the-loaded-tape [--record-size <BYTES>]` | Overwrite the loaded scratch tape with raw dump bytes (test fixture setup). `--tape` takes the serial of the library that holds the tape. `--record-size` sets the variable record size (default 1048576). |
+| `rem-debug tape freeze-drill --device </dev/sgN> --block-size <BYTES> --damage-plan <PLAN> --report <PATH.json> [--data-mib <MIB>] [--default-index-separation] [--yes-i-know-scratch]` | Run one destructive REM-PARITY freeze criterion 4 fault-injected scratch-tape round-trip: write drill objects through a full terminal-index finalization, then inject a chosen read-side medium-error damage plan and verify recovery. `--damage-plan` is one of `bootstrap-copy0`, `sidecar-head`, `object-span`, `terminal-replica-c`, or `combined` (the maximal conforming set). `--yes-i-know-scratch` permits overwriting the tape when BOT cannot be read; `--default-index-separation` uses the production 1 GiB separation extent instead of the compact drill profile. `--block-size` is 262144, 524288 or 1048576; `--data-mib` defaults to 512. Writes a stable JSON report to `--report`. The drill does not consult `--allow`; the explicit `--device` is its only target selection. |
 
-The `--allow-derived <SERIAL>` flag additionally permits operating drive
-bays whose identity was derived rather than read from the device; it must
-be a subset of `--allow`.
+The global `--allow-derived <SERIAL>` flag additionally permits operating
+drive bays whose identity was derived rather than read from the device, in
+the commands that `--allow` gates; it must be a subset of `--allow`. `tape
+init` is not gated by `--allow`: it operates only on the libraries in the
+configuration. `tape retire`, `tape quarantine release` and `catalog reset`
+change only local state and carry their own confirmations.
 
 <!-- code-anchor: crates/remanence-cli/src/lib.rs @ 6ed03ef0 -->
 ## Catalog rebuild
@@ -689,18 +736,20 @@ recovers plaintext members with nothing else.
 
 ```
 rem-recover --object <FILE> --private-key <REMP> --out <DIR>
-            [--staging-dir <DIR>] [--overwrite]
+            [--staging-dir <DIR>] [--overwrite] [--xattr-namespace <PREFIX>]...
 ```
 
 It parses the envelope header and key frame directly (no daemon/catalog
 dependency), selects the slot matching the private key's epoch id, and
 fails with a message naming the object recipient labels when none match.
 Decrypted plaintext is
-staged in a temporary file next to `--out` (or inside `--staging-dir` if
-given, never `/tmp`) and securely zeroed on drop before the restore
-completes. It validates the embedded object id against the header before
-writing files out, and refuses to overwrite existing output unless
-`--overwrite` is given.
+staged in a temporary file inside `--out` when that directory already
+exists, otherwise next to it (or inside `--staging-dir` if given, never
+`/tmp`), and securely zeroed on drop before the restore completes. It
+validates the embedded object id against the header before writing files
+out, and refuses to overwrite existing output unless `--overwrite` is given.
+`--xattr-namespace <PREFIX>` (repeatable) restores an additional xattr
+namespace besides `user.`.
 
 Use this deliberately small binary when the full CLI stack is unavailable;
 ordinary local restores can use `rem archive extract --private-key`.

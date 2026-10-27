@@ -385,8 +385,8 @@ the [CLI reference](reference-cli.md#writing-to-tape)). This
 walkthrough instead uses `rem-debug`, which drives the same pool
 machinery directly against hardware without a daemon — useful for a
 first hands-on write, at the cost of the break-glass gauntlet. Note the
-`--allow` flag: every state-changing `rem-debug` command must name the
-library it may touch. Direct Object writes still require the drive to report
+`--allow` flag: the direct tape-path `archive` commands, like the robotics,
+must name the library they may touch. Direct Object writes still require the drive to report
 the loaded cartridge as rewritable; write-protected, WORM, and unknown media
 are refused before MODE SELECT or any tape write. These `rem-debug` commands
 also take the daemon's exclusive state lock, so stop the daemon before running
