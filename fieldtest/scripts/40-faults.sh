@@ -245,12 +245,32 @@ wrong_tape() {
   "$(fieldtest_script_dir)/03-bringup.sh" >/dev/null 2>&1 || true
 }
 
+# Prints the drive bay that holds the cleaning cartridge, read from the
+# changer's own element status (the daemon publishes its inventory only after a
+# whole cleaning sequence); empty when no drive holds it.
+cleaning_cart_bay() {
+  local serial="$1" barcode="$2" out="$3"
+  fieldtest_capture_json "$out" "$(fieldtest_rem_bin)" library "$serial" --json 2>/dev/null || true
+  python3 - "$out" "$barcode" <<'PY'
+import json,sys
+from pathlib import Path
+try:
+    payload=json.loads(Path(sys.argv[1]).read_text())
+except ValueError:
+    raise SystemExit(0)
+for drive in payload.get("drives", []):
+    if drive.get("loaded") and drive.get("loaded_tape") == sys.argv[2]:
+        print(drive.get("element_address", ""))
+        break
+PY
+}
+
 crash_clean() {
   if [[ "${REMFIELD_ENV:-unknown}" == vtl ]]; then
     fieldtest_evidence_record "$SCRIPT_NAME" crash-clean SKIP "crash-mid-clean recovery is real-iron only"
     exit 0
   fi
-  local serial op_ref daemon_pid workdir drive_list_json drive_serial
+  local serial op_ref daemon_pid workdir drive_list_json drive_serial cleaning_barcode library_json bay
   serial="$(fieldtest_selected_library_serial)"
   workdir="$(mktemp -d "$(fieldtest_spool_dir)/fault-clean-${RANDOM}.XXXXXX")"
   op_ref="$workdir/clean.json"
@@ -269,7 +289,52 @@ print(drives[index].get("serial","") if 0 <= index < len(drives) else "")
 PY
 )"
   [[ -n "$drive_serial" ]] || { echo "error: no drive at index ${FIELD_CLEAN_DRIVE_INDEX:-0} in the daemon drive list" >&2; exit 1; }
-  fieldtest_capture_json "$op_ref" "$(fieldtest_rem_bin)" drive --endpoint "$(fieldtest_rem_endpoint)" clean "$drive_serial" --json || true
+  cleaning_barcode="$(fieldtest_allowlist_cleaning_barcode || true)"
+  [[ -n "$cleaning_barcode" ]] || { echo "error: allowlist has no CLN barcode; rerun 01-allowlist.sh" >&2; exit 1; }
+  library_json="$workdir/library.json"
+  bay="$(cleaning_cart_bay "$serial" "$cleaning_barcode" "$library_json")"
+  if [[ -n "$bay" ]]; then
+    fieldtest_evidence_record "$SCRIPT_NAME" crash-clean FAIL "CLN:$cleaning_barcode is already in drive bay $bay before the cleaning request; recover with 31-cleaning.sh --recover" "$library_json"
+    exit 1
+  fi
+  if ! fieldtest_capture_json "$op_ref" "$(fieldtest_rem_bin)" drive --endpoint "$(fieldtest_rem_endpoint)" clean "$drive_serial" --json; then
+    fieldtest_evidence_record "$SCRIPT_NAME" crash-clean FAIL "failed to start drive cleaning on $drive_serial; the daemon was not killed" "$op_ref"
+    exit 1
+  fi
+  # Kill while the cleaning is in progress: once the changer shows the CLN
+  # cartridge in a drive bay, and before the cleaning operation ends.
+  local op_id op_json state timeout start
+  op_id="$(fieldtest_json_get operation_id <"$op_ref")"
+  op_json="$workdir/clean-op.json"
+  timeout="${FIELD_CLEAN_TIMEOUT_SECONDS:-1800}"
+  start=$SECONDS
+  while true; do
+    bay="$(cleaning_cart_bay "$serial" "$cleaning_barcode" "$library_json")"
+    [[ -z "$bay" ]] || break
+    fieldtest_capture_json "$op_json" "$(fieldtest_rem_bin)" op --endpoint "$(fieldtest_rem_endpoint)" get "$op_id" --json || true
+    state="$(python3 - "$op_json" <<'PY'
+import json,sys
+from pathlib import Path
+payload=json.loads(Path(sys.argv[1]).read_text())
+print(payload.get("data", {}).get("state", "unknown"))
+PY
+)"
+    case "$state" in
+      SUCCEEDED|SUCCEEDED?*|succeeded|done|FAILED|failed|cancelled|CANCELLED)
+        fieldtest_evidence_record "$SCRIPT_NAME" crash-clean FAIL "cleaning on $drive_serial ended ($state) before CLN:$cleaning_barcode was seen in a drive; the daemon was not killed" "$op_json"
+        exit 1
+        ;;
+    esac
+    if (( SECONDS - start > timeout )); then
+      fieldtest_evidence_record "$SCRIPT_NAME" crash-clean FAIL "CLN:$cleaning_barcode did not reach a drive within ${timeout}s of the cleaning request; the daemon was not killed" "$op_json"
+      exit 1
+    fi
+    sleep 5
+  done
+  local at_kill_json
+  at_kill_json="$(fieldtest_artifact_path "$SCRIPT_NAME" crash-clean-at-kill "$(fieldtest_timestamp_id)")"
+  mkdir -p "$(dirname -- "$at_kill_json")"
+  cp -f -- "$library_json" "$at_kill_json"
   daemon_pid="$(tmux display-message -p -t remfield:rem '#{pane_pid}' 2>/dev/null || true)"
   [[ -n "$daemon_pid" ]] || { echo "error: no remfield tmux daemon found" >&2; exit 1; }
   kill -9 "$daemon_pid" || true
@@ -277,7 +342,7 @@ PY
   local alarm_json
   alarm_json="$(fieldtest_artifact_path "$SCRIPT_NAME" crash-clean-alarms "$(fieldtest_timestamp_id)")"
   fieldtest_capture_json "$alarm_json" "$(fieldtest_rem_bin)" alarms --endpoint "$(fieldtest_rem_endpoint)" --all --json || true
-  fieldtest_evidence_record "$SCRIPT_NAME" crash-clean PASS "daemon was restarted after a mid-clean crash on $drive_serial and reconciliation evidence was captured" "$alarm_json"
+  fieldtest_evidence_record "$SCRIPT_NAME" crash-clean PASS "daemon was killed with CLN:$cleaning_barcode in drive bay $bay during cleaning on $drive_serial, restarted, and reconciliation evidence was captured" "$alarm_json"
   rm -rf -- "$workdir"
 }
 

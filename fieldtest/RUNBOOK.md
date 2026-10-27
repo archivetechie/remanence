@@ -21,10 +21,20 @@ the day produces a management-ready test record, not just a feeling.
    sudo setcap cap_sys_rawio+ep ~/remfield/bin/rem-daemon   # SCSI passthrough
    sudo setcap cap_sys_rawio+ep ~/remfield/bin/rem          # direct-SCSI verbs
    sudo setcap cap_sys_rawio+ep ~/remfield/bin/rem-debug    # break-glass verbs
+   printf 'remfield soft memlock unlimited\nremfield hard memlock unlimited\n' | sudo tee /etc/security/limits.d/remfield.conf
+   sudo prlimit --pid <tmux server pid> --memlock=unlimited:unlimited
    ```
    plus read access to `/dev/sg*` (usually via `sudo usermod -aG tape $USER`
    + re-login, or `sudo setfacl -m u:$USER:rw /dev/sg*` for the day).
-   `00-preflight.sh` tells you exactly which of these you need.
+   `00-preflight.sh` tells you exactly which setcap and sg lines you need.
+   The two memlock lines raise the locked-memory limit of the field account.
+   The `limits.d` file applies only to a new login shell, so log in again
+   after writing it. An ssh ControlMaster connection opened before the change
+   still carries the old limits into every session it multiplexes; close it
+   with `ssh -O exit <host>` before you log in again. `prlimit` raises a tmux
+   server that is already running, whose pid
+   `tmux display-message -p '#{pid}'` prints when run as the field account.
+   `03-bringup.sh` refuses to start the daemon under a limit below 1 GiB.
 3. **The barcode allowlist is the interlock.** `01-allowlist.sh` asks
    you to type the scratch barcodes (and the CLN barcode). Every script
    refuses to initialize, write, move, or erase any cartridge not on
@@ -39,14 +49,11 @@ the day produces a management-ready test record, not just a feeling.
 The October 2026 window on the MSL3040 produced these operational rules.
 
 1. The daemon inherits the locked-memory limit of the tmux server it is
-   started in, and under the field account's default of 8 MiB a restore's
-   read reservoir cannot grow past 8 MiB. As root, set memlock
-   unlimited for the field account in `/etc/security/limits.d/remfield.conf`
-   and raise an already running tmux server with
-   `prlimit --pid <server> --memlock=unlimited:unlimited`
-   (`tmux display-message -p '#{pid}'` prints its pid); `03-bringup.sh` now
-   refuses to start the daemon under a limit below 1 GiB and prints both
-   commands.
+   started in. Only the read reservoir is locked memory: under the field
+   account's default of 8 MiB a restore's reservoir cannot grow past 8 MiB,
+   so its drive reader parks more often. Run the two memlock lines of the
+   sudo surface above before bring-up; `03-bringup.sh` refuses to start the
+   daemon under a limit below 1 GiB and prints both commands.
 2. The lock limit does not set the write batch. That night's writes ran with
    an effective batch of 4 blocks against a configured 16, which is what a
    1 MiB sg reserved buffer gives with 256 KiB blocks, so check
@@ -281,7 +288,7 @@ The management questions: what happens when it breaks?
 | 4.2 | `40-faults.sh rebuild` | **catalog rebuild from journals with real tape data** — deletes the SQLite index, rebuilds, verifies every object still restorable + drive history survived (authoritative tables) |
 | 4.3 | `40-faults.sh retire-rebind` | retires a written tape, verifies copies flagged missing, re-inits the same barcode as a fresh tape |
 | 4.4 | `40-faults.sh wrong-tape` | 🖐 swap two allowlisted tapes between slots (or via `rem-debug move`), then attempt a write — must refuse with an identity mismatch, never overwrite |
-| 4.5 | `40-faults.sh crash-clean` | if the CLN cart is still available: kill the daemon mid-clean, restart, watch startup reconciliation resolve the run (the DS-M2 crash-resume path on real robotics) |
+| 4.5 | `40-faults.sh crash-clean` | if the CLN cart is still available: kill the daemon mid-clean (once the changer shows the CLN cart in the drive), restart, watch startup reconciliation resolve the run (the DS-M2 crash-resume path on real robotics) |
 
 **Every red result here is still evidence** — capture it, note it, move
 on. A refused unsafe operation is a PASS.
@@ -292,8 +299,10 @@ on. A refused unsafe operation is a PASS.
 
 - `50-soak.sh start` actually belongs at the END of Phase 1 — it runs a
   mixed write/read/verify workload in the background whenever drives
-  are idle between phases, all day. At H8.5, `50-soak.sh report` totals
-  bytes moved, operations, and error count.
+  are idle between phases, all day. At H8.5, `50-soak.sh report` prints
+  each run's cycle, ok and failed counts from `log/soak.log`, then the
+  total over every run in it with the number of runs summed
+  (`runs=… cycles=… ok=… failed=…`).
 - Re-run `11-happy-path.sh` — after every fault above, the plain happy
   path must still pass. This is the stability headline.
 - **5.V — full-verification timing** (after the last write of the day, with the soak stopped, before
@@ -354,5 +363,8 @@ on. A refused unsafe operation is a PASS.
 | `FIELD_READY_WARN_SECS` | `90` | mark a single fence wait with `readiness_warning=true` and print a warning above this duration |
 | `FIELD_READY_FAIL_SECS` | `900` | log `FAIL` and abort the daemon I/O retry loop above this duration |
 | `FIELD_CLEAN_DRIVE_INDEX` | `0` | position, in the daemon's drive list (`rem drive list --foreign --retired --json`), of the drive that `31-cleaning.sh` and `40-faults.sh crash-clean` clean; set it to leave alone a drive cleaned earlier in the day, which the cleaning cadence guard would refuse |
+| `FIELD_CLEAN_TIMEOUT_SECONDS` | `1800` | how long `31-cleaning.sh` follows a cleaning run, and how long `40-faults.sh crash-clean` waits for the CLN cartridge to reach the drive before it records FAIL without killing the daemon |
 | `FIELD_INIT_ALLOW_REINIT` | `0` | `1` lets `10-init-pools.sh` re-initialize a barcode that already has a PASS init record from this kit; otherwise the script records SKIP for that barcode |
+| `FIELD_BUSY_WAIT_S` | `600` | how long `remfield-io` keeps re-trying a session open that a busy drive bay refused, and how long `22-bench-dual.sh` waits for idle bays before its fixture write |
+| `FIELD_BUSY_RETRY_INTERVAL_S` | `5` | seconds between those attempts |
 | `FIELD_ALLOW_LOW_MEMLOCK` | `0` | `1` lets `03-bringup.sh` start the daemon although the locked-memory limit it would inherit is below 1 GiB and not unlimited; for a deliberate low-memory test only |
