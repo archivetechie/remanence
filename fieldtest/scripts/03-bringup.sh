@@ -40,6 +40,10 @@ start_daemon() {
   # BEFORE the daemon takes device ownership — a 2-drive library with
   # occupied drives can't serve writes.
   fieldtest_drain_drives "$(fieldtest_selected_library_serial)" || true
+  if ! fieldtest_require_overlap_staging; then
+    fieldtest_evidence_record "$SCRIPT_NAME" staging-mode FAIL "refusing to start the daemon in serial append staging mode; set append_staging_mode = \"overlap\" (see stderr)"
+    exit 1
+  fi
   if ! fieldtest_require_memlock; then
     fieldtest_evidence_record "$SCRIPT_NAME" memlock FAIL "refusing to start the daemon under a locked-memory limit that clamps the staging ring; raise RLIMIT_MEMLOCK for the daemon (see stderr)"
     exit 1
