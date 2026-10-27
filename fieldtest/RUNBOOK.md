@@ -34,6 +34,46 @@ the day produces a management-ready test record, not just a feeling.
 4. If anything looks wrong on the box (other users, jobs on the
    library, drives in use), STOP and resolve before continuing.
 
+### Lessons from 2026-10-26
+
+The October 2026 window on the MSL3040 produced these operational rules.
+
+1. The daemon inherits the locked-memory limit of the tmux server it is
+   started in, and under the field account's default of 8 MiB a restore's
+   read reservoir cannot grow past 8 MiB. As root, set memlock
+   unlimited for the field account in `/etc/security/limits.d/remfield.conf`
+   and raise an already running tmux server with
+   `prlimit --pid <server> --memlock=unlimited:unlimited`
+   (`tmux display-message -p '#{pid}'` prints its pid); `03-bringup.sh` now
+   refuses to start the daemon under a limit below 1 GiB and prints both
+   commands.
+2. The lock limit does not set the write batch. That night's writes ran with
+   an effective batch of 4 blocks against a configured 16, which is what a
+   1 MiB sg reserved buffer gives with 256 KiB blocks, so check
+   `effective_batch_blocks` in the bench output against the
+   [host I/O setup](#host-io-setup-for-batched-tape-commands) before
+   accepting throughput data.
+3. Insert new cartridges into empty slots that are not any loaded tape's
+   home slot, or drain the drives first. A cartridge placed in a loaded
+   tape's home slot strands that tape in its drive when the drain tries to
+   return it, and the fence left behind makes the next `10-init-pools.sh`
+   fail with an unexpected refusal.
+4. A daemon killed mid-unload leaves the cartridge unthreaded and the drive
+   reporting not ready until it receives a LOAD; `rem tape quarantine list`
+   shows the resulting fence as `media_initializing`, and waiting does not
+   clear it. The drain now sends one LOAD with `sg_start --load` (sg3_utils
+   must be installed) before it skips the bay, and `03-bringup.sh --stop`
+   waits a minute for a graceful stop before the hard kill.
+5. Never rerun `10-init-pools.sh` over initialized tapes without the rerun
+   guard, which skips every barcode that has a PASS init record from this
+   kit in `evidence/records.jsonl`. `FIELD_INIT_ALLOW_REINIT=1` is the
+   override; it sends those tapes through the clobber route again and
+   destroys what they hold.
+6. After any hard kill of the daemon, check `rem top --once` for a bay shown
+   busy with no I/O. That is the stall in item 4, and a LOAD to the drive
+   clears it (see
+   [the troubleshooting guide](../docs/guide-troubleshooting.md#a-drive-stays-not-ready-after-a-daemon-crash)).
+
 ### Unpack + binary check (5 min)
 
 ```
@@ -313,3 +353,6 @@ on. A refused unsafe operation is a PASS.
 | `FIELD_IO_READY_POLL` | `30s` | steady-state `wait-ready --poll` used by daemon I/O fence retries |
 | `FIELD_READY_WARN_SECS` | `90` | mark a single fence wait with `readiness_warning=true` and print a warning above this duration |
 | `FIELD_READY_FAIL_SECS` | `900` | log `FAIL` and abort the daemon I/O retry loop above this duration |
+| `FIELD_CLEAN_DRIVE_INDEX` | `0` | position, in the daemon's drive list (`rem drive list --foreign --retired --json`), of the drive that `31-cleaning.sh` and `40-faults.sh crash-clean` clean; set it to leave alone a drive cleaned earlier in the day, which the cleaning cadence guard would refuse |
+| `FIELD_INIT_ALLOW_REINIT` | `0` | `1` lets `10-init-pools.sh` re-initialize a barcode that already has a PASS init record from this kit; otherwise the script records SKIP for that barcode |
+| `FIELD_ALLOW_LOW_MEMLOCK` | `0` | `1` lets `03-bringup.sh` start the daemon although the locked-memory limit it would inherit is below 1 GiB and not unlimited; for a deliberate low-memory test only |
