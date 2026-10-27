@@ -37,7 +37,9 @@ path to an explicitly authorized drive serial and refuse writes unless
 discovery proves that no changer owns the drive.
 
 **Writing and reading tape.** Pipelined fixed-block tape I/O backed by a
-staging ring, with position proofs. This is the only path for writing and reading object data. (Verification reads single blocks and does not use it.) Reads are served through a
+staging ring, with position proofs. This is the only path for writing and reading object data. Full verification
+reads through its own strict batch reader, which issues the same fixed-block
+commands but not through the staging ring or the read reservoir. Reads are served through a
 host-RAM reservoir that supports ranged access, so a partial-file restore does
 not have to stream a whole object.
 
@@ -131,20 +133,22 @@ only one caller at a time waits on it. Open write sessions one at a time until
 this is fixed. In the same window, a restore running beside a write session on
 another pool completed normally.
 
-**A drive that asks for a LOAD is polled instead of loaded.** When a cartridge
-is in a drive but not threaded, the drive reports that it is not ready and
-needs an initializing command. The daemon's media-readiness check keeps
-polling the drive and never sends that LOAD, so the readiness fence stays in
-`media_initializing` and writes wait on it. A LOAD sent to the drive by hand
-makes it ready, and the fence clears at the next poll. The field window used
-`sg_start --load` on the drive's sg node.
+**A cartridge left unthreaded by a hard kill needed a LOAD by hand.** When the
+field stop script killed the daemon outright during an unload, the cartridge
+stayed in the drive unthreaded, the drive asked for an initializing command,
+and the daemon's media-readiness check polled it without sending a LOAD, so
+writes waited on a `media_initializing` fence until `sg_start --load` was
+sent by hand. On main the readiness wait now sends that LOAD once when the
+drive asks for it, and a stop signal lets the daemon finish the unload before
+it exits; both are in the next release. After any hard kill, still check
+`rem top` for a bay shown busy with no I/O and `rem tape quarantine list` for
+a `media_initializing` fence.
 
-**A hard kill during an unload can leave a cartridge unthreaded.** When a stop
-script killed the daemon outright shortly after asking it to stop, while the
-daemon was unloading a cartridge, the cartridge stayed in the drive unthreaded
-and the stall above followed. Let the daemon exit on its own after a stop
-signal. After any hard kill, check `rem top` for a bay shown busy with no I/O,
-and `rem tape quarantine list` for a `media_initializing` fence.
+**Full verification runs well below the drive rate.** On the field host a full
+verification of a 36 GB parity tape took 13 minutes, about 46 MB/s, where the
+same drive restores at 300 MB/s. The verification reads and checks on one
+thread and walks the tape with many direction changes before it checks any
+data. A redesign is in progress.
 
 **The catalog rebuild's summary leaves out the checkpoint journals.**
 `rem rebuild-catalog-from-journals` replays the checkpoint journals after the

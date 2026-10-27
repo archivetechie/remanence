@@ -81,8 +81,8 @@ access policy (the allowlist) and set a dirty flag when a command's completion
 is uncertain.
 
 This crate also carries Layer 3a, drive tape I/O. Streaming reads and writes
-of object data use one pipelined, fixed-block path (full verification reads single
-blocks separately). The configuration keys
+of object data use one pipelined, fixed-block path (full verification reads
+separately, through its own strict batch reader). The configuration keys
 `tape_io.legacy_single_block` and `tape_io.pipelined_submission` are not
 accepted: a `config.toml` that sets either fails to load with an error naming
 the key. "Pipelined" means the staging ring described under
