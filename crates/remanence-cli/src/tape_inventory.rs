@@ -34,6 +34,17 @@ pub(crate) struct TapeInventoryArgs {
     pub(crate) endpoint: String,
 }
 
+/// Verification adds a bounded readiness wait to the exact-tape target.
+#[derive(Args, Clone, Debug)]
+pub(crate) struct TapeVerifyIndexArgs {
+    #[command(flatten)]
+    inventory: TapeInventoryArgs,
+
+    /// Wait for a media-readiness fence. Accepts ms/s/m/h; 0 returns the refusal.
+    #[arg(long, value_name = "DURATION", default_value = "15m", value_parser = crate::parse_wait_duration_arg)]
+    ready_wait: std::time::Duration,
+}
+
 impl TapeInventoryArgs {
     fn exact_tape_uuid(&self) -> Result<[u8; 16], String> {
         Uuid::parse_str(&self.tape_uuid)
@@ -677,10 +688,11 @@ fn print_inventory_bot_object(
 }
 
 pub(crate) fn run_verify_index(
-    args: &TapeInventoryArgs,
+    verify_args: &TapeVerifyIndexArgs,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
+    let args = &verify_args.inventory;
     let tape_uuid = match args.exact_tape_uuid() {
         Ok(tape_uuid) => tape_uuid,
         Err(error) => {
@@ -698,13 +710,23 @@ pub(crate) fn run_verify_index(
             .block_on(connect_daemon(&args.endpoint))
             .map_err(DaemonClientError::client)?;
         runtime.block_on(crate::observe_daemon(&channel, args.json))?;
-        let mut client = pb::catalog_client::CatalogClient::new(channel);
-        let verification = runtime
-            .block_on(client.verify_tape_index(pb::VerifyTapeIndexRequest {
-                tape_uuid: tape_uuid.to_vec(),
-            }))
-            .map(tonic::Response::into_inner)
-            .map_err(DaemonClientError::status)?;
+        let client = pb::catalog_client::CatalogClient::new(channel.clone());
+        let verification = runtime.block_on(verify_with_readiness(
+            || {
+                let mut client = client.clone();
+                async move {
+                    client
+                        .verify_tape_index(pb::VerifyTapeIndexRequest {
+                            tape_uuid: tape_uuid.to_vec(),
+                        })
+                        .await
+                        .map(tonic::Response::into_inner)
+                }
+            },
+            &mut crate::media_readiness::DaemonReadinessClient::new(channel),
+            verify_args.ready_wait,
+            err,
+        ))?;
         let fast_inventory =
             validate_verification(&verification, tape_uuid).map_err(DaemonClientError::client)?;
         print_verification(&verification, fast_inventory, args.json, out)
@@ -718,6 +740,58 @@ pub(crate) fn run_verify_index(
         Ok(false) => ExitCode::from(1),
         Err(error) => finish_daemon_client_result(Err(error), args.json, err),
     }
+}
+
+/// Retry verification once after a fence reaches ready, bounded by the caller's wait.
+async fn verify_with_readiness<F, Fut>(
+    mut verify: F,
+    readiness: &mut impl crate::media_readiness::ReadinessClient,
+    ready_wait: std::time::Duration,
+    err: &mut dyn Write,
+) -> Result<pb::TapeIndexVerification, DaemonClientError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<pb::TapeIndexVerification, tonic::Status>>,
+{
+    let original = match verify().await {
+        Ok(report) => return Ok(report),
+        Err(status) => status,
+    };
+    let Some(operation) = crate::media_readiness::readiness_operation(&original) else {
+        if crate::media_readiness::wait_for_busy_drive_retry(&original, "verification", err).await {
+            return verify().await.map_err(DaemonClientError::status);
+        }
+        return Err(DaemonClientError::status(original));
+    };
+    if ready_wait.is_zero() {
+        return Err(DaemonClientError::status(original));
+    }
+    let _ = writeln!(err, "verification blocked by media readiness operation {operation}; waiting up to {ready_wait:?} (pass --ready-wait 0 to fail fast)");
+    let wait = crate::media_readiness::wait_for_verification_readiness(
+        readiness, operation, &original, err,
+    );
+    match tokio::time::timeout(ready_wait, wait).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let mut refusal = DaemonClientError::status(original);
+            refusal.message.push_str(&format!("; {}", error.message));
+            return Err(refusal);
+        }
+        Err(_) => {
+            let _ = writeln!(
+                err,
+                "ready wait of {ready_wait:?} expired; returning the daemon's refusal"
+            );
+            return Err(DaemonClientError::status(original));
+        }
+    }
+    let result = verify().await;
+    if let Err(status) = &result {
+        if crate::media_readiness::wait_for_busy_drive_retry(status, "verification", err).await {
+            return verify().await.map_err(DaemonClientError::status);
+        }
+    }
+    result.map_err(DaemonClientError::status)
 }
 
 fn validate_verification(
@@ -1447,24 +1521,7 @@ fn print_verification(
     let io_json = verification.io.as_ref().map(verification_io_json);
     if !json_output {
         if let Some(io) = &verification.io {
-            if let Some(c) = &io.total {
-                writeln!(out, "io: {} ms; LOCATE {} SPACE {} READ POSITION {}; READ single {} batch {}; records {}/{} confirmed/requested; {} bytes; protected {} bytes; backward seeks {}; recovered {}", io.elapsed_ms, c.locate, c.space, c.read_position, c.single_read, c.batch_read, c.records_confirmed, c.records_requested, c.bytes, io.protected_bytes, io.backward_data_seeks, c.recovered_reads).map_err(|e| e.to_string())?;
-            }
-            for phase in &io.phases {
-                if let Some(c) = &phase.counts {
-                    let commands = c.locate
-                        + c.space
-                        + c.read_position
-                        + c.single_read
-                        + c.batch_read
-                        + c.other;
-                    if commands > 0 {
-                        writeln!(out, "io phase {}: {:.1} s, inside commands {:.1} s, {} commands, slowest {:.1} s",
-                            phase.phase, c.elapsed_ms as f64 / 1000.0, c.command_ms as f64 / 1000.0,
-                            commands, c.max_command_ms as f64 / 1000.0).map_err(|e| e.to_string())?;
-                    }
-                }
-            }
+            print_verification_io(io, out)?;
         }
     }
     let state = pb::TapeIndexVerificationState::try_from(verification.state)
@@ -1692,8 +1749,37 @@ fn print_verification(
     writeln!(out, "verification_detail: {}", verification.detail).map_err(|error| error.to_string())
 }
 
+/// Shared human-readable I/O totals and phase timings for full verification.
+pub(crate) fn print_verification_io(
+    io: &pb::VerificationIo,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    if let Some(c) = &io.total {
+        writeln!(out, "io: {} ms; LOCATE {} SPACE {} READ POSITION {}; READ single {} batch {}; records {}/{} confirmed/requested; {} bytes; protected {} bytes; backward seeks {}; recovered {}", io.elapsed_ms, c.locate, c.space, c.read_position, c.single_read, c.batch_read, c.records_confirmed, c.records_requested, c.bytes, io.protected_bytes, io.backward_data_seeks, c.recovered_reads).map_err(|e| e.to_string())?;
+    }
+    for phase in &io.phases {
+        if let Some(c) = &phase.counts {
+            let commands =
+                c.locate + c.space + c.read_position + c.single_read + c.batch_read + c.other;
+            if commands > 0 {
+                writeln!(
+                    out,
+                    "io phase {}: {:.1} s, inside commands {:.1} s, {} commands, slowest {:.1} s",
+                    phase.phase,
+                    c.elapsed_ms as f64 / 1000.0,
+                    c.command_ms as f64 / 1000.0,
+                    commands,
+                    c.max_command_ms as f64 / 1000.0
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Preserve wire presence and the CLI's decimal-string convention for u64s.
-fn verification_io_json(io: &pb::VerificationIo) -> serde_json::Value {
+pub(crate) fn verification_io_json(io: &pb::VerificationIo) -> serde_json::Value {
     fn counts(c: &pb::VerificationIoCounts) -> serde_json::Value {
         json!({
             "locate": c.locate.to_string(),
@@ -1731,6 +1817,496 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+
+    /// Scripted readiness responses keep these tests independent of sockets and hardware.
+    struct FakeReadiness {
+        statuses: std::collections::VecDeque<pb::OperationStatus>,
+        requests: Vec<pb::ResumeMediaReadinessRequest>,
+        pending_resume: bool,
+        pending_watch: bool,
+        resume_error: Option<tonic::Status>,
+        watch_error: Option<tonic::Status>,
+        watches: Vec<Uuid>,
+    }
+
+    impl FakeReadiness {
+        fn initializing_then_ready() -> Self {
+            let initializing = pb::OperationStatus {
+                state: pb::OperationState::Running as i32,
+                progress: [
+                    ("state".into(), "media_initializing".into()),
+                    (
+                        remanence_library::MEDIA_READINESS_SENSE_PROGRESS_KEYS
+                            .0
+                            .into(),
+                        "02/04/02".into(),
+                    ),
+                    (
+                        remanence_library::MEDIA_READINESS_SENSE_PROGRESS_KEYS
+                            .1
+                            .into(),
+                        "initializing command required".into(),
+                    ),
+                ]
+                .into(),
+                ..Default::default()
+            };
+            Self {
+                statuses: [
+                    initializing.clone(),
+                    initializing,
+                    pb::OperationStatus {
+                        state: pb::OperationState::Succeeded as i32,
+                        progress: [("state".into(), "ready".into())].into(),
+                        ..Default::default()
+                    },
+                ]
+                .into(),
+                requests: Vec::new(),
+                pending_resume: false,
+                pending_watch: false,
+                resume_error: None,
+                watch_error: None,
+                watches: Vec::new(),
+            }
+        }
+    }
+
+    impl crate::media_readiness::ReadinessClient for FakeReadiness {
+        async fn resume(
+            &mut self,
+            request: pb::ResumeMediaReadinessRequest,
+        ) -> Result<(), tonic::Status> {
+            self.requests.push(request);
+            if self.pending_resume {
+                std::future::pending::<()>().await;
+            }
+            if let Some(error) = self.resume_error.take() {
+                return Err(error);
+            }
+            Ok(())
+        }
+
+        async fn watch(&mut self, operation_id: Uuid) -> Result<(), tonic::Status> {
+            self.watches.push(operation_id);
+            Ok(())
+        }
+
+        async fn next(&mut self) -> Result<Option<pb::OperationStatus>, tonic::Status> {
+            if let Some(error) = self.watch_error.take() {
+                return Err(error);
+            }
+            if self.pending_watch {
+                std::future::pending::<()>().await;
+            }
+            Ok(self.statuses.pop_front())
+        }
+    }
+
+    fn readiness_refusal() -> tonic::Status {
+        tonic::Status::failed_precondition(format!(
+            "fully verify terminal tape index blocked by media-readiness fence operation={} library=LIB drive=0x0100 media_readiness_state=media_initializing",
+            Uuid::from_u128(1)
+        ))
+    }
+
+    #[tokio::test]
+    async fn verification_waits_for_readiness_and_retries_once_with_report() {
+        let mut readiness = FakeReadiness::initializing_then_ready();
+        let expected = pb::TapeIndexVerification {
+            tape_uuid: Uuid::from_u128(2).as_bytes().to_vec(),
+            io: Some(pb::VerificationIo {
+                elapsed_ms: 42,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut replies = [Err(readiness_refusal()), Ok(expected.clone())].into_iter();
+        let mut calls = 0;
+        let mut stderr = Vec::new();
+        let actual = verify_with_readiness(
+            || {
+                calls += 1;
+                std::future::ready(replies.next().expect("only one retry"))
+            },
+            &mut readiness,
+            std::time::Duration::from_secs(900),
+            &mut stderr,
+        )
+        .await
+        .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(calls, 2);
+        assert_eq!(
+            readiness.requests,
+            vec![pb::ResumeMediaReadinessRequest {
+                operation_id: Uuid::from_u128(1).as_bytes().to_vec(),
+                timeout_seconds: crate::media_readiness::DEFAULT_READY_TIMEOUT_SECONDS,
+                poll_interval_seconds: 30,
+            }]
+        );
+        assert_eq!(String::from_utf8(stderr).unwrap(), concat!(
+            "verification blocked by media readiness operation 00000000-0000-0000-0000-000000000001; waiting up to 900s (pass --ready-wait 0 to fail fast)\n",
+            "media readiness operation 00000000-0000-0000-0000-000000000001: media_initializing sense=02/04/02 (initializing command required)\n",
+            "media readiness operation 00000000-0000-0000-0000-000000000001: ready\n",
+        ));
+    }
+
+    #[tokio::test]
+    async fn verification_readiness_deadline_returns_original_refusal() {
+        for pending_resume in [true, false] {
+            let mut readiness = FakeReadiness::initializing_then_ready();
+            readiness.pending_resume = pending_resume;
+            readiness.pending_watch = !pending_resume;
+            let mut calls = 0;
+            let mut stderr = Vec::new();
+            let error = verify_with_readiness(
+                || {
+                    calls += 1;
+                    std::future::ready(Err(readiness_refusal()))
+                },
+                &mut readiness,
+                std::time::Duration::from_millis(1),
+                &mut stderr,
+            )
+            .await
+            .unwrap_err();
+            let expected = DaemonClientError::status(readiness_refusal());
+            assert_eq!(error.message, expected.message);
+            assert_eq!(error.code, expected.code);
+            assert_eq!(calls, 1);
+            assert_eq!(readiness.requests.len(), 1);
+            assert_eq!(
+                readiness.requests[0].timeout_seconds,
+                crate::media_readiness::DEFAULT_READY_TIMEOUT_SECONDS
+            );
+            let stderr = String::from_utf8(stderr).unwrap();
+            assert!(stderr.starts_with("verification blocked by media readiness operation 00000000-0000-0000-0000-000000000001; waiting up to 1ms (pass --ready-wait 0 to fail fast)\n"));
+            assert!(stderr.ends_with("ready wait of 1ms expired; returning the daemon's refusal\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn verification_ready_wait_zero_returns_refusal_without_resume() {
+        let mut readiness = FakeReadiness::initializing_then_ready();
+        let mut calls = 0;
+        let mut stderr = Vec::new();
+        let error = verify_with_readiness(
+            || {
+                calls += 1;
+                std::future::ready(Err(readiness_refusal()))
+            },
+            &mut readiness,
+            std::time::Duration::ZERO,
+            &mut stderr,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.message,
+            DaemonClientError::status(readiness_refusal()).message
+        );
+        assert_eq!(calls, 1);
+        assert!(readiness.requests.is_empty());
+        assert!(stderr.is_empty());
+    }
+
+    #[tokio::test]
+    async fn verification_does_not_wait_on_other_refusals_or_retry_twice() {
+        for status in [
+            tonic::Status::failed_precondition(
+                "blocked by media-readiness fence operation=invalid",
+            ),
+            tonic::Status::unavailable(readiness_refusal().message()),
+        ] {
+            let mut readiness = FakeReadiness::initializing_then_ready();
+            let mut calls = 0;
+            let error = verify_with_readiness(
+                || {
+                    calls += 1;
+                    std::future::ready(Err(status.clone()))
+                },
+                &mut readiness,
+                std::time::Duration::from_secs(900),
+                &mut Vec::new(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.message, DaemonClientError::status(status).message);
+            assert_eq!(calls, 1);
+            assert!(readiness.requests.is_empty());
+        }
+        let mut readiness = FakeReadiness::initializing_then_ready();
+        let mut calls = 0;
+        let error = verify_with_readiness(
+            || {
+                calls += 1;
+                std::future::ready(Err(readiness_refusal()))
+            },
+            &mut readiness,
+            std::time::Duration::from_secs(900),
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(calls, 2);
+        assert_eq!(readiness.requests.len(), 1);
+        assert_eq!(
+            error.message,
+            DaemonClientError::status(readiness_refusal()).message
+        );
+    }
+
+    #[tokio::test]
+    async fn verification_does_not_retry_an_unfinished_readiness_operation() {
+        for terminal_state in [
+            None,
+            Some(pb::OperationState::Failed),
+            Some(pb::OperationState::Cancelled),
+            Some(pb::OperationState::CompletionUnknown),
+        ] {
+            let mut readiness = FakeReadiness::initializing_then_ready();
+            readiness.statuses.truncate(1);
+            if let Some(state) = terminal_state {
+                readiness.statuses.push_back(pb::OperationStatus {
+                    state: state as i32,
+                    progress: [("state".into(), "not_ready".into())].into(),
+                    error_summary: "drive does not report ready".into(),
+                    ..Default::default()
+                });
+            }
+            let mut calls = 0;
+            let error = verify_with_readiness(
+                || {
+                    calls += 1;
+                    std::future::ready(Err(readiness_refusal()))
+                },
+                &mut readiness,
+                std::time::Duration::from_secs(900),
+                &mut Vec::new(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(calls, 1);
+            assert_eq!(readiness.requests.len(), 1);
+            assert!(error.message.starts_with(&format!(
+                "{}; ",
+                DaemonClientError::status(readiness_refusal()).message
+            )));
+            assert_eq!(
+                error.code,
+                DaemonClientError::status(readiness_refusal()).code
+            );
+            assert!(error.message.contains(if terminal_state.is_some() {
+                "did not reach READY"
+            } else {
+                "watch ended before READY"
+            }));
+        }
+    }
+
+    /// The local watch budget never shortens the daemon's readiness operation.
+    #[tokio::test]
+    async fn verification_resume_timeout_is_independent_of_ready_wait() {
+        for ready_wait in [
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(900),
+        ] {
+            let mut readiness = FakeReadiness::initializing_then_ready();
+            let mut replies = [
+                Err(readiness_refusal()),
+                Ok(pb::TapeIndexVerification::default()),
+            ]
+            .into_iter();
+            verify_with_readiness(
+                || std::future::ready(replies.next().unwrap()),
+                &mut readiness,
+                ready_wait,
+                &mut Vec::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(readiness.requests.len(), 1);
+            assert_eq!(
+                readiness.requests[0].timeout_seconds,
+                crate::media_readiness::DEFAULT_READY_TIMEOUT_SECONDS
+            );
+            assert_eq!(readiness.requests[0].timeout_seconds, 9000);
+        }
+    }
+
+    /// Resume and stream failures retain the refusal's guidance and status code.
+    #[tokio::test]
+    async fn verification_wait_errors_append_to_original_refusal() {
+        for resume_fails in [true, false] {
+            let mut readiness = FakeReadiness::initializing_then_ready();
+            let status = tonic::Status::unavailable("readiness connection lost");
+            if resume_fails {
+                readiness.resume_error = Some(status.clone());
+            } else {
+                readiness.watch_error = Some(status.clone());
+            }
+            let mut calls = 0;
+            let error = verify_with_readiness(
+                || {
+                    calls += 1;
+                    std::future::ready(Err(readiness_refusal()))
+                },
+                &mut readiness,
+                std::time::Duration::from_secs(30),
+                &mut Vec::new(),
+            )
+            .await
+            .unwrap_err();
+            let original = DaemonClientError::status(readiness_refusal());
+            assert_eq!(error.code, original.code);
+            assert_eq!(
+                error.message,
+                format!(
+                    "{}; {}",
+                    original.message,
+                    crate::status_error(status).message
+                )
+            );
+            assert_eq!(calls, 1);
+        }
+    }
+
+    /// A competing resume owns the drive; watch its operation without another resume.
+    #[tokio::test]
+    async fn verification_watches_another_callers_operation() {
+        let held = tonic::Status::failed_precondition(format!(
+            "drive bay 0x0100 is busy: another caller holds this drive while media-readiness operation {} is unresolved, sense=02/04/02. Robot moves in library LIB are refused until that operation finishes, even when other drive bays are idle; retry when operation {} finishes",
+            Uuid::from_u128(1), Uuid::from_u128(1)
+        ));
+        for initial_refusal in [true, false] {
+            for expires in [true, false] {
+                let mut readiness = FakeReadiness::initializing_then_ready();
+                readiness.pending_watch = expires;
+                if !initial_refusal {
+                    readiness.resume_error = Some(held.clone());
+                }
+                let original = if initial_refusal {
+                    held.clone()
+                } else {
+                    readiness_refusal()
+                };
+                let mut replies = [
+                    Err(original.clone()),
+                    Ok(pb::TapeIndexVerification::default()),
+                ]
+                .into_iter();
+                let mut calls = 0;
+                let result = verify_with_readiness(
+                    || {
+                        calls += 1;
+                        std::future::ready(replies.next().unwrap())
+                    },
+                    &mut readiness,
+                    std::time::Duration::from_millis(1),
+                    &mut Vec::new(),
+                )
+                .await;
+                assert_eq!(readiness.requests.len(), usize::from(!initial_refusal));
+                assert_eq!(readiness.watches, vec![Uuid::from_u128(1)]);
+                if expires {
+                    assert_eq!(
+                        result.unwrap_err().message,
+                        DaemonClientError::status(original).message
+                    );
+                    assert_eq!(calls, 1);
+                } else {
+                    result.unwrap();
+                    assert_eq!(calls, 2);
+                }
+            }
+        }
+    }
+
+    /// A reservation can outlast Succeeded; allow exactly one short busy-bay retry.
+    #[tokio::test]
+    async fn verification_retries_a_busy_bay_once() {
+        for after_readiness in [true, false] {
+            for stays_busy in [true, false] {
+                let mut readiness = FakeReadiness::initializing_then_ready();
+                let busy = tonic::Status::failed_precondition("drive bay 0x0100 is busy");
+                let mut replies = Vec::new();
+                if after_readiness {
+                    replies.push(Err(readiness_refusal()));
+                }
+                replies.push(Err(busy.clone()));
+                replies.push(if stays_busy {
+                    Err(busy.clone())
+                } else {
+                    Ok(pb::TapeIndexVerification::default())
+                });
+                let mut replies = replies.into_iter();
+                let mut stderr = Vec::new();
+                let mut calls = 0;
+                let result = verify_with_readiness(
+                    || {
+                        calls += 1;
+                        std::future::ready(replies.next().expect("only one busy retry"))
+                    },
+                    &mut readiness,
+                    std::time::Duration::from_secs(30),
+                    &mut stderr,
+                )
+                .await;
+                assert_eq!(calls, 2 + usize::from(after_readiness));
+                assert_eq!(readiness.requests.len(), usize::from(after_readiness));
+                assert_eq!(
+                    String::from_utf8(stderr)
+                        .unwrap()
+                        .matches("verification found a busy drive bay; retrying once after 1s\n")
+                        .count(),
+                    1
+                );
+                if stays_busy {
+                    assert_eq!(
+                        result.unwrap_err().message,
+                        DaemonClientError::status(busy).message
+                    );
+                } else {
+                    result.unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn verification_ready_wait_arguments() {
+        for (arg, seconds) in [(None, 900), (Some("0"), 0), (Some("2m"), 120)] {
+            let mut argv = vec![
+                "rem",
+                "tape",
+                "verify-index",
+                "--tape-uuid",
+                "00000000-0000-0000-0000-000000000001",
+            ];
+            if let Some(arg) = arg {
+                argv.extend(["--ready-wait", arg]);
+            }
+            let parsed: crate::ParsedCli = crate::Cli::try_parse_from(argv).unwrap().into();
+            let crate::Command::TapeVerifyIndexClient(args) = parsed.command else {
+                panic!("verification command")
+            };
+            assert_eq!(args.ready_wait, std::time::Duration::from_secs(seconds));
+        }
+        for invalid in ["invalid", "1e300h", "NaNs", "-1m"] {
+            assert!(crate::Cli::try_parse_from([
+                "rem",
+                "tape",
+                "verify-index",
+                "--tape-uuid",
+                "00000000-0000-0000-0000-000000000001",
+                "--ready-wait",
+                invalid,
+            ])
+            .is_err());
+        }
+    }
 
     fn args(tape_uuid: &str) -> TapeInventoryArgs {
         TapeInventoryArgs {
@@ -1860,7 +2436,7 @@ mod tests {
         ])
         .into();
         match verify.command {
-            crate::Command::TapeVerifyIndexClient(args) => assert!(args.json),
+            crate::Command::TapeVerifyIndexClient(args) => assert!(args.inventory.json),
             other => panic!("unexpected verify-index dispatch: {other:?}"),
         }
     }

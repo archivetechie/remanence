@@ -102,6 +102,7 @@ mod pool_ops;
 pub use pool_ops::{
     export_mounted_tape_object, read_mounted_tape_object, verify_mounted_tape_object,
 };
+mod media_readiness;
 mod put;
 mod recovery_report;
 mod tape_finalize;
@@ -1270,7 +1271,7 @@ enum Command {
 
     /// Report the verification state for one exact tape's terminal index.
     #[command(name = "tape-verify-index-client", hide = true)]
-    TapeVerifyIndexClient(tape_inventory::TapeInventoryArgs),
+    TapeVerifyIndexClient(tape_inventory::TapeVerifyIndexArgs),
 
     /// Archive local files through the daemon (daemon-only).
     #[command(name = "put-client", hide = true)]
@@ -1655,7 +1656,7 @@ enum RemTapeCommand {
 
     /// Report whether one exact tape index has received full physical verification.
     #[command(name = "verify-index")]
-    VerifyIndex(tape_inventory::TapeInventoryArgs),
+    VerifyIndex(tape_inventory::TapeVerifyIndexArgs),
 }
 
 impl From<RemTapeCommand> for TapeCommand {
@@ -2478,7 +2479,8 @@ fn parse_wait_duration_arg(s: &str) -> Result<StdDuration, String> {
             "invalid duration {s:?}: must be finite and non-negative"
         ));
     }
-    Ok(StdDuration::from_secs_f64(parsed * multiplier))
+    StdDuration::try_from_secs_f64(parsed * multiplier)
+        .map_err(|error| format!("invalid duration {s:?}: {error}"))
 }
 
 #[derive(Subcommand, Debug)]

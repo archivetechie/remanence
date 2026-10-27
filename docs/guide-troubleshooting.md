@@ -120,6 +120,12 @@ until the fence is cleared. You will see messages like:
 run `rem tape quarantine show <id>` or wait-ready/resume before retrying
 ```
 
+`rem tape verify-index --tape-uuid <UUID>` resumes a media-readiness fence
+and waits up to `15m` before retrying verification. It prints each readiness
+state change to stderr. Use `--ready-wait <DURATION>` to set the wait, or
+`rem tape verify-index --tape-uuid <UUID> --ready-wait 0` to keep the immediate
+refusal. At the deadline the command returns the daemon's original message.
+
 Inspect with `rem tape quarantine list` / `show <id>`. Both print the
 drive's last sense with its name, for example `sense=02/04/02 (initializing
 command required)`; a drive that reports `02/04/02` is covered under [A drive
