@@ -45,4 +45,5 @@ unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "warn"
 
 [dev-dependencies]
+remanence-chaos = { path = "../remanence-chaos" }
 serde_json = { workspace = true }

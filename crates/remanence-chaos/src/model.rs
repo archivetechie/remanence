@@ -815,9 +815,25 @@ impl ModelTransport {
     }
 
     fn read_position(&self, buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
-        self.drive_bay()?;
+        let bay = self.drive_bay()?;
         let flags = if self.position == 0 { 0x80 } else { 0x00 };
-        copy_response(buf, &rp_long_response(flags, 0, self.position))
+        let mut response = rp_long_response(flags, 0, self.position);
+        let world = self.world.lock().expect("virtual world lock");
+        // Position reporting also works without media or before initialization.
+        let file = world
+            .drive_bays
+            .get(&bay)
+            .and_then(Option::as_ref)
+            .and_then(|barcode| world.tapes.get(barcode))
+            .map_or(0, |tape| {
+                tape.records
+                    .iter()
+                    .take(self.position as usize)
+                    .filter(|record| matches!(record, Record::Filemark))
+                    .count() as u64
+            });
+        response[16..24].copy_from_slice(&file.to_be_bytes());
+        copy_response(buf, &response)
     }
 
     /// MAINTENANCE IN: the RSOC one_command probe (`A3h/0Ch`) and READ END
@@ -1748,6 +1764,44 @@ mod tests {
         let mut world = VirtualWorld::single_drive("LIB-MODEL", 0x0100, "DRV-MODEL", 0x0400, 2);
         world.put_tape_in_slot(0x0400, "TAPE001", VirtualTape::default());
         Arc::new(Mutex::new(world))
+    }
+
+    /// READ POSITION must not acquire the media/readiness preconditions of READ.
+    #[test]
+    fn read_position_without_media_and_before_initialization() {
+        let world = world();
+        let mut drive = ModelTransport::new(world.clone(), DeviceRole::Drive { bay: 0x100 });
+        drive.position = 2;
+        for loaded in [false, true] {
+            if loaded {
+                let tape = VirtualTape {
+                    records: vec![Record::Block(vec![1]), Record::Filemark],
+                    ..Default::default()
+                };
+                world
+                    .lock()
+                    .unwrap()
+                    .put_tape_in_drive(0x100, "TAPE001", Some(0x400), tape);
+            }
+            for initializing in [false, true] {
+                world
+                    .lock()
+                    .unwrap()
+                    .drive_states
+                    .entry(0x100)
+                    .or_default()
+                    .initializing_command_required = initializing;
+                let mut response = [0; 32];
+                drive
+                    .execute_in(&read_position::build_cdb_long(), &mut response)
+                    .unwrap();
+                assert_eq!(u64::from_be_bytes(response[8..16].try_into().unwrap()), 2);
+                assert_eq!(
+                    u64::from_be_bytes(response[16..24].try_into().unwrap()),
+                    u64::from(loaded)
+                );
+            }
+        }
     }
 
     #[test]

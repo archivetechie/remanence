@@ -195,6 +195,53 @@ fn source_with_read_completion(
             "record insertions do not combine with position-named faults"
         );
     }
+    let tape = tape_with_faults(vector, faults);
+    let lbas: Vec<u64> = faults["unreadable_records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["lba"].as_u64().unwrap())
+        .collect();
+    let filemarks = tape
+        .records
+        .iter()
+        .enumerate()
+        .filter_map(|(at, record)| matches!(record, Record::Filemark).then_some(at as u64));
+    let engine = FaultEngine::for_read_medium_errors_in_files(lbas, filemarks).unwrap();
+    let mut world = VirtualWorld::single_drive("IMAGE-LIB", 0x100, "IMAGE-DRV", 0x400, 1);
+    world.put_tape_in_drive(0x100, "IMAGE001", None, tape);
+    let model = OverlengthReads {
+        inner: ModelTransport::new(
+            Arc::new(Mutex::new(world)),
+            DeviceRole::Drive { bay: 0x100 },
+        ),
+        scratch: Vec::new(),
+    };
+    let transport = ChaosTransport::new(
+        model,
+        engine.clone(),
+        DeviceCtx::new().with_backend("model"),
+    );
+    let transport = RecoveredRead {
+        inner: transport,
+        fault: recovered,
+        position: None,
+    };
+    let (transport, log) = remanence_library::RecordingTransport::new(transport);
+    (
+        DriveHandle::open_standalone_with_transport(
+            Path::new("/dev/sg-image-model"),
+            Box::new(transport),
+            &remanence_library::StaticAllowlist::new(["/dev/sg-image-model"]),
+        )
+        .unwrap(),
+        engine,
+        log,
+    )
+}
+
+/// Build the exact physical fixture used by both the transport and path assertions.
+fn tape_with_faults(vector: &VectorImage, faults: &Value) -> VirtualTape {
     let mut tape = VirtualTape::empty(64 * 1024 * 1024, BLOCK);
     let removed = faults["removed_filemark_after_tape_file"].as_u64();
     let edits = faults["record_edits"]
@@ -283,43 +330,7 @@ fn source_with_read_completion(
             "record edit address"
         );
     }
-    let lbas: Vec<u64> = faults["unreadable_records"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|r| r["lba"].as_u64().unwrap())
-        .collect();
-    let engine = FaultEngine::for_read_medium_errors(lbas).unwrap();
-    let mut world = VirtualWorld::single_drive("IMAGE-LIB", 0x100, "IMAGE-DRV", 0x400, 1);
-    world.put_tape_in_drive(0x100, "IMAGE001", None, tape);
-    let model = OverlengthReads {
-        inner: ModelTransport::new(
-            Arc::new(Mutex::new(world)),
-            DeviceRole::Drive { bay: 0x100 },
-        ),
-        scratch: Vec::new(),
-    };
-    let transport = ChaosTransport::new(
-        model,
-        engine.clone(),
-        DeviceCtx::new().with_backend("model"),
-    );
-    let transport = RecoveredRead {
-        inner: transport,
-        fault: recovered,
-        position: None,
-    };
-    let (transport, log) = remanence_library::RecordingTransport::new(transport);
-    (
-        DriveHandle::open_standalone_with_transport(
-            Path::new("/dev/sg-image-model"),
-            Box::new(transport),
-            &remanence_library::StaticAllowlist::new(["/dev/sg-image-model"]),
-        )
-        .unwrap(),
-        engine,
-        log,
-    )
+    tape
 }
 
 fn scheme(k: u64, m: u64, s: u64) -> ParityScheme {
@@ -3593,4 +3604,89 @@ fn recovered_verification_reads_are_counted_and_crc_checked() {
         remanence_api::pb::TapeIndexVerificationState::VerifiedDegraded as i32
     );
     assert!(debug.contains("CrcMismatch"), "{debug}");
+}
+
+/// Every image and stable fault set supplies fresh sources to both file measurers.
+#[test]
+fn forward_file_reader_matches_walk_for_entire_damage_matrix() {
+    let frozen: Value = serde_json::from_str(EXPECTATIONS).unwrap();
+    let cases = frozen["cases"].as_array().unwrap();
+    assert!(!cases.is_empty());
+    for case in cases {
+        let id = case["id"].as_str().unwrap();
+        let vector = generate(case["image"].as_str().unwrap()).unwrap();
+        let faults = fault_map_of(case, &vector);
+        let uuid = vector.written.inputs.tape_uuid;
+        let block_size = vector.written.inputs.block_size;
+        let hints = faults["hints"].as_object().map(|h| ScanRecoveryHints {
+            tape_uuid: uuid,
+            block_size: h["block_size"].as_u64().unwrap() as u32,
+            scheme: ParityConfig::Scheme(scheme(
+                h["scheme"]["k"].as_u64().unwrap(),
+                h["scheme"]["m"].as_u64().unwrap(),
+                h["scheme"]["S"].as_u64().unwrap(),
+            )),
+        });
+        let mode = hints
+            .as_ref()
+            .map_or(ScanMode::Standard, ScanMode::Recovery);
+        let (mut walk, _) = source(&vector, &faults);
+        let (mut forward, _) = source(&vector, &faults);
+        let walk = scan_reconstruct_filemark_map_with_report_mode(
+            &mut DriveHandleRawSource::new(&mut walk),
+            &uuid,
+            block_size,
+            mode,
+        );
+        let forward = remanence_parity::scan::forward_file_scan_for_test(
+            &mut DriveHandleRawSource::new(&mut forward),
+            &uuid,
+            block_size,
+            mode,
+        );
+        let files = remanence_parity::scan::take_forward_file_io_for_test();
+        let tape = tape_with_faults(&vector, &faults);
+        let mut healthy_files = 0;
+        for file in &files {
+            let start = file.head_position.lba as usize;
+            let Some(rest) = tape.records.get(start..) else {
+                continue;
+            };
+            let Some(end) = rest.iter().position(|r| matches!(r, Record::Filemark)) else {
+                continue;
+            };
+            let contains = |at: usize| (start..=start + end).contains(&at);
+            let damaged = ["unreadable_records", "record_edits"].iter().any(|key| {
+                faults[*key].as_array().is_some_and(|rows| {
+                    rows.iter()
+                        .any(|r| contains(r["lba"].as_u64().unwrap() as usize))
+                })
+            }) || faults["removed_filemark_after_tape_file"]
+                .as_u64()
+                .is_some_and(|number| {
+                    contains(vector.image.files[number as usize].filemark_record.unwrap())
+                });
+            if damaged
+                || end == 0
+                || !rest[..end]
+                    .iter()
+                    .all(|r| matches!(r, Record::Block(b) if b.len() == block_size as usize))
+            {
+                continue;
+            }
+            healthy_files += 1;
+            assert_eq!(file.fallbacks, 0, "{id}: {file:?}");
+            assert_eq!(file.positioned_classification_reads, 0, "{id}: {file:?}");
+        }
+        if let (Ok(walk), Ok(forward)) = (&walk, &forward) {
+            assert_eq!(walk, forward, "{id}");
+            assert!(
+                !files.is_empty(),
+                "{id}: file-reader path was not exercised"
+            );
+        }
+        assert_eq!(format!("{walk:?}"), format!("{forward:?}"), "{id}");
+        println!("{id}: {healthy_files} healthy files have zero fallbacks and positioned classification reads");
+    }
+    println!("forward file reader / walk: {} damage vectors", cases.len());
 }
