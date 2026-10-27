@@ -178,7 +178,14 @@ fn preserve_measurement_on_cleanup_error(
 }
 
 #[cfg(target_os = "linux")]
-use remanence_library::verification_read_completion as completion;
+fn completion(
+    error: &remanence_library::TapeIoError,
+    size: u32,
+    count: u32,
+) -> (u32, &'static str) {
+    let (records, outcome) = remanence_library::verification_read_completion(error, size, count);
+    (records, outcome.name())
+}
 
 #[cfg(target_os = "linux")]
 /// Median command latency, or no value when no commands were timed.

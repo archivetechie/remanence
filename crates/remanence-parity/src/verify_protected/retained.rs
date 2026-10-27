@@ -85,6 +85,9 @@ pub(super) struct RetainedSource<'a> {
     enabled: bool,
     used: usize,
     budget: usize,
+    pub(super) positioned: bool,
+    observed_extent: Option<(u32, u64, u64)>,
+    fallback_counted: bool,
 }
 
 impl<'a> RetainedSource<'a> {
@@ -99,11 +102,58 @@ impl<'a> RetainedSource<'a> {
             recording: false,
             enabled: false,
             used: 0,
+            positioned: false,
+            observed_extent: None,
+            fallback_counted: false,
             #[cfg(not(test))]
             budget: METADATA_BUDGET,
             #[cfg(test)]
             budget: TEST_METADATA_BUDGET.get(),
         }
+    }
+
+    /// Replay the file reader's bounded windows through the existing acquisition source.
+    pub(super) fn from_file(
+        source: &'a mut dyn RawTapeSource,
+        block_size: u32,
+        observation: &crate::scan::forward_file::FileObservation,
+    ) -> Self {
+        let mut retained = Self::new(source, block_size);
+        retained.enabled = true;
+        retained.observed_extent = Some((
+            observation.head_position.partition,
+            observation.head_position.lba,
+            observation
+                .head_position
+                .lba
+                .saturating_add(observation.whole_blocks),
+        ));
+        for offset in observation.retained_offsets() {
+            if let Some(bytes) = observation.retained(offset) {
+                let position = PhysicalPositionHint {
+                    lba: observation.head_position.lba + offset,
+                    ..observation.head_position
+                };
+                let after = PhysicalPositionHint {
+                    lba: position.lba + 1,
+                    ..position
+                };
+                retained.metadata.insert(
+                    (position.partition, position.lba),
+                    RetainedRecord {
+                        record: Record::Read(
+                            RawReadOutcome::Block {
+                                bytes: bytes.len(),
+                                position_after: after,
+                            },
+                            bytes.into(),
+                        ),
+                        after: Some(after),
+                    },
+                );
+            }
+        }
+        retained
     }
 
     /// Segment boundaries keep metadata out of hardware batches, so its second
@@ -161,12 +211,25 @@ impl<'a> RetainedSource<'a> {
         Ok(())
     }
 
+    /// Charge a live read within this observed file once; data rereads count at their epoch.
+    fn count_missing(&mut self, position: PhysicalPositionHint) {
+        if !self.fallback_counted
+            && self.observed_extent.is_some_and(|(partition, start, end)| {
+                position.partition == partition && (start..end).contains(&position.lba)
+            })
+        {
+            self.source.verification_context().algorithmic_fallback();
+            self.fallback_counted = true;
+        }
+    }
+
     fn position_live(&mut self) -> Result<PhysicalPositionHint, ParityError> {
         let cursor = self
             .cursor
             .ok_or(ParityError::Invariant("retained read requires a position"))?;
         if self.live_next != Some(cursor) {
             self.live_next = None;
+            self.positioned = true;
             self.source.locate_physical(cursor)?;
             self.live_next = Some(cursor);
         }
@@ -190,6 +253,36 @@ impl RawTapeSource for RetainedSource<'_> {
         self.source.verification_context()
     }
 
+    fn position_report(&mut self) -> Result<crate::raw::RawPositionReport, ParityError> {
+        if !self.enabled {
+            return self.source.position_report();
+        }
+        Err(ParityError::Invariant(
+            "retained source cannot report physical measurement",
+        ))
+    }
+
+    fn read_forward_records(
+        &mut self,
+        buf: &mut [u8],
+        size: u32,
+        count: u32,
+    ) -> crate::raw::RawForwardReadBatch {
+        if !self.enabled {
+            return self.source.read_forward_records(buf, size, count);
+        }
+        crate::raw::RawForwardReadBatch {
+            batch: RawReadBatch {
+                records_read: 0,
+                position_after: None,
+                end: crate::raw::RawReadEnd::Error(ParityError::Invariant(
+                    "retained source cannot measure physical files",
+                )),
+            },
+            unconfirmed_boundary: false,
+        }
+    }
+
     fn configure_fixed_block_size(&mut self, size: u32) -> Result<(), ParityError> {
         self.source.configure_fixed_block_size(size)
     }
@@ -201,6 +294,8 @@ impl RawTapeSource for RetainedSource<'_> {
         if !self.metadata.contains_key(&(hint.partition, hint.lba)) {
             self.cursor = None;
             self.live_next = None;
+            self.count_missing(hint);
+            self.positioned = true;
             self.source.locate_physical(hint)?;
             self.live_next = Some(hint);
         }
@@ -256,6 +351,7 @@ impl RawTapeSource for RetainedSource<'_> {
         if self.recording
             && matches!(&result, Err(ParityError::TapeIo(error)) if tape_error_is_current_medium_damage(error))
         {
+            self.positioned = true;
             self.source.locate_physical(cursor)?;
             result = self.source.read_record(buf);
             self.accept_live(&result);

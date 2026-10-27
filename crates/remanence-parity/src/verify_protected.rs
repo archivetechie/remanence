@@ -23,6 +23,7 @@
 //! only one that may report a tape's protected content as verified.
 
 mod forward;
+pub(crate) mod one_pass;
 mod retained;
 use forward::{DataObservation, ForwardPass, PendingEpoch, PENDING_BUDGET};
 
@@ -528,6 +529,32 @@ fn verify_sidecar_cached<const BUFFER_SIDECAR: bool>(
     directory_cache: &mut crate::recovery::DirectoryCache,
     pending: Option<&PendingEpoch>,
 ) -> Result<SidecarVerification, ParityError> {
+    verify_sidecar_observed::<BUFFER_SIDECAR>(
+        source,
+        scoped_map,
+        sidecar,
+        scheme,
+        tape_uuid,
+        block_size,
+        directory_cache,
+        pending,
+        None,
+    )
+}
+
+/// The same acquisition and checks consume sidecar observations from either reader.
+#[allow(clippy::too_many_arguments)]
+fn verify_sidecar_observed<const BUFFER_SIDECAR: bool>(
+    source: &mut dyn RawTapeSource,
+    scoped_map: &ScopedFilemarkMap,
+    sidecar: &TapeFileMapEntry,
+    scheme: &ParityScheme,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    directory_cache: &mut crate::recovery::DirectoryCache,
+    pending: Option<&PendingEpoch>,
+    observed_shards: Option<std::collections::BTreeMap<u64, DataObservation>>,
+) -> Result<SidecarVerification, ParityError> {
     let _phase = source
         .verification_context()
         .phase(remanence_library::verification_io::VerificationPhase::Sidecar);
@@ -550,7 +577,7 @@ fn verify_sidecar_cached<const BUFFER_SIDECAR: bool>(
     if BUFFER_SIDECAR {
         retained.read_sidecar(scoped_map, sidecar, scheme)?;
     }
-    let shards = std::mem::take(&mut retained.shards);
+    let shards = observed_shards.unwrap_or_else(|| std::mem::take(&mut retained.shards));
     let source: &mut dyn RawTapeSource = &mut retained;
     let mut findings = Vec::new();
     let mut reader = SequentialReader::new(source, block_size);
@@ -740,7 +767,11 @@ fn verify_sidecar_cached<const BUFFER_SIDECAR: bool>(
         let mut run = crate::raw::ReadRun::new(
             reader.source,
             block_size,
-            overlap_end - overlap_start - buffered_len,
+            if buffered_len == 0 {
+                overlap_end - overlap_start
+            } else {
+                0
+            },
         );
         let mut reader = SequentialReader::new(&mut run, block_size);
         let mut ordinal = overlap_start;
@@ -756,8 +787,12 @@ fn verify_sidecar_cached<const BUFFER_SIDECAR: bool>(
             let offset = (ordinal - overlap_start) as usize;
             // Observations carry no physical cursor. The first unbuffered read
             // (if any) locates from the live source's actual metadata position.
-            let observation = match buffered.filter(|run| offset < run.len()) {
-                Some(run) => run.get(offset),
+            let observation = match buffered
+                .filter(|run| offset < run.len())
+                .map(|run| run.get(offset))
+                .filter(|observation| observation.is_present())
+            {
+                Some(observation) => observation,
                 None => {
                     let context = reader.source.verification_context();
                     if !fallback_counted {

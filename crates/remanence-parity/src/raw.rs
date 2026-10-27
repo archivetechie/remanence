@@ -1691,7 +1691,7 @@ impl RawTapeSource for DriveHandleRawSource<'_> {
     fn position_report(&mut self) -> Result<RawPositionReport, ParityError> {
         let report = self.drive.position_report()?;
         let position = report.position.into();
-        self.cursor_hint = Some(position);
+        self.cursor_hint = (!report.logical_object_number_unknown).then_some(position);
         Ok(RawPositionReport {
             position,
             logical_file_identifier: Some(report.logical_file_identifier),
@@ -1709,30 +1709,39 @@ impl RawTapeSource for DriveHandleRawSource<'_> {
         let mut unconfirmed_boundary = false;
         let result = (|| {
             let before = self.current_or_seed_position()?;
-            let selected = count.min(
-                (self.drive.sg_reserved_size_bytes() / block_size.max(1))
-                    .clamp(1, self.drive.requested_read_batch_blocks().max(1)),
-            );
-            let read = self
+            let (selected, read) = self
                 .drive
-                .read_block_batch_for_file_verification(buf, block_size, selected);
+                .read_block_batch_for_file_verification(buf, block_size, count);
             let (records, boundary) = match read {
-                Ok(read) => (read.records_read, "complete"),
+                Ok(read) => (read.records_read, None),
                 Err(error) => {
                     self.cursor_hint = None;
                     let (records, boundary) = remanence_library::verification_read_completion(
                         &error, block_size, selected,
                     );
-                    if boundary == "unconfirmed_boundary" {
+                    if boundary
+                        == remanence_library::VerificationReadCompletion::UnconfirmedBoundary
+                    {
                         unconfirmed_boundary = true;
                         let filemark =
                             error.check_condition_transfer().is_some_and(|(sense, _)| {
                                 remanence_library::decode_scsi_sense(sense)
                                     .is_some_and(|s| s.key == 0 && s.filemark)
                             });
-                        (0, if filemark { "filemark" } else { "end_of_data" })
-                    } else if matches!(boundary, "filemark" | "end_of_data") {
-                        (records, boundary)
+                        (
+                            0,
+                            Some(if filemark {
+                                remanence_library::VerificationReadCompletion::Filemark
+                            } else {
+                                remanence_library::VerificationReadCompletion::EndOfData
+                            }),
+                        )
+                    } else if matches!(
+                        boundary,
+                        remanence_library::VerificationReadCompletion::Filemark
+                            | remanence_library::VerificationReadCompletion::EndOfData
+                    ) {
+                        (records, Some(boundary))
                     } else {
                         return Err(error.into());
                     }
@@ -1740,12 +1749,16 @@ impl RawTapeSource for DriveHandleRawSource<'_> {
             };
             let after = device_position_after(before, u64::from(records), "forward batch")?;
             let end = match boundary {
-                "filemark" => RawReadEnd::Filemark {
-                    position_after: device_position_after(after, 1, "forward boundary hint")?,
-                },
-                "end_of_data" => RawReadEnd::EndOfData {
-                    position_after: after,
-                },
+                Some(remanence_library::VerificationReadCompletion::Filemark) => {
+                    RawReadEnd::Filemark {
+                        position_after: device_position_after(after, 1, "forward boundary hint")?,
+                    }
+                }
+                Some(remanence_library::VerificationReadCompletion::EndOfData) => {
+                    RawReadEnd::EndOfData {
+                        position_after: after,
+                    }
+                }
                 _ => {
                     self.cursor_hint = Some(after);
                     RawReadEnd::Complete
@@ -2895,6 +2908,60 @@ mod compat_tests {
             )
             .unwrap();
         (drive, log)
+    }
+
+    /// LONU discards the raw cursor as well as the drive's position evidence.
+    #[test]
+    fn lonu_report_discards_raw_cursor() {
+        let (mut drive, _) = scripted_read_drive(
+            vec![
+                (0x34, Ok(read_position_long_response(0, 0, 42))),
+                (0x34, Ok(read_position_long_response(4, 0, 42))),
+            ],
+            0,
+        );
+        let mut source = DriveHandleRawSource::new(&mut drive);
+        source.position_report().unwrap();
+        assert!(source.cursor_hint.is_some());
+        assert!(
+            source
+                .position_report()
+                .unwrap()
+                .logical_object_number_unknown
+        );
+        assert!(source.cursor_hint.is_none());
+    }
+
+    /// Boundary credit uses the library's issued count after its batch limit applies.
+    #[test]
+    fn forward_credit_uses_actual_issued_batch_count() {
+        let mut sense = vec![0; 18];
+        sense[0] = 0xf0;
+        sense[2] = 0x80;
+        sense[3..7].copy_from_slice(&1u32.to_be_bytes());
+        sense[7] = 10;
+        let (mut drive, log) = scripted_read_drive(
+            vec![
+                (0x34, Ok(read_position_long_response(0, 0, 0))),
+                (
+                    0x08,
+                    Err(remanence_library::ScsiError::CheckCondition {
+                        sense,
+                        bytes_transferred: 8,
+                    }),
+                ),
+            ],
+            0,
+        );
+        let mut source = DriveHandleRawSource::new(&mut drive);
+        let read = source.read_forward_records(&mut [0; 128], 4, 32);
+        assert_eq!(read.batch.records_read, 1);
+        assert!(!read.unconfirmed_boundary);
+        assert!(matches!(read.batch.end, RawReadEnd::Filemark { .. }));
+        assert!(log
+            .borrow()
+            .iter()
+            .any(|c| c[0] == 8 && c[2..5] == [0, 0, 2]));
     }
 
     /// A filemark without VALID sense remains a boundary, never record credit.
@@ -4370,6 +4437,28 @@ impl<S: crate::RawTapeSource> crate::RawTapeSource for CancellableRawSource<S> {
     fn read_record(&mut self, buf: &mut [u8]) -> Result<crate::RawReadOutcome, crate::ParityError> {
         self.check()?;
         self.0.read_record(buf)
+    }
+    fn position_report(&mut self) -> Result<RawPositionReport, ParityError> {
+        self.check()?;
+        self.0.position_report()
+    }
+    fn read_forward_records(
+        &mut self,
+        buf: &mut [u8],
+        size: u32,
+        count: u32,
+    ) -> RawForwardReadBatch {
+        if let Err(error) = self.check() {
+            return RawForwardReadBatch {
+                batch: RawReadBatch {
+                    records_read: 0,
+                    position_after: None,
+                    end: RawReadEnd::Error(error),
+                },
+                unconfirmed_boundary: false,
+            };
+        }
+        self.0.read_forward_records(buf, size, count)
     }
     fn position(&mut self) -> Result<crate::PhysicalPositionHint, crate::ParityError> {
         self.check()?;

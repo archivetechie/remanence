@@ -10,7 +10,7 @@ use std::path::Path;
 use remanence_parity::{
     recover_terminal_inventory_from_bot_controlled_mode,
     recover_terminal_inventory_from_bot_with_authority_controlled_mode,
-    verify_terminal_index_full_with_scan_mode, BotRecoveredObject, BotStructuralRecoveryError,
+    verify_terminal_index_full_with_route, BotRecoveredObject, BotStructuralRecoveryError,
     BotStructuralRecoveryEvent, BotStructuralRecoverySummary, RawTapeSource, ScanWalkControl,
     TerminalIndexVerificationError, TerminalIndexVerificationOutcome,
 };
@@ -64,6 +64,8 @@ pub(super) fn verify_terminal_index_with_checkpoint_authority(
     tape_uuid: &[u8; 16],
     block_size: u32,
     mode: remanence_parity::ScanMode<'_>,
+    route: remanence_parity::VerificationRoute,
+    report: impl FnMut(remanence_parity::VerificationRouteStatus),
 ) -> Result<TerminalIndexVerificationOutcome, TerminalIndexVerificationError> {
     let authority =
         CheckpointBotRecoveryAuthority::try_open(checkpoint_journal_dir, *tape_uuid, block_size)
@@ -71,15 +73,17 @@ pub(super) fn verify_terminal_index_with_checkpoint_authority(
                 message: error.to_string(),
             })?;
     match authority {
-        Some(mut authority) => verify_terminal_index_full_with_scan_mode(
+        Some(mut authority) => verify_terminal_index_full_with_route(
             source,
             tape_uuid,
             block_size,
             Some(&mut authority),
             mode,
+            route,
+            report,
         ),
-        None => {
-            verify_terminal_index_full_with_scan_mode(source, tape_uuid, block_size, None, mode)
-        }
+        None => verify_terminal_index_full_with_route(
+            source, tape_uuid, block_size, None, mode, route, report,
+        ),
     }
 }

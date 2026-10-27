@@ -15,6 +15,7 @@ pub(crate) enum HeadProvenance {
 /// Why the read-derived measurement cannot stand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SpacingReason {
+    NotFullyVerified,
     Unreadable,
     WrongLength,
     UncleanRead,
@@ -49,6 +50,8 @@ pub(crate) enum FileReadEnd {
 pub(crate) struct FileObservation {
     pub(crate) tape_file_number: u64,
     pub(crate) head_position: PhysicalPositionHint,
+    // Provenance remains available to the per-file diagnostic assertions.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) head_provenance: HeadProvenance,
     pub(crate) head_outcome: HeadOutcome,
     pub(crate) head_read: Option<Result<RawReadOutcome, ParityError>>,
@@ -65,7 +68,7 @@ pub(crate) struct FileObservation {
 
 impl FileObservation {
     /// Measure with the walk whenever the sequential read lacks proof.
-    pub(crate) fn measure(
+    pub(super) fn measure(
         &self,
         source: &mut dyn RawTapeSource,
     ) -> Result<MeasureCurrentFileOutcome, ParityError> {
@@ -130,7 +133,15 @@ impl FileObservation {
         Ok(())
     }
 
-    fn retained(&self, offset: u64) -> Option<&[u8]> {
+    /// Iterate the bounded retained windows without visiting the file's interior.
+    pub(crate) fn retained_offsets(&self) -> impl Iterator<Item = u64> {
+        let first = (self.first.len() / self.block_size).max(1) as u64;
+        let tail = (self.tail.len() / self.block_size).max(1) as u64;
+        (0..first.min(self.whole_blocks))
+            .chain(self.whole_blocks.saturating_sub(tail).max(first)..self.whole_blocks)
+    }
+
+    pub(crate) fn retained(&self, offset: u64) -> Option<&[u8]> {
         if self.requires_spacing.is_some() || offset >= self.whole_blocks {
             return None;
         }
@@ -160,6 +171,7 @@ pub(crate) type BlockObserver<'a> =
 
 /// Reusable batch buffer; no per-block allocation occurs while streaming.
 pub(crate) struct ForwardFileReader {
+    pub(crate) read_through: bool,
     block_size: u32,
     batch_blocks: u32,
     buffer: Vec<u8>,
@@ -174,6 +186,7 @@ impl ForwardFileReader {
             .checked_mul(batch_blocks as usize)
             .ok_or(ParityError::Invariant("forward batch size overflows"))?;
         Ok(Self {
+            read_through: true,
             block_size,
             batch_blocks,
             buffer: vec![0; len],
@@ -266,6 +279,11 @@ impl ForwardFileReader {
                     .checked_add(1)
                     .ok_or_else(|| device_position_error("whole-block count overflows"))?;
             }
+            if !self.read_through && matches!(batch.end, RawReadEnd::Complete) {
+                observation.requires_spacing = Some(SpacingReason::NotFullyVerified);
+                observation.boundary = FileReadEnd::UncleanRead;
+                return Ok(observation);
+            }
             match batch.end {
                 RawReadEnd::Complete => continue,
                 RawReadEnd::Filemark { position_after } => {
@@ -288,6 +306,8 @@ impl ForwardFileReader {
                     let expected = device_position_after(expected, 1, "forward filemark")?;
                     observation.requires_spacing = if report.logical_object_number_unknown {
                         Some(SpacingReason::PositionUnknown)
+                    } else if forward.unconfirmed_boundary {
+                        Some(SpacingReason::UncleanRead)
                     } else if report.position != expected {
                         Some(SpacingReason::PositionMismatch)
                     } else if !report.mark_position_unknown
@@ -296,8 +316,6 @@ impl ForwardFileReader {
                             .is_some_and(|file| tape_file_number.checked_add(1) != Some(file))
                     {
                         Some(SpacingReason::FileIdentifierMismatch)
-                    } else if forward.unconfirmed_boundary {
-                        Some(SpacingReason::UncleanRead)
                     } else {
                         None
                     };
@@ -339,8 +357,13 @@ impl ForwardFileReader {
                         )
                         .1
                         {
-                            "wrong_length" => SpacingReason::WrongLength,
-                            "unclean_read" | "recovered_error" => SpacingReason::UncleanRead,
+                            remanence_library::VerificationReadCompletion::WrongLength => {
+                                SpacingReason::WrongLength
+                            }
+                            remanence_library::VerificationReadCompletion::UncleanRead
+                            | remanence_library::VerificationReadCompletion::RecoveredError => {
+                                SpacingReason::UncleanRead
+                            }
                             _ => return Err(error),
                         }
                     } else {

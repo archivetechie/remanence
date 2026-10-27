@@ -3273,6 +3273,85 @@ fn forward_verification_matches_step1_for_entire_damage_matrix() {
     println!("forward / Step 1 equivalence: {} damage cases", cases.len());
 }
 
+#[test]
+fn one_pass_matches_walk_for_entire_damage_matrix() {
+    let frozen: Value = serde_json::from_str(EXPECTATIONS).unwrap();
+    let cases = frozen["cases"].as_array().unwrap();
+    assert!(!cases.is_empty());
+    let mut distinct_schedules = 0;
+    let mut successes = 0;
+    let mut fallbacks = 0;
+    let mut reasons = BTreeMap::new();
+    for case in cases {
+        let id = case["id"].as_str().unwrap();
+        let vector = generate(case["image"].as_str().unwrap()).unwrap();
+        let faults = fault_map_of(case, &vector);
+        let uuid = vector.written.inputs.tape_uuid;
+        let block_size = vector.written.inputs.block_size;
+        let hints = faults["hints"].as_object().map(|h| ScanRecoveryHints {
+            tape_uuid: uuid,
+            block_size: h["block_size"].as_u64().unwrap() as u32,
+            scheme: ParityConfig::Scheme(scheme(
+                h["scheme"]["k"].as_u64().unwrap(),
+                h["scheme"]["m"].as_u64().unwrap(),
+                h["scheme"]["S"].as_u64().unwrap(),
+            )),
+        });
+        let mode = hints
+            .as_ref()
+            .map_or(ScanMode::Standard, ScanMode::Recovery);
+        let (mut before, _, before_log) = source_with_command_log(&vector, &faults);
+        let (mut after, _, after_log) = source_with_command_log(&vector, &faults);
+        let before = verify_terminal_index_full_with_scan_mode(
+            &mut DriveHandleRawSource::new(&mut before),
+            &uuid,
+            block_size,
+            None,
+            mode,
+        );
+        let mut fell_back = false;
+        let after = remanence_parity::verify_terminal_index_full_with_route(
+            &mut remanence_parity::raw::CancellableRawSource(DriveHandleRawSource::new(&mut after)),
+            &uuid,
+            block_size,
+            None,
+            mode,
+            remanence_parity::VerificationRoute::OnePass,
+            |status| {
+                fell_back |= status.fell_back;
+                if let Some(reason) = status.fallback_reason {
+                    *reasons.entry(reason).or_insert(0usize) += 1;
+                }
+            },
+        );
+        fallbacks += usize::from(fell_back);
+        successes += usize::from(!fell_back && after.is_ok());
+        if before
+            .as_ref()
+            .is_ok_and(|outcome| outcome.is_complete_tape())
+        {
+            assert!(!fell_back, "healthy fixture must succeed: {id}");
+        }
+        if let (Ok(before), Ok(after)) = (&before, &after) {
+            assert_eq!(before, after, "typed full verification for {id}");
+        }
+        distinct_schedules += usize::from(*before_log.borrow() != *after_log.borrow());
+        assert_eq!(
+            format!("{before:?}"),
+            format!("{after:?}"),
+            "damage case {id}"
+        );
+    }
+    assert!(
+        distinct_schedules > 0,
+        "the observation schedules must actually differ"
+    );
+    println!("one-pass routes: success={successes}, fallback={fallbacks}");
+    println!("fallback reasons: {reasons:?}");
+    println!("distinct transport schedules: {distinct_schedules}");
+    println!("one-pass / walk equivalence: {} damage cases", cases.len());
+}
+
 /// Damage-touched Object files still have to agree with replica row counts;
 /// the relaxed kind/ordinal comparison must never authorize a forward sweep.
 #[test]
@@ -3347,6 +3426,7 @@ fn full_verification_command_counts() {
             image,
             recipe,
         };
+        one_pass_counts::compare(&vector);
         let (mut drive, _, command_log) =
             source_with_command_log(&vector, &json!({"unreadable_records": []}));
         let mut raw = crate::terminal_index_drill::InstrumentedSource::new(
@@ -3551,6 +3631,8 @@ fn metadata_run_positioning_is_independent_of_block_count() {
 }
 
 mod forward_counts;
+#[cfg(test)]
+mod one_pass_counts;
 
 /// Recovery never bypasses the sidecar CRC, including the batch retry path.
 #[test]

@@ -16910,6 +16910,7 @@ mod tests {
             cleaning: remanence_state::CleaningConfig::default(),
             livestatus: remanence_state::LiveStatusConfig::default(),
             tape_io: remanence_state::TapeIoConfig::default(),
+            verification: remanence_state::config::VerificationConfig::default(),
             journal: remanence_state::JournalConfig {
                 dir: root.join("journals"),
                 require_trusted_volume: false,

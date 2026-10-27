@@ -52,6 +52,7 @@ pub(crate) struct WriteOwnerConfig {
     pub managed_library_serials: Arc<HashSet<String>>,
     pub cleaning: CleaningConfig,
     pub tape_io: TapeIoConfig,
+    pub verification_route: remanence_parity::VerificationRoute,
     pub io_memory: Arc<crate::io_memory::IoMemoryReservation>,
     /// Cross-drive claims that make replay-key and canonical-UUID admission
     /// atomic through checkpoint projection.

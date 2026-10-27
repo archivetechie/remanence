@@ -11,6 +11,7 @@ const MPU_BIT: u8 = 1 << 3;
 
 /// Compare typed findings and errors, including bootstrap provenance and ordinals.
 fn equivalent(mut walk: RecordingRawSource, mode: ScanMode<'_>) {
+    compare_full_routes(&walk, &TAPE_UUID, BLOCK_SIZE, mode);
     walk.cursor = 0;
     walk.calls.clear();
     let mut forward = walk.clone();
@@ -188,7 +189,7 @@ fn report_faults_require_spacing_and_spacing_failure_stands() {
             forward_file_scan_for_test(&mut make(), &TAPE_UUID, BLOCK_SIZE, ScanMode::Standard)
                 .unwrap();
         assert_eq!(walk, forward, "{name}");
-        let mut source = make();
+        let mut source = crate::raw::CancellableRawSource(make());
         let observation = ForwardFileReader::new(BLOCK_SIZE, 4)
             .unwrap()
             .read_file(
@@ -208,11 +209,12 @@ fn report_faults_require_spacing_and_spacing_failure_stands() {
             measure_current_file(&mut make(), PhysicalPositionHint::new(0)).unwrap()
         );
         assert!(source
+            .0
             .source
             .calls
             .windows(2)
             .any(|calls| calls == [ScanCall::Locate(0), ScanCall::SpaceFilemarks(1)]));
-        source.fail_space = true;
+        source.0.fail_space = true;
         assert!(
             matches!(
                 observation.measure(&mut source),
@@ -312,6 +314,7 @@ pub(super) fn checked_scan_mode(
     mode: ScanMode<'_>,
 ) -> Result<ScanWalkResult, ParityError> {
     compare_control_and_bot(source, uuid, size, mode);
+    compare_full_routes(source, uuid, size, mode);
     let mut forward = source.clone();
     let walk =
         super::super::scan_reconstruct_filemark_map_with_report_mode(source, uuid, size, mode);
@@ -588,10 +591,22 @@ fn compare_control_and_bot(
         );
         (format!("{result:?}"), progress)
     };
-    let expected = controlled(&mut fixture.clone());
+    let mut expected_source = fixture.clone();
+    expected_source.calls.clear();
+    let expected = controlled(&mut expected_source);
     FILES.with_borrow_mut(Vec::clear);
     let actual = with_forward(|| controlled(&mut fixture.clone()));
     assert_eq!(expected, actual, "controlled scan");
+    if expected_source
+        .calls
+        .iter()
+        .any(|call| matches!(call, ScanCall::ReadRecord(_)))
+    {
+        assert!(
+            !FILES.with_borrow(|files| files.is_empty()),
+            "controlled scan runs the forward reader"
+        );
+    }
     if !FILES.with_borrow(|files| files.is_empty()) {
         assert_healthy_read_through(&fixture.records, size);
     }
@@ -617,10 +632,22 @@ fn compare_control_and_bot(
         );
         (format!("{result:?}"), objects, progress)
     };
-    let expected = recover(&mut fixture.clone());
+    let mut expected_source = fixture.clone();
+    expected_source.calls.clear();
+    let expected = recover(&mut expected_source);
     FILES.with_borrow_mut(Vec::clear);
     let actual = with_forward(|| recover(&mut fixture.clone()));
     assert_eq!(expected, actual, "BOT recovery");
+    if expected_source
+        .calls
+        .iter()
+        .any(|call| matches!(call, ScanCall::ReadRecord(_)))
+    {
+        assert!(
+            !FILES.with_borrow(|files| files.is_empty()),
+            "BOT recovery runs the forward reader"
+        );
+    }
     if !FILES.with_borrow(|files| files.is_empty()) {
         assert_healthy_read_through(&fixture.records, size);
     }
@@ -694,7 +721,9 @@ fn controlled_scan_and_bot_abort_at_same_file_boundary() {
             (last_tape_file_number, position, structural_candidate_count)
         };
         let mut forward = fixture.clone();
-        let expected = recover(&mut fixture.clone());
+        let mut expected_source = fixture.clone();
+        expected_source.calls.clear();
+        let expected = recover(&mut expected_source);
         let actual = with_forward(|| recover(&mut forward));
         assert_eq!(expected, actual);
         assert!(!forward
@@ -737,4 +766,47 @@ fn next_head_provenance_tracks_fallback_and_classification_locates() {
             assert_eq!(files[1].provenance, HeadProvenance::DeviceReport);
         });
     }
+}
+
+/// Fresh sources preserve the same record faults for both full-verification routes.
+fn compare_full_routes(
+    fixture: &RecordingRawSource,
+    uuid: &[u8; 16],
+    size: u32,
+    mode: ScanMode<'_>,
+) {
+    let walk = crate::verify_terminal_index_full_with_scan_mode(
+        &mut fixture.clone(),
+        uuid,
+        size,
+        None,
+        mode,
+    );
+    let mut fallback = false;
+    let observed = crate::verify_terminal_index_full_with_route(
+        &mut fixture.clone(),
+        uuid,
+        size,
+        None,
+        mode,
+        crate::VerificationRoute::OnePass,
+        |status| fallback |= status.fell_back,
+    );
+    if let (Ok(walk), Ok(observed)) = (&walk, &observed) {
+        assert_eq!(walk, observed);
+        if walk.is_complete_tape() {
+            assert!(!fallback);
+        }
+    }
+    assert_eq!(format!("{walk:?}"), format!("{observed:?}"));
+    println!(
+        "scan full route: {}",
+        if fallback {
+            "fallback"
+        } else if observed.is_ok() {
+            "success"
+        } else {
+            "fault"
+        }
+    );
 }

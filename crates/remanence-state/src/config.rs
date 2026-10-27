@@ -61,6 +61,9 @@ pub struct RemConfig {
     /// Tape I/O batching and position-proof settings.
     #[serde(default)]
     pub tape_io: TapeIoConfig,
+    /// Full tape verification route.
+    #[serde(default)]
+    pub verification: VerificationConfig,
     /// Layer 3c journal settings.
     pub journal: JournalConfig,
     /// Layer 4 audit-log settings.
@@ -69,6 +72,15 @@ pub struct RemConfig {
     pub index: IndexConfig,
     /// Rebuildable tape-catalog cache settings.
     pub cache: CacheConfig,
+}
+
+/// Daemon full-verification scheduling. Unknown route names fail deserialization.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationConfig {
+    /// The walk remains the default until operators opt into one forward pass.
+    #[serde(default)]
+    pub route: remanence_parity::VerificationRoute,
 }
 
 /// Home-mode defaults; `rem setup` saves the selected drive serial here.
@@ -1073,6 +1085,41 @@ fn reject_untrusted_volume(_configured: &Path, _probe: &Path) -> Result<(), Stat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Default and explicit routes round-trip; unknown route names and keys fail.
+    #[test]
+    fn verification_routes_are_validated() {
+        use remanence_parity::VerificationRoute;
+        assert_eq!(
+            parse_config_toml(&valid_config())
+                .unwrap()
+                .verification
+                .route,
+            VerificationRoute::Walk
+        );
+        for (name, route) in [
+            ("walk", VerificationRoute::Walk),
+            ("one_pass", VerificationRoute::OnePass),
+        ] {
+            let config = parse_config_toml(&format!(
+                "{}\n[verification]\nroute = \"{}\"\n",
+                valid_config(),
+                name
+            ))
+            .unwrap();
+            assert_eq!(config.verification.route, route);
+            assert_eq!(
+                parse_config_toml(&toml::to_string(&config).unwrap()).unwrap(),
+                config
+            );
+        }
+        for extra in [r#"route = "fast""#, "unknown = true"] {
+            assert!(
+                parse_config_toml(&format!("{}\n[verification]\n{extra}\n", valid_config()))
+                    .is_err()
+            );
+        }
+    }
 
     fn valid_config() -> String {
         let root = std::env::temp_dir().join("remanence-state-config-test");

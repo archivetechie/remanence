@@ -930,6 +930,32 @@ mod reowp_drive_surface {
         .expect("standalone drive opens over fixture transport")
     }
 
+    /// A flagged device report never establishes the drive's arithmetic cursor.
+    #[test]
+    fn lonu_report_invalidates_the_drive_cursor() {
+        let mut valid = vec![0; 32];
+        valid[8..16].copy_from_slice(&42u64.to_be_bytes());
+        let mut unknown = valid.clone();
+        unknown[0] = 4;
+        let mut drive = drive_with_responses(vec![valid, unknown]);
+        assert!(
+            !drive
+                .position_report()
+                .unwrap()
+                .logical_object_number_unknown
+        );
+        assert!(drive.position_known);
+        assert!(drive.expected_position.is_some());
+        assert!(
+            drive
+                .position_report()
+                .unwrap()
+                .logical_object_number_unknown
+        );
+        assert!(!drive.position_known);
+        assert!(drive.expected_position.is_none());
+    }
+
     /// A three-wrap long-form response: two completed wraps and the
     /// EOD wrap, using the documented wrap 0/1 end LOIs from the real
     /// LTO-8 capture.
