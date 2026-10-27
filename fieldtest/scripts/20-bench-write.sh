@@ -114,6 +114,12 @@ PY
 )"
   fieldtest_bench_record "write-$label" "$serial" "n/a" "$pool" "$mb_s" "$seconds" "$bytes"
   fieldtest_evidence_record "$SCRIPT_NAME" "$label" PASS "wrote $bytes bytes at ${mb_s} MB/s" "$out_path"
+  local daemon_total daemon_transfer
+  daemon_total="$(fieldtest_daemon_phase_rate drive_append_total)"
+  daemon_transfer="$(fieldtest_daemon_phase_rate transfer)"
+  if [[ -n "$daemon_total" || -n "$daemon_transfer" ]]; then
+    fieldtest_evidence_record "$SCRIPT_NAME" "$label-daemon" INFO "daemon drive-side: whole append ${daemon_total%% *} MiB/s, transfer phase ${daemon_transfer%% *} MiB/s (the kit figure spans the whole client call)" "$out_path"
+  fi
 }
 
 bench_write_batch_list() {

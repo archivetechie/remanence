@@ -1338,6 +1338,30 @@ fieldtest_require_overlap_staging() {
   return 1
 }
 
+# Prints "throughput_mib_s elapsed_ms" from the daemon's latest write or read
+# diagnostic line for a phase (drive_append_total, transfer, restore_total),
+# or nothing when the log has none. The kit's own MB/s spans the whole client
+# call; the daemon's figure is the drive-side rate.
+fieldtest_daemon_phase_rate() {
+  local phase="$1" log line
+  log="$(fieldtest_log_dir)/rem-daemon.log"
+  [[ -f "$log" ]] || return 0
+  line="$(grep -E "\"phase\":\"$phase\"" "$log" | tail -n 1)"
+  [[ -n "$line" ]] || return 0
+  python3 - "$line" <<'PY'
+import json, re, sys
+line = sys.argv[1]
+try:
+    d = json.loads(line)
+except ValueError:
+    raise SystemExit(0)
+rate = d.get("throughput_mib_s") or d.get("drive_rate_mib_s")
+elapsed = d.get("elapsed_ms") or d.get("wall_ms")
+if rate is not None:
+    print(f"{float(rate):.1f} {float(elapsed or 0):.0f}")
+PY
+}
+
 fieldtest_drain_drives() {
   local serial="$1"
   local lib_json loaded_drives bay barcode

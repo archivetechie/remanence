@@ -116,6 +116,11 @@ PY
 )"
   fieldtest_bench_record read "$serial" n/a fieldtest-a "$mb_s" "$seconds" "$bytes"
   fieldtest_evidence_record "$SCRIPT_NAME" sustained PASS "full-object read restored $bytes bytes at ${mb_s} MB/s" "$workdir/read.json"
+  local daemon_restore
+  daemon_restore="$(fieldtest_daemon_phase_rate restore_total)"
+  if [[ -n "$daemon_restore" ]]; then
+    fieldtest_evidence_record "$SCRIPT_NAME" sustained-daemon INFO "daemon drive-side restore rate ${daemon_restore%% *} MiB/s over ${daemon_restore##* } ms (the kit figure spans the whole client call)" "$workdir/read.json"
+  fi
 
   local range_dir
   range_dir="$workdir/range"
