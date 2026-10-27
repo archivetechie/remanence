@@ -9,15 +9,17 @@ usage() {
   cat <<'EOF'
 Usage: 50-soak.sh start|stop|report [--help]
 
-Runs or reports a background write/read/verify soak loop.
+Runs or reports a background write/read/verify soak loop. The report sums the
+cycle records of every run in the soak journal and prints each run's counts.
 EOF
 }
 
 soak_loop() {
   fieldtest_init_layout
   fieldtest_detect_env || true
-  local serial pidfile journal workdir source object locator restore count=0
+  local serial pidfile journal workdir source object locator restore count=0 run_id
   serial="$(fieldtest_selected_library_serial)"
+  run_id="$(fieldtest_timestamp_id)-$$"
   pidfile="$(fieldtest_soak_pidfile)"
   journal="$(fieldtest_soak_journal)"
   workdir="$(mktemp -d "$(fieldtest_spool_dir)/soak-${RANDOM}.XXXXXX")"
@@ -48,9 +50,9 @@ PY
     fieldtest_capture_json "$workdir/build-$count.json" "$(fieldtest_rem_bin)" archive build --inputs "$source" --out "$object" || true
     if fieldtest_capture_io_json "$locator" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$serial" --file "$object" --pool fieldtest-a; then
       fieldtest_capture_io_json "$workdir/read-$count.json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" read --object "$(cat "$locator")" --out "$restore" || true
-      echo "{\"cycle\":$count,\"status\":\"ok\",\"object\":\"$object\"}" >>"$journal"
+      echo "{\"run\":\"$run_id\",\"utc\":\"$(fieldtest_now_utc)\",\"cycle\":$count,\"status\":\"ok\",\"object\":\"$object\"}" >>"$journal"
     else
-      echo "{\"cycle\":$count,\"status\":\"write-failed\"}" >>"$journal"
+      echo "{\"run\":\"$run_id\",\"utc\":\"$(fieldtest_now_utc)\",\"cycle\":$count,\"status\":\"write-failed\"}" >>"$journal"
     fi
     count=$((count + 1))
     fieldtest_release_lock
@@ -94,17 +96,34 @@ report_soak() {
 import json,sys
 from pathlib import Path
 journal = Path(sys.argv[1])
-total = ok = failed = 0
+runs = {}
+untagged = 0
+previous_cycle = None
 for raw in journal.read_text().splitlines():
     if not raw.strip():
         continue
-    total += 1
     data = json.loads(raw)
+    key = data.get("run")
+    if not key:
+        # A record without a run tag: every run's cycle counter starts at 0,
+        # so a cycle that does not follow the previous one starts a new run.
+        cycle = data.get("cycle")
+        if untagged == 0 or (isinstance(cycle, int) and isinstance(previous_cycle, int) and cycle <= previous_cycle):
+            untagged += 1
+        previous_cycle = cycle
+        key = f"untagged-{untagged}"
+    run = runs.setdefault(key, {"cycles": 0, "ok": 0, "failed": 0, "first": data.get("utc"), "last": None})
+    run["cycles"] += 1
     if data.get("status") == "ok":
-        ok += 1
+        run["ok"] += 1
     else:
-        failed += 1
-print(f"cycles={total} ok={ok} failed={failed}")
+        run["failed"] += 1
+    run["last"] = data.get("utc") or run["last"]
+for key, run in runs.items():
+    span = f" {run['first']} to {run['last']}" if run["first"] else ""
+    print(f"run {key}{span}: cycles={run['cycles']} ok={run['ok']} failed={run['failed']}")
+total = {field: sum(run[field] for run in runs.values()) for field in ("cycles", "ok", "failed")}
+print(f"runs={len(runs)} cycles={total['cycles']} ok={total['ok']} failed={total['failed']}")
 PY
 }
 

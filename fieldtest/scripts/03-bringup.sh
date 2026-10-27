@@ -45,7 +45,7 @@ start_daemon() {
     exit 1
   fi
   if ! fieldtest_require_memlock; then
-    fieldtest_evidence_record "$SCRIPT_NAME" memlock FAIL "refusing to start the daemon under a locked-memory limit that clamps the staging ring; raise RLIMIT_MEMLOCK for the daemon (see stderr)"
+    fieldtest_evidence_record "$SCRIPT_NAME" memlock FAIL "refusing to start the daemon under a locked-memory limit below 1 GiB, which caps the read reservoir; raise RLIMIT_MEMLOCK for the daemon (see stderr)"
     exit 1
   fi
   # Close the work-lock descriptor for the tmux server: a server started here

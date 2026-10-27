@@ -1270,6 +1270,14 @@ PY
   rm -f "$report"
 }
 
+# Prints the media-readiness operation a `rem tape wait-ready` output names:
+# its own operation_id, or the active operation it says to resume. Empty if
+# the output names none.
+fieldtest_wait_ready_operation_from_output() {
+  local output="$1" uuid='[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+  sed -nE "s/.*\"operation_id\": *\"($uuid)\".*/\1/p; s/.*--resume +($uuid).*/\1/p" "$output" | head -n 1
+}
+
 # The locked-memory limit the daemon will inherit: the tmux server's when one
 # runs for this user (the daemon starts inside it), otherwise this shell's.
 # Prints "unlimited" or a byte count.
@@ -1292,10 +1300,13 @@ fieldtest_daemon_memlock_limit() {
   fi
 }
 
-# Refuse to start the daemon under a locked-memory limit that would clamp the
-# staging ring and the read reservoir: the drives then run below their
-# speed-matching floor. FIELD_ALLOW_LOW_MEMLOCK=1 overrides for a deliberate
-# low-memory test. Requires unlimited or at least 1 GiB.
+# Refuse to start the daemon under a locked-memory limit below 1 GiB (unlimited
+# passes). Only the read reservoir is locked memory: a low limit stops it
+# growing past the limit, so a restore's drive reader parks more often, and a
+# limit below its minimum leaves slabs in unlocked buffers that may be swapped
+# (binaries without that fallback refuse the read). The write batch is held by
+# the host adapter's per-command grant, not by this limit.
+# FIELD_ALLOW_LOW_MEMLOCK=1 overrides for a deliberate low-memory test.
 fieldtest_require_memlock() {
   local limit
   limit="$(fieldtest_daemon_memlock_limit)"
@@ -1308,8 +1319,11 @@ fieldtest_require_memlock() {
     return 0
   fi
   cat >&2 <<EOF
-error: the daemon would inherit a locked-memory limit of ${limit:-unknown} bytes; the staging ring and
-read reservoir would be clamped and the drives fed below their speed-matching floor.
+error: the daemon would inherit a locked-memory limit of ${limit:-unknown} bytes. Only the read
+reservoir is locked memory: this limit stops it growing past the limit, so a restore's drive
+reader parks more often, and a limit below its minimum leaves slabs in unlocked buffers that may
+be swapped (binaries without that fallback refuse the read). The write batch is held by the
+host adapter's per-command grant, not by this limit.
 Fix as root, then retry:
   printf 'remfield soft memlock unlimited\nremfield hard memlock unlimited\n' > /etc/security/limits.d/remfield.conf
   prlimit --pid \$(tmux display-message -p '#{pid}') --memlock=unlimited:unlimited   # as the remfield user's tmux server
@@ -1408,14 +1422,22 @@ PY
       # A daemon stopped between SSC UNLOAD and the changer move leaves the
       # cartridge unthreaded in the drive, which answers "not ready" until a
       # LOAD arrives. Issue one and retry once before giving up on the bay.
-      local drive_sg
+      # The first wait-ready recorded a readiness operation that fences the
+      # bay, so the retry resumes it; a second --barcode wait is refused.
+      local drive_sg operation target
       drive_sg="$(fieldtest_drive_sg_for_bay "$serial" "$bay")"
       if [[ -n "$drive_sg" ]] && command -v sg_start >/dev/null 2>&1; then
-        echo "warn: drive bay $bay ($barcode) is not ready; issuing LOAD to $drive_sg and retrying once" >&2
+        operation="$(fieldtest_wait_ready_operation_from_output "$readiness_out" || true)"
+        if [[ -n "$operation" ]]; then
+          target=(--resume "$operation")
+        else
+          target=(--barcode "$barcode")
+        fi
+        echo "warn: drive bay $bay ($barcode) is not ready; issuing LOAD to $drive_sg and retrying once (${target[*]})" >&2
         sg_start --load "$drive_sg" >/dev/null 2>&1 || true
         sleep 5
         set +e
-        "$(fieldtest_rem_bin)" tape wait-ready --config "$(fieldtest_config_path)" --library "$serial" --barcode "$barcode" --json >"$readiness_out" 2>&1
+        "$(fieldtest_rem_bin)" tape wait-ready --config "$(fieldtest_config_path)" --library "$serial" "${target[@]}" --json >"$readiness_out" 2>&1
         readiness_rc=$?
         set -e
       fi

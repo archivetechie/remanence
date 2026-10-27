@@ -28,7 +28,8 @@ const DEFAULT_CHUNK_BYTES_U32: u32 = 1_048_576;
 const WRITE_MANY_APPEND_FAILED_EXIT: u8 = 12;
 const DEFAULT_READY_TIMEOUT_SECONDS: u32 = 9_000;
 const DEFAULT_READY_POLL_SECONDS: u32 = 30;
-const DRIVE_BUSY_RETRY_DELAY: Duration = Duration::from_secs(1);
+const DEFAULT_BUSY_WAIT_SECONDS: u64 = 600;
+const DEFAULT_BUSY_RETRY_INTERVAL_SECONDS: u64 = 5;
 
 type AppResult<T> = Result<T, AppError>;
 
@@ -100,6 +101,8 @@ struct Cli {
     endpoint: String,
 
     /// Return immediately on media-readiness fences and busy drive bays.
+    /// Otherwise a busy bay is retried every FIELD_BUSY_RETRY_INTERVAL_S
+    /// seconds (default 5) for up to FIELD_BUSY_WAIT_S seconds (default 600).
     #[arg(long, global = true)]
     no_wait: bool,
 
@@ -232,23 +235,102 @@ async fn connect_daemon(endpoint: &str) -> AppResult<Channel> {
         .map_err(|error| AppError::new(format!("connect daemon at {endpoint}: {error}")))
 }
 
-async fn wait_before_open_retry(channel: Channel, status: &tonic::Status) -> AppResult<()> {
+/// Retry state for one session open. A media-readiness fence is waited on
+/// once; a busy drive bay is polled by re-trying the open every
+/// `busy_interval` for up to `busy_wait`, counted from the first busy refusal.
+struct OpenRetry {
+    busy_wait: Duration,
+    busy_interval: Duration,
+    busy_since: Option<Instant>,
+    fence_waited: bool,
+}
+
+impl OpenRetry {
+    fn from_env() -> AppResult<Self> {
+        let busy_wait = seconds_setting(
+            "FIELD_BUSY_WAIT_S",
+            std::env::var("FIELD_BUSY_WAIT_S").ok(),
+            DEFAULT_BUSY_WAIT_SECONDS,
+        )?;
+        let busy_interval = seconds_setting(
+            "FIELD_BUSY_RETRY_INTERVAL_S",
+            std::env::var("FIELD_BUSY_RETRY_INTERVAL_S").ok(),
+            DEFAULT_BUSY_RETRY_INTERVAL_SECONDS,
+        )?;
+        if busy_interval.is_zero() {
+            return Err(AppError::new(
+                "FIELD_BUSY_RETRY_INTERVAL_S must be at least 1",
+            ));
+        }
+        Ok(Self {
+            busy_wait,
+            busy_interval,
+            busy_since: None,
+            fence_waited: false,
+        })
+    }
+}
+
+/// A whole number of seconds from an environment value; unset or empty gives
+/// the default.
+fn seconds_setting(name: &str, raw: Option<String>, default: u64) -> AppResult<Duration> {
+    match raw.as_deref().map(str::trim) {
+        None | Some("") => Ok(Duration::from_secs(default)),
+        Some(value) => value.parse::<u64>().map(Duration::from_secs).map_err(|_| {
+            AppError::new(format!(
+                "{name} must be a whole number of seconds, got {value:?}"
+            ))
+        }),
+    }
+}
+
+/// The pause before the next open attempt after a busy-bay refusal, clipped so
+/// the last attempt lands on the deadline; `None` once `elapsed` reaches `wait`.
+fn busy_retry_delay(elapsed: Duration, wait: Duration, interval: Duration) -> Option<Duration> {
+    if elapsed >= wait {
+        return None;
+    }
+    Some(interval.min(wait - elapsed))
+}
+
+async fn wait_before_open_retry(
+    channel: Channel,
+    status: &tonic::Status,
+    retry: &mut OpenRetry,
+) -> AppResult<()> {
     if status.code() != tonic::Code::FailedPrecondition {
         return Err(status.clone().into());
     }
     if let Some(operation_id) = media_readiness_operation_id(status.message()) {
+        if retry.fence_waited {
+            return Err(status.clone().into());
+        }
+        retry.fence_waited = true;
         eprintln!(
             "remfield-io: open fenced by media readiness operation {operation_id}; waiting up to {}s",
             DEFAULT_READY_TIMEOUT_SECONDS
         );
-        return wait_for_media_readiness_operation(channel, operation_id).await;
+        wait_for_media_readiness_operation(channel, operation_id).await?;
+        // Time spent on the fence does not count against the busy-bay wait.
+        retry.busy_since = None;
+        return Ok(());
     }
     if drive_bay_busy(status.message()) {
+        let elapsed = retry.busy_since.get_or_insert_with(Instant::now).elapsed();
+        let Some(delay) = busy_retry_delay(elapsed, retry.busy_wait, retry.busy_interval) else {
+            eprintln!(
+                "remfield-io: drive bay still busy after {}s; giving up",
+                elapsed.as_secs()
+            );
+            return Err(status.clone().into());
+        };
         eprintln!(
-            "remfield-io: open found a busy drive bay; retrying once after {:.0}s",
-            DRIVE_BUSY_RETRY_DELAY.as_secs_f64()
+            "remfield-io: open found a busy drive bay; elapsed_s={} wait_s={}; retrying in {:.0}s",
+            elapsed.as_secs(),
+            retry.busy_wait.as_secs(),
+            delay.as_secs_f64()
         );
-        tokio::time::sleep(DRIVE_BUSY_RETRY_DELAY).await;
+        tokio::time::sleep(delay).await;
         return Ok(());
     }
     Err(status.clone().into())
@@ -310,7 +392,7 @@ async fn wait_for_media_readiness_operation(channel: Channel, operation_id: Uuid
         match state {
             pb::OperationState::Succeeded => {
                 eprintln!(
-                    "remfield-io: media readiness operation {operation_id} reached READY; retrying open once"
+                    "remfield-io: media readiness operation {operation_id} reached READY; retrying open"
                 );
                 return Ok(());
             }
@@ -565,17 +647,15 @@ async fn open_write_session(
         idempotency_key: None,
         recover_session_id: None,
     };
-    match client.open_write_session(request()).await {
-        Ok(response) => Ok(response.into_inner().session_id),
-        Err(status) if !no_wait => {
-            wait_before_open_retry(channel, &status).await?;
-            Ok(client
-                .open_write_session(request())
-                .await?
-                .into_inner()
-                .session_id)
+    let mut retry = OpenRetry::from_env()?;
+    loop {
+        match client.open_write_session(request()).await {
+            Ok(response) => return Ok(response.into_inner().session_id),
+            Err(status) if !no_wait => {
+                wait_before_open_retry(channel.clone(), &status, &mut retry).await?
+            }
+            Err(status) => return Err(status.into()),
         }
-        Err(status) => Err(status.into()),
     }
 }
 
@@ -892,13 +972,15 @@ async fn read_command(endpoint: &str, args: ReadArgs, no_wait: bool) -> AppResul
         idempotency_key: None,
         resume_target: None,
     };
-    let session = match read_client.open_read_session(request()).await {
-        Ok(response) => response.into_inner(),
-        Err(status) if !no_wait => {
-            wait_before_open_retry(channel, &status).await?;
-            read_client.open_read_session(request()).await?.into_inner()
+    let mut retry = OpenRetry::from_env()?;
+    let session = loop {
+        match read_client.open_read_session(request()).await {
+            Ok(response) => break response.into_inner(),
+            Err(status) if !no_wait => {
+                wait_before_open_retry(channel.clone(), &status, &mut retry).await?
+            }
+            Err(status) => return Err(status.into()),
         }
-        Err(status) => return Err(status.into()),
     };
     let open_ms = duration_ms(open_started.elapsed());
 
@@ -1605,6 +1687,47 @@ mod tests {
         assert!(drive_bay_busy("drive-session owner is busy"));
         assert!(!drive_bay_busy("all drives are busy"));
         assert!(!drive_bay_busy("drive bay 0x0100 is fenced"));
+    }
+
+    #[test]
+    fn busy_retry_delay_stops_at_the_deadline() {
+        let wait = Duration::from_secs(600);
+        let interval = Duration::from_secs(5);
+        assert_eq!(
+            busy_retry_delay(Duration::ZERO, wait, interval),
+            Some(interval)
+        );
+        assert_eq!(
+            busy_retry_delay(Duration::from_secs(597), wait, interval),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(busy_retry_delay(wait, wait, interval), None);
+        assert_eq!(
+            busy_retry_delay(Duration::from_secs(601), wait, interval),
+            None
+        );
+        assert_eq!(
+            busy_retry_delay(Duration::ZERO, Duration::ZERO, interval),
+            None
+        );
+    }
+
+    #[test]
+    fn busy_wait_settings_default_when_unset_or_empty() {
+        let name = "FIELD_BUSY_WAIT_S";
+        assert_eq!(
+            seconds_setting(name, None, 600).unwrap(),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            seconds_setting(name, Some(" ".to_string()), 600).unwrap(),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            seconds_setting(name, Some("30".to_string()), 600).unwrap(),
+            Duration::from_secs(30)
+        );
+        assert!(seconds_setting(name, Some("ten".to_string()), 600).is_err());
     }
 
     #[test]
