@@ -66,7 +66,7 @@ pub fn verify_terminal_index_full_with_route(
 }
 
 /// Only cancellation can end an attempt without running the walk.
-enum AttemptError {
+pub(super) enum AttemptError {
     Rejected(&'static str),
     Fatal(TerminalIndexVerificationError),
 }
@@ -108,7 +108,7 @@ fn prefix_error(error: ParityError) -> AttemptError {
     }
 }
 
-fn verify_one_pass(
+pub(super) fn verify_one_pass(
     source: &mut dyn RawTapeSource,
     tape_uuid: &[u8; 16],
     block_size: u32,
@@ -121,7 +121,13 @@ fn verify_one_pass(
     let TerminalVerificationPlan {
         measured_eod,
         layout,
+        no_parity,
     } = plan_terminal_verification(source, tape_uuid, block_size)?;
+    // A validated footer's zero protected bound selects the walk without more I/O.
+    // This hint never establishes a verdict: the walk checks contradictory payloads too.
+    if no_parity {
+        return Err(AttemptError::Rejected("no_parity"));
+    }
     let TerminalReplicaSetEvidence {
         edition,
         replicas,
@@ -133,12 +139,6 @@ fn verify_one_pass(
         layout,
         ReplicaRowCheck::CollectOnly,
     )?;
-    if !rows[0]
-        .iter()
-        .any(|row| row.kind == TapeIndexReplicaFileKind::ParitySidecar)
-    {
-        return Err(AttemptError::Rejected("no_parity"));
-    }
     let separation_interior_records = verify_terminal_separations(
         source,
         tape_uuid,
@@ -147,19 +147,17 @@ fn verify_one_pass(
         edition.descriptor.edition_id,
     )?;
     let scoped = scoped_map_from_terminal_replica(&edition, &rows[0]).map_err(prefix_error)?;
-    let mut directory_cache = crate::recovery::DirectoryCache::default();
-    directory_cache
-        .preload(source, &scoped, tape_uuid, block_size)
-        .map_err(prefix_error)?;
-    if matches!(directory_cache, crate::recovery::DirectoryCache::Failed) {
-        return Err(AttemptError::Rejected("directory_load"));
-    }
     let directory = {
         let _phase = source
             .verification_context()
             .phase(remanence_library::verification_io::VerificationPhase::ParityMap);
         crate::parity_map::read_final_parity_map(source, &scoped.map, tape_uuid, block_size)
             .map_err(prefix_error)?
+    };
+    // The walk's reader decides directory availability; both consumers use its result.
+    let directory_cache = match &directory {
+        Some(decoded) => crate::recovery::DirectoryCache::Loaded(decoded.payload.directory.clone()),
+        None => crate::recovery::DirectoryCache::Absent,
     };
     let mut checks = crate::verify_protected::one_pass::PrefixChecks::new(
         scoped,

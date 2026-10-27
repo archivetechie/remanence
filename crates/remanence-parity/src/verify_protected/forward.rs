@@ -92,6 +92,10 @@ impl PendingRun {
     pub(super) fn len(&self) -> usize {
         self.tags.len()
     }
+    /// Fully retracted runs use the same batched reads as missing runs.
+    pub(super) fn has_observations(&self) -> bool {
+        self.tags.iter().any(|&tag| tag != 5)
+    }
     pub(super) fn get(&self, offset: usize) -> DataObservation {
         DataObservation {
             tag: self.tags[offset],

@@ -762,7 +762,9 @@ fn verify_sidecar_observed<const BUFFER_SIDECAR: bool>(
             overlap_start - first,
             overlap_end - overlap_start,
         )?;
-        let buffered = observations.next_if(|run| run.file == entry.tape_file_number);
+        let buffered = observations
+            .next_if(|run| run.file == entry.tape_file_number)
+            .filter(|run| run.has_observations());
         let buffered_len = buffered.map_or(0, |run| run.len() as u64);
         let mut run = crate::raw::ReadRun::new(
             reader.source,
