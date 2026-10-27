@@ -140,6 +140,14 @@ per-release summaries.
   is below 1 GiB and not unlimited (`FIELD_ALLOW_LOW_MEMLOCK=1` overrides).
   `remfield-io` reads committed placement from the catalog after a session
   closes.
+- Release binaries are statically linked against musl and run without a
+  Rust toolchain or a particular C library version.
+  `remanence-<version>-x86_64-unknown-linux-musl.tar.gz` holds `rem`,
+  `rem-debug`, `rem-daemon` and `rem-recover` with the README and `docs/`, and
+  replaces `remanence-x86_64-linux.tar.gz`. The release workflow runs the
+  unpacked binaries before it publishes, and a manual run builds an
+  unpublished preview. `docs/guide-install.md` covers installation and host
+  setup.
 - Dependencies: `rustls` 0.23.46 for RUSTSEC-2026-0346, RUSTSEC-2026-0347,
   RUSTSEC-2026-0348 and RUSTSEC-2026-0349; `rustls-webpki` 0.103.16 for
   RUSTSEC-2026-0382; `ctutils` 0.4.4 for RUSTSEC-2026-0385.

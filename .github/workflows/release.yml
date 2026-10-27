@@ -1,70 +1,214 @@
 name: Release
 
+# A `v*` tag builds, verifies and publishes a release. A manual run on a branch
+# builds and verifies the same files as a preview and publishes nothing; a
+# manual run on a tag behaves like the tag push.
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
-  contents: write
-  actions: read
-  id-token: write
-  attestations: write
-  artifact-metadata: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-musl
 
 jobs:
-  linux-artifacts:
+  build:
+    name: Build static Linux binaries
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      archive: ${{ steps.version.outputs.archive }}
     steps:
-      - name: Checkout tagged source
+      - name: Checkout source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - name: Verify signed tag, main ancestry, and successful CI
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          workspace_versions=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '[.packages[].version] | unique | .[]')
-          test "$GITHUB_REF_NAME" = "v$workspace_versions"
-          python3 tools/release_evidence.py gate --output dist/eligibility.json
-      - name: Install Rust and musl target
+
+      - name: Install Rust, the lint components and the musl target
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: "1.95.0"
+          components: rustfmt, clippy
           targets: x86_64-unknown-linux-musl
+
+      - name: Resolve the release version
+        id: version
+        run: |
+          version=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '[.packages[].version] | unique | .[]')
+          if [ -z "$version" ] || [ "$(printf '%s\n' "$version" | wc -l)" -ne 1 ]; then
+            echo "workspace packages must share one version; found: $version" >&2
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match the workspace version v$version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "archive=remanence-$version-$TARGET" >> "$GITHUB_OUTPUT"
+
+      - name: Verify signed tag, main ancestry, and successful CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/release_evidence.py gate --output dist/eligibility.json
+
       - name: Install build dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y \
-            musl-tools libarchive-tools attr
+            musl-tools libarchive-tools attr file
           cargo install cargo-about --version 0.9.1 --locked --features cli
+
       - name: Run release gates
         run: |
-          cargo test --workspace --locked
+          cargo fmt --all --check
           cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Build Linux binaries
+          cargo test --workspace --locked
+
+      - name: Build static binaries
         run: |
-          cargo build --release --locked -p remanence-cli -p remanence-daemon
-          cargo build --release --locked --target x86_64-unknown-linux-musl -p rem-recover
+          cargo build --release --locked --target "$TARGET" \
+            -p remanence-cli -p remanence-daemon -p rem-recover
+          for bin in rem rem-debug rem-daemon rem-recover; do
+            file "target/$TARGET/release/$bin" | grep -E 'statically linked|static-pie linked'
+          done
+
       - name: Package and checksum artifacts
+        env:
+          ARCHIVE: ${{ steps.version.outputs.archive }}
         run: |
-          install -d dist/remanence-x86_64-linux dist/rem-recover-x86_64-linux-musl
           cargo about generate about.hbs > dist/THIRD-PARTY-LICENSES.html
           test -s dist/THIRD-PARTY-LICENSES.html
-          install -m 0755 target/release/rem target/release/rem-debug target/release/rem-daemon dist/remanence-x86_64-linux/
-          install -m 0755 target/x86_64-unknown-linux-musl/release/rem-recover dist/rem-recover-x86_64-linux-musl/
-          install -m 0644 LICENSE-APACHE-2.0 dist/remanence-x86_64-linux/
-          install -m 0644 LICENSE-APACHE-2.0 dist/rem-recover-x86_64-linux-musl/
-          install -m 0644 dist/THIRD-PARTY-LICENSES.html dist/remanence-x86_64-linux/
-          install -m 0644 dist/THIRD-PARTY-LICENSES.html dist/rem-recover-x86_64-linux-musl/
-          tar -C dist -czf dist/remanence-x86_64-linux.tar.gz remanence-x86_64-linux
-          tar -C dist -czf dist/rem-recover-x86_64-linux-musl.tar.gz rem-recover-x86_64-linux-musl
+          stage="$RUNNER_TEMP/stage"
+          release="target/$TARGET/release"
+          # The operator archive: the four binaries under bin/, and the README,
+          # licensing files and docs/ exactly as committed.
+          install -d "$stage/$ARCHIVE/bin"
+          git -c tar.umask=022 archive --format=tar HEAD \
+            README.md LICENSING.md LICENSE-APACHE-2.0 docs | tar -x -C "$stage/$ARCHIVE"
+          install -m 0755 "$release/rem" "$release/rem-debug" "$release/rem-daemon" \
+            "$release/rem-recover" "$stage/$ARCHIVE/bin/"
+          install -m 0644 dist/THIRD-PARTY-LICENSES.html "$stage/$ARCHIVE/"
+          # The recovery archive stays separate so it can be kept with key
+          # escrow without a full installation.
+          install -d "$stage/rem-recover-x86_64-linux-musl"
+          install -m 0755 "$release/rem-recover" "$stage/rem-recover-x86_64-linux-musl/"
+          install -m 0644 LICENSE-APACHE-2.0 dist/THIRD-PARTY-LICENSES.html \
+            "$stage/rem-recover-x86_64-linux-musl/"
+          # Fixed order, owner and timestamps, so the archive bytes depend only
+          # on the files they hold.
+          epoch=$(git log -1 --format=%ct)
+          for dir in "$ARCHIVE" rem-recover-x86_64-linux-musl; do
+            tar -C "$stage" --sort=name --owner=0 --group=0 --numeric-owner \
+              --mtime="@$epoch" -cf - "$dir" | gzip -9n > "dist/$dir.tar.gz"
+          done
           python3 tools/release_evidence.py record --name remanence-linux --dist dist --lock Cargo.lock
           python3 tools/release_evidence.py manifest --dist dist --lock Cargo.lock --require-build remanence-linux
+
+      - name: Keep the release files for the verify and publish jobs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-dist
+          path: dist/
+          if-no-files-found: error
+
+  verify:
+    name: Verify the archive on a clean runner
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Download the release files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh run download "$GITHUB_RUN_ID" --name release-dist --dir dist
+
+      - name: Check the checksums
+        working-directory: dist
+        run: sha256sum --strict -c SHA256SUMS
+
+      - name: Unpack the archive and run its binaries
+        env:
+          BUILD_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          # On a tag the expected version comes from the tag name, not from the build job.
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            expected=${GITHUB_REF_NAME#v}
+          else
+            expected=$BUILD_VERSION
+          fi
+          archive="remanence-$expected-$TARGET"
+          mkdir unpacked
+          tar -C unpacked -xzf "dist/$archive.tar.gz"
+          root="unpacked/$archive"
+          for path in bin/rem bin/rem-debug bin/rem-daemon bin/rem-recover \
+            README.md LICENSING.md LICENSE-APACHE-2.0 THIRD-PARTY-LICENSES.html \
+            docs/guide-install.md docs/guide-quickstart.md; do
+            test -e "$root/$path" || { echo "missing from $archive: $path" >&2; exit 1; }
+          done
+          # Run each binary in an otherwise empty root with an empty environment:
+          # no dynamic loader, no C library and no configuration.
+          jail="$RUNNER_TEMP/jail"
+          install -d "$jail/bin"
+          install -m 0755 "$root"/bin/* "$jail/bin/"
+          chroot=$(command -v chroot)
+          for bin in rem rem-debug rem-daemon; do
+            printed=$(sudo env -i "$chroot" "$jail" "/bin/$bin" --version)
+            if [ "$printed" != "$bin $expected" ]; then
+              echo "$bin --version printed '$printed'; expected '$bin $expected'" >&2
+              exit 1
+            fi
+            echo "$printed"
+          done
+          # rem-recover has no --version flag; its help proves it starts.
+          sudo env -i "$chroot" "$jail" /bin/rem-recover --help > /dev/null
+          tar -C unpacked -xzf dist/rem-recover-x86_64-linux-musl.tar.gz
+          cmp unpacked/rem-recover-x86_64-linux-musl/rem-recover "$root/bin/rem-recover"
+
+  publish:
+    name: Publish the GitHub release
+    needs: [build, verify]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Download the release files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh run download "$GITHUB_RUN_ID" --name release-dist --dir dist
+
+      - name: Check the checksums
+        working-directory: dist
+        run: sha256sum --strict -c SHA256SUMS
+
       - name: Attest release payload and manifest
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-checksums: dist/SHA256SUMS
+
       - name: Create GitHub release and attach artifacts
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.json dist/THIRD-PARTY-LICENSES.html dist/SHA256SUMS --verify-tag --generate-notes
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.json \
+            dist/THIRD-PARTY-LICENSES.html dist/SHA256SUMS --verify-tag --generate-notes
