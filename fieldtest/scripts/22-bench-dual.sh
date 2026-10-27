@@ -92,40 +92,6 @@ PY
   printf '%s %s %s\n' "$bytes" "$seconds" "$mb_s"
 }
 
-# Waits until no drive of the selected library is busy or cleaning in the
-# daemon's live status, polling every FIELD_BUSY_RETRY_INTERVAL_S seconds
-# (default 5) for up to FIELD_BUSY_WAIT_S seconds (default 600), so the fixture
-# write does not race the park of the previous script's session. The last
-# status snapshot stays in the evidence file. Returns 1 at the deadline.
-wait_for_idle_bays() {
-  local serial="$1" out="$2" wait_s interval_s start busy
-  wait_s="${FIELD_BUSY_WAIT_S:-600}"
-  interval_s="${FIELD_BUSY_RETRY_INTERVAL_S:-5}"
-  start=$SECONDS
-  while true; do
-    fieldtest_capture_json "$out" "$(fieldtest_rem_bin)" top --endpoint "$(fieldtest_rem_endpoint)" --once --json || true
-    busy="$(python3 - "$out" "$serial" <<'PY'
-import json,sys
-from pathlib import Path
-try:
-    payload=json.loads(Path(sys.argv[1]).read_text())
-except ValueError:
-    raise SystemExit(0)
-for library in payload.get("data", {}).get("libraries", []):
-    if (library.get("library") or {}).get("library_serial") != sys.argv[2]:
-        continue
-    print(" ".join(f"{drive.get('element_address')}:{drive.get('status')}" for drive in library.get("drives", []) if drive.get("status") in ("busy", "cleaning")))
-PY
-)"
-    [[ -n "$busy" ]] || return 0
-    if (( SECONDS - start >= wait_s )); then
-      return 1
-    fi
-    echo "drive bays not idle ($busy); elapsed_s=$((SECONDS - start)) wait_s=$wait_s; checking again in ${interval_s}s" >&2
-    sleep "$interval_s"
-  done
-}
-
 main() {
   if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
     usage

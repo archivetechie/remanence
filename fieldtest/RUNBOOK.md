@@ -289,6 +289,54 @@ The management questions: what happens when it breaks?
 | 4.3 | `40-faults.sh retire-rebind` | retires a written tape, verifies copies flagged missing, re-inits the same barcode as a fresh tape |
 | 4.4 | `40-faults.sh wrong-tape` | 🖐 swap two allowlisted tapes between slots (or via `rem-debug move`), then attempt a write — must refuse with an identity mismatch, never overwrite |
 | 4.5 | `40-faults.sh crash-clean` | if the CLN cart is still available: kill the daemon mid-clean (once the changer shows the CLN cart in the drive), restart, watch startup reconciliation resolve the run (the DS-M2 crash-resume path on real robotics) |
+| 4.6 | `34-verify-throughput.sh` | full verification timing, phase split, command latency and same-tape deltas |
+
+### 4.6 Full verification throughput
+
+Run this leg before and after a binary change on the same tape. The default is
+the first `sealed` tape from `rem catalog tapes --json` present in the selected
+library's live slots or drives. `sealed` is the catalog's terminal-finalization
+state; the catalog has no separate terminal-index flag. An explicit UUID or
+barcode must also select a sealed tape in that library.
+
+```bash
+./scripts/34-verify-throughput.sh --tape-uuid <uuid>
+./scripts/34-verify-throughput.sh --barcode <barcode>
+FIELD_CONFIRM_FINALIZE=1 ./scripts/34-verify-throughput.sh --finalize-bench
+```
+
+`--finalize-bench` selects the first appendable `fieldtest-a` tape and permanently
+removes its appendability. It requires `FIELD_CONFIRM_FINALIZE=1`, records the
+exact UUID and idempotency key, and uses `rem tape finalize --wait`. The resolved
+binary must offer that command. `FIELD_VERIFY_TIMEOUT_SECONDS` defaults to
+14400 and bounds each verification or finalization command. The leg waits for
+idle bays using `FIELD_BUSY_WAIT_S` (600) and `FIELD_BUSY_RETRY_INTERVAL_S` (5).
+It uses `--ready-wait 15m` when available; otherwise it reads at most 1 MiB from
+an object on that tape through the readiness-aware `remfield-io` wrapper.
+
+The 27 Oct baseline on a 36 GB parity tape gives these figures to beat:
+
+| Phase | Elapsed seconds | Inside commands | Between commands |
+|---|---:|---:|---:|
+| walk_terminal | 398 | 394 | 4 |
+| parity_map | 27.5 | — | — |
+| sidecar | 184 | 175 | 9 |
+| protected_data | 266 | 135 | 131 |
+| total | 875 | — | — |
+
+Evidence lives under `evidence/34-verify-throughput/`: `verify-<stamp>.json`,
+`verify-split-<stamp>.tsv`, `verify-delta-<stamp>.txt`, and
+`verify-diag-<stamp>.jsonl`. Each TSV row includes the tape UUID, decimal MB/s,
+six command-latency buckets in milliseconds (`<5`, `5–20`, `20–100`, `100–1000`,
+`1000–10000`, `>=10000`), and command counts. The total uses the daemon's total
+counters, including setup, rather than adding the rounded baseline phases.
+Deltas use the most recent split for that UUID by file modification time and
+report elapsed, command and between-command seconds and percentages; a zero
+reference has no percentage. PASS requires `verification_state=verified_complete`
+and a successful command. Missing timing or daemon diagnostics fails the leg.
+The diagnostic file contains only events appended during the command window;
+plain tmux lines are preserved in JSON `line` fields. Keep other verification
+clients idle during this leg because daemon events do not include a tape UUID.
 
 **Every red result here is still evidence** — capture it, note it, move
 on. A refused unsafe operation is a PASS.
