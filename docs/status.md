@@ -131,7 +131,17 @@ reports ready, the daemon refuses every request in that library that needs the
 robot, and the clients' resume calls then find the fenced drive busy because
 only one caller at a time waits on it. Open write sessions one at a time until
 this is fixed. In the same window, a restore running beside a write session on
-another pool completed normally.
+another pool completed normally, and a concurrent restore and append against
+two pools on two drives ran at an aggregate of about 218 MB/s.
+
+**A readiness fence clears only when a session waits on it.** A drive that is
+becoming ready after a load leaves a media-readiness fence. A session open
+waits on that fence and resumes the readiness operation until the drive is
+ready, but `rem tape verify-index` is refused by the fence and does not wait,
+and nothing re-probes the drive on its own, so the fence stays until some
+client opens a session on that drive. Open a session (a small read of any
+object on the tape) before a verification that follows a fresh load, or retry
+the verification after the daemon log shows the drive ready.
 
 **A cartridge left unthreaded by a hard kill needed a LOAD by hand.** When the
 field stop script killed the daemon outright during an unload, the cartridge
@@ -140,7 +150,8 @@ and the daemon's media-readiness check polled it without sending a LOAD, so
 writes waited on a `media_initializing` fence until `sg_start --load` was
 sent by hand. On main the readiness wait now sends that LOAD once when the
 drive asks for it, and a stop signal lets the daemon finish the unload before
-it exits; both are in the next release. After any hard kill, still check
+it exits; both are in the next release, and the LOAD was reproduced on the
+same drive after a daemon killed during an unload. After any hard kill, still check
 `rem top` for a bay shown busy with no I/O and `rem tape quarantine list` for
 a `media_initializing` fence.
 
