@@ -1318,6 +1318,26 @@ EOF
   return 1
 }
 
+# Refuse to start the daemon on a configuration whose append staging mode is
+# serial: the upload then waits for the whole object before any tape motion and
+# every write figure understates the product. FIELD_ALLOW_SERIAL_STAGING=1
+# overrides for a deliberate comparison run.
+fieldtest_require_overlap_staging() {
+  local config mode
+  config="$(fieldtest_config_path)"
+  [[ -f "$config" ]] || return 0
+  mode="$(sed -nE 's/^append_staging_mode *= *"([a-z]+)".*/\1/p' "$config" | head -n 1)"
+  if [[ "$mode" == overlap ]]; then
+    return 0
+  fi
+  if [[ "${FIELD_ALLOW_SERIAL_STAGING:-0}" == 1 ]]; then
+    echo "warn: starting the daemon with append_staging_mode=${mode:-serial} (FIELD_ALLOW_SERIAL_STAGING=1)" >&2
+    return 0
+  fi
+  echo "error: $config has append_staging_mode=${mode:-serial}; the kit measures the product only in overlap mode. Add append_staging_mode = \"overlap\" under [daemon] (the generated config carries it), or set FIELD_ALLOW_SERIAL_STAGING=1 for a deliberate comparison run." >&2
+  return 1
+}
+
 fieldtest_drain_drives() {
   local serial="$1"
   local lib_json loaded_drives bay barcode
@@ -1427,6 +1447,9 @@ parts = [
     f'spool_dir = "{home / "spool"}"',
     'spool_tmpfs_ram_budget = "64GiB"',
     'io_memory_ceiling = "96GiB"',
+    # The upload overlaps the tape write; serial mode spools the whole object
+    # first and measures the product with its hands tied.
+    'append_staging_mode = "overlap"',
     "",
     "[[libraries]]",
     f'serial = "{selected}"',
