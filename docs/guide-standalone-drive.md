@@ -4,8 +4,10 @@ With one manually loaded LTO drive, `rem` writes and restores tapes directly.
 There is no daemon to start. You insert the cartridges yourself.
 
 Remanence is alpha software. Keep another copy of your files and test a restore
-on your drive. See [tested hardware](status.md#tested-hardware) for the limits
-of hardware testing.
+on your drive. Standalone mode has model-backed integration tests but has not
+yet run on a physical standalone drive, so expect hardware-specific findings.
+See [tested hardware](status.md#tested-hardware) for the limits of hardware
+testing and for what to attach to a report.
 
 <!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-library/src/discovery.rs @ 4dc2a3c6 -->
 ## What you need
@@ -51,6 +53,20 @@ Standalone `put` stores one regular file per object and does not need
 `bsdtar`. Install `bsdtar` (`libarchive-tools` on Debian/Ubuntu) for the local
 archive walkthrough and for extracting objects that contain packed wrappers.
 
+Home-mode state lives under `${XDG_STATE_HOME:-$HOME/.local/state}/rem/` and
+must be on a local persistent filesystem. If your home directory is on NFS,
+SMB/CIFS, tmpfs, ramfs or overlayfs, `rem` refuses it as an untrusted state
+volume. Set `XDG_STATE_HOME` to a directory on a local disk instead, and set it
+the same way for every later `rem` command.
+
+`rem doctor` (step 1) also reports the locked-memory limit, `RLIMIT_MEMLOCK`.
+With the home defaults it compares the limit with a 16 MiB minimum read
+reservoir (256 KiB blocks, 16 blocks per read batch, 4 staging buffers). A
+lower limit is marked `!` and does not block use: reads continue in unlocked
+memory and print `read reservoir uses unlocked buffers`.
+[Non-fatal warnings](guide-troubleshooting.md#non-fatal-warnings) explains how
+to raise the limit.
+
 ## 1. Set up the drive
 
 ```sh
@@ -62,13 +78,26 @@ rem drives --json
 Setup shows the drive model, serial and current device path, then asks before
 saving the serial. If discovery is incomplete, it separately asks whether the
 drive belongs to no library on this host. Confirm only if you know that is true.
-With several drives, use `rem setup --device /dev/sg3` to select one.
+With several drives, use `rem setup --device /dev/sg3` to select one. When it
+saves the serial, setup prints `saved <model> serial <serial> as this host's
+drive`.
+
+`rem doctor` prints one row per check: `✓` for a pass, `!` for an advisory
+warning that does not block use, and `✗` for a failure, followed by its fix. It
+ends with `ready to use the drive`, or with `fix the items above` and exit
+status 1. In `rem drives --json`, the drive you plan to write must appear with
+`kind: "standalone"`, `ownership: "standalone"`, a `/dev/sgN` path and a
+serial.
 
 On a host without `/etc/rem/config.toml`, home state lives at
 `${XDG_STATE_HOME:-$HOME/.local/state}/rem/`. Setup saves `[home] drive_serial`
 in its `config.toml`. Later commands rediscover the path by serial; a changed
 `/dev/sgN` number does not change the authorized drive. The home config includes
-a `default` pool with `custom:128,4,1` parity and a 256 KiB block size.
+a `default` [tape pool](reference-glossary.md#catalog-and-daemon), the group of
+tapes that writes target. It uses `custom:128,4,1` parity (128 data blocks and
+4 parity blocks per stripe, one stripe per neighborhood; the
+[glossary](reference-glossary.md#formats-and-objects) defines these terms) and a
+256 KiB block size.
 
 These short commands assume that home setup. An explicit `--config` or
 `--endpoint` selects the library route for shared verbs. To select a standalone
@@ -100,7 +129,9 @@ rem tape init --label HOME01 --generation L6
 The drive's measured density wins and is recorded. Without `--generation`,
 a label ending in a generation code must agree with it. Remanence disables
 drive compression. LTO-9 media can take an hour or
-more on their first load while the drive optimizes them.
+more on their first load while the drive optimizes them. Init first waits for
+the drive to report the cartridge ready, polling every 30 seconds for up to 2.5
+hours, so a first load can look like a pause.
 
 **Cartridges formatted with LTFS.** Init refuses these with `has 2 partitions`
 before checking for old data. Repartitioning erases everything on the cartridge;
@@ -153,6 +184,10 @@ Symlinks and special files get `skipped_unsupported`; they are not backed up.
 The final `Total:` line counts the results and names any failed file.
 `--json` emits receipts as JSON lines and a final result envelope.
 
+Each file becomes its own Object on tape, with its own tape file and filemark,
+and occupies at least one tape block. Before you write a tree of many small
+files, read [Object sizing](guide-object-sizing.md).
+
 ## 4. List the files and get one back
 
 ```sh
@@ -172,8 +207,10 @@ filesystem and restores recorded modification times after validation.
 
 ## 5. Finalize, verify and eject
 
-Finalization writes three copies of the closing index, so another machine can
-find the files without your catalog. It permanently closes the tape to new
+Finalization writes three copies of the closing index, called the terminal
+index (the [glossary](reference-glossary.md#formats-and-objects) calls each
+copy a terminal replica), so another machine can find the files without your
+catalog. It permanently closes the tape to new
 objects. Only the acknowledgement is required:
 
 ```sh
@@ -183,8 +220,17 @@ rem tape verify --full
 ```
 
 The first verification checks structure and the terminal index. `--full` also
-checks all sidecar-protected data and parity; it can take hours. Finalize retries
-use the same automatically generated per-tape request key.
+checks all data protected by the parity
+[sidecars](reference-glossary.md#formats-and-objects), and the parity itself;
+it can take hours. Finalize retries use the same automatically generated
+per-tape request key.
+
+Each command prints a JSON summary. A successful finalize reports
+`"finalized": true`. `rem tape verify` reports `"status": "verified"` with the
+tape's `object_count`, and `--full` reports `"verified_complete": true`. On a
+tape without a usable terminal index, `rem tape verify` exits with status 1 and
+`verification failed: no usable terminal index`. A full verification that does
+not complete exits with status 1 and `full verification incomplete`.
 
 Wait for the command to exit before ejecting. Use the drive button, or the
 matching non-rewinding tape node. Install `mt-st` and find the drive's `nstN`

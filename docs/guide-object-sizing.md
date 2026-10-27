@@ -73,7 +73,9 @@ bundle rather than one row per member.
 Bundling is explicit. Ordinary `rem put A B C` (three input paths) writes three one-member
 Objects and therefore three tape filemarks. Build one multi-member object first
 and ingest it with `rem put --stored-object` when the files should share one
-tape file and one trailing filemark. Per-member catalog rows, hashes, and
+tape file and one trailing filemark. `--stored-object` goes through the daemon;
+standalone `rem put` has no such option, so on a standalone drive every file is
+its own Object. Per-member catalog rows, hashes, and
 individual restore selection remain available inside that bundle.
 
 Bundling has a floor as well as a ceiling. Every non-empty member starts on a

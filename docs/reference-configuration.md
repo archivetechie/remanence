@@ -479,7 +479,12 @@ Restore newer state or use catalogless `tape restore --scan` to rescue files.
 
 Direct standalone commands acquire the state lock for one
 invocation, append audit and journal evidence, update the catalog projection,
-and release the lock when they exit.
+and release the lock when they exit. A command that opens a drive also holds a
+per-drive lock file, `/run/lock/rem/<drive serial>.lock`, for the invocation.
+That file lives outside the state directory, so `/run/lock/rem` must exist and
+be writable by the user who runs `rem`; the
+[standalone guide](guide-standalone-drive.md#what-you-need) creates it for the
+`tape` group and recreates it at boot.
 
 On parity tapes, the matching `.remjournal` and `.remcheckpoint` histories are
 both required while the tape is open and during terminal repair. In addition

@@ -22,12 +22,15 @@ in-process, so `protoc` is not needed:
 git clone https://github.com/archivetechie/remanence
 cd remanence
 cargo build --release
+export PATH="$PWD/target/release:$PATH"
 ```
 
 That produces four binaries under `target/release/`: `rem` (operator
 CLI), `rem-debug` (break-glass CLI), `rem-daemon` (the service), and
 `rem-recover` (a standalone catalogless disaster-recovery tool — see the
-[CLI reference](reference-cli.md#rem-recover-standalone-recovery)).
+[CLI reference](reference-cli.md#rem-recover-standalone-recovery)). The
+`export` line puts them on your path for this shell, and the rest of this page
+assumes it.
 
 One optional cargo feature widens the core surface:
 
@@ -137,7 +140,10 @@ the ordered `recipient_epochs`, but cannot expose the encrypted manifest.
 The matching REMP file selects its epoch's slot during open.
 
 To rotate recipients, open the existing encrypted object with one current private
-key and reseal it to a new 2-8-recipient set:
+key and reseal it to a new 2-8-recipient set. This example replaces the primary
+key, so first create its successor with
+`rem archive recipient keygen --out primary-rotated.remp --label primary-rotated`,
+which also writes the slot-0 public file `primary-rotated.remr`:
 
 ```sh
 rem archive reseal --object demo-enc.rem-object --private-key primary.remp \
@@ -167,10 +173,12 @@ with `bsdtar`. For streaming and partial retrieval,
 <!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_backend.rs @ 4dc2a3c6 -->
 ## First physical tape with one drive
 
-No published binary has standalone mode yet. Build from source using the
-commands above, then put the release directory on your path:
+No published binary has standalone mode yet, so this section uses the binaries
+built above. Run its commands from the checkout directory. The local walkthrough
+left you in `demo/`, so return to the checkout first:
 
 ```sh
+cd ..
 export PATH="$PWD/target/release:$PATH"
 ```
 
@@ -180,7 +188,9 @@ including the persistent `/run/lock/rem` rule, and log in again after joining
 `export PATH="$PWD/target/release:$PATH"`. Never run rem with sudo. No daemon is needed.
 
 On a host without `/etc/rem/config.toml`, setup saves your selected drive's
-serial in the home config. Insert a blank LTO-9 cartridge, write HOME01 on its
+serial in the home config, which
+[step 1 of the standalone guide](guide-standalone-drive.md#1-set-up-the-drive)
+describes. Insert a blank LTO-9 cartridge, write HOME01 on its
 shell, and run:
 
 ```sh
@@ -228,10 +238,16 @@ open before any SCSI command works:
    `/dev/sgN`): `sudo usermod -aG tape $USER`, then log in again.
 2. The binary needs `CAP_SYS_RAWIO` (the kernel filters most SCSI
    opcodes for everyone else): `sudo setcap cap_sys_rawio+ep
-   target/release/rem`.
+   target/release/rem`. The sections below also run `rem-debug`, and
+   `rem-daemon` when it runs in the foreground rather than under systemd.
+   Give each the capability the same way:
+   `sudo setcap cap_sys_rawio+ep target/release/rem-debug` and
+   `sudo setcap cap_sys_rawio+ep target/release/rem-daemon`.
 
-Rebuilding drops the capability with the binary's inode; `make rem-dev`
-rebuilds the debug binary and reapplies it in one step. If you skip these
+Rebuilding drops the capability with the binary's inode, so repeat the
+`setcap` commands after each `cargo build --release`. `make rem-dev`
+rebuilds the debug binary, `target/debug/rem`, and reapplies the capability to
+it in one step; it does not touch the release binaries. If you skip these
 gates, discovery fails with an explicit EPERM hint — see
 [troubleshooting](guide-troubleshooting.md).
 
@@ -255,9 +271,9 @@ issues INQUIRY, VPD, and READ ELEMENT STATUS, and moves nothing.
 <!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-state/src/config.rs @ 1dd451b2 -->
 ## Running the daemon (requires hardware)
 
-The daemon needs a config file. A minimal one, using `/var/lib/rem` for
-state (see the [configuration reference](reference-configuration.md) for
-every key):
+The daemon needs a config file. Save the following minimal one as
+`/etc/rem/config.toml`; it uses `/var/lib/rem` for state (see the
+[configuration reference](reference-configuration.md) for every key):
 
 ```toml
 [daemon]
@@ -288,6 +304,13 @@ sqlite_path = "/var/lib/rem/rem-state.sqlite"
 tape_catalog_dir = "/var/lib/rem/tape-catalog"
 ```
 
+Creating `/etc/rem/config.toml` changes how `rem` routes commands on this
+host. Standalone commands then use this file and its state instead of the
+home-mode state under `${XDG_STATE_HOME:-$HOME/.local/state}/rem/`, and shared
+verbs such as `put`, `get`, `tape init` and `tape finalize` take the library
+route. If you also use a standalone drive on this host, read the
+[routing table](reference-cli.md#standalone-drives) first.
+
 Start it in the foreground:
 
 ```sh
@@ -313,7 +336,10 @@ rem catalog pools
 ```
 
 If your state dir is not `/var/lib/rem`, pass `--endpoint
-unix:<state_dir>/rem.sock` — the CLI default assumes that path.
+unix:<state_dir>/rem.sock` — the CLI default assumes that path. The Unix
+socket admits only root and the daemon's own user (see `socket_path` in the
+[configuration reference](reference-configuration.md#daemon-required)), so run
+these commands as the account that runs the daemon.
 
 <!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-api/src/tape_init.rs @ 6ed03ef0 -->
 ## Initializing a tape (requires hardware, writes to media)
@@ -330,6 +356,12 @@ writes nothing:
 rem tape init DMO001L9 --dry-run
 rem tape init DMO001L9
 ```
+
+Initialization other than the dry run opens the local state directly and takes
+the same exclusive state lock as the daemon (see
+[What ends up on disk](reference-configuration.md#what-ends-up-on-disk)).
+Stop the daemon before you run it, and start it again afterwards; while the
+daemon holds the lock, init refuses.
 
 Batch initialization takes a slot range (`rem tape init
 0x0400..0x0407`). Overrides are deliberately narrow: `--force` only
@@ -356,7 +388,9 @@ first hands-on write, at the cost of the break-glass gauntlet. Note the
 `--allow` flag: every state-changing `rem-debug` command must name the
 library it may touch. Direct Object writes still require the drive to report
 the loaded cartridge as rewritable; write-protected, WORM, and unknown media
-are refused before MODE SELECT or any tape write.
+are refused before MODE SELECT or any tape write. These `rem-debug` commands
+also take the daemon's exclusive state lock, so stop the daemon before running
+them.
 
 ```sh
 rem-debug --allow <SERIAL> archive write \

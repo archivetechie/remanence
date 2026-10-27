@@ -68,10 +68,11 @@ this page.
 | `<DRIVE_SERIAL>` | A standalone drive's VPD page 0x80 serial, as printed by `rem drives --json`. |
 | `<ADDR>`, `<SLOT>`, `<BAY>` | A changer element address (for example `0x0400`), a storage-slot address, and a drive-bay address. `rem library <SERIAL> --slots` lists them. |
 | `<BARCODE>` | The barcode printed on a cartridge, as shown by `rem library <SERIAL> --slots`. |
+| `<LABEL>` | A standalone cartridge's operator label: free text chosen with `rem tape init --label`, unique in the catalog. It is not the tape's identity. |
 | `<TARGET>` | A cartridge, given either as a barcode or as an element address, or as an inclusive slot range such as `0x0400..0x0407` where the command says a range is accepted. |
-| `<UUID>`, `<TAPE_UUID>` | A tape's UUID, as printed by `rem catalog tapes`. Other `<UUID>` values are named where they appear (an operation UUID from `rem op list`, an object UUID from `rem put`). |
+| `<UUID>`, `<TAPE_UUID>` | A tape's UUID, as printed by `rem catalog tapes`, or on a standalone drive by `rem tape identify` and in `rem put` receipts. Other `<UUID>` values are named where they appear (an operation UUID from `rem op list`, an object UUID from `rem put`). |
 | `<DRIVE>` | A drive's serial number or UUID, as printed by `rem drive list`. |
-| `<POOL>`, `<POOL_ID>` | The `id` of a `[[tape_pools]]` entry in the [configuration](reference-configuration.md#tape_pools-and-tape_pool_rules). |
+| `<POOL>`, `<POOL_ID>` | The `id` of a `[[tape_pools]]` entry in the [configuration](reference-configuration.md#tape_pools-and-tape_pool_rules). In home mode the generated config defines `default`, and `rem pool new` creates further pools. |
 | `<UNIT_ID>` | A catalog unit id, as printed by `rem catalog units`. |
 | `<CONDITION_KEY>` | The key of a standing alarm, as printed by `rem alarms`. |
 | `<ID>` (in `rem put`, `rem tape quarantine`) | For `rem put`, the caller's own identifier for the object. For quarantine commands, a quarantine id or operation UUID as printed by `rem tape quarantine list`. |
@@ -441,12 +442,14 @@ paths are refused; non-regular files are skipped with a warning.
 The ordinary command deliberately treats each input file as a separate Object,
 so each receives its own trailing tape filemark. To store many small files with
 one filemark, first build one multi-member REM-OBJECT with `rem archive build`,
-then use `--stored-object`. Every member remains separately named and
+then use `--stored-object`, which is a library-mode option; standalone `put`
+does not accept it. Every member remains separately named and
 checksummed in the manifest and can be restored individually; there are no
 tape filemarks between members of that one Object. Each non-empty member starts on a chunk boundary and therefore
 costs at least one tape block; for trees of very small files, and for files
 the format cannot represent natively, see the blob wrapper in REM-OBJECT Core
-Format Appendix E.
+Format Appendix E. [Object sizing](guide-object-sizing.md) discusses the
+tradeoffs.
 
 The receipt reports committed state. It is built from the daemon's
 checkpoint barrier — with a catalog lookup for objects an automatic
@@ -510,7 +513,6 @@ None of these touch tape; they are the easiest way to exercise the format.
 | `rem archive extract-stream --private-key <REMP> [--range <START:LEN> --authenticated-prefix <FILE> --stored-range-start <BYTE>]` | Stream-decrypt an envelope from stdin to stdout with per-chunk authentication and bounded memory. With the three ranged flags together, re-authenticate the header/key-frame/metadata prefix and decrypt only the covering ciphertext frames beginning at `--stored-range-start`. |
 | `rem archive covering-range --private-key <REMP> --object-id <ID> --file-id <ID> --range <START:LEN>` | Authenticate an envelope header/key-frame/metadata prefix from stdin and print the smallest covering stored-ciphertext range (`stored_range_start`, `stored_range_len`, `first_chunk`, `chunk_count`). See [`reference-extract-stream-protocol.md`](reference-extract-stream-protocol.md). |
 | `rem restore --object <FILE> --dest <DIR> [--private-key <REMP>]` | Top-level native-restore alias with the same key contract as `extract`. |
-
 | `rem archive list` | List native objects from the local catalog (no tape access). |
 | `rem archive formats` | Print JSON describing the foreign-format adapters linked into this binary; stock Remanence returns an empty list. |
 | `rem archive probe --format <ID> --dump <FILE>` | Ask a registered foreign-format adapter to identify a dump without streaming it. |
@@ -650,7 +652,7 @@ journals):
 | `rem-debug archive write --library <SERIAL> --file <PATH> --pool <POOL> [--recipient <REMR>]... [--json]` | Break-glass direct write of one local file to a pool-selected tape. It applies the same positive `NotWorm` admission as daemon-owned Object writes before MODE SELECT; write-protected, WORM, and unknown media fail closed. Repeating `--recipient` 2-8 times writes the encrypted envelope; omitting it writes plaintext. The locator includes `format_version` and `recipient_epochs`. |
 | `rem-debug archive read --library <SERIAL> --locator <JSON> --out <PATH> [--private-key <REMP>]` | Read an object by locator; an encrypted copy requires the matching private key. |
 | `rem-debug archive export-object ...` | Export the complete stored object bytes (including envelope) by locator. |
-| `rem-debug archive verify --locator <JSON> --expected-sha256 <HEX> [--private-key <REMP>]` | Stream and hash an object on tape against an expected digest, restoring nothing; encrypted copies require the matching private key. |
+| `rem-debug archive verify --library <SERIAL> --locator <JSON> --expected-sha256 <HEX> [--private-key <REMP>]` | Stream and hash an object on tape against an expected digest, restoring nothing; encrypted copies require the matching private key. |
 | `rem-debug archive probe/scan/restore/recover --format <ID> --tape <SERIAL> --bay <BAY> [--rewind]` | Run a registered foreign-format adapter directly against a mounted tape instead of a dump file. |
 | `rem-debug tape alerts --bay <BAY>` | Read the loaded drive's TapeAlert LOG SENSE page directly. |
 | `rem-debug tape terminal-index-drill --device <SG> --tape-uuid <UUID> --block-size <BYTES> --damage-plan <PLAN> [--full-verify] --report <PATH>` | Run one read-only live-SG terminal-index verification leg and write schema `rem.tape.terminal-index-drill.v1`. Replica plans are `none`, `a`, `b`, `c`, `ab`, `ac`, `bc`, `abc`, and `disagreement`; the latter substitutes a locally valid conflicting A edition and requires the fail-closed typed `TerminalIndexReplicaConflict` refusal with no selected replica, while `abc` executes BOT structural recovery. Gap plans are `gap-ab-header`, `gap-ab-footer`, `gap-bc-header`, and `gap-bc-footer`; each replaces the named record with a fixed `0xd7` block above the transport, requires `--full-verify`, and reports typed degraded separation evidence. Reports name the mechanism and exact injected LBAs. All injection occurs in the reader above the transport and never rewrites media. Full verification otherwise requires `--damage-plan none`. In the report's `full_verify` object, `outcome` names what the terminal suffix did and `complete` names what the tape did: `outcome: "verified_complete"` with `complete: false` means that the terminal suffix validated and the protected content did not, and `complete` is `true` only when both hold. See [Full verification](guide-full-verification.md). |
