@@ -112,6 +112,55 @@ that field.
 accept further objects through a write session, but the single-object write
 path still refuses it.
 
+### Known limitations found in field testing
+
+The most recent field window on the HPE MSL3040 with LTO-9 drives ran the
+library paths end to end: plaintext and encrypted writes and reads,
+multi-object writes, repeated appends, an overnight soak, and recovery after a
+killed write, a refused wrong tape, a retired and re-initialized cartridge and
+a catalog rebuild. It also found the following limitations, which are not yet
+fixed.
+
+**Concurrent write sessions can collide on one drive.** On a library with
+several drives, a second write session opened while the first is running can
+be assigned the drive bay that the first session holds instead of an idle
+drive, and it then fails because the bay is busy. Open write sessions one at a
+time until this is fixed. In the same window, a restore running beside a write
+session on another pool completed normally.
+
+**A drive that asks for a LOAD is polled instead of loaded.** When a cartridge
+is in a drive but not threaded, the drive reports that it is not ready and
+needs an initializing command. The daemon's media-readiness check keeps
+polling the drive and never sends that LOAD, so the readiness fence stays in
+`media_initializing` and writes wait on it. A LOAD sent to the drive by hand
+makes it ready, and the fence clears at the next poll. The field window used
+`sg_start --load` on the drive's sg node.
+
+**A hard kill during an unload can leave a cartridge unthreaded.** When a stop
+script killed the daemon outright shortly after asking it to stop, while the
+daemon was unloading a cartridge, the cartridge stayed in the drive unthreaded
+and the stall above followed. Let the daemon exit on its own after a stop
+signal. After any hard kill, check `rem top` for a bay shown busy with no I/O,
+and `rem tape quarantine list` for a `media_initializing` fence.
+
+**The catalog rebuild's summary leaves out the checkpoint journals.**
+`rem rebuild-catalog-from-journals` replays the checkpoint journals after the
+audit log and the per-tape journals, but its printed counts cover only the
+audit log and the per-tape journals. The counts for tapes, tape files and
+object copies can read zero even when the rebuilt catalog is complete.
+
+**Write throughput is below the drive rate.** On the field-test host, the host
+adapter limits each SCSI command to 1 MiB, and the daemon's staging ring keeps
+only a few such commands in flight. Together these held writes to about
+190 MB/s on LTO-9 drives rated at 300 MB/s.
+
+**Two tests are timing-sensitive.**
+`read_pipeline_diag_open_and_close_have_stable_json_schema` in
+`remanence-api` and
+`checkpoints_restore_versions_after_projection_loss_and_full_rebuild` in
+`remanence-cli` fail intermittently without any code change, so a single CI
+failure in either is not by itself evidence of a regression.
+
 <!-- code-anchor: crates/remanence-library/src/lib.rs crates/remanence-cli/src/standalone.rs crates/remanence-library/tests @ 4dc2a3c6 -->
 ## Tested hardware
 
