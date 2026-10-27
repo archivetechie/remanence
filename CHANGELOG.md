@@ -145,11 +145,17 @@ per-release summaries.
   clobber, generated recipient keys, and whole-object extraction in the
   multi-object leg. It captures read-only diagnostics for a library window,
   skips barcodes its init script has already initialized, re-threads a drive
-  left not ready before draining, waits a minute for a graceful daemon stop,
-  and refuses to start the daemon when the locked-memory limit it would inherit
-  is below 1 GiB and not unlimited (`FIELD_ALLOW_LOW_MEMLOCK=1` overrides).
-  `remfield-io` reads committed placement from the catalog after a session
-  closes.
+  left not ready before draining, and waits a minute for a graceful daemon
+  stop. Bring-up stops the daemon before it kills the daemon's tmux session, so
+  the shutdown messages are no longer lost. It refuses to start the daemon when
+  the locked-memory limit it would inherit is below 1 GiB and not unlimited
+  (`FIELD_ALLOW_LOW_MEMLOCK=1` overrides), and when the configuration uses
+  serial append staging (`FIELD_ALLOW_SERIAL_STAGING=1` overrides for a
+  comparison run); the generated configuration sets
+  `append_staging_mode = "overlap"`. The write and read benchmarks record the
+  daemon's drive-side rates from its diagnostics beside the kit's own figure,
+  which spans the whole client call. `remfield-io` reads committed placement
+  from the catalog after a session closes.
 - Release binaries are statically linked against musl and run without a
   Rust toolchain or a particular C library version.
   `remanence-<version>-x86_64-unknown-linux-musl.tar.gz` holds `rem`,
