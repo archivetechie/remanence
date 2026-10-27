@@ -364,7 +364,8 @@ durable, catalog-persisted refusal); see
 (`tape_io.staging_ring_buffers`, default 4) a write session's producer
 thread fills while a submitter issues one blocking tape-write command at
 a time. It is the only path for streaming object reads and writes; there is no
-non-pipelined fallback. Full verification reads single blocks outside it.
+non-pipelined fallback. Full verification reads outside it through its own
+strict batch reader.
 
 **read reservoir / watermark stop-start** — the host-RAM buffer a read
 session's submitter fills up to a high watermark

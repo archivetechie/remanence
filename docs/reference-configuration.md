@@ -334,8 +334,9 @@ Serves `rem top` and the live-status RPC. Optional.
 
 Tape I/O batching and staging-ring settings. Optional. Fixed-block pipelined
 submission is the only path for streaming object reads and writes, and a key for
-any other mode is rejected. Full verification reads single blocks and does not use
-these settings.
+any other mode is rejected. Full verification uses its own strict batch reader,
+which issues fixed-block commands of the same size but does not use these
+settings.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
