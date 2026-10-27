@@ -159,6 +159,135 @@ fn seam_bootstrap_head_and_unreadable_bot_need_no_probes() {
     }
 }
 
+/// A readable BOT head may probe the footer but must not enter the ParityMap tail route.
+#[test]
+fn seam_parity_map_tail_readable_head_is_guarded_at_tape_file_zero() {
+    let encoded = parity_map_blocks();
+    let count = encoded.blocks.len() as u64;
+    let mut head = encoded.blocks[0].clone();
+    head[0] ^= 1;
+    let mut source = MemoryClassificationSource::from_blocks(&encoded.blocks);
+    let mut builder = FilemarkMapBuilder::new();
+    let mut damage = Vec::new();
+    let result = append_classified_file(
+        &mut source,
+        &mut builder,
+        Some(&head),
+        &TAPE_UUID,
+        BLOCK_SIZE,
+        PhysicalPositionHint::new(0),
+        count,
+        &mut damage,
+    );
+    assert!(matches!(
+        result,
+        Err(ParityError::FilemarkMapReconstruct(_))
+    ));
+    assert!(builder.entries().is_empty());
+    assert!(damage.is_empty());
+    assert_eq!(source.requests, [count - 1]);
+}
+
+#[test]
+fn seam_bootstrap_head_away_from_tape_file_zero_is_object() {
+    let map = FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)]).unwrap();
+    let head = bootstrap_block(map.digest(false).unwrap(), 0);
+    let mut source = MemoryClassificationSource::from_blocks(std::slice::from_ref(&head));
+    let (entry, damage) = classify(&mut source, Some(&head), 1, BLOCK_SIZE);
+    assert_eq!(entry, TapeFileMapEntry::object(2, 1, 2));
+    assert!(damage.is_empty());
+    assert_eq!(source.requests, [0]);
+}
+
+#[test]
+fn seam_bootstrap_count_mismatch_at_bot_stops_before_fallback() {
+    let map = FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)]).unwrap();
+    let head = bootstrap_block(map.digest(false).unwrap(), 0);
+    let mut source = MemoryClassificationSource::default();
+    let mut builder = FilemarkMapBuilder::new();
+    let mut damage = Vec::new();
+    let result = append_classified_file(
+        &mut source,
+        &mut builder,
+        Some(&head),
+        &TAPE_UUID,
+        BLOCK_SIZE,
+        PhysicalPositionHint::new(0),
+        2,
+        &mut damage,
+    );
+    // The mismatch is recorded before the builder refuses an Object at BOT.
+    assert!(matches!(
+        result,
+        Err(ParityError::FilemarkMapReconstruct(_))
+    ));
+    assert!(builder.entries().is_empty());
+    assert_eq!(
+        damage,
+        [ScanDamagedRegion {
+            start: PhysicalPositionHint::new(0),
+            block_count: 2,
+            kind: ScanDamageKind::ClassificationCountMismatch,
+        }]
+    );
+    assert!(source.requests.is_empty());
+}
+
+#[test]
+fn seam_bootstrap_drive_compression_enabled_is_rejected() {
+    let map = FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)]).unwrap();
+    let mut head = bootstrap_block(map.digest(false).unwrap(), 0);
+    let end = 56 + u32::from_le_bytes(head[44..48].try_into().unwrap()) as usize;
+    assert_eq!(&head[end - 2..end], &[5, 0xf4]);
+    head[end - 1] = 0xf5;
+    let crc = crate::crc64_xz(&head[56..end]);
+    head[end..end + 8].copy_from_slice(&crc.to_le_bytes());
+    let mut source = MemoryClassificationSource::default();
+    let mut builder = FilemarkMapBuilder::new();
+    let mut damage = Vec::new();
+    let result = append_classified_file(
+        &mut source,
+        &mut builder,
+        Some(&head),
+        &TAPE_UUID,
+        BLOCK_SIZE,
+        PhysicalPositionHint::new(0),
+        1,
+        &mut damage,
+    );
+    assert!(matches!(
+        result,
+        Err(ParityError::DriveCompressionEnabled { .. })
+    ));
+    assert!(builder.entries().is_empty());
+    assert!(damage.is_empty());
+    assert!(source.requests.is_empty());
+}
+
+#[test]
+fn seam_unreadable_bot_with_multiple_blocks_is_rejected_without_probes() {
+    let mut source = MemoryClassificationSource::default();
+    let mut builder = FilemarkMapBuilder::new();
+    let mut damage = Vec::new();
+    let result = append_classified_file(
+        &mut source,
+        &mut builder,
+        None,
+        &TAPE_UUID,
+        BLOCK_SIZE,
+        PhysicalPositionHint::new(0),
+        2,
+        &mut damage,
+    );
+    assert!(
+        matches!(result, Err(ParityError::FilemarkMapReconstruct(message))
+        if message == "unreadable BOT tape file has 2 blocks; schema-major 2 requires one Bootstrap block")
+    );
+    assert!(builder.entries().is_empty());
+    assert!(damage.is_empty());
+    assert!(source.requests.is_empty());
+}
+
 #[test]
 fn seam_control_heads_need_no_probes() {
     let parity_map = parity_map_blocks();
@@ -508,12 +637,10 @@ fn pure_reconciliation_preserves_healthy_map() {
 fn pure_reconciliation_identifies_sidecar_and_recounts_later_objects() {
     let (expected, decoded) = reconciliation_fixture();
     let measured = object_candidate(&expected, 0);
-    let snapshot = measured.clone();
     let proposed = reconcile_measured_sidecars(&measured, &decoded)
         .unwrap()
         .unwrap();
     assert_eq!(proposed, expected);
-    assert_eq!(measured, snapshot);
     assert_eq!(proposed.entries()[3].first_parity_data_ordinal, Some(2));
     assert_eq!(proposed.entries()[5].first_parity_data_ordinal, Some(5));
     assert_eq!(
@@ -563,7 +690,6 @@ fn pure_reconciliation_proposal_requires_whole_map_validation() {
             "final" => invalid.payload.directory.is_final_directory = false,
             _ => unreachable!(),
         }
-        let snapshot = measured.clone();
         let proposed = reconcile_measured_sidecars(&measured, &invalid)
             .unwrap()
             .unwrap();
@@ -575,7 +701,6 @@ fn pure_reconciliation_proposal_requires_whole_map_validation() {
             ),
             "{mismatch}"
         );
-        assert_eq!(measured, snapshot);
     }
 }
 

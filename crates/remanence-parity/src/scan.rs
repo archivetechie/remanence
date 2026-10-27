@@ -1320,6 +1320,7 @@ fn append_classified_entry(
     )
 }
 
+/// Append the classification of a measured file whose head is unreadable.
 fn append_entry_with_unreadable_head(
     source: &mut dyn RawTapeSource,
     builder: &mut FilemarkMapBuilder,
@@ -1328,7 +1329,7 @@ fn append_entry_with_unreadable_head(
     file_start: PhysicalPositionHint,
     block_count: u64,
     damaged_regions: &mut Vec<ScanDamagedRegion>,
-) -> Result<bool, ParityError> {
+) -> Result<(), ParityError> {
     append_classified_file(
         &mut PositionedClassificationSource { source },
         builder,
@@ -1339,10 +1340,7 @@ fn append_entry_with_unreadable_head(
         block_count,
         damaged_regions,
     )?;
-    Ok(builder
-        .entries()
-        .last()
-        .is_some_and(|entry| entry.kind == TapeFileKind::Object))
+    Ok(())
 }
 
 /// Classify one measured file using its head and only the blocks named by the ladder.
@@ -2393,9 +2391,10 @@ mod tests {
             let mut source = RecordingRawSource::new(
                 encoded.blocks.iter().cloned().map(Record::Block).collect(),
             );
+            let mut builder = FilemarkMapBuilder::new();
             let result = append_entry_with_unreadable_head(
                 &mut source,
-                &mut FilemarkMapBuilder::new(),
+                &mut builder,
                 &TAPE_UUID,
                 BLOCK_SIZE,
                 PhysicalPositionHint::new(0),
@@ -2403,7 +2402,8 @@ mod tests {
                 &mut Vec::new(),
             );
             if count == 1 {
-                assert!(!result.unwrap());
+                result.unwrap();
+                assert_eq!(builder.entries(), &[TapeFileMapEntry::bootstrap(0, 1)]);
             } else {
                 assert!(matches!(
                     result,

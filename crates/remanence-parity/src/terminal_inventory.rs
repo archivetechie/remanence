@@ -1640,6 +1640,63 @@ fn verify_terminal_index_strict<V: ProtectedPass>(
     block_size: u32,
     mode: ScanMode<'_>,
 ) -> Result<TerminalIndexCompleteEvidence, TerminalIndexVerificationError> {
+    let TerminalVerificationPlan {
+        measured_eod,
+        layout,
+    } = plan_terminal_verification(source, tape_uuid, block_size)?;
+    let walked = scan_verification_prefix(source, tape_uuid, block_size, mode)?;
+    let measured = check_measured_prefix(&walked, &layout)?;
+    let TerminalReplicaSetEvidence {
+        edition,
+        replicas,
+        rows,
+    } = verify_terminal_replicas(
+        source,
+        tape_uuid,
+        block_size,
+        layout,
+        ReplicaRowCheck::AgainstMeasured(&walked.map.entries()[..measured.prefix_len]),
+    )?;
+    let separation_interior_records = verify_terminal_separations(
+        source,
+        tape_uuid,
+        block_size,
+        layout,
+        edition.descriptor.edition_id,
+    )?;
+    let protected = verify_protected_prefix::<V>(
+        source,
+        tape_uuid,
+        block_size,
+        &walked,
+        &edition,
+        &rows,
+        vec![],
+    )?;
+    Ok(TerminalIndexCompleteEvidence {
+        edition,
+        replicas,
+        separation_interior_records,
+        measured_eod,
+        verified_prefix_tape_file_count: layout.components[0].planned_tape_file_number,
+        verified_prefix_record_count: measured.verified_prefix_record_count,
+        measured_tape_file_count: measured.expected_file_count,
+        protected,
+    })
+}
+
+/// Owned terminal geometry selected from the measured end of data.
+struct TerminalVerificationPlan {
+    measured_eod: PhysicalPositionHint,
+    layout: TerminalTailLayout,
+}
+
+/// Configure the source, measure EOD and select its unique complete terminal layout.
+fn plan_terminal_verification(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+) -> Result<TerminalVerificationPlan, TerminalIndexVerificationError> {
     validate_terminal_index_block_size_hint(block_size)?;
     source
         .configure_fixed_block_size(block_size)
@@ -1674,8 +1731,25 @@ fn verify_terminal_index_strict<V: ProtectedPass>(
         }
     };
 
-    let walked = scan_verification_prefix(source, tape_uuid, block_size, mode)?;
-    if let Some(truncation) = walked.truncation {
+    Ok(TerminalVerificationPlan {
+        measured_eod,
+        layout,
+    })
+}
+
+/// Counts established by checking the walked map against the terminal layout.
+struct MeasuredPrefixEvidence {
+    expected_file_count: u64,
+    prefix_len: usize,
+    verified_prefix_record_count: u64,
+}
+
+/// Check truncation, damage, terminal geometry and prefix counts without tape I/O.
+fn check_measured_prefix(
+    walked: &ScanWalkResult,
+    layout: &TerminalTailLayout,
+) -> Result<MeasuredPrefixEvidence, TerminalIndexVerificationError> {
+    if let Some(truncation) = walked.truncation.as_ref() {
         return Err(TerminalIndexVerificationError::PrefixTruncated {
             tape_file_number: truncation.tape_file_number,
             kind: truncation.kind,
@@ -1700,7 +1774,7 @@ fn verify_terminal_index_strict<V: ProtectedPass>(
             actual: walked.map.tape_file_count(),
         });
     }
-    validate_measured_terminal_components(walked.map.entries(), &layout)?;
+    validate_measured_terminal_components(walked.map.entries(), layout)?;
 
     let prefix_count = layout.components[0].planned_tape_file_number;
     let prefix_len = usize::try_from(prefix_count).map_err(|_| {
@@ -1722,10 +1796,43 @@ fn verify_terminal_index_strict<V: ProtectedPass>(
         )
     })?;
 
+    Ok(MeasuredPrefixEvidence {
+        expected_file_count,
+        prefix_len,
+        verified_prefix_record_count,
+    })
+}
+
+/// Select whether canonical rows are checked as the payload streams.
+#[derive(Clone, Copy)]
+enum ReplicaRowCheck<'a> {
+    AgainstMeasured(&'a [TapeFileMapEntry]),
+    // Reserved for verification that measures the prefix after reading the index.
+    #[allow(dead_code)]
+    CollectOnly,
+}
+
+/// Owned evidence from three mutually agreeing terminal replicas.
+struct TerminalReplicaSetEvidence {
+    edition: TapeIndexEditionPlan,
+    replicas: [TapeIndexReplicaPayloadSummary; 3],
+    rows: Vec<TapeIndexReplicaMapEntry>,
+}
+
+/// Validate all replicas, retaining the first replica's structural rows.
+/// With CollectOnly, a row disagreement followed by a payload fault reports the
+/// payload fault. The strict path therefore keeps AgainstMeasured so the first
+/// disagreeing row fails inside the streaming callback before later payload faults.
+fn verify_terminal_replicas(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    layout: TerminalTailLayout,
+    row_check: ReplicaRowCheck<'_>,
+) -> Result<TerminalReplicaSetEvidence, TerminalIndexVerificationError> {
     let mut replica_summaries = Vec::with_capacity(usize::from(TERMINAL_INDEX_REPLICA_COUNT));
     let mut edition: Option<TapeIndexEditionPlan> = None;
-    // The structural rows of the validated replicas (they agree row by row
-    // with the measured prefix), which scope the protected-content pass.
+    // Retain the structural rows to scope the protected-content pass.
     let mut rows: Vec<TapeIndexReplicaMapEntry> = Vec::new();
     for ordinal in 1..=TERMINAL_INDEX_REPLICA_COUNT {
         let envelope = validate_member_envelope(source, tape_uuid, block_size, layout, ordinal)
@@ -1738,20 +1845,13 @@ fn verify_terminal_index_strict<V: ProtectedPass>(
             block_size,
             &envelope,
             &mut |entry| {
-                let Some(physical) = physical_prefix.get(entry_index) else {
-                    let detail = format!("canonical map emitted extra row at index {entry_index}");
-                    canonical_mismatch = Some(detail.clone());
-                    return Err(TapeIndexReplicaError::Payload { message: detail });
-                };
-                if !canonical_entry_matches_physical(entry, physical) {
-                    canonical_mismatch = Some(format!(
-                        "canonical row {entry:?} disagrees with measured row {physical:?}"
-                    ));
-                    return Err(TapeIndexReplicaError::Payload {
-                        message: canonical_mismatch
-                            .clone()
-                            .expect("mismatch detail was just populated"),
-                    });
+                if let ReplicaRowCheck::AgainstMeasured(physical_prefix) = row_check {
+                    if let Err(detail) =
+                        check_row_against_measured(entry, entry_index, physical_prefix)
+                    {
+                        canonical_mismatch = Some(detail.clone());
+                        return Err(TapeIndexReplicaError::Payload { message: detail });
+                    }
                 }
                 replica_rows_seen.push(entry.clone());
                 entry_index = entry_index.checked_add(1).ok_or(
@@ -1784,15 +1884,8 @@ fn verify_terminal_index_strict<V: ProtectedPass>(
         if rows.is_empty() {
             rows = replica_rows_seen;
         }
-        if entry_index != physical_prefix.len() {
-            return Err(TerminalIndexVerificationError::CanonicalMapMismatch {
-                ordinal,
-                tape_file_number: u64::try_from(entry_index).unwrap_or(u64::MAX),
-                detail: format!(
-                    "canonical map emitted {entry_index} rows, measured prefix has {}",
-                    physical_prefix.len()
-                ),
-            });
+        if let ReplicaRowCheck::AgainstMeasured(physical_prefix) = row_check {
+            check_measured_row_count(ordinal, entry_index, physical_prefix.len())?;
         }
         if let Some(reference) = edition.as_ref() {
             if envelope.header.plan.edition != *reference
@@ -1809,6 +1902,82 @@ fn verify_terminal_index_strict<V: ProtectedPass>(
     }
 
     let edition = edition.expect("three verified replicas establish one edition");
+    let replicas: [TapeIndexReplicaPayloadSummary; 3] = replica_summaries
+        .try_into()
+        .expect("terminal replica count is exactly three");
+    Ok(TerminalReplicaSetEvidence {
+        edition,
+        replicas,
+        rows,
+    })
+}
+
+/// Compare one canonical row at its stream index, allocating only on disagreement.
+fn check_row_against_measured(
+    entry: &TapeIndexReplicaMapEntry,
+    entry_index: usize,
+    physical_prefix: &[TapeFileMapEntry],
+) -> Result<(), String> {
+    let Some(physical) = physical_prefix.get(entry_index) else {
+        return Err(format!(
+            "canonical map emitted extra row at index {entry_index}"
+        ));
+    };
+    if !canonical_entry_matches_physical(entry, physical) {
+        return Err(format!(
+            "canonical row {entry:?} disagrees with measured row {physical:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Preserve the streaming diagnostic when the canonical map ends before the prefix.
+fn check_measured_row_count(
+    ordinal: u16,
+    entry_count: usize,
+    physical_count: usize,
+) -> Result<(), TerminalIndexVerificationError> {
+    if entry_count != physical_count {
+        return Err(TerminalIndexVerificationError::CanonicalMapMismatch {
+            ordinal,
+            tape_file_number: u64::try_from(entry_count).unwrap_or(u64::MAX),
+            detail: format!(
+                "canonical map emitted {entry_count} rows, measured prefix has {physical_count}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Compare collected rows without I/O, using the streaming check's first mismatch.
+/// CollectOnly validates the payload before this check, so a later payload fault
+/// takes precedence over a row disagreement; strict verification checks rows inline.
+#[allow(dead_code)] // Used when the prefix is measured after replica collection.
+fn check_rows_against_measured(
+    ordinal: u16,
+    rows: &[TapeIndexReplicaMapEntry],
+    physical_prefix: &[TapeFileMapEntry],
+) -> Result<(), TerminalIndexVerificationError> {
+    for (entry_index, entry) in rows.iter().enumerate() {
+        check_row_against_measured(entry, entry_index, physical_prefix).map_err(|detail| {
+            TerminalIndexVerificationError::CanonicalMapMismatch {
+                ordinal,
+                tape_file_number: u64::try_from(entry_index).unwrap_or(u64::MAX),
+                detail,
+            }
+        })?;
+    }
+    check_measured_row_count(ordinal, rows.len(), physical_prefix.len())
+}
+
+/// Read and validate both separation extents in ordinal order.
+fn verify_terminal_separations(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    layout: TerminalTailLayout,
+    expected_edition_id: [u8; 16],
+) -> Result<[u64; 2], TerminalIndexVerificationError> {
     let mut separation_interior_records = [0u64; 2];
     for ordinal in 1..=crate::terminal_tail::TERMINAL_INDEX_SEPARATION_COUNT {
         separation_interior_records[usize::from(ordinal - 1)] = verify_separation_full(
@@ -1817,32 +1986,11 @@ fn verify_terminal_index_strict<V: ProtectedPass>(
             block_size,
             layout,
             ordinal,
-            edition.descriptor.edition_id,
+            expected_edition_id,
         )?;
     }
 
-    let replicas: [TapeIndexReplicaPayloadSummary; 3] = replica_summaries
-        .try_into()
-        .expect("terminal replica count is exactly three");
-    let protected = verify_protected_prefix::<V>(
-        source,
-        tape_uuid,
-        block_size,
-        &walked,
-        &edition,
-        &rows,
-        vec![],
-    )?;
-    Ok(TerminalIndexCompleteEvidence {
-        edition,
-        replicas,
-        separation_interior_records,
-        measured_eod,
-        verified_prefix_tape_file_count: prefix_count,
-        verified_prefix_record_count,
-        measured_tape_file_count: walked.map.tape_file_count(),
-        protected,
-    })
+    Ok(separation_interior_records)
 }
 
 fn validate_measured_terminal_components(
@@ -3050,6 +3198,131 @@ mod tests {
             layout.expected_eod_lba
         );
         TripleFixture { records, layout }
+    }
+
+    /// Compare the complete mismatch diagnostics from streaming and deferred checks.
+    fn assert_deferred_row_mismatch(
+        physical_prefix: &[TapeFileMapEntry],
+        expected_file: u64,
+        expected_detail: &str,
+    ) {
+        let fixture = triple_fixture();
+        let collected = verify_terminal_replicas(
+            &mut RecordingSource::new(fixture.records.clone()),
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            fixture.layout,
+            ReplicaRowCheck::CollectOnly,
+        )
+        .unwrap();
+        let deferred =
+            check_rows_against_measured(1, &collected.rows, physical_prefix).unwrap_err();
+        let streaming = verify_terminal_replicas(
+            &mut RecordingSource::new(fixture.records),
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            fixture.layout,
+            ReplicaRowCheck::AgainstMeasured(physical_prefix),
+        )
+        .err()
+        .expect("streaming comparison must fail");
+        match (streaming, deferred) {
+            (
+                TerminalIndexVerificationError::CanonicalMapMismatch {
+                    ordinal,
+                    tape_file_number,
+                    detail,
+                },
+                TerminalIndexVerificationError::CanonicalMapMismatch {
+                    ordinal: deferred_ordinal,
+                    tape_file_number: deferred_file,
+                    detail: deferred_detail,
+                },
+            ) => {
+                assert_eq!(ordinal, 1);
+                assert_eq!(tape_file_number, expected_file);
+                assert_eq!(detail, expected_detail);
+                assert_eq!(deferred_ordinal, ordinal);
+                assert_eq!(deferred_file, tape_file_number);
+                assert_eq!(deferred_detail, detail);
+            }
+            other => panic!("expected matching canonical mismatch errors, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collected_rows_match_streaming_extra_row_error() {
+        assert_deferred_row_mismatch(&[], 0, "canonical map emitted extra row at index 0");
+    }
+
+    #[test]
+    fn collected_rows_match_streaming_missing_row_error() {
+        assert_deferred_row_mismatch(
+            &[
+                TapeFileMapEntry::bootstrap(0, 1),
+                TapeFileMapEntry::object(1, 1, 0),
+            ],
+            1,
+            "canonical map emitted 1 rows, measured prefix has 2",
+        );
+    }
+
+    #[test]
+    fn collected_rows_match_streaming_disagreeing_row_error() {
+        let physical = TapeFileMapEntry::bootstrap(0, 2);
+        let mut rows = Vec::new();
+        BotOnlyRows
+            .visit_structural_entries(&mut |entry| {
+                rows.push(entry.clone());
+                Ok(())
+            })
+            .unwrap();
+        assert_deferred_row_mismatch(
+            std::slice::from_ref(&physical),
+            0,
+            &format!(
+                "canonical row {:?} disagrees with measured row {physical:?}",
+                rows[0]
+            ),
+        );
+    }
+
+    #[test]
+    fn streaming_row_mismatch_precedes_later_payload_fault() {
+        let mut fixture = triple_fixture();
+        let payload_lba = fixture.layout.replica(1).unwrap().planned_start_lba + 1;
+        let Record::Block(block) = &mut fixture.records[payload_lba as usize] else {
+            panic!("payload record must be a block");
+        };
+        *block.last_mut().unwrap() = 1;
+        let physical_prefix = [TapeFileMapEntry::bootstrap(0, 2)];
+        let streaming = verify_terminal_replicas(
+            &mut RecordingSource::new(fixture.records.clone()),
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            fixture.layout,
+            ReplicaRowCheck::AgainstMeasured(&physical_prefix),
+        );
+        assert!(matches!(
+            streaming,
+            Err(TerminalIndexVerificationError::CanonicalMapMismatch {
+                ordinal: 1,
+                tape_file_number: 0,
+                ..
+            })
+        ));
+        let collected = verify_terminal_replicas(
+            &mut RecordingSource::new(fixture.records),
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            fixture.layout,
+            ReplicaRowCheck::CollectOnly,
+        );
+        assert!(
+            matches!(collected, Err(TerminalIndexVerificationError::Replica {
+            ordinal: 1, failure: TerminalReplicaFailureKind::PayloadInvalid, detail,
+        }) if detail.contains("payload record padding"))
+        );
     }
 
     fn bot_bootstrap() -> Vec<u8> {
