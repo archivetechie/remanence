@@ -371,6 +371,32 @@ with `ulimit -l`, `LimitMEMLOCK=` for the daemon unit, or a `security/limits.d`
 entry for the user. `rem doctor` reports a low limit as an advisory warning.
 Read diagnostics include `minimum_slabs_locked` and `minimum_slabs_unlocked`.
 
+### Sizing the lock limit
+
+Only the read reservoir is locked into memory, so the soft `RLIMIT_MEMLOCK`
+limit of the daemon, or of `rem` for a standalone restore, is sized from
+reads. Reads and writes both move data in batches of
+`effective_batch_blocks × block_size` bytes, where the effective batch is
+`read_batch_blocks` or `write_batch_blocks` reduced to what the kernel's sg
+reserved buffer for the drive holds; the lock limit does not change it. The
+write staging ring holds `staging_ring_buffers` write batches per active
+drive in ordinary, unlocked memory. Each restore stream's read reservoir
+starts with `staging_ring_buffers` slabs of one read batch each, which is
+the minimum `rem doctor` checks, and grows towards `read_reservoir_bytes`,
+locking each slab it adds. Below the minimum, slabs fall back to unlocked
+memory with the `read reservoir uses unlocked buffers` warning; above it,
+growth stops at the limit with
+`read reservoir growth stopped at effective cap`. For every reservoir to
+reach its target, the limit must cover `read_reservoir_bytes` times the
+number of concurrent restore streams. A limit equal to `io_memory_ceiling`,
+or unlimited, always does, because the ceiling bounds all reservoirs
+together.
+
+| Case | Slab: batch × block size | Minimum: slab × ring buffers | Under an 8 MiB limit |
+|---|---|---|---|
+| Defaults: 16-block batch, 256 KiB blocks, 4 ring buffers | 16 × 256 KiB = 4 MiB | 4 MiB × 4 = 16 MiB | Two of the four minimum slabs stay unlocked, and the reservoir does not grow. |
+| A 1 MiB sg grant clamps the batch to 4; otherwise defaults | 4 × 256 KiB = 1 MiB | 1 MiB × 4 = 4 MiB | The minimum is locked, and growth stops at 8 slabs (8 MiB) of the 8 GiB target. |
+
 <!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-state/src/paths.rs crates/remanence-state/src/checkpoint.rs crates/remanence-api/src/lib.rs @ 1dd451b2 -->
 ## `[journal]`, `[audit]`, `[index]`, `[cache]` (required)
 

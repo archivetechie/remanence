@@ -128,6 +128,45 @@ rem tape quarantine release <id> --after-settled-inventory \
 The `--ack` text is recorded. The fence exists so that nobody writes to a tape whose state was last seen
 mid-uncertainty.
 
+<!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs @ 638210f7 -->
+## A drive stays not ready after a daemon crash
+
+A daemon that is killed while it unloads a cartridge can stop after the
+drive has unthreaded the tape and before the changer has moved it. The
+cartridge stays in the drive, and the drive answers NOT READY until it
+receives a LOAD. Remanence reads that answer as a cartridge becoming ready,
+so the restarted daemon reconciles a media-readiness fence for the drive
+and keeps polling it without end.
+
+The signs are:
+
+- `rem tape quarantine list` shows a fence for that cartridge in state
+  `media_initializing`, updated at every poll, and the drive never comes
+  ready.
+- `rem top --once` shows the bay busy with the cartridge mounted and no
+  I/O.
+- Writes and restores that need the drive wait on the fence.
+
+The same state appears during the one-time calibration of a new LTO-9
+cartridge, which can last over an hour. A cartridge that has been loaded
+before, and a stall that began with a daemon kill or crash, point to the
+unthreaded case instead.
+
+A LOAD resolves it. `rem tape wait-ready` only polls and does not issue
+one today, so send it with `sg_start` from sg3_utils:
+
+```sh
+rem libraries --json      # the observed_endpoints entry for the library serial and bay gives /dev/sgN
+sg_start --load /dev/sgN
+```
+
+The LOAD threads the cartridge that is already in the drive and moves
+nothing in the library, so it is safe to send while the daemon runs. The
+drive comes ready within seconds, sometimes after a unit attention that
+reports the change to ready, and the daemon clears the fence at its next
+poll. If the fence remains after the drive reports ready, handle it as
+described in the previous section.
+
 <!-- code-anchor: crates/remanence-library/src/handle/mod.rs crates/remanence-library/src/handle/tape_io/mod.rs @ 1dd451b2 -->
 ## Dirty snapshots and completion-unknown
 
@@ -183,6 +222,7 @@ when minimum slabs fall back to unlocked memory.
 | Message | Cause and fix |
 |---|---|
 | `read reservoir uses unlocked buffers` | The soft `RLIMIT_MEMLOCK` limit or lock permission prevents locking minimum read slabs. Reads continue, but tape data may be swapped. Check the limit, slab size, and count in the warning; raise the limit with `ulimit -l`, `LimitMEMLOCK=` for the daemon unit, or a `security/limits.d` entry for the user. `rem doctor` reports the limit and configured minimum without blocking readiness. |
+| `read reservoir growth stopped at effective cap` | A slab above the minimum could not be added. The restore continues with the reservoir it has. `reason` names the cause: an `mlock` error means the lock limit is reached, and `daemon.io_memory_ceiling has no reservoir capacity` means the shared ceiling is full. `allocated` is the slab count the reservoir stopped at. See [Throughput far below the drive](#throughput-far-below-the-drive). |
 
 The daemon also prints two non-fatal startup warnings to stderr:
 `daemon.io_memory_ceiling=... exceeds startup MemAvailable=...;
@@ -191,6 +231,49 @@ exceeds LimitMEMLOCK=...; reads fall back to unlocked buffers when minimum
 read reservoirs cannot be locked`. Both check the host's memory and lock
 limits once at startup; the ceiling itself is what the daemon enforces at
 runtime.
+
+### Throughput far below the drive
+
+Two host limits can hold a drive far below its rated speed without any
+error, and they show in different places.
+
+The lock limit affects restores. A restore stream's read reservoir locks
+every slab it adds. When a lock fails, the daemon logs
+`read reservoir growth stopped at effective cap` (target
+`remanence_read_reservoir`) with the lock error in `reason`, and the
+restore continues with the reservoir it has. `rem doctor` marks the same
+limit with `!` in its `memlock` check. A daemon started by hand inherits
+the limit of the shell or tmux server it runs in, often 8 MiB, and a
+running tmux server keeps its limit after a new `limits.d` entry. The
+`Max locked memory` line of `/proc/<daemon pid>/limits` shows what the
+daemon has, and as root this raises a running tmux server's limit:
+
+```sh
+prlimit --pid <tmux server pid> --memlock=unlimited:unlimited
+```
+
+The fix is the lock limit, not `read_reservoir_bytes` or the batch
+settings: raise it to at least `io_memory_ceiling`, or to unlimited, and
+restart the daemon. [Sizing the lock
+limit](reference-configuration.md#sizing-the-lock-limit) gives the
+arithmetic.
+
+The transfer size affects every command. The write diagnostics
+(`target: "remanence_write_diag"`, phases `drive_prepare` and
+`staging_ring_open`), the read `restore_total` event and
+`rem top --once --json` report `effective_batch_blocks`. When it is
+smaller than the configured `write_batch_blocks`, the kernel granted the
+drive a smaller sg reserved buffer than Remanence requested, and the batch
+is that buffer divided by the block size: a 1 MiB grant with 256 KiB
+blocks gives 4. The write staging ring is not locked memory, so the lock
+limit does not change this value, and a larger `write_batch_blocks` does
+not either. The grant is bounded by the HBA driver's maximum transfer size
+and the sg driver's limits. With a smaller batch the host issues more
+commands for the same data, and the feed can fall below the drive's
+speed-matching floor.
+
+A host that has never been tuned can show both at once. Each is fixed at
+its own limit.
 
 <!-- code-anchor: crates/remanence-api/src/pool_write.rs crates/remanence-parity/src/error.rs crates/remanence-api/src/pool_write/selection.rs crates/remanence-api/src/write_admission.rs @ 1dd451b2 -->
 ## Writes are refused
@@ -284,6 +367,7 @@ Strings worth grepping for, mapped to the sections above:
 | `read-only mode` | daemon started with `read_only = true` |
 | `acquire daemon state ownership` | another daemon or offline state owner holds `state.lock`; stop that owner |
 | `read reservoir uses unlocked buffers` | non-fatal memory-lock fallback; see warnings above |
+| `read reservoir growth stopped at effective cap` | reservoir growth hit the lock limit or the I/O ceiling; see [Throughput far below the drive](#throughput-far-below-the-drive) |
 | `remanence_read_reservoir` (as `target`) | read-reservoir memory-lock warning and remedy |
 | `remanence_read_diag` (as `target`) | read-pipeline reservoir/backpressure diagnostics, see above |
 
