@@ -9,6 +9,13 @@
 //! Terminal replica/separation magic is structurally reserved: damaged terminal
 //! framing remains typed control evidence so it cannot consume Object ordinals.
 
+// The file reader is exercised independently until verification selects it.
+#[allow(dead_code)]
+mod forward_file;
+use forward_file::{
+    FileObservation, ForwardFileReader, HeadProvenance, ObservedClassificationSource,
+};
+
 use crate::bootstrap::{has_bootstrap_magic, parse_bootstrap_block, BootstrapPayload};
 use crate::error::{BootstrapRefusedField, ParityError};
 use crate::filemark_map::{
@@ -947,6 +954,34 @@ fn scan_reconstruct_filemark_map_with_provenance<F>(
 where
     F: FnMut(&ScanWalkProgress) -> ScanWalkControl,
 {
+    #[cfg(test)]
+    let forward = forward_file::test_support::FORWARD.get();
+    #[cfg(not(test))]
+    let forward = false;
+    reconstruct_with_reader(
+        source,
+        forward,
+        tape_uuid,
+        block_size,
+        mode,
+        control,
+        bootstrap_observer,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_with_reader<F>(
+    source: &mut dyn RawTapeSource,
+    forward: bool,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    mode: ScanMode<'_>,
+    control: &mut F,
+    bootstrap_observer: &mut dyn FnMut(&ScanBootstrapCandidate),
+) -> Result<ScanReconstructionOutcome, ParityError>
+where
+    F: FnMut(&ScanWalkProgress) -> ScanWalkControl,
+{
     if block_size == 0 {
         return Err(ParityError::Invariant("scan block size is zero"));
     }
@@ -976,15 +1011,46 @@ where
     let mut damaged_regions = Vec::new();
     let started_at = Instant::now();
 
+    let mut reader = forward
+        .then(|| ForwardFileReader::new(block_size, 32))
+        .transpose()?;
+    let mut forward_head = PhysicalPositionHint::new(0);
+    let mut provenance = HeadProvenance::Locate;
     loop {
-        let file_start = source.position()?;
+        let file_start = if forward {
+            forward_head
+        } else {
+            source.position()?
+        };
         let at_bot = builder.next_tape_file_number()? == 0 && file_start.lba == 0;
         // Supplied values judge only tape file 0's record at LBA 0 (REM-PARITY 8.4).
         let bot_hints = match mode {
             ScanMode::Recovery(hints) if at_bot => Some(hints),
             _ => None,
         };
-        let read = source.read_record(&mut buf);
+        let mut observation = reader
+            .as_mut()
+            .map(|reader| {
+                reader.read_file(
+                    source,
+                    builder.next_tape_file_number()?,
+                    file_start,
+                    provenance,
+                    1,
+                    1,
+                    &mut |_, _| Ok(()),
+                )
+            })
+            .transpose()?;
+        let read = if let Some(observation) = observation.as_mut() {
+            buf.copy_from_slice(&observation.head_block);
+            observation
+                .head_read
+                .take()
+                .ok_or(ParityError::Invariant("forward head is absent"))?
+        } else {
+            source.read_record(&mut buf)
+        };
         if let Some(hints) = bot_hints {
             // The measured length is judged before anything else.
             hints.check_bootstrap_read_length(&read, block_size_usize)?;
@@ -1014,6 +1080,7 @@ where
             }
             Err(error) => return Err(error),
         };
+        provenance = HeadProvenance::DeviceReport;
         match head {
             // A filemark or EOD where the first record should be is an unreadable
             // bootstrap, never a refusal (REM-PARITY 8.4): the walk continues on
@@ -1044,26 +1111,31 @@ where
                         }
                     }
                 }
-                let measured = match measure_current_file(source, file_start)? {
-                    MeasureCurrentFileOutcome::Complete(measured) => measured,
-                    MeasureCurrentFileOutcome::Truncated(kind) => {
-                        truncation_candidate_kind = Some(classify_tape_file_head(
-                            &first_block,
-                            tape_uuid,
-                            block_size,
-                            at_bot,
-                        ));
-                        truncation = Some(ScanTailTruncation {
-                            tape_file_number: builder.next_tape_file_number()?,
-                            position: file_start,
-                            kind,
-                        });
-                        break;
-                    }
-                };
+                let measured =
+                    match measure_file_observation(source, file_start, observation.as_ref())? {
+                        MeasureCurrentFileOutcome::Complete(measured) => measured,
+                        MeasureCurrentFileOutcome::EndOfData => break,
+                        MeasureCurrentFileOutcome::Truncated(kind) => {
+                            truncation_candidate_kind = Some(classify_tape_file_head(
+                                &first_block,
+                                tape_uuid,
+                                block_size,
+                                at_bot,
+                            ));
+                            truncation = Some(ScanTailTruncation {
+                                tape_file_number: builder.next_tape_file_number()?,
+                                position: file_start,
+                                kind,
+                            });
+                            break;
+                        }
+                    };
                 if invalid_bootstrap {
-                    append_entry_with_unreadable_head(
+                    append_from_observation(
                         source,
+                        observation.as_ref(),
+                        &mut provenance,
+                        None,
                         &mut builder,
                         tape_uuid,
                         block_size,
@@ -1071,10 +1143,12 @@ where
                         measured.block_count,
                         &mut damaged_regions,
                     )?;
-                } else if let Some(candidate) = append_classified_entry(
+                } else if let Some(candidate) = append_from_observation(
                     source,
+                    observation.as_ref(),
+                    &mut provenance,
+                    Some(&first_block),
                     &mut builder,
-                    &first_block,
                     tape_uuid,
                     block_size,
                     file_start,
@@ -1084,7 +1158,14 @@ where
                     bootstrap_observer(&candidate);
                     bootstrap_candidates.push(candidate);
                 }
-                source.locate_physical(measured.position_after)?;
+                if observation
+                    .as_ref()
+                    .is_none_or(|o| o.requires_spacing.is_some())
+                {
+                    source.locate_physical(measured.position_after)?;
+                    provenance = HeadProvenance::Locate;
+                }
+                forward_head = measured.position_after;
                 saw_file = true;
                 if let Some(aborted) =
                     scan_boundary_control(&builder, measured.position_after, started_at, control)?
@@ -1101,20 +1182,27 @@ where
                 if let Some(hints) = bot_hints {
                     bootstrap_recovery_hints = Some(hints.clone());
                 }
-                source.locate_physical(file_start)?;
-                let measured = match measure_current_file(source, file_start)? {
-                    MeasureCurrentFileOutcome::Complete(measured) => measured,
-                    MeasureCurrentFileOutcome::Truncated(kind) => {
-                        truncation = Some(ScanTailTruncation {
-                            tape_file_number: builder.next_tape_file_number()?,
-                            position: file_start,
-                            kind,
-                        });
-                        break;
-                    }
-                };
-                append_entry_with_unreadable_head(
+                if observation.is_none() {
+                    source.locate_physical(file_start)?;
+                }
+                let measured =
+                    match measure_file_observation(source, file_start, observation.as_ref())? {
+                        MeasureCurrentFileOutcome::Complete(measured) => measured,
+                        MeasureCurrentFileOutcome::EndOfData => break,
+                        MeasureCurrentFileOutcome::Truncated(kind) => {
+                            truncation = Some(ScanTailTruncation {
+                                tape_file_number: builder.next_tape_file_number()?,
+                                position: file_start,
+                                kind,
+                            });
+                            break;
+                        }
+                    };
+                append_from_observation(
                     source,
+                    observation.as_ref(),
+                    &mut provenance,
+                    None,
                     &mut builder,
                     tape_uuid,
                     block_size,
@@ -1122,7 +1210,14 @@ where
                     measured.block_count,
                     &mut damaged_regions,
                 )?;
-                source.locate_physical(measured.position_after)?;
+                if observation
+                    .as_ref()
+                    .is_none_or(|o| o.requires_spacing.is_some())
+                {
+                    source.locate_physical(measured.position_after)?;
+                    provenance = HeadProvenance::Locate;
+                }
+                forward_head = measured.position_after;
                 saw_file = true;
                 if let Some(aborted) =
                     scan_boundary_control(&builder, measured.position_after, started_at, control)?
@@ -1145,6 +1240,150 @@ where
         bootstrap_candidates,
         damaged_regions,
     }))
+}
+
+/// Select the walk's measurement for files without sequential position proof.
+fn measure_file_observation(
+    source: &mut dyn RawTapeSource,
+    start: PhysicalPositionHint,
+    observation: Option<&FileObservation>,
+) -> Result<MeasureCurrentFileOutcome, ParityError> {
+    match observation {
+        Some(observation) => observation.measure(source),
+        None => measure_current_file(source, start),
+    }
+}
+
+/// Feed the single classification ladder from retained or positioned blocks.
+#[allow(clippy::too_many_arguments)]
+fn append_from_observation(
+    source: &mut dyn RawTapeSource,
+    observation: Option<&FileObservation>,
+    next_provenance: &mut HeadProvenance,
+    head: Option<&[u8]>,
+    builder: &mut FilemarkMapBuilder,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    file_start: PhysicalPositionHint,
+    block_count: u64,
+    damage: &mut Vec<ScanDamagedRegion>,
+) -> Result<Option<ScanBootstrapCandidate>, ParityError> {
+    #[cfg(any(test, feature = "test-support"))]
+    let _classification =
+        observation.map(|o| forward_file::test_support::ClassificationScope::new(o.head_position));
+    if let Some(observation) = observation.filter(|o| o.requires_spacing.is_none()) {
+        let mut blocks = ObservedClassificationSource {
+            source,
+            observation,
+            positioned: false,
+        };
+        let candidate = append_classified_file(
+            &mut blocks,
+            builder,
+            head,
+            tape_uuid,
+            block_size,
+            file_start,
+            block_count,
+            damage,
+        )?;
+        if blocks.positioned {
+            *next_provenance = HeadProvenance::Locate;
+            blocks.source.locate_physical(
+                observation
+                    .report_after_filemark
+                    .expect("measured file has a report")
+                    .position,
+            )?;
+        }
+        Ok(candidate)
+    } else if let Some(head) = head {
+        append_classified_entry(
+            source,
+            builder,
+            head,
+            tape_uuid,
+            block_size,
+            file_start,
+            block_count,
+            damage,
+        )
+    } else {
+        append_entry_with_unreadable_head(
+            source,
+            builder,
+            tape_uuid,
+            block_size,
+            file_start,
+            block_count,
+            damage,
+        )?;
+        Ok(None)
+    }
+}
+
+/// Per-file physical work collected by the file-reader equivalence seam.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug)]
+pub struct ForwardFileIoForTest {
+    /// Physical head of this observed file.
+    pub head_position: PhysicalPositionHint,
+    /// Measurement fallbacks to LOCATE and SPACE.
+    pub fallbacks: usize,
+    /// Addressed classification reads outside the retained windows.
+    pub positioned_classification_reads: usize,
+    /// Whether a positioning command established this head.
+    pub head_established_by_positioning: bool,
+}
+
+/// Drain the current thread's per-file counters, including files before an error.
+#[cfg(any(test, feature = "test-support"))]
+pub fn take_forward_file_io_for_test() -> Vec<ForwardFileIoForTest> {
+    forward_file::test_support::FILES.with_borrow_mut(|files| {
+        files
+            .drain(..)
+            .map(|file| ForwardFileIoForTest {
+                head_position: file.head,
+                fallbacks: file.fallbacks,
+                positioned_classification_reads: file.positioned_reads,
+                head_established_by_positioning: file.provenance == HeadProvenance::Locate,
+            })
+            .collect()
+    })
+}
+
+/// Exercise the physical reader without selecting it for full verification.
+#[cfg(any(test, feature = "test-support"))]
+pub fn forward_file_scan_for_test(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    mode: ScanMode<'_>,
+) -> Result<ScanWalkResult, ParityError> {
+    forward_file::test_support::FILES.with_borrow_mut(Vec::clear);
+    let ScanReconstructionOutcome::Complete(mut reconstructed) = reconstruct_with_reader(
+        source,
+        true,
+        tape_uuid,
+        block_size,
+        mode,
+        &mut |_| ScanWalkControl::Continue,
+        &mut |_| {},
+    )?
+    else {
+        unreachable!("unconditional reader")
+    };
+    let final_parity_map =
+        reconcile_walk_sidecars(source, &mut reconstructed.map, tape_uuid, block_size)?;
+    Ok(ScanWalkResult {
+        final_parity_map: final_parity_map.map(Box::new),
+        bootstrap_recovery_hints: reconstructed.bootstrap_recovery_hints,
+        map: reconstructed.map,
+        truncation: reconstructed.truncation,
+        truncation_candidate_kind: reconstructed.truncation_candidate_kind,
+        bootstrap_candidates: reconstructed.bootstrap_candidates,
+        damaged_regions: reconstructed.damaged_regions,
+    })
 }
 
 fn scan_boundary_control<F>(
@@ -1193,6 +1432,7 @@ struct MeasuredTapeFile {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MeasureCurrentFileOutcome {
+    EndOfData,
     Complete(MeasuredTapeFile),
     Truncated(ScanTailTruncationKind),
 }
@@ -1754,6 +1994,8 @@ impl ClassificationBlockSource for PositionedClassificationSource<'_> {
         block_within_file: u64,
         block_size: u32,
     ) -> Result<ClassificationBlockRead, ParityError> {
+        #[cfg(any(test, feature = "test-support"))]
+        forward_file::test_support::record_classification();
         // Every offset passed here is below the file's measured block count (the
         // last block, or a tail copy that a footer whose total equals the measured
         // count places inside the file), so the sum lies before the device's
@@ -1847,6 +2089,11 @@ fn bootstrap_refused(field: BootstrapRefusedField, detail: impl Into<String>) ->
 #[cfg(test)]
 mod tests {
     mod classification_tests;
+    mod forward_file_tests;
+    use forward_file_tests::{
+        checked_scan as scan_reconstruct_filemark_map_with_report,
+        checked_scan_mode as scan_reconstruct_filemark_map_with_report_mode,
+    };
 
     use super::*;
     use crate::bootstrap::{write_bootstrap_block, BootstrapPayload, ParitySchemeRecord};
@@ -2003,6 +2250,7 @@ mod tests {
         Block(Vec<u8>),
         Filemark,
         ReadFault(TestReadFault),
+        UnreadableFilemark,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2063,7 +2311,7 @@ mod tests {
         SpaceFilemarks(i64),
     }
 
-    #[derive(Debug)]
+    #[derive(Clone, Debug)]
     struct RecordingRawSource {
         records: Vec<Record>,
         cursor: usize,
@@ -2137,6 +2385,9 @@ mod tests {
 
             let mut spaced = 0i64;
             while self.cursor < self.records.len() && spaced < count {
+                if matches!(self.records[self.cursor], Record::UnreadableFilemark) {
+                    return Err(TestReadFault::Medium.error());
+                }
                 let is_filemark = matches!(self.records[self.cursor], Record::Filemark);
                 self.cursor += 1;
                 if is_filemark {
@@ -2184,6 +2435,7 @@ mod tests {
                     })
                 }
                 Record::ReadFault(fault) => Err(fault.error()),
+                Record::UnreadableFilemark => Err(TestReadFault::Medium.error()),
             }
         }
 

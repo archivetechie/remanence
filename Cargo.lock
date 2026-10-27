@@ -2730,6 +2730,7 @@ dependencies = [
  "hmac",
  "nix 0.31.3",
  "reed-solomon-erasure",
+ "remanence-chaos",
  "remanence-crc",
  "remanence-library",
  "serde",

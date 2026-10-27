@@ -201,6 +201,29 @@ impl FaultEngine {
         })
     }
 
+    /// Bind a virtual medium-error plan to its actual filemark boundaries.
+    /// A fixed READ stops at the first filemark, so damage in a later file must
+    /// not affect the current command even when its requested count spans it.
+    pub fn for_read_medium_errors_in_files(
+        lbas: impl IntoIterator<Item = u64>,
+        filemarks: impl IntoIterator<Item = u64>,
+    ) -> Result<Self, ChaosError> {
+        let engine = Self::for_read_medium_errors(lbas)?;
+        let filemarks: BTreeSet<_> = filemarks.into_iter().collect();
+        {
+            let mut inner = engine.inner.lock().expect("chaos engine lock");
+            for fault in &mut inner.scenario.as_mut().expect("medium-error plan").faults {
+                let bad = fault.trigger["lba"].as_u64().expect("fault LBA");
+                let start = filemarks
+                    .range(..bad)
+                    .next_back()
+                    .map_or(0, |mark| mark + 1);
+                fault.trigger["read_file_start"] = json!(start);
+            }
+        }
+        Ok(engine)
+    }
+
     /// Load an engine from `REM_CHAOS_STATE`.
     pub fn from_env() -> Result<Self, ChaosError> {
         let state_path = env::var_os(ENV_CHAOS_STATE).ok_or(ChaosError::MissingStateEnv)?;
@@ -1608,6 +1631,11 @@ fn fault_matches(fault: &Fault, ctx: &DeviceCtx, command: &CommandInfo) -> bool 
     // record must fail even when it begins earlier. Confirm no prefix here;
     // the reader will locate and retry singly to identify the damaged record.
     if fault.catalogue_id == "MED-01" && command.operation == "read" {
+        if let Some(file_start) = json_u64(fault.trigger.get("read_file_start")) {
+            if command.lba.is_none_or(|start| start < file_start) {
+                return false;
+            }
+        }
         if let (Some(start), Some(bad), Some(count)) = (
             command.lba,
             json_u64(fault.trigger.get("lba")),
@@ -2890,6 +2918,30 @@ mod tests {
         assert!(engine
             .pre_call_decision(&DeviceCtx::new(), &before_fault, 1024)
             .is_none());
+    }
+
+    /// An intervening mark shields a healthy file from faults in later files.
+    #[test]
+    fn medium_error_plan_stops_at_filemarks() {
+        let engine = FaultEngine::for_read_medium_errors_in_files([42], [40]).unwrap();
+        let mut command = CommandInfo::decode(&[0x08, 1, 0, 0, 4, 0], DataDirection::In, 2048);
+        command.lba = Some(39);
+        assert!(engine
+            .pre_call_decision(&DeviceCtx::new(), &command, 2048)
+            .is_none());
+        command.lba = Some(40);
+        assert!(engine
+            .pre_call_decision(&DeviceCtx::new(), &command, 2048)
+            .is_none());
+        command.lba = Some(41);
+        assert!(engine
+            .pre_call_decision(&DeviceCtx::new(), &command, 2048)
+            .is_some());
+        let mark_error = FaultEngine::for_read_medium_errors_in_files([40], [40]).unwrap();
+        command.lba = Some(39);
+        assert!(mark_error
+            .pre_call_decision(&DeviceCtx::new(), &command, 2048)
+            .is_some());
     }
 
     fn chaos_fixture(state_path: &Path, ctx: DeviceCtx) -> ChaosTransport<FixtureTransport> {

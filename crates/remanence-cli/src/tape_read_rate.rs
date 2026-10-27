@@ -3,7 +3,7 @@
 
 use super::*;
 #[cfg(target_os = "linux")]
-use remanence_library::{decode_scsi_sense, ScsiError, SpaceKind, TapeIoError};
+use remanence_library::SpaceKind;
 #[cfg(target_os = "linux")]
 use std::time::Instant;
 
@@ -177,70 +177,11 @@ fn preserve_measurement_on_cleanup_error(
     }
 }
 
-/// Decode boundary/error completions without the verification reader's LOCATE redo.
-/// Only complete records in a current, aligned filemark/EOD response are credited.
 #[cfg(target_os = "linux")]
-fn completion(error: &TapeIoError, size: u32, requested: u32) -> (u32, &'static str) {
-    let (source, corrected) = match error {
-        TapeIoError::CheckCondition(source) => (source, None),
-        TapeIoError::CheckConditionWithResidue {
-            source,
-            bytes_transferred,
-        } => (source, Some(*bytes_transferred)),
-        TapeIoError::GoodReadLengthMismatch { .. } | TapeIoError::ReadBufferTooSmall { .. } => {
-            return (0, "wrong_length")
-        }
-        TapeIoError::OperationFailed(message)
-            if message.starts_with("unclean verification batch:") =>
-        {
-            return (0, "unclean_read")
-        }
-        _ => return (0, "io_error"),
-    };
-    let ScsiError::CheckCondition {
-        sense,
-        bytes_transferred,
-    } = source
-    else {
-        return (0, "io_error");
-    };
-    let Some(sense) = decode_scsi_sense(sense) else {
-        return (0, "io_error");
-    };
-    if sense.is_deferred() {
-        return (0, "io_error");
-    }
-    if sense.ili {
-        return (0, "wrong_length");
-    }
-    if sense.key == 3 {
-        return (0, "medium_error");
-    }
-    if sense.key == 1 {
-        return (0, "recovered_error");
-    }
-    let bytes = corrected.unwrap_or(*bytes_transferred);
-    if !sense.valid || bytes % size != 0 || bytes / size >= requested {
-        return (
-            0,
-            if sense.key == 8 {
-                "end_of_data"
-            } else {
-                "io_error"
-            },
-        );
-    }
-    if sense.key == 0 && sense.filemark && !sense.eom {
-        return (bytes / size, "filemark");
-    }
-    if sense.key == 8 {
-        return (bytes / size, "end_of_data");
-    }
-    (0, "io_error")
-}
+use remanence_library::verification_read_completion as completion;
 
-/// Median command latency, or no value when no commands were timed.
 #[cfg(target_os = "linux")]
+/// Median command latency, or no value when no commands were timed.
 fn median_seconds(samples: &mut [f64]) -> Option<f64> {
     samples.sort_by(f64::total_cmp);
     if samples.is_empty() {
@@ -464,7 +405,7 @@ mod tests {
         DeviceRole, ModelTransport, Record, SharedVirtualWorld, VirtualTape, VirtualWorld,
     };
     use remanence_library::transport::TransferOutcome;
-    use remanence_library::{SgTransport, TimeoutClass};
+    use remanence_library::{decode_scsi_sense, ScsiError, SgTransport, TimeoutClass};
     use std::sync::{Arc, Mutex};
 
     /// Keep actual positioning and READ semantics in the virtual drive; inject one read fault.
@@ -476,6 +417,7 @@ mod tests {
         omit_kernel_residual: bool,
         position_mismatch: bool,
         awaiting_filemark_position: bool,
+        fixed_reads_only: bool,
     }
     impl SgTransport for ReadFault {
         fn execute_in(&mut self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
@@ -488,7 +430,9 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
             if cdb[0] == 0x08 {
-                assert_eq!(cdb[1], 1, "READ uses fixed mode without SILI");
+                if self.fixed_reads_only {
+                    assert_eq!(cdb[1], 1, "READ uses fixed mode without SILI");
+                }
                 self.reads += 1;
                 if self.reads == 2 {
                     if let Some(flags) = self.fault {
@@ -523,7 +467,7 @@ mod tests {
                         // Model a stop whose cost is inside the terminal READ.
                         std::thread::sleep(std::time::Duration::from_millis(10));
                     }
-                    if self.omit_kernel_residual {
+                    if self.omit_kernel_residual && cdb[1] & 1 != 0 {
                         *bytes_transferred = buf.len() as u32;
                     }
                 }
@@ -558,6 +502,16 @@ mod tests {
         omit_kernel_residual: bool,
         position_mismatch: bool,
     ) -> (DriveHandle, SharedVirtualWorld) {
+        drive_with_policy(fault, empty, omit_kernel_residual, position_mismatch, true)
+    }
+
+    fn drive_with_policy(
+        fault: Option<u8>,
+        empty: bool,
+        omit_kernel_residual: bool,
+        position_mismatch: bool,
+        fixed_reads_only: bool,
+    ) -> (DriveHandle, SharedVirtualWorld) {
         let mut world = VirtualWorld::single_drive("TESTLIB", 0x100, "TESTDRIVE", 0x400, 1);
         let mut tape = VirtualTape::empty(1 << 30, 262144);
         tape.records.push(Record::ZeroBlock(262144));
@@ -577,6 +531,7 @@ mod tests {
             omit_kernel_residual,
             position_mismatch,
             awaiting_filemark_position: false,
+            fixed_reads_only,
         };
         let mut drive = DriveHandle::open_standalone_with_transport(
             Path::new("/virtual/read-rate"),
@@ -588,6 +543,90 @@ mod tests {
         drive.write_config(config).unwrap();
         world.lock().unwrap().command_log.clear();
         (drive, world)
+    }
+
+    /// The same no-residual transport mode exercises file measurement and crediting.
+    #[test]
+    fn forward_file_reader_credits_no_residual_partial_batch() {
+        for omit in [false, true] {
+            let (mut walk, walk_world) = drive_with_policy(None, false, omit, false, false);
+            let (mut forward, world) = drive_with_policy(None, false, omit, false, true);
+            let mut bot = vec![0; 262144];
+            remanence_parity::bootstrap::write_bootstrap_block(
+                &remanence_parity::BootstrapPayload {
+                    tape_uuid: [0; 16],
+                    sequence: 0,
+                    block_size_bytes: 262144,
+                    scheme: None,
+                    no_parity_flag: true,
+                    filemark_map_digest: None,
+                    drive_compression: false,
+                    written_by_version: "file-reader-test".into(),
+                    written_at: String::new(),
+                },
+                &mut bot,
+            )
+            .unwrap();
+            for world in [&walk_world, &world] {
+                world
+                    .lock()
+                    .unwrap()
+                    .tapes
+                    .get_mut("TESTL9")
+                    .unwrap()
+                    .records[0] = Record::Block(bot.clone());
+            }
+            let walk = remanence_parity::scan_reconstruct_filemark_map_with_report(
+                &mut remanence_parity::DriveHandleRawSource::new(&mut walk),
+                &[0; 16],
+                262144,
+            )
+            .unwrap();
+            let forward = remanence_parity::scan::forward_file_scan_for_test(
+                &mut remanence_parity::DriveHandleRawSource::new(&mut forward),
+                &[0; 16],
+                262144,
+                remanence_parity::ScanMode::Standard,
+            )
+            .unwrap();
+            assert_eq!(walk, forward);
+            assert_eq!(
+                forward
+                    .map
+                    .entries()
+                    .iter()
+                    .map(|e| e.block_count)
+                    .collect::<Vec<_>>(),
+                [1, 19, 5, 1]
+            );
+            let world = world.lock().unwrap();
+            let count = |opcode| {
+                world
+                    .command_log
+                    .iter()
+                    .filter(|c| c.opcode == opcode)
+                    .count()
+            };
+            assert_eq!(count(0x11), 0, "healthy file reader issues no SPACE");
+            assert_eq!(count(0x92), 1, "only the initial BOT LOCATE");
+            assert_eq!(
+                count(0x34),
+                5,
+                "initial LOCATE report plus one report per filemark"
+            );
+        }
+    }
+
+    /// A boundary without agreeing transfer evidence cannot contribute bytes.
+    #[test]
+    fn read_rate_reports_unconfirmed_boundary_without_credit() {
+        let (mut drive, _) = drive(Some(0x80), false);
+        let value = measure(&mut drive, 262144, 1, 1, Mode::Read);
+        assert_eq!(value["outcome"], "unconfirmed_boundary");
+        assert_eq!(value["files"][0]["outcome"], "unconfirmed_boundary");
+        assert_eq!(value["totals"]["bytes"], "262144");
+        assert_eq!(value["totals"]["files_completed"], 0);
+        assert_eq!(value["ok"], false);
     }
 
     #[test]

@@ -371,6 +371,29 @@ pub struct RawReadBatch {
     pub end: RawReadEnd,
 }
 
+/// A forward READ prefix and whether its boundary lacks record-count evidence.
+#[derive(Debug)]
+pub struct RawForwardReadBatch {
+    /// Whole records and the terminal outcome.
+    pub batch: RawReadBatch,
+    /// A filemark is reported without a usable VALID residue. No data from that
+    /// command is credited, and measurement must use spacing from the head.
+    pub unconfirmed_boundary: bool,
+}
+
+/// A physical position report, distinct from a buffered reader's logical cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawPositionReport {
+    /// Position returned by the device or the physical test source.
+    pub position: PhysicalPositionHint,
+    /// Logical file identifier, when the source reports one.
+    pub logical_file_identifier: Option<u64>,
+    /// LONU: neither the logical object number nor the partition is reported.
+    pub logical_object_number_unknown: bool,
+    /// MPU: file position is unknown or inaccurate.
+    pub mark_position_unknown: bool,
+}
+
 /// Raw physical-tape READ access used by Layer 3c.
 pub trait RawTapeSource {
     /// Passive drive context; non-drive sources have no transport to observe.
@@ -416,6 +439,32 @@ pub trait RawTapeSource {
             max_records,
             records_remaining_in_file,
         )
+    }
+
+    /// Read a forward batch without seeking back at a filemark. The boundary
+    /// position in the result is not measurement evidence: the caller must issue
+    /// `position_report` after a filemark. Unclean commands remain uncredited.
+    fn read_forward_records(
+        &mut self,
+        buf: &mut [u8],
+        block_size: u32,
+        count: u32,
+    ) -> RawForwardReadBatch {
+        RawForwardReadBatch {
+            batch: read_records_default(self, buf, block_size, count, count),
+            unconfirmed_boundary: false,
+        }
+    }
+
+    /// Issue a physical position report. Physical test sources can use their
+    /// cursor; buffered adapters must not use a computed cursor as evidence.
+    fn position_report(&mut self) -> Result<RawPositionReport, ParityError> {
+        Ok(RawPositionReport {
+            position: self.position()?,
+            logical_file_identifier: None,
+            logical_object_number_unknown: false,
+            mark_position_unknown: false,
+        })
     }
 
     /// Return the current physical tape position.
@@ -582,6 +631,30 @@ impl RawTapeSource for ReadRun<'_> {
         self.pending_data.clear();
         self.source.space_filemarks(count)
     }
+    fn position_report(&mut self) -> Result<RawPositionReport, ParityError> {
+        Err(ParityError::Invariant(
+            "buffered read run has no physical position report",
+        ))
+    }
+
+    fn read_forward_records(
+        &mut self,
+        _buf: &mut [u8],
+        _size: u32,
+        _count: u32,
+    ) -> RawForwardReadBatch {
+        RawForwardReadBatch {
+            batch: RawReadBatch {
+                records_read: 0,
+                position_after: None,
+                end: RawReadEnd::Error(ParityError::Invariant(
+                    "buffered read run cannot measure physical files",
+                )),
+            },
+            unconfirmed_boundary: false,
+        }
+    }
+
     fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
         match self.next {
             Some(next) => Ok(next),
@@ -1613,6 +1686,85 @@ impl RawTapeSource for DriveHandleRawSource<'_> {
             }
         }
         batch
+    }
+
+    fn position_report(&mut self) -> Result<RawPositionReport, ParityError> {
+        let report = self.drive.position_report()?;
+        let position = report.position.into();
+        self.cursor_hint = Some(position);
+        Ok(RawPositionReport {
+            position,
+            logical_file_identifier: Some(report.logical_file_identifier),
+            logical_object_number_unknown: report.logical_object_number_unknown,
+            mark_position_unknown: report.mark_position_unknown,
+        })
+    }
+
+    fn read_forward_records(
+        &mut self,
+        buf: &mut [u8],
+        block_size: u32,
+        count: u32,
+    ) -> RawForwardReadBatch {
+        let mut unconfirmed_boundary = false;
+        let result = (|| {
+            let before = self.current_or_seed_position()?;
+            let selected = count.min(
+                (self.drive.sg_reserved_size_bytes() / block_size.max(1))
+                    .clamp(1, self.drive.requested_read_batch_blocks().max(1)),
+            );
+            let read = self
+                .drive
+                .read_block_batch_for_file_verification(buf, block_size, selected);
+            let (records, boundary) = match read {
+                Ok(read) => (read.records_read, "complete"),
+                Err(error) => {
+                    self.cursor_hint = None;
+                    let (records, boundary) = remanence_library::verification_read_completion(
+                        &error, block_size, selected,
+                    );
+                    if boundary == "unconfirmed_boundary" {
+                        unconfirmed_boundary = true;
+                        let filemark =
+                            error.check_condition_transfer().is_some_and(|(sense, _)| {
+                                remanence_library::decode_scsi_sense(sense)
+                                    .is_some_and(|s| s.key == 0 && s.filemark)
+                            });
+                        (0, if filemark { "filemark" } else { "end_of_data" })
+                    } else if matches!(boundary, "filemark" | "end_of_data") {
+                        (records, boundary)
+                    } else {
+                        return Err(error.into());
+                    }
+                }
+            };
+            let after = device_position_after(before, u64::from(records), "forward batch")?;
+            let end = match boundary {
+                "filemark" => RawReadEnd::Filemark {
+                    position_after: device_position_after(after, 1, "forward boundary hint")?,
+                },
+                "end_of_data" => RawReadEnd::EndOfData {
+                    position_after: after,
+                },
+                _ => {
+                    self.cursor_hint = Some(after);
+                    RawReadEnd::Complete
+                }
+            };
+            Ok(RawReadBatch {
+                records_read: records,
+                position_after: Some(after),
+                end,
+            })
+        })();
+        RawForwardReadBatch {
+            unconfirmed_boundary,
+            batch: result.unwrap_or_else(|error| RawReadBatch {
+                records_read: 0,
+                position_after: None,
+                end: RawReadEnd::Error(error),
+            }),
+        }
     }
 
     fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
@@ -2743,6 +2895,32 @@ mod compat_tests {
             )
             .unwrap();
         (drive, log)
+    }
+
+    /// A filemark without VALID sense remains a boundary, never record credit.
+    #[test]
+    fn forward_boundary_without_residue_requires_spacing() {
+        let (mut drive, log) = scripted_read_drive(
+            vec![
+                (0x34, Ok(read_position_long_response(0, 0, 0))),
+                (
+                    0x08,
+                    Err(remanence_library::ScsiError::CheckCondition {
+                        sense: vec![0x70, 0, 0x80, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
+                        bytes_transferred: 8,
+                    }),
+                ),
+                (0x34, Ok(read_position_long_response(0, 0, 2))),
+            ],
+            0,
+        );
+        let mut source = DriveHandleRawSource::new(&mut drive);
+        let forward = source.read_forward_records(&mut [0; 8], 4, 2);
+        assert!(forward.unconfirmed_boundary);
+        assert_eq!(forward.batch.records_read, 0);
+        assert!(matches!(forward.batch.end, RawReadEnd::Filemark { .. }));
+        assert_eq!(source.position_report().unwrap().position.lba, 2);
+        assert!(!log.borrow().iter().any(|cdb| matches!(cdb[0], 0x11 | 0x92)));
     }
 
     fn read_filemark_error(residual: u32, bytes_transferred: u32) -> remanence_library::ScsiError {

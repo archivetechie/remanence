@@ -17,6 +17,7 @@ pub mod model;
 /// Media readiness classification for TEST UNIT READY probes.
 pub mod readiness;
 mod transfer;
+pub use transfer::verification_read_completion;
 
 use transfer::map_transfer_scsi;
 pub(crate) use transfer::transfer_bytes_from_sense;
@@ -48,8 +49,8 @@ pub use model::{
     BlockSize, ComputedPosition, DevicePositionProof, PipelinedReadDiagnostics,
     PipelinedWriteDiagnostics, PositionAfter, ReadBatchOutcome, ReadBuffer, ReadBufferHandoff,
     ReadDelivery, ReadHandoffOutcome, ReadTerminalFlags, SequencedHandoff, SpaceKind, SpaceResult,
-    TapeConfig, TapePosition, WormMediaState, WriteBatchOutcome, WriteFilemarksOutcome,
-    WriteOutcome, WriteUnpositionedOutcome,
+    TapeConfig, TapePosition, TapePositionReport, WormMediaState, WriteBatchOutcome,
+    WriteFilemarksOutcome, WriteOutcome, WriteUnpositionedOutcome,
 };
 pub use readiness::{
     classify_media_readiness_error, classify_media_readiness_error_ref,
@@ -663,26 +664,18 @@ fn extract_sense(err: &ScsiError) -> Option<Vec<u8>> {
     }
 }
 
-/// Parse the 32-byte READ POSITION long-form (service action 6)
-/// response into a [`TapePosition`]. Per IBM LTO SCSI Reference
-/// §5.2.22.3 / Table 99:
-///
-/// - Byte 0 flags: bit 7 `BOP`, bit 6 `EOP`, bit 0 `BPEW`
-/// - Byte 1: reserved
-/// - Bytes 4..8: Partition number (4-byte big-endian)
-/// - Bytes 8..16: First Logical Object Position on Partition
-///   (current LBA, big-endian u64)
-///
-/// Codex review 19:57 (idref=403679f2) caught the earlier byte-1
-/// partition parse — the spec puts partition at bytes 4..8.
-///
-/// Short responses surface as [`TapeIoError::MalformedResponse`]:
-/// the CDB completed without CHECK CONDITION, but the returned bytes
-/// were unusable.
-fn parse_read_position_long(buf: &[u8]) -> Result<TapePosition, TapeIoError> {
+/// Parse READ POSITION long form. IBM LTO SCSI Reference GA32-0928-08,
+/// section 5.2.22.3, Table 99: byte 0 bits 7/6/3/2/0 are BOP/EOP/MPU/LONU/BPEW;
+/// bytes 4..8 hold the partition, 8..16 the logical object number, and 16..24
+/// the logical file identifier, all big endian. LONU invalidates both the logical
+/// object number and partition; MPU invalidates only the file identifier.
+/// Short responses are malformed.
+fn parse_read_position_long(buf: &[u8]) -> Result<TapePositionReport, TapeIoError> {
     const RPL_RESPONSE_LEN: usize = 32;
     const BOP_BIT: u8 = 1 << 7;
     const EOP_BIT: u8 = 1 << 6;
+    const LONU_BIT: u8 = 1 << 2;
+    const MPU_BIT: u8 = 1 << 3;
     const BPEW_BIT: u8 = 1 << 0;
 
     if buf.len() < RPL_RESPONSE_LEN {
@@ -701,12 +694,19 @@ fn parse_read_position_long(buf: &[u8]) -> Result<TapePosition, TapeIoError> {
         .expect("32-byte slice contains 8 bytes at offset 8");
     let lba = u64::from_be_bytes(lba_bytes);
 
-    Ok(TapePosition {
-        lba,
-        partition,
-        beginning_of_partition: (flags & BOP_BIT) != 0,
-        end_of_partition: (flags & EOP_BIT) != 0,
-        block_position_end_of_warning: (flags & BPEW_BIT) != 0,
+    Ok(TapePositionReport {
+        position: TapePosition {
+            lba,
+            partition,
+            beginning_of_partition: (flags & BOP_BIT) != 0,
+            end_of_partition: (flags & EOP_BIT) != 0,
+            block_position_end_of_warning: (flags & BPEW_BIT) != 0,
+        },
+        logical_file_identifier: u64::from_be_bytes(
+            buf[16..24].try_into().expect("file identifier"),
+        ),
+        logical_object_number_unknown: flags & LONU_BIT != 0,
+        mark_position_unknown: flags & MPU_BIT != 0,
     })
 }
 
@@ -951,6 +951,11 @@ impl super::DriveHandle {
     /// success; transport errors do, same as any other Layer 3a
     /// method.
     pub fn position(&mut self) -> Result<TapePosition, TapeIoError> {
+        self.position_report().map(|report| report.position)
+    }
+
+    /// Issue READ POSITION and preserve the long-form validity and file fields.
+    pub fn position_report(&mut self) -> Result<TapePositionReport, TapeIoError> {
         let op = AuditOp::TapeReadPosition {
             bay: self.bay_address(),
         };
@@ -959,7 +964,7 @@ impl super::DriveHandle {
         self.fire_tape_started(op, &cdb);
 
         let started = Instant::now();
-        match self.read_position_inline_with_cdb(&cdb) {
+        match self.read_position_report_with_cdb(&cdb) {
             Ok(pos) => {
                 self.finish_tape_success(op, started.elapsed());
                 Ok(pos)
@@ -2018,6 +2023,41 @@ impl super::DriveHandle {
         requested_records: u32,
         remaining_records_in_file: u32,
     ) -> Result<ReadBatchOutcome, TapeIoError> {
+        self.read_verification_batch(
+            buf,
+            block_size_bytes,
+            requested_records,
+            remaining_records_in_file,
+            true,
+        )
+    }
+
+    /// Strict forward file READ. The file reader verifies position at the
+    /// filemark, so successful batches carry arithmetic positions without a
+    /// periodic READ POSITION. Completion validation is shared with verification.
+    pub fn read_block_batch_for_file_verification(
+        &mut self,
+        buf: &mut [u8],
+        block_size_bytes: u32,
+        requested_records: u32,
+    ) -> Result<ReadBatchOutcome, TapeIoError> {
+        self.read_verification_batch(
+            buf,
+            block_size_bytes,
+            requested_records,
+            requested_records,
+            false,
+        )
+    }
+
+    fn read_verification_batch(
+        &mut self,
+        buf: &mut [u8],
+        block_size_bytes: u32,
+        requested_records: u32,
+        remaining_records_in_file: u32,
+        periodic_position_check: bool,
+    ) -> Result<ReadBatchOutcome, TapeIoError> {
         self.ensure_data_command_state_valid(true)?;
         if block_size_bytes == 0 || requested_records == 0 || remaining_records_in_file == 0 {
             return Err(TapeIoError::InvalidRequest(ScsiError::InvalidInput(
@@ -2049,15 +2089,22 @@ impl super::DriveHandle {
             Ok(transfer)
                 if transfer.bytes_transferred == transfer_len && transfer.sense.is_none() =>
             {
-                self.advance_expected_position(records, 0, u64::from(transfer_len))
-                    .map(|position| {
-                        ReadBatchOutcome::from_position_evidence(
-                            records,
-                            transfer.bytes_transferred,
-                            false,
-                            position,
-                        )
-                    })
+                let position = if periodic_position_check {
+                    self.advance_expected_position(records, 0, u64::from(transfer_len))
+                } else {
+                    self.advance_expected_position_arithmetic(records, 0, u64::from(transfer_len))
+                        .map(|position| {
+                            PositionAfter::Computed(ComputedPosition::from_position(position))
+                        })
+                };
+                position.map(|position| {
+                    ReadBatchOutcome::from_position_evidence(
+                        records,
+                        transfer.bytes_transferred,
+                        false,
+                        position,
+                    )
+                })
             }
             Ok(transfer) => Err(TapeIoError::OperationFailed(format!(
                 "unclean verification batch: transferred {} of {transfer_len} bytes, sense {:?}",
@@ -3613,6 +3660,14 @@ impl super::DriveHandle {
     }
 
     fn read_position_inline_with_cdb(&mut self, cdb: &[u8]) -> Result<TapePosition, TapeIoError> {
+        self.read_position_report_with_cdb(cdb)
+            .map(|report| report.position)
+    }
+
+    fn read_position_report_with_cdb(
+        &mut self,
+        cdb: &[u8],
+    ) -> Result<TapePositionReport, TapeIoError> {
         self.transport.set_timeout_for(TimeoutClass::TapeStatus);
         let mut buf = [0u8; 32];
         match self.transport.execute_in(cdb, &mut buf) {
@@ -3620,7 +3675,7 @@ impl super::DriveHandle {
                 let bytes = (outcome.bytes_transferred as usize).min(buf.len());
                 match parse_read_position_long(&buf[..bytes]) {
                     Ok(position) => {
-                        self.record_device_position(position);
+                        self.record_device_position(position.position);
                         Ok(position)
                     }
                     Err(err) => {

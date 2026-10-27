@@ -22,8 +22,7 @@ pub struct TapePosition {
     pub lba: u64,
     /// Partition number. Decoded from `READ POSITION` long-form
     /// bytes 4..8 (4-byte big-endian, per IBM LTO SCSI Reference
-    /// §5.2.22.3 / Table 99) — codex 19:57 caught the earlier
-    /// byte-1 parse. rem operates only in partition 0 in
+    /// §5.2.22.3 / Table 99). rem operates only in partition 0 in
     /// production (LTFS uses partition 1 for its index, one
     /// reason rem does not use LTFS), but the wider type
     /// reflects the on-wire field accurately.
@@ -41,6 +40,19 @@ pub struct TapePosition {
     /// itself does not auto-retire near-EOM tapes (Layer 5
     /// policy).
     pub block_position_end_of_warning: bool,
+}
+
+/// Long-form device report, including the validity of its object and file positions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TapePositionReport {
+    /// Position and partition fields, with the ordinary boundary flags.
+    pub position: TapePosition,
+    /// Number of filemarks before the reported position.
+    pub logical_file_identifier: u64,
+    /// LONU: neither the logical object number nor the partition is reported.
+    pub logical_object_number_unknown: bool,
+    /// MPU: the logical file identifier is unknown or inaccurate.
+    pub mark_position_unknown: bool,
 }
 
 /// Position proven by a successful READ POSITION response.

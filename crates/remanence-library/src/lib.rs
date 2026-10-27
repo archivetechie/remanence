@@ -43,15 +43,16 @@ pub use error::{
 };
 pub use handle::tape_io::{
     classify_media_readiness_error_ref, media_readiness_poll_interval, media_readiness_sense_label,
-    media_readiness_sense_name, wrap_map_is_servable, AppendBoundaryProof, AppendSession,
-    BlockSize, ComputedPosition, DevicePositionProof, DriveErrorCounters,
-    InMemoryCalibrationControl, MediaFamily, MediaReadiness, MediaReadinessPoll,
-    MediaReadinessWaitEvent, MediaReadinessWaitOptions, MediaWriteFence, MediaWriteFenceError,
-    NoCalibrationControl, PipelinedReadDiagnostics, PipelinedWriteDiagnostics, PositionAfter,
-    ReadBatchOutcome, ReadBuffer, ReadBufferHandoff, ReadDelivery, ReadHandoffOutcome,
-    ReadTerminalFlags, SequencedHandoff, SpaceKind, SpaceResult, TapeConfig, TapeIoError,
-    TapePosition, WormMediaState, WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome,
-    WriteUnpositionedOutcome, MEDIA_READINESS_MAX_INITIALIZING_LOADS,
+    media_readiness_sense_name, verification_read_completion, wrap_map_is_servable,
+    AppendBoundaryProof, AppendSession, BlockSize, ComputedPosition, DevicePositionProof,
+    DriveErrorCounters, InMemoryCalibrationControl, MediaFamily, MediaReadiness,
+    MediaReadinessPoll, MediaReadinessWaitEvent, MediaReadinessWaitOptions, MediaWriteFence,
+    MediaWriteFenceError, NoCalibrationControl, PipelinedReadDiagnostics,
+    PipelinedWriteDiagnostics, PositionAfter, ReadBatchOutcome, ReadBuffer, ReadBufferHandoff,
+    ReadDelivery, ReadHandoffOutcome, ReadTerminalFlags, SequencedHandoff, SpaceKind, SpaceResult,
+    TapeConfig, TapeIoError, TapePosition, TapePositionReport, WormMediaState, WriteBatchOutcome,
+    WriteFilemarksOutcome, WriteOutcome, WriteUnpositionedOutcome,
+    MEDIA_READINESS_MAX_INITIALIZING_LOADS,
 };
 pub use handle::{
     ChangerHandle, DirtyCause, DriveHandle, LibraryHandle, RemovalLockGuard, TapeIoRuntimeConfig,

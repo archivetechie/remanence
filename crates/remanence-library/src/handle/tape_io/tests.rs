@@ -196,7 +196,7 @@ fn parse_read_position_at_bot() {
     buf[0] = 0b1000_0000; // BOP=1, EOP=0, BPEW=0
     buf[1] = 0; // partition 0
                 // bytes 8..16 all zero (LBA = 0)
-    let pos = parse_read_position_long(&buf).expect("parse ok");
+    let pos = parse_read_position_long(&buf).expect("parse ok").position;
     assert_eq!(pos.lba, 0);
     assert_eq!(pos.partition, 0);
     assert!(pos.beginning_of_partition);
@@ -210,7 +210,7 @@ fn parse_read_position_mid_tape_with_bpew() {
     buf[0] = 0b0000_0001; // BPEW=1 only
     buf[1] = 0;
     buf[8..16].copy_from_slice(&0x12345678_9ABCDEF0u64.to_be_bytes());
-    let pos = parse_read_position_long(&buf).expect("parse ok");
+    let pos = parse_read_position_long(&buf).expect("parse ok").position;
     assert_eq!(pos.lba, 0x12345678_9ABCDEF0);
     assert!(!pos.beginning_of_partition);
     assert!(!pos.end_of_partition);
@@ -222,7 +222,7 @@ fn parse_read_position_at_eop() {
     let mut buf = [0u8; 32];
     buf[0] = 0b0100_0000; // EOP=1
     buf[8..16].copy_from_slice(&u64::MAX.to_be_bytes());
-    let pos = parse_read_position_long(&buf).expect("parse ok");
+    let pos = parse_read_position_long(&buf).expect("parse ok").position;
     assert_eq!(pos.lba, u64::MAX);
     assert!(pos.end_of_partition);
     assert!(!pos.beginning_of_partition);
@@ -231,12 +231,12 @@ fn parse_read_position_at_eop() {
 #[test]
 fn parse_read_position_decodes_nonzero_partition() {
     // IBM Table 99: PARTITION NUMBER is a 4-byte field at bytes
-    // 4..8 (codex 19:57 caught the earlier byte-1 parse).
+    // 4..8.
     let mut buf = [0u8; 32];
     buf[0] = 0;
     buf[4..8].copy_from_slice(&0x0000_0001u32.to_be_bytes());
     buf[8..16].copy_from_slice(&42u64.to_be_bytes());
-    let pos = parse_read_position_long(&buf).expect("parse ok");
+    let pos = parse_read_position_long(&buf).expect("parse ok").position;
     assert_eq!(pos.partition, 1);
     assert_eq!(pos.lba, 42);
 }
@@ -247,18 +247,17 @@ fn parse_read_position_decodes_large_partition_number() {
     // partition 0, but the on-wire field is 4 bytes.
     let mut buf = [0u8; 32];
     buf[4..8].copy_from_slice(&0xCAFE_BABEu32.to_be_bytes());
-    let pos = parse_read_position_long(&buf).expect("parse ok");
+    let pos = parse_read_position_long(&buf).expect("parse ok").position;
     assert_eq!(pos.partition, 0xCAFE_BABE);
 }
 
 #[test]
 fn parse_read_position_byte_1_is_reserved_not_partition() {
-    // Codex regression: a 1 in byte 1 (the old parse site) must
-    // NOT affect partition any more.
+    // Reserved byte 1 does not affect the partition.
     let mut buf = [0u8; 32];
     buf[1] = 0xFF; // reserved garbage
     buf[4..8].copy_from_slice(&7u32.to_be_bytes());
-    let pos = parse_read_position_long(&buf).expect("parse ok");
+    let pos = parse_read_position_long(&buf).expect("parse ok").position;
     assert_eq!(pos.partition, 7);
 }
 
@@ -1146,5 +1145,25 @@ fn medium_partition_page_counts() {
         );
         data.pop();
         assert!(medium_partition_count(&data).is_err());
+    }
+}
+
+/// Table 99 fields retain all 64 file bits and distinguish each validity flag.
+#[test]
+fn long_position_report_file_identifier_and_validity() {
+    const LONU_BIT: u8 = 1 << 2;
+    const MPU_BIT: u8 = 1 << 3;
+    for flags in [0, 4, 8, 12, 0xc1] {
+        let mut buf = [0; 32];
+        buf[0] = flags;
+        buf[4..8].copy_from_slice(&7u32.to_be_bytes());
+        buf[8..16].copy_from_slice(&123u64.to_be_bytes());
+        buf[16..24].copy_from_slice(&0xfedc_ba98_7654_3210u64.to_be_bytes());
+        let report = parse_read_position_long(&buf).unwrap();
+        assert_eq!(report.position.partition, 7);
+        assert_eq!(report.position.lba, 123);
+        assert_eq!(report.logical_file_identifier, 0xfedc_ba98_7654_3210);
+        assert_eq!(report.logical_object_number_unknown, flags & LONU_BIT != 0);
+        assert_eq!(report.mark_position_unknown, flags & MPU_BIT != 0);
     }
 }
