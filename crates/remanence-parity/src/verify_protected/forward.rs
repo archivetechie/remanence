@@ -17,8 +17,16 @@ pub(super) struct DataObservation {
 
 impl DataObservation {
     pub(super) fn from_probe(probe: Probe<'_>) -> Self {
+        Self::with_crc(probe, data_shard_crc64)
+    }
+
+    pub(super) fn from_parity_probe(probe: Probe<'_>) -> Self {
+        Self::with_crc(probe, crate::sidecar::parity_shard_crc64)
+    }
+
+    fn with_crc(probe: Probe<'_>, crc: fn(&[u8]) -> u64) -> Self {
         let (tag, payload) = match probe {
-            Probe::Block(block) => (0, data_shard_crc64(block)),
+            Probe::Block(block) => (0, crc(block)),
             Probe::WrongLength(length) => (1, length),
             Probe::Boundary("filemark where a block belongs") => (2, 0),
             Probe::Boundary(_) => (3, 0),

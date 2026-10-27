@@ -15,6 +15,7 @@ enum Record {
     Filemark,
     Eod,
     Medium,
+    Transient(Vec<u8>),
     Fatal,
     Deferred,
     Hardware,
@@ -27,6 +28,7 @@ struct Tape {
     configured: bool,
     reads: Vec<u64>,
     locates: Vec<u64>,
+    medium_locate: Option<u64>,
     positions: usize,
     spaces: usize,
     batches: usize,
@@ -41,6 +43,15 @@ impl RawTapeSource for Tape {
     }
     fn locate_physical(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
         self.locates.push(hint.lba);
+        if self.medium_locate == Some(hint.lba) {
+            return Err(remanence_library::TapeIoError::CheckCondition(
+                remanence_library::scsi::ScsiError::CheckCondition {
+                    sense: vec![0x72, 3, 0x11, 0],
+                    bytes_transferred: 0,
+                },
+            )
+            .into());
+        }
         self.cursor = hint.lba as usize;
         Ok(())
     }
@@ -61,13 +72,22 @@ impl RawTapeSource for Tape {
     fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
         assert!(self.configured, "forward data must follow configuration");
         self.reads.push(self.cursor as u64);
-        let record = self.records.get(self.cursor).unwrap_or(&Record::Eod);
+        let mut record = self
+            .records
+            .get(self.cursor)
+            .unwrap_or(&Record::Eod)
+            .clone();
+        if let Record::Transient(bytes) = record {
+            self.records[self.cursor] = Record::Block(bytes);
+            record = Record::Medium;
+        }
         self.cursor += 1;
         let position_after = PhysicalPositionHint {
             partition: 0,
             lba: self.cursor as u64,
         };
-        match record {
+        match &record {
+            Record::Transient(_) => unreachable!("transient record becomes readable"),
             Record::Block(bytes) => {
                 let n = bytes.len().min(buf.len());
                 buf[..n].copy_from_slice(&bytes[..n]);
@@ -111,7 +131,34 @@ impl RawTapeSource for Tape {
         remaining: u32,
     ) -> crate::raw::RawReadBatch {
         self.batches += 1;
-        crate::raw::read_records_default(self, buf, size, max, remaining)
+        let transient = self.records[self.cursor..]
+            .iter()
+            .take(max.min(remaining) as usize)
+            .position(|r| matches!(r, Record::Transient(_)))
+            .map(|offset| self.cursor + offset);
+        let mut batch = crate::raw::read_records_default(self, buf, size, max, remaining);
+        // Model the drive's batch-to-single retry for a transient medium fault.
+        if matches!(batch.end, crate::raw::RawReadEnd::Error(_))
+            && transient == self.cursor.checked_sub(1)
+        {
+            self.locate_physical(PhysicalPositionHint {
+                partition: 0,
+                lba: transient.unwrap() as u64,
+            })
+            .unwrap();
+            let offset = batch.records_read as usize * size as usize;
+            let single = crate::raw::read_records_default(
+                self,
+                &mut buf[offset..],
+                size,
+                max - batch.records_read,
+                remaining - batch.records_read,
+            );
+            batch.records_read += single.records_read;
+            batch.position_after = single.position_after.or(batch.position_after);
+            batch.end = single.end;
+        }
+        batch
     }
 }
 
@@ -123,11 +170,16 @@ enum File {
 }
 
 fn fixture(files: &[File]) -> (ScopedFilemarkMap, ParityScheme, Tape) {
+    fixture_with_stripes(files, 2)
+}
+
+fn fixture_with_stripes(files: &[File], stripes: u32) -> (ScopedFilemarkMap, ParityScheme, Tape) {
+    let epoch_blocks = 2 * u64::from(stripes);
     let scheme = ParityScheme {
         id: crate::SchemeId::new_static("rs-cauchy-gf256-v1"),
         data_blocks_per_stripe: 2,
         parity_blocks_per_stripe: 1,
-        stripes_per_neighborhood: 2,
+        stripes_per_neighborhood: stripes,
     };
     let data_count: u64 = files
         .iter()
@@ -160,14 +212,17 @@ fn fixture(files: &[File]) -> (ScopedFilemarkMap, ParityScheme, Tape) {
                 records.extend((0..3).map(|_| Record::Block(vec![0; SIZE as usize])));
             }
             File::Sidecar(epoch) => {
-                let start = epoch * 4;
-                let blocks = &data[start as usize..start as usize + 4];
+                let start = epoch * epoch_blocks;
+                let blocks = &data[start as usize..(start + epoch_blocks) as usize];
                 let codec = crate::codec::ReedSolomonCodec::new(&scheme).unwrap();
                 let mut parity = Vec::new();
-                for stripe in 0..2 {
+                for stripe in 0..stripes as usize {
                     parity.extend(
                         codec
-                            .encode(&[blocks[stripe].clone(), blocks[stripe + 2].clone()])
+                            .encode(&[
+                                blocks[stripe].clone(),
+                                blocks[stripe + stripes as usize].clone(),
+                            ])
                             .unwrap(),
                     );
                 }
@@ -177,10 +232,10 @@ fn fixture(files: &[File]) -> (ScopedFilemarkMap, ParityScheme, Tape) {
                         epoch_id: *epoch,
                         k: 2,
                         m: 1,
-                        stripes_per_epoch: 2,
+                        stripes_per_epoch: stripes,
                         block_size: SIZE,
                         protected_ordinal_start: start,
-                        protected_ordinal_end_exclusive: start + 4,
+                        protected_ordinal_end_exclusive: start + epoch_blocks,
                     },
                     &parity,
                     blocks.iter().map(|b| data_shard_crc64(b)).collect(),
@@ -191,7 +246,7 @@ fn fixture(files: &[File]) -> (ScopedFilemarkMap, ParityScheme, Tape) {
                     encoded.blocks.len() as u64,
                     *epoch,
                     start,
-                    start + 4,
+                    start + epoch_blocks,
                 ));
                 records.extend(encoded.blocks.into_iter().map(Record::Block));
             }
@@ -207,6 +262,7 @@ fn fixture(files: &[File]) -> (ScopedFilemarkMap, ParityScheme, Tape) {
             configured: false,
             reads: vec![],
             locates: vec![],
+            medium_locate: None,
             positions: 0,
             spaces: 0,
             batches: 0,
@@ -225,7 +281,8 @@ fn run_budget(
     let mut cache = crate::recovery::DirectoryCache::default();
     cache.preload(tape, map, &UUID, SIZE).unwrap();
     let mut pending = ForwardPass::plan(map, budget).unwrap();
-    let result = verify_pass(tape, map, scheme, &UUID, SIZE, &mut cache, &mut pending).unwrap();
+    let result =
+        verify_pass::<true>(tape, map, scheme, &UUID, SIZE, &mut cache, &mut pending).unwrap();
     assert!(pending.high_water <= budget);
     (result, pending)
 }
@@ -488,7 +545,23 @@ fn data_after_sidecar_including_navigational_suffix_uses_live_reads() {
         assert!(actual.is_clean());
         assert_eq!(pending.payload_high_water, 0);
         assert_data_once(&after, &map);
-        assert_eq!(before.reads, after.reads);
+        let object_lbas: std::collections::BTreeSet<_> = map
+            .map
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == TapeFileKind::Object)
+            .flat_map(|entry| {
+                (0..entry.block_count).map(|block| lba(&map, entry.tape_file_number, block))
+            })
+            .collect();
+        let data_reads = |tape: &Tape| {
+            tape.reads
+                .iter()
+                .copied()
+                .filter(|address| object_lbas.contains(address))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(data_reads(&before), data_reads(&after));
     }
 }
 
@@ -556,7 +629,17 @@ fn failed_preload_retains_branch_specific_directory_fault_handling() {
         cache.preload(&mut tape, &map, &UUID, SIZE).unwrap();
         assert!(matches!(cache, crate::recovery::DirectoryCache::Failed));
         assert_eq!(tape.cursor, 0, "setup restores the physical cursor");
-        let actual = verify_sidecar_cached(
+        let expected = verify_sidecar_cached::<false>(
+            &mut tape.clone(),
+            &map,
+            &map.map.entries()[2],
+            &scheme,
+            &UUID,
+            SIZE,
+            &mut crate::recovery::DirectoryCache::Failed,
+            None,
+        );
+        let actual = verify_sidecar_cached::<true>(
             &mut tape,
             &map,
             &map.map.entries()[2],
@@ -565,6 +648,10 @@ fn failed_preload_retains_branch_specific_directory_fault_handling() {
             SIZE,
             &mut cache,
             None,
+        );
+        assert_eq!(
+            actual.as_ref().map_err(ToString::to_string),
+            expected.as_ref().map_err(ToString::to_string)
         );
         // Only TapeIo faults are tolerated by a valid footer. Invariant
         // faults propagate on both branches; failed attempts remain retryable.
@@ -577,5 +664,295 @@ fn failed_preload_retains_branch_specific_directory_fault_handling() {
             2,
             "failed preload must retry at acquisition"
         );
+    }
+}
+
+/// Compare every field and ordered finding, both individually and in the full
+/// protected result. Each source starts from the same media and fault state.
+fn compare_sidecar_orders(
+    tape: &Tape,
+    map: &ScopedFilemarkMap,
+    scheme: &ParityScheme,
+) -> (SidecarVerification, Tape) {
+    let entry = map
+        .map
+        .entries()
+        .iter()
+        .find(|e| e.kind == TapeFileKind::ParitySidecar)
+        .unwrap();
+    let mut direct = tape.clone();
+    let expected = verify_sidecar_cached::<false>(
+        &mut direct,
+        map,
+        entry,
+        scheme,
+        &UUID,
+        SIZE,
+        &mut crate::recovery::DirectoryCache::default(),
+        None,
+    )
+    .unwrap();
+    let mut forward = tape.clone();
+    let actual = verify_sidecar(&mut forward, map, entry, scheme, &UUID, SIZE).unwrap();
+    assert_eq!(actual, expected);
+    let expected = Step1::verify(&mut tape.clone(), map, scheme, &UUID, SIZE).unwrap();
+    let full = verify_protected_content(&mut tape.clone(), map, scheme, &UUID, SIZE).unwrap();
+    assert_eq!(full, expected);
+    assert_eq!(full.sidecars, vec![actual.clone()]);
+    (actual, forward)
+}
+
+#[test]
+fn sidecar_damage_cases_match_direct_order() {
+    let names = [
+        "unreadable_middle_shard",
+        "unreadable_primary_header",
+        "unreadable_footer",
+        "both_copies_damaged",
+        "wrong_length_tail_record",
+        "short_filemark",
+        "short_end_of_data",
+        "odd_geometry",
+        "healthy",
+    ];
+    for name in names {
+        let (mut map, scheme, mut tape) =
+            fixture_with_stripes(&[File::Object(512), File::Sidecar(0)], 256);
+        let total = map.map.entries()[2].block_count;
+        let (h, tail) = sidecar_geometry_from_total(total, scheme_parity_blocks(&scheme)).unwrap();
+        let first = lba(&map, 2, 0) as usize;
+        match name {
+            "unreadable_middle_shard" => tape.records[first + h as usize + 1] = Record::Medium,
+            "unreadable_primary_header" => tape.records[first] = Record::Medium,
+            "unreadable_footer" => tape.records[first + total as usize - 1] = Record::Medium,
+            "both_copies_damaged" => {
+                tape.records[first] = Record::Block(vec![0; SIZE as usize]);
+                tape.records[first + tail as usize] = Record::Block(vec![0; SIZE as usize]);
+            }
+            "wrong_length_tail_record" => {
+                tape.records[first + tail as usize + 1] = Record::Block(vec![0; 31])
+            }
+            "short_filemark" => tape.records[first + total as usize - 2] = Record::Filemark,
+            "short_end_of_data" => tape.records[first + total as usize - 2] = Record::Eod,
+            "odd_geometry" => {
+                let mut entries = map.map.entries().to_vec();
+                entries[2].block_count += 1;
+                map = ScopedFilemarkMap::from_catalog(FilemarkMap::new(entries).unwrap(), 512);
+            }
+            "healthy" => (),
+            _ => unreachable!(),
+        }
+        let (actual, forward) = compare_sidecar_orders(&tape, &map, &scheme);
+        match name {
+            "unreadable_middle_shard" => {
+                assert_eq!(
+                    actual.metadata_health,
+                    Some(SidecarMetadataHealth::BothCopiesUsable)
+                );
+                assert!(actual.findings.is_empty());
+                assert_eq!(actual.failed_parity_shards.len(), 1);
+                assert_eq!(
+                    actual.failed_parity_shards[0].reason,
+                    BlockFailureReason::Unreadable
+                );
+                assert!(forward.reads.contains(&(first as u64 + total - 1)));
+            }
+            "unreadable_primary_header" => {
+                assert_eq!(
+                    actual.metadata_health,
+                    Some(SidecarMetadataHealth::PrimaryHeaderLost)
+                );
+                assert_eq!(actual.primary, SidecarComponentState::Unreadable);
+                assert_eq!(actual.tail, SidecarComponentState::Valid);
+                assert!(actual
+                    .findings
+                    .iter()
+                    .any(|f| f.kind == SidecarFindingKind::CopyHealth
+                        && f.detail.starts_with("primary copy")));
+                assert_eq!(
+                    forward.reads.iter().filter(|&&p| p == first as u64).count(),
+                    2
+                );
+            }
+            "unreadable_footer" => {
+                assert_eq!(actual.footer, SidecarComponentState::Unreadable);
+                assert_eq!(actual.tail, SidecarComponentState::Valid);
+                assert!(actual.checked_against_index);
+            }
+            "both_copies_damaged" => {
+                assert!(actual
+                    .findings
+                    .iter()
+                    .any(|f| f.kind == SidecarFindingKind::SidecarMetadataUnavailable));
+                assert!(!actual.checked_against_index);
+                assert!(actual.failed_parity_shards.is_empty());
+                for offset in h..tail {
+                    assert_eq!(
+                        forward
+                            .reads
+                            .iter()
+                            .filter(|&&p| p == first as u64 + offset)
+                            .count(),
+                        1
+                    );
+                }
+            }
+            "wrong_length_tail_record" => assert!(
+                matches!(actual.tail, SidecarComponentState::Invalid { ref detail } if detail.contains("31 bytes"))
+            ),
+            "short_filemark" | "short_end_of_data" => {
+                assert!(matches!(actual.tail, SidecarComponentState::Invalid { .. }));
+                assert_eq!(actual.footer, SidecarComponentState::Valid);
+                // The pass stops at the boundary; the footer probe reaches the
+                // live source for the unretained final position.
+                assert!(forward.locates.contains(&(first as u64 + total - 1)));
+            }
+            "odd_geometry" => {
+                let mut direct = tape.clone();
+                verify_sidecar_cached::<false>(
+                    &mut direct,
+                    &map,
+                    &map.map.entries()[2],
+                    &scheme,
+                    &UUID,
+                    SIZE,
+                    &mut crate::recovery::DirectoryCache::default(),
+                    None,
+                )
+                .unwrap();
+                assert_eq!(forward.reads, direct.reads);
+                assert_eq!(forward.locates, direct.locates);
+            }
+            "healthy" => assert!(actual.is_clean()),
+            _ => unreachable!(),
+        }
+        println!("sidecar differential: {name}");
+    }
+    println!("sidecar differential: {} stable cases", names.len());
+}
+
+#[test]
+fn metadata_medium_retry_matches_direct_order_with_two_forward_reads() {
+    let (map, scheme, mut tape) = fixture_with_stripes(&[File::Object(512), File::Sidecar(0)], 256);
+    let (h, _) = sidecar_geometry_from_total(
+        map.map.entries()[2].block_count,
+        scheme_parity_blocks(&scheme),
+    )
+    .unwrap();
+    assert!(h > 2, "index suffix must exercise a batch in direct order");
+    let address = lba(&map, 2, 1) as usize;
+    let Record::Block(bytes) = tape.records[address].clone() else {
+        unreachable!()
+    };
+    tape.records[address] = Record::Transient(bytes);
+    let (actual, forward) = compare_sidecar_orders(&tape, &map, &scheme);
+    assert!(actual.is_clean());
+    assert_eq!(
+        forward
+            .reads
+            .iter()
+            .filter(|&&p| p == address as u64)
+            .count(),
+        2
+    );
+    println!("sidecar differential: metadata_medium_retry");
+}
+
+/// Retention limits leave missing metadata on the live acquisition path.
+#[test]
+fn metadata_retention_cap_matches_direct_order() {
+    let (map, scheme, tape) = fixture_with_stripes(&[File::Object(512), File::Sidecar(0)], 256);
+    let total = map.map.entries()[2].block_count;
+    let (h, tail) = sidecar_geometry_from_total(total, scheme_parity_blocks(&scheme)).unwrap();
+    for (blocks, missing) in [(0, 0), (h, tail), (2 * h, total - 1)] {
+        retained::with_metadata_budget(blocks as usize * SIZE as usize, || {
+            let (actual, forward) = compare_sidecar_orders(&tape, &map, &scheme);
+            assert!(actual.is_clean());
+            let address = lba(&map, 2, missing);
+            assert!(
+                forward.reads.iter().filter(|&&p| p == address).count() > 1,
+                "metadata outside the {blocks}-block budget requires live reads"
+            );
+        });
+    }
+}
+
+/// Medium sense from LOCATE remains fatal for sidecar, data and directory reads.
+#[test]
+fn medium_locate_faults_are_fatal_in_both_sidecar_orders() {
+    for file in [1, 2, 3] {
+        let (map, scheme, mut tape) = fixture(&[File::Object(4), File::Sidecar(0), File::Map]);
+        let address = lba(&map, file, 0);
+        tape.medium_locate = Some(address);
+        if file == 3 {
+            let footer = lba(&map, 2, map.map.entries()[2].block_count - 1);
+            tape.records[footer as usize] = Record::Block(vec![0; SIZE as usize]);
+        }
+        let mut direct_tape = tape.clone();
+        let direct = verify_sidecar_cached::<false>(
+            &mut direct_tape,
+            &map,
+            &map.map.entries()[2],
+            &scheme,
+            &UUID,
+            SIZE,
+            &mut crate::recovery::DirectoryCache::default(),
+            None,
+        )
+        .unwrap_err();
+        let forward = verify_sidecar(&mut tape, &map, &map.map.entries()[2], &scheme, &UUID, SIZE)
+            .unwrap_err();
+        assert!(
+            matches!(&direct, ParityError::TapeIo(error) if tape_error_is_current_medium_damage(error))
+        );
+        assert_eq!(forward.to_string(), direct.to_string(), "file {file}");
+        for source in [&direct_tape, &tape] {
+            assert!(source.locates.contains(&address));
+            assert!(!source.reads.contains(&address));
+        }
+    }
+}
+
+#[test]
+fn sidecar_non_medium_faults_remain_fatal_in_both_orders() {
+    for fault in [Record::Fatal, Record::Deferred, Record::Hardware] {
+        for offset in [0, 2, 4] {
+            let (map, scheme, mut tape) = fixture(&[File::Object(4), File::Sidecar(0)]);
+            let address = lba(&map, 2, offset) as usize;
+            tape.records[address] = fault.clone();
+            let direct = verify_sidecar_cached::<false>(
+                &mut tape.clone(),
+                &map,
+                &map.map.entries()[2],
+                &scheme,
+                &UUID,
+                SIZE,
+                &mut crate::recovery::DirectoryCache::default(),
+                None,
+            )
+            .unwrap_err();
+            let forward =
+                verify_sidecar(&mut tape, &map, &map.map.entries()[2], &scheme, &UUID, SIZE)
+                    .unwrap_err();
+            assert_eq!(forward.to_string(), direct.to_string());
+        }
+    }
+}
+
+#[test]
+fn acquired_geometry_outside_buffered_shards_uses_positioned_reads() {
+    let (map, mut scheme, tape) = fixture_with_stripes(&[File::Object(512), File::Sidecar(0)], 256);
+    for stripes in [254, 258] {
+        scheme.stripes_per_neighborhood = stripes;
+        let (actual, forward) = compare_sidecar_orders(&tape, &map, &scheme);
+        assert!(!actual.checked_against_index);
+        assert!(actual
+            .findings
+            .iter()
+            .any(|f| f.kind == SidecarFindingKind::SchemeMismatch));
+        let entry = &map.map.entries()[2];
+        let start = lba(&map, 2, 0);
+        let end = start + entry.block_count;
+        assert!(forward.reads.iter().all(|&p| p < end));
     }
 }

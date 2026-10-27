@@ -9,7 +9,9 @@
 //!   even when the footer or the directory decides between them
 //!   (Section 9.1);
 //! - acquires the epoch's index through the Recoverer's own acquisition
-//!   (Section 13.3), never a second path, and pins it as the Recoverer does;
+//!   over the metadata retained by one forward pass, never a second path,
+//!   and pins it as the Recoverer does. Section 13.3 specifies an order of
+//!   precedence; the acquisition applies it to the retained blocks;
 //! - reads every data block that the sidecar protects and every parity shard,
 //!   as opaque bytes, and checks each against the acquired index
 //!   (Section 13.4), reporting each failure by the address Section 2.2 names:
@@ -21,6 +23,7 @@
 //! only one that may report a tape's protected content as verified.
 
 mod forward;
+mod retained;
 use forward::{DataObservation, ForwardPass, PendingEpoch, PENDING_BUDGET};
 
 use crate::error::ParityError;
@@ -35,9 +38,8 @@ use crate::recovery::{
     scheme_parity_blocks, sidecar_geometry_from_total, validate_sidecar_for_recovery,
 };
 use crate::sidecar::{
-    parity_block_position, parity_shard_crc64, parse_sidecar_footer_block,
-    parse_sidecar_header_block, parse_sidecar_index_blocks, DecodedSidecarIndex, SidecarCopyKind,
-    SidecarFooter,
+    parity_block_position, parse_sidecar_footer_block, parse_sidecar_header_block,
+    parse_sidecar_index_blocks, DecodedSidecarIndex, SidecarCopyKind, SidecarFooter,
 };
 
 /// Why a data block or a parity shard failed verification.
@@ -301,18 +303,6 @@ enum Probe<'a> {
 }
 
 impl Probe<'_> {
-    /// Why a record that is not a block failed, for a data block or a shard.
-    fn failure(&self) -> Option<BlockFailureReason> {
-        match self {
-            Self::Block(_) => None,
-            Self::Unreadable => Some(BlockFailureReason::Unreadable),
-            Self::WrongLength(measured_bytes) => Some(BlockFailureReason::WrongLength {
-                measured_bytes: *measured_bytes,
-            }),
-            Self::Boundary(_) => Some(BlockFailureReason::UnexpectedBoundary),
-        }
-    }
-
     /// What a record that is not a block says, for a sidecar copy or footer.
     fn detail(&self, block_size: u32) -> String {
         match self {
@@ -514,7 +504,7 @@ pub fn verify_sidecar(
     tape_uuid: &[u8; 16],
     block_size: u32,
 ) -> Result<SidecarVerification, ParityError> {
-    verify_sidecar_cached(
+    verify_sidecar_cached::<true>(
         source,
         scoped_map,
         sidecar,
@@ -528,7 +518,7 @@ pub fn verify_sidecar(
 
 /// Share loaded and established-absent directory evidence across the epoch pass.
 #[allow(clippy::too_many_arguments)]
-fn verify_sidecar_cached(
+fn verify_sidecar_cached<const BUFFER_SIDECAR: bool>(
     source: &mut dyn RawTapeSource,
     scoped_map: &ScopedFilemarkMap,
     sidecar: &TapeFileMapEntry,
@@ -556,6 +546,12 @@ fn verify_sidecar_cached(
         }
     };
     source.configure_fixed_block_size(block_size)?;
+    let mut retained = retained::RetainedSource::new(source, block_size);
+    if BUFFER_SIDECAR {
+        retained.read_sidecar(scoped_map, sidecar, scheme)?;
+    }
+    let shards = std::mem::take(&mut retained.shards);
+    let source: &mut dyn RawTapeSource = &mut retained;
     let mut findings = Vec::new();
     let mut reader = SequentialReader::new(source, block_size);
 
@@ -825,7 +821,11 @@ fn verify_sidecar_cached(
                     .physical_run(sidecar.tape_file_number, header_blocks, shard_count)
             })
             .transpose()?;
-        let mut run = crate::raw::ReadRun::new(reader.source, block_size, shard_count);
+        // Partial observations can split live reads into separate runs.
+        // Read one record at a time when observations exist, so reads do not
+        // cross retained shards or the acquired geometry. Use batches otherwise.
+        let live_run = if shards.is_empty() { shard_count } else { 0 };
+        let mut run = crate::raw::ReadRun::new(reader.source, block_size, live_run);
         let mut reader = SequentialReader::new(&mut run, block_size);
         for parity_index in 0..parity_per_stripe {
             for stripe_index in 0..stripes {
@@ -844,16 +844,19 @@ fn verify_sidecar_cached(
                     lba: first_physical.lba + (sidecar_block - header_blocks),
                     ..first_physical
                 };
-                let probe = reader.read(physical)?;
-                let reason = match &probe {
-                    Probe::Block(block) => match index.filter(|_| usable) {
+                let observation = match shards.get(&sidecar_block) {
+                    Some(observation) => *observation,
+                    None => DataObservation::from_parity_probe(reader.read(physical)?),
+                };
+                let reason = match observation.crc() {
+                    Some(crc) => match index.filter(|_| usable) {
                         // The Recoverer's own parity entry lookup.
                         Some(index) => (parity_crc_for(index, stripe_index, parity_index).ok()
-                            != Some(parity_shard_crc64(block)))
+                            != Some(crc))
                         .then_some(BlockFailureReason::CrcMismatch),
                         None => None,
                     },
-                    failed => failed.failure(),
+                    None => observation.failure(),
                 };
                 if let Some(reason) = reason {
                     failed_parity_shards.push(FailedParityShard {
@@ -893,6 +896,9 @@ fn verify_sidecar_cached(
 /// Configures fixed records and preloads the directory before reading eligible
 /// data forward. Stable per-address observations and successful positioning give
 /// the same findings as direct verification; fatal fault order can differ.
+/// The forward order reads every block of the sidecar. A device fault that is
+/// not medium damage on a block the direct order does not read ends the run
+/// in the forward order only.
 pub fn verify_protected_content(
     source: &mut dyn RawTapeSource,
     scoped_map: &ScopedFilemarkMap,
@@ -904,7 +910,7 @@ pub fn verify_protected_content(
     let mut directory_cache = crate::recovery::DirectoryCache::default();
     directory_cache.preload(source, scoped_map, tape_uuid, block_size)?;
     let mut pending = ForwardPass::plan(scoped_map, PENDING_BUDGET)?;
-    verify_pass(
+    verify_pass::<true>(
         source,
         scoped_map,
         scheme,
@@ -915,9 +921,9 @@ pub fn verify_protected_content(
     )
 }
 
-/// Single verification funnel; an empty observation table retains Step 1 order.
+/// Single verification funnel with independent data and sidecar observation seams.
 #[allow(clippy::too_many_arguments)]
-fn verify_pass(
+fn verify_pass<const BUFFER_SIDECAR: bool>(
     source: &mut dyn RawTapeSource,
     scoped_map: &ScopedFilemarkMap,
     scheme: &ParityScheme,
@@ -963,7 +969,7 @@ fn verify_pass(
         }
         reader.next = None;
         pending.prepare(entry.tape_file_number);
-        sidecars.push(verify_sidecar_cached(
+        sidecars.push(verify_sidecar_cached::<BUFFER_SIDECAR>(
             reader.source,
             scoped_map,
             entry,
@@ -1019,7 +1025,7 @@ impl ProtectedPass for Step1 {
         uuid: &[u8; 16],
         block_size: u32,
     ) -> Result<ProtectedContentVerification, ParityError> {
-        verify_pass(
+        verify_pass::<false>(
             source,
             map,
             scheme,
@@ -1059,7 +1065,7 @@ pub fn verify_protected_budget_for_test(
     let mut cache = crate::recovery::DirectoryCache::default();
     cache.preload(source, map, uuid, block_size)?;
     let mut pending = ForwardPass::plan(map, budget)?;
-    let result = verify_pass(
+    let result = verify_pass::<true>(
         source,
         map,
         scheme,

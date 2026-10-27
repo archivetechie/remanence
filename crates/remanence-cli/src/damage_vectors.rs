@@ -3204,7 +3204,7 @@ fn collector_preserves_outcomes_findings_and_commands_for_entire_damage_matrix()
 }
 
 /// Stable per-address damage must have identical outcomes and ordered findings
-/// with the forward observation schedule and the original Step 1 schedule.
+/// with the forward observation schedule and the direct acquisition order.
 #[test]
 fn forward_verification_matches_step1_for_entire_damage_matrix() {
     let frozen: Value = serde_json::from_str(EXPECTATIONS).unwrap();
@@ -3244,6 +3244,9 @@ fn forward_verification_matches_step1_for_entire_damage_matrix() {
             None,
             mode,
         );
+        if let (Ok(before), Ok(after)) = (&before, &after) {
+            assert_eq!(before, after, "typed full verification for {id}");
+        }
         distinct_schedules += usize::from(*before_log.borrow() != *after_log.borrow());
         assert_eq!(
             format!("{before:?}"),
@@ -3343,6 +3346,23 @@ fn full_verification_command_counts() {
                 .expect("full verification");
         assert!(result.is_complete_tape(), "{result:?}");
         assert_eq!(result.protected().sidecars.len(), 3);
+        // Measure protected verification separately from scanner positioning.
+        let (mut protected_drive, _, _) =
+            source_with_command_log(&vector, &json!({"unreadable_records": []}));
+        let mut protected_raw = crate::terminal_index_drill::InstrumentedSource::new(
+            DriveHandleRawSource::new(&mut protected_drive),
+        );
+        let scoped =
+            ScopedFilemarkMap::from_catalog(vector.written.map.clone(), 6 * u64::from(stripes));
+        let protected = verify_protected_content(
+            &mut protected_raw,
+            &scoped,
+            &vector.written.inputs.scheme,
+            &vector.written.inputs.tape_uuid,
+            TEST_BLOCK,
+        )
+        .expect("protected verification");
+        assert!(protected.is_clean(), "{protected:?}");
         let sidecar_files: Vec<_> = result
             .protected()
             .sidecars
@@ -3353,16 +3373,13 @@ fn full_verification_command_counts() {
         for file in &sidecar_files {
             let start = file.start_record as u64;
             let end = start + file.bytes.len() as u64 / u64::from(TEST_BLOCK);
-            let locates = raw
+            let locates = protected_raw
                 .locate_lbas
                 .iter()
                 .filter(|&&lba| (start..end).contains(&lba))
                 .count();
             epoch_locates.push(locates);
-            assert!(
-                locates <= 12,
-                "sidecar LOCATE count grows with metadata: {locates}"
-            );
+            assert_eq!(locates, 1, "one entry LOCATE per healthy sidecar");
             let header = remanence_parity::sidecar::parse_sidecar_header_block(
                 &file.bytes[..TEST_BLOCK as usize],
                 &vector.written.inputs.tape_uuid,
@@ -3431,11 +3448,11 @@ fn full_verification_command_counts() {
             .filter(|cdb| cdb[0] == 0x08 && cdb[1] & 1 != 0)
             .count();
         // Step 2 setup observes the directory excursion's return position.
-        assert_eq!((locates, positions, singles, batches), (73, 111, 56, 19));
+        assert_eq!((locates, positions, singles, batches), (55, 93, 47, 19));
         assert_eq!(locates, raw.locate_lbas.len());
         assert_eq!(batches, raw.batch_reads.len());
         println!("transport counts: LOCATE={locates} READ_POSITION={positions} single_READ={singles} batch_READ={batches}");
-        println!("stripes={stripes} files={} epochs=3 objects=2 metadata_blocks={metadata_blocks} locates={} singles={} batches={} epoch_locates={epoch_locates:?} directory_loads={}",
+        println!("stripes={stripes} files={} epochs=3 objects=2 metadata_blocks={metadata_blocks} locates={} singles={} batches={} protected_epoch_locates={epoch_locates:?} directory_loads={}",
             vector.image.files.len(), raw.locate_lbas.len(),
             raw.read_lbas.len() - raw.batch_reads.iter().map(|(_, n)| *n as usize).sum::<usize>(),
             raw.batch_reads.len(), map_body_reads - 2);
