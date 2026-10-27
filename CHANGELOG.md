@@ -4,53 +4,152 @@ Notable changes to Remanence and its published formats. The format
 specifications carry their own revision histories; entries here are
 per-release summaries.
 
-<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_backend.rs crates/remanence-state/src/index.rs crates/remanence-library/src/discovery.rs @ 4dc2a3c6 -->
+<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_backend.rs crates/remanence-state/src/index.rs crates/remanence-library/src/discovery.rs @ 638210f7 -->
 ## Unreleased
 
-- Generate private key files and public recipient files with
-  `rem archive recipient keygen`; protect private files with mode `0600` and
-  refuse existing output paths.
-- Read reservoirs keep minimum slabs unlocked when memory-lock limits or
-  permissions prevent locking. A once-per-process warning and an advisory
-  `rem doctor` check give the lock-limit remedy; read diagnostics count locked
-  and unlocked minimum slabs.
-- Library `tape init --clobber-data` reads the typed `CLOBBER <label>`
-  confirmation from standard input and completes; end of input is refused
-  with the non-interactive form, `--confirm-clobber "CLOBBER <label>"`.
-  `rem tape supersede-tail` reads its confirmation the same way. Neither
-  command can wait forever on a second standard-input lock any more.
+- `rem` operates one manually loaded LTO drive directly, with no daemon and no
+  changer. `rem setup` checks the host, finds the drive and saves its serial as
+  `[home] drive_serial`. Home mode keeps configuration and state under
+  `${XDG_STATE_HOME:-$HOME/.local/state}/rem` and refuses to run as root. The
+  standalone verbs create pools; initialize, identify, adopt, verify, finalize
+  and restore tapes; put, get and list files; and assign pools, record
+  generations, rebind labels, import journals, clear the medium-removal guard
+  and manage quarantine. A verb both routes share takes the standalone route
+  with `--device`, or with a saved home drive when `/etc/rem/config.toml` does
+  not exist and none of `--config`, `--endpoint` or `--library` is given;
+  otherwise it takes the daemon route. A direct command binds the drive's `/dev/sgN` path to its authorized serial and
+  refuses writes unless discovery proves that no changer owns the drive; a
+  `[[standalone_drives]]` entry can pin known ownership but cannot override a
+  changer's claim.
+- Standalone `rem put` decides per file before writing. When the pool's newest
+  committed version of an archive path has the same size, SHA-256 and
+  representation, the file is reported as already stored, with the tape that
+  holds it, and nothing is written; otherwise the file is written as a new
+  version with a new object UUID. Each file gets a receipt (`written`,
+  `already_stored`, `skipped_unsupported` or `refused`), and when the tape is
+  full the summary names the next commands. A plaintext put over a newest
+  version that is encrypted is refused unless `--allow-plaintext-copy` is
+  given. `rem get` takes an object UUID or an archive path and selects an older
+  version with `--version`. `rem list` shows catalogued paths, versions and
+  tapes without a device.
+- `rem tape restore` restores files from the loaded tape without the original
+  catalog, using the terminal index or, with `--scan`, a walk from BOT.
+  `--list` lists the tape's members without extracting anything, and `--path`
+  restores the named members only, validated before anything is written.
+  `rem tape adopt` records the tape's identity and nothing else.
+- Restores set each file's recorded modification time once its content is
+  validated, standalone and through the daemon; library-mode `rem put` sends
+  each source file's modification time with its append. `rem get` stages under
+  the destination (`<out>/.rem-staging-*`), never under `$TMPDIR`, removes the
+  staging directory on success and on error, and reports and clears a leftover
+  from a crashed restore.
+- Every pool write and every finalization, through the daemon or standalone, is
+  admitted against what is physically on the tape before its first block. The
+  tape is read at the recorded end. End of data passes, and a fragment that
+  runs to end of data without its closing filemark is superseded. A complete or
+  unclassifiable object, or a foreign terminal component, refuses the write
+  with `TailBeyondKnownState`, and the daemon puts that tape into the
+  recovery-required state. `rem tape supersede-tail`, standalone or through the
+  daemon, lists what would be discarded, requires a typed confirmation, audits
+  the discarded object ids and rescans before writing. A session that abandons
+  its own pending batch writes one filemark at its last checkpoint before it
+  releases the drive.
+- Initializing a cartridge that holds data, whether foreign, unrecognized or a
+  retired Remanence tape, requires `--clobber-data` and the confirmation
+  `CLOBBER <label>`, given as `--confirm-clobber "CLOBBER <label>"` or typed or
+  piped on standard input. End of input without it is refused with a message
+  that names the flag. This includes a retired cartridge that still carries its
+  old data, which 0.2.0 re-initialized without confirmation. Every
+  initialization reads the Medium Partition mode page and refuses a partitioned
+  cartridge, such as one formatted for LTFS, naming the `mt` command that makes
+  it single-partition.
+- On a standalone drive, an active tape-I/O fence blocks writes and leaves
+  reads available: identify, get, verify and restore run and report the fence,
+  and writes refuse a fence that names the loaded tape or the drive.
+  `rem tape quarantine list` and `rem tape quarantine release` work in home
+  mode.
+- `rem archive recipient keygen` writes a private key file with mode `0600` and
+  its slot-0 public recipient file, from the operating system's random source.
+  It refuses existing output paths and a public path equal to the private one.
+- A read reservoir whose minimum slabs cannot be locked in memory, because of
+  the memory-lock limit or permissions, keeps them unlocked and continues
+  rather than refusing the read. The first fallback in a process warns once
+  with the limit, the slab size and the remedy, the daemon's startup warning
+  says that reads fall back, and read diagnostics count locked and unlocked
+  slabs. `rem doctor` reports the memory-lock limit as an advisory check that
+  never blocks readiness.
+- Discovery opens only the SCSI nodes that sysfs reports as tape drives or
+  medium changers. Other nodes are reported for information and do not make
+  discovery incomplete. Discovery reports unattached drives with their
+  ownership and says whether enumeration was complete.
+- `rem doctor` prints a readiness checklist with fixes and exits non-zero when
+  the host is not ready. `rem drives` lists discovered endpoints, and
+  `rem diagnostics capture --out <FILE.tar>` collects what a hardware report
+  needs without reading tape data or positioning media. These three read the
+  catalog without taking the state lock. Every standalone flag has help text,
+  and both parsers accept `--dest` for `--out`, `--tape-uuid` for `--tape` and
+  `--ack-tape-uuid` for `--acknowledge-tape`. Standalone finalize needs only
+  `--acknowledge-tape`: the reason defaults to a fixed text and the
+  idempotency key to a UUIDv5 of the tape, so a retry is the same request.
+- The catalog records an operator label's provenance, the cartridge generation
+  with its source (measured from the drive's density code, read from the label,
+  or set by the operator) and each tape's pool-assignment history,
+  independently of library identity, and it audits label rebinding. The
+  catalog schema is 20. A 0.2.0 catalog (schema 18) migrates in place the first
+  time the daemon or a state-changing command opens it; commands that only
+  read the catalog do not migrate it. A 0.2.0 binary refuses a schema-20
+  catalog. `rem rebuild-catalog-from-journals` also replays checkpoint
+  journals, which reproduces standalone objects exactly.
+- Layer 5 contract: the `Catalog` service gains `SupersedeTail`.
+  `HealthResponse` and `VersionResponse` carry `supported_endpoint_kinds`,
+  `daemon_capabilities` and `observed_endpoints`. `FileRecord` and
+  `AppendObjectStart` carry an optional `mtime`. `CartridgeFacts` gains
+  `generation_source`, and its `cartridge_generation` is proto3 `optional`:
+  absent means the generation is unknown, where 0.2.0 sent an empty string to
+  mean "derive from the voltag". Existing field numbers are unchanged.
 
-- Operate a manually loaded LTO drive without a daemon: setup, initialize,
-  put/get, finalize, verify and restore. Home mode keeps state in the user's
-  state directory and remembers the drive by serial. Library operations keep
-  their daemon route; direct operations retain identity, ownership and write
-  safety checks.
-- Recover files without the original catalog using a terminal index or a BOT
-  scan. List tape members and restore selected paths. Adoption records tape
-  identity only. Restore preserves modification times; get stages on the
-  destination filesystem.
-- Track standalone file versions by pool and archive path. Unchanged newest
-  content skips; changed content gets a new object UUID. Put prints per-file
-  receipts and tape-full continuation instructions. List catalogued paths and
-  select older versions with get. The catalog migrates to schema 20.
-- Refuse append when tape data extends beyond local checkpoint authority.
-  Rescue it or explicitly confirm supersede-tail. Used cartridges, including
-  retired media, require confirmed clobber. Partition checks and quarantine
-  protect uncertain writes while leaving reads available.
-- Skip non-tape SCSI devices during discovery. Add doctor readiness guidance,
-  destination/tape flag aliases, stable standalone finalize defaults, a home
-  root refusal, and explicit opt-in for tests that issue live SCSI commands.
-- Record operator labels, generation observations and pool-assignment history
-  independently of library identity. Add diagnostics capture and direct-drive
-  ownership configuration.
+- READ and WRITE completions take the transferred count from valid sense data
+  when the kernel reports no residual for a check condition, as some host
+  adapters do: bytes for a variable-length transfer, blocks times the block
+  size for a fixed-block one, clamped to the request. A nonzero kernel residual
+  stays authoritative. On such hosts this is what lets physical end of data be
+  recognized; without it, end of data reads as an I/O failure, and append
+  admission and the catalog-less recovery report refuse the tape. The
+  corrected count is carried by the public
+  `TapeIoError::CheckConditionWithResidue` variant, which library error
+  matchers must accept, and the error message gives both counts.
+- Overlap-mode writes (`append_staging_mode = "overlap"`) to a newly
+  initialized tape succeed from the first object. The overlap writer's position
+  bookkeeping and the staged sink's IMMED filemark cursor count filemarks; in
+  0.2.0 they did not, and the first object failed.
+- An encrypted object that closes in a parity tape's first epoch records its
+  parity state. In 0.2.0 closing such an object failed.
+- When a catalog rebuild keeps a tape's committed-file watermark but loses the
+  rows at a checkpoint's exact boundary, checkpoint replay repairs that prefix,
+  including its last file, rather than treating it as a new append.
 
-- Fix first-append failures on freshly initialized tapes and catalog-less
-  recovery report failures on real drives whose adapters report no residual.
-  READ/WRITE uses a valid sense residue when the kernel reports no residual;
-  a nonzero kernel residual stays authoritative for partial transfers.
-  The public `TapeIoError::CheckConditionWithResidue` variant carries the
-  corrected byte count in variable and fixed block modes; library error
-  matchers must accept it.
+- Tests that issue live SCSI commands run only with `REM_TEST_LIVE_SCSI=1`;
+  otherwise device open and enumeration refuse inside test binaries and their
+  children.
+- The field-test kit (`fieldtest/`) follows the current command line: confirmed
+  clobber, generated recipient keys, and whole-object extraction in the
+  multi-object leg. It captures read-only diagnostics for a library window,
+  skips barcodes its init script has already initialized, re-threads a drive
+  left not ready before draining, waits a minute for a graceful daemon stop,
+  and refuses to start the daemon when the locked-memory limit it would inherit
+  is below 1 GiB and not unlimited (`FIELD_ALLOW_LOW_MEMLOCK=1` overrides).
+  `remfield-io` reads committed placement from the catalog after a session
+  closes.
+- Dependencies: `rustls` 0.23.46 for RUSTSEC-2026-0346, RUSTSEC-2026-0347,
+  RUSTSEC-2026-0348 and RUSTSEC-2026-0349; `rustls-webpki` 0.103.16 for
+  RUSTSEC-2026-0382; `ctutils` 0.4.4 for RUSTSEC-2026-0385.
+- Documentation: the standalone-drive guide walks a first physical tape in the
+  order a newcomer needs it, from building and finding the drive to recovering
+  without the catalog and what to keep besides the tape, and it covers
+  LTFS-formatted cartridges, locally generated keys and confirmed clobber.
+  `docs/status.md` has a tested-hardware table, names the diagnostics capture
+  to attach to a hardware report, and lists the limitations found in field
+  testing.
 
 ## 0.2.0 — 2026-10-15
 
