@@ -3022,6 +3022,302 @@ mod tests {
         assert!(err.message().contains("no free drive"), "{err}");
     }
 
+    const POOL_A: &str = "fieldtest-a";
+    const POOL_B: &str = "fieldtest-b";
+    const POOL_TAPE_A: TapeUuid = [0xA1; 16];
+    const POOL_TAPE_B: TapeUuid = [0xB1; 16];
+
+    struct ThreeBayHarness {
+        _temp: tempfile::TempDir,
+        state: ApiState,
+        pool: crate::write_owner::DrivePool,
+        drive_rxs: HashMap<u16, mpsc::Receiver<crate::write_owner::DriveCommand>>,
+        changer_rx: mpsc::Receiver<crate::write_owner::ChangerCommand>,
+    }
+
+    /// Three drive bays in LIB001 and one catalogued cartridge for each of two
+    /// pools: FTA001L9 in fieldtest-a and FTB001L9 in fieldtest-b. The caller
+    /// places the cartridges in the snapshot.
+    fn three_bay_two_pool_harness(drive_bays: Vec<DriveBay>, slots: Vec<Slot>) -> ThreeBayHarness {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        const BLOCK_SIZE: u32 = 256 * 1024;
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-three-bay-pools")
+            .tempdir()
+            .expect("tempdir");
+        let mut index = CatalogIndex::open(temp.path().join("state.sqlite")).expect("open catalog");
+        let mut pool_configs = Vec::new();
+        for (pool_id, tape_uuid, voltag) in [
+            (POOL_A, POOL_TAPE_A, "FTA001L9"),
+            (POOL_B, POOL_TAPE_B, "FTB001L9"),
+        ] {
+            index
+                .upsert_tape_pool_projection(TapePoolProjectionInput {
+                    pool_id: pool_id.to_string(),
+                    display_name: None,
+                    copy_class: None,
+                    content_class: None,
+                    created_at_utc: None,
+                })
+                .expect("project pool");
+            index
+                .provision_tape(ProvisionTapeInput {
+                    tape_uuid,
+                    voltag: voltag.to_string(),
+                    block_size: BLOCK_SIZE,
+                    parity: ParityConfig::None,
+                    force: false,
+                })
+                .expect("provision pool tape");
+            index
+                .project_tape_pool_membership(tape_uuid, pool_id)
+                .expect("assign pool tape");
+            pool_configs.push(TapePoolConfig {
+                scheme: None,
+                id: pool_id.to_string(),
+                display_name: None,
+                copy_class: None,
+                content_class: None,
+                selection_policy: PoolSelectionPolicyName::CompleteOrFill,
+                watermark_low: 0.92,
+                watermark_high: 0.97,
+                capacity_cap_bytes: None,
+                block_size_bytes: u64::from(BLOCK_SIZE),
+                min_object_size_bytes: 0,
+            });
+        }
+        let mut state = ApiState::new_with_pool_configs(index, pool_configs);
+        state.default_library_serial = Some(Arc::new("LIB001".to_string()));
+        state.library_snapshot = Some(Arc::new(std::sync::RwLock::new(Arc::new(
+            crate::live_status::LibrarySnapshot {
+                report: remanence_library::DiscoveryReport {
+                    unattached_drives: Vec::new(),
+                    complete: true,
+                    incomplete_evidence: Vec::new(),
+                    libraries: vec![test_library(drive_bays, slots)],
+                    warnings: Vec::new(),
+                },
+                captured_at: time::OffsetDateTime::UNIX_EPOCH,
+            },
+        ))));
+        let mut drive_txs = HashMap::new();
+        let mut drive_rxs = HashMap::new();
+        let mut reservations = HashMap::new();
+        for bay in [0x0101, 0x0102, 0x0103] {
+            let (tx, rx) = mpsc::channel(1);
+            drive_txs.insert(bay, tx);
+            drive_rxs.insert(bay, rx);
+            reservations.insert(bay, AtomicBool::new(false));
+        }
+        let (changer_tx, changer_rx) = mpsc::channel(1);
+        let pool =
+            crate::write_owner::DrivePool::new(changer_tx, drive_txs, Arc::new(reservations));
+        state.drive_pool = Some(pool.clone());
+        ThreeBayHarness {
+            _temp: temp,
+            state,
+            pool,
+            drive_rxs,
+            changer_rx,
+        }
+    }
+
+    fn spawn_pool_open(
+        state: &ApiState,
+        pool_id: &str,
+    ) -> tokio::task::JoinHandle<Result<pb::WriteSession, Status>> {
+        let state = state.clone();
+        let target = WriteSessionTarget::Pool {
+            pool_id: pool_id.to_string(),
+        };
+        tokio::spawn(async move {
+            open_write_session(remanence_state::AuditActor::System, &state, target, None).await
+        })
+    }
+
+    /// Wait for the drive actor of one bay to receive a write open and return
+    /// the selected tape with the reply channel, which the caller holds.
+    async fn expect_open_write(
+        rx: &mut mpsc::Receiver<crate::write_owner::DriveCommand>,
+    ) -> (TapeUuid, oneshot::Sender<Result<pb::WriteSession, Status>>) {
+        let command = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("drive actor receives the open within five seconds")
+            .expect("drive command channel stays open");
+        let crate::write_owner::DriveCommand::OpenWrite {
+            selected, reply, ..
+        } = command
+        else {
+            panic!("the drive actor must receive a write open");
+        };
+        (selected.tape_uuid, reply)
+    }
+
+    fn write_session_reply(session_id: Uuid) -> Result<pb::WriteSession, Status> {
+        Ok(pb::WriteSession {
+            session_id: session_id.as_bytes().to_vec(),
+            ..Default::default()
+        })
+    }
+
+    /// Two pool opens on different pools in flight together: while the first
+    /// still holds bay 0x0101 inside its drive actor, the second takes the
+    /// next idle empty bay rather than the held one.
+    #[tokio::test]
+    async fn concurrent_pool_opens_on_different_pools_take_different_idle_bays() {
+        let mut harness = three_bay_two_pool_harness(
+            vec![
+                drive_bay(0x0101, false, None),
+                drive_bay(0x0102, false, None),
+                drive_bay(0x0103, false, None),
+            ],
+            vec![slot(0x0401, "FTA001L9"), slot(0x0402, "FTB001L9")],
+        );
+        let moves = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut changer_rx = harness.changer_rx;
+        let changer = tokio::spawn({
+            let moves = moves.clone();
+            async move {
+                while let Some(command) = changer_rx.recv().await {
+                    let crate::write_owner::ChangerCommand::Move { src, dst, reply } = command
+                    else {
+                        panic!("pool opens only move media");
+                    };
+                    moves.lock().expect("moves lock").push((src, dst));
+                    reply.send(Ok(())).expect("move reply receiver");
+                }
+            }
+        });
+
+        let open_a = spawn_pool_open(&harness.state, POOL_A);
+        let (tape_a, reply_a) =
+            expect_open_write(harness.drive_rxs.get_mut(&0x0101).expect("bay 0x0101")).await;
+        assert_eq!(tape_a, POOL_TAPE_A);
+        assert_eq!(
+            harness.pool.busy_bays("LIB001"),
+            HashSet::from([0x0101]),
+            "the first open holds its bay while its drive actor opens"
+        );
+
+        let open_b = spawn_pool_open(&harness.state, POOL_B);
+        let (tape_b, reply_b) =
+            expect_open_write(harness.drive_rxs.get_mut(&0x0102).expect("bay 0x0102")).await;
+        assert_eq!(tape_b, POOL_TAPE_B);
+        let session_b = Uuid::new_v4();
+        reply_b
+            .send(write_session_reply(session_b))
+            .expect("open b reply receiver");
+        open_b
+            .await
+            .expect("open b task joins")
+            .expect("open b lands on an idle bay");
+
+        let session_a = Uuid::new_v4();
+        reply_a
+            .send(write_session_reply(session_a))
+            .expect("open a reply receiver");
+        open_a
+            .await
+            .expect("open a task joins")
+            .expect("open a keeps its bay");
+
+        assert_eq!(
+            harness.pool.session(session_a).expect("session a").bay,
+            0x0101
+        );
+        assert_eq!(
+            harness.pool.session(session_b).expect("session b").bay,
+            0x0102
+        );
+        assert_eq!(
+            harness.pool.busy_bays("LIB001"),
+            HashSet::from([0x0101, 0x0102])
+        );
+        assert!(
+            harness
+                .drive_rxs
+                .get_mut(&0x0103)
+                .expect("bay 0x0103")
+                .try_recv()
+                .is_err(),
+            "the third bay stays idle"
+        );
+        changer.abort();
+        assert_eq!(
+            *moves.lock().expect("moves lock"),
+            vec![(0x0401, 0x0101), (0x0402, 0x0102)]
+        );
+    }
+
+    /// The field shape behind "drive bay 0x0001 is busy": a session-open
+    /// readiness fence on one drive refuses another pool's open before any
+    /// robot motion, although other bays are idle and empty. The refusal
+    /// names the fenced drive's operation and says robot moves wait for it.
+    #[tokio::test]
+    async fn readiness_fence_on_one_drive_refuses_a_robot_open_on_an_idle_bay() {
+        let mut fenced = drive_bay(0x0101, true, Some("FTA001L9"));
+        fenced.source_slot = Some(0x0401);
+        let mut harness = three_bay_two_pool_harness(
+            vec![
+                fenced,
+                drive_bay(0x0102, false, None),
+                drive_bay(0x0103, false, None),
+            ],
+            vec![empty_slot(0x0401), slot(0x0402, "FTB001L9")],
+        );
+        let operation_id = Uuid::from_u128(0xfe4ce);
+        CatalogIndex::open(harness.state.index_path.as_ref())
+            .expect("open writable catalog")
+            .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+                operation_id,
+                run_id: None,
+                endpoint: crate::drive_pool::DriveKey::new("LIB001", 0x0101),
+                changer_sg: None,
+                drive_sg: None,
+                drive_serial: Some("DRV0101".to_string()),
+                barcode: Some("FTA001L9".to_string()),
+                source_slot: Some(0x0401),
+                media_generation: Some(9),
+                phase: "session_open_short_probe".to_string(),
+                state: "becoming_ready".to_string(),
+                dirty_scope: Some("drive+tape".to_string()),
+                deadline_at_utc: None,
+                evidence_path: None,
+            })
+            .expect("record session-open readiness fence");
+
+        let error = spawn_pool_open(&harness.state, POOL_B)
+            .await
+            .expect("open b task joins")
+            .expect_err("the readiness fence refuses an open that needs the robot");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        let message = error.message();
+        assert!(
+            message.contains(&format!("operation={operation_id}")),
+            "{message}"
+        );
+        assert!(message.contains("drive=0x0101"), "{message}");
+        assert!(
+            message.contains("robot moves in library LIB001 are refused"),
+            "{message}"
+        );
+        assert!(
+            message.contains("even when other drive bays are idle"),
+            "{message}"
+        );
+        assert!(
+            harness.pool.busy_bays("LIB001").is_empty(),
+            "the refused open releases the idle bay it planned to use"
+        );
+        assert!(harness.changer_rx.try_recv().is_err(), "no robot motion");
+        for rx in harness.drive_rxs.values_mut() {
+            assert!(rx.try_recv().is_err(), "no drive actor command");
+        }
+    }
+
     #[tokio::test]
     async fn canonical_dismount_tail_unloads_then_moves_home() {
         let harness = dismount_harness(0);

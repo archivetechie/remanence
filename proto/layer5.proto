@@ -211,6 +211,12 @@ service LibraryService {
   rpc CleanDrive        (CleanDriveRequest)           returns (OperationRef);
   // Resume an existing durable media-readiness fence in place. Progress is
   // observed through Daemon.WatchOperation using the returned operation id.
+  // The wait holds the fenced drive until it ends, so one caller at a time
+  // waits on a drive. A call while another caller holds that drive is
+  // refused with FAILED_PRECONDITION ("... is busy: another caller holds
+  // this drive while media-readiness operation ... is unresolved"), and the
+  // caller retries after the operation finishes. Any caller can follow a
+  // wait started through this RPC with Daemon.WatchOperation on the same id.
   rpc ResumeMediaReadiness (ResumeMediaReadinessRequest) returns (OperationRef);
   rpc ListAlarms        (ListAlarmsRequest)           returns (ListAlarmsResponse);
   rpc AckAlarm          (AckAlarmRequest)             returns (Alarm);
@@ -1584,6 +1590,24 @@ enum ArchiveGapCause {
 // =============================================================================
 
 service WriteSessionService {
+  // Open a write session. A target that needs a mount reserves a drive bay
+  // before any robot motion: the bay that already holds the selected tape,
+  // otherwise the first idle empty bay, otherwise an idle bay whose cartridge
+  // can return to an empty home slot. A bay that another session or wait
+  // holds is never chosen, so concurrent opens on different pools take
+  // different bays. When the selected tape sits in a bay that another caller
+  // holds, the open is refused with FAILED_PRECONDITION ("drive bay ... is
+  // busy").
+  //
+  // Robot moves in one library are serialized behind media readiness. While
+  // any drive in a library has an active media-readiness fence (for example
+  // a load that has not yet reached READY, recorded under an operation id),
+  // an open in that library that needs the robot is refused with
+  // FAILED_PRECONDITION naming that operation, even when other bays are
+  // idle. The open probes readiness only briefly, so on real drives a cold
+  // load commonly leaves such a fence. The caller retries the open once the
+  // operation finishes; LibraryService.ResumeMediaReadiness drives a fence to
+  // completion, one caller per drive at a time.
   rpc OpenWriteSession   (OpenWriteSessionRequest)   returns (WriteSession);
 
   // Stream one object into the session. The first message in each call must

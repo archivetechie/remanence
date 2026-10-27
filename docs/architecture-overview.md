@@ -291,6 +291,25 @@ finalization.
    instead pin a specific tape UUID. The same pool, writability, and fencing
    checks then apply as for pool selection; see [`rem put
    --tape`](reference-cli.md#writing-to-tape).
+
+   The daemon reserves the drive bay before any robot motion. It uses the
+   bay that already holds the selected tape, otherwise the first idle empty
+   bay, otherwise an idle bay whose cartridge can return to an empty home
+   slot. Bays that another session or readiness wait holds are skipped, so
+   concurrent opens on different pools land on different bays.
+
+   Robot moves in one library are serialized behind media readiness. A load
+   records a media-readiness fence until the drive reports READY, and the
+   open probes readiness only briefly, so on real drives a cold load commonly
+   leaves a fence for the client to resume. While a fence is active, every
+   other request in that library that needs the robot is refused with the
+   fence's operation id, even when other bays are idle. One caller at a time
+   waits on a fenced drive, so a second client that tries to resume the same
+   operation gets `<library> drive bay 0x<bay> is busy: another caller holds
+   this drive while media-readiness operation <id> is unresolved`. It retries
+   the open after that operation finishes. [Media-readiness fences and
+   quarantine](guide-troubleshooting.md#media-readiness-fences-and-quarantine)
+   covers fences in general.
 2. The actor prepares the drive: it rewinds, reads the bootstrap at BOT, and
    verifies that the tape UUID matches what the catalog expects. A tape that
    cannot prove its identity is never written.
