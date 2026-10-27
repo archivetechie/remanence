@@ -1699,7 +1699,39 @@ mod tests {
         }
     }
 
+    const ISOLATED_TEST_CHILD_ENV: &str = "REMANENCE_TEST_ISOLATED_CHILD";
+
+    /// Re-run `test` alone in a fresh test process; true only inside that process.
+    ///
+    /// tracing caches each callsite's interest process-wide when the callsite is
+    /// first reached. While a thread-local capture subscriber is the only one
+    /// registered, a callsite first reached by another test's thread, which has
+    /// no subscriber, is cached as never and its events vanish from the capture.
+    /// The process also owns the production fallback `Once` and warning sink.
+    fn run_alone_in_child_process(test: &str) -> bool {
+        if std::env::var_os(ISOLATED_TEST_CHILD_ENV).is_some() {
+            return true;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(ISOLATED_TEST_CHILD_ENV, "1")
+            .output()
+            .expect("run isolated test process");
+        assert!(
+            output.status.success(),
+            "isolated test {test} fails:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        false
+    }
+
     fn capture_read_events<T>(run: impl FnOnce() -> T) -> (T, Vec<Value>) {
+        assert!(
+            std::env::var_os(ISOLATED_TEST_CHILD_ENV).is_some(),
+            "capture tracing events only under run_alone_in_child_process"
+        );
         let writer = SharedLogWriter::default();
         let bytes = Arc::clone(&writer.0);
         let subscriber = tracing_subscriber::fmt()
@@ -2680,25 +2712,9 @@ mod tests {
     /// Exercise real pipeline fallback and the process-wide warning without host lock limits.
     #[test]
     fn read_pipeline_unlocked_minimum_completes_and_warns_once() {
-        const CHILD_ENV: &str = "REMANENCE_TEST_UNLOCKED_PIPELINE_CHILD";
-        if std::env::var_os(CHILD_ENV).is_none() {
-            // A fresh test process owns the production Once and warning sink.
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "read_core::tests::read_pipeline_unlocked_minimum_completes_and_warns_once",
-                    "--nocapture",
-                ])
-                .env(CHILD_ENV, "1")
-                .output()
-                .expect("run isolated pipeline test");
-            assert!(
-                output.status.success(),
-                "isolated pipeline test fails:\n{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        if !run_alone_in_child_process(
+            "read_core::tests::read_pipeline_unlocked_minimum_completes_and_warns_once",
+        ) {
             return;
         }
 
@@ -2819,6 +2835,9 @@ mod tests {
     /// Zero fallback leaves the guard available; concurrent fallbacks report only once.
     #[test]
     fn reservoir_fallback_warning_once() {
+        if !run_alone_in_child_process("read_core::tests::reservoir_fallback_warning_once") {
+            return;
+        }
         let once = Once::new();
         let messages = Mutex::new(Vec::new());
         warn_unlocked_minimum_once(
@@ -3024,6 +3043,11 @@ mod tests {
 
     #[test]
     fn read_pipeline_diag_open_and_close_have_stable_json_schema() {
+        if !run_alone_in_child_process(
+            "read_core::tests::read_pipeline_diag_open_and_close_have_stable_json_schema",
+        ) {
+            return;
+        }
         let mut source = InstrumentedReadSource {
             inner: VecBlockSource::new((0u8..4).map(|value| vec![value; 4]).collect())
                 .with_read_batch_blocks_for_test(2),
@@ -3079,6 +3103,11 @@ mod tests {
 
     #[test]
     fn slow_consumer_parks_reproves_and_keeps_one_command_in_flight() {
+        if !run_alone_in_child_process(
+            "read_core::tests::slow_consumer_parks_reproves_and_keeps_one_command_in_flight",
+        ) {
+            return;
+        }
         let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let max_in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let proofs = Arc::new(std::sync::atomic::AtomicUsize::new(0));

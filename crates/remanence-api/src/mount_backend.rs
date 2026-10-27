@@ -96,7 +96,7 @@ pub struct MountedTape {
     pub generation: Option<(LtoGen, GenerationSource)>,
     pub endpoint: MountEndpoint,
     pub identity_generation: u64,
-    _device_lock: Option<Arc<File>>,
+    _device_lock: Option<Arc<DeviceLock>>,
     reserved: bool,
 }
 impl Drop for MountedTape {
@@ -146,7 +146,23 @@ pub trait MountBackend {
 /// The only filesystem boundary for device locks. Production supplies exactly
 /// /run/lock/rem; tests inject a root without changing acquisition semantics.
 type LockIo = dyn FnMut(&str, &Path) -> std::io::Result<PathBuf>;
-fn lock_device(io: &mut LockIo, serial: &str) -> Result<File, MountError> {
+
+/// Held exclusive flock on a device lock file, released explicitly on drop.
+///
+/// A flock belongs to the open file description, not to this descriptor. A
+/// child forked by any other thread inherits a duplicate of that description
+/// and keeps it until its exec closes it (`O_CLOEXEC`), so close(2) alone can
+/// leave the drive locked after release. `LOCK_UN` on any duplicate releases it.
+struct DeviceLock(File);
+impl Drop for DeviceLock {
+    fn drop(&mut self) {
+        // SAFETY: flock borrows the live descriptor that the File owns. A
+        // failed unlock leaves close(2) to release the lock as before.
+        let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+fn lock_device(io: &mut LockIo, serial: &str) -> Result<DeviceLock, MountError> {
     if serial.is_empty() || serial == "." || serial == ".." || serial.contains(['/', '\\', '\0']) {
         return Err(refusal(
             "invalid drive serial for device lock; check VPD identity",
@@ -213,14 +229,14 @@ fn lock_device(io: &mut LockIo, serial: &str) -> Result<File, MountError> {
             std::io::Error::last_os_error()
         )));
     }
-    Ok(file)
+    Ok(DeviceLock(file))
 }
 
 /// Physical removal recovery owns only the device lock and audit sink. It never
 /// constructs an OperatorMount or gains write/session admission methods.
 struct LockedAuditedDevice {
     drive: Option<DriveHandle>,
-    lock: Option<Arc<File>>,
+    lock: Option<Arc<DeviceLock>>,
     audit_error: Arc<Mutex<Option<String>>>,
     endpoint: MountEndpoint,
 }

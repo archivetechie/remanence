@@ -2008,3 +2008,28 @@ fn standalone_fence_release_rebuild_preserves_endpoint_and_ack() {
     assert_eq!(row.state, "released");
     assert!(rebuilt.list_active_tape_io_fences().unwrap().is_empty());
 }
+
+/// A child forked by another thread shares the lock's open file description
+/// until it execs, so release must unlock explicitly rather than rely on close.
+#[test]
+fn device_lock_release_frees_the_drive_while_a_duplicate_descriptor_lives() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().to_owned();
+    let mut io = move |_: &str, logical: &Path| -> std::io::Result<PathBuf> {
+        Ok(base.join(logical.strip_prefix("/run/lock/rem").unwrap()))
+    };
+    let held = lock_device(&mut io, "DUP-DRIVE").unwrap();
+    // try_clone duplicates the descriptor onto the same open file description,
+    // exactly what fork(2) hands a child that has not exec'd yet.
+    let inherited = held.0.try_clone().unwrap();
+    let error = lock_device(&mut io, "DUP-DRIVE")
+        .err()
+        .expect("held lock refuses a second owner")
+        .to_string();
+    assert!(error.contains("os error 11"), "{error}");
+    drop(held);
+    let reacquired = lock_device(&mut io, "DUP-DRIVE")
+        .expect("released lock is free although a duplicate descriptor is still open");
+    drop(reacquired);
+    drop(inherited);
+}
