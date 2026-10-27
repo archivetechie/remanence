@@ -134,14 +134,13 @@ this is fixed. In the same window, a restore running beside a write session on
 another pool completed normally, and a concurrent restore and append against
 two pools on two drives ran at an aggregate of about 218 MB/s.
 
-**A readiness fence clears only when a session waits on it.** A drive that is
-becoming ready after a load leaves a media-readiness fence. A session open
-waits on that fence and resumes the readiness operation until the drive is
-ready, but `rem tape verify-index` is refused by the fence and does not wait,
-and nothing re-probes the drive on its own, so the fence stays until some
-client opens a session on that drive. Open a session (a small read of any
-object on the tape) before a verification that follows a fresh load, or retry
-the verification after the daemon log shows the drive ready.
+**A readiness fence clears when a client waits on it.** A drive that is
+becoming ready after a load leaves a media-readiness fence. Session opens
+and `rem tape verify-index` resume the readiness operation and wait until
+the drive is ready. Verification waits up to `15m`; `--ready-wait <DURATION>`
+sets the deadline, and `--ready-wait 0` returns the refusal immediately.
+Nothing re-probes a fence on its own, so it stays until a client resumes
+the readiness operation.
 
 **A cartridge left unthreaded by a hard kill needed a LOAD by hand.** When the
 field stop script killed the daemon outright during an unload, the cartridge

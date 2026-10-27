@@ -615,13 +615,14 @@ where
     let mut observed = vec![];
     let mut output = PutOutput {
         active_fences: Vec::new(),
+        verification_complete: None,
         out,
         json: cli.json,
         receipts: Vec::new(),
         summary: None,
         tape_continuation: false,
     };
-    let mut result = dispatch(
+    let result = dispatch(
         &cli,
         &env,
         enumeration,
@@ -630,6 +631,17 @@ where
         errors,
         &mut output,
     );
+    render_result(&cli, result, &observed, output, errors)
+}
+
+/// Render command facts and typed completion state through the standalone envelope.
+fn render_result(
+    cli: &Cli,
+    mut result: Result<Value, String>,
+    observed: &[Value],
+    mut output: PutOutput<'_>,
+    errors: &mut dyn Write,
+) -> ExitCode {
     if let Err(error) = &result {
         if matches!(cli.command, Command::Put { .. }) && output.summary.is_none() {
             let _ = output.finish(Some(&(PathBuf::new(), error.clone())), "");
@@ -638,7 +650,8 @@ where
     let receipts = std::mem::take(&mut output.receipts);
     let summary = output.summary.take();
     let active_fences = std::mem::take(&mut output.active_fences);
-    drop(output);
+    let incomplete_verification = output.verification_complete == Some(false);
+    let out = output.out;
     if read_only(&cli.command) {
         if let Ok(value) = &mut result {
             value["active_fences"] = json!(active_fences);
@@ -653,6 +666,9 @@ where
         }
     ) && result.as_ref().is_ok_and(|v| v["finalized"] == false);
     let value = match &result {
+        Ok(v) if incomplete_verification => {
+            json!({"ok":false,"status":"failed","error":"full verification incomplete","result":v})
+        }
         Ok(v) if incomplete_finalization => {
             json!({"ok":false,"status":"failed","error":format!("finalization outcome: {}", v["outcome"].as_str().unwrap_or("unknown")),"result":v})
         }
@@ -685,7 +701,7 @@ where
                 let _ = render_doctor(v, out);
             }
             Ok(_) if matches!(cli.command, Command::Drives) => {
-                let _ = render_drives(&observed, out);
+                let _ = render_drives(observed, out);
             }
             Ok(v) if matches!(cli.command, Command::List { .. }) => {
                 let mut rows = vec![vec![
@@ -719,6 +735,10 @@ where
                 }
                 let _ = render_table(&rows, out);
             }
+            Ok(v) if incomplete_verification => {
+                let _ = writeln!(out, "{}", serde_json::to_string_pretty(v).unwrap());
+                let _ = writeln!(errors, "error: full verification incomplete");
+            }
             Ok(v) if !matches!(cli.command, Command::Put { .. }) => {
                 let _ = writeln!(out, "{}", serde_json::to_string_pretty(v).unwrap());
             }
@@ -728,12 +748,27 @@ where
             Ok(_) => {}
         }
     }
-    if result.is_ok() && !incomplete_finalization && !doctor_not_ready {
+    if result.is_ok() && !incomplete_finalization && !incomplete_verification && !doctor_not_ready {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
     }
 }
+/// Attach the shared I/O JSON shape and render the same phase lines as verify-index.
+fn attach_verification_io(
+    facts: &mut Value,
+    io: remanence_library::verification_io::VerificationIo,
+    json_output: bool,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    let io = remanence_api::verification_io_to_proto(io);
+    facts["io"] = crate::tape_inventory::verification_io_json(&io);
+    if !json_output {
+        crate::tape_inventory::print_verification_io(&io, out)?;
+    }
+    Ok(())
+}
+
 fn read_only(command: &Command) -> bool {
     matches!(
         command,
@@ -1799,6 +1834,8 @@ where
                 }
                 Tape::Verify { full } => {
                     if *full {
+                        let io = mounted.drive.begin_verification_io();
+                        let _verification = mounted.drive.verification_context().verification();
                         let bootstrap = remanence_parity::bootstrap::discover_bootstrap(
                             &mut remanence_parity::DriveHandleRawSource::new(&mut mounted.drive),
                             None,
@@ -1811,15 +1848,13 @@ where
                         )
                         .map_err(err)?;
                         let complete = result.is_complete_tape();
-                        let facts = match result {
+                        output.verification_complete = Some(complete);
+                        let mut facts = match result {
                             remanence_parity::TerminalIndexVerificationOutcome::VerifiedComplete(v) | remanence_parity::TerminalIndexVerificationOutcome::VerifiedDegraded(v) => json!({"verified_complete": complete, "finalized": true, "object_count": v.selected_payload.object_row_count, "verified_prefix_bytes": v.verified_prefix_record_count.saturating_mul(u64::from(bootstrap.block_size_bytes)), "edition_digest": crate::bytes_to_hex(&v.edition.edition_digest)}),
                             remanence_parity::TerminalIndexVerificationOutcome::RecoveryRequired(r) => json!({"verified_complete": false, "status": "recovery_required", "detail": r.detail}),
                         };
-                        if complete {
-                            Ok(facts)
-                        } else {
-                            Err(format!("full verification incomplete: {facts}"))
-                        }
+                        attach_verification_io(&mut facts, io.finish(), cli.json, output.out)?;
+                        Ok(facts)
                     } else {
                         terminal_summary(&mut mounted.drive, true)
                     }
@@ -2013,6 +2048,7 @@ fn tape_continuation(error: &remanence_api::MountError) -> bool {
 /// Stream receipts before proceeding to another file, retaining them for the envelope.
 struct PutOutput<'a> {
     active_fences: Vec<Value>,
+    verification_complete: Option<bool>,
     out: &'a mut dyn Write,
     json: bool,
     receipts: Vec<Value>,
@@ -3020,6 +3056,112 @@ fn read_catalog_display<T>(
 
 #[cfg(test)]
 mod tests {
+    /// Typed incompleteness controls the real renderer even when facts omit the JSON flag.
+    #[test]
+    fn standalone_incomplete_verification_renders_facts_and_fences_with_exit_one() {
+        use clap::Parser;
+        for json_output in [true, false] {
+            for include_complete_key in [true, false] {
+                let mut args = vec!["rem", "tape", "verify", "--full"];
+                if json_output {
+                    args.push("--json");
+                }
+                let cli = super::Cli::try_parse_from(args).unwrap();
+                let mut facts = serde_json::json!({"status": "recovery_required", "detail": "terminal index is unreadable"});
+                if include_complete_key {
+                    facts["verified_complete"] = false.into();
+                }
+                super::attach_verification_io(
+                    &mut facts,
+                    Default::default(),
+                    true,
+                    &mut Vec::new(),
+                )
+                .unwrap();
+                let fences = vec![
+                    serde_json::json!({"operation_id": "00000000-0000-0000-0000-000000000001"}),
+                ];
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                let output = super::PutOutput {
+                    active_fences: fences.clone(),
+                    verification_complete: Some(false),
+                    out: &mut stdout,
+                    json: json_output,
+                    receipts: Vec::new(),
+                    summary: None,
+                    tape_continuation: false,
+                };
+                let code = super::render_result(&cli, Ok(facts.clone()), &[], output, &mut stderr);
+                assert_eq!(code, std::process::ExitCode::from(1));
+                facts["active_fences"] = serde_json::json!(fences);
+                let rendered: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+                if json_output {
+                    assert_eq!(rendered["ok"], false);
+                    assert_eq!(rendered["status"], "failed");
+                    assert_eq!(rendered["error"], "full verification incomplete");
+                    assert_eq!(rendered["result"], facts);
+                    assert_eq!(
+                        rendered["result"]["active_fences"],
+                        serde_json::json!(fences)
+                    );
+                } else {
+                    assert_eq!(rendered, facts);
+                    assert_eq!(
+                        String::from_utf8(stderr).unwrap(),
+                        "error: full verification incomplete\n"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Standalone results carry the same decimal-string counters and phase timing fields.
+    #[test]
+    fn standalone_full_verification_io_shape_and_human_lines() {
+        use remanence_library::verification_io::{IoCounts, VerificationIo};
+        let counts = IoCounts {
+            single_read: 2,
+            bytes: 8192,
+            elapsed_ms: 1200,
+            command_ms: 1100,
+            max_command_ms: 700,
+            command_latency: [0, 0, 0, 2, 0, 0],
+            ..Default::default()
+        };
+        let mut io = VerificationIo {
+            total: counts.clone(),
+            elapsed_ms: 1200,
+            ..Default::default()
+        };
+        io.phases[0] = counts;
+        let mut facts = serde_json::json!({"verified_complete": true});
+        let mut out = Vec::new();
+        super::attach_verification_io(&mut facts, io.clone(), true, &mut out).unwrap();
+        assert!(out.is_empty());
+        let encoded =
+            serde_json::to_vec(&serde_json::json!({"ok": true, "result": facts})).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        let report = &value["result"]["io"];
+        assert_eq!(report["elapsed_ms"], "1200");
+        assert_eq!(report["total"]["bytes"], "8192");
+        assert_eq!(report["phases"][0]["phase"], "setup");
+        for c in [&report["total"], &report["phases"][0]["counts"]] {
+            assert_eq!(c["elapsed_ms"], "1200");
+            assert_eq!(c["command_ms"], "1100");
+            assert_eq!(c["max_command_ms"], "700");
+            assert_eq!(
+                c["command_latency_buckets"],
+                serde_json::json!(["0", "0", "0", "2", "0", "0"])
+            );
+        }
+        super::attach_verification_io(&mut facts, io, false, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with("io: 1200 ms;"));
+        assert!(text
+            .contains("io phase setup: 1.2 s, inside commands 1.1 s, 2 commands, slowest 0.7 s\n"));
+    }
+
     /// Derived mappings remain actionable warnings instead of panicking.
     #[test]
     fn derived_mapping_warning_is_readable() {
@@ -3565,6 +3707,7 @@ mod tests {
             let mut bytes = Vec::new();
             let mut output = super::PutOutput {
                 active_fences: Vec::new(),
+                verification_complete: None,
                 out: &mut bytes,
                 json: true,
                 receipts: Vec::new(),
@@ -3600,6 +3743,7 @@ mod tests {
         let mut bytes = Vec::new();
         let mut output = super::PutOutput {
             active_fences: Vec::new(),
+            verification_complete: None,
             out: &mut bytes,
             json: true,
             receipts: Vec::new(),

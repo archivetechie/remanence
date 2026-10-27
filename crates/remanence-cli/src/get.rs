@@ -32,7 +32,8 @@ use uuid::Uuid;
 
 use remanence_api::pb;
 
-use crate::put::{archive_path_for, format_bytes, format_uuid, hex, wait_before_open_retry};
+use crate::media_readiness::wait_before_open_retry;
+use crate::put::{archive_path_for, format_bytes, format_uuid, hex};
 use crate::{
     connect_daemon, daemon_runtime, finish_daemon_client_result, status_error, DaemonClientError,
     DEFAULT_DAEMON_ENDPOINT,

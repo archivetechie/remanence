@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use clap::Args;
 use sha2::{Digest as _, Sha256};
@@ -33,6 +33,8 @@ use uuid::Uuid;
 
 use remanence_api::pb;
 
+use crate::media_readiness::wait_before_open_retry;
+
 use crate::{
     connect_daemon, daemon_runtime, finish_daemon_client_result, parse_element_addr, status_error,
     DaemonClientError, DEFAULT_DAEMON_ENDPOINT,
@@ -40,11 +42,6 @@ use crate::{
 
 const DEFAULT_PUT_CHUNK_BYTES: usize = 1_048_576;
 const MAX_PUT_CHUNK_BYTES: usize = 64 * 1024 * 1024;
-// Media-readiness waits mirror remfield-io: a cold library may need minutes
-// of load/position work before the first open succeeds.
-const DEFAULT_READY_TIMEOUT_SECONDS: u32 = 9_000;
-const DEFAULT_READY_POLL_SECONDS: u32 = 30;
-const DRIVE_BUSY_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Arguments for `rem put`.
 #[derive(Args, Debug)]
@@ -720,124 +717,6 @@ async fn open_write_session(
         }
         Err(status) => Err(status_error(status)),
     }
-}
-
-/// Mirror of the remfield-io open-retry contract: a FailedPrecondition that
-/// names a media-readiness operation means a tape load is in flight — watch it
-/// to completion, then retry once. A busy drive bay gets one short retry.
-/// Anything else is a real error.
-pub(crate) async fn wait_before_open_retry(
-    channel: Channel,
-    status: &tonic::Status,
-    err: &mut dyn Write,
-) -> Result<(), DaemonClientError> {
-    if status.code() != tonic::Code::FailedPrecondition
-        || status.message().contains("resume append error:")
-    {
-        return Err(status_error(status.clone()));
-    }
-    if let Some(operation_id) = media_readiness_operation_id(status.message()) {
-        let _ = writeln!(
-            err,
-            "open fenced by media readiness operation {operation_id}; waiting \
-             up to {DEFAULT_READY_TIMEOUT_SECONDS}s (pass --no-wait to fail fast)",
-        );
-        return wait_for_media_readiness_operation(channel, operation_id, err).await;
-    }
-    if drive_bay_busy(status.message()) {
-        let _ = writeln!(
-            err,
-            "open found a busy drive bay; retrying once after {:.0}s",
-            DRIVE_BUSY_RETRY_DELAY.as_secs_f64()
-        );
-        tokio::time::sleep(DRIVE_BUSY_RETRY_DELAY).await;
-        return Ok(());
-    }
-    Err(status_error(status.clone()))
-}
-
-fn media_readiness_operation_id(message: &str) -> Option<Uuid> {
-    if !message.contains("media-readiness") {
-        return None;
-    }
-    message.split_ascii_whitespace().find_map(|token| {
-        let value = token.strip_prefix("operation=")?;
-        Uuid::parse_str(value.trim_matches(|ch: char| !ch.is_ascii_hexdigit() && ch != '-')).ok()
-    })
-}
-
-fn drive_bay_busy(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    (lower.contains("drive bay") && lower.contains("is busy"))
-        || lower.contains("drive-session owner is busy")
-}
-
-async fn wait_for_media_readiness_operation(
-    channel: Channel,
-    operation_id: Uuid,
-    err: &mut dyn Write,
-) -> Result<(), DaemonClientError> {
-    let mut library = pb::library_service_client::LibraryServiceClient::new(channel.clone());
-    let operation = library
-        .resume_media_readiness(pb::ResumeMediaReadinessRequest {
-            operation_id: operation_id.as_bytes().to_vec(),
-            timeout_seconds: DEFAULT_READY_TIMEOUT_SECONDS,
-            poll_interval_seconds: DEFAULT_READY_POLL_SECONDS,
-        })
-        .await
-        .map_err(status_error)?
-        .into_inner();
-    let mut stream = pb::daemon_client::DaemonClient::new(channel)
-        .watch_operation(pb::GetOperationRequest {
-            operation_id: operation.operation_id,
-        })
-        .await
-        .map_err(status_error)?
-        .into_inner();
-    while let Some(status) = stream.message().await.map_err(status_error)? {
-        let state =
-            pb::OperationState::try_from(status.state).unwrap_or(pb::OperationState::Unspecified);
-        let readiness = status
-            .progress
-            .get("state")
-            .map(String::as_str)
-            .unwrap_or("unknown");
-        let reason = match (
-            status
-                .progress
-                .get(remanence_library::MEDIA_READINESS_SENSE_PROGRESS_KEYS.0),
-            status
-                .progress
-                .get(remanence_library::MEDIA_READINESS_SENSE_PROGRESS_KEYS.1),
-        ) {
-            (Some(sense), Some(name)) => format!(" sense={sense} ({name})"),
-            (Some(sense), None) => format!(" sense={sense}"),
-            _ => String::new(),
-        };
-        let _ = writeln!(
-            err,
-            "media readiness operation {operation_id}: {readiness}{reason}"
-        );
-        match state {
-            pb::OperationState::Succeeded => return Ok(()),
-            pb::OperationState::Failed
-            | pb::OperationState::Cancelled
-            | pb::OperationState::CompletionUnknown => {
-                let summary = if status.error_summary.is_empty() {
-                    format!("finished {state:?}")
-                } else {
-                    status.error_summary
-                };
-                return Err(DaemonClientError::client(format!(
-                    "media readiness operation {operation_id} did not reach READY: {summary}"
-                )));
-            }
-            _ => {}
-        }
-    }
-    Err(DaemonClientError::client(format!(
-        "media readiness operation {operation_id} watch ended before READY"
-    )))
 }
 
 /// Best-effort abort. Returns whether the daemon acknowledged it, so the

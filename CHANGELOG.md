@@ -7,6 +7,17 @@ per-release summaries.
 <!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_backend.rs crates/remanence-state/src/index.rs crates/remanence-library/src/discovery.rs @ 638210f7 -->
 ## Unreleased
 
+- `rem tape verify-index` waits for media readiness before retrying verification
+  (`--ready-wait`, default `15m`; `0` returns the refusal). Standalone
+  `rem tape verify --full` prints the I/O report and per-phase timing in JSON
+  and human output. Incomplete verification exits 1 with facts in `result`
+  instead of the error text, and this read-only command includes
+  `result.active_fences`. `--ready-wait` bounds only the local watch; the daemon
+  keeps its 9000 s readiness timeout after the command returns.
+
+- `parse_wait_duration_arg` rejects overflowing durations instead of panicking,
+  including for `rem tape wait-ready`.
+
 - `rem tape verify-index` reports per-phase and total elapsed time, time inside
   commands, slowest-command time and latency buckets in JSON, with phase timing
   lines in human output and `remanence_verify_diag` INFO events in the daemon.

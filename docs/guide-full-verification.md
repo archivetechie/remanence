@@ -75,6 +75,27 @@ rem tape verify-index --tape-uuid TAPE_UUID
 rem tape verify-index --tape-uuid TAPE_UUID --json
 ```
 
+A verification after a fresh load waits for the drive when a media-readiness
+fence blocks it. `verify-index` resumes the readiness operation with the daemon's
+9000 s timeout and watches locally for up to `15m`. It retries verification once
+the operation reports ready. Set `--ready-wait <DURATION>` to change only the
+local watch deadline, or `--ready-wait 0` to return the refusal immediately.
+The daemon keeps waiting after the command returns, so the fence clears when
+the drive becomes ready within its timeout. A later command resumes the
+readiness operation if the fence still blocks it.
+
+Stderr announces the operation and wait duration when the wait starts, and
+announces expiry when the local deadline ends. Each `media readiness operation
+<UUID>: <state>` line reports a state change; `sense=KK/AA/QQ (name)` explains
+the drive's response when available, and `ready` ends the wait. At the deadline
+the command returns the daemon's original refusal. If another caller holds the
+drive for that readiness operation, verification watches it without resuming
+it. If the operation fails, is cancelled, or has an unknown completion, the
+command returns the original refusal with the wait error appended after a
+semicolon; it does not retry verification. Resume and watch errors use the same
+form. A busy drive bay gets one retry after 1 s, including when the readiness
+operation reports success before releasing its reservation.
+
 The drive is occupied for the whole run. Plan for that before you start; the
 section [How long a full verification takes](#how-long-a-full-verification-takes)
 gives the arithmetic.
@@ -184,6 +205,13 @@ that issues a command. With `--json`, `io` is an object in the
 results. Every count, millisecond value and address is a decimal string. When the daemon supplies
 no report, `io` is `null`; that does not mean no commands were issued. A failed
 RPC carries no verification report.
+
+Standalone `rem tape verify --full` includes the same I/O fields in `result.io`
+and prints the same human timing lines. Its `setup` phase starts after the
+mount; the daemon's starts before the readiness probe and load. The two `setup`
+figures cover different work and are not comparable. An incomplete standalone
+verification exits 1 and keeps its facts, I/O report and `active_fences` in
+`result`, with `error` set to `full verification incomplete`.
 
 `total` covers all commands dispatched from readiness and setup to the end of
 verification. `phases` divides the same work at the existing read boundaries:

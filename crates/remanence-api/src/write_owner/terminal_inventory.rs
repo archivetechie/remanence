@@ -994,8 +994,8 @@ fn log_verification_io(io: &remanence_library::verification_io::VerificationIo) 
     }
 }
 
-/// Project only collected diagnostics; verdict conversion alone leaves io absent.
-fn verification_io_to_proto(
+/// Convert drive-local verification diagnostics for daemon and standalone reports.
+pub fn verification_io_to_proto(
     io: remanence_library::verification_io::VerificationIo,
 ) -> pb::VerificationIo {
     fn counts(c: remanence_library::verification_io::IoCounts) -> pb::VerificationIoCounts {
