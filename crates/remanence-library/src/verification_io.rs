@@ -2,7 +2,7 @@
 //! state rather than borrowing the drive, so nested raw adapters share a report.
 
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::transport::TransferOutcome;
 use remanence_scsi::{decode_sense, ScsiError};
@@ -51,10 +51,18 @@ impl VerificationPhase {
     }
 }
 
-/// Dispatch counts, including unsuccessful attempts. Bytes include all data-in
+/// Dispatch counts and timing, including unsuccessful attempts. Bytes include all data-in
 /// and data-out transfers; records are exact READ transfers only.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IoCounts {
+    /// Wall time while this phase is current, excluding nested phases.
+    pub elapsed_ms: u64,
+    /// Wall time inside transport dispatches, including unsuccessful attempts.
+    pub command_ms: u64,
+    /// Longest transport dispatch.
+    pub max_command_ms: u64,
+    /// Command durations in ms: <5, [5,20), [20,100), [100,1000), [1000,10000), >=10000.
+    pub command_latency: [u64; 6],
     /// LOCATE attempts.
     pub locate: u64,
     /// SPACE attempts.
@@ -117,6 +125,27 @@ struct State {
     verification_depth: usize,
     position: Option<u64>,
     protected_end: Option<u64>,
+    phase_started: Option<Instant>,
+    phase_elapsed: [Duration; 7],
+    phase_commands: [Duration; 7],
+    command_elapsed: Duration,
+}
+
+/// Keep fractional milliseconds across phase entries and command dispatches.
+fn milliseconds(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+impl State {
+    /// Charge only the current phase, then start the next exclusive interval.
+    fn account_phase(&mut self, now: Instant) {
+        if let (Some(report), Some(started)) = (&mut self.report, self.phase_started) {
+            let phase = self.phase as usize;
+            self.phase_elapsed[phase] += now.duration_since(started);
+            report.phases[phase].elapsed_ms = milliseconds(self.phase_elapsed[phase]);
+            self.phase_started = Some(now);
+        }
+    }
 }
 /// Shared passive hooks for a drive and its source adapters.
 #[derive(Clone, Default)]
@@ -124,7 +153,9 @@ pub struct VerificationContext(Arc<Mutex<State>>);
 impl VerificationContext {
     /// Enter a phase without issuing commands.
     pub fn phase(&self, phase: VerificationPhase) -> VerificationScope {
+        let entered = Instant::now();
         let mut state = self.0.lock().unwrap();
+        state.account_phase(entered);
         let previous = state.phase;
         state.phase = phase;
         VerificationScope {
@@ -167,7 +198,10 @@ impl VerificationContext {
         cdb: &[u8],
         buf: &[u8],
         result: &Result<TransferOutcome, ScsiError>,
+        duration: Duration,
     ) {
+        let command_ms = milliseconds(duration);
+        let bucket = [5, 20, 100, 1_000, 10_000].partition_point(|&bound| command_ms >= bound);
         let mut state = self.0.lock().unwrap();
         if state.report.is_none() {
             return;
@@ -209,8 +243,16 @@ impl VerificationContext {
         let phase = state.phase;
         let before = state.position;
         let protected_end = state.protected_end;
+        state.phase_commands[phase as usize] += duration;
+        state.command_elapsed += duration;
+        let phase_command_ms = milliseconds(state.phase_commands[phase as usize]);
+        let total_command_ms = milliseconds(state.command_elapsed);
         let report = state.report.as_mut().unwrap();
+        report.total.command_ms = total_command_ms;
+        report.phases[phase as usize].command_ms = phase_command_ms;
         for counts in [&mut report.total, &mut report.phases[phase as usize]] {
+            counts.max_command_ms = counts.max_command_ms.max(command_ms);
+            counts.command_latency[bucket] += 1;
             match opcode {
                 0x92 => counts.locate += 1,
                 0x11 | 0x91 => counts.space += 1,
@@ -284,8 +326,10 @@ pub struct VerificationScope {
 }
 impl Drop for VerificationScope {
     fn drop(&mut self) {
+        let now = Instant::now();
         let mut state = self.context.0.lock().unwrap();
         if let Some(previous) = self.previous {
+            state.account_phase(now);
             state.phase = previous;
         } else {
             state.verification_depth -= 1;
@@ -300,13 +344,12 @@ pub struct VerificationIoSession {
 impl VerificationIoSession {
     /// Finish collection and return its report.
     pub fn finish(self) -> VerificationIo {
-        let mut report = self.context.0.lock().unwrap().report.take().unwrap();
-        report.elapsed_ms = self
-            .started
-            .elapsed()
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX);
+        let now = Instant::now();
+        let mut state = self.context.0.lock().unwrap();
+        state.account_phase(now);
+        let mut report = state.report.take().unwrap();
+        report.elapsed_ms = milliseconds(now.duration_since(self.started));
+        report.total.elapsed_ms = report.elapsed_ms;
         report
     }
 }
@@ -319,6 +362,7 @@ impl VerificationContext {
     /// Begin one diagnostic collection before readiness/setup.
     pub(crate) fn begin(&self) -> VerificationIoSession {
         let context = self.clone();
+        let started = Instant::now();
         {
             let mut state = context.0.lock().unwrap();
             assert!(state.report.is_none(), "nested verification collectors");
@@ -326,11 +370,12 @@ impl VerificationContext {
             state.phase = VerificationPhase::Setup;
             state.position = None;
             state.protected_end = None;
+            state.phase_started = Some(started);
+            state.phase_elapsed = [Duration::ZERO; 7];
+            state.phase_commands = [Duration::ZERO; 7];
+            state.command_elapsed = Duration::ZERO;
         }
-        VerificationIoSession {
-            context,
-            started: Instant::now(),
-        }
+        VerificationIoSession { context, started }
     }
 }
 
@@ -417,6 +462,114 @@ pub(crate) fn exact_recovered(result: &Result<TransferOutcome, ScsiError>, size:
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn phase_time_covers_repeated_entries_and_leaves_unused_phases_empty() {
+        let context = VerificationContext::default();
+        let session = context.begin();
+        for _ in 0..2 {
+            let _scope = context.phase(VerificationPhase::Walk);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let report = session.finish();
+        assert!(report.phases[VerificationPhase::Walk as usize].elapsed_ms >= 40);
+        for phase in VerificationPhase::ALL.into_iter().skip(2) {
+            assert_eq!(report.phases[phase as usize].elapsed_ms, 0);
+        }
+        assert!(
+            report.total.elapsed_ms >= report.phases[VerificationPhase::Walk as usize].elapsed_ms
+        );
+        assert!(report.total.elapsed_ms <= report.elapsed_ms);
+    }
+
+    #[test]
+    fn nested_phase_time_is_exclusive_and_finish_accounts_active_scope() {
+        let context = VerificationContext::default();
+        let session = context.begin();
+        let started = Instant::now();
+        let outer = context.phase(VerificationPhase::Walk);
+        std::thread::sleep(Duration::from_millis(20));
+        {
+            let _inner = context.phase(VerificationPhase::Sidecar);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        let report = session.finish();
+        let wall_ms = milliseconds(started.elapsed());
+        drop(outer);
+        let outer_ms = report.phases[VerificationPhase::Walk as usize].elapsed_ms;
+        let inner_ms = report.phases[VerificationPhase::Sidecar as usize].elapsed_ms;
+        assert!(outer_ms >= 40);
+        assert!(inner_ms >= 20);
+        assert!(outer_ms + inner_ms <= wall_ms);
+        assert!(report.total.elapsed_ms >= outer_ms + inner_ms);
+    }
+
+    #[test]
+    fn dispatch_duration_counts_one_bucket_at_each_boundary() {
+        for (duration_us, bucket) in [
+            (0, 0),
+            (4_999, 0),
+            (5_000, 1),
+            (19_999, 1),
+            (20_000, 2),
+            (99_999, 2),
+            (100_000, 3),
+            (999_999, 3),
+            (1_000_000, 4),
+            (9_999_999, 4),
+            (10_000_000, 5),
+        ] {
+            let context = VerificationContext::default();
+            let session = context.begin();
+            let duration = Duration::from_micros(duration_us);
+            context.dispatch(&[0], &[], &Ok(TransferOutcome::clean(0)), duration);
+            let report = session.finish();
+            for counts in [
+                &report.total,
+                &report.phases[VerificationPhase::Setup as usize],
+            ] {
+                assert!(counts.command_ms >= duration_us / 1000);
+                assert!(counts.command_ms < duration_us / 1000 + 1);
+                assert!(counts.max_command_ms >= duration_us / 1000);
+                assert!(counts.max_command_ms < duration_us / 1000 + 1);
+                assert_eq!(counts.command_latency.iter().sum::<u64>(), 1);
+                assert_eq!(counts.command_latency[bucket], 1);
+            }
+        }
+    }
+
+    #[test]
+    fn command_time_fits_phase_and_retains_fractional_milliseconds() {
+        let context = VerificationContext::default();
+        let session = context.begin();
+        {
+            let _scope = context.phase(VerificationPhase::ProtectedData);
+            let started = Instant::now();
+            std::thread::sleep(Duration::from_millis(20));
+            let duration = started.elapsed();
+            context.dispatch(&[0], &[], &Ok(TransferOutcome::clean(0)), duration);
+            // Short dispatches accumulate without losing each sub-millisecond part.
+            std::thread::sleep(Duration::from_millis(3));
+            for _ in 0..1500 {
+                context.dispatch(
+                    &[0],
+                    &[],
+                    &Ok(TransferOutcome::clean(0)),
+                    Duration::from_micros(1),
+                );
+            }
+        }
+        let report = session.finish();
+        let phase = &report.phases[VerificationPhase::ProtectedData as usize];
+        for counts in [phase, &report.total] {
+            assert!(counts.command_ms >= 21);
+            assert!(counts.command_ms <= counts.elapsed_ms);
+            assert!(counts.max_command_ms >= 20);
+            assert!(counts.command_ms > counts.max_command_ms);
+            assert_eq!(counts.command_latency.iter().sum::<u64>(), 1501);
+        }
+    }
+
     fn position(context: &VerificationContext, lba: u64) {
         let mut buf = [0; 32];
         buf[8..16].copy_from_slice(&lba.to_be_bytes());
@@ -424,6 +577,7 @@ mod tests {
             &remanence_scsi::read_position::build_cdb_long(),
             &buf,
             &Ok(TransferOutcome::clean(32)),
+            Duration::ZERO,
         );
     }
     #[test]
@@ -448,6 +602,7 @@ mod tests {
                     sense,
                     bytes_transferred: 4,
                 }),
+                Duration::ZERO,
             );
             let report = session.finish();
             assert_eq!(report.total.bytes, 0);
@@ -468,17 +623,20 @@ mod tests {
                     &remanence_scsi::read_write::build_read_variable_cdb(4),
                     &[0; 4],
                     &Ok(TransferOutcome::clean(4)),
+                    Duration::ZERO,
                 );
                 context.dispatch(
                     &remanence_scsi::locate::build_cdb(10),
                     &[],
                     &Ok(TransferOutcome::clean(0)),
+                    Duration::ZERO,
                 );
                 position(&context, 10);
                 context.dispatch(
                     &remanence_scsi::read_write::build_read_variable_cdb(4),
                     &[0; 4],
                     &Ok(TransferOutcome::clean(4)),
+                    Duration::ZERO,
                 );
             }
             position(&context, 30);

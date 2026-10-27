@@ -1450,6 +1450,21 @@ fn print_verification(
             if let Some(c) = &io.total {
                 writeln!(out, "io: {} ms; LOCATE {} SPACE {} READ POSITION {}; READ single {} batch {}; records {}/{} confirmed/requested; {} bytes; protected {} bytes; backward seeks {}; recovered {}", io.elapsed_ms, c.locate, c.space, c.read_position, c.single_read, c.batch_read, c.records_confirmed, c.records_requested, c.bytes, io.protected_bytes, io.backward_data_seeks, c.recovered_reads).map_err(|e| e.to_string())?;
             }
+            for phase in &io.phases {
+                if let Some(c) = &phase.counts {
+                    let commands = c.locate
+                        + c.space
+                        + c.read_position
+                        + c.single_read
+                        + c.batch_read
+                        + c.other;
+                    if commands > 0 {
+                        writeln!(out, "io phase {}: {:.1} s, inside commands {:.1} s, {} commands, slowest {:.1} s",
+                            phase.phase, c.elapsed_ms as f64 / 1000.0, c.command_ms as f64 / 1000.0,
+                            commands, c.max_command_ms as f64 / 1000.0).map_err(|e| e.to_string())?;
+                    }
+                }
+            }
         }
     }
     let state = pb::TapeIndexVerificationState::try_from(verification.state)
@@ -1693,6 +1708,10 @@ fn verification_io_json(io: &pb::VerificationIo) -> serde_json::Value {
             "hardware_batch_fallbacks": c.hardware_batch_fallbacks.to_string(),
             "recovered_reads": c.recovered_reads.to_string(),
             "algorithmic_fallback_epochs": c.algorithmic_fallback_epochs.to_string(),
+            "elapsed_ms": c.elapsed_ms.to_string(),
+            "command_ms": c.command_ms.to_string(),
+            "max_command_ms": c.max_command_ms.to_string(),
+            "command_latency_buckets": c.command_latency_buckets.iter().map(u64::to_string).collect::<Vec<_>>(),
         })
     }
     json!({
@@ -2001,6 +2020,62 @@ mod tests {
             reason: pb::TapeInventoryBotRecoveryReason::AllMembersInvalid as i32,
         };
         assert!(accept_bot_recovery_started(&mut state, &wrong_tape, tape_uuid).is_err());
+    }
+
+    #[test]
+    fn verification_io_phase_timing_json_and_human_output() {
+        let counts = pb::VerificationIoCounts {
+            elapsed_ms: 120_300,
+            command_ms: 118_900,
+            max_command_ms: 61_200,
+            command_latency_buckets: vec![300, 40, 8, 1, 2, 1],
+            batch_read: 352,
+            ..Default::default()
+        };
+        let mut report = verified_degraded_with_invalid_bc();
+        report.io = Some(pb::VerificationIo {
+            total: Some(counts.clone()),
+            elapsed_ms: 120_300,
+            phases: vec![
+                pb::VerificationIoPhase {
+                    phase: "walk_terminal".into(),
+                    counts: Some(counts),
+                },
+                pb::VerificationIoPhase {
+                    phase: "sidecar".into(),
+                    counts: Some(pb::VerificationIoCounts::default()),
+                },
+            ],
+            ..Default::default()
+        });
+        let mut out = Vec::new();
+        print_verification(&report, None, true, &mut out).unwrap();
+        let value: Value = serde_json::from_slice(&out).unwrap();
+        let expected = json!({
+            "phase": "walk_terminal",
+            "counts": {
+                "locate": "0", "space": "0", "read_position": "0",
+                "single_read": "0", "batch_read": "352", "other": "0",
+                "records_requested": "0", "records_confirmed": "0", "bytes": "0",
+                "hardware_batch_fallbacks": "0", "recovered_reads": "0",
+                "algorithmic_fallback_epochs": "0",
+                "elapsed_ms": "120300", "command_ms": "118900", "max_command_ms": "61200",
+                "command_latency_buckets": ["300", "40", "8", "1", "2", "1"]
+            }
+        });
+        assert_eq!(value["data"]["io"]["phases"][0], expected);
+        assert_eq!(value["data"]["io"]["total"], expected["counts"]);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value["data"]["io"]["phases"][0]).unwrap()
+        );
+        out.clear();
+        print_verification(&report, None, false, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let mut lines = text.lines();
+        assert!(lines.next().unwrap().starts_with("io:"));
+        assert_eq!(lines.next().unwrap(), "io phase walk_terminal: 120.3 s, inside commands 118.9 s, 352 commands, slowest 61.2 s");
+        assert!(!text.contains("io phase sidecar:"));
     }
 
     #[test]

@@ -7,6 +7,10 @@ per-release summaries.
 <!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_backend.rs crates/remanence-state/src/index.rs crates/remanence-library/src/discovery.rs @ 638210f7 -->
 ## Unreleased
 
+- `rem tape verify-index` reports per-phase and total elapsed time, time inside
+  commands, slowest-command time and latency buckets in JSON, with phase timing
+  lines in human output and `remanence_verify_diag` INFO events in the daemon.
+
 - `rem` operates one manually loaded LTO drive directly, with no daemon and no
   changer. `rem setup` checks the host, finds the drive and saves its serial as
   `[home] drive_serial`. Home mode keeps configuration and state under

@@ -35,6 +35,7 @@
 
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use remanence_scsi::{decode_sense, ScsiError};
 
@@ -427,8 +428,10 @@ impl MediaFencedTransport {
         cdb: &[u8],
         buf: &mut [u8],
     ) -> Result<TransferOutcome, ScsiError> {
+        let started = Instant::now();
         let result = self.inner.execute_in(cdb, buf);
-        self.verification.dispatch(cdb, buf, &result);
+        self.verification
+            .dispatch(cdb, buf, &result, started.elapsed());
         if let Ok(outcome) = &result {
             self.note_outcome(outcome);
         }
@@ -450,9 +453,10 @@ impl MediaFencedTransport {
                  route it through the media-dispatch gate",
             ));
         }
+        let started = Instant::now();
         let result = self.inner.execute_none(cdb);
         self.verification
-            .dispatch(cdb, &[], &Ok(TransferOutcome::clean(0)));
+            .dispatch(cdb, &[], &Ok(TransferOutcome::clean(0)), started.elapsed());
         if let Err(error) = &result {
             self.note_error(error, cdb.first() == Some(&0x00));
         }
@@ -559,17 +563,24 @@ impl MediaFencedTransport {
 
         let result = match data_out {
             Some(buf) => {
+                let started = Instant::now();
                 let result = self.inner.execute_out(cdb, buf);
-                self.verification.dispatch(cdb, buf, &result);
+                self.verification
+                    .dispatch(cdb, buf, &result, started.elapsed());
                 if let Ok(outcome) = &result {
                     self.note_outcome(outcome);
                 }
                 result.map(Some)
             }
             None => {
+                let started = Instant::now();
                 let result = self.inner.execute_none(cdb);
-                self.verification
-                    .dispatch(cdb, &[], &Ok(TransferOutcome::clean(0)));
+                self.verification.dispatch(
+                    cdb,
+                    &[],
+                    &Ok(TransferOutcome::clean(0)),
+                    started.elapsed(),
+                );
                 result.map(|()| None)
             }
         };

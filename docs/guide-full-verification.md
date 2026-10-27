@@ -178,9 +178,10 @@ suffix is not.
 The `io` report shows the work the drive did during verification. It helps
 explain the elapsed time and makes repeated reads visible. It is diagnostic:
 none of its numbers decides the tape's outcome or adds a finding. The human
-output has one `io:` summary line. With `--json`, `io` is an object in the
+output has one `io:` summary line and one `io phase` timing line for each phase
+that issues a command. With `--json`, `io` is an object in the
 `rem.tape.verify-index.v1` response for complete, degraded and recovery-required
-results. Every count and address is a decimal string. When the daemon supplies
+results. Every count, millisecond value and address is a decimal string. When the daemon supplies
 no report, `io` is `null`; that does not mean no commands were issued. A failed
 RPC carries no verification report.
 
@@ -201,6 +202,10 @@ Each phase has a `counts` object with the same fields as `total`:
 
 | Field | Meaning |
 | --- | --- |
+| `elapsed_ms` | Wall milliseconds while the phase is current, summed across entries and excluding nested phases; `total` covers the whole collection. |
+| `command_ms` | Wall milliseconds inside transport dispatches, including unsuccessful attempts. |
+| `max_command_ms` | Milliseconds in the slowest command. |
+| `command_latency_buckets` | Six command counts for durations <5, [5,20), [20,100), [100,1000), [1000,10000), and >=10000 ms, in that order. |
 | `locate`, `space`, `read_position` | Attempted positioning commands. Inline READ POSITION commands issued by LOCATE and SPACE count too. |
 | `single_read` | Variable-mode, single-record READ commands. |
 | `batch_read` | Fixed-mode READ commands, including a batch that requests one record. |
@@ -212,7 +217,7 @@ Each phase has a `counts` object with the same fields as `total`:
 | `algorithmic_fallback_epochs` | Epochs needing at least one unbuffered data read. These are counted in `fallback_data`, separately from hardware retries. |
 | `recovered_reads` | Accepted reads for which the drive reports that it corrected an error. |
 
-`elapsed_ms` is monotonic elapsed time in the daemon, including readiness and
+`io.elapsed_ms` is monotonic elapsed time in the daemon, including readiness and
 setup. It excludes time spent waiting for a drive before verification starts,
 and client and RPC overhead. It measures the whole verification, not just I/O.
 
@@ -294,7 +299,14 @@ that were never written.
 <!-- code-anchor: crates/remanence-parity/src/verify_protected.rs @ c80a553a -->
 ## How long a full verification takes
 
-The time has two parts: the time to read the bytes, and the time the drive
+Per-phase `command_ms` measures time inside commands; `elapsed_ms - command_ms`
+measures time between commands on the drive actor's thread. Operators use this
+split to distinguish drive motion and transfer waits from host work. It is a
+wall-time split, so transport overhead and scheduling waits remain included.
+The daemon emits `remanence_verify_diag` INFO events for each phase that issues
+a command and for `total`, with the same timing and command counts.
+
+Drive time has two parts: the time to read the bytes, and the time the drive
 spends moving to places on the tape.
 
 The bytes set a floor. A full LTO-9 cartridge holds 18 TB natively, which is

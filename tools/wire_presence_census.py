@@ -65,6 +65,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
 import sys
 
@@ -84,8 +85,9 @@ LABEL_REPEATED = 3
 
 
 def find_descriptor() -> pathlib.Path:
+    target = pathlib.Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))
     hits = sorted(
-        ROOT.glob("target/*/build/remanence-api-*/out/layer5_descriptor.bin"),
+        target.glob("*/build/remanence-api-*/out/layer5_descriptor.bin"),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
