@@ -9,9 +9,16 @@ exactly `v<workspace.package.version>`, so the release name and the versions
 reported by its binaries cannot diverge. Existing historical unsigned tags are
 not rewritten.
 
-A `v*` tag runs the release workflow, rebuilds the test and lint gates, and
-creates a GitHub release containing checksummed Linux operator binaries and a
-separate static-musl `rem-recover` archive. The recovery archive is separate so
+A `v*` tag runs the release workflow. It repeats the formatting, lint and test
+gates, builds statically linked (musl) binaries, and packs
+`remanence-<version>-x86_64-unknown-linux-musl.tar.gz`, which holds `rem`,
+`rem-debug`, `rem-daemon` and `rem-recover` with the README, the licensing
+files and `docs/`, and a separate `rem-recover` archive. A second job unpacks
+the archive on a clean runner, runs each binary in an empty root directory and
+checks that it reports the tag's version. The GitHub release is created, with
+the checksums and generated notes, only after that job passes. A manual run of
+the workflow on a branch builds and verifies the same files as a workflow
+artifact and publishes nothing. The recovery archive is separate so
 an operator can preserve it with key escrow without depending on a full
 Remanence installation. Each archive includes Remanence's Apache-2.0 license
 and a generated inventory containing the full selected license texts for its

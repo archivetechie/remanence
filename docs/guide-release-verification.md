@@ -6,10 +6,14 @@ signed source revision.
 
 Binary releases require an annotated, GitHub-verified signed tag on an ancestor
 of `main`, successful main-push CI for the exact tagged commit, and a matching
-workspace version. The release build repeats Rust tests and clippy with locked
-dependencies before packaging Linux binaries.
+workspace version. The release build repeats the formatting check, clippy and
+the Rust tests with locked dependencies before packaging statically linked
+Linux binaries. A separate job unpacks the operator archive and runs its
+binaries before anything is published.
 
-Release files include `release-manifest.json`, `build-remanence-linux.json`,
+Release files include the operator archive
+`remanence-<version>-x86_64-unknown-linux-musl.tar.gz`, the recovery archive
+`rem-recover-x86_64-linux-musl.tar.gz`, `release-manifest.json`, `build-remanence-linux.json`,
 `eligibility.json`, third-party licenses, and `SHA256SUMS`. The manifest binds
 source and workflow identities, the verified tag object, eligible CI run links,
 lockfile hashes, actual compiler/Cargo versions, runner identity, and artifact

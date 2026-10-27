@@ -17,6 +17,8 @@ can continue through the daemon half of the quickstart.
 
 ## Start here
 
+- [guide-install.md](guide-install.md) — install the release binaries or
+  build from source, and prepare a host for tape hardware.
 - [guide-quickstart.md](guide-quickstart.md) — runnable walkthrough from
   build to first tape write, with separate standalone-drive and library paths.
 - [guide-standalone-drive.md](guide-standalone-drive.md) — initialize, write,

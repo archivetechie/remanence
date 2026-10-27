@@ -78,6 +78,13 @@ verify real material on your own equipment before you rely on it.
 
 [docs/status.md](docs/status.md) sets out what works today and what does not.
 
+## Install
+
+Releases publish prebuilt x86-64 Linux binaries that need no Rust toolchain.
+[docs/guide-install.md](docs/guide-install.md) explains how to download,
+check and install them, and how to prepare a host for tape hardware. To build
+from source instead, see [Build](#build).
+
 <!-- code-anchor: Cargo.toml crates/remanence-api/build.rs crates/remanence-cli/src/archive_ingest.rs @ 6ed03ef0 -->
 ## Build
 
@@ -136,6 +143,8 @@ LTO drive attached, go straight to the
 
 ## Documentation
 
+- [Install](docs/guide-install.md) — release binaries, building from source,
+  and host setup for tape hardware.
 - [Quickstart](docs/guide-quickstart.md) — runnable walkthrough.
 - [Standalone LTO drive](docs/guide-standalone-drive.md) — first physical
   tape with one drive, no changer or daemon.
