@@ -40,6 +40,10 @@ start_daemon() {
   # BEFORE the daemon takes device ownership — a 2-drive library with
   # occupied drives can't serve writes.
   fieldtest_drain_drives "$(fieldtest_selected_library_serial)" || true
+  if ! fieldtest_require_memlock; then
+    fieldtest_evidence_record "$SCRIPT_NAME" memlock FAIL "refusing to start the daemon under a locked-memory limit that clamps the staging ring; raise RLIMIT_MEMLOCK for the daemon (see stderr)"
+    exit 1
+  fi
   # Close the work-lock descriptor for the tmux server: a server started here
   # would otherwise inherit fd 9 and hold the kit lock for its whole life.
   tmux new-session -d -s "$session" -n rem 9>&-

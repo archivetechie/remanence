@@ -1270,6 +1270,54 @@ PY
   rm -f "$report"
 }
 
+# The locked-memory limit the daemon will inherit: the tmux server's when one
+# runs for this user (the daemon starts inside it), otherwise this shell's.
+# Prints "unlimited" or a byte count.
+fieldtest_daemon_memlock_limit() {
+  local server_pid line
+  server_pid="$(tmux display-message -p '#{pid}' 2>/dev/null || true)"
+  if [[ -n "$server_pid" && -r "/proc/$server_pid/limits" ]]; then
+    line="$(grep -E '^Max locked memory' "/proc/$server_pid/limits" || true)"
+    if [[ -n "$line" ]]; then
+      awk '{print $4}' <<<"$line"
+      return 0
+    fi
+  fi
+  local kib
+  kib="$(ulimit -l 2>/dev/null || true)"
+  if [[ "$kib" == unlimited ]]; then
+    printf 'unlimited\n'
+  elif [[ "$kib" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' $((kib * 1024))
+  fi
+}
+
+# Refuse to start the daemon under a locked-memory limit that would clamp the
+# staging ring and the read reservoir: the drives then run below their
+# speed-matching floor. FIELD_ALLOW_LOW_MEMLOCK=1 overrides for a deliberate
+# low-memory test. Requires unlimited or at least 1 GiB.
+fieldtest_require_memlock() {
+  local limit
+  limit="$(fieldtest_daemon_memlock_limit)"
+  [[ "$limit" == unlimited ]] && return 0
+  if [[ "$limit" =~ ^[0-9]+$ ]] && (( limit >= 1073741824 )); then
+    return 0
+  fi
+  if [[ "${FIELD_ALLOW_LOW_MEMLOCK:-0}" == 1 ]]; then
+    echo "warn: starting the daemon under a locked-memory limit of ${limit:-unknown} bytes (FIELD_ALLOW_LOW_MEMLOCK=1)" >&2
+    return 0
+  fi
+  cat >&2 <<EOF
+error: the daemon would inherit a locked-memory limit of ${limit:-unknown} bytes; the staging ring and
+read reservoir would be clamped and the drives fed below their speed-matching floor.
+Fix as root, then retry:
+  printf 'remfield soft memlock unlimited\nremfield hard memlock unlimited\n' > /etc/security/limits.d/remfield.conf
+  prlimit --pid \$(tmux display-message -p '#{pid}') --memlock=unlimited:unlimited   # as the remfield user's tmux server
+Set FIELD_ALLOW_LOW_MEMLOCK=1 only for a deliberate low-memory test.
+EOF
+  return 1
+}
+
 fieldtest_drain_drives() {
   local serial="$1"
   local lib_json loaded_drives bay barcode
