@@ -399,8 +399,13 @@ A single implementation may fill several roles.
   about a copy of the ParityMap or its footer likewise leaves the tape not
   complete. The
   Verifier measures and classifies every tape file of the prefix, including
-  when the replicas validate, and reports the damage it finds there. A
-  Verifier does not report whether a stripe could be recovered. It reports a
+  when the replicas validate, and reports the damage it finds there. It may
+  measure a tape file of the prefix from its reads of every block of that
+  file, as Section 12.2 permits, when its full verification reads every block
+  of that file. When a replica is accepted, the prefix that it measures ends
+  at the planned start of replica A (Section 8.3), whatever number of rows the
+  replicas record. A Verifier does not report whether a stripe could be
+  recovered. It reports a
   nonzero fill of the bootstrap (Section 8.1) only when the bootstrap can be
   read.
 - **Reader**: any role that reads a tape: the Scanner, the Recoverer, the
@@ -2447,6 +2452,66 @@ classifies the file by its head, when the head can be read, as a torn
 candidate (an incomplete Object candidate when nothing else fits, Section
 8.4.1), and ends there.
 
+A Reader whose role reads every block of a tape file in order, such as a
+Verifier in its full verification (Section 2.2), may measure the file from
+those reads instead of by filemark spacing. It reads one block per read, with
+no positioning command between the head block and the trailing filemark, until
+a read returns a filemark. The file ends at the first filemark that a read
+returns, and the Reader takes no file's length or boundary from a replica's
+rows or from any other record. The position of the head block is the one the
+device reports after the previous file's trailing filemark, or one that a
+positioning command to the head block establishes. The file's block count is
+the position that the device reports after the read that returned the
+filemark, less the position of the head block, less one. This is the walk's
+measurement on the two conditions below. The conditions are that:
+
+- every read from the head block up to the filemark returned one whole block,
+  so that the k-th of those reads returned the block at the head block's
+  position plus k; and
+- the position that the device reports after the filemark equals the position
+  of the head block plus the number of those reads plus one.
+
+A reported position that goes backwards is a device fault (`TapeIo`, Section
+2.4). A transport failure is `TapeIo` (Section 3.5), as for any read.
+
+A file that does not meet both conditions is measured and classified by the
+walk of the first paragraph of this section, as though the pass had not read
+it. This includes a file in which a read returned an unreadable record, a
+record of the wrong length (Section 3.5) or end of data, and one whose
+reported position after the filemark differs from the second condition. The
+pass's read of the head block may serve as the walk's read of it, so a
+filemark or end of data at the head block, and an unreadable head block, have
+the outcomes this section and Section 12.3 give them. A failed read after the
+head block does not make the head block unreadable. When the failed read is a
+later one, the Reader positions to the head block, or to the block after it,
+by a positioning command, and spaces to the next filemark from there. Spacing
+from a position after the failed read is not the walk's measurement. A
+filemark that a read returns after a failed read, including one that a pass
+reaches by positioning past the failed record (Section 13.3), does not measure
+the file. If the walk ends at that file, or its spacing fails, the walk's
+outcome stands, and no later file is measured from the pass.
+
+Either way, Section 12.3 classifies the file from the blocks its rungs name,
+each at the position the rung names. A block that the pass read as one whole
+block, at a position that the conditions above place, may serve for the read
+of that block. A block that a rung names and that the pass did not keep is
+read at its position before the rung uses it or treats it as unreadable. The
+other blocks of the file, which the pass reads for the checks of its role,
+take no part in the classification (item 7). The measurement and the
+classification are then the ones the walk reaches from the same reads, and the
+file is a tape file of the walk in every respect.
+
+*Rationale.* On a linear tape drive, spacing over a file costs a large part of
+the time it takes to read it, and a Verifier reads every data block that a
+sidecar protects and every parity shard in its full verification (Section
+2.2). Measuring in that pass reads each block once. The second condition
+catches a device or transport that miscounts the blocks before a filemark, or
+reports its position late. After a read that fails, the device's position, and
+whether the failed record was the filemark, are the device's to report
+(Appendix D, item TT-2). Spacing from the head block crosses the same records
+the walk crosses, so the file's measurement is the walk's whatever the device
+reports.
+
 ### 12.3. The Classification Ladder
 
 The bootstrap at tape file 0 establishes the tape identity against which every
@@ -3986,6 +4051,21 @@ an errata revision of draft.1.
     reaches the same decisions as one that reads the footer first. A
     rationale paragraph gives the reason. This settles a reading the earlier
     text left open, and a Recoverer that reads the footer first remains
+    conformant. No tape byte and no vector outcome changes.
+  - Section 12.2 now says that a Reader whose role reads every block of a
+    tape file in order may measure the file from those reads instead of by
+    filemark spacing. The block count is the device's position after the
+    trailing filemark, less the head block's position, less one, provided
+    every read returned one whole block and the reported position agrees with
+    the number of reads. A file that does not meet both conditions is measured
+    and classified by the walk from its head block. Section 12.3 classifies
+    the file from the blocks its rungs name, so the file is a tape file of the
+    walk in every respect. Section 2.2 says that a Verifier may measure a file
+    of the prefix this way when its full verification reads every block of
+    that file, and that the prefix ends at replica A's planned start. A
+    rationale paragraph gives the reason. This is a new permission: the
+    measurement, the classification and every finding are the walk's, no
+    requirement is relaxed, and a Reader that measures by spacing remains
     conformant. No tape byte and no vector outcome changes.
 - **2026-08-11 — 1.0.0-draft.4 — replacement review draft.** Replaces the
   geometric/checkpoint-bootstrap design with one BOT Bootstrap and exactly
