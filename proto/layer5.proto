@@ -82,7 +82,10 @@ message OperationStatus {
   google.protobuf.Timestamp created_at = 4;
   google.protobuf.Timestamp updated_at = 5;
   // Free-form progress payload (e.g., bytes_written, current_lba, etc.).
-  // Keys are operation-kind-specific.
+  // Keys are operation-kind-specific. tape_verification publishes tape_uuid,
+  // drive_serial, bay, phase, tape_file, bytes_read, and elapsed_ms.
+  // Unknown locations use "unknown". Phase changes
+  // publish immediately; other progress publishes at most once per five seconds.
   map<string, string> progress = 6;
   // On failure, a human-readable summary; structured detail in audit log.
   string error_summary         = 7;
@@ -691,6 +694,10 @@ service Catalog {
   // prefix, compare its canonical map, and read all three replicas and both
   // typed separation extents. This is distinct from GetTapeInventory.
   rpc VerifyTapeIndex  (VerifyTapeIndexRequest)  returns (TapeIndexVerification);
+  // Full verification retained by this daemon process; watch and cancel via Daemon.
+  rpc StartTapeVerification (StartTapeVerificationRequest) returns (OperationRef);
+  // NOT_FOUND for unknown/pruned ids; FAILED_PRECONDITION without a completed verdict.
+  rpc GetTapeVerification (GetOperationRequest) returns (TapeIndexVerification);
   rpc ListTapeFiles    (ListTapeFilesRequest)    returns (ListTapeFilesResponse);
   rpc ListTapePools    (ListTapePoolsRequest)    returns (ListTapePoolsResponse);
   rpc GetTapePool      (GetTapePoolRequest)      returns (TapePool);
@@ -793,6 +800,10 @@ message Tape {
   optional string scheme_id = 15;
   // Monotonic exact pool-assignment generation from the catalog row.
   uint64 assignment_generation = 16;
+  // Completion time of the most recent full verification verdict.
+  optional google.protobuf.Timestamp last_verified_at = 17;
+  optional TapeIndexVerificationState last_verification_state = 18;
+  optional bytes last_verified_edition_digest = 19;
 }
 
 message FinalizeTapeRequest {
@@ -1039,6 +1050,11 @@ message TapeInventory {
   // recovery outcomes, whose rows use TapeInventoryBotObject instead; never
   // zero.
   optional uint64 selected_attempt_id = 17;
+}
+
+message StartTapeVerificationRequest {
+  // Exact 16-byte Remanence tape UUID. Voltags are refused.
+  bytes tape_uuid = 1;
 }
 
 message VerifyTapeIndexRequest {

@@ -4159,3 +4159,66 @@ unsafe impl remanence_library::AppendBoundaryProof for FixtureAppendProof {
         (self.0, self.1, self.2, self.3)
     }
 }
+
+/// Raw boundary cancellation complements the per-CDB guard for composite calls.
+/// Neither guard interprets cancellation as tape damage or adds verifier findings.
+pub struct CancellableRawSource<S>(pub S);
+impl<S: crate::RawTapeSource> crate::RawTapeSource for CancellableRawSource<S> {
+    fn verification_context(&self) -> remanence_library::verification_io::VerificationContext {
+        self.0.verification_context()
+    }
+    fn configure_fixed_block_size(&mut self, size: u32) -> Result<(), crate::ParityError> {
+        self.check()?;
+        self.0.configure_fixed_block_size(size)
+    }
+    fn locate_physical(
+        &mut self,
+        hint: crate::PhysicalPositionHint,
+    ) -> Result<(), crate::ParityError> {
+        self.check()?;
+        self.0.locate_physical(hint)
+    }
+    fn locate_end_of_data(&mut self) -> Result<crate::PhysicalPositionHint, crate::ParityError> {
+        self.check()?;
+        self.0.locate_end_of_data()
+    }
+    fn space_filemarks(
+        &mut self,
+        count: i64,
+    ) -> Result<crate::SpaceFilemarksOutcome, crate::ParityError> {
+        self.check()?;
+        self.0.space_filemarks(count)
+    }
+    fn read_record(&mut self, buf: &mut [u8]) -> Result<crate::RawReadOutcome, crate::ParityError> {
+        self.check()?;
+        self.0.read_record(buf)
+    }
+    fn position(&mut self) -> Result<crate::PhysicalPositionHint, crate::ParityError> {
+        self.check()?;
+        self.0.position()
+    }
+    fn read_records(
+        &mut self,
+        buf: &mut [u8],
+        size: u32,
+        max: u32,
+        remaining: u32,
+    ) -> crate::raw::RawReadBatch {
+        if let Err(error) = self.check() {
+            return crate::raw::RawReadBatch {
+                records_read: 0,
+                position_after: None,
+                end: crate::raw::RawReadEnd::Error(error),
+            };
+        }
+        self.0.read_records(buf, size, max, remaining)
+    }
+}
+impl<S: crate::RawTapeSource> CancellableRawSource<S> {
+    fn check(&self) -> Result<(), crate::ParityError> {
+        self.0
+            .verification_context()
+            .check_cancelled()
+            .map_err(|_| remanence_library::TapeIoError::Cancelled.into())
+    }
+}

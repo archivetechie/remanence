@@ -154,11 +154,15 @@ same drive after a daemon killed during an unload. After any hard kill, still ch
 `rem top` for a bay shown busy with no I/O and `rem tape quarantine list` for
 a `media_initializing` fence.
 
-**Full verification runs well below the drive rate.** On the field host a full
-verification of a 36 GB parity tape took 13 minutes, about 46 MB/s, where the
-same drive restores at 300 MB/s. The verification reads and checks on one
-thread and walks the tape with many direction changes before it checks any
-data. A redesign is in progress.
+**Full verification can be watched and cancelled, but cannot be resumed.**
+`rem tape verify-index --tape-uuid <UUID> --detach` returns an operation UUID. Use
+`rem operation watch <UUID>`, `rem operation cancel <UUID>`, and
+`rem tape verify-index --result <UUID>` to track, cancel, and fetch the verdict.
+Cancellation waits for the in-flight tape command and releases the reservation.
+A cancelled verification starts over. The catalog records completed verdicts,
+and audit replay rebuilds their timestamps, states and terminal edition digests.
+Drive allocation policy belongs to the caller; the daemon does not preempt a
+verification to admit a write or restore.
 
 **The catalog rebuild's summary leaves out the checkpoint journals.**
 `rem rebuild-catalog-from-journals` replays the checkpoint journals after the

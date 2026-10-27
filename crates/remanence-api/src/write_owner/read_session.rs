@@ -43,6 +43,16 @@ pub(super) fn handle_drive_open_read(
         reply,
     } = request;
 
+    let session_id = Uuid::new_v4();
+    if let Some(lifecycle) = &cfg.lifecycle {
+        lifecycle.set_holder(
+            &crate::drive_pool::DriveKey::new(&library_serial, bay),
+            drive_serial.as_deref(),
+            "read session",
+            session_id,
+        );
+    }
+
     if let Err(status) = session_open_short_probe_or_load(
         index,
         drive,
@@ -77,7 +87,6 @@ pub(super) fn handle_drive_open_read(
         )));
         return;
     }
-    let session_id = Uuid::new_v4();
     let position_proof = match resume_target.as_ref() {
         Some(target) => {
             if let Err(status) = prepare_drive_for_read(index, drive, &tape_uuid, session_id) {

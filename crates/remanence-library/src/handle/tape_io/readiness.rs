@@ -342,7 +342,7 @@ pub fn classify_media_readiness_error_ref(err: &ScsiError, family: MediaFamily) 
         ScsiError::TransportError { .. } | ScsiError::Io(_) => MediaReadiness::TransportUnknown {
             detail: err.to_string(),
         },
-        ScsiError::InvalidInput(_) => MediaReadiness::InvalidRequest {
+        ScsiError::Cancelled | ScsiError::InvalidInput(_) => MediaReadiness::InvalidRequest {
             detail: err.to_string(),
         },
         ScsiError::Truncated { .. } | ScsiError::InvalidResponse { .. } => {

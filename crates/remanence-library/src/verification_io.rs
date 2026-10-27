@@ -121,6 +121,9 @@ pub struct VerificationIo {
 #[derive(Default)]
 struct State {
     report: Option<VerificationIo>,
+    control: Option<VerificationControl>,
+    read_bytes: u64,
+    tape_file: Option<u64>,
     phase: VerificationPhase,
     verification_depth: usize,
     position: Option<u64>,
@@ -147,10 +150,79 @@ impl State {
         }
     }
 }
+/// Operation hooks scoped to a full verification. The observer never issues I/O.
+struct VerificationControl {
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    observer: Arc<dyn Fn(VerificationPhase, u64, Option<u64>) + Send + Sync>,
+}
+
+/// Removes operation hooks when verification returns, including error paths.
+pub struct VerificationControlScope(VerificationContext);
+impl Drop for VerificationControlScope {
+    fn drop(&mut self) {
+        self.0 .0.lock().unwrap().control = None;
+    }
+}
+
 /// Shared passive hooks for a drive and its source adapters.
 #[derive(Clone, Default)]
 pub struct VerificationContext(Arc<Mutex<State>>);
 impl VerificationContext {
+    /// Install cancellation and progress for this operation only.
+    pub fn control(
+        &self,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        observer: Arc<dyn Fn(VerificationPhase, u64, Option<u64>) + Send + Sync>,
+    ) -> VerificationControlScope {
+        {
+            let mut state = self.0.lock().unwrap();
+            assert!(
+                state.control.is_none(),
+                "nested verification operation controls"
+            );
+            state.read_bytes = 0;
+            state.tape_file = None;
+            state.phase = VerificationPhase::Setup;
+            state.control = Some(VerificationControl { cancel, observer });
+        }
+        self.notify();
+        VerificationControlScope(self.clone())
+    }
+
+    /// Check immediately before each CDB, including commands inside raw adapters.
+    /// An in-flight READ has the longest timeout: 900 seconds (TapeIo).
+    pub fn check_cancelled(&self) -> Result<(), ScsiError> {
+        self.notify();
+        if self
+            .0
+            .lock()
+            .unwrap()
+            .control
+            .as_ref()
+            .is_some_and(|c| c.cancel.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            Err(ScsiError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn notify(&self) {
+        let state = self.0.lock().unwrap();
+        let update = state.control.as_ref().map(|c| {
+            (
+                c.observer.clone(),
+                state.phase,
+                state.read_bytes,
+                state.tape_file,
+            )
+        });
+        drop(state);
+        if let Some((observer, phase, bytes, tape_file)) = update {
+            observer(phase, bytes, tape_file);
+        }
+    }
+
     /// Enter a phase without issuing commands.
     pub fn phase(&self, phase: VerificationPhase) -> VerificationScope {
         let entered = Instant::now();
@@ -158,6 +230,8 @@ impl VerificationContext {
         state.account_phase(entered);
         let previous = state.phase;
         state.phase = phase;
+        drop(state);
+        self.notify();
         VerificationScope {
             context: self.clone(),
             previous: Some(previous),
@@ -207,6 +281,21 @@ impl VerificationContext {
             return;
         }
         let opcode = cdb[0];
+        // READ POSITION long form supplies the logical file identifier without
+        // another command. MPU means the mark position is unknown.
+        if matches!(opcode, 0x01 | 0x11 | 0x2b | 0x91 | 0x92) {
+            state.tape_file = None;
+        }
+        if opcode == 0x34 && cdb.get(1).is_some_and(|action| action & 0x1f == 6) {
+            state.tape_file = if matches!(result, Ok(outcome) if outcome.sense.is_none() && outcome.bytes_transferred >= 32)
+                && buf.len() >= 32
+                && buf[0] & 0x08 == 0
+            {
+                Some(u64::from_be_bytes(buf[16..24].try_into().unwrap()))
+            } else {
+                None
+            };
+        }
         let fixed = opcode == 8 && cdb[1] & 1 != 0;
         let requested = if opcode != 8 {
             0
@@ -234,6 +323,9 @@ impl VerificationContext {
             }) => u64::from(*bytes_transferred),
             _ => 0,
         };
+        if opcode == 8 {
+            state.read_bytes = state.read_bytes.saturating_add(bytes);
+        }
         let recovered = opcode == 8
             && !fixed
             && state.verification_depth > 0
@@ -334,6 +426,8 @@ impl Drop for VerificationScope {
         } else {
             state.verification_depth -= 1;
         }
+        // Restoring accounting scope does not enter a new algorithmic phase.
+        // The next phase entry or command publishes the actual work performed.
     }
 }
 /// A report collection lifetime. Dropping also disables collection on errors.
@@ -366,6 +460,8 @@ impl VerificationContext {
         {
             let mut state = context.0.lock().unwrap();
             assert!(state.report.is_none(), "nested verification collectors");
+            state.read_bytes = 0;
+            state.tape_file = None;
             state.report = Some(VerificationIo::default());
             state.phase = VerificationPhase::Setup;
             state.position = None;

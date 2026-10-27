@@ -304,6 +304,9 @@ fn format_residue_check_condition(source: &ScsiError, corrected: u32) -> String 
 /// clean (physical state is known).
 #[derive(Debug, Error)]
 pub enum TapeIoError {
+    /// Cooperative cancellation; no command dispatch and no medium damage.
+    #[error("tape verification cancelled")]
+    Cancelled,
     /// No command dispatched: the caller's proof belongs to an earlier medium state.
     #[error("tape identity invalidated: proved generation {proved}, current generation {current}; re-establish media proof before writing")]
     IdentityInvalidated {
@@ -563,6 +566,7 @@ impl TapeIoError {
 /// [`TapeIoError::UnexpectedStatus`], or [`TapeIoError::Transport`].
 pub(crate) fn map_scsi(err: ScsiError) -> TapeIoError {
     match err {
+        ScsiError::Cancelled => TapeIoError::Cancelled,
         #[cfg(target_os = "linux")]
         ScsiError::CheckCondition {
             ref sense,
@@ -2088,8 +2092,10 @@ impl super::DriveHandle {
         // This includes Transport and ordinary CheckCondition errors, which may
         // invalidate the cursor without invalidating mode. The shared dirty bit
         // is audit evidence, not an additional data-command guard.
-        !matches!(error, TapeIoError::StateInvalidatingReset(_))
-            && self.ensure_data_command_state_valid(false).is_ok()
+        !matches!(
+            error,
+            TapeIoError::StateInvalidatingReset(_) | TapeIoError::Cancelled
+        ) && self.ensure_data_command_state_valid(false).is_ok()
     }
 
     /// Issue fixed-mode READ(6) for a batch that is clamped to the

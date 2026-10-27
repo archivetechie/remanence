@@ -99,7 +99,10 @@ impl pb::daemon_server::Daemon for DaemonService {
             .get_operation(operation_id.as_str())
             .map_err(|err| Status::internal(err.to_string()))?
             .ok_or_else(|| Status::not_found("operation not found"))?;
-        Ok(Response::new(operation_to_proto(operation)?))
+        Ok(Response::new(overlay_operation(
+            &self.state,
+            operation_to_proto(operation)?,
+        )))
     }
 
     async fn list_operations(
@@ -115,16 +118,41 @@ impl pb::daemon_server::Daemon for DaemonService {
             .list_operations()
             .map_err(|err| Status::internal(err.to_string()))?
             .into_iter()
-            .filter(|record| {
+            .map(|record| {
+                let started = record.started_at_utc.clone();
+                let stored_state = record.state.clone();
+                let status = overlay_operation(&self.state, operation_to_proto(record)?);
+                let state = if status.state
+                    == crate::catalog_conversion::operation_state(&stored_state) as i32
+                {
+                    stored_state
+                } else {
+                    match pb::OperationState::try_from(status.state) {
+                        Ok(pb::OperationState::Queued) => "queued",
+                        Ok(pb::OperationState::Running) => "running",
+                        Ok(pb::OperationState::Succeeded) => "finished",
+                        Ok(pb::OperationState::Failed) => "failed",
+                        Ok(pb::OperationState::Cancelled) => "cancelled_before_dispatch",
+                        Ok(pb::OperationState::CompletionUnknown) => "completion_unknown",
+                        _ => "unspecified",
+                    }
+                    .to_owned()
+                };
+                Ok::<_, Status>((status, state, started))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let operations = operations
+            .into_iter()
+            .filter_map(|(status, state, started)| {
                 crate::operations::matches_filter(
-                    record.operation_kind.as_str(),
-                    record.state.as_str(),
-                    record.started_at_utc.as_str(),
+                    &status.operation_kind,
+                    &state,
+                    &started,
                     &request.filter,
                 )
+                .then_some(status)
             })
-            .map(operation_to_proto)
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect();
         Ok(Response::new(pb::ListOperationsResponse {
             operations,
             next_page_token: None,
@@ -297,14 +325,39 @@ impl pb::catalog_server::Catalog for CatalogService {
         Ok(Response::new(Box::pin(inventory)))
     }
 
+    async fn start_tape_verification(
+        &self,
+        request: Request<pb::StartTapeVerificationRequest>,
+    ) -> Result<Response<pb::OperationRef>, Status> {
+        let actor = authorize_request(&request, AuthPermission::ReadTape)?;
+        let tape_uuid = decode_uuid_bytes(&request.into_inner().tape_uuid, "tape_uuid")?;
+        let (operation, _) = crate::tape_verification::start(&self.state, actor, tape_uuid)?;
+        Ok(Response::new(operation))
+    }
+
+    async fn get_tape_verification(
+        &self,
+        request: Request<pb::GetOperationRequest>,
+    ) -> Result<Response<pb::TapeIndexVerification>, Status> {
+        authorize_request(&request, AuthPermission::ReadTape)?;
+        let id = Uuid::from_bytes(decode_uuid_bytes(
+            &request.into_inner().operation_id,
+            "operation_id",
+        )?);
+        Ok(Response::new(self.state.operations.verification(&id)?))
+    }
+
     async fn verify_tape_index(
         &self,
         request: Request<pb::VerifyTapeIndexRequest>,
     ) -> Result<Response<pb::TapeIndexVerification>, Status> {
-        authorize_request(&request, AuthPermission::ReadTape)?;
-        let tape_uuid = decode_uuid_bytes(request.into_inner().tape_uuid.as_slice(), "tape_uuid")?;
-        let verification = crate::mount::verify_tape_index(&self.state, tape_uuid).await?;
-        Ok(Response::new(verification))
+        let actor = authorize_request(&request, AuthPermission::ReadTape)?;
+        let tape_uuid = decode_uuid_bytes(&request.into_inner().tape_uuid, "tape_uuid")?;
+        let (_, result) = crate::tape_verification::start(&self.state, actor, tape_uuid)?;
+        let result = result
+            .await
+            .map_err(|_| Status::unavailable("verification task stopped"))??;
+        Ok(Response::new(result))
     }
 
     async fn list_tape_files(
@@ -391,6 +444,7 @@ impl pb::catalog_server::Catalog for CatalogService {
         let changer = pool.changer_tx(&library_serial)?;
         pool.reserve_library_exclusive(&library_serial)?;
         let operation_id = Uuid::new_v4();
+        pool.set_library_holder(&library_serial, "reconcile_tape", operation_id);
         if let Err(err) = self.state.record_request_received(
             actor,
             operation_id,
@@ -660,4 +714,24 @@ impl pb::catalog_server::Catalog for CatalogService {
         let foreign_formats = self.state.foreign_formats.clone();
         blocking_status(move || list_entries_for_unit(unit, &foreign_formats)).await
     }
+}
+
+/// Keep durable operation semantics while exposing process-local verification progress.
+fn overlay_operation(state: &ApiState, mut stored: pb::OperationStatus) -> pb::OperationStatus {
+    if stored.operation_kind != "tape_verification" {
+        return stored;
+    }
+    let live = Uuid::from_slice(&stored.operation_id)
+        .ok()
+        .and_then(|id| state.operations.latest(&id));
+    if let Some(live) = live {
+        stored.progress = live.progress.clone();
+        stored.created_at = live.created_at;
+        stored.updated_at = live.updated_at;
+        if crate::operations::is_terminal(&live) {
+            stored.state = live.state;
+            stored.error_summary = live.error_summary;
+        }
+    }
+    stored
 }

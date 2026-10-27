@@ -2102,11 +2102,11 @@ fn home_put_and_get_migrate_old_catalog_but_doctor_does_not() {
     assert_eq!(doctor["catalog_fence_check"]["ok"], false);
     assert_eq!(catalog_schema(&f, None), 19);
     f.ok(&["put", source.to_str().unwrap()]);
-    assert_eq!(catalog_schema(&f, None), 20);
+    assert_eq!(catalog_schema(&f, None), remanence_state::SCHEMA_VERSION);
     assert_eq!(catalog_schema(&f, Some(19)), 19);
     let dest = f.root.path().join("restored-migration");
     f.ok(&["get", "migrate.txt", "--out", dest.to_str().unwrap()]);
-    assert_eq!(catalog_schema(&f, None), 20);
+    assert_eq!(catalog_schema(&f, None), remanence_state::SCHEMA_VERSION);
     assert_eq!(
         std::fs::read(dest.join("migrate.txt")).unwrap(),
         b"migration payload"
@@ -3318,5 +3318,78 @@ fn explicit_endpoint_connection_error_has_no_setup_hint() {
         let error = String::from_utf8_lossy(&result.stderr);
         assert!(error.contains("connect daemon at"), "{error}");
         assert!(!error.contains("rem setup"), "{error}");
+    }
+}
+
+/// The public local rebuild command reconstructs tape-level verification from audit authority.
+#[test]
+fn rebuild_command_restores_tape_verification_record() {
+    use ciborium::value::Value;
+    use remanence_state::{
+        AuditActor, AuditEvent, AuditEventRecord, AuditSubject, FileAuditLog, SourceLayer,
+    };
+    let f = VersionFixture::with_parity(false);
+    let tape = f.index().get_tape_by_voltag("FIRST").unwrap().unwrap();
+    let text = std::fs::read_to_string(f.config())
+        .unwrap()
+        .replace("[journal]\n", "[journal]\nrequire_trusted_volume = false\n");
+    std::fs::write(f.config(), text).unwrap();
+    let config = remanence_state::load_config(f.config()).unwrap();
+    let record = FileAuditLog::open(&config.audit.dir, false)
+        .unwrap()
+        .append_and_return_record(AuditEventRecord {
+            actor: AuditActor::System,
+            source_layer: SourceLayer::Layer5,
+            operation_id: Some(uuid::Uuid::new_v4()),
+            session_id: None,
+            idempotency_key: None,
+            event: AuditEvent::OperationFinished,
+            subject: AuditSubject {
+                kind: "tape".into(),
+                id: Some(uuid::Uuid::from_slice(&tape.tape_uuid).unwrap().to_string()),
+            },
+            detail: std::collections::BTreeMap::from([
+                (
+                    "operation_kind".into(),
+                    Value::Text("tape_verification".into()),
+                ),
+                ("tape_uuid".into(), Value::Bytes(tape.tape_uuid.to_vec())),
+                ("verification_state".into(), Value::Integer(2.into())),
+                ("edition_digest".into(), Value::Bytes(vec![0x67; 32])),
+            ]),
+        })
+        .unwrap();
+    assert!(f
+        .index()
+        .get_tape(&tape.tape_uuid)
+        .unwrap()
+        .unwrap()
+        .last_verified_at_utc
+        .is_none());
+    for _ in 0..2 {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_rem"))
+            .env("REM_TEST_NO_LIVE_SCSI", "1")
+            .args([
+                "rebuild-catalog-from-journals",
+                "--config",
+                f.config().to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("rebuild-catalog-from-journals ok")
+        );
+        let rebuilt = f.index().get_tape(&tape.tape_uuid).unwrap().unwrap();
+        assert_eq!(
+            rebuilt.last_verified_at_utc.as_deref(),
+            Some(record.1.timestamp_utc.as_str())
+        );
+        assert_eq!(rebuilt.last_verification_state, Some(2));
+        assert_eq!(rebuilt.last_verified_edition_digest, Some(vec![0x67; 32]));
     }
 }

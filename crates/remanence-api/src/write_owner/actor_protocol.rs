@@ -118,6 +118,8 @@ pub(crate) enum DriveCommand {
         reply: oneshot::Sender<Result<(), Status>>,
     },
     VerifyTapeIndex {
+        handle: crate::operations::OperationHandle,
+        progress: crate::tape_verification::Progress,
         tape_uuid: [u8; 16],
         needs_drive_load: bool,
         library_serial: String,

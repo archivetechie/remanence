@@ -764,6 +764,18 @@ mod tests {
         ) -> Result<Response<Self::GetTapeInventoryStream>, Status> {
             Err(Status::unimplemented("not needed"))
         }
+        async fn start_tape_verification(
+            &self,
+            _: Request<pb::StartTapeVerificationRequest>,
+        ) -> Result<Response<pb::OperationRef>, Status> {
+            Err(Status::unimplemented("not needed"))
+        }
+        async fn get_tape_verification(
+            &self,
+            _: Request<pb::GetOperationRequest>,
+        ) -> Result<Response<pb::TapeIndexVerification>, Status> {
+            Err(Status::unimplemented("not needed"))
+        }
         async fn verify_tape_index(
             &self,
             _request: Request<pb::VerifyTapeIndexRequest>,

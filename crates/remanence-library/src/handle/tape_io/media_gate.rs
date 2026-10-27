@@ -429,6 +429,7 @@ impl MediaFencedTransport {
         buf: &mut [u8],
     ) -> Result<TransferOutcome, ScsiError> {
         let started = Instant::now();
+        self.verification.check_cancelled()?;
         let result = self.inner.execute_in(cdb, buf);
         self.verification
             .dispatch(cdb, buf, &result, started.elapsed());
@@ -454,6 +455,7 @@ impl MediaFencedTransport {
             ));
         }
         let started = Instant::now();
+        self.verification.check_cancelled()?;
         let result = self.inner.execute_none(cdb);
         self.verification
             .dispatch(cdb, &[], &Ok(TransferOutcome::clean(0)), started.elapsed());
@@ -561,6 +563,9 @@ impl MediaFencedTransport {
                 )?;
         }
 
+        self.verification
+            .check_cancelled()
+            .map_err(MediaDispatchError::Scsi)?;
         let result = match data_out {
             Some(buf) => {
                 let started = Instant::now();
@@ -631,6 +636,45 @@ impl fmt::Debug for MediaFencedTransport {
 mod tests {
     use super::*;
     use crate::transport::FixtureTransport;
+
+    /// Once cancellation is requested, no dispatch direction reaches the transport.
+    #[test]
+    fn verification_cancel_stops_every_dispatch_direction() {
+        use crate::transport::RecordingTransport;
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let fixture = FixtureTransport::new().with_responses([vec![0; 32]]);
+        let (inner, log) = RecordingTransport::new(fixture);
+        let mut transport = MediaFencedTransport::new(Box::new(inner));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let control = transport
+            .verification
+            .control(cancel.clone(), Arc::new(|_, _, _| {}));
+        transport
+            .execute_none_nonmedia(&[0x01, 0, 0, 0, 0, 0])
+            .unwrap();
+        cancel.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            transport.execute_none_nonmedia(&[0x01, 0, 0, 0, 0, 0]),
+            Err(ScsiError::Cancelled)
+        ));
+        assert!(matches!(
+            transport.execute_in(&[0x34, 6, 0, 0, 0, 0, 0, 0, 0, 0], &mut [0; 32]),
+            Err(ScsiError::Cancelled)
+        ));
+        assert!(matches!(
+            transport.dispatch_media_out(&[0x15, 0, 0, 0, 0, 0], &[0; 4]),
+            Err(MediaDispatchError::Scsi(ScsiError::Cancelled))
+        ));
+        assert_eq!(log.borrow().len(), 1);
+        drop(control);
+        transport
+            .execute_none_nonmedia(&[0x01, 0, 0, 0, 0, 0])
+            .unwrap();
+        assert_eq!(log.borrow().len(), 2);
+    }
 
     fn fenced_fixture() -> (MediaFencedTransport, InMemoryCalibrationControl) {
         let control = InMemoryCalibrationControl::new();

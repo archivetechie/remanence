@@ -121,6 +121,9 @@ pub struct BotStructuralRecoverySummary {
 /// Failure of the explicit BOT structural recovery path.
 #[derive(Debug, thiserror::Error)]
 pub enum BotStructuralRecoveryError {
+    /// Cooperative cancellation before the next physical command.
+    #[error("tape verification cancelled")]
+    Cancelled,
     /// Physical scan failed and no recovery inventory can be claimed.
     #[error("BOT structural scan failed: {message}")]
     Scan {
@@ -350,6 +353,9 @@ where
         |progress| visit_control(&BotStructuralRecoveryEvent::Progress(*progress)),
     )
     .map_err(|error| match error {
+        ParityError::TapeIo(remanence_library::TapeIoError::Cancelled) => {
+            BotStructuralRecoveryError::Cancelled
+        }
         ParityError::BootstrapRefused {
             field: BootstrapRefusedField::TapeUuid,
             ..
@@ -789,6 +795,12 @@ fn bot_bootstrap_source_error(
     operation: &'static str,
     error: ParityError,
 ) -> BotStructuralRecoveryError {
+    if matches!(
+        error,
+        ParityError::TapeIo(remanence_library::TapeIoError::Cancelled)
+    ) {
+        return BotStructuralRecoveryError::Cancelled;
+    }
     BotStructuralRecoveryError::Scan {
         message: format!("{operation}: {error}"),
     }

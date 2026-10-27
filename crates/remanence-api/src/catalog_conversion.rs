@@ -213,6 +213,12 @@ pub(crate) fn operation_state(value: &str) -> pb::OperationState {
 
 pub(crate) fn tape_to_proto(record: TapeRecord) -> pb::Tape {
     pb::Tape {
+        last_verified_at: record
+            .last_verified_at_utc
+            .as_deref()
+            .and_then(timestamp_from_rfc3339),
+        last_verification_state: record.last_verification_state,
+        last_verified_edition_digest: record.last_verified_edition_digest,
         tape_uuid: record.tape_uuid,
         // The record already carries all of these as Option, from nullable
         // columns. The line below for written_extent_lba was the only one that

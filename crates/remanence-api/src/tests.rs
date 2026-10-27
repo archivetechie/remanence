@@ -2954,6 +2954,9 @@ fn no_parity_bootstrap_block(tape_uuid: [u8; 16]) -> Vec<u8> {
 
 fn writable_tape_record() -> TapeRecord {
     TapeRecord {
+        last_verified_at_utc: None,
+        last_verification_state: None,
+        last_verified_edition_digest: None,
         tape_uuid: POOL_WRITE_TAPE_UUID.to_vec(),
         voltag: Some("RMN001L9".to_string()),
         voltag_source: Some(remanence_state::LabelProvenance::Changer),
@@ -7487,12 +7490,20 @@ fn drive_pool_exclusive_guard_drop_releases_all_bays() {
     );
 
     pool.reserve_all_exclusive().expect("reserve all");
+    let holder = Uuid::new_v4();
+    pool.set_library_holder("LIB001", "reconcile_tape", holder);
+    assert!(pool.busy_error().message().contains(&holder.to_string()));
     assert_eq!(
         pool.reserve_free_drive("LIB001")
             .expect_err("exclusive reservation holds all bays")
             .code(),
         tonic::Code::FailedPrecondition
     );
+    drop(crate::write_owner::ExclusiveGuard::from_reserved(
+        reservations.clone(),
+    ));
+    pool.reserve_all_exclusive().expect("reserve all again");
+    assert!(!pool.busy_error().message().contains(&holder.to_string()));
     drop(crate::write_owner::ExclusiveGuard::from_reserved(
         reservations.clone(),
     ));
@@ -7503,6 +7514,7 @@ fn drive_pool_exclusive_guard_drop_releases_all_bays() {
             .unwrap(),
         0x0101
     );
+    assert!(!pool.busy_error().message().contains(&holder.to_string()));
 }
 
 #[test]
@@ -9069,5 +9081,127 @@ async fn append_rejects_invalid_mtime_before_io() {
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
         assert!(error.message().contains("mtime"));
+    }
+}
+
+/// Registered reconcile operations retain their durable response bytes and filter semantics.
+#[tokio::test]
+async fn reconcile_operation_get_and_list_preserve_stored_status() {
+    use pb::daemon_server::Daemon;
+    use prost::Message;
+    let mut index = test_index();
+    let id = Uuid::new_v4();
+    index
+        .project_audit_record(&audit_record(
+            1,
+            AuditEvent::OperationStarted,
+            id,
+            None,
+            detail(&[("operation_kind", CborValue::Text("reconcile_tape".into()))]),
+        ))
+        .unwrap();
+    let expected = crate::catalog_conversion::operation_to_proto(
+        index.get_operation(&id.to_string()).unwrap().unwrap(),
+    )
+    .unwrap();
+    let state = ApiState::new(index);
+    let handle = state.operations.register(id, "reconcile_tape");
+    assert!(expected.progress.is_empty());
+    let service = state.daemon_service();
+    for failed in [false, true] {
+        if failed {
+            handle.publish_failed(
+                "live state must not replace durable state",
+                &[("phase", "project"), ("tape_files", "3")],
+            );
+        } else {
+            handle.publish_state(pb::OperationState::Running, &[("phase", "scan")]);
+        }
+        assert!(!state.operations.latest(&id).unwrap().progress.is_empty());
+        let fetched = service
+            .get_operation(Request::new(pb::GetOperationRequest {
+                operation_id: id.as_bytes().to_vec(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(fetched.encode_to_vec(), expected.encode_to_vec());
+        let listed = service
+            .list_operations(Request::new(pb::ListOperationsRequest {
+                filter: HashMap::from([("state".into(), "running".into())]),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            listed.encode_to_vec(),
+            pb::ListOperationsResponse {
+                operations: vec![expected.clone()],
+                next_page_token: None
+            }
+            .encode_to_vec()
+        );
+    }
+}
+
+/// Verification progress retains registration time, and filters use the returned terminal state.
+#[tokio::test]
+async fn verification_operation_progress_timestamps_and_terminal_filters() {
+    use pb::daemon_server::Daemon;
+    let mut index = test_index();
+    let id = Uuid::new_v4();
+    index
+        .project_audit_record(&audit_record(
+            1,
+            AuditEvent::OperationStarted,
+            id,
+            None,
+            detail(&[(
+                "operation_kind",
+                CborValue::Text("tape_verification".into()),
+            )]),
+        ))
+        .unwrap();
+    let state = ApiState::new(index);
+    let handle = state.operations.register(id, "tape_verification");
+    let service = state.daemon_service();
+    let mut created = None;
+    for phase in ["setup", "walk", "protected_data"] {
+        handle.publish_state(pb::OperationState::Running, &[("phase", phase)]);
+        let status = service
+            .get_operation(Request::new(pb::GetOperationRequest {
+                operation_id: id.as_bytes().to_vec(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(status.progress["phase"], phase);
+        assert_eq!(*created.get_or_insert(status.created_at), status.created_at);
+        assert_eq!(
+            status.updated_at,
+            state.operations.latest(&id).unwrap().updated_at
+        );
+        let listed = service
+            .list_operations(Request::new(pb::ListOperationsRequest::default()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(listed.operations, vec![status]);
+    }
+    handle.publish_state(pb::OperationState::Cancelled, &[]);
+    for (filter, expected) in [("running", 0), ("cancelled", 1)] {
+        let listed = service
+            .list_operations(Request::new(pb::ListOperationsRequest {
+                filter: HashMap::from([("state".into(), filter.into())]),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(listed.operations.len(), expected);
+        for status in listed.operations {
+            assert_eq!(status.state, pb::OperationState::Cancelled as i32);
+        }
     }
 }

@@ -1506,6 +1506,14 @@ pub(super) fn handle_drive_open_write(
     } = request;
     let actor_open_started = Instant::now();
     let session_id = Uuid::new_v4();
+    if let Some(lifecycle) = &cfg.lifecycle {
+        lifecycle.set_holder(
+            &crate::drive_pool::DriveKey::new(&library_serial, bay),
+            drive_serial.as_deref(),
+            "write session",
+            session_id,
+        );
+    }
     let tape_uuid = selected.tape_uuid;
     if let Err(status) = session_open_reject_tape_io_fences(
         index,

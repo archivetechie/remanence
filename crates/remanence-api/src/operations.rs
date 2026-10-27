@@ -27,9 +27,11 @@ pub(crate) type OperationStatusStream =
     Pin<Box<dyn Stream<Item = Result<pb::OperationStatus, Status>> + Send + 'static>>;
 
 struct OpEntry {
+    created_at: prost_types::Timestamp,
     ring: VecDeque<pb::OperationStatus>,
     tx: broadcast::Sender<pb::OperationStatus>,
     cancel: Arc<AtomicBool>,
+    verification: Option<pb::TapeIndexVerification>,
 }
 
 #[derive(Clone, Default)]
@@ -60,6 +62,8 @@ impl OperationRegistry {
         ops.insert(
             op_id,
             OpEntry {
+                created_at: timestamp_now(),
+                verification: None,
                 ring: VecDeque::new(),
                 tx: tx.clone(),
                 cancel: cancel.clone(),
@@ -72,6 +76,24 @@ impl OperationRegistry {
             cancel,
             ops: self.ops.clone(),
         }
+    }
+
+    pub(crate) fn latest(&self, id: &Uuid) -> Option<pb::OperationStatus> {
+        self.ops
+            .lock()
+            .expect("ops lock")
+            .get(id)
+            .and_then(|entry| entry.ring.back().cloned())
+    }
+
+    pub(crate) fn verification(&self, id: &Uuid) -> Result<pb::TapeIndexVerification, Status> {
+        let ops = self.ops.lock().expect("ops lock");
+        let entry = ops
+            .get(id)
+            .ok_or_else(|| Status::not_found("operation not found"))?;
+        entry.verification.clone().ok_or_else(|| {
+            Status::failed_precondition("operation has no completed tape verification verdict")
+        })
     }
 
     pub(crate) fn request_cancel(&self, op_id: &Uuid) -> Result<pb::OperationState, Status> {
@@ -108,6 +130,34 @@ impl OperationRegistry {
 }
 
 impl OperationHandle {
+    pub(crate) fn cancel_flag(&self) -> Arc<AtomicBool> {
+        self.cancel.clone()
+    }
+
+    pub(crate) fn complete_verification(&self, result: pb::TapeIndexVerification) {
+        let mut ops = self.ops.lock().expect("ops lock");
+        if let Some(entry) = ops.get_mut(&self.op_id) {
+            entry.verification = Some(result);
+            let mut terminal = entry.ring.back().cloned().unwrap_or_else(|| {
+                status(
+                    self.op_id,
+                    &self.operation_kind,
+                    pb::OperationState::Running,
+                    &[],
+                )
+            });
+            terminal.state = pb::OperationState::Succeeded as i32;
+            terminal.updated_at = status(
+                self.op_id,
+                &self.operation_kind,
+                pb::OperationState::Succeeded,
+                &[],
+            )
+            .updated_at;
+            push_locked(entry, terminal);
+        }
+    }
+
     pub(crate) fn op_id_uuid(&self) -> Uuid {
         self.op_id
     }
@@ -223,7 +273,8 @@ fn build_watch_stream(
     Box::pin(ReceiverStream::new(out_rx))
 }
 
-fn push_locked(entry: &mut OpEntry, status: pb::OperationStatus) {
+fn push_locked(entry: &mut OpEntry, mut status: pb::OperationStatus) {
+    status.created_at = Some(entry.created_at);
     if entry.ring.len() >= RING_CAP {
         entry.ring.pop_front();
     }
@@ -316,6 +367,25 @@ fn is_terminal_state(state: pb::OperationState) -> bool {
 mod tests {
     use super::*;
 
+    /// Every live publish retains the timestamp captured at registration.
+    #[test]
+    fn creation_time_survives_progress_and_completion() {
+        let registry = OperationRegistry::default();
+        let id = Uuid::new_v4();
+        let handle = registry.register(id, "tape_verification");
+        let created = registry.ops.lock().unwrap()[&id].created_at;
+        handle.publish_state(pb::OperationState::Running, &[("phase", "walk")]);
+        let first = registry.latest(&id).unwrap();
+        handle.publish_state(pb::OperationState::Running, &[("phase", "protected_data")]);
+        handle.complete_verification(pb::TapeIndexVerification::default());
+        let last = registry.latest(&id).unwrap();
+        assert_eq!(first.created_at, Some(created));
+        assert_eq!(last.created_at, first.created_at);
+        let last = last.updated_at.unwrap();
+        let first = first.updated_at.unwrap();
+        assert!((last.seconds, last.nanos) >= (first.seconds, first.nanos));
+    }
+
     #[tokio::test]
     async fn registry_publishes_replays_and_cancels() {
         let reg = OperationRegistry::default();
@@ -347,6 +417,41 @@ mod tests {
         assert!(!h2.is_cancelled());
         reg.request_cancel(&id2).unwrap();
         assert!(h2.is_cancelled());
+    }
+
+    /// Verdict ownership follows registry retention, including wrong-kind and unfinished ids.
+    #[tokio::test]
+    async fn verification_verdict_retention_and_pruning() {
+        let registry = OperationRegistry::default();
+        let id = Uuid::from_u128(0);
+        let handle = registry.register(id, "tape_verification");
+        handle.publish_state(pb::OperationState::Running, &[]);
+        assert_eq!(
+            registry.verification(&id).unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+        let verdict = pb::TapeIndexVerification {
+            state: pb::TapeIndexVerificationState::VerifiedComplete as i32,
+            ..Default::default()
+        };
+        handle.complete_verification(verdict.clone());
+        assert_eq!(registry.verification(&id).unwrap(), verdict);
+        for raw in 1..=MAX_RETAINED_OPS {
+            registry
+                .register(Uuid::from_u128(raw as u128), "other")
+                .publish_state(pb::OperationState::Running, &[]);
+        }
+        assert_eq!(
+            registry.verification(&id).unwrap_err().code(),
+            tonic::Code::NotFound
+        );
+        assert_eq!(
+            registry
+                .verification(&Uuid::from_u128(1))
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
     }
 
     #[tokio::test]

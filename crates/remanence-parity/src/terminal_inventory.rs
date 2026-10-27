@@ -190,6 +190,9 @@ pub enum TerminalInventoryOutcome {
 /// Physical positioning or post-selection streaming failure.
 #[derive(Debug, thiserror::Error)]
 pub enum TerminalInventoryReadError {
+    /// Cooperative cancellation before the next physical command.
+    #[error("tape verification cancelled")]
+    Cancelled,
     /// The supplied fixed-block profile is unsupported.
     #[error("terminal inventory block-size validation failed: {0}")]
     BlockSize(#[from] crate::terminal_tail::TerminalTailLayoutError),
@@ -347,6 +350,9 @@ impl TerminalIndexVerificationOutcome {
 /// Typed reason a full physical terminal-index verification failed.
 #[derive(Debug, thiserror::Error)]
 pub enum TerminalIndexVerificationError {
+    /// Cooperative cancellation before the next physical command.
+    #[error("tape verification cancelled")]
+    Cancelled,
     /// The supplied fixed-block profile is unsupported.
     #[error("terminal index verification block-size validation failed: {0}")]
     BlockSize(#[from] crate::terminal_tail::TerminalTailLayoutError),
@@ -1449,6 +1455,9 @@ fn scan_verification_prefix(
         Ok(crate::scan::ControlledScanWalkOutcome::Aborted(_)) => {
             unreachable!("an unconditional scan controller cannot abort")
         }
+        Err(ParityError::TapeIo(remanence_library::TapeIoError::Cancelled)) => {
+            Err(TerminalIndexVerificationError::Cancelled)
+        }
         Err(error) => Err(attach_prefix_findings(
             TerminalIndexVerificationError::PrefixWalk {
                 message: error.to_string(),
@@ -1486,7 +1495,8 @@ fn attach_prefix_findings(
                 message.push_str(&finding);
             }
         }
-        _ => unreachable!("protected pass returns only source or prefix-walk errors"),
+        TerminalIndexVerificationError::Cancelled => {}
+        _ => unreachable!("protected pass returns only cancellation, source or prefix-walk errors"),
     }
     error
 }
@@ -1607,6 +1617,7 @@ fn bot_recovery_verification_error(
     error: BotStructuralRecoveryError,
 ) -> TerminalIndexVerificationError {
     match error {
+        BotStructuralRecoveryError::Cancelled => TerminalIndexVerificationError::Cancelled,
         BotStructuralRecoveryError::Scan { message } => {
             TerminalIndexVerificationError::PrefixWalk { message }
         }
@@ -2554,6 +2565,12 @@ fn member_error_to_separation(
 }
 
 fn source_error(operation: &'static str, error: ParityError) -> TerminalInventoryReadError {
+    if matches!(
+        error,
+        ParityError::TapeIo(remanence_library::TapeIoError::Cancelled)
+    ) {
+        return TerminalInventoryReadError::Cancelled;
+    }
     TerminalInventoryReadError::Source {
         operation,
         message: error.to_string(),
@@ -2564,6 +2581,12 @@ fn verification_source_error(
     operation: &'static str,
     error: ParityError,
 ) -> TerminalIndexVerificationError {
+    if matches!(
+        error,
+        ParityError::TapeIo(remanence_library::TapeIoError::Cancelled)
+    ) {
+        return TerminalIndexVerificationError::Cancelled;
+    }
     TerminalIndexVerificationError::Source {
         operation,
         message: error.to_string(),
@@ -2574,6 +2597,7 @@ fn inventory_error_to_verification(
     error: TerminalInventoryReadError,
 ) -> TerminalIndexVerificationError {
     match error {
+        TerminalInventoryReadError::Cancelled => TerminalIndexVerificationError::Cancelled,
         TerminalInventoryReadError::BlockSize(error) => {
             TerminalIndexVerificationError::BlockSize(error)
         }

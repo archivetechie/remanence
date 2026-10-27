@@ -23,6 +23,7 @@ enum Record {
 
 #[derive(Clone)]
 struct Tape {
+    context: remanence_library::verification_io::VerificationContext,
     records: Vec<Record>,
     cursor: usize,
     configured: bool,
@@ -35,6 +36,9 @@ struct Tape {
     configurations: usize,
 }
 impl RawTapeSource for Tape {
+    fn verification_context(&self) -> remanence_library::verification_io::VerificationContext {
+        self.context.clone()
+    }
     fn configure_fixed_block_size(&mut self, size: u32) -> Result<(), ParityError> {
         assert_eq!(size, SIZE);
         self.configured = true;
@@ -257,6 +261,7 @@ fn fixture_with_stripes(files: &[File], stripes: u32) -> (ScopedFilemarkMap, Par
         ScopedFilemarkMap::from_catalog(FilemarkMap::new(entries).unwrap(), data_count),
         scheme,
         Tape {
+            context: Default::default(),
             records,
             cursor: 0,
             configured: false,
@@ -955,4 +960,45 @@ fn acquired_geometry_outside_buffered_shards_uses_positioned_reads() {
         let end = start + entry.block_count;
         assert!(forward.reads.iter().all(|&p| p < end));
     }
+}
+
+/// Cancelling the forward protected pass aborts before its next source command.
+#[test]
+fn cancelled_protected_pass_has_no_verdict_and_can_restart() {
+    use remanence_library::verification_io::VerificationPhase;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let (map, scheme, tape) = fixture(&[File::Object(4), File::Sidecar(0)]);
+    let context = tape.context.clone();
+    let flag = Arc::new(AtomicBool::new(false));
+    let token = flag.clone();
+    let control = context.control(
+        flag.clone(),
+        Arc::new(move |phase, _, _| {
+            if phase == VerificationPhase::ProtectedData {
+                token.store(true, Ordering::SeqCst);
+            }
+        }),
+    );
+    let mut source = crate::raw::CancellableRawSource(tape);
+    let error = verify_protected_content(&mut source, &map, &scheme, &UUID, SIZE).unwrap_err();
+    assert!(flag.load(Ordering::SeqCst));
+    assert!(matches!(
+        error,
+        ParityError::TapeIo(remanence_library::TapeIoError::Cancelled)
+    ));
+    assert!(!crate::raw::tape_error_is_current_medium_damage(
+        &remanence_library::TapeIoError::Cancelled
+    ));
+    let commands = source.0.reads.len() + source.0.locates.len();
+    assert!(source.position().is_err());
+    assert_eq!(source.0.reads.len() + source.0.locates.len(), commands);
+    drop(control);
+    assert!(
+        verify_protected_content(&mut source, &map, &scheme, &UUID, SIZE)
+            .unwrap()
+            .is_clean()
+    );
 }
