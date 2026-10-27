@@ -859,6 +859,24 @@ fn reconcile_walk_sidecars(
     let Some(parity_map) = read_final_parity_map(source, map, tape_uuid, block_size)? else {
         return Ok(None);
     };
+    let Some(reconciled) = reconcile_measured_sidecars(map, &parity_map)? else {
+        return Ok(Some(parity_map));
+    };
+    match ScopedFilemarkMap::validate_against_final_parity_map(reconciled, &parity_map) {
+        Ok(confirmed) => *map = confirmed.map,
+        Err(ParityError::FilemarkMapDigestMismatch { .. }) => {}
+        Err(error) => return Err(error),
+    }
+    Ok(Some(parity_map))
+}
+
+/// Propose directory identifications from measured file numbers and lengths.
+/// A scope that does not end at the last classified ParityMap has no proposal.
+/// The caller must validate the complete proposal before accepting any change.
+pub(crate) fn reconcile_measured_sidecars(
+    map: &FilemarkMap,
+    parity_map: &DecodedParityMapTapeFile,
+) -> Result<Option<FilemarkMap>, ParityError> {
     let directory = &parity_map.payload.directory;
     if !map
         .entries()
@@ -869,7 +887,7 @@ fn reconcile_walk_sidecars(
             entry.tape_file_number.checked_add(1) == Some(directory.directory_scope_tape_file_count)
         })
     {
-        return Ok(Some(parity_map));
+        return Ok(None);
     }
     let mut entries = map.entries().to_vec();
     for entry in &directory.entries {
@@ -900,13 +918,7 @@ fn reconcile_walk_sidecars(
                 .ok_or_else(|| filemark_scan_error("reconciled Object ordinals overflow"))?;
         }
     }
-    let reconciled = FilemarkMap::new(entries)?;
-    match ScopedFilemarkMap::validate_against_final_parity_map(reconciled, &parity_map) {
-        Ok(confirmed) => *map = confirmed.map,
-        Err(ParityError::FilemarkMapDigestMismatch { .. }) => {}
-        Err(error) => return Err(error),
-    }
-    Ok(Some(parity_map))
+    Ok(Some(FilemarkMap::new(entries)?))
 }
 
 #[derive(Debug)]
@@ -1296,95 +1308,160 @@ fn append_classified_entry(
     block_count: u64,
     damaged_regions: &mut Vec<ScanDamagedRegion>,
 ) -> Result<Option<ScanBootstrapCandidate>, ParityError> {
-    // REM-PARITY 12.3: a count mismatch at a classification rung abandons that
-    // rung for this tape file only. It MUST NOT abort the walk — the catalog-less
-    // reader needs the rest of the map for bootstrap digest validation.
-    let note_count_mismatch = |damaged_regions: &mut Vec<ScanDamagedRegion>| {
-        damaged_regions.push(ScanDamagedRegion {
-            start: file_start,
-            block_count,
-            kind: ScanDamageKind::ClassificationCountMismatch,
-        });
-    };
-    let has_magic = |magic: [u8; 8]| block0.get(..8).is_some_and(|prefix| prefix == magic);
-    if has_magic(derive_tape_index_replica_header_magic(tape_uuid)) {
-        let valid_count = parse_tape_index_replica_header(block0, tape_uuid)
-            .is_ok_and(|header| header.plan.component.record_count == block_count);
-        if !valid_count {
+    append_classified_file(
+        &mut PositionedClassificationSource { source },
+        builder,
+        Some(block0),
+        tape_uuid,
+        block_size,
+        file_start,
+        block_count,
+        damaged_regions,
+    )
+}
+
+fn append_entry_with_unreadable_head(
+    source: &mut dyn RawTapeSource,
+    builder: &mut FilemarkMapBuilder,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    file_start: PhysicalPositionHint,
+    block_count: u64,
+    damaged_regions: &mut Vec<ScanDamagedRegion>,
+) -> Result<bool, ParityError> {
+    append_classified_file(
+        &mut PositionedClassificationSource { source },
+        builder,
+        None,
+        tape_uuid,
+        block_size,
+        file_start,
+        block_count,
+        damaged_regions,
+    )?;
+    Ok(builder
+        .entries()
+        .last()
+        .is_some_and(|entry| entry.kind == TapeFileKind::Object))
+}
+
+/// Classify one measured file using its head and only the blocks named by the ladder.
+/// `None` denotes a head with no usable whole block. All borrows end with this call.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_classified_file(
+    source: &mut dyn ClassificationBlockSource,
+    builder: &mut FilemarkMapBuilder,
+    head: Option<&[u8]>,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    file_start: PhysicalPositionHint,
+    block_count: u64,
+    damaged_regions: &mut Vec<ScanDamagedRegion>,
+) -> Result<Option<ScanBootstrapCandidate>, ParityError> {
+    if let Some(block0) = head {
+        // REM-PARITY 12.3: a count mismatch at a classification rung abandons that
+        // rung for this tape file only. It MUST NOT abort the walk — the catalog-less
+        // reader needs the rest of the map for bootstrap digest validation.
+        let note_count_mismatch = |damaged_regions: &mut Vec<ScanDamagedRegion>| {
             damaged_regions.push(ScanDamagedRegion {
                 start: file_start,
                 block_count,
-                kind: ScanDamageKind::InvalidTerminalControl,
+                kind: ScanDamageKind::ClassificationCountMismatch,
             });
+        };
+        let has_magic = |magic: [u8; 8]| block0.get(..8).is_some_and(|prefix| prefix == magic);
+        if has_magic(derive_tape_index_replica_header_magic(tape_uuid)) {
+            let valid_count = parse_tape_index_replica_header(block0, tape_uuid)
+                .is_ok_and(|header| header.plan.component.record_count == block_count);
+            if !valid_count {
+                damaged_regions.push(ScanDamagedRegion {
+                    start: file_start,
+                    block_count,
+                    kind: ScanDamageKind::InvalidTerminalControl,
+                });
+            }
+            builder.push_tape_index_replica(block_count)?;
+            return Ok(None);
         }
-        builder.push_tape_index_replica(block_count)?;
-        return Ok(None);
-    }
-    if has_magic(derive_index_separation_header_magic(tape_uuid)) {
-        let valid_count = parse_index_separation_header(block0, tape_uuid)
-            .is_ok_and(|header| header.plan.component.record_count == block_count);
-        if !valid_count {
-            damaged_regions.push(ScanDamagedRegion {
-                start: file_start,
-                block_count,
-                kind: ScanDamageKind::InvalidTerminalControl,
-            });
+        if has_magic(derive_index_separation_header_magic(tape_uuid)) {
+            let valid_count = parse_index_separation_header(block0, tape_uuid)
+                .is_ok_and(|header| header.plan.component.record_count == block_count);
+            if !valid_count {
+                damaged_regions.push(ScanDamagedRegion {
+                    start: file_start,
+                    block_count,
+                    kind: ScanDamageKind::InvalidTerminalControl,
+                });
+            }
+            builder.push_index_separation_extent(block_count)?;
+            return Ok(None);
         }
-        builder.push_index_separation_extent(block_count)?;
-        return Ok(None);
-    }
-    if builder.next_tape_file_number()? == 0 && file_start.lba == 0 && has_bootstrap_magic(block0) {
-        match crate::bootstrap::parse_bootstrap_block_with_fill(block0) {
-            Ok((payload, nonzero_fill)) => {
-                if payload.block_size_bytes == block_size && payload.tape_uuid == *tape_uuid {
-                    if block_count != 1 {
-                        note_count_mismatch(damaged_regions);
-                        builder.push_object(block_count)?;
-                        return Ok(None);
+        if builder.next_tape_file_number()? == 0
+            && file_start.lba == 0
+            && has_bootstrap_magic(block0)
+        {
+            match crate::bootstrap::parse_bootstrap_block_with_fill(block0) {
+                Ok((payload, nonzero_fill)) => {
+                    if payload.block_size_bytes == block_size && payload.tape_uuid == *tape_uuid {
+                        if block_count != 1 {
+                            note_count_mismatch(damaged_regions);
+                            builder.push_object(block_count)?;
+                            return Ok(None);
+                        }
+                        let tape_file_number = builder.next_tape_file_number()?;
+                        builder.push_bootstrap()?;
+                        return Ok(Some(ScanBootstrapCandidate {
+                            tape_file_number,
+                            payload,
+                            nonzero_fill,
+                        }));
                     }
-                    let tape_file_number = builder.next_tape_file_number()?;
-                    builder.push_bootstrap()?;
-                    return Ok(Some(ScanBootstrapCandidate {
-                        tape_file_number,
-                        payload,
-                        nonzero_fill,
-                    }));
                 }
+                Err(error @ ParityError::DriveCompressionEnabled { .. }) => {
+                    return Err(error);
+                }
+                Err(_) => {}
             }
-            Err(error @ ParityError::DriveCompressionEnabled { .. }) => {
-                return Err(error);
-            }
-            Err(_) => {}
         }
-    }
 
-    if let Ok(Some(header)) = classify_parity_map_header_block(block0, tape_uuid) {
-        let expected = header.parity_map_total_block_count;
-        if block_count != expected {
-            note_count_mismatch(damaged_regions);
-            builder.push_object(block_count)?;
+        if let Ok(Some(header)) = classify_parity_map_header_block(block0, tape_uuid) {
+            let expected = header.parity_map_total_block_count;
+            if block_count != expected {
+                note_count_mismatch(damaged_regions);
+                builder.push_object(block_count)?;
+                return Ok(None);
+            }
+            builder.push_parity_map(block_count)?;
             return Ok(None);
         }
-        builder.push_parity_map(block_count)?;
-        return Ok(None);
-    }
 
-    if let Ok(Some(header)) = classify_sidecar_header_block(block0, tape_uuid) {
-        let expected = header.sidecar_total_block_count;
-        if block_count != expected {
-            note_count_mismatch(damaged_regions);
-            builder.push_object(block_count)?;
+        if let Ok(Some(header)) = classify_sidecar_header_block(block0, tape_uuid) {
+            let expected = header.sidecar_total_block_count;
+            if block_count != expected {
+                note_count_mismatch(damaged_regions);
+                builder.push_object(block_count)?;
+                return Ok(None);
+            }
+            builder.push_parity_sidecar(
+                block_count,
+                header.epoch_id,
+                header.protected_ordinal_start,
+                header.protected_ordinal_end_exclusive,
+            )?;
             return Ok(None);
         }
-        builder.push_parity_sidecar(
-            block_count,
-            header.epoch_id,
-            header.protected_ordinal_start,
-            header.protected_ordinal_end_exclusive,
-        )?;
+    } else if builder.next_tape_file_number()? == 0 && file_start.lba == 0 {
+        if block_count != 1 {
+            return Err(filemark_scan_error(format!(
+                "unreadable BOT tape file has {block_count} blocks; schema-major 2 requires one Bootstrap block"
+            )));
+        }
+        // The caller supplied the expected tape UUID and fixed block size.
+        // Those inputs safely classify the unreadable one-block physical BOT
+        // as the required structural Bootstrap; they do not authenticate it.
+        builder.push_bootstrap()?;
         return Ok(None);
     }
-
     // §12.3 shares this last-block read between items 2/3, 4 and 6,
     // including an unreadable result: do not retry a medium error per probe.
     let footer_block =
@@ -1444,91 +1521,12 @@ fn append_classified_entry(
     Ok(None)
 }
 
-fn append_entry_with_unreadable_head(
-    source: &mut dyn RawTapeSource,
-    builder: &mut FilemarkMapBuilder,
-    tape_uuid: &[u8; 16],
-    block_size: u32,
-    file_start: PhysicalPositionHint,
-    block_count: u64,
-    damaged_regions: &mut Vec<ScanDamagedRegion>,
-) -> Result<bool, ParityError> {
-    if builder.next_tape_file_number()? == 0 && file_start.lba == 0 {
-        if block_count != 1 {
-            return Err(filemark_scan_error(format!(
-                "unreadable BOT tape file has {block_count} blocks; schema-major 2 requires one Bootstrap block"
-            )));
-        }
-        // The caller supplied the expected tape UUID and fixed block size.
-        // Those inputs safely classify the unreadable one-block physical BOT
-        // as the required structural Bootstrap; they do not authenticate it.
-        builder.push_bootstrap()?;
-        return Ok(false);
-    }
-    // §12.3 shares this last-block read between items 2/3, 4 and 6,
-    // including an unreadable result: do not retry a medium error per probe.
-    let footer_block =
-        read_optional_fixed_block_at(source, file_start, block_count - 1, block_size)?;
-    if builder.next_tape_file_number()? != 0
-        && classify_parity_map_from_footer_tail(
-            footer_block.as_deref(),
-            source,
-            file_start,
-            tape_uuid,
-            block_size,
-            block_count,
-            damaged_regions,
-        )?
-    {
-        builder.push_parity_map(block_count)?;
-        return Ok(false);
-    }
-
-    if let Some(kind) = classify_terminal_from_footer_tail(
-        footer_block.as_deref(),
-        file_start,
-        tape_uuid,
-        block_count,
-        damaged_regions,
-    )? {
-        match kind {
-            TerminalControlScanClassification::Replica => {
-                builder.push_tape_index_replica(block_count)?;
-            }
-            TerminalControlScanClassification::Separation => {
-                builder.push_index_separation_extent(block_count)?;
-            }
-        }
-        return Ok(false);
-    }
-    if let Some(header) = classify_sidecar_from_footer_tail(
-        footer_block.as_deref(),
-        source,
-        file_start,
-        tape_uuid,
-        block_size,
-        block_count,
-        damaged_regions,
-    )? {
-        builder.push_parity_sidecar(
-            block_count,
-            header.epoch_id,
-            header.protected_ordinal_start,
-            header.protected_ordinal_end_exclusive,
-        )?;
-        Ok(false)
-    } else {
-        builder.push_object(block_count)?;
-        Ok(true)
-    }
-}
-
 /// Item 4's fallback reads only the footer and the located tail header. Count
 /// disagreement is damage even when no tail header can be parsed.
 #[allow(clippy::too_many_arguments)]
 fn classify_parity_map_from_footer_tail(
     footer_block: Option<&[u8]>,
-    source: &mut dyn RawTapeSource,
+    source: &mut dyn ClassificationBlockSource,
     file_start: PhysicalPositionHint,
     tape_uuid: &[u8; 16],
     block_size: u32,
@@ -1612,7 +1610,7 @@ fn classify_terminal_from_footer_tail(
 #[allow(clippy::too_many_arguments)]
 fn classify_sidecar_from_footer_tail(
     footer_block: Option<&[u8]>,
-    source: &mut dyn RawTapeSource,
+    source: &mut dyn ClassificationBlockSource,
     file_start: PhysicalPositionHint,
     tape_uuid: &[u8; 16],
     block_size: u32,
@@ -1669,7 +1667,7 @@ enum SidecarTailProbe {
 }
 
 fn read_tail_sidecar_header(
-    source: &mut dyn RawTapeSource,
+    source: &mut dyn ClassificationBlockSource,
     file_start: PhysicalPositionHint,
     tape_uuid: &[u8; 16],
     block_size: u32,
@@ -1709,39 +1707,86 @@ fn read_tail_sidecar_header(
 }
 
 fn read_optional_fixed_block_at(
-    source: &mut dyn RawTapeSource,
+    source: &mut dyn ClassificationBlockSource,
     file_start: PhysicalPositionHint,
     block_within_file: u64,
     block_size: u32,
 ) -> Result<Option<Vec<u8>>, ParityError> {
-    // Every offset passed here is below the file's measured block count (the
-    // last block, or a tail copy that a footer whose total equals the measured
-    // count places inside the file), so the sum lies before the device's
-    // post-space position and cannot overflow. Were it to, the offset would be
-    // a recorded value outside the file, a format fact rather than a device
-    // report, so the distinction is kept and this stays a map error.
-    let lba = file_start
-        .lba
-        .checked_add(block_within_file)
-        .ok_or_else(|| filemark_scan_error("scan sidecar probe LBA overflows"))?;
-    source.locate_physical(PhysicalPositionHint {
-        lba,
-        partition: file_start.partition,
-    })?;
-    let block_size_usize = usize::try_from(block_size)
-        .map_err(|_| ParityError::Invariant("scan block size does not fit usize"))?;
-    let mut buf = vec![0u8; block_size_usize];
-    // A probed record of the wrong length (REM-PARITY 3.5), like a boundary or
-    // a medium error, is no candidate for the probed control structure.
-    match read_fixed_record(source, &mut buf) {
-        Ok(FixedRecordRead::Block { .. }) => Ok(Some(buf)),
-        Ok(
-            FixedRecordRead::WrongLength { .. }
-            | FixedRecordRead::Filemark { .. }
-            | FixedRecordRead::EndOfData { .. },
-        ) => Ok(None),
-        Err(error) if scan_read_error_is_medium_damage(&error) => Ok(None),
-        Err(error) => Err(error),
+    Ok(
+        match source.read_block(file_start, block_within_file, block_size)? {
+            ClassificationBlockRead::Block(block) => Some(block),
+            ClassificationBlockRead::Unreadable
+            | ClassificationBlockRead::WrongLength { .. }
+            | ClassificationBlockRead::Filemark
+            | ClassificationBlockRead::EndOfData => None,
+        },
+    )
+}
+
+/// A classification probe preserves record-length and boundary outcomes.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ClassificationBlockRead {
+    Block(Vec<u8>),
+    Unreadable,
+    WrongLength { measured_bytes: u64 },
+    Filemark,
+    EndOfData,
+}
+
+/// Supply a block named by the classification ladder, relative to one file.
+/// Current medium damage is unreadable; positioning and other I/O errors propagate.
+pub(crate) trait ClassificationBlockSource {
+    fn read_block(
+        &mut self,
+        file_start: PhysicalPositionHint,
+        block_within_file: u64,
+        block_size: u32,
+    ) -> Result<ClassificationBlockRead, ParityError>;
+}
+
+/// Borrow the walk's raw source for the classification of one measured file.
+struct PositionedClassificationSource<'a> {
+    source: &'a mut dyn RawTapeSource,
+}
+
+impl ClassificationBlockSource for PositionedClassificationSource<'_> {
+    fn read_block(
+        &mut self,
+        file_start: PhysicalPositionHint,
+        block_within_file: u64,
+        block_size: u32,
+    ) -> Result<ClassificationBlockRead, ParityError> {
+        // Every offset passed here is below the file's measured block count (the
+        // last block, or a tail copy that a footer whose total equals the measured
+        // count places inside the file), so the sum lies before the device's
+        // post-space position and cannot overflow. Were it to, the offset would be
+        // a recorded value outside the file, a format fact rather than a device
+        // report, so the distinction is kept and this stays a map error.
+        let lba = file_start
+            .lba
+            .checked_add(block_within_file)
+            .ok_or_else(|| filemark_scan_error("scan sidecar probe LBA overflows"))?;
+        self.source.locate_physical(PhysicalPositionHint {
+            lba,
+            partition: file_start.partition,
+        })?;
+        let block_size_usize = usize::try_from(block_size)
+            .map_err(|_| ParityError::Invariant("scan block size does not fit usize"))?;
+        let mut buf = vec![0u8; block_size_usize];
+        // A probed record of the wrong length (REM-PARITY 3.5), like a boundary or
+        // a medium error, is no candidate for the probed control structure.
+        match read_fixed_record(self.source, &mut buf) {
+            Ok(FixedRecordRead::Block { .. }) => Ok(ClassificationBlockRead::Block(buf)),
+            Ok(FixedRecordRead::WrongLength { measured_bytes }) => {
+                Ok(ClassificationBlockRead::WrongLength { measured_bytes })
+            }
+            Ok(FixedRecordRead::Filemark { .. }) => Ok(ClassificationBlockRead::Filemark),
+            Ok(FixedRecordRead::EndOfData { .. }) => Ok(ClassificationBlockRead::EndOfData),
+            Err(error) if scan_read_error_is_medium_damage(&error) => {
+                Ok(ClassificationBlockRead::Unreadable)
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -1803,6 +1848,8 @@ fn bootstrap_refused(field: BootstrapRefusedField, detail: impl Into<String>) ->
 
 #[cfg(test)]
 mod tests {
+    mod classification_tests;
+
     use super::*;
     use crate::bootstrap::{write_bootstrap_block, BootstrapPayload, ParitySchemeRecord};
     use crate::filemark_map::{FilemarkMapDigest, TapeFileKind, TapeFileMapEntry};
@@ -2034,6 +2081,21 @@ mod tests {
                 calls: Vec::new(),
                 locate_fault: None,
             }
+        }
+    }
+
+    impl ClassificationBlockSource for RecordingRawSource {
+        fn read_block(
+            &mut self,
+            file_start: PhysicalPositionHint,
+            block_within_file: u64,
+            block_size: u32,
+        ) -> Result<ClassificationBlockRead, ParityError> {
+            PositionedClassificationSource { source: self }.read_block(
+                file_start,
+                block_within_file,
+                block_size,
+            )
         }
     }
 
