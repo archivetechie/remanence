@@ -301,7 +301,7 @@ fn every_observation_tag_matches_live_comparison_and_keeps_reading_after_damage(
         assert_eq!(tape.positions, 0, "counter must not query position");
     }
     let tags: Vec<_> = [
-        Probe::Block(vec![]),
+        Probe::Block(&[]),
         Probe::WrongLength(u64::MAX),
         Probe::Boundary("filemark where a block belongs"),
         Probe::Boundary("end-of-data where a block belongs"),

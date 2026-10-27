@@ -18,6 +18,12 @@ per-release summaries.
 - `parse_wait_duration_arg` rejects overflowing durations instead of panicking,
   including for `rem tape wait-ready`.
 
+- `remanence-crc` uses slice-by-8 CRC-64/XZ for all callers, including tape
+  verification, sidecar and bootstrap writes, the audit log and checkpoints.
+  `rem tape verify-index` uses reusable read buffers and physical-position
+  lookups per run. `ReadRun` reuses its buffer across fills in the verification
+  sweep, recovery, terminal-inventory and parity-map runs.
+
 - `rem tape verify-index` reports per-phase and total elapsed time, time inside
   commands, slowest-command time and latency buckets in JSON, with phase timing
   lines in human output and `remanence_verify_diag` INFO events in the daemon.
