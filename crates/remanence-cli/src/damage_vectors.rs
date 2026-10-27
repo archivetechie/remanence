@@ -3280,6 +3280,8 @@ fn one_pass_matches_walk_for_entire_damage_matrix() {
     assert!(!cases.is_empty());
     let mut distinct_schedules = 0;
     let mut successes = 0;
+    let mut prefix = 0;
+    let mut direct_walk = 0;
     let mut fallbacks = 0;
     let mut reasons = BTreeMap::new();
     for case in cases {
@@ -3309,6 +3311,9 @@ fn one_pass_matches_walk_for_entire_damage_matrix() {
             None,
             mode,
         );
+        let io = after.begin_verification_io();
+        let mut direct = false;
+        let mut reason = None;
         let mut fell_back = false;
         let after = remanence_parity::verify_terminal_index_full_with_route(
             &mut remanence_parity::raw::CancellableRawSource(DriveHandleRawSource::new(&mut after)),
@@ -3319,13 +3324,28 @@ fn one_pass_matches_walk_for_entire_damage_matrix() {
             remanence_parity::VerificationRoute::OnePass,
             |status| {
                 fell_back |= status.fell_back;
+                reason = status.fallback_reason;
+                direct |= status.fallback_reason == Some("no_parity");
                 if let Some(reason) = status.fallback_reason {
                     *reasons.entry(reason).or_insert(0usize) += 1;
                 }
             },
         );
+        let io = io.finish();
+        let reaches_prefix = io.phases
+            [remanence_library::verification_io::VerificationPhase::OnePassPrefix as usize]
+            .batch_read
+            > 0;
+        prefix += usize::from(reaches_prefix);
+        if !reaches_prefix {
+            println!(
+                "damage fixture before prefix: {id} reason={}",
+                reason.unwrap_or("none")
+            );
+        }
+        direct_walk += usize::from(direct);
         fallbacks += usize::from(fell_back);
-        successes += usize::from(!fell_back && after.is_ok());
+        successes += usize::from(!fell_back && !direct && after.is_ok());
         if before
             .as_ref()
             .is_ok_and(|outcome| outcome.is_complete_tape())
@@ -3346,7 +3366,8 @@ fn one_pass_matches_walk_for_entire_damage_matrix() {
         distinct_schedules > 0,
         "the observation schedules must actually differ"
     );
-    println!("one-pass routes: success={successes}, fallback={fallbacks}");
+    assert_eq!((prefix, successes, fallbacks, direct_walk), (36, 3, 68, 0));
+    println!("one-pass routes: prefix={prefix}, success={successes}, rejected={fallbacks}, direct_walk={direct_walk}");
     println!("fallback reasons: {reasons:?}");
     println!("distinct transport schedules: {distinct_schedules}");
     println!("one-pass / walk equivalence: {} damage cases", cases.len());

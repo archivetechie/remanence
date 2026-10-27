@@ -70,6 +70,8 @@ impl PrefixObserver for PrefixChecks<'_> {
                 TapeFileKind::Bootstrap | TapeFileKind::ParitySidecar | TapeFileKind::ParityMap
             );
         }
+        // Sidecar rows permit reads even when bootstrap disables parity;
+        // every rejection still runs the walk.
         let Some(mut covered) = entry.first_parity_data_ordinal else {
             return false;
         };

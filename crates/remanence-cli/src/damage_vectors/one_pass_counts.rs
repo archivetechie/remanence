@@ -99,6 +99,7 @@ impl<S> Counted<S> {
 }
 
 pub(super) fn compare(vector: &VectorImage) {
+    compare_retracted(vector);
     let uuid = vector.written.inputs.tape_uuid;
     let size = vector.written.inputs.block_size;
     let mut outcomes = Vec::new();
@@ -195,6 +196,20 @@ pub(super) fn compare(vector: &VectorImage) {
                         assert_eq!(source.reads[&lba], 1, "block {lba} read once");
                     }
                 }
+                // The final map is read once before BOT and once in the physical prefix.
+                let final_map = vector
+                    .written
+                    .map
+                    .entries()
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.kind == TapeFileKind::ParityMap)
+                    .unwrap();
+                let start =
+                    vector.image.files[final_map.tape_file_number as usize].start_record as u64;
+                for lba in start..start + final_map.block_count {
+                    assert_eq!(source.reads[&lba], 2, "final map block {lba}");
+                }
                 // LOCATE itself proves position once; subsequent reports are exactly filemarks.
                 let commands = log.borrow();
                 let bot = commands
@@ -281,6 +296,8 @@ pub(super) fn compare(vector: &VectorImage) {
 #[test]
 fn one_pass_protected_findings_and_budget() {
     let mut success = 0;
+    let mut prefix = 0;
+    let mut direct_walk = 0;
     let mut fallback = 0;
     let mut reasons = BTreeMap::new();
     for case in [
@@ -310,6 +327,7 @@ fn one_pass_protected_findings_and_budget() {
         remanence_parity::scan::take_forward_file_io_for_test();
         let io = after.begin_verification_io();
         let mut fell_back = false;
+        let mut direct = false;
         let actual = if case == "small_budget" {
             remanence_parity::terminal_inventory::verify_terminal_index_one_pass_budget_for_test(
                 &mut DriveHandleRawSource::new(&mut after),
@@ -328,6 +346,7 @@ fn one_pass_protected_findings_and_budget() {
                 remanence_parity::VerificationRoute::OnePass,
                 |status| {
                     fell_back |= status.fell_back;
+                    direct |= status.fallback_reason == Some("no_parity");
                     if let Some(reason) = status.fallback_reason {
                         *reasons.entry(reason).or_insert(0usize) += 1;
                     }
@@ -359,19 +378,29 @@ fn one_pass_protected_findings_and_budget() {
                     > 0
             );
         }
+        prefix += usize::from(
+            io.phases
+                [remanence_library::verification_io::VerificationPhase::OnePassPrefix as usize]
+                .batch_read
+                > 0,
+        );
+        direct_walk += usize::from(direct);
         if fell_back {
             fallback += 1
-        } else {
+        } else if !direct {
             success += 1
         }
     }
-    println!("protected fixtures: success={success}, fallback={fallback}, reasons={reasons:?}");
+    assert_eq!((prefix, success, fallback, direct_walk), (5, 4, 1, 0));
+    println!("protected fixtures: prefix={prefix}, success={success}, rejected={fallback}, direct_walk={direct_walk}, reasons={reasons:?}");
 }
 
 /// Every encoded tape image runs both routes, including images without a complete tail.
 #[test]
 fn one_pass_all_tape_images() {
     let mut success = 0;
+    let mut prefix = 0;
+    let mut direct_walk = 0;
     let mut fallback = 0;
     let mut reasons = BTreeMap::new();
     for name in crate::tape_image_vectors::IMAGE_NAMES {
@@ -381,7 +410,9 @@ fn one_pass_all_tape_images() {
         let uuid = vector.written.inputs.tape_uuid;
         let walk =
             verify_terminal_index_full(&mut DriveHandleRawSource::new(&mut before), &uuid, BLOCK);
+        let io = after.begin_verification_io();
         let mut fell_back = false;
+        let mut direct = false;
         let observed = remanence_parity::verify_terminal_index_full_with_route(
             &mut DriveHandleRawSource::new(&mut after),
             &uuid,
@@ -391,6 +422,7 @@ fn one_pass_all_tape_images() {
             remanence_parity::VerificationRoute::OnePass,
             |status| {
                 fell_back |= status.fell_back;
+                direct |= status.fallback_reason == Some("no_parity");
                 if let Some(reason) = status.fallback_reason {
                     *reasons.entry(reason).or_insert(0usize) += 1;
                 }
@@ -403,11 +435,65 @@ fn one_pass_all_tape_images() {
         {
             assert!(!fell_back, "{name}");
         }
+        let io = io.finish();
+        prefix += usize::from(
+            io.phases
+                [remanence_library::verification_io::VerificationPhase::OnePassPrefix as usize]
+                .batch_read
+                > 0,
+        );
+        direct_walk += usize::from(direct);
         if fell_back {
             fallback += 1
-        } else {
+        } else if !direct {
             success += 1
         }
     }
-    println!("tape images: success={success}, fallback={fallback}, reasons={reasons:?}");
+    assert_eq!((prefix, success, fallback, direct_walk), (3, 3, 3, 0));
+    println!("tape images: prefix={prefix}, success={success}, rejected={fallback}, direct_walk={direct_walk}, reasons={reasons:?}");
+}
+
+/// Count a large Object re-read after its prefix observations are retracted.
+fn compare_retracted(vector: &VectorImage) {
+    let uuid = vector.written.inputs.tape_uuid;
+    let size = vector.written.inputs.block_size;
+    let mut outcomes = Vec::new();
+    for route in [
+        remanence_parity::VerificationRoute::Walk,
+        remanence_parity::VerificationRoute::OnePass,
+    ] {
+        let (mut drive, _, log) =
+            source_with_command_log(vector, &json!({"unreadable_records": [{"lba": 4}]}));
+        let io = drive.begin_verification_io();
+        let mut status = None;
+        let result = remanence_parity::verify_terminal_index_full_with_route(
+            &mut DriveHandleRawSource::new(&mut drive),
+            &uuid,
+            size,
+            None,
+            ScanMode::Standard,
+            route,
+            |s| status = Some(s),
+        )
+        .unwrap();
+        assert!(!status.unwrap().fell_back);
+        let io = io.finish();
+        let fallback = &io.phases
+            [remanence_library::verification_io::VerificationPhase::FallbackData as usize];
+        let commands = log.borrow();
+        let count = |opcode| commands.iter().filter(|c| c[0] == opcode).count();
+        println!("retracted {}: total={} LOCATE={} SPACE={} READ_POSITION={} READ={} fallback_single={} fallback_batch={} fallback_bytes={}",
+            route.name(), commands.len(), count(0x92), count(0x11) + count(0x91), count(0x34), count(0x08),
+            fallback.single_read, fallback.batch_read, fallback.bytes);
+        if route == remanence_parity::VerificationRoute::OnePass {
+            // The persistent fault uses the normal single-read recovery for its epoch;
+            // the other retracted epoch resumes batched reads over the missing run.
+            assert_eq!(fallback.single_read, 32);
+            assert_eq!(fallback.batch_read, 3);
+            assert_eq!(commands.len(), 206);
+            assert_eq!(count(0x08), 85);
+        }
+        outcomes.push(result);
+    }
+    assert_eq!(outcomes[0], outcomes[1]);
 }

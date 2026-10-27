@@ -73,6 +73,22 @@ fn fixture(actual: &[u64], recorded: &[u64], different_kind: bool) -> TripleFixt
             ordinal += count;
         }
     }
+    let mut records = triple_fixture().records[..2].to_vec();
+    for &count in actual {
+        records.extend((0..count).map(|_| Record::Block(vec![0x35; BLOCK_SIZE as usize])));
+        records.push(Record::Filemark);
+    }
+    rebuild(records, rows)
+}
+
+/// Encode all terminal components from rows without consulting the physical prefix.
+fn rebuild(mut records: Vec<Record>, mut rows: Rows) -> TripleFixture {
+    let ordinal = rows
+        .0
+        .iter()
+        .filter(|r| r.kind == TapeIndexReplicaFileKind::Object)
+        .map(|r| r.block_count)
+        .sum();
     let counts = TapeIndexReplicaCounts {
         structural_entry_count: rows.0.len() as u64,
         object_row_count: rows
@@ -84,7 +100,7 @@ fn fixture(actual: &[u64], recorded: &[u64], different_kind: bool) -> TripleFixt
     let replica_records = checked_tape_index_replica_layout(BLOCK_SIZE, counts)
         .unwrap()
         .replica_record_count;
-    let start = 2 + actual.iter().map(|count| count + 1).sum::<u64>();
+    let start = records.len() as u64;
     let layout = TerminalTailLayout::new(
         0,
         BLOCK_SIZE,
@@ -99,15 +115,15 @@ fn fixture(actual: &[u64], recorded: &[u64], different_kind: bool) -> TripleFixt
     descriptor.scope = TapeIndexReplicaScope {
         covered_prefix_tape_file_count: counts.structural_entry_count,
         total_data_ordinals: ordinal,
-        highest_protected_ordinal: if different_kind { recorded[0] } else { 0 },
+        highest_protected_ordinal: rows
+            .0
+            .iter()
+            .filter_map(|row| row.protected_ordinal_end_exclusive)
+            .max()
+            .unwrap_or(0),
     };
     descriptor.terminal_layout = layout;
     let edition = plan_tape_index_edition(descriptor, &mut rows).unwrap();
-    let mut records = triple_fixture().records[..2].to_vec();
-    for &count in actual {
-        records.extend((0..count).map(|_| Record::Block(vec![0x35; BLOCK_SIZE as usize])));
-        records.push(Record::Filemark);
-    }
     for ordinal in 1..=3 {
         let plan = plan_tape_index_replica(edition.clone(), ordinal).unwrap();
         write_tape_index_replica(
@@ -156,72 +172,130 @@ fn fixture(actual: &[u64], recorded: &[u64], different_kind: bool) -> TripleFixt
     TripleFixture { records, layout }
 }
 
-#[test]
-fn rebuilt_rows_require_independent_measurement() {
-    let mut success = 0;
-    let mut fallback = 0;
-    let mut reasons = std::collections::BTreeMap::new();
-    for (name, actual, recorded, kind, expected_fallback) in [
-        ("healthy", vec![4, 4], vec![4, 4], false, false),
-        ("row_longer", vec![4, 4], vec![5, 3], false, true),
-        ("row_shorter", vec![4, 4], vec![3, 5], false, true),
-        ("different_kind", vec![4, 7, 3], vec![4, 7, 3], true, true),
-        (
-            "extra_filemark_inside_object",
-            vec![2, 2, 3],
-            vec![4, 1, 2],
-            false,
-            true,
-        ),
-        (
-            "extra_one_block_file_before_a",
-            vec![4, 4, 1],
-            vec![4, 4, 1],
-            false,
-            false,
-        ),
-    ] {
-        let fixture = fixture(&actual, &recorded, kind);
-        // Every rebuilt member validates before the physical-prefix disagreement.
-        let collected = verify_terminal_replicas(
+/// Recover the independently validated rows for rebuilding terminal components.
+fn prefix_rows(fixture: &TripleFixture) -> Rows {
+    Rows(
+        verify_terminal_replicas(
             &mut RecordingSource::new(fixture.records.clone()),
             &TAPE_UUID,
             BLOCK_SIZE,
             fixture.layout,
             ReplicaRowCheck::CollectOnly,
         )
-        .unwrap();
-        assert_eq!(collected.rows[0], collected.rows[1]);
-        assert_eq!(collected.rows[1], collected.rows[2]);
-        let expected = super::super::verify_terminal_index_full(
-            &mut RecordingSource::new(fixture.records.clone()),
-            &TAPE_UUID,
-            BLOCK_SIZE,
-        );
-        let mut fell_back = false;
-        let actual = verify_terminal_index_full_with_route(
-            &mut RecordingSource::new(fixture.records),
-            &TAPE_UUID,
-            BLOCK_SIZE,
-            None,
-            ScanMode::Standard,
-            VerificationRoute::OnePass,
-            |status| {
-                fell_back |= status.fell_back;
-                if let Some(reason) = status.fallback_reason {
-                    *reasons.entry(reason).or_insert(0usize) += 1;
-                }
-            },
-        );
-        assert_eq!(format!("{actual:?}"), format!("{expected:?}"), "{name}");
-        assert_eq!(fell_back, expected_fallback && kind, "{name}");
-        if fell_back {
-            fallback += 1
-        } else {
-            success += 1
+        .unwrap()
+        .rows[0]
+            .clone(),
+    )
+}
+
+/// Compare a fresh walk and an attempt, checking prefix entry before fallback can hide it.
+fn compare_prefix(name: &str, fixture: TripleFixture, expected_reason: Option<&str>) {
+    let mut attempt = RecordingSource::new(fixture.records.clone());
+    let result = super::super::one_pass::verify_one_pass(
+        &mut attempt,
+        &TAPE_UUID,
+        BLOCK_SIZE,
+        ScanMode::Standard,
+        64 * 1024 * 1024,
+    );
+    assert!(
+        attempt.forward_calls > 0,
+        "{name}: attempt must read the prefix"
+    );
+    match (result, expected_reason) {
+        (Ok(_), None) => {}
+        (Err(super::super::one_pass::AttemptError::Rejected(reason)), Some(expected)) => {
+            assert_eq!(reason, expected, "{name}")
         }
+        (Err(super::super::one_pass::AttemptError::Rejected(reason)), _) => {
+            panic!("{name}: rejected {reason}")
+        }
+        _ => panic!("{name}: unexpected attempt result"),
     }
-    println!("rebuilt fixtures: success={success}, fallback={fallback}, reasons={reasons:?}");
+    let expected = super::super::verify_terminal_index_full(
+        &mut RecordingSource::new(fixture.records.clone()),
+        &TAPE_UUID,
+        BLOCK_SIZE,
+    );
+    let mut reason = None;
+    let actual = verify_terminal_index_full_with_route(
+        &mut RecordingSource::new(fixture.records),
+        &TAPE_UUID,
+        BLOCK_SIZE,
+        None,
+        ScanMode::Standard,
+        VerificationRoute::OnePass,
+        |s| reason = s.fallback_reason,
+    );
+    assert_eq!(reason, expected_reason, "{name}");
+    assert_eq!(format!("{actual:?}"), format!("{expected:?}"), "{name}");
+}
+
+#[test]
+fn rebuilt_rows_require_independent_measurement() {
+    for name in [
+        "healthy",
+        "row_longer",
+        "row_shorter",
+        "different_kind",
+        "extra_filemark_inside_object",
+        "extra_one_block_file_before_a",
+    ] {
+        let fixture = protected_fixture();
+        let mut rows = prefix_rows(&fixture);
+        let mut records =
+            fixture.records[..fixture.layout.components[0].planned_start_lba as usize].to_vec();
+        let reason = match name {
+            "row_longer" | "row_shorter" => {
+                // Keep the ParityMap address fixed while moving the Object/sidecar boundary.
+                if name == "row_longer" {
+                    rows.0[1].block_count += 1;
+                    rows.0[2].block_count -= 1;
+                } else {
+                    rows.0[1].block_count -= 1;
+                    rows.0[2].block_count += 1;
+                }
+                rows.0[2].protected_ordinal_end_exclusive = Some(rows.0[1].block_count);
+                Some("prefix_map")
+            }
+            "different_kind" => {
+                // A sidecar header occupies a row that claims a protected Object.
+                records[2] = records[7].clone();
+                Some("prefix_damaged")
+            }
+            "extra_filemark_inside_object" => {
+                records.insert(4, Record::Filemark);
+                rows.0[1].block_count = 2;
+                let mut second = rows.0[1].clone();
+                second.first_parity_data_ordinal = Some(2);
+                rows.0.insert(2, second);
+                // Both shorter files contain the same protected ordinal stream.
+                None
+            }
+            "extra_one_block_file_before_a" => {
+                records.push(Record::Block(vec![0x35; BLOCK_SIZE as usize]));
+                records.push(Record::Filemark);
+                // Finalized rows require the ParityMap last. Match every physical length,
+                // but claim the old map as an Object and the added file as the final map.
+                rows.0[3].kind = TapeIndexReplicaFileKind::Object;
+                rows.0[3].first_parity_data_ordinal = Some(4);
+                rows.0[2].protected_ordinal_end_exclusive = Some(7);
+                let mut last = rows.0[3].clone();
+                last.kind = TapeIndexReplicaFileKind::ParityMap;
+                last.block_count = 1;
+                last.first_parity_data_ordinal = None;
+                rows.0.push(last);
+                Some("prefix_map")
+            }
+            _ => None,
+        };
+        for (file, row) in rows.0.iter_mut().enumerate() {
+            row.tape_file_number = file as u64;
+        }
+        let fixture = rebuild(records, rows);
+        compare_prefix(name, fixture, reason);
+    }
+    println!("rebuilt fixtures: prefix=6 success=2 rejected=4 reasons={{prefix_map: 3, prefix_damaged: 1}} direct_walk=0");
 }
 
 #[test]
@@ -263,7 +337,7 @@ fn deferred_comparison_checks_later_rows_and_replica_two() {
 }
 
 /// Repeated Object bytes make a shifted stream indistinguishable until its corrupt last block.
-fn protected_fixture() -> TripleFixture {
+pub(super) fn protected_fixture() -> TripleFixture {
     let mut fixture = fixture(&[4, 7, 3], &[4, 7, 3], true);
     let scheme = crate::ParityScheme {
         id: crate::SchemeId::new_static("rs-cauchy-gf256-v1"),
@@ -403,6 +477,39 @@ fn spaced_file_retracts_duplicate_and_clean_prefix_observations() {
 #[test]
 fn no_parity_hardware_fault_in_object_interior_uses_walk() {
     let fixture = fixture(&[4], &[4], false);
+    let mut attempt = RecordingSource::new(fixture.records.clone());
+    assert!(matches!(
+        super::super::one_pass::verify_one_pass(
+            &mut attempt,
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            ScanMode::Standard,
+            64 * 1024 * 1024,
+        ),
+        Err(super::super::one_pass::AttemptError::Rejected("no_parity"))
+    ));
+    assert_eq!(attempt.forward_calls, 0);
+    assert_eq!(
+        attempt.read_lbas.len(),
+        5,
+        "only the existing tail probes read blocks"
+    );
+    for ordinal in 1..=3 {
+        let component = fixture.layout.replica(ordinal).unwrap();
+        for lba in component.planned_start_lba + 1
+            ..component.planned_start_lba + component.record_count - 1
+        {
+            assert!(
+                !attempt.read_lbas.contains(&lba),
+                "no replica payload before the walk"
+            );
+        }
+    }
+    println!(
+        "no-parity selection: prefix=0 success=0 rejected=0 direct_walk=1 reads={} bytes={}",
+        attempt.read_lbas.len(),
+        attempt.read_lbas.len() * BLOCK_SIZE as usize
+    );
     let mut walk =
         RecordingSource::new(fixture.records.clone()).with_read_fault(3, TestReadFault::Hardware);
     let expected =
@@ -664,4 +771,65 @@ fn one_pass_cancellation_does_not_fall_back() {
         );
         assert!(!fell_back);
     }
+}
+
+/// Row coverage still streams Objects when the bootstrap explicitly disables parity.
+#[test]
+fn contradictory_no_parity_bootstrap_preserves_walk_outcome() {
+    for fault in [false, true] {
+        let mut fixture = protected_fixture();
+        let Record::Block(block) = &mut fixture.records[0] else {
+            unreachable!()
+        };
+        let mut payload = crate::bootstrap::parse_bootstrap_block(block).unwrap();
+        payload.no_parity_flag = true;
+        payload.scheme = None;
+        crate::bootstrap::write_bootstrap_block(&payload, block).unwrap();
+        let mut walk = RecordingSource::new(fixture.records.clone());
+        let mut attempt = RecordingSource::new(fixture.records.clone());
+        let mut routed = RecordingSource::new(fixture.records);
+        if fault {
+            walk.read_fault = Some((3, TestReadFault::Hardware));
+            attempt.read_fault = walk.read_fault;
+            routed.read_fault = walk.read_fault;
+        }
+        let expected = super::super::verify_terminal_index_full(&mut walk, &TAPE_UUID, BLOCK_SIZE);
+        assert!(
+            !walk.read_lbas.contains(&3),
+            "walk skips the Object interior"
+        );
+        let result = super::super::one_pass::verify_one_pass(
+            &mut attempt,
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            ScanMode::Standard,
+            64 * 1024 * 1024,
+        );
+        assert!(attempt.forward_calls > 0);
+        assert!(
+            attempt.read_lbas.contains(&3),
+            "row coverage reads the Object interior"
+        );
+        if fault {
+            assert!(matches!(
+                result,
+                Err(super::super::one_pass::AttemptError::Rejected("tape_io"))
+            ));
+        } else {
+            assert!(result.is_ok());
+        }
+        let mut reason = None;
+        let actual = verify_terminal_index_full_with_route(
+            &mut routed,
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            None,
+            ScanMode::Standard,
+            VerificationRoute::OnePass,
+            |s| reason = s.fallback_reason,
+        );
+        assert_eq!(reason, fault.then_some("tape_io"));
+        assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+    }
+    println!("contradictory bootstrap: prefix=2 success=1 rejected=1 reasons={{tape_io: 1}} direct_walk=0");
 }

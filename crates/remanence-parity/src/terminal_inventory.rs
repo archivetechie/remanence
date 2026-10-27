@@ -1662,6 +1662,7 @@ fn verify_terminal_index_strict<V: ProtectedPass>(
     let TerminalVerificationPlan {
         measured_eod,
         layout,
+        no_parity: _,
     } = plan_terminal_verification(source, tape_uuid, block_size)?;
     let walked = scan_verification_prefix(source, tape_uuid, block_size, mode)?;
     let measured = check_measured_prefix(&walked, &layout)?;
@@ -1708,6 +1709,7 @@ fn verify_terminal_index_strict<V: ProtectedPass>(
 struct TerminalVerificationPlan {
     measured_eod: PhysicalPositionHint,
     layout: TerminalTailLayout,
+    no_parity: bool,
 }
 
 /// Configure the source, measure EOD and select its unique complete terminal layout.
@@ -1730,7 +1732,20 @@ fn plan_terminal_verification(
         });
     }
 
-    let mut layouts = discover_terminal_layouts(source, tape_uuid, block_size, measured_eod)
+    let mut no_parity_layouts = Vec::new();
+    let mut layouts =
+        discover_terminal_layouts_observed(source, tape_uuid, block_size, measured_eod, |footer| {
+            if footer
+                .plan
+                .edition
+                .descriptor
+                .scope
+                .highest_protected_ordinal
+                == 0
+            {
+                no_parity_layouts.push(footer.plan.edition.descriptor.terminal_layout);
+            }
+        })
         .map_err(inventory_error_to_verification)?
         .into_iter()
         .filter(|layout| layout.expected_eod_lba == measured_eod.lba)
@@ -1753,6 +1768,7 @@ fn plan_terminal_verification(
     Ok(TerminalVerificationPlan {
         measured_eod,
         layout,
+        no_parity: no_parity_layouts.contains(&layout),
     })
 }
 
@@ -2253,6 +2269,17 @@ fn discover_terminal_layouts(
     block_size: u32,
     eod: PhysicalPositionHint,
 ) -> Result<Vec<TerminalTailLayout>, TerminalInventoryReadError> {
+    discover_terminal_layouts_observed(source, tape_uuid, block_size, eod, |_| {})
+}
+
+/// Retain selection hints from the footer probes that layout discovery already reads.
+fn discover_terminal_layouts_observed(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    eod: PhysicalPositionHint,
+    mut observe: impl FnMut(&crate::tape_index_replica::TapeIndexBootstrapFooter),
+) -> Result<Vec<TerminalTailLayout>, TerminalInventoryReadError> {
     source
         .locate_physical(eod)
         .map_err(|error| source_error("restore EOD position", error))?;
@@ -2275,6 +2302,7 @@ fn discover_terminal_layouts(
             Ok(block) => {
                 if let Ok(footer) = parse_tape_index_bootstrap_footer(&block, tape_uuid) {
                     if footer.observed_footer_lba == footer_lba {
+                        observe(&footer);
                         let layout = footer.plan.edition.descriptor.terminal_layout;
                         if layout.expected_eod_lba >= eod.lba && !layouts.contains(&layout) {
                             layouts.push(layout);
@@ -2891,6 +2919,7 @@ mod tests {
         records: Vec<Record>,
         cursor: usize,
         read_lbas: Vec<u64>,
+        forward_calls: usize,
         eod_calls: u64,
         duplicate_at: Option<usize>,
         duplicated: bool,
@@ -2957,6 +2986,7 @@ mod tests {
                 records,
                 cursor: 0,
                 read_lbas: Vec::new(),
+                forward_calls: 0,
                 eod_calls: 0,
                 duplicate_at: None,
                 duplicated: false,
@@ -3100,6 +3130,7 @@ mod tests {
             size: u32,
             count: u32,
         ) -> crate::raw::RawForwardReadBatch {
+            self.forward_calls += 1;
             if self.duplicate_at == Some(self.cursor) && !self.duplicated {
                 self.duplicated = true;
                 let Record::Block(bytes) = &self.records[self.cursor - 1] else {
@@ -3139,13 +3170,38 @@ mod tests {
         source: &mut RecordingSource,
         uuid: &[u8; 16],
         size: u32,
+        expected_reason: Option<&'static str>,
     ) -> Result<TerminalIndexVerificationOutcome, TerminalIndexVerificationError> {
         let mut fresh = source.clone();
         fresh.cursor = 0;
         fresh.read_lbas.clear();
+        fresh.forward_calls = 0;
+        let mut attempt = fresh.clone();
+        let result = super::one_pass::verify_one_pass(
+            &mut attempt,
+            uuid,
+            size,
+            ScanMode::Standard,
+            64 * 1024 * 1024,
+        );
+        let (success, rejection) = match result {
+            Ok(_) => (true, None),
+            Err(super::one_pass::AttemptError::Rejected(reason)) => (false, Some(reason)),
+            Err(super::one_pass::AttemptError::Fatal(_)) => (false, Some("cancelled")),
+        };
+        assert_eq!(rejection, expected_reason, "attempt rejection reason");
+        if success
+            || matches!(
+                rejection,
+                Some("prefix_map" | "prefix_damaged" | "prefix_truncated" | "tape_io")
+            )
+        {
+            assert!(
+                attempt.forward_calls > 0,
+                "prefix fixtures must reach the reader"
+            );
+        }
         let walk = super::verify_terminal_index_full(source, uuid, size);
-        let mut fallback = false;
-        let mut reason = None;
         let observed = verify_terminal_index_full_with_route(
             &mut crate::raw::CancellableRawSource(fresh),
             uuid,
@@ -3153,28 +3209,19 @@ mod tests {
             None,
             ScanMode::Standard,
             VerificationRoute::OnePass,
-            |status| {
-                fallback |= status.fell_back;
-                reason = status.fallback_reason;
-            },
+            |_| {},
         );
         if let (Ok(walk), Ok(observed)) = (&walk, &observed) {
             assert_eq!(walk, observed);
             if walk.is_complete_tape() {
-                assert!(!fallback);
+                assert!(success, "healthy tape must complete the attempt");
             }
         }
         assert_eq!(format!("{walk:?}"), format!("{observed:?}"));
         println!(
-            "terminal fixture route: {} reason={}",
-            if fallback {
-                "fallback"
-            } else if observed.is_ok() {
-                "success"
-            } else {
-                "fault"
-            },
-            reason.unwrap_or("none")
+            "terminal fixture route: prefix={} success={success} reason={} direct_walk=0",
+            attempt.forward_calls > 0,
+            rejection.unwrap_or("none")
         );
         walk
     }
@@ -3617,7 +3664,7 @@ mod tests {
     fn full_verify_bootstrap_fill_is_a_nonconformity_without_rejecting_bootstrap() {
         for terminal in [true, false] {
             for nonzero in [false, true] {
-                let mut fixture = triple_fixture();
+                let mut fixture = one_pass_tests::protected_fixture();
                 let Record::Block(block) = &mut fixture.records[0] else {
                     panic!("fixture starts with bootstrap");
                 };
@@ -3628,8 +3675,17 @@ mod tests {
                     fixture.records.truncate(2);
                 }
                 let mut source = RecordingSource::new(fixture.records);
-                let outcome = verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE)
-                    .expect("full verification retains fill evidence");
+                let outcome = verify_terminal_index_full(
+                    &mut source,
+                    &TAPE_UUID,
+                    BLOCK_SIZE,
+                    if terminal {
+                        None
+                    } else {
+                        Some("no_complete_layout")
+                    },
+                )
+                .expect("full verification retains fill evidence");
                 assert_eq!(
                     outcome.protected().prefix_damage.len(),
                     usize::from(nonzero)
@@ -3697,7 +3753,7 @@ mod tests {
     #[test]
     fn failed_verification_walk_retains_bootstrap_fill() {
         for terminal in [false, true] {
-            let mut fixture = triple_fixture();
+            let mut fixture = one_pass_tests::protected_fixture();
             let Record::Block(block) = &mut fixture.records[0] else {
                 panic!("BOT block")
             };
@@ -3705,7 +3761,8 @@ mod tests {
             let mut source =
                 RecordingSource::new(fixture.records).with_read_fault(2, TestReadFault::Hardware);
             let error = if terminal {
-                verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE).unwrap_err()
+                verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE, Some("tape_io"))
+                    .unwrap_err()
             } else {
                 verify_protected_walk::<Forward>(
                     &mut source,
@@ -3730,13 +3787,18 @@ mod tests {
     /// Supplied values cannot establish anything about unreadable fill bytes.
     #[test]
     fn full_verify_unreadable_bootstrap_is_not_a_fill_failure() {
-        let fixture = triple_fixture();
+        let fixture = one_pass_tests::protected_fixture();
         let mut source =
             RecordingSource::new(fixture.records).with_read_fault(0, TestReadFault::Medium);
         let hints = crate::ScanRecoveryHints {
             tape_uuid: TAPE_UUID,
             block_size: BLOCK_SIZE,
-            scheme: crate::ParityConfig::None,
+            scheme: crate::ParityConfig::Scheme(crate::ParityScheme {
+                id: crate::SchemeId::new_static("rs-cauchy-gf256-v1"),
+                data_blocks_per_stripe: 2,
+                parity_blocks_per_stripe: 2,
+                stripes_per_neighborhood: 2,
+            }),
         };
         let mut fresh = source.clone();
         let outcome = verify_terminal_index_full_with_scan_mode(
@@ -3748,6 +3810,7 @@ mod tests {
         )
         .expect("supplied values permit verification");
         let mut fallback = false;
+        let mut reason = None;
         let routed = verify_terminal_index_full_with_route(
             &mut fresh,
             &TAPE_UUID,
@@ -3755,12 +3818,17 @@ mod tests {
             None,
             ScanMode::Recovery(&hints),
             VerificationRoute::OnePass,
-            |status| fallback |= status.fell_back,
+            |status| {
+                fallback |= status.fell_back;
+                reason = status.fallback_reason;
+            },
         )
         .unwrap();
         assert_eq!(outcome, routed);
-        assert!(!fallback);
-        println!("terminal fixture route: direct walk, no_parity");
+        assert!(fallback);
+        assert_eq!(reason, Some("prefix_map"));
+        assert!(fresh.forward_calls > 0);
+        println!("terminal recovery fixture: prefix=1 success=0 rejected=1 reasons={{prefix_map: 1}} direct_walk=0");
         assert!(!outcome.is_complete_tape());
         assert!(!outcome.protected().prefix_damage.is_empty());
         assert!(outcome
@@ -3772,19 +3840,19 @@ mod tests {
 
     #[test]
     fn full_verify_walks_prefix_and_validates_three_replicas_and_two_gaps() {
-        let fixture = triple_fixture();
+        let fixture = one_pass_tests::protected_fixture();
         let expected_eod = fixture.layout.expected_eod_lba;
         let mut source = RecordingSource::new(fixture.records);
-        let outcome = verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE)
+        let outcome = verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE, None)
             .expect("complete physical verification");
         let TerminalIndexVerificationOutcome::VerifiedComplete(verification) = outcome else {
             panic!("healthy physical tape must verify complete")
         };
 
         assert_eq!(verification.measured_eod.lba, expected_eod);
-        assert_eq!(verification.verified_prefix_tape_file_count, 1);
-        assert_eq!(verification.verified_prefix_record_count, 1);
-        assert_eq!(verification.measured_tape_file_count, 6);
+        assert_eq!(verification.verified_prefix_tape_file_count, 4);
+        assert_eq!(verification.verified_prefix_record_count, 15);
+        assert_eq!(verification.measured_tape_file_count, 9);
         assert!(verification.separations.iter().all(|evidence| matches!(
             evidence,
             TerminalSeparationEvidence::Valid {
@@ -3826,11 +3894,12 @@ mod tests {
 
     #[test]
     fn full_verify_reports_one_corrupt_replica_as_verified_degraded() {
-        let mut fixture = triple_fixture();
+        let mut fixture = one_pass_tests::protected_fixture();
         corrupt_replica_payload(&mut fixture, 1);
         let mut source = RecordingSource::new(fixture.records);
-        let outcome = verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE)
-            .expect("physical integrity damage is a typed outcome");
+        let outcome =
+            verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE, Some("replica"))
+                .expect("physical integrity damage is a typed outcome");
         let TerminalIndexVerificationOutcome::VerifiedDegraded(verification) = outcome else {
             panic!("one corrupt redundant replica must verify degraded")
         };
@@ -3845,7 +3914,7 @@ mod tests {
 
     #[test]
     fn full_verify_after_replica_damage_keeps_medium_separation_damage_typed() {
-        let mut fixture = triple_fixture();
+        let mut fixture = one_pass_tests::protected_fixture();
         corrupt_replica_payload(&mut fixture, 1);
         let separation_lba = fixture
             .layout
@@ -3857,8 +3926,9 @@ mod tests {
         let mut source = RecordingSource::new(fixture.records)
             .with_read_fault(separation_lba, TestReadFault::Medium);
 
-        let outcome = verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE)
-            .expect("medium damage remains typed degraded evidence");
+        let outcome =
+            verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE, Some("replica"))
+                .expect("medium damage remains typed degraded evidence");
         assert!(matches!(
             outcome,
             TerminalIndexVerificationOutcome::VerifiedDegraded(verification)
@@ -3877,7 +3947,7 @@ mod tests {
             TestReadFault::Hardware,
             TestReadFault::Transport,
         ] {
-            let mut fixture = triple_fixture();
+            let mut fixture = one_pass_tests::protected_fixture();
             corrupt_replica_payload(&mut fixture, 1);
             let separation_lba = fixture
                 .layout
@@ -3889,8 +3959,9 @@ mod tests {
             let mut source =
                 RecordingSource::new(fixture.records).with_read_fault(separation_lba, fault);
 
-            let error = verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE)
-                .expect_err("non-medium separation failure must abort degraded verification");
+            let error =
+                verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE, Some("replica"))
+                    .expect_err("non-medium separation failure must abort degraded verification");
             assert!(matches!(
                 error,
                 TerminalIndexVerificationError::Source {
@@ -3903,11 +3974,12 @@ mod tests {
 
     #[test]
     fn full_verify_reports_nonzero_separation_interior_as_degraded() {
-        let mut fixture = triple_fixture();
+        let mut fixture = one_pass_tests::protected_fixture();
         corrupt_separation_interior(&mut fixture, 2);
         let mut source = RecordingSource::new(fixture.records);
-        let outcome = verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE)
-            .expect("separation damage is a typed outcome");
+        let outcome =
+            verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE, Some("separation"))
+                .expect("separation damage is a typed outcome");
         assert!(matches!(
             outcome,
             TerminalIndexVerificationOutcome::VerifiedDegraded(verification)
@@ -3917,11 +3989,12 @@ mod tests {
 
     #[test]
     fn full_verify_rejects_self_consistent_separation_from_another_edition() {
-        let mut fixture = triple_fixture();
+        let mut fixture = one_pass_tests::protected_fixture();
         replace_separation_edition(&mut fixture, 1, [0x99; 16]);
         let mut source = RecordingSource::new(fixture.records);
-        let outcome = verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE)
-            .expect("edition mismatch is retained as typed degraded evidence");
+        let outcome =
+            verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE, Some("separation"))
+                .expect("edition mismatch is retained as typed degraded evidence");
         assert!(matches!(
             outcome,
             TerminalIndexVerificationOutcome::VerifiedDegraded(verification)
@@ -3935,13 +4008,18 @@ mod tests {
 
     #[test]
     fn full_verify_rejects_physical_data_after_planned_eod() {
-        let mut fixture = triple_fixture();
+        let mut fixture = one_pass_tests::protected_fixture();
         fixture
             .records
             .push(Record::Block(vec![0xEE; BLOCK_SIZE as usize]));
         let mut source = RecordingSource::new(fixture.records);
-        let outcome = verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE)
-            .expect("untrusted tail returns typed recovery evidence");
+        let outcome = verify_terminal_index_full(
+            &mut source,
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            Some("no_complete_layout"),
+        )
+        .expect("untrusted tail returns typed recovery evidence");
         assert!(matches!(
             outcome,
             TerminalIndexVerificationOutcome::RecoveryRequired(_)
@@ -3950,14 +4028,15 @@ mod tests {
 
     #[test]
     fn full_verify_all_invalid_runs_bot_recovery_with_measured_eod() {
-        let mut fixture = triple_fixture();
+        let mut fixture = one_pass_tests::protected_fixture();
         for ordinal in 1..=TERMINAL_INDEX_REPLICA_COUNT {
             corrupt_replica_payload(&mut fixture, ordinal);
         }
         let expected_eod = fixture.layout.expected_eod_lba;
         let mut source = RecordingSource::new(fixture.records);
-        let outcome = verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE)
-            .expect("semantic damage must return typed recovery evidence");
+        let outcome =
+            verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE, Some("replica"))
+                .expect("semantic damage must return typed recovery evidence");
         let TerminalIndexVerificationOutcome::RecoveryRequired(recovery) = outcome else {
             panic!("no canonical survivor must require structural recovery")
         };
@@ -4541,11 +4620,16 @@ mod tests {
 
     #[test]
     fn full_verify_bot_head_faults_only_degrade_medium_errors() {
-        let fixture = triple_fixture();
+        let fixture = one_pass_tests::protected_fixture();
         let mut medium_source =
             RecordingSource::new(fixture.records.clone()).with_read_fault(0, TestReadFault::Medium);
-        let medium_outcome = verify_terminal_index_full(&mut medium_source, &TAPE_UUID, BLOCK_SIZE)
-            .expect("BOT medium damage remains a typed outcome");
+        let medium_outcome = verify_terminal_index_full(
+            &mut medium_source,
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            Some("prefix_map"),
+        )
+        .expect("BOT medium damage remains a typed outcome");
         // The damaged bootstrap is prefix damage: the replicas' rows agree with
         // the walk, so the terminal route stands, the damage is a finding, and
         // with no bootstrap or supplied scheme the protected pass is not
@@ -4566,8 +4650,9 @@ mod tests {
         ] {
             let mut source =
                 RecordingSource::new(fixture.records.clone()).with_read_fault(0, fault);
-            let error = verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE)
-                .expect_err("non-medium BOT source failure must abort full verification");
+            let error =
+                verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE, Some("tape_io"))
+                    .expect_err("non-medium BOT source failure must abort full verification");
             assert!(matches!(
                 error,
                 TerminalIndexVerificationError::PrefixWalk { .. }
