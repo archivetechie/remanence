@@ -2816,15 +2816,18 @@ once, from block 0 to the footer, retain blocks as they pass, and apply the
 steps to the retained blocks afterwards. The conditions are that the
 Recoverer:
 
-- continues past an unreadable record, or a record of the wrong length
-  (Section 3.5), by positioning to the block that follows it, rather than
-  ending its reading there;
+- in a sequential pass, continues past an unreadable record, or a record of
+  the wrong length (Section 3.5), by positioning to the block that follows it,
+  rather than ending the pass there;
 - places each block it obtains by a position the device reports, or that a
   positioning command to that block establishes, carried forward only across
   reads that each returned one whole block and established again from the
   device after any read that did not;
 - reads at its position any block a step names that it has not obtained,
   before that step uses the block or treats it as unreadable.
+
+A Recoverer that reads each block at its position when a step names it, in the
+order of the steps, meets these conditions.
 
 Each step then uses the block at the position it names, and a block that could
 not be read at that position is unreadable to every step that names it. The
@@ -2833,13 +2836,14 @@ Recoverer that reads the footer first reaches from the same blocks. When
 `total − 1 − P` is even and greater than zero, with `total` the map entry's
 block count and `H = (total − 1 − P) / 2`, every block that a step names from
 the map entry, from a directory entry, or from a footer or header copy whose
-parity shard block count is `P` lies in the first `H` blocks or the last
-`H + 1` blocks of the file. Retaining those blocks is then enough for the
-steps, and the third condition covers any other block a step names. A Verifier
-that acquires the index this way (Section 2.2) needs besides them only each
-parity shard's read outcome, with a CRC-64/XZ of each shard that reads as one
-block, to check and report the shards against the acquired index. It makes its
-reports of unreadable, invalid and divergent copies from the same blocks.
+parity shard block count is `P` and whose total matches the map entry lies in
+the first `H` blocks or the last `H + 1` blocks of the file. Retaining those
+blocks is then enough for the steps, and the third condition covers any other
+block a step names. A Verifier that acquires the index this way (Section 2.2)
+needs besides them only each parity shard's read outcome, with a CRC-64/XZ of
+each shard that reads as one block, to check and report the shards against
+the acquired index. It makes its reports of unreadable, invalid and divergent
+copies from the same blocks.
 
 *Rationale.* The footer decides because it records where each copy lies and
 the hash that both copies carry (Section 9.6). Reading it first lets a
