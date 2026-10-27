@@ -1,5 +1,11 @@
 //! Startup media-readiness reconciliation and transport/status mapping.
 
+use std::time::Duration;
+
+use remanence_library::{
+    media_readiness_sense_label, media_readiness_sense_name, MediaReadiness,
+    MediaReadinessWaitEvent, MediaReadinessWaitOptions, MEDIA_READINESS_MAX_INITIALIZING_LOADS,
+};
 use remanence_state::{
     CatalogIndex, MediaReadinessOperationRecord, MediaReadinessTransitionInput, StateError,
 };
@@ -7,6 +13,17 @@ use tonic::Status;
 use uuid::Uuid;
 
 use crate::hex_encoding::bytes_to_hex;
+
+/// Phase of the write-ahead transition a readiness wait records before the
+/// SSC LOAD it sends when the drive asks for an initializing command.
+pub(crate) const INITIALIZING_LOAD_PHASE: &str = "initializing_command_load";
+
+/// Bound on the startup poll that follows a startup initializing LOAD. A
+/// drive that only needed the LOAD reports ready within seconds; one still
+/// conditioning media stays fenced in a resumable state for the next wait.
+const STARTUP_INITIALIZING_LOAD_TIMEOUT: Duration = Duration::from_secs(60);
+/// Steady poll interval of that startup poll, after the shared fast ramp.
+const STARTUP_INITIALIZING_LOAD_POLL: Duration = Duration::from_secs(5);
 
 pub(crate) fn status_from_state_error(err: StateError) -> Status {
     match err {
@@ -28,7 +45,7 @@ pub(crate) fn media_readiness_conflict_status(
         return Status::internal("media-readiness admission conflict called without conflicts");
     };
     Status::failed_precondition(format!(
-        "{action} is blocked by active media-readiness fence {} operation={} {} barcode={} state={}",
+        "{action} is blocked by active media-readiness fence {} operation={} {} barcode={} state={}{}",
         first
             .quarantine_id
             .as_deref()
@@ -39,8 +56,153 @@ pub(crate) fn media_readiness_conflict_status(
                 remanence_state::DriveKey::Standalone { .. } => format!("endpoint={}",first.endpoint.label()),
             },
         first.barcode.as_deref().unwrap_or("(unknown)"),
-        first.state
+        first.state,
+        media_readiness_record_sense_suffix(first)
     ))
+}
+
+/// ` sense=KK/AA/QQ (name)` for a readiness record that carries decoded
+/// sense, or an empty string. Fence messages append it after `state=`.
+pub(crate) fn media_readiness_record_sense_suffix(
+    record: &MediaReadinessOperationRecord,
+) -> String {
+    media_readiness_record_sense_label(record)
+        .map(|label| format!(" sense={label}"))
+        .unwrap_or_default()
+}
+
+/// `KK/AA/QQ (name)` label of the last sense a readiness record stores.
+pub(crate) fn media_readiness_record_sense_label(
+    record: &MediaReadinessOperationRecord,
+) -> Option<String> {
+    let key = media_readiness_u8_field(record.last_sense_key)?;
+    let asc = media_readiness_u8_field(record.last_asc)?;
+    let ascq = media_readiness_u8_field(record.last_ascq)?;
+    Some(media_readiness_sense_label(key, asc, ascq))
+}
+
+/// Operation progress entries naming a readiness observation's sense, so a
+/// watching client can show why the drive is not ready.
+pub(crate) fn media_readiness_sense_progress(
+    readiness: &MediaReadiness,
+) -> Vec<(&'static str, String)> {
+    let Some((key, asc, ascq)) = readiness.sense() else {
+        return Vec::new();
+    };
+    let (sense_key, name_key) = remanence_library::MEDIA_READINESS_SENSE_PROGRESS_KEYS;
+    let mut progress = vec![(sense_key, format!("{key:02x}/{asc:02x}/{ascq:02x}"))];
+    if let Some(name) = media_readiness_sense_name(asc, ascq) {
+        progress.push((name_key, name.to_string()));
+    }
+    progress
+}
+
+/// LOADs the operation may still send for an initializing-command request:
+/// [`MEDIA_READINESS_MAX_INITIALIZING_LOADS`] minus the LOAD attempts it
+/// recorded since it last reported ready.
+pub(crate) fn media_readiness_initializing_load_budget(
+    index: &CatalogIndex,
+    operation_id: Uuid,
+) -> Result<u32, StateError> {
+    Ok(MEDIA_READINESS_MAX_INITIALIZING_LOADS
+        .saturating_sub(index.media_readiness_load_attempts_since_ready(operation_id)?))
+}
+
+/// Write-ahead transition recorded before the SSC LOAD a readiness wait
+/// sends for an initializing-command request. `pre_ready_loading` with
+/// opcode `1Bh` is the row the LOAD budget counts.
+pub(crate) fn media_readiness_initializing_load_transition(
+    operation_id: Uuid,
+    observed: &MediaReadiness,
+) -> MediaReadinessTransitionInput {
+    let sense = observed.sense();
+    let label = sense
+        .map(|(key, asc, ascq)| media_readiness_sense_label(key, asc, ascq))
+        .unwrap_or_else(|| "an initializing-command request".to_string());
+    MediaReadinessTransitionInput {
+        operation_id,
+        phase: Some(INITIALIZING_LOAD_PHASE.to_string()),
+        state: "pre_ready_loading".to_string(),
+        dirty_scope: Some("drive+tape".to_string()),
+        last_cdb_opcode: Some(0x1b),
+        last_sense_raw: None,
+        last_sense_key: sense.map(|(key, _, _)| key),
+        last_asc: sense.map(|(_, asc, _)| asc),
+        last_ascq: sense.map(|(_, _, ascq)| ascq),
+        last_host_status: None,
+        last_driver_status: None,
+        target_status: None,
+        transport_class: None,
+        cancel_source: None,
+        signal: None,
+        evidence_path: None,
+        last_error_json: Some(json_detail(
+            INITIALIZING_LOAD_PHASE,
+            format!("TEST UNIT READY reported {label}; sending one SSC LOAD").as_str(),
+        )),
+        quarantine_id: None,
+    }
+}
+
+/// Transition recorded when the initializing SSC LOAD fails. The state
+/// follows the failure's readiness classification, so a completion-unknown
+/// or refused LOAD fences for operator release.
+pub(crate) fn media_readiness_initializing_load_failed_transition(
+    operation_id: Uuid,
+    failure: &MediaReadiness,
+    detail: &str,
+) -> MediaReadinessTransitionInput {
+    let state = media_readiness_state_name(failure).to_string();
+    let quarantine_id = media_readiness_state_requires_release(state.as_str())
+        .then(|| media_readiness_quarantine_id_for_operation(operation_id));
+    MediaReadinessTransitionInput {
+        operation_id,
+        phase: Some(INITIALIZING_LOAD_PHASE.to_string()),
+        state,
+        dirty_scope: Some("drive+tape".to_string()),
+        last_cdb_opcode: Some(0x1b),
+        last_sense_raw: media_readiness_sense_raw(failure),
+        last_sense_key: media_readiness_sense_key(failure),
+        last_asc: media_readiness_asc(failure),
+        last_ascq: media_readiness_ascq(failure),
+        last_host_status: None,
+        last_driver_status: None,
+        target_status: media_readiness_target_status(failure),
+        transport_class: media_readiness_transport_class(failure),
+        cancel_source: None,
+        signal: None,
+        evidence_path: None,
+        last_error_json: Some(json_detail("initializing_command_load_failed", detail)),
+        quarantine_id,
+    }
+}
+
+/// Log a readiness observation that keeps a fence in place, naming the
+/// drive's not-ready reason when the sense is known.
+pub(crate) fn log_media_readiness_not_ready(
+    operation_id: Uuid,
+    endpoint: &str,
+    phase: &str,
+    state: &str,
+    readiness: &MediaReadiness,
+) {
+    let (sense, sense_name) = match readiness.sense() {
+        Some((key, asc, ascq)) => (
+            format!("{key:02x}/{asc:02x}/{ascq:02x}"),
+            media_readiness_sense_name(asc, ascq).unwrap_or("(unnamed)"),
+        ),
+        None => ("(none)".to_string(), "(none)"),
+    };
+    tracing::warn!(
+        operation_id = %operation_id,
+        endpoint,
+        phase,
+        state,
+        sense = sense.as_str(),
+        sense_name,
+        detail = %readiness,
+        "media-readiness fence remains active: drive not ready"
+    );
 }
 
 pub(crate) fn ensure_media_readiness_admitted(
@@ -103,7 +265,8 @@ fn media_readiness_fence_names_target(
 }
 
 /// Reconcile active media-readiness fences against the current selected-library
-/// discovery snapshot using only TEST UNIT READY probes.
+/// discovery snapshot using TEST UNIT READY probes. It may send one initializing
+/// SSC LOAD per operation when inventory places the cartridge in the drive.
 pub fn reconcile_media_readiness_on_startup(
     index: &mut CatalogIndex,
     report: &remanence_library::DiscoveryReport,
@@ -195,13 +358,39 @@ pub(crate) fn reconcile_library_media_readiness_records_on_startup(
                     reconciled = reconciled.saturating_add(1);
                     continue;
                 };
-                let readiness = drive.probe_media_readiness(family);
-                index
-                    .record_media_readiness_transition(startup_media_readiness_probe_transition(
+                let observed = drive.probe_media_readiness(family);
+                let load_budget = if observed.requires_initializing_command() {
+                    media_readiness_initializing_load_budget(index, operation_id)
+                        .map_err(status_from_state_error)?
+                } else {
+                    0
+                };
+                let readiness = if load_budget > 0 {
+                    startup_media_readiness_initializing_load(
+                        index,
+                        drive,
                         operation_id,
+                        family,
+                        observed,
+                        load_budget,
+                    )?
+                } else {
+                    index
+                        .record_media_readiness_transition(
+                            startup_media_readiness_probe_transition(operation_id, &observed),
+                        )
+                        .map_err(status_from_state_error)?;
+                    observed
+                };
+                if !readiness.is_ready() {
+                    log_media_readiness_not_ready(
+                        operation_id,
+                        format!("library={} drive=0x{drive_element:04x}", library.serial).as_str(),
+                        "startup_reconcile_tur",
+                        media_readiness_state_name(&readiness),
                         &readiness,
-                    ))
-                    .map_err(status_from_state_error)?;
+                    );
+                }
                 reconciled = reconciled.saturating_add(1);
             }
             StartupReadinessPlan::KeepFenced { transition } => {
@@ -220,6 +409,77 @@ pub(crate) fn reconcile_library_media_readiness_records_on_startup(
         );
     }
     Ok(reconciled)
+}
+
+/// Send the startup reconcile's one SSC LOAD to a drive that asks for an
+/// initializing command, then poll briefly.
+///
+/// The probe plan has already matched the recorded drive serial and barcode
+/// against changer inventory, so the cartridge is physically in this drive.
+/// A daemon stopped between SSC UNLOAD and the changer move leaves it there
+/// unthreaded, and the drive answers `02/04/02` until a LOAD arrives; a TUR
+/// poll alone would keep the fence for the whole readiness timeout. Each
+/// observation is recorded as a startup transition in its readiness state
+/// (never `timeout_unknown`), so a drive still conditioning media after the
+/// short startup poll stays resumable.
+fn startup_media_readiness_initializing_load(
+    index: &mut CatalogIndex,
+    drive: &mut remanence_library::DriveHandle,
+    operation_id: Uuid,
+    family: remanence_library::MediaFamily,
+    observed: MediaReadiness,
+    load_budget: u32,
+) -> Result<MediaReadiness, Status> {
+    let poll = drive
+        .wait_for_media_readiness_with_initializing_load(
+            family,
+            Some(observed),
+            MediaReadinessWaitOptions {
+                wait: true,
+                timeout: STARTUP_INITIALIZING_LOAD_TIMEOUT,
+                poll_interval: STARTUP_INITIALIZING_LOAD_POLL,
+            },
+            load_budget,
+            || None,
+            |event| {
+                let transition = match event {
+                    MediaReadinessWaitEvent::Poll(poll) => {
+                        startup_media_readiness_probe_transition(operation_id, &poll.readiness)
+                    }
+                    MediaReadinessWaitEvent::InitializingLoad(poll) => {
+                        tracing::warn!(
+                            operation_id = %operation_id,
+                            detail = %poll.readiness,
+                            "startup readiness: drive asks for an initializing command; sending one SSC LOAD"
+                        );
+                        media_readiness_initializing_load_transition(operation_id, &poll.readiness)
+                    }
+                    MediaReadinessWaitEvent::InitializingLoadFailed { readiness, detail } => {
+                        tracing::warn!(
+                            operation_id = %operation_id,
+                            detail,
+                            "startup readiness: initializing SSC LOAD failed"
+                        );
+                        media_readiness_initializing_load_failed_transition(
+                            operation_id,
+                            readiness,
+                            detail,
+                        )
+                    }
+                    MediaReadinessWaitEvent::Cancelled(_) => return Ok(()),
+                };
+                index
+                    .record_media_readiness_transition(transition)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            },
+        )
+        .map_err(|error| {
+            Status::internal(format!(
+                "startup readiness LOAD for operation {operation_id}: {error}"
+            ))
+        })?;
+    Ok(poll.readiness)
 }
 
 pub(crate) enum StartupReadinessPlan {

@@ -137,6 +137,28 @@ per-release summaries.
   `OpenWriteSession` and `ResumeMediaReadiness` proto comments and the write
   path in the architecture overview document bay selection and this
   serialization. Bay selection and admission behaviour are unchanged.
+- Readiness waits send one SSC LOAD when a drive answers NOT READY /
+  INITIALIZING COMMAND REQUIRED (`02/04/02`) for a cartridge that changer
+  inventory places in it, then keep polling. Daemon readiness operations,
+  startup reconciliation, load waits and `rem tape wait-ready --wait` all do
+  this. The operation records the attempt before the LOAD and sends no second
+  one until the drive reports ready. A cartridge left unthreaded by a daemon
+  killed between unload and move no longer holds a write session behind its
+  fence until the readiness timeout. Library code that matches
+  `MediaReadinessWaitEvent` must accept the `InitializingLoad` and
+  `InitializingLoadFailed` variants.
+- A graceful daemon stop no longer separates a cartridge's SSC UNLOAD from
+  its move home. The pair runs on a task that owns the bay reservation, so a
+  cancelled eviction request still finishes the move. Idle and eviction
+  dismounts do not start once shutdown has begun, and SIGHUP starts the same
+  graceful shutdown as SIGTERM instead of ending the process. A hard kill
+  between the two commands or a failed changer move after a successful UNLOAD
+  leaves the cartridge unthreaded.
+- `rem tape quarantine list` and `show` name the drive's not-ready reason:
+  the last sense and its name, such as `sense=02/04/02 (initializing command
+  required)`. The JSON adds `last_sense` and `last_sense_name`; existing
+  fields are unchanged. Fence refusals, daemon logs and `rem put` readiness
+  progress carry the same reason.
 
 - Tests that issue live SCSI commands run only with `REM_TEST_LIVE_SCSI=1`;
   otherwise device open and enumeration refuse inside test binaries and their

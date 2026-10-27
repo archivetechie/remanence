@@ -1740,19 +1740,92 @@ impl DismountReason {
 /// Perform the one canonical rewind/unload/move-home tail while the caller
 /// holds the bay reservation. Session close only parks the cartridge; eviction,
 /// idle expiry, and shutdown all converge here.
+///
+/// The SSC UNLOAD and the changer move form one unit with respect to
+/// shutdown. A cartridge unloaded but never moved stays unthreaded in the
+/// drive, which then answers NOT READY / INITIALIZING COMMAND REQUIRED
+/// (`02/04/02`) until a host sends LOAD, and every later readiness wait on it
+/// stalls. So:
+///
+/// - The pair runs on a detached task that owns the bay reservation.
+///   Dropping the caller's future (an eviction inside an RPC whose client
+///   disconnects) cannot separate the UNLOAD from the move, and no other
+///   operation can reserve the bay until the move has finished.
+/// - An idle or eviction dismount does not start its UNLOAD once shutdown
+///   has begun; the shutdown pass dismounts that cartridge instead. The check
+///   runs under the reservation: either the UNLOAD starts before shutdown
+///   begins, and the shutdown pass waits for the reservation the task
+///   releases only after the move, or the UNLOAD never starts.
+/// - The shutdown pass takes each bay reservation before its own UNLOAD and
+///   awaits the move before it moves on, and the daemon serves until that
+///   pass returns, so a graceful stop never exits between the two commands.
+///
+/// A hard kill between the commands or a failed changer move leaves the cartridge
+/// unthreaded; session open and media-readiness waits then send one SSC LOAD
+/// to thread it.
+///
+/// On success the reservation returns to the caller; on failure it is
+/// released once the task has finished with the drive.
 async fn dismount_reserved_cartridge(
     state: &ApiState,
     pool: &crate::write_owner::DrivePool,
     seated: &crate::write_owner::SeatedCartridge,
     reason: DismountReason,
-) -> Result<(), Status> {
+    reservation: crate::write_owner::DriveReservation,
+) -> Result<crate::write_owner::DriveReservation, Status> {
     ensure_seated_cartridge_media_readiness_admitted(state, seated, reason)?;
     ensure_seated_cartridge_matches_snapshot(state, seated)?;
 
+    let pool = pool.clone();
+    let seated = seated.clone();
+    let bay = seated.bay;
+    tokio::spawn(async move {
+        dismount_pair(&pool, &seated, reason).await?;
+        Ok(reservation)
+    })
+    .await
+    .map_err(|err| Status::internal(format!("dismount task for drive bay 0x{bay:04x}: {err}")))?
+}
+
+/// The SSC UNLOAD and changer move of [`dismount_reserved_cartridge`], run
+/// on its detached task while that task owns the bay reservation.
+async fn dismount_pair(
+    pool: &crate::write_owner::DrivePool,
+    seated: &crate::write_owner::SeatedCartridge,
+    reason: DismountReason,
+) -> Result<(), Status> {
+    if reason != DismountReason::Shutdown && pool.is_shutting_down() {
+        return Err(Status::unavailable(format!(
+            "daemon shutdown began before the {} dismount of drive bay 0x{:04x} started its unload; the shutdown pass dismounts it",
+            reason.as_str(),
+            seated.bay
+        )));
+    }
     let started = Instant::now();
     let ssc_unload = drive_unload(pool, &seated.drive_key()).await?;
     let move_started = Instant::now();
-    changer_move(pool, &seated.library_serial, seated.bay, seated.home_slot).await?;
+    if let Err(err) = changer_move(pool, &seated.library_serial, seated.bay, seated.home_slot).await
+    {
+        tracing::error!(
+            library_serial = %seated.library_serial,
+            bay = seated.bay,
+            home_slot = seated.home_slot,
+            barcode = seated.barcode.as_deref().unwrap_or("(unknown)"),
+            unload = reason.as_str(),
+            error = %err,
+            "drive unloaded but the move home failed; the cartridge stays unthreaded in the drive until a changer move or an SSC LOAD"
+        );
+        return Err(Status::new(
+            err.code(),
+            format!(
+                "drive bay 0x{:04x} unloaded but the move to slot 0x{:04x} failed; cartridge {} stays unthreaded in the drive: {}",
+                seated.bay,
+                seated.home_slot,
+                seated.barcode.as_deref().unwrap_or("(unknown)"),
+                err.message()
+            ),
+        ));
+    }
     let changer_move = move_started.elapsed();
     if let Some(parked) = pool.parked_at(&seated.drive_key()) {
         pool.forget_parked(&parked);
@@ -1880,17 +1953,18 @@ fn schedule_idle_dismount(state: ApiState, parked: crate::write_owner::ParkedCar
                 &pool,
                 &parked.seated,
                 DismountReason::IdleTimeout,
+                reservation,
             )
             .await
             {
-                Ok(()) => return,
+                Ok(_reservation) => return,
+                Err(_) if pool.is_shutting_down() => return,
                 Err(err) => tracing::warn!(
                     bay = parked.seated.bay,
                     error = %err,
                     "idle drive unload failed; retrying after the configured timeout"
                 ),
             }
-            drop(reservation);
             tokio::time::sleep(Duration::from_secs(timeout_seconds)).await;
         }
     });
@@ -2124,11 +2198,11 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
                 .and_then(|parked| parked.seated.prior_session_id),
         };
         if let Err(err) =
-            dismount_reserved_cartridge(state, pool, &seated, DismountReason::Shutdown).await
+            dismount_reserved_cartridge(state, pool, &seated, DismountReason::Shutdown, reservation)
+                .await
         {
             failures.push(format!("{} bay 0x{:04x}: {err}", *library_serial, *bay));
         }
-        drop(reservation);
     }
     if failures.is_empty() {
         Ok(())
@@ -2314,8 +2388,14 @@ async fn resolve_and_reserve_actor_mount(
                             seated.prior_session_id = parked.seated.prior_session_id;
                         }
                     }
-                    dismount_reserved_cartridge(state, pool, &seated, DismountReason::Evicted)
-                        .await?;
+                    let reservation = dismount_reserved_cartridge(
+                        state,
+                        pool,
+                        &seated,
+                        DismountReason::Evicted,
+                        reservation,
+                    )
+                    .await?;
                     return Ok((mount, reservation));
                 }
             },
@@ -3287,6 +3367,18 @@ mod tests {
                 evidence_path: None,
             })
             .expect("record session-open readiness fence");
+        CatalogIndex::open(harness.state.index_path.as_ref())
+            .expect("open writable catalog")
+            .record_media_readiness_transition(
+                crate::startup_media_readiness::startup_media_readiness_probe_transition(
+                    operation_id,
+                    &remanence_library::MediaReadiness::BecomingReady {
+                        ascq: 0x02,
+                        media_initializing: true,
+                    },
+                ),
+            )
+            .expect("record the fence's last sense");
 
         let error = spawn_pool_open(&harness.state, POOL_B)
             .await
@@ -3309,6 +3401,10 @@ mod tests {
             "{message}"
         );
         assert!(
+            message.contains(" sense=02/04/02 (initializing command required); robot moves"),
+            "{message}"
+        );
+        assert!(
             harness.pool.busy_bays("LIB001").is_empty(),
             "the refused open releases the idle bay it planned to use"
         );
@@ -3326,15 +3422,16 @@ mod tests {
             harness.drive_rx,
             harness.changer_rx,
         ));
-        let _reservation = harness
+        let reservation = harness
             .pool
             .reserve_drive(&crate::drive_pool::DriveKey::new("LIB001", 0x0101))
             .expect("reserve idle bay");
-        dismount_reserved_cartridge(
+        let _reservation = dismount_reserved_cartridge(
             &harness.state,
             &harness.pool,
             &harness.seated,
             DismountReason::IdleTimeout,
+            reservation,
         )
         .await
         .expect("dismount succeeds");
@@ -3377,6 +3474,277 @@ mod tests {
             .expect("shutdown dismount succeeds");
         responder.await.expect("mock actors join");
         assert!(!harness.pool.parked_is_current(&parked));
+    }
+
+    /// A refused changer move names the unthreaded tape and releases its bay.
+    #[tokio::test]
+    async fn failed_move_after_unload_names_cartridge_and_releases_reservation() {
+        let mut harness = dismount_harness(0);
+        let drive_key = harness.seated.drive_key();
+        let reservation = harness.pool.reserve_drive(&drive_key).expect("reserve bay");
+        let (state, pool, seated) = (
+            harness.state.clone(),
+            harness.pool.clone(),
+            harness.seated.clone(),
+        );
+        let caller = tokio::spawn(async move {
+            dismount_reserved_cartridge(
+                &state,
+                &pool,
+                &seated,
+                DismountReason::Shutdown,
+                reservation,
+            )
+            .await
+        });
+        let Some(crate::write_owner::DriveCommand::Unload { reply }) =
+            tokio::time::timeout(Duration::from_secs(1), harness.drive_rx.recv())
+                .await
+                .expect("unload deadline")
+        else {
+            panic!("unload command")
+        };
+        reply
+            .send(Ok(Duration::from_millis(7)))
+            .expect("unload reply");
+        let Some(crate::write_owner::ChangerCommand::Move { src, dst, reply }) =
+            tokio::time::timeout(Duration::from_secs(1), harness.changer_rx.recv())
+                .await
+                .expect("move deadline")
+        else {
+            panic!("move command")
+        };
+        assert_eq!((src, dst), (0x0101, 0x0401));
+        assert!(harness.pool.reserve_drive(&drive_key).is_err());
+        reply
+            .send(Err(Status::failed_precondition(
+                "destination slot unavailable",
+            )))
+            .expect("move reply");
+        let error = tokio::time::timeout(Duration::from_secs(1), caller)
+            .await
+            .expect("dismount deadline")
+            .expect("dismount joins")
+            .expect_err("move fails");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        for text in [
+            "OLD001L9",
+            "unthreaded",
+            "0x0101",
+            "0x0401",
+            "destination slot unavailable",
+        ] {
+            assert!(error.message().contains(text), "missing {text}: {error}");
+        }
+        drop(
+            harness
+                .pool
+                .reserve_drive(&drive_key)
+                .expect("failed move releases bay"),
+        );
+        assert!(
+            harness.drive_rx.try_recv().is_err(),
+            "no extra drive command"
+        );
+        assert!(
+            harness.changer_rx.try_recv().is_err(),
+            "no extra changer command"
+        );
+    }
+
+    #[tokio::test]
+    async fn dismount_does_not_start_its_unload_once_shutdown_has_begun() {
+        let drive_key = crate::drive_pool::DriveKey::new("LIB001", 0x0101);
+        for reason in [DismountReason::IdleTimeout, DismountReason::Evicted] {
+            let mut harness = dismount_harness(0);
+            let reservation = harness
+                .pool
+                .reserve_drive(&drive_key)
+                .expect("reserve idle bay");
+            harness.pool.begin_shutdown();
+
+            let err = tokio::time::timeout(
+                Duration::from_secs(1),
+                dismount_reserved_cartridge(
+                    &harness.state,
+                    &harness.pool,
+                    &harness.seated,
+                    reason,
+                    reservation,
+                ),
+            )
+            .await
+            .expect("shutdown guard completes within the deadline")
+            .expect_err("no new dismount starts once shutdown has begun");
+
+            assert_eq!(err.code(), tonic::Code::Unavailable, "{err}");
+            assert!(
+                harness.drive_rx.try_recv().is_err(),
+                "{reason:?} dismount must not send SSC UNLOAD after shutdown began"
+            );
+            assert!(harness.changer_rx.try_recv().is_err());
+            drop(
+                harness
+                    .pool
+                    .reserve_drive_for_shutdown(&drive_key)
+                    .expect("the refused dismount releases the bay for the shutdown pass"),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dismount_finishes_its_move_when_the_caller_goes_away() {
+        let drive_key = crate::drive_pool::DriveKey::new("LIB001", 0x0101);
+        let mut harness = dismount_harness(0);
+        let reservation = harness
+            .pool
+            .reserve_drive(&drive_key)
+            .expect("reserve idle bay");
+        let (state, pool, seated) = (
+            harness.state.clone(),
+            harness.pool.clone(),
+            harness.seated.clone(),
+        );
+        let caller = tokio::spawn(async move {
+            dismount_reserved_cartridge(
+                &state,
+                &pool,
+                &seated,
+                DismountReason::Evicted,
+                reservation,
+            )
+            .await
+        });
+        let Some(crate::write_owner::DriveCommand::Unload { reply }) =
+            tokio::time::timeout(Duration::from_secs(1), harness.drive_rx.recv())
+                .await
+                .expect("unload arrives within the deadline")
+        else {
+            panic!("dismount must issue drive unload first");
+        };
+
+        // The eviction's RPC goes away while the drive is unloading.
+        caller.abort();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), caller)
+                .await
+                .expect("cancelled caller joins")
+                .is_err(),
+            "caller future was cancelled"
+        );
+        reply
+            .send(Ok(Duration::from_millis(7)))
+            .expect("the detached dismount still awaits the unload");
+
+        let Some(crate::write_owner::ChangerCommand::Move { src, dst, reply }) =
+            tokio::time::timeout(Duration::from_secs(1), harness.changer_rx.recv())
+                .await
+                .expect("move arrives within the deadline")
+        else {
+            panic!("the move home must follow the unload");
+        };
+        assert_eq!((src, dst), (0x0101, 0x0401));
+        assert!(
+            harness.pool.reserve_drive(&drive_key).is_err(),
+            "the bay stays reserved until the move finishes"
+        );
+        reply.send(Ok(())).expect("move reply receiver");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(reservation) = harness.pool.reserve_drive(&drive_key) {
+                    drop(reservation);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the finished dismount releases the bay");
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_an_in_flight_dismount_to_finish_its_move() {
+        let drive_key = crate::drive_pool::DriveKey::new("LIB001", 0x0101);
+        let mut harness = dismount_harness(0);
+        let reservation = harness
+            .pool
+            .reserve_drive(&drive_key)
+            .expect("reserve idle bay");
+        let (state, pool, seated) = (
+            harness.state.clone(),
+            harness.pool.clone(),
+            harness.seated.clone(),
+        );
+        let idle = tokio::spawn(async move {
+            dismount_reserved_cartridge(
+                &state,
+                &pool,
+                &seated,
+                DismountReason::IdleTimeout,
+                reservation,
+            )
+            .await
+            .map(drop)
+        });
+        let Some(crate::write_owner::DriveCommand::Unload { reply }) =
+            harness.drive_rx.recv().await
+        else {
+            panic!("dismount must issue drive unload first");
+        };
+
+        // SIGTERM arrives while the drive is unloading.
+        let shutdown_state = harness.state.clone();
+        let shutdown = tokio::spawn(async move { shutdown_drive_pool(&shutdown_state).await });
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown must not finish between the unload and the move"
+        );
+
+        reply
+            .send(Ok(Duration::from_millis(7)))
+            .expect("unload reply receiver");
+        let Some(crate::write_owner::ChangerCommand::Move { src, dst, reply }) =
+            harness.changer_rx.recv().await
+        else {
+            panic!("the move home must follow the unload");
+        };
+        assert_eq!((src, dst), (0x0101, 0x0401));
+        // The changer actor publishes the moved inventory before it replies.
+        let home = test_library(
+            vec![drive_bay(0x0101, false, None)],
+            vec![slot(0x0401, "OLD001L9")],
+        );
+        *harness
+            .state
+            .library_snapshot
+            .as_ref()
+            .expect("library snapshot")
+            .write()
+            .expect("snapshot lock") = std::sync::Arc::new(crate::live_status::LibrarySnapshot {
+            report: remanence_library::DiscoveryReport {
+                unattached_drives: Vec::new(),
+                complete: true,
+                incomplete_evidence: Vec::new(),
+                libraries: vec![home],
+                warnings: Vec::new(),
+            },
+            captured_at: time::OffsetDateTime::UNIX_EPOCH,
+        });
+        reply.send(Ok(())).expect("move reply receiver");
+
+        idle.await
+            .expect("idle dismount task joins")
+            .expect("idle dismount finishes");
+        tokio::time::timeout(Duration::from_secs(2), shutdown)
+            .await
+            .expect("shutdown finishes once the move is done")
+            .expect("shutdown task joins")
+            .expect("shutdown succeeds");
+        assert!(
+            harness.drive_rx.try_recv().is_err(),
+            "shutdown must not unload the cartridge a second time"
+        );
     }
 
     #[test]

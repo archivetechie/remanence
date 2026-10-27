@@ -21,6 +21,7 @@ use super::cleaning::run_cleaning_sequence;
 use super::readiness::{
     poll_drive_media_readiness, record_session_open_readiness_poll_transition,
     session_open_media_family, session_open_readiness_state, session_open_readiness_summary,
+    DriveReadinessPoll,
 };
 use super::reconcile::publish_running;
 use super::{LOAD_READY_POLL_INTERVAL, LOAD_READY_TIMEOUT};
@@ -282,18 +283,24 @@ pub(crate) fn run_load_sequence(
     let mut drive = library
         .open_drive(bay, &cfg.policy)
         .map_err(|error| format!("open drive 0x{bay:04x} for readiness wait: {error}"))?;
+    // The changer just moved the cartridge into this bay, so it is
+    // physically in the drive.
     let poll = poll_drive_media_readiness(
         index,
         &mut drive,
-        operation_id,
-        family,
-        MediaReadinessWaitOptions {
-            wait: true,
-            timeout: LOAD_READY_TIMEOUT,
-            poll_interval: LOAD_READY_POLL_INTERVAL,
+        DriveReadinessPoll {
+            bay,
+            operation_id,
+            family,
+            options: MediaReadinessWaitOptions {
+                wait: true,
+                timeout: LOAD_READY_TIMEOUT,
+                poll_interval: LOAD_READY_POLL_INTERVAL,
+            },
+            cartridge_in_drive: true,
+            phase: "load_drive_readiness",
         },
         handle,
-        "load_drive_readiness",
     )?;
     if !poll.readiness.is_ready() {
         let state = if poll.timed_out {

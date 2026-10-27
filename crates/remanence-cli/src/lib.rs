@@ -80,7 +80,7 @@ use remanence_library::{
     DriveBay, DriveHandle, DriveHandleSource, ElementException, FileBlockSink, FileBlockSource,
     IePort, IoErrorKind, Library, MediaFamily, MediaReadiness, MediaReadinessWaitEvent,
     MediaReadinessWaitOptions, OpenError, Slot, StaticAllowlist, TapeAlerts, TapeConfig,
-    VecBlockSource, WormMediaState,
+    VecBlockSource, WormMediaState, MEDIA_READINESS_MAX_INITIALIZING_LOADS,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -8067,6 +8067,27 @@ fn find_media_readiness_quarantine<'a>(
     }
 }
 
+/// Sense key, ASC and ASCQ of the last observation a readiness record
+/// stores, when all three are present.
+fn media_readiness_record_sense(
+    record: &remanence_state::MediaReadinessOperationRecord,
+) -> Option<(u8, u8, u8)> {
+    let field = |value: Option<i64>| value.and_then(|value| u8::try_from(value).ok());
+    Some((
+        field(record.last_sense_key)?,
+        field(record.last_asc)?,
+        field(record.last_ascq)?,
+    ))
+}
+
+/// `KK/AA/QQ (name)` label of a readiness record's last sense.
+fn media_readiness_record_sense_label(
+    record: &remanence_state::MediaReadinessOperationRecord,
+) -> Option<String> {
+    media_readiness_record_sense(record)
+        .map(|(key, asc, ascq)| remanence_library::media_readiness_sense_label(key, asc, ascq))
+}
+
 fn media_readiness_record_json(record: &remanence_state::MediaReadinessOperationRecord) -> Value {
     let mut value = json!({
         "quarantine_id": media_readiness_quarantine_id(record),
@@ -8096,6 +8117,10 @@ fn media_readiness_record_json(record: &remanence_state::MediaReadinessOperation
         "last_sense_key": record.last_sense_key,
         "last_asc": record.last_asc,
         "last_ascq": record.last_ascq,
+        "last_sense": media_readiness_record_sense(record)
+            .map(|(key, asc, ascq)| format!("{key:02x}/{asc:02x}/{ascq:02x}")),
+        "last_sense_name": media_readiness_record_sense(record)
+            .and_then(|(_, asc, ascq)| remanence_library::media_readiness_sense_name(asc, ascq)),
         "last_host_status": record.last_host_status,
         "last_driver_status": record.last_driver_status,
         "target_status": record.target_status,
@@ -8140,7 +8165,7 @@ fn print_tape_quarantine_list(
     for record in records {
         let _ = writeln!(
             out,
-            "{} operation={} {} barcode={} state={} updated={}",
+            "{} operation={} {} barcode={} state={}{} updated={}",
             media_readiness_quarantine_id(record),
             record.operation_id,
             match &record.endpoint {
@@ -8153,6 +8178,9 @@ fn print_tape_quarantine_list(
             },
             record.barcode.as_deref().unwrap_or("(unknown)"),
             record.state,
+            media_readiness_record_sense_label(record)
+                .map(|label| format!(" sense={label}"))
+                .unwrap_or_default(),
             record.updated_at_utc
         );
     }
@@ -8197,6 +8225,10 @@ fn print_tape_quarantine_show(
         record.barcode.as_deref().unwrap_or("(unknown)")
     );
     let _ = writeln!(out, "state: {}", record.state);
+    if let Some(label) = media_readiness_record_sense_label(record) {
+        let _ = writeln!(out, "last_sense: {label}");
+    }
+    let _ = writeln!(out, "phase: {}", record.phase);
     let _ = writeln!(
         out,
         "dirty_scope: {}",
@@ -8250,7 +8282,7 @@ fn media_readiness_admission_error(
         return "internal error: media-readiness admission called without conflicts".to_string();
     };
     format!(
-        "{action} is blocked by active media-readiness fence {} operation={} {} barcode={} state={}; run `rem tape quarantine show {}` or wait-ready/resume before retrying",
+        "{action} is blocked by active media-readiness fence {} operation={} {} barcode={} state={}{}; run `rem tape quarantine show {}` or wait-ready/resume before retrying",
         media_readiness_quarantine_id(first),
         first.operation_id,
         match &first.endpoint {
@@ -8259,6 +8291,9 @@ fn media_readiness_admission_error(
             },
         first.barcode.as_deref().unwrap_or("(unknown)"),
         first.state,
+        media_readiness_record_sense_label(first)
+            .map(|label| format!(" sense={label}"))
+            .unwrap_or_default(),
         media_readiness_quarantine_id(first)
     )
 }
@@ -9241,9 +9276,27 @@ fn run_tape_wait_ready_hardware(
         message,
         exit_code: 130,
     })?;
+    // Changer inventory must show the cartridge in this drive before the
+    // wait may send its one initializing SSC LOAD; the operation's durable
+    // history bounds it to one LOAD until the drive reports ready.
+    let cartridge_in_drive = library
+        .drive_bays
+        .iter()
+        .any(|bay| bay.element_address == drive_element && bay.loaded);
+    let load_budget = if cartridge_in_drive {
+        catalog
+            .media_readiness_load_attempts_since_ready(operation_id)
+            .map(|attempts| MEDIA_READINESS_MAX_INITIALIZING_LOADS.saturating_sub(attempts))
+            .map_err(|error| TapeWaitReadyFailure {
+                message: format!("count media readiness LOAD attempts: {error}"),
+                exit_code: 1,
+            })?
+    } else {
+        0
+    };
     let initial = drive.probe_media_readiness(family);
     let poll = drive
-        .wait_for_media_readiness(
+        .wait_for_media_readiness_with_initializing_load(
             family,
             Some(initial),
             MediaReadinessWaitOptions {
@@ -9251,6 +9304,7 @@ fn run_tape_wait_ready_hardware(
                 timeout: args.timeout,
                 poll_interval: args.poll,
             },
+            load_budget,
             || signal_guard.requested_signal_name().map(ToOwned::to_owned),
             |event| match event {
                 MediaReadinessWaitEvent::Poll(observed) => {
@@ -9263,6 +9317,30 @@ fn run_tape_wait_ready_hardware(
                         catalog,
                         media_readiness_transition_input(operation_id, "wait_ready_tur", &observed),
                     )
+                }
+                MediaReadinessWaitEvent::InitializingLoad(observed) => {
+                    TapeInitStateOps::record_media_readiness_transition(
+                        catalog,
+                        media_readiness_initializing_load_transition(
+                            operation_id,
+                            &observed.readiness,
+                        ),
+                    )
+                }
+                MediaReadinessWaitEvent::InitializingLoadFailed { readiness, detail } => {
+                    let failed = MediaReadinessPoll {
+                        readiness: readiness.clone(),
+                        attempts: 0,
+                        timed_out: false,
+                    };
+                    let mut transition = media_readiness_transition_input(
+                        operation_id,
+                        INITIALIZING_LOAD_PHASE,
+                        &failed,
+                    );
+                    transition.last_cdb_opcode = Some(0x1b);
+                    transition.last_error_json = Some(json!({ "detail": detail }).to_string());
+                    TapeInitStateOps::record_media_readiness_transition(catalog, transition)
                 }
                 MediaReadinessWaitEvent::Cancelled(signal) => {
                     record_media_readiness_signal_transition(
@@ -9832,6 +9910,38 @@ fn media_readiness_transition_input(
     }
 }
 
+/// Phase of the write-ahead transition `tape wait-ready` records before the
+/// SSC LOAD it sends when the drive asks for an initializing command.
+#[cfg(target_os = "linux")]
+const INITIALIZING_LOAD_PHASE: &str = "initializing_command_load";
+
+/// Write-ahead transition for the initializing SSC LOAD: `pre_ready_loading`
+/// with opcode `1Bh` and the sense that asked for it. The LOAD budget counts
+/// this row.
+#[cfg(target_os = "linux")]
+fn media_readiness_initializing_load_transition(
+    operation_id: Uuid,
+    observed: &MediaReadiness,
+) -> remanence_state::MediaReadinessTransitionInput {
+    let sense = observed.sense();
+    let label = sense
+        .map(|(key, asc, ascq)| remanence_library::media_readiness_sense_label(key, asc, ascq))
+        .unwrap_or_else(|| "an initializing-command request".to_string());
+    let mut transition = media_readiness_mechanical_transition(
+        operation_id,
+        INITIALIZING_LOAD_PHASE,
+        "pre_ready_loading",
+        Some(0x1b),
+        Some(format!(
+            "TEST UNIT READY reported {label}; sending one SSC LOAD"
+        )),
+    );
+    transition.last_sense_key = sense.map(|(key, _, _)| key);
+    transition.last_asc = sense.map(|(_, asc, _)| asc);
+    transition.last_ascq = sense.map(|(_, _, ascq)| ascq);
+    transition
+}
+
 fn media_readiness_mechanical_transition(
     operation_id: Uuid,
     phase: &str,
@@ -10166,7 +10276,7 @@ fn readiness_requires_conditional_load(
     readiness: &MediaReadiness,
     conditional_load_on_no_medium: bool,
 ) -> bool {
-    matches!(readiness, MediaReadiness::BecomingReady { ascq: 0x02, .. })
+    readiness.requires_initializing_command()
         || (conditional_load_on_no_medium && matches!(readiness, MediaReadiness::NoMedium { .. }))
 }
 
@@ -11831,6 +11941,9 @@ fn media_family_for_init_generation(generation: remanence_api::LtoGen) -> MediaF
 fn describe_media_readiness(readiness: &MediaReadiness) -> String {
     match readiness {
         MediaReadiness::Ready => "ready".to_string(),
+        MediaReadiness::BecomingReady { ascq: 0x02, .. } => {
+            "drive asks for an initializing command (TEST UNIT READY sense 02/04/02); the cartridge sits unthreaded in the drive until an SSC LOAD arrives".to_string()
+        }
         MediaReadiness::BecomingReady {
             ascq,
             media_initializing,
@@ -19253,6 +19366,99 @@ mod tests {
         }
     }
 
+    /// The CLI wait route uses inventory to deny LOAD for an unlabelled fence.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tape_wait_ready_without_inventory_sends_no_load() {
+        use remanence_chaos::model::{ModelTransport, VirtualTape, VirtualWorld};
+        use std::sync::{Arc, Mutex};
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut index =
+            remanence_state::CatalogIndex::open(temp.path().join("state.sqlite")).expect("catalog");
+        let operation_id = Uuid::new_v4();
+        index
+            .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+                operation_id,
+                run_id: None,
+                endpoint: remanence_state::DriveKey::new("LIB-WAIT".to_string(), 0x0100),
+                changer_sg: None,
+                drive_sg: None,
+                drive_serial: Some("DRV-WAIT".to_string()),
+                barcode: None,
+                source_slot: None,
+                media_generation: Some(9),
+                phase: "readiness_poll".to_string(),
+                state: "media_initializing".to_string(),
+                dirty_scope: Some("drive+tape".to_string()),
+                deadline_at_utc: None,
+                evidence_path: None,
+            })
+            .expect("record fence");
+        let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
+            "LIB-WAIT", 0x0100, "DRV-WAIT", 0x0400, 1,
+        )));
+        let mut library = {
+            let mut world = world.lock().unwrap();
+            world.put_tape_in_drive(0x0100, "WAIT001L9", Some(0x0400), VirtualTape::default());
+            world.leave_cartridge_unthreaded(0x0100);
+            world.library_snapshot()
+        };
+        library.drive_bays[0].loaded = false;
+        library.drive_bays[0].loaded_tape = None;
+        let factory_world = Arc::clone(&world);
+        TEST_CLI_TRANSPORT_FACTORY.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(move |path| {
+                let role = factory_world
+                    .lock()
+                    .unwrap()
+                    .role_for_path(path)
+                    .expect("model path");
+                Ok(Box::new(ModelTransport::new(
+                    Arc::clone(&factory_world),
+                    role,
+                )))
+            }));
+        });
+        let policy = StaticAllowlist::new(["LIB-WAIT"]);
+        let args = TapeWaitReadyArgs {
+            resume: Some(operation_id),
+            barcode: None,
+            drive_element: None,
+            already_loaded: false,
+            wait: true,
+            timeout: StdDuration::ZERO,
+            poll: StdDuration::ZERO,
+            config: temp.path().join("config.toml"),
+            library: Some("LIB-WAIT".to_string()),
+            json: false,
+        };
+        let result = run_tape_wait_ready_hardware(&library, &policy, &args, &mut index)
+            .unwrap_or_else(|failure| panic!("wait route fails: {}", failure.message));
+        TEST_CLI_TRANSPORT_FACTORY
+            .with(|slot| assert!(slot.borrow().is_none(), "route opens model transport"));
+        assert!(result.timed_out);
+        assert!(result.readiness.requires_initializing_command());
+        assert_eq!(
+            world
+                .lock()
+                .unwrap()
+                .command_log
+                .iter()
+                .filter(|command| command.opcode == 0x1b)
+                .count(),
+            0
+        );
+        assert_eq!(
+            index
+                .media_readiness_operation(operation_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "timeout_unknown"
+        );
+    }
+
     #[test]
     fn tape_wait_ready_new_barcode_refuses_active_media_readiness_fence() {
         let temp = tempfile::Builder::new()
@@ -19581,6 +19787,89 @@ mod tests {
         assert!(error.contains(operation_id.to_string().as_str()));
         assert!(error.contains("AOX032L9"));
         assert!(error.contains("media_initializing"));
+    }
+
+    #[test]
+    fn quarantine_list_and_show_name_the_drive_not_ready_reason() {
+        let operation_id = Uuid::from_u128(0xdef);
+        let mut record = remanence_state::MediaReadinessOperationRecord {
+            operation_id: operation_id.to_string(),
+            run_id: None,
+            endpoint: remanence_state::DriveKey::new("LIB-A", 1),
+            library_serial: Some("LIB-A".to_string()),
+            changer_sg: None,
+            drive_element: Some(0x0001),
+            drive_sg: None,
+            drive_serial: Some("DRV1".to_string()),
+            barcode: Some("AOX033L9".to_string()),
+            source_slot: Some(0x03ed),
+            media_generation: Some(9),
+            phase: "startup_reconcile_tur".to_string(),
+            state: "media_initializing".to_string(),
+            dirty_scope: Some("drive+tape".to_string()),
+            started_at_utc: "2026-10-27T00:00:00Z".to_string(),
+            updated_at_utc: "2026-10-27T00:01:00Z".to_string(),
+            deadline_at_utc: None,
+            last_cdb_opcode: Some(0),
+            last_sense_raw: None,
+            last_sense_key: Some(2),
+            last_asc: Some(4),
+            last_ascq: Some(2),
+            last_host_status: None,
+            last_driver_status: None,
+            target_status: None,
+            transport_class: None,
+            cancel_source: None,
+            signal: None,
+            evidence_path: None,
+            last_error_json: None,
+            quarantine_id: None,
+        };
+
+        let value = media_readiness_record_json(&record);
+        assert_eq!(value["state"], "media_initializing");
+        assert_eq!(value["last_sense_key"], 2);
+        assert_eq!(value["last_asc"], 4);
+        assert_eq!(value["last_ascq"], 2);
+        assert_eq!(value["last_sense"], "02/04/02");
+        assert_eq!(value["last_sense_name"], "initializing command required");
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        print_tape_quarantine_list(std::slice::from_ref(&record), false, &mut out, &mut err);
+        let listed = String::from_utf8(out).expect("utf8 list");
+        assert!(
+            listed.contains(
+                "state=media_initializing sense=02/04/02 (initializing command required) updated="
+            ),
+            "{listed}"
+        );
+        let mut out = Vec::new();
+        print_tape_quarantine_show(&record, false, &mut out, &mut err);
+        let shown = String::from_utf8(out).expect("utf8 show");
+        assert!(
+            shown.contains("last_sense: 02/04/02 (initializing command required)"),
+            "{shown}"
+        );
+        let blocked = media_readiness_admission_error("tape init", std::slice::from_ref(&record));
+        assert!(
+            blocked.contains(
+                "state=media_initializing sense=02/04/02 (initializing command required);"
+            ),
+            "{blocked}"
+        );
+
+        record.last_sense_key = None;
+        let value = media_readiness_record_json(&record);
+        assert!(value["last_sense"].is_null());
+        assert!(value["last_sense_name"].is_null());
+        let mut out = Vec::new();
+        print_tape_quarantine_list(std::slice::from_ref(&record), false, &mut out, &mut err);
+        let listed = String::from_utf8(out).expect("utf8 list");
+        assert!(
+            listed.contains("state=media_initializing updated="),
+            "{listed}"
+        );
     }
 
     #[test]

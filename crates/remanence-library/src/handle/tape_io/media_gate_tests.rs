@@ -628,7 +628,8 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
             "remanence-chaos/src/model.rs",
             DispatchPolicy::Exact {
                 execute_out: 12,
-                execute_none: 9,
+                // Six calls exercise the opt-in UNLOAD state and dismount pair.
+                execute_none: 15,
                 why: "in-memory virtual-world SgTransport model and its \
                       tests; no real device behind it",
             },
