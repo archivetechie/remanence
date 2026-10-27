@@ -670,6 +670,14 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
                 why: "mounted-reader tests forward through an in-memory ModelTransport; no real device",
             },
         ),
+        (
+            "remanence-cli/src/tape_read_rate.rs",
+            DispatchPolicy::Exact {
+                execute_out: 1,
+                execute_none: 1,
+                why: "read-rate test transport forwards MODE SELECT and positioning to an in-memory ModelTransport; no hardware transport",
+            },
+        ),
         // Frozen P1 model-only fault-injection forwarders.
         ("remanence-api/tests/oracle_standalone_mount.rs", DispatchPolicy::Exact { execute_out: 1, execute_none: 2, why: "P1 model fault-injection forwarder" }),
         ("remanence-cli/tests/standalone_dispatch.rs", DispatchPolicy::Exact { execute_out: 2, execute_none: 2, why: "integration model and source-mutation transport forwarders; no production dispatch" }),

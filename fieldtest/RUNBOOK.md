@@ -290,6 +290,7 @@ The management questions: what happens when it breaks?
 | 4.4 | `40-faults.sh wrong-tape` | 🖐 swap two allowlisted tapes between slots (or via `rem-debug move`), then attempt a write — must refuse with an identity mismatch, never overwrite |
 | 4.5 | `40-faults.sh crash-clean` | if the CLN cart is still available: kill the daemon mid-clean (once the changer shows the CLN cart in the drive), restart, watch startup reconciliation resolve the run (the DS-M2 crash-resume path on real robotics) |
 | 4.6 | `34-verify-throughput.sh` | full verification timing, phase split, command latency and same-tape deltas |
+| 4.7 | `35-read-rate.sh` | forward READ filemark gaps and SPACE seconds per GiB at two tape positions |
 
 ### 4.6 Full verification throughput
 
@@ -337,6 +338,65 @@ and a successful command. Missing timing or daemon diagnostics fails the leg.
 The diagnostic file contains only events appended during the command window;
 plain tmux lines are preserved in JSON `line` fields. Keep other verification
 clients idle during this leg because daemon events do not include a tape UUID.
+
+### 4.7 Read through filemarks and space over files
+
+Run after writes or full verification, before fault exercises, with other clients
+idle. The default selects the same first sealed tape as leg 34. An exact barcode
+also accepts a ready tape with committed files. The leg captures idle inventory
+and catalog, then calls `03-bringup.sh --stop`. The daemon must be stopped for
+measurement; the command refuses a held state lock. The leg leaves it stopped.
+
+```bash
+FIELD_READ_RATE_FILES=20 ./scripts/35-read-rate.sh --barcode <barcode>
+./scripts/03-bringup.sh
+```
+
+Each window covers `FIELD_READ_RATE_FILES` files (default 20), first from file 1,
+then near the midpoint of `last_committed_tape_file`. File 0 holds Bootstrap.
+The midpoint start is clamped to `last_committed_tape_file - count`, leaving
+a committed next file for the final boundary gap. Full coverage requires
+`last_committed_tape_file >= count + 2`. On shorter tapes the leg reduces the
+count to what fits and records successful runs as partial measurements (`INFO`),
+with the requested count and `partial: true` in the selection JSON. If only one
+start fits, it runs that window once; a one-file tape has no final gap.
+Each window runs `read`, then `space`. READ uses the strict
+verification batch size without retry seeks. A single-record READ after each
+filemark timestamps the next file's first block, including one final lookahead
+record excluded from byte totals. Gaps include READ POSITION and host overhead;
+a batch containing the last block can also contain the filemark completion.
+Per-file `filemark_read_seconds` includes any stop/reposition delay inside that
+READ. Compare it with `median_batch_read_seconds`, the median of all READ
+durations in that file, including the initial single-record and terminal READs.
+Empty files and missing next records have null gaps. SPACE position deltas
+include a filemark; seconds per GiB uses data bytes with that filemark removed.
+
+Budget about 20–30 minutes on a 36 GB tape for the four measurements and mount
+cycles. This is a planning allowance, not a measured read-rate result: file
+sizes, drive readiness and boundary stops determine elapsed time.
+`FIELD_READ_RATE_TIMEOUT_SECONDS` defaults to 14400 per measurement.
+Evidence lands under `evidence/35-read-rate/`: timestamped catalog, bays,
+selection and library JSON, plus `*-read-from-1.json`, `*-space-from-1.json` and
+the corresponding midpoint outputs. `evidence/records.jsonl` links each result.
+Medium errors, wrong lengths and EOD during requested files retain partial
+counts and an outcome; these command results exit 0 with `ok: false`, fail the
+leg, and allow the remaining measurements to run. An EOD or other outcome in
+the final `lookahead` does not change a completed measurement's outcome.
+A non-zero exit (command error, cleanup error or timeout) skips all remaining
+measurements. Inspect the saved output and cartridge location before retrying.
+A timeout's SIGTERM can bypass cleanup, leaving the tape mounted with fixed
+block mode set. In that case, use the selected library serial and occupied bay
+to unload before restarting the daemon:
+
+```bash
+rem-debug --allow <SERIAL> unload --bay <BAY> <SERIAL>
+./scripts/03-bringup.sh
+```
+
+The unload uses the bay's recorded source slot as its destination.
+For a daemon that is already stopped, set both `FIELD_READ_RATE_CATALOG` and
+`FIELD_READ_RATE_BAYS` to catalog and top snapshots from this tape population.
+The leg checks live barcode/home-slot identity again before measuring.
 
 **Every red result here is still evidence** — capture it, note it, move
 on. A refused unsafe operation is a PASS.

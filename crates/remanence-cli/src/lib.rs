@@ -116,6 +116,7 @@ pub mod resume_vectors;
 #[doc(hidden)]
 pub mod tape_image_vectors;
 mod tape_inventory;
+mod tape_read_rate;
 mod terminal_index_drill;
 #[cfg(feature = "tui")]
 mod top;
@@ -795,6 +796,9 @@ fn state_changing_target(cmd: &Command) -> Option<&str> {
         Command::Tape {
             command: TapeCommand::BotProbe(args),
         } => Some(args.library.as_str()),
+        Command::Tape {
+            command: TapeCommand::ReadRate(args),
+        } => Some(args.address.library.as_str()),
         Command::Tape {
             command: TapeCommand::AdoptBootstrap(args),
         } => Some(args.library.as_str()),
@@ -1691,6 +1695,12 @@ enum TapeCommand {
     #[command(name = "bot-probe")]
     BotProbe(TapeBotProbeArgs),
 
+    /// Measure forward fixed READs and SPACE across tape files.
+    ///
+    /// Medium error, wrong length and end of data during measurement exit 0 with
+    /// ok: false and the outcome in JSON. Command or cleanup errors exit non-zero.
+    ReadRate(tape_read_rate::TapeReadRateArgs),
+
     /// Adopt a checksum-valid existing Bootstrap without writing tape.
     #[command(name = "adopt-bootstrap")]
     AdoptBootstrap(TapeAdoptBootstrapArgs),
@@ -1730,6 +1740,7 @@ impl TapeCommand {
         match self {
             Self::RecoveryReport(args) => args.validate_before_discovery(),
             Self::BotProbe(args) => args.validate_before_discovery(),
+            Self::ReadRate(args) => args.validate_before_discovery(),
             Self::AdoptBootstrap(args) => args.validate_before_discovery(),
             Self::FreezeDrill(args) => args.validate_before_discovery(),
             Self::TerminalIndexDrill(args) => args.validate_before_discovery(),
@@ -1969,6 +1980,83 @@ fn run_bot_identity_hardware(
     mode: BotIdentityReadMode,
     expected_home_slot: u16,
 ) -> Result<PhysicalBotIdentityResult, String> {
+    with_bot_identity_drive(
+        library,
+        policy,
+        candidate,
+        drive_element,
+        expected_home_slot,
+        |drive, identity| {
+            with_temporary_bot_read_config(drive, |drive| {
+                let (classification, adoption) = match mode {
+                    BotIdentityReadMode::Probe => {
+                        let mut source = DriveHandleSource(drive);
+                        (
+                            remanence_api::probe_bot_identity_from_source(&mut source),
+                            None,
+                        )
+                    }
+                    BotIdentityReadMode::Adoption => {
+                        let mut source = DriveHandleSource(drive);
+                        let projection =
+                            remanence_api::classify_bootstrap_adoption_from_source(&mut source);
+                        let classification = match &projection.tail {
+                            remanence_api::BootstrapTailClassification::InvalidBot(
+                                classification,
+                            ) => classification.clone(),
+                            _ => {
+                                let payload = projection.payload.as_ref().ok_or_else(|| {
+                                    "valid Bootstrap tail classification lost its payload"
+                                        .to_string()
+                                })?;
+                                remanence_api::BotIdentityClassification::ValidRemBootstrap {
+                                    payload: payload.clone(),
+                                    physical_record_bytes: payload.block_size_bytes,
+                                    canonical_adoption_geometry:
+                                        remanence_api::has_canonical_adoption_geometry(payload),
+                                }
+                            }
+                        };
+                        (classification, Some(projection))
+                    }
+                };
+                Ok(PhysicalBotIdentityResult {
+                    library_serial: identity.library_serial,
+                    library_revision: identity.library_revision,
+                    voltag: identity.voltag,
+                    home_slot: identity.home_slot,
+                    drive_element: identity.drive_element,
+                    drive_serial: identity.drive_serial,
+                    configured_drive_compression: false,
+                    classification,
+                    adoption,
+                })
+            })
+        },
+    )
+}
+
+/// Mounted barcode identity shared by read-only tape diagnostics.
+#[cfg(target_os = "linux")]
+struct BotMountIdentity {
+    library_serial: String,
+    library_revision: String,
+    voltag: String,
+    home_slot: u16,
+    drive_element: u16,
+    drive_serial: String,
+}
+
+/// Mount an exact barcode, run a read-only operation and return it to its home slot.
+#[cfg(target_os = "linux")]
+fn with_bot_identity_drive<T>(
+    library: &Library,
+    policy: &StaticAllowlist,
+    candidate: TapeInitCandidate,
+    drive_element: u16,
+    expected_home_slot: u16,
+    operation: impl FnOnce(&mut DriveHandle, BotMountIdentity) -> Result<T, String>,
+) -> Result<T, String> {
     let voltag = candidate
         .voltag
         .clone()
@@ -2069,50 +2157,17 @@ fn run_bot_identity_hardware(
                 describe_media_readiness(&readiness.readiness)
             ));
         }
-        with_temporary_bot_read_config(&mut drive, |drive| {
-            let (classification, adoption) = match mode {
-                BotIdentityReadMode::Probe => {
-                    let mut source = DriveHandleSource(drive);
-                    (
-                        remanence_api::probe_bot_identity_from_source(&mut source),
-                        None,
-                    )
-                }
-                BotIdentityReadMode::Adoption => {
-                    let mut source = DriveHandleSource(drive);
-                    let projection =
-                        remanence_api::classify_bootstrap_adoption_from_source(&mut source);
-                    let classification = match &projection.tail {
-                        remanence_api::BootstrapTailClassification::InvalidBot(classification) => {
-                            classification.clone()
-                        }
-                        _ => {
-                            let payload = projection.payload.as_ref().ok_or_else(|| {
-                                "valid Bootstrap tail classification lost its payload".to_string()
-                            })?;
-                            remanence_api::BotIdentityClassification::ValidRemBootstrap {
-                                payload: payload.clone(),
-                                physical_record_bytes: payload.block_size_bytes,
-                                canonical_adoption_geometry:
-                                    remanence_api::has_canonical_adoption_geometry(payload),
-                            }
-                        }
-                    };
-                    (classification, Some(projection))
-                }
-            };
-            Ok(PhysicalBotIdentityResult {
+        operation(
+            &mut drive,
+            BotMountIdentity {
                 library_serial,
                 library_revision,
                 voltag,
                 home_slot,
                 drive_element,
                 drive_serial,
-                configured_drive_compression: false,
-                classification,
-                adoption,
-            })
-        })
+            },
+        )
     })();
 
     let park_result = handle
@@ -4432,6 +4487,9 @@ where
         if let Err(error) = command.validate_before_discovery() {
             let _ = writeln!(err, "error: {error}");
             return ExitCode::from(1);
+        }
+        if let TapeCommand::ReadRate(args) = command {
+            return tape_read_rate::run(args, out, err);
         }
         if let TapeCommand::RecoveryReport(args) = command {
             if args.source.is_dir() {
@@ -8881,6 +8939,7 @@ fn run_tape_command(
 ) -> ExitCode {
     match command {
         TapeCommand::BotProbe(args) => run_tape_bot_probe(report, args, out, err),
+        TapeCommand::ReadRate(_) => unreachable!("read-rate dispatches before discovery"),
         TapeCommand::AdoptBootstrap(args) => run_tape_adopt_bootstrap(report, args, out, err),
         TapeCommand::RecoveryReport(_) => {
             unreachable!("tape recovery report dispatched pre-discovery")
