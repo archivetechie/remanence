@@ -29,19 +29,24 @@ Two separate gates must both be open: your user needs to be in the `tape`
 group (that gates `open("/dev/sgN")`), and the binary needs
 `CAP_SYS_RAWIO` (that gates the filtered SG_IO opcodes). `INQUIRY` is
 whitelisted by the kernel, so `sg_inq` working proves nothing about the
-second gate.
+second gate. (`sg_inq` comes from `sg3-utils` on Debian/Ubuntu and `sg3_utils`
+on Fedora; Remanence itself does not use those tools.)
 
 **The capability vanished after a rebuild.** File capabilities live in
 xattrs on the binary's inode; `cargo build` replacing the binary drops
-them. Use `make rem-dev` after rebuilding (it rebuilds and re-runs
-`setcap`), and run the binary directly rather than through `cargo run`.
+them. After `cargo build --release`, rerun
+`sudo setcap cap_sys_rawio+ep target/release/rem`, and the same for
+`rem-debug` or `rem-daemon` if you run them directly. `make rem-dev` rebuilds
+and re-runs `setcap` in one step, but only for the debug binary
+`target/debug/rem`. Run the binary directly rather than through `cargo run`.
+`rem doctor` names the executable whose capability it checked.
 For the daemon under systemd, grant the capability in the unit instead:
 `AmbientCapabilities=CAP_SYS_RAWIO` plus
 `CapabilityBoundingSet=CAP_SYS_RAWIO`.
 
 **could not enumerate /dev/sg\*.** Directory-level permission problem;
-check that `/dev/sg*` nodes exist at all (no HBA, no VTL, or the module
-is not loaded).
+check that `/dev/sg*` nodes exist at all (no HBA, no VTL, or the `sg`
+kernel module is not loaded; `sudo modprobe sg` loads it).
 
 <!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-library/src/discovery.rs @ 4dc2a3c6 -->
 ## A standalone drive is missing or read-only

@@ -30,7 +30,9 @@ price. `rem` can operate one standalone LTO drive directly, with no changer and
 no daemon. A home or lab user can insert a cartridge, initialize it, write and
 restore files, finalize it, and verify it from the command line. The
 [standalone-drive guide](docs/guide-standalone-drive.md) is the shortest path
-to a first physical tape.
+to a first physical tape. Standalone mode has model-backed integration tests but
+has not yet run on a physical standalone drive; the
+[tested hardware](docs/status.md#tested-hardware) table lists what has.
 
 Long-term tape archiving is dominated by proprietary systems whose on-tape
 formats become unreadable when the vendor disappears, and by tools that treat
@@ -79,7 +81,8 @@ verify real material on your own equipment before you rely on it.
 <!-- code-anchor: Cargo.toml crates/remanence-api/build.rs crates/remanence-cli/src/archive_ingest.rs @ 6ed03ef0 -->
 ## Build
 
-Rust 1.88+, Linux. The default build needs no system packages; the protobuf
+Rust 1.88+, Linux, and a C compiler (`build-essential` on Debian/Ubuntu, `gcc`
+on Fedora). The default build needs no other system packages; the protobuf
 definitions are compiled in-process by protox, so `protoc` is not required:
 
 ```sh
@@ -115,7 +118,7 @@ environment variables documented in their test modules.
 <!-- code-anchor: crates/remanence-cli/src/lib.rs @ 6ed03ef0 -->
 ## Quickstart
 
-The native object format works against local files, no tape required. In the first command, replace `some-directory` with an existing directory that holds the files you want to archive:
+The native object format works against local files, no tape required. From the checkout, put the built binaries on your path with `export PATH="$PWD/target/release:$PATH"`. In the first command, replace `some-directory` with an existing directory that holds the files you want to archive:
 
 ```sh
 rem archive build --inputs some-directory --out demo.rem-object
