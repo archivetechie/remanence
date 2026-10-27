@@ -2808,6 +2808,48 @@ size), or against the supplied scheme and block size when the bootstrap is
 unreadable, and against the map entry's ordinal range; disagreement is
 `SchemeMismatch`.
 
+The order of the steps above is an order of precedence. It fixes which result
+decides, not the order in which blocks are read from the medium. A Recoverer
+may obtain the blocks the steps name in any physical order on the three
+conditions below. In particular, it may read the sidecar tape file forward
+once, from block 0 to the footer, retain blocks as they pass, and apply the
+steps to the retained blocks afterwards. The conditions are that the
+Recoverer:
+
+- continues past an unreadable record, or a record of the wrong length
+  (Section 3.5), by positioning to the block that follows it, rather than
+  ending its reading there;
+- places each block it obtains by a position the device reports, or that a
+  positioning command to that block establishes, carried forward only across
+  reads that each returned one whole block and established again from the
+  device after any read that did not;
+- reads at its position any block a step names that it has not obtained,
+  before that step uses the block or treats it as unreadable.
+
+Each step then uses the block at the position it names, and a block that could
+not be read at that position is unreadable to every step that names it. The
+decisions, and the copy health that step 1 records, are then the ones a
+Recoverer that reads the footer first reaches from the same blocks. When
+`total − 1 − P` is even and greater than zero, with `total` the map entry's
+block count and `H = (total − 1 − P) / 2`, every block that a step names from
+the map entry, from a directory entry, or from a footer or header copy whose
+parity shard block count is `P` lies in the first `H` blocks or the last
+`H + 1` blocks of the file. Retaining those blocks is then enough for the
+steps, and the third condition covers any other block a step names. A Verifier
+that acquires the index this way (Section 2.2) needs besides them only each
+parity shard's read outcome, with a CRC-64/XZ of each shard that reads as one
+block, to check and report the shards against the acquired index. It makes its
+reports of unreadable, invalid and divergent copies from the same blocks.
+
+*Rationale.* The footer decides because it records where each copy lies and
+the hash that both copies carry (Section 9.6). Reading it first lets a
+Recoverer that reads only part of the file place its reads without trusting
+either copy. A Recoverer that reads the whole file in order does not depend on
+a copy's fields to place the pass, so it needs no such order. On a linear tape,
+moving backward within a file costs far more than reading forward through it.
+A Verifier reads every block of every sidecar (Section 2.2), and by reading
+each sidecar this way it can avoid those moves.
+
 ### 13.4. Erasure Taxonomy
 
 For each stripe containing a failed block, gather the stripe's peers. Each
@@ -3931,6 +3973,16 @@ an errata revision of draft.1.
     that states what the reference implementation and the second
     implementation already did; `s6-13` pins it. No tape byte and no vector
     outcome changes.
+  - Section 13.3 now says that the order of its steps is an order of
+    precedence and not an order of reads. A Recoverer may read a sidecar tape
+    file forward once, retain the blocks the steps need and apply the steps
+    to them, provided it continues past unreadable records, places each block
+    by a position the device reports or a positioning command establishes,
+    and reads at its position any named block it has not obtained. It then
+    reaches the same decisions as one that reads the footer first. A
+    rationale paragraph gives the reason. This settles a reading the earlier
+    text left open, and a Recoverer that reads the footer first remains
+    conformant. No tape byte and no vector outcome changes.
 - **2026-08-11 — 1.0.0-draft.4 — replacement review draft.** Replaces the
   geometric/checkpoint-bootstrap design with one BOT Bootstrap and exactly
   three complete terminal index replicas separated by two typed extents.
