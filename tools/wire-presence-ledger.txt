@@ -199,3 +199,8 @@ VerificationIo.elapsed_ms  measured diagnostic; zero is an observed value within
 VerificationIo.backward_data_seeks  measured diagnostic; zero is an observed value within present io
 VerificationIo.protected_bytes  measured diagnostic; zero is an observed value within present io
 VerificationIo.recovered_unknown_addresses  measured diagnostic; zero is an observed value within present io
+
+# Verification timing: a phase that never runs spends no time.
+VerificationIoCounts.elapsed_ms     zero is honest when a phase never runs or spends less than one millisecond
+VerificationIoCounts.command_ms     zero is honest when a phase never runs or its commands total less than one millisecond
+VerificationIoCounts.max_command_ms zero is honest when a phase never runs or no command lasts one millisecond

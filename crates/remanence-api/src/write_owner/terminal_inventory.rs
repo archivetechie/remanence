@@ -569,7 +569,9 @@ pub(crate) fn handle_drive_verify_tape_index(
         .map_err(status_from_terminal_index_verification_error)?
     };
     let mut report = terminal_verification_to_proto(tape_uuid, outcome);
-    report.io = Some(verification_io_to_proto(io.finish()));
+    let io = io.finish();
+    log_verification_io(&io);
+    report.io = Some(verification_io_to_proto(io));
     prepared.append_provenance(&mut report.detail);
     Ok(report)
 }
@@ -957,6 +959,41 @@ pub(crate) const fn terminal_replica_failure_name(
     }
 }
 
+/// Emit the passive phase split on the drive actor after collection finishes.
+fn log_verification_io(io: &remanence_library::verification_io::VerificationIo) {
+    use remanence_library::verification_io::VerificationPhase;
+    for (phase, counts) in VerificationPhase::ALL
+        .into_iter()
+        .map(VerificationPhase::name)
+        .zip(&io.phases)
+        .chain(std::iter::once(("total", &io.total)))
+    {
+        let commands = counts.locate
+            + counts.space
+            + counts.read_position
+            + counts.single_read
+            + counts.batch_read
+            + counts.other;
+        if commands == 0 && phase != "total" {
+            continue;
+        }
+        tracing::info!(
+            target: "remanence_verify_diag",
+            phase,
+            elapsed_ms = counts.elapsed_ms,
+            command_ms = counts.command_ms,
+            max_command_ms = counts.max_command_ms,
+            commands,
+            batch_read = counts.batch_read,
+            locate = counts.locate,
+            space = counts.space,
+            read_position = counts.read_position,
+            bytes = counts.bytes,
+            "remanence_verify_diag",
+        );
+    }
+}
+
 /// Project only collected diagnostics; verdict conversion alone leaves io absent.
 fn verification_io_to_proto(
     io: remanence_library::verification_io::VerificationIo,
@@ -975,6 +1012,10 @@ fn verification_io_to_proto(
             hardware_batch_fallbacks: c.hardware_batch_fallbacks,
             recovered_reads: c.recovered_reads,
             algorithmic_fallback_epochs: c.algorithmic_fallback_epochs,
+            elapsed_ms: c.elapsed_ms,
+            command_ms: c.command_ms,
+            max_command_ms: c.max_command_ms,
+            command_latency_buckets: c.command_latency.to_vec(),
         }
     }
     pb::VerificationIo {

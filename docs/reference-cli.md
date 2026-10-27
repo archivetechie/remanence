@@ -379,7 +379,9 @@ verified clean.
 The verification JSON also carries `io`, a diagnostic object under the same
 `rem.tape.verify-index.v1` schema. It is present for complete, degraded and
 recovery-required results when the daemon collects it, and `null` when the
-daemon supplies none. Human output has one `io:` summary line. Counts and
+daemon supplies none. Human output has one `io:` summary line and one `io phase`
+line per phase that issues a command, with elapsed seconds, seconds inside
+commands, command count and slowest-command seconds. Counts, milliseconds and
 physical addresses in JSON are decimal strings. These measurements do not
 change the outcome or findings.
 
@@ -387,6 +389,19 @@ change the outcome or findings.
 `space`, `read_position`, `single_read`, `batch_read` and `other` commands;
 `records_requested` and `records_confirmed`; transport-reported `bytes`;
 `hardware_batch_fallbacks`; `algorithmic_fallback_epochs`; and `recovered_reads`.
+The same objects carry these timing fields:
+
+- `elapsed_ms`: wall milliseconds while the phase is current, excluding nested phases; `total` covers the whole collection.
+- `command_ms`: wall milliseconds inside transport dispatches, including unsuccessful attempts.
+- `max_command_ms`: milliseconds in the slowest command.
+- `command_latency_buckets`: six command counts for <5, [5,20), [20,100), [100,1000), [1000,10000), and >=10000 ms, in that order.
+
+Per-phase time inside commands (`command_ms`) against time between commands
+(`elapsed_ms - command_ms`) is the split operators use to tell drive motion
+and transfer waits from host work on the drive actor's thread. These wall times
+include transport overhead and scheduling waits. The daemon logs
+`remanence_verify_diag` INFO events per phase with commands and for `total`.
+
 Inline positioning commands and retries count. Fixed-mode reads of one record
 count as batches. Unclean batches contribute requested records and reported
 bytes, but only their successful single-record retries confirm records.

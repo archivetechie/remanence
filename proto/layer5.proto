@@ -1130,6 +1130,12 @@ message VerificationIoCounts {
   uint64 hardware_batch_fallbacks = 10;
   uint64 recovered_reads = 11;
   uint64 algorithmic_fallback_epochs = 12;
+  // Exclusive wall time in the phase; total covers the collection lifetime.
+  uint64 elapsed_ms = 13;
+  uint64 command_ms = 14;
+  uint64 max_command_ms = 15;
+  // Command durations in ms: <5, [5,20), [20,100), [100,1000), [1000,10000), >=10000.
+  repeated uint64 command_latency_buckets = 16;
 }
 message VerificationIoPhase {
   string phase = 1;
