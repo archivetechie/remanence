@@ -432,6 +432,34 @@ fn checkpoint_finalize_and_terminal_restore_share_the_production_funnels() {
     );
     mount.release(mounted);
 }
+/// Idle removal preserves the absent journal so adoption can import its authority.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adopted_idle_unload_preserves_journal_import() {
+    let root = tempfile::tempdir().unwrap();
+    let mut original = state(&root.path().join("original"));
+    let world = world();
+    let lock = root.path().join("locks");
+    let from = original.paths().journal_dir.clone();
+    let mut mount = backend(&mut original, &world, &lock, fault()).unwrap();
+    let mut mounted = mount.mount(target()).unwrap();
+    mount
+        .write_checkpointed(&mut mounted, request(root.path(), "first"))
+        .unwrap();
+    mount.release(mounted);
+    let mut adopted = adopted_state(&root.path().join("new-host"), crate::ParityConfig::None);
+    crate::write_owner::tests::unload_adopted_cartridge(&adopted, world.clone(), UUID).await;
+    {
+        let mut world = world.lock().unwrap();
+        world.drive_bays.insert(BAY, Some("HAND".into()));
+        world.slots[0].full = false;
+        world.slots[0].barcode = None;
+    }
+    let mut mount = backend(&mut adopted, &world, &lock, fault()).unwrap();
+    let mut mounted = mount.mount(target()).unwrap();
+    mount.import_journals(&mut mounted, &from).unwrap();
+    mount.release(mounted);
+}
+
 #[test]
 fn imported_checkpoint_authorizes_append_and_conflicting_import_is_refused() {
     let root = tempfile::tempdir().unwrap();
@@ -2187,6 +2215,16 @@ async fn epoch_removal_admission_failure_matrix() {
     let requested_case = std::env::var("REMOVAL_MATRIX_CASE").ok();
     let mut exercised = 0;
     for case in [
+        "replay_failure",
+        "journal_corrupt",
+        "open_tail_catalog_read",
+        "suffix_medium",
+        "suffix_scan_medium",
+        "open_admission_blank",
+        "open_admission_medium",
+        "open_admission_unit_attention",
+        "open_admission_not_ready",
+        "open_admission_timeout",
         "unit_attention",
         "timeout",
         "not_ready",
@@ -2312,15 +2350,29 @@ async fn epoch_removal_admission_failure_matrix() {
             .await;
             let log = std::fs::read_to_string(&log_path).unwrap();
             let log = &log[log_start..];
-            let expected = if case == "success" {
+            let expected = if matches!(
+                case,
+                "replay_failure" | "journal_corrupt" | "lease" | "finalize_lease" | "catalog_read"
+            ) {
+                "epoch_projection_failed"
+            } else if matches!(case, "open_admission_blank" | "open_admission_medium") {
+                "fenced removal leaves the epoch open"
+            } else if matches!(
+                case,
+                "suffix_medium"
+                    | "suffix_scan_medium"
+                    | "open_admission_unit_attention"
+                    | "open_admission_not_ready"
+                    | "open_admission_timeout"
+            ) {
+                "epoch_left_open"
+            } else if case == "success" {
                 ""
             } else if matches!(case, "post_projection" | "projection_busy") {
                 "durable epoch close follow-up fails"
             } else if matches!(
                 case,
-                "finalize_lease"
-                    | "mode_sense"
-                    | "catalog_read"
+                "mode_sense"
                     | "summary_mismatch"
                     | "unit_attention"
                     | "timeout"
@@ -2352,13 +2404,7 @@ async fn epoch_removal_admission_failure_matrix() {
                 "epoch_left_open"
             } else if matches!(
                 case,
-                "lease"
-                    | "tail"
-                    | "identity"
-                    | "read"
-                    | "medium"
-                    | "missing_checkpoint"
-                    | "late_barcode_fence"
+                "tail" | "identity" | "read" | "medium" | "late_barcode_fence"
             ) {
                 "epoch close fails before removal"
             } else if matches!(case, "barcode_fence" | "open_read" | "open_medium") {
@@ -2417,6 +2463,57 @@ async fn durable_session_close_survives_removal_after_projection_busy() {
         .await;
     }
     assert!(exercised > 0, "requested removal path does not exist");
+}
+
+/// Removal replays open checkpoints even when SQLite still describes closed or fresh media.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_checkpoint_survives_removal_after_projection_busy() {
+    check_open_checkpoint_removal(false, &["idle", "eviction", "shutdown"]).await;
+}
+
+/// A catalog row without a parity scheme skips removal projection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_parity_scheme_skips_removal_after_projection_busy() {
+    check_open_checkpoint_removal(true, &["idle", "eviction", "shutdown"]).await;
+}
+
+/// A pool-selection shared lease leaves a stale closed projection unknown at removal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_checkpoint_lease_audits_unknown_epoch_after_projection_busy() {
+    check_open_checkpoint_removal(false, &["shared_lease"]).await;
+}
+
+/// Exercise removal with an unprojected open checkpoint.
+async fn check_open_checkpoint_removal(fresh: bool, paths: &[&'static str]) {
+    for &path in paths {
+        let root = tempfile::tempdir().unwrap();
+        let parity = crate::ParityConfig::Scheme(remanence_parity::ParityScheme {
+            id: remanence_parity::SchemeId::new_static("seated"),
+            data_blocks_per_stripe: 4,
+            parity_blocks_per_stripe: 2,
+            stripes_per_neighborhood: 32,
+        });
+        let world = world();
+        set_rollback_bootstrap(&world, parity.clone());
+        let state = state_with_parity(root.path(), true, parity.clone());
+        crate::write_owner::tests::check_seated_parity_sessions(
+            &state,
+            world,
+            crate::SelectedTape {
+                standalone_endpoint: None,
+                pool_id: "default".into(),
+                tape_uuid: UUID,
+                block_size: BLOCK,
+                parity_config: parity,
+            },
+            false,
+            false,
+            false,
+            crate::write_owner::tests::RetentionInvalidation::StaleProjection(fresh, path),
+            false,
+        )
+        .await;
+    }
 }
 
 /// An epoch spans API sessions with multiple stripes and fills while the tape stays seated.

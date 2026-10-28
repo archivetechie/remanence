@@ -53,6 +53,8 @@ pub(crate) enum AdmissionError {
     Unproved(String),
     #[error(transparent)]
     Io(#[from] TapeIoError),
+    #[error("append suffix at LBA {start_lba}: {source}")]
+    SuffixIo { start_lba: u64, source: TapeIoError },
 }
 
 impl From<String> for AdmissionError {
@@ -126,7 +128,12 @@ pub(crate) fn admit_append_boundary(
         match drive.read_block(&mut block) {
             Err(e) if e.is_physical_eod() => return Ok(AppendSuffix::default()),
             Ok(_) | Err(TapeIoError::FilemarkEncountered) => {}
-            Err(e) => return Err(AdmissionError::Io(e)),
+            Err(source) => {
+                return Err(AdmissionError::SuffixIo {
+                    start_lba: boundary.lba,
+                    source,
+                })
+            }
         };
         prove_position(drive, boundary)?;
         let plan = match &authority {
@@ -141,7 +148,14 @@ pub(crate) fn admit_append_boundary(
             plan,
             ctx.terminal_prefix.as_ref(),
             ctx.inspect_all,
-        )?;
+        )
+        .map_err(|error| match error {
+            AdmissionError::Io(source) => AdmissionError::SuffixIo {
+                start_lba: boundary.lba,
+                source,
+            },
+            other => other,
+        })?;
         let mut found = suffix.objects.clone();
         found.extend(suffix.foreign_components.clone());
         if ctx
@@ -160,6 +174,11 @@ pub(crate) fn admit_append_boundary(
         Ok(suffix)
     })();
     let restored = prove_position(drive, ctx.write_position);
+    // A suffix read failure refuses admission even when it also invalidates the
+    // handle. Preserve its location after attempting cursor restoration.
+    if let Err(error @ AdmissionError::SuffixIo { .. }) = probe {
+        return Err(error);
+    }
     if drive.identity_generation() != generation {
         return Err(AdmissionError::Io(TapeIoError::IdentityInvalidated {
             proved: generation,
@@ -326,7 +345,10 @@ pub(crate) fn daemon_admission_error(
     error: AdmissionError,
 ) -> tonic::Status {
     let detail = error.to_string();
-    if matches!(error, AdmissionError::Io(_)) {
+    if matches!(
+        error,
+        AdmissionError::Io(_) | AdmissionError::SuffixIo { .. }
+    ) {
         return tonic::Status::unavailable(detail);
     }
     if let Err(e) = index.set_append_recovery_required(tape_uuid, true) {

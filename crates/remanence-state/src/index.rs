@@ -4308,6 +4308,30 @@ impl CatalogIndex {
                 .map_err(|err| sqlite_error("commit checkpoint extent projection", err))?;
             return Ok(());
         }
+        if replay_plan == CheckpointReplayPlan::InitializeGeometry {
+            let scheme = record
+                .scheme
+                .as_ref()
+                .expect("missing fresh parity geometry");
+            tx.execute(
+                "update tapes set scheme_id = ?2, data_blocks_per_stripe = ?3,
+                 parity_blocks_per_stripe = ?4, stripes_per_neighborhood = ?5
+                 where tape_uuid = ?1",
+                params![
+                    record.tape_uuid.to_vec(),
+                    scheme.id.as_str(),
+                    scheme.data_blocks_per_stripe,
+                    scheme.parity_blocks_per_stripe,
+                    scheme.stripes_per_neighborhood
+                ],
+            )
+            .map_err(|err| sqlite_error("restore fresh checkpoint geometry", err))?;
+        }
+        // Restoring missing geometry keeps strict prefix and object validation.
+        let strict_append = matches!(
+            replay_plan,
+            CheckpointReplayPlan::StrictAppend | CheckpointReplayPlan::InitializeGeometry
+        );
         for (projection, bundle) in projections.iter().zip(&object_bundles) {
             let tape_input = TapeJournalIndexInput {
                 tape_uuid: projection.copy.tape_uuid,
@@ -4315,7 +4339,7 @@ impl CatalogIndex {
                 scheme: record.scheme.clone(),
                 journal_offset_bytes: 0,
             };
-            if replay_plan == CheckpointReplayPlan::StrictAppend {
+            if strict_append {
                 validate_append_bundle_extension_tx(&tx, &tape_input, bundle)?;
                 validate_append_object_conflicts_tx(
                     &tx,
@@ -4346,7 +4370,7 @@ impl CatalogIndex {
                 scheme: record.scheme.clone(),
                 journal_offset_bytes: 0,
             };
-            if replay_plan == CheckpointReplayPlan::StrictAppend {
+            if strict_append {
                 validate_checkpoint_sidecar_extension_tx(&tx, &tape_input, barrier_bundle)?;
             }
             project_committed_tape_file_bundle_tx(
@@ -8203,6 +8227,7 @@ fn insert_native_object_file_projection_tx(
 enum CheckpointReplayPlan {
     AlreadyProjected,
     StrictAppend,
+    InitializeGeometry,
     Repair,
     RepairRetired,
 }
@@ -8585,6 +8610,7 @@ fn inspect_checkpoint_projection_tx(
     let mut record_component_visible = false;
     let mut last_committed_tape_file = None;
     let mut tape_is_retired = false;
+    let mut fresh_geometry_missing = false;
 
     let authority_bundle = barrier_bundle
         .or_else(|| object_bundles.last())
@@ -8661,6 +8687,16 @@ fn inspect_checkpoint_projection_tx(
                     format!("{actual:?}"),
                 ));
             }
+            // A first durable checkpoint supplies missing parity geometry for an
+            // unwritten row. Written prefixes still require matching geometry.
+            fresh_geometry_missing = record.ordinal == 1
+                && actual.scheme_id.is_none()
+                && expected_tape.scheme_id.is_some()
+                && actual.highest_protected_ordinal.get() == 0
+                && actual.total_committed_ordinals.get() == 0
+                && actual
+                    .last_committed_tape_file
+                    .is_none_or(|last| last.get() == 0);
             if actual.block_size.is_none()
                 || expected_tape.scheme_id.is_some() && actual.scheme_id.is_none()
                 || expected_tape.data_blocks_per_stripe.is_some()
@@ -8960,6 +8996,8 @@ fn inspect_checkpoint_projection_tx(
         } else {
             Ok(CheckpointReplayPlan::Repair)
         }
+    } else if fresh_geometry_missing {
+        Ok(CheckpointReplayPlan::InitializeGeometry)
     } else {
         Ok(CheckpointReplayPlan::StrictAppend)
     }
@@ -20841,6 +20879,17 @@ mod tests {
 
     #[test]
     fn written_extent_is_the_barrier_measurement_not_an_object_rollup() {
+        check_checkpoint_written_extent(false);
+    }
+
+    /// Fresh geometry repair preserves prefix validation and rolls back on a gap.
+    #[test]
+    fn first_checkpoint_restores_geometry_without_bypassing_prefix_validation() {
+        check_checkpoint_written_extent(true);
+    }
+
+    /// Project a parity checkpoint and check its physical extent and replay behavior.
+    fn check_checkpoint_written_extent(missing_geometry: bool) {
         // The panel's named fixture: a parity tape whose record carries a
         // trailing sidecar and checkpoint files. The extent must equal the
         // barrier-proved eod_lba — which covers them — while a rollup over
@@ -20979,6 +21028,34 @@ mod tests {
             terminal_finalization: None,
             sealed_after_write: false,
         };
+        if missing_geometry {
+            index
+                .conn
+                .execute(
+                    "update tapes set scheme_id = NULL, data_blocks_per_stripe = NULL,
+                 parity_blocks_per_stripe = NULL, stripes_per_neighborhood = NULL
+                 where tape_uuid = ?1",
+                    [tape_uuid.as_slice()],
+                )
+                .unwrap();
+            let mut gapped = record.clone();
+            gapped.next_tape_file_number = 5;
+            gapped.objects[0].copy.tape_file_number = 3;
+            gapped.objects[0].object_recovery_row.tape_file_number = 3;
+            gapped.object_tape_file_bundles[0].entries[0].tape_file_number = 3;
+            gapped.barrier_bundle.as_mut().unwrap().entries[0].tape_file_number = 4;
+            let error = index.project_checkpoint_record(&gapped).unwrap_err();
+            assert!(error.to_string().contains("non-contiguous"), "{error}");
+            assert!(
+                index
+                    .get_tape(&tape_uuid)
+                    .unwrap()
+                    .unwrap()
+                    .scheme_id
+                    .is_none(),
+                "rejected checkpoint rolls back geometry repair"
+            );
+        }
         index
             .project_checkpoint_record(&record)
             .expect("project parity checkpoint record");

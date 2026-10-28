@@ -2096,6 +2096,13 @@ pub struct CheckpointTerminalRecoveryAuthority {
 }
 
 impl FileCheckpointJournal {
+    /// Check for an existing journal without creating its directory, file or lease.
+    pub fn exists(dir: impl AsRef<Path>, tape_uuid: [u8; 16]) -> Result<bool, StateError> {
+        let path = checkpoint_journal_path(dir.as_ref(), tape_uuid);
+        path.try_exists()
+            .map_err(|error| StateError::io_at("inspect checkpoint journal", &path, error))
+    }
+
     /// Open or create the journal handle for `tape_uuid` beneath `dir`.
     pub fn open(dir: impl AsRef<Path>, tape_uuid: [u8; 16]) -> Result<Self, StateError> {
         let dir = dir.as_ref();
