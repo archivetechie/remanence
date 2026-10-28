@@ -46,7 +46,7 @@ hmac                = { version = "0.13", features = ["zeroize"] }
 hyper-util          = "0.1"
 libc                = "0.2"
 nix                 = { version = "0.31", features = ["ioctl", "fs"] }
-reed-solomon-erasure = { version = "6", features = ["simd-accel"] }
+reed-solomon-erasure = { version = "6" }
 # fallible_uint keeps the pre-0.38 u64/usize binding, which errors above i64::MAX.
 rusqlite            = { version = "0.40", features = ["bundled", "fallible_uint"] }
 serde               = { version = "1",   features = ["derive"] }

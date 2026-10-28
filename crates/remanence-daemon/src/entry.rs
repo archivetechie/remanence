@@ -92,6 +92,10 @@ pub async fn main_entry_with_registry(
     foreign_formats: remanence_format_driver::ForeignFormatRegistry,
 ) -> ExitCode {
     init_tracing();
+    tracing::info!(
+        kernel = remanence_parity::codec::encoding_kernel(),
+        "parity encoding kernel"
+    );
     let args = Args::parse();
 
     let config = match remanence_state::load_config(&args.config) {

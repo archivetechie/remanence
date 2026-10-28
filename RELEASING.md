@@ -24,6 +24,11 @@ Remanence installation. Each archive includes Remanence's Apache-2.0 license
 and a generated inventory containing the full selected license texts for its
 third-party Rust dependency graph.
 
+The Linux x86-64 archive runs on any x86-64 CPU. Parity encoding selects AVX2,
+SSSE3, or portable Rust at startup; AVX2 and SSSE3 make encoding faster. The
+daemon logs the selected kernel once. Release builds do not require a newer
+CPU instruction set.
+
 Format documents are released independently. A software release must not
 publish or resolve a reserved format DOI; a format deposit is made only when its
 document, vector archive, checksum, and compatibility statement agree.
