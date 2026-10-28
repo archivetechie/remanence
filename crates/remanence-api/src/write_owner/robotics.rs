@@ -154,21 +154,40 @@ pub(crate) fn handle_robotics(
         .map_err(|err| err.message().to_string());
     publish_library_snapshot(&cfg.library_snapshot, library.library().clone());
 
+    finish_library_operation(
+        index,
+        cfg,
+        &handle,
+        &library_serial,
+        action_result,
+        observe_result,
+    );
+}
+
+/// Persist the robotics outcome before publishing its terminal status.
+pub(crate) fn finish_library_operation(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    handle: &crate::operations::OperationHandle,
+    library_serial: &str,
+    action_result: Result<(), String>,
+    observe_result: Result<(), String>,
+) {
     match (action_result, observe_result) {
         (Ok(()), Ok(())) => {
             if let Err(err) = record_library_event(
                 index,
                 cfg,
-                &handle,
-                &library_serial,
+                handle,
+                library_serial,
                 AuditEvent::OperationFinished,
                 BTreeMap::new(),
             ) {
                 fail_library_operation(
                     index,
                     cfg,
-                    &handle,
-                    &library_serial,
+                    handle,
+                    library_serial,
                     &format!("record operation finish audit: {err}"),
                     &[("phase", "audit")],
                 );
@@ -180,21 +199,28 @@ pub(crate) fn handle_robotics(
             fail_library_operation(
                 index,
                 cfg,
-                &handle,
-                &library_serial,
+                handle,
+                library_serial,
                 &format!("observe refreshed drive catalog: {message}"),
                 &[("phase", "catalog")],
             );
         }
         (Err(message), _) if message.contains(crate::readiness_wait::SHUTDOWN_REASON) => {
-            super::readiness::publish_readiness_shutdown(index, &handle, &message);
+            fail_library_operation(
+                index,
+                cfg,
+                handle,
+                library_serial,
+                &message,
+                &[("phase", "shutdown")],
+            );
         }
         (Err(message), _) => {
             fail_library_operation(
                 index,
                 cfg,
-                &handle,
-                &library_serial,
+                handle,
+                library_serial,
                 message.as_str(),
                 &[("phase", "execute")],
             );

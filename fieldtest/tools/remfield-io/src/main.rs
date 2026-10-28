@@ -235,14 +235,15 @@ async fn connect_daemon(endpoint: &str) -> AppResult<Channel> {
         .map_err(|error| AppError::new(format!("connect daemon at {endpoint}: {error}")))
 }
 
-/// Retry state for one session open. A media-readiness fence is waited on
-/// once; a busy drive bay is polled by re-trying the open every
+/// Retry state for one session open. Each media-readiness fence is waited on
+/// once within a shared deadline; a busy drive bay is polled every
 /// `busy_interval` for up to `busy_wait`, counted from the first busy refusal.
 struct OpenRetry {
     busy_wait: Duration,
     busy_interval: Duration,
     busy_since: Option<Instant>,
-    fence_waited: bool,
+    fences_waited: std::collections::HashSet<Uuid>,
+    readiness_deadline: Option<tokio::time::Instant>,
 }
 
 impl OpenRetry {
@@ -266,7 +267,8 @@ impl OpenRetry {
             busy_wait,
             busy_interval,
             busy_since: None,
-            fence_waited: false,
+            fences_waited: Default::default(),
+            readiness_deadline: None,
         })
     }
 }
@@ -298,19 +300,40 @@ async fn wait_before_open_retry(
     status: &tonic::Status,
     retry: &mut OpenRetry,
 ) -> AppResult<()> {
+    wait_before_open_retry_with(status, retry, |id| {
+        wait_for_media_readiness_operation(channel, id)
+    })
+    .await
+}
+
+/// Bound all readiness attachments for one open by the first fence's deadline.
+async fn wait_before_open_retry_with<F, Fut>(
+    status: &tonic::Status,
+    retry: &mut OpenRetry,
+    wait: F,
+) -> AppResult<()>
+where
+    F: FnOnce(Uuid) -> Fut,
+    Fut: std::future::Future<Output = AppResult<()>>,
+{
     if status.code() != tonic::Code::FailedPrecondition {
         return Err(status.clone().into());
     }
     if let Some(operation_id) = media_readiness_operation_id(status.message()) {
-        if retry.fence_waited {
+        let deadline = *retry.readiness_deadline.get_or_insert_with(|| {
+            tokio::time::Instant::now()
+                + Duration::from_secs(u64::from(DEFAULT_READY_TIMEOUT_SECONDS))
+        });
+        if tokio::time::Instant::now() >= deadline || !retry.fences_waited.insert(operation_id) {
             return Err(status.clone().into());
         }
-        retry.fence_waited = true;
         eprintln!(
             "remfield-io: open fenced by media readiness operation {operation_id}; waiting up to {}s",
             DEFAULT_READY_TIMEOUT_SECONDS
         );
-        wait_for_media_readiness_operation(channel, operation_id).await?;
+        tokio::time::timeout_at(deadline, wait(operation_id))
+            .await
+            .map_err(|_| AppError::new("media readiness wait deadline expired"))??;
         // Time spent on the fence does not count against the busy-bay wait.
         retry.busy_since = None;
         return Ok(());
@@ -1639,6 +1662,51 @@ fn print_json_error(message: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A retried open can meet a fresh fence, but never waits twice on the same id.
+    #[tokio::test]
+    async fn open_retry_waits_on_each_new_fence_with_one_deadline() {
+        let mut retry = OpenRetry::from_env().unwrap();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let refusal =
+            |id| tonic::Status::failed_precondition(format!("media-readiness operation={id}"));
+        let mut observed = vec![];
+        for id in [first, second] {
+            wait_before_open_retry_with(&refusal(id), &mut retry, |id| {
+                observed.push(id);
+                std::future::ready(Ok(()))
+            })
+            .await
+            .unwrap();
+        }
+        assert_eq!(observed, [first, second]);
+        assert!(
+            wait_before_open_retry_with(&refusal(first), &mut retry, |_| {
+                panic!("a fence is never waited on twice");
+                #[allow(unreachable_code)]
+                std::future::ready(Ok(()))
+            })
+            .await
+            .is_err()
+        );
+        retry.readiness_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(20));
+        let error = wait_before_open_retry_with(&refusal(Uuid::new_v4()), &mut retry, |_| {
+            std::future::pending::<AppResult<()>>()
+        })
+        .await
+        .unwrap_err();
+        assert!(error.message.contains("deadline expired"));
+        assert!(
+            wait_before_open_retry_with(&refusal(Uuid::new_v4()), &mut retry, |_| {
+                panic!("the shared deadline prevents another wait");
+                #[allow(unreachable_code)]
+                std::future::ready(Ok(()))
+            })
+            .await
+            .is_err()
+        );
+    }
 
     #[test]
     fn no_wait_is_a_plain_global_flag() {

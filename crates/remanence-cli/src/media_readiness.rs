@@ -520,6 +520,59 @@ mod tests {
         }
     }
 
+    /// Both wait-ready and verification watch a live LoadDrive until it ends.
+    #[tokio::test]
+    async fn live_load_clients_wait_until_terminal() {
+        struct LoadClient(tokio::sync::mpsc::Receiver<pb::OperationStatus>);
+        impl ReadinessClient for LoadClient {
+            async fn resume(
+                &mut self,
+                _: pb::ResumeMediaReadinessRequest,
+            ) -> Result<(), tonic::Status> {
+                Ok(())
+            }
+            async fn watch(&mut self, _: Uuid) -> Result<(), tonic::Status> {
+                Ok(())
+            }
+            async fn next(&mut self) -> Result<Option<pb::OperationStatus>, tonic::Status> {
+                Ok(self.0.recv().await)
+            }
+        }
+        for verification in [false, true] {
+            let id = Uuid::new_v4();
+            let (tx, rx) = tokio::sync::mpsc::channel(2);
+            let mut client = LoadClient(rx);
+            let event = |state| pb::OperationStatus {
+                operation_id: id.as_bytes().to_vec(),
+                operation_kind: "load_drive".into(),
+                state: state as i32,
+                progress: [("state".into(), "becoming_ready".into())].into(),
+                ..Default::default()
+            };
+            tx.send(event(pb::OperationState::Running)).await.unwrap();
+            let mut err = Vec::new();
+            let refusal =
+                tonic::Status::failed_precondition(format!("media-readiness operation={id}"));
+            let wait = async {
+                if verification {
+                    wait_for_verification_readiness(&mut client, id, &refusal, &mut err)
+                        .await
+                        .unwrap();
+                    0
+                } else {
+                    watch_daemon_wait_ready(&mut client, id, Duration::from_secs(1), &mut err).await
+                }
+            };
+            tokio::pin!(wait);
+            tokio::select! {
+                code = &mut wait => panic!("live load returns early with exit {code}"),
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+            tx.send(event(pb::OperationState::Succeeded)).await.unwrap();
+            assert_eq!(wait.await, 0);
+        }
+    }
+
     /// Daemon attachment uses the long wait and maps every command outcome.
     #[tokio::test]
     async fn daemon_wait_ready_attach_exit_codes_and_state_changes() {

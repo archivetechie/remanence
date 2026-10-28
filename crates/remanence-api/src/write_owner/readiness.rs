@@ -125,10 +125,12 @@ pub(crate) fn handle_drive_wait_ready_and_release(
         Err(error) if error.contains(crate::readiness_wait::SHUTDOWN_REASON) => {
             publish_readiness_shutdown(index, handle, &error);
         }
-        Err(error) if handle.is_cancelled() => handle.publish_state(
-            pb::OperationState::Cancelled,
-            &[("phase", "cancelled"), ("detail", error.as_str())],
-        ),
+        Err(error) if error == "media readiness interrupted by operator cancels readiness wait" => {
+            handle.publish_state(
+                pb::OperationState::Cancelled,
+                &[("phase", "cancelled"), ("detail", error.as_str())],
+            )
+        }
         Err(error) => handle.publish_failed(
             error.as_str(),
             &[("phase", "readiness_poll"), ("state", "recording_failed")],
@@ -317,13 +319,13 @@ pub(crate) fn poll_drive_media_readiness(
             }
             MediaReadinessWaitEvent::Cancelled(reason) => {
                 if reason == crate::readiness_wait::SHUTDOWN_REASON { return Ok(()); }
-                let record = index.media_readiness_operation(operation_id).map_err(|e| e.to_string())?.ok_or("readiness operation missing")?;
+                let record = index.media_readiness_operation(operation_id).map_err(|e| format!("operator cancel is not recorded: {e}"))?.ok_or("operator cancel is not recorded: readiness operation missing")?;
                 let mut transition = crate::startup_media_readiness::startup_media_readiness_requires_release_transition(&record, operation_id);
                 transition.phase = Some("cancelled".into());
                 transition.cancel_source = Some("operator".into());
                 transition.last_error_json = Some(session_open_json_detail("cancelled", "operator cancels readiness wait; explicit resume continues it"));
                 transition.quarantine_id = record.quarantine_id;
-                index.record_media_readiness_transition(transition).map(|_| ()).map_err(|e| e.to_string())
+                index.record_media_readiness_transition(transition).map(|_| ()).map_err(|e| format!("operator cancel is not recorded: {e}"))
             },
         },
     )
