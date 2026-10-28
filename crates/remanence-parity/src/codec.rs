@@ -364,8 +364,13 @@ fn gf_mul(a: u8, b: u8) -> u8 {
     GF_MUL_TABLE[a as usize][b as usize]
 }
 
+/// Add a constant multiple over GF(2^8)/0x11D using the slice accelerator.
 fn gf_mul_slice_xor(coefficient: u8, input: &[u8], output: &mut [u8]) {
     debug_assert_eq!(input.len(), output.len());
+    // The SIMD wrapper in reed-solomon-erasure 6 indexes the first byte.
+    if input.is_empty() {
+        return;
+    }
     match coefficient {
         0 => {}
         1 => {
@@ -373,14 +378,12 @@ fn gf_mul_slice_xor(coefficient: u8, input: &[u8], output: &mut [u8]) {
                 *out ^= *byte;
             }
         }
-        _ => {
-            let row = &GF_MUL_TABLE[coefficient as usize];
-            for (out, byte) in output.iter_mut().zip(input) {
-                *out ^= row[*byte as usize];
-            }
-        }
+        _ => reed_solomon_erasure::galois_8::mul_slice_xor(coefficient, input, output),
     }
 }
+
+#[cfg(test)]
+mod slice_tests;
 
 #[cfg(test)]
 mod tests {
