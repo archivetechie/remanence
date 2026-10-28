@@ -376,6 +376,7 @@ mod tests {
             barrier_bundle: None,
             terminal_finalization: None,
             sealed_after_write: false,
+            seal_due: None,
         };
 
         plan.publish(&record).expect("publish evidence");

@@ -2172,6 +2172,7 @@ fn append_checkpoint_record(checkpoint_dir: &Path, tape_uuid: [u8; 16]) {
             barrier_bundle: None,
             terminal_finalization: None,
             sealed_after_write: false,
+            seal_due: None,
         })
         .expect("append checkpoint record");
 }
@@ -2379,6 +2380,7 @@ fn restart_cycle_checkpoint_record(
         barrier_bundle: None,
         terminal_finalization: None,
         sealed_after_write: false,
+        seal_due: None,
     }
 }
 
@@ -2817,6 +2819,7 @@ fn startup_replay_restores_pending_automatic_finalization_through_replica_c() {
         }),
         terminal_finalization: Some(completed_intent),
         sealed_after_write: true,
+        seal_due: None,
     };
     let mut lease = journal
         .acquire_exclusive_for_terminal_recovery()

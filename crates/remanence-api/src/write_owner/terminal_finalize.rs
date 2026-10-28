@@ -661,6 +661,18 @@ pub(crate) fn preflight_manual_finalize_with_prefix(
     request: &mut ManualFinalizeTapeActorRequest,
     prefix: Option<&TerminalPrefixPlan>,
 ) -> Result<Option<ManualFinalizeTapeActorReply>, Status> {
+    preflight_manual_finalize_cancellable(index, cfg, barcode, request, prefix, || false)
+}
+
+/// Recheck caller lifetime at the durable admission boundary after slow planning.
+pub(crate) fn preflight_manual_finalize_cancellable(
+    index: &mut CatalogIndex,
+    cfg: ManualFinalizePreflightConfig<'_>,
+    barcode: Option<&str>,
+    request: &mut ManualFinalizeTapeActorRequest,
+    prefix: Option<&TerminalPrefixPlan>,
+    cancelled: impl Fn() -> bool,
+) -> Result<Option<ManualFinalizeTapeActorReply>, Status> {
     let checkpoint_journal =
         remanence_state::FileCheckpointJournal::open(cfg.checkpoint_journal_dir, request.tape_uuid)
             .map_err(crate::status_from_state_error)?;
@@ -821,6 +833,7 @@ pub(crate) fn preflight_manual_finalize_with_prefix(
         block_size: request.block_size,
         parity_config: request.parity_config.clone(),
     };
+    let new_acceptance = existing_intent.is_none();
     let (intent, plan) = match existing_intent {
         Some(intent) => {
             validate_manual_finalize_intent(request, &intent)?;
@@ -950,6 +963,11 @@ pub(crate) fn preflight_manual_finalize_with_prefix(
         },
     };
 
+    if cancelled() && new_acceptance {
+        return Err(Status::cancelled(
+            "finalization request dropped before acceptance",
+        ));
+    }
     // Planning may stream a large authority. Re-read at the acceptance edge,
     // then let the immediate catalog transaction repeat the same guard while
     // holding assignment writers out through companion publication.
@@ -1001,9 +1019,27 @@ pub(crate) fn preflight_manual_finalize_with_prefix(
                     operation_id: request.candidate_operation_id,
                     projection,
                 },
-                || checkpoint.begin_terminal_finalization(&intent).map(|_| ()),
+                || {
+                    checkpoint.begin_terminal_finalization(&intent)?;
+                    #[cfg(test)]
+                    PREFLIGHT_INTENT_HOOK.with(|hook| {
+                        if let Some(hook) = hook.borrow_mut().take() {
+                            hook();
+                        }
+                    });
+                    if new_acceptance && cancelled() {
+                        checkpoint.retire_provisional_manual_finalization(&intent, false, false)?;
+                        return Err(remanence_state::StateError::ConfigInvalid(
+                            "finalization request dropped before acceptance".into(),
+                        ));
+                    }
+                    Ok(())
+                },
             )
             .map_err(|error| match error {
+                remanence_state::StateError::ConfigInvalid(detail) if cancelled() => {
+                    Status::cancelled(detail)
+                }
                 remanence_state::StateError::TapePoolAssignmentConflict(detail) => {
                     Status::failed_precondition(detail)
                 }
@@ -1874,6 +1910,7 @@ pub(super) fn complete_terminal_finalization_host_only(
         barrier_bundle: Some(final_bundle),
         terminal_finalization: Some(completed_intent),
         sealed_after_write: true,
+        seal_due: None,
     };
     if let Some(fault) = tix_fault {
         fault
@@ -2873,5 +2910,17 @@ pub(super) fn terminal_tail_write_failure(
 #[cfg(test)]
 thread_local! {
     /// Pause real finalization preflight while it owns the checkpoint lease.
+    pub(super) static PREFLIGHT_INTENT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
     pub(super) static PREFLIGHT_LEASE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
+}
+
+/// Install a one-shot preflight pause on the current test task's thread.
+#[cfg(test)]
+pub(crate) fn set_manual_preflight_hook(after_intent: bool, hook: impl FnOnce() + 'static) {
+    let slot = if after_intent {
+        &PREFLIGHT_INTENT_HOOK
+    } else {
+        &PREFLIGHT_LEASE_HOOK
+    };
+    slot.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }

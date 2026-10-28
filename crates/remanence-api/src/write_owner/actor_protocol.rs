@@ -51,6 +51,12 @@ pub(crate) enum RoboticsAction {
 }
 
 pub(crate) enum ChangerCommand {
+    PlanningMove {
+        src: u16,
+        dst: u16,
+        ownership: std::sync::Arc<crate::mount::PlanningOwnership>,
+        reply: oneshot::Sender<crate::mount::PlanningResult<()>>,
+    },
     Move {
         src: u16,
         dst: u16,
@@ -149,12 +155,13 @@ pub(crate) enum DriveCommand {
         reply: oneshot::Sender<Result<ManualFinalizeTapeActorReply, Status>>,
     },
     PlanFinalization {
+        ownership: std::sync::Arc<crate::mount::PlanningOwnership>,
         request: ManualFinalizeTapeActorRequest,
         needs_drive_load: bool,
         barcode: Option<String>,
         source_slot: Option<u16>,
         drive_serial: Option<String>,
-        reply: oneshot::Sender<Result<remanence_parity::TerminalPrefixPlan, Status>>,
+        reply: oneshot::Sender<crate::mount::PlanningResult<remanence_parity::TerminalPrefixPlan>>,
     },
     PrepareRemoval {
         progress: Option<crate::operations::OperationHandle>,

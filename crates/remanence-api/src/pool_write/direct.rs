@@ -434,6 +434,7 @@ pub(super) fn execute_direct_terminal_tail(
             barrier_bundle: Some(final_bundle),
             terminal_finalization: Some(completed_intent),
             sealed_after_write: true,
+            seal_due: None,
         };
         checkpoint.append_terminal_finalization(std::slice::from_ref(&final_record))?;
         state.project_checkpoint_record(&final_record)?;
@@ -1187,6 +1188,7 @@ pub(super) fn write_to_selected_tape_checkpointed_after_preflight(
             barrier_bundle,
             terminal_finalization: None,
             sealed_after_write: false,
+            seal_due: None,
         };
         let used_bytes = captured
             .lba

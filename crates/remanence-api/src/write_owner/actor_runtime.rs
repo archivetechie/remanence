@@ -120,6 +120,36 @@ pub(super) fn changer_loop(
     }
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
+            ChangerCommand::PlanningMove {
+                src,
+                dst,
+                ownership,
+                reply,
+            } => {
+                let result = changer
+                    .move_medium(src, dst, &cfg.policy)
+                    .map_err(|err| Status::internal(format!("move medium: {err}")));
+                if result.is_ok() {
+                    match observe_refreshed_library(&mut index, &cfg, changer.library()) {
+                        Ok(()) => clear_library_snapshot_persist_alarm(
+                            &mut index,
+                            &cfg,
+                            changer.library().serial.as_str(),
+                        ),
+                        Err(err) => record_library_observation_failure(
+                            &mut index,
+                            &cfg,
+                            changer.library(),
+                            err.message(),
+                        ),
+                    }
+                    publish_library_snapshot(&cfg.library_snapshot, changer.library().clone());
+                }
+                if result.is_ok() {
+                    ownership.moved();
+                }
+                let _ = reply.send(ownership.complete(result));
+            }
             ChangerCommand::Move { src, dst, reply } => {
                 let result = changer
                     .move_medium(src, dst, &cfg.policy)
@@ -222,6 +252,11 @@ pub(super) fn drain_failed_changer_commands(
 ) {
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
+            ChangerCommand::PlanningMove {
+                reply, ownership, ..
+            } => {
+                let _ = reply.send(ownership.complete(Err(Status::internal(message.clone()))));
+            }
             ChangerCommand::Move { reply, .. } => {
                 let _ = reply.send(Err(Status::internal(message.clone())));
             }
@@ -554,6 +589,7 @@ pub(super) fn drive_loop(
                 let _ = reply.send(result);
             }
             DriveCommand::PlanFinalization {
+                ownership,
                 request,
                 needs_drive_load,
                 barcode,
@@ -586,7 +622,7 @@ pub(super) fn drive_loop(
                     )
                 });
 
-                let _ = reply.send(result);
+                let _ = reply.send(ownership.complete(result));
             }
             DriveCommand::PrepareRemoval { reply, progress } => {
                 let result = super::checkpoint::close_retained_before_removal(
@@ -709,10 +745,12 @@ pub(super) fn drain_failed_drive_commands(mut rx: mpsc::Receiver<DriveCommand>, 
             DriveCommand::FinalizeTape { reply, .. } => {
                 let _ = reply.send(Err(Status::internal(message.clone())));
             }
-            DriveCommand::PlanFinalization { reply, .. } => {
-                let _ = reply.send(Err(Status::failed_precondition(
+            DriveCommand::PlanFinalization {
+                reply, ownership, ..
+            } => {
+                let _ = reply.send(ownership.complete(Err(Status::failed_precondition(
                     "drive actor cannot plan finalization in its current state",
-                )));
+                ))));
             }
             DriveCommand::PrepareRemoval { reply, .. } => {
                 let _ = reply.send(Err(Status::internal(message.clone())));

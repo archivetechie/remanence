@@ -434,11 +434,34 @@ pub(crate) fn spawn_auto_resume(state: ApiState) {
     });
 }
 
+/// Observe cancellation before or after durable operation admission.
+pub(crate) trait ReadinessWaitOwner {
+    fn is_cancelled(&self) -> bool;
+    fn operation(&self) -> Option<&crate::operations::OperationHandle> {
+        None
+    }
+}
+
+impl ReadinessWaitOwner for crate::operations::OperationHandle {
+    fn is_cancelled(&self) -> bool {
+        self.is_cancelled()
+    }
+    fn operation(&self) -> Option<&crate::operations::OperationHandle> {
+        Some(self)
+    }
+}
+
+impl<T: Send> ReadinessWaitOwner for tokio::sync::oneshot::Sender<T> {
+    fn is_cancelled(&self) -> bool {
+        self.is_closed()
+    }
+}
+
 /// Watch the named fence without taking its drive or cancellation token.
 /// The caller retains one deadline across every refused open.
 pub(crate) async fn wait_after_refusal(
     state: &ApiState,
-    handle: &crate::operations::OperationHandle,
+    handle: &(impl ReadinessWaitOwner + Sync),
     refusal: Status,
     budget: Duration,
     deadline: &mut Option<(tokio::time::Instant, String)>,
@@ -535,17 +558,19 @@ pub(crate) async fn wait_after_refusal(
             _ => "",
         };
         let (sense_key, name_key) = remanence_library::MEDIA_READINESS_SENSE_PROGRESS_KEYS;
-        handle.publish_state(
-            pb::OperationState::Running,
-            &[
-                ("phase", "readiness"),
-                ("readiness_operation_id", &id.to_string()),
-                ("state", &record.state),
-                (sense_key, &sense_raw),
-                (name_key, sense_name),
-                ("detail", &sense),
-            ],
-        );
+        if let Some(handle) = handle.operation() {
+            handle.publish_state(
+                pb::OperationState::Running,
+                &[
+                    ("phase", "readiness"),
+                    ("readiness_operation_id", &id.to_string()),
+                    ("state", &record.state),
+                    (sense_key, &sense_raw),
+                    (name_key, sense_name),
+                    ("detail", &sense),
+                ],
+            );
+        }
         tokio::time::sleep_until(std::cmp::min(
             deadline,
             tokio::time::Instant::now() + Duration::from_millis(250),

@@ -2441,6 +2441,7 @@ impl CatalogIndex {
                       or finalization_layout_digest is not null
                       or completed_replicas is not null
                       or finalization_outcome is not null
+                      or seal_due is not null
                       or (kind = 'cleaning' and (
                            cleaning_uses is null or cleaning_uses <> 0
                            or cleaning_state is null or cleaning_state <> 'unverified'
@@ -2614,6 +2615,7 @@ impl CatalogIndex {
             && tape.total_committed_ordinals == 0
             && tape.written_extent_lba.is_none()
             && tape.terminal_finalization.is_none()
+            && tape.seal_due.is_none()
             && highest_protected_ordinal == 0
             && !has_dependent_rows;
         let assignment_generation = tape
@@ -2752,27 +2754,6 @@ impl CatalogIndex {
                     " with no terminal finalization projection"
                 }
             )));
-        }
-        Ok(())
-    }
-
-    /// Persist a deferred seal on the exact tape until terminal completion clears it.
-    pub fn record_tape_seal_due(
-        &mut self,
-        tape_uuid: [u8; 16],
-        reason: &str,
-    ) -> Result<(), StateError> {
-        let changed = self
-            .conn
-            .execute(
-                "update tapes set seal_due = ?2 where tape_uuid = ?1 and state = 'ready'",
-                params![tape_uuid.as_slice(), reason],
-            )
-            .map_err(|e| sqlite_error("record seal due", e))?;
-        if changed != 1 {
-            return Err(StateError::IndexCorrupt(
-                "seal due requires a ready tape".into(),
-            ));
         }
         Ok(())
     }
@@ -4089,7 +4070,7 @@ impl CatalogIndex {
         }
         tx.execute(
             "update tapes
-             set state = 'retired',
+             set state = 'retired', seal_due = null,
                  voltag = null,
                  updated_at_utc = ?2
              where tape_uuid = ?1",
@@ -4302,6 +4283,7 @@ impl CatalogIndex {
                 &tx,
                 record.tape_uuid,
                 record.sealed_after_write,
+                record.seal_due,
                 updated_at.as_str(),
             )?;
             tx.commit()
@@ -4390,6 +4372,7 @@ impl CatalogIndex {
             &tx,
             record.tape_uuid,
             record.sealed_after_write,
+            record.seal_due,
             updated_at.as_str(),
         )?;
         if replay_plan == CheckpointReplayPlan::RepairRetired {
@@ -4518,6 +4501,12 @@ impl CatalogIndex {
             .transaction()
             .map_err(|error| sqlite_error("begin structured terminal projection", error))?;
         project_tape_written_extent_tx(&tx, record.tape_uuid, record.eod_lba)?;
+        // The terminal checkpoint proves the final partial epoch as well as C.
+        // Live projection and replay therefore advance the same safety watermark.
+        tx.execute(
+            "update tapes set highest_protected_ordinal = max(highest_protected_ordinal, ?2) where tape_uuid = ?1",
+            params![record.tape_uuid.as_slice(), SqliteU64::new(bundle.highest_protected_ordinal)],
+        ).map_err(|error| sqlite_error("project terminal protected watermark", error))?;
         project_terminal_finalization_tx(&tx, &input, updated_at.as_str())?;
         tx.commit()
             .map_err(|error| sqlite_error("commit structured terminal projection", error))?;
@@ -6871,6 +6860,7 @@ struct PreservedTapeRow {
     finalization_layout_digest: Option<Vec<u8>>,
     completed_replicas: Option<i64>,
     finalization_outcome: Option<String>,
+    seal_due: Option<String>,
 }
 
 /// Stable identities for cache rows whose original writers predate durable
@@ -6955,6 +6945,9 @@ impl PreservedEvidenceKeys {
         let mut warnings = Vec::new();
         for tape in tapes {
             let id = hex_uuid_from_slice(tape.tape_uuid.as_slice());
+            if tape.seal_due.is_some() {
+                warnings.push(format!("seal_due cache fallback tape_uuid={id}; checkpoint reconciliation applies later resolutions"));
+            }
             if !tape_lifecycle.contains(&id) {
                 warnings.push(format!("tape lifecycle row tape_uuid={id}"));
             }
@@ -7728,7 +7721,7 @@ fn query_preserved_tape_rows_tx(
                     finalization_trigger, finalization_operation_id,
                     finalization_edition_digest, finalization_layout_digest,
                     completed_replicas, finalization_outcome,
-                    voltag_source, cartridge_generation, generation_source
+                    voltag_source, cartridge_generation, generation_source, seal_due
              from tapes
              where voltag is not null
                 or cartridge_generation is not null
@@ -7781,6 +7774,7 @@ fn query_preserved_tape_rows_tx(
             finalization_layout_digest: row_get(row, 21, "tapes.finalization_layout_digest")?,
             completed_replicas: row_get(row, 22, "tapes.completed_replicas")?,
             finalization_outcome: row_get(row, 23, "tapes.finalization_outcome")?,
+            seal_due: row_get(row, 27, "tapes.seal_due")?,
         });
     }
     Ok(preserved)
@@ -7801,11 +7795,11 @@ fn restore_preserved_tape_rows_tx(
                finalization_progress, finalization_trigger,
                finalization_operation_id, finalization_edition_digest,
                finalization_layout_digest, completed_replicas,
-               finalization_outcome, voltag_source, cartridge_generation, generation_source
+               finalization_outcome, voltag_source, cartridge_generation, generation_source, seal_due
             )
              values(
                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-               ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27
+               ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28
              )",
             params![
                 row.tape_uuid.as_slice(),
@@ -7835,6 +7829,7 @@ fn restore_preserved_tape_rows_tx(
                 row.voltag_source.as_deref(),
                 row.cartridge_generation.as_deref(),
                 row.generation_source.as_deref(),
+                row.seal_due.as_deref(),
             ],
         )
         .map_err(|err| sqlite_error("restore preserved tape row", err))?;
@@ -7890,6 +7885,7 @@ fn merge_preserved_tape_operator_columns_tx(
                  completed_replicas = ?13,
                  finalization_outcome = ?14,
                  voltag_source = ?16, cartridge_generation = ?17, generation_source = ?18,
+                 seal_due = case when ?15 in ('sealed', 'retired', 'finalized', 'finalized_degraded') then null else ?19 end,
                  state =
                    case
                      when ?15 in (
@@ -7918,6 +7914,7 @@ fn merge_preserved_tape_operator_columns_tx(
                 row.voltag_source.as_deref(),
                 row.cartridge_generation.as_deref(),
                 row.generation_source.as_deref(),
+                row.seal_due.as_deref(),
             ],
         )
         .map_err(|err| sqlite_error("merge preserved tape operator columns", err))?;
@@ -10403,7 +10400,8 @@ fn project_catalog_evidence_record(
                      tapes.stripes_per_neighborhood
                    ),
                    state = case
-                     when tapes.finalization_progress is not null then tapes.state
+                     when tapes.finalization_progress is not null
+                       or tapes.state in ('sealed', 'retired', 'finalized', 'finalized_degraded') then tapes.state
                      else 'ready'
                    end,
                    updated_at_utc = max(tapes.updated_at_utc, excluded.updated_at_utc)",
@@ -10483,6 +10481,7 @@ fn project_catalog_evidence_record(
                 "insert into tapes(tape_uuid, voltag, state, updated_at_utc)
                  values(?1, null, ?2, ?3)
                  on conflict(tape_uuid) do update set
+                   seal_due = null,
                    voltag = case when excluded.state = 'retired' then null else tapes.voltag end,
                    state = case
                      when tapes.state = 'retired' then tapes.state
@@ -11712,9 +11711,17 @@ fn project_checkpoint_tape_seal_tx(
     tx: &rusqlite::Transaction<'_>,
     tape_uuid: [u8; 16],
     sealed_after_write: bool,
+    seal_due: Option<crate::checkpoint::SealDueReason>,
     updated_at_utc: &str,
 ) -> Result<(), StateError> {
     if !sealed_after_write {
+        if let Some(reason) = seal_due {
+            tx.execute(
+                "update tapes set seal_due = ?2 where tape_uuid = ?1 and state = 'ready'",
+                params![tape_uuid.as_slice(), reason.as_str()],
+            )
+            .map_err(|err| sqlite_error("project checkpoint seal obligation", err))?;
+        }
         return Ok(());
     }
     let changed = tx
@@ -15346,8 +15353,122 @@ mod tests {
         assert!(CatalogIndex::read_legacy_catalog_reset_erase_source(&path).is_err());
     }
 
-    /// Upgrading recent catalogs must not rerun generation or assignment backfills.
-    /// Schema upgrades preserve exact tape identity and deferred seals survive reopen.
+    /// Checkpoint replay is the sole source of new obligations; legacy cache rows
+    /// survive rebuild only until terminal or lifecycle authority resolves them.
+    #[test]
+    fn checkpoint_seal_due_replay_and_legacy_fallback() {
+        use crate::checkpoint::{
+            CheckpointJournalRecord, CheckpointObjectProjection,
+            CheckpointObjectRecoveryRepresentation, CheckpointObjectRecoveryRow, SealDueReason,
+        };
+        for reason in [
+            SealDueReason::HardwareEarlyWarning,
+            SealDueReason::ReachedLowWatermark,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let uuid = [0x64; 16];
+            let mut index = CatalogIndex::open(root.path().join("index.sqlite")).unwrap();
+            index
+                .provision_tape(ProvisionTapeInput {
+                    tape_uuid: uuid,
+                    voltag: "PENDINGL9".into(),
+                    block_size: 262144,
+                    parity: ParityConfig::None,
+                    force: false,
+                })
+                .unwrap();
+            let mut record = CheckpointJournalRecord {
+                ordinal: 1,
+                committed_object_count: 1,
+                eod_partition: 0,
+                eod_lba: 6,
+                tape_uuid: uuid,
+                batch_id: [0x65; 16],
+                next_tape_file_number: 2,
+                block_size: 262144,
+                objects: vec![CheckpointObjectProjection {
+                    object: append_object_projection("pending-object"),
+                    files: Vec::new(),
+                    copy: append_copy_projection("pending-object", uuid, 1),
+                    block_size: 262144,
+                    block_count: 3,
+                    fresh_tape: true,
+                    total_committed_ordinals: 3,
+                    object_recovery_row: CheckpointObjectRecoveryRow {
+                        tape_file_number: 1,
+                        stored_block_count: 3,
+                        object_id: b"pending-object".to_vec(),
+                        representation: CheckpointObjectRecoveryRepresentation::Plaintext {
+                            manifest_first_chunk_lba: 1,
+                            manifest_size_bytes: 1,
+                            manifest_chunk_count: 1,
+                            manifest_sha256: [0x64; 32],
+                        },
+                    },
+                }],
+                scheme: None,
+                object_tape_file_bundles: Vec::new(),
+                barrier_bundle: None,
+                terminal_finalization: None,
+                sealed_after_write: false,
+                seal_due: Some(reason),
+            };
+            index.project_checkpoint_record(&record).unwrap();
+            assert_eq!(
+                index.get_tape(&uuid).unwrap().unwrap().seal_due.as_deref(),
+                Some(reason.as_str())
+            );
+            record.seal_due = None;
+            index.project_checkpoint_record(&record).unwrap();
+            assert_eq!(
+                index.get_tape(&uuid).unwrap().unwrap().seal_due.as_deref(),
+                Some(reason.as_str())
+            );
+            let report = index.rebuild_from_authoritative_sources(&[], &[]).unwrap();
+            assert!(report
+                .preserved_fallbacks
+                .iter()
+                .any(|w| w.contains("seal_due")));
+            index.project_checkpoint_record(&record).unwrap();
+            assert_eq!(
+                index.get_tape(&uuid).unwrap().unwrap().seal_due.as_deref(),
+                Some(reason.as_str())
+            );
+            // A catalog from the old build has no journal obligation, but the
+            // final checkpoint still resolves its preserved cache fallback.
+            let terminal = structured_terminal_checkpoint(&record);
+            index.project_checkpoint_record(&terminal).unwrap();
+            index.rebuild_from_authoritative_sources(&[], &[]).unwrap();
+            record.seal_due = Some(reason);
+            index.project_checkpoint_record(&record).unwrap();
+            index.project_checkpoint_record(&terminal).unwrap();
+            assert!(index.get_tape(&uuid).unwrap().unwrap().seal_due.is_none());
+            for event in [AuditEvent::TapeSealed, AuditEvent::TapeRetired] {
+                let mut other =
+                    CatalogIndex::open(root.path().join(format!("{event:?}.sqlite"))).unwrap();
+                other
+                    .provision_tape(ProvisionTapeInput {
+                        tape_uuid: uuid,
+                        voltag: "PENDINGL9".into(),
+                        block_size: 262144,
+                        parity: ParityConfig::None,
+                        force: false,
+                    })
+                    .unwrap();
+                other.project_checkpoint_record(&record).unwrap();
+                let evidence =
+                    catalog_evidence_record(1, event, "tape", &hex_uuid(uuid), BTreeMap::new());
+                other.project_audit_record(&evidence).unwrap();
+                other
+                    .rebuild_from_authoritative_sources(&[evidence], &[])
+                    .unwrap();
+                other.project_checkpoint_record(&record).unwrap();
+                assert!(other.get_tape(&uuid).unwrap().unwrap().seal_due.is_none());
+            }
+        }
+    }
+
+    /// Schema upgrades preserve tape identity and deferred seals across reopen.
     #[test]
     fn schema_21_seal_due_upgrade_survives_reopen() {
         let root = tempfile::tempdir().unwrap();
@@ -15367,7 +15488,7 @@ mod tests {
             .execute_batch("alter table tapes drop column seal_due; PRAGMA user_version=21;")
             .unwrap();
         drop(index);
-        let mut index = CatalogIndex::open(&path).unwrap();
+        let index = CatalogIndex::open(&path).unwrap();
         assert_eq!(index.schema_version().unwrap(), SCHEMA_VERSION);
         assert!(index
             .get_tape(&[0x62; 16])
@@ -15376,7 +15497,11 @@ mod tests {
             .seal_due
             .is_none());
         index
-            .record_tape_seal_due([0x62; 16], "hardware_early_warning")
+            .conn
+            .execute(
+                "update tapes set seal_due = ?2 where tape_uuid = ?1",
+                params![[0x62u8; 16].as_slice(), "hardware_early_warning"],
+            )
             .unwrap();
         drop(index);
         let index = CatalogIndex::open_read_only(&path).unwrap();
@@ -15978,6 +16103,7 @@ mod tests {
             }),
             terminal_finalization: Some(finalization),
             sealed_after_write: true,
+            seal_due: None,
         }
     }
 
@@ -16942,7 +17068,11 @@ mod tests {
             )
             .unwrap();
         index
-            .record_tape_seal_due(old_uuid, "reached_low_watermark")
+            .conn
+            .execute(
+                "update tapes set seal_due = ?2 where tape_uuid = ?1",
+                params![old_uuid.as_slice(), "reached_low_watermark"],
+            )
             .unwrap();
         assert!(index
             .get_tape(&old_uuid)
@@ -20062,6 +20192,7 @@ mod tests {
             finalization_layout_digest: None,
             completed_replicas: None,
             finalization_outcome: None,
+            seal_due: None,
         };
         let tx = index.conn.transaction().expect("begin merge transaction");
         merge_preserved_tape_operator_columns_tx(&tx, &[preserved]).expect("merge retired row");
@@ -20541,6 +20672,7 @@ mod tests {
             barrier_bundle: None,
             terminal_finalization: None,
             sealed_after_write: false,
+            seal_due: None,
         };
         let bundles = record
             .objects
@@ -20811,6 +20943,7 @@ mod tests {
             barrier_bundle: None,
             terminal_finalization: None,
             sealed_after_write: false,
+            seal_due: None,
         };
         // The old journal shape (no span hints) remains replayable at the exact
         // watermark even when all object rows have been lost during rebuild.
@@ -21027,6 +21160,7 @@ mod tests {
             barrier_bundle: Some(barrier_bundle),
             terminal_finalization: None,
             sealed_after_write: false,
+            seal_due: None,
         };
         if missing_geometry {
             index
@@ -21158,6 +21292,7 @@ mod tests {
             barrier_bundle: None,
             terminal_finalization: None,
             sealed_after_write: false,
+            seal_due: None,
         };
 
         let error = index

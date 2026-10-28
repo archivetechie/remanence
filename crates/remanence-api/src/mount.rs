@@ -757,6 +757,38 @@ pub(crate) async fn manual_finalize_tape(
     state: &ApiState,
     admission: ManualFinalizeTapeAdmission,
 ) -> Result<crate::write_owner::ManualFinalizeTapeResult, Status> {
+    manual_finalize_tape_with_budget(
+        state,
+        admission,
+        Duration::from_secs(crate::readiness_wait::DEFAULT_OPERATION_READY_WAIT_SECONDS),
+    )
+    .await
+}
+
+/// Share the bounded admission path with deterministic readiness tests.
+async fn manual_finalize_tape_with_budget(
+    state: &ApiState,
+    admission: ManualFinalizeTapeAdmission,
+    ready_wait: Duration,
+) -> Result<crate::write_owner::ManualFinalizeTapeResult, Status> {
+    let (reply, received) = oneshot::channel();
+    let state = state.clone();
+    tokio::spawn(async move {
+        let result = manual_finalize_tape_critical(&state, admission, &reply, ready_wait).await;
+        let _ = reply.send(result);
+    });
+    received
+        .await
+        .map_err(|_| Status::unavailable("finalization admission task stopped"))?
+}
+
+/// Retain physical ownership across caller cancellation until planning cleanup ends.
+async fn manual_finalize_tape_critical(
+    state: &ApiState,
+    admission: ManualFinalizeTapeAdmission,
+    reply: &oneshot::Sender<Result<crate::write_owner::ManualFinalizeTapeResult, Status>>,
+    ready_wait: Duration,
+) -> Result<crate::write_owner::ManualFinalizeTapeResult, Status> {
     let pool = state.drive_pool()?.clone();
     let tape_reservation = match pool.reserve_tape(admission.tape_uuid) {
         Ok(reservation) => reservation,
@@ -773,6 +805,7 @@ pub(crate) async fn manual_finalize_tape(
         }
         Err(error) => return Err(error),
     };
+    let tape_reservation = std::sync::Arc::new(tape_reservation);
     let mut index = CatalogIndex::open(state.index_path.as_ref())
         .map_err(|error| Status::internal(error.to_string()))?;
     let (tape, mut actor_request) =
@@ -787,11 +820,46 @@ pub(crate) async fn manual_finalize_tape(
         && tape.scheme_id.is_some()
         && tape.highest_protected_ordinal < tape.total_committed_ordinals
     {
-        Some(plan_epoch_finalization(state, &pool, &actor_request).await?)
+        let mut deadline = None;
+        let prefix = loop {
+            if reply.is_closed() {
+                return Err(Status::cancelled(
+                    "finalization request dropped before acceptance",
+                ));
+            }
+            match plan_epoch_finalization(
+                state,
+                &pool,
+                &actor_request,
+                tape_reservation.clone(),
+                || reply.is_closed(),
+            )
+            .await
+            {
+                Ok(prefix) => break prefix,
+                Err(refusal) => {
+                    crate::readiness_wait::wait_after_refusal(
+                        state,
+                        reply,
+                        refusal.clone(),
+                        ready_wait,
+                        &mut deadline,
+                    )
+                    .await
+                    .map_err(|_| refusal)?;
+                }
+            }
+        };
+        Some(prefix)
     } else {
         None
     };
-    if let Some(reply) = crate::write_owner::preflight_manual_finalize_with_prefix(
+    if reply.is_closed() {
+        return Err(Status::cancelled(
+            "finalization request dropped before acceptance",
+        ));
+    }
+    if let Some(reply) = crate::write_owner::preflight_manual_finalize_cancellable(
         &mut index,
         crate::write_owner::ManualFinalizePreflightConfig {
             checkpoint_journal_dir: state.checkpoint_journal_dir.as_path(),
@@ -802,6 +870,7 @@ pub(crate) async fn manual_finalize_tape(
         tape.voltag.as_deref(),
         &mut actor_request,
         prefix.as_ref(),
+        || reply.is_closed(),
     )? {
         return Ok(crate::write_owner::ManualFinalizeTapeResult::Accepted(
             reply,
@@ -890,7 +959,7 @@ fn rejoin_accepted_manual_finalization(
 async fn run_manual_finalize_worker(
     state: ApiState,
     pool: crate::write_owner::DrivePool,
-    _tape_reservation: crate::write_owner::TapeReservation,
+    _tape_reservation: std::sync::Arc<crate::write_owner::TapeReservation>,
     actor_request: crate::write_owner::ManualFinalizeTapeActorRequest,
 ) -> Result<(), Status> {
     run_manual_finalize_worker_with_budget(
@@ -907,7 +976,7 @@ async fn run_manual_finalize_worker(
 async fn run_manual_finalize_worker_with_budget(
     state: ApiState,
     pool: crate::write_owner::DrivePool,
-    _tape_reservation: crate::write_owner::TapeReservation,
+    _tape_reservation: std::sync::Arc<crate::write_owner::TapeReservation>,
     actor_request: crate::write_owner::ManualFinalizeTapeActorRequest,
     ready_wait: Duration,
 ) -> Result<(), Status> {
@@ -945,7 +1014,7 @@ fn start_finalize_attempt(
 async fn run_started_manual_finalize_worker(
     state: ApiState,
     pool: crate::write_owner::DrivePool,
-    _tape_reservation: crate::write_owner::TapeReservation,
+    _tape_reservation: std::sync::Arc<crate::write_owner::TapeReservation>,
     actor_request: crate::write_owner::ManualFinalizeTapeActorRequest,
     ready_wait: Duration,
     handle: crate::operations::OperationHandle,
@@ -1206,7 +1275,13 @@ async fn recover_manual_terminal_tape(
     let pool = state.drive_pool()?.clone();
     let tape_reservation = pool.reserve_tape(intent.tape_uuid)?;
     let request = manual_finalize_request_from_intent(state, intent)?;
-    run_manual_finalize_worker(state.clone(), pool, tape_reservation, request).await
+    run_manual_finalize_worker(
+        state.clone(),
+        pool,
+        std::sync::Arc::new(tape_reservation),
+        request,
+    )
+    .await
 }
 
 /// Rehydrate the original exact request without trusting transient process
@@ -3087,33 +3162,128 @@ pub(crate) async fn supersede_tail(
     .map_err(|e| Status::internal(e.to_string()))?
 }
 
+/// Ownership follows each dispatched planning command until its physical work ends.
+/// The last owner schedules cleanup before releasing the tape and drive leases.
+pub(crate) struct PlanningOwnership {
+    state: Option<ApiState>,
+    runtime: tokio::runtime::Handle,
+    seated: Option<crate::write_owner::SeatedCartridge>,
+    parked: std::sync::Mutex<Option<crate::write_owner::ParkedCartridge>>,
+    _drive: Option<crate::write_owner::DriveReservation>,
+    _tape: Option<std::sync::Arc<crate::write_owner::TapeReservation>>,
+}
+
+/// A completed command transfers its lease with its reply, without a release race.
+pub(crate) struct PlanningResult<T> {
+    result: Result<T, Status>,
+    _ownership: std::sync::Arc<PlanningOwnership>,
+}
+
+impl<T> PlanningResult<T> {
+    pub(crate) fn into_result(self) -> Result<T, Status> {
+        self.result
+    }
+}
+
+impl PlanningOwnership {
+    pub(crate) fn complete<T>(
+        self: std::sync::Arc<Self>,
+        result: Result<T, Status>,
+    ) -> PlanningResult<T> {
+        PlanningResult {
+            result,
+            _ownership: self,
+        }
+    }
+
+    /// Publish the new physical location before replying or releasing ownership.
+    pub(crate) fn moved(&self) {
+        if let (Some(state), Some(seated)) = (&self.state, &self.seated) {
+            let pool = state.drive_pool().expect("planning owns a drive pool");
+            let parked = pool
+                .parked_at(&seated.drive_key())
+                .filter(|p| p.seated.tape_uuid == seated.tape_uuid)
+                .unwrap_or_else(|| pool.park_cartridge(seated.clone()));
+            *self.parked.lock().unwrap() = Some(parked);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn model() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            state: None,
+            runtime: tokio::runtime::Handle::current(),
+            seated: None,
+            parked: std::sync::Mutex::new(None),
+            _drive: None,
+            _tape: None,
+        })
+    }
+}
+
+impl Drop for PlanningOwnership {
+    fn drop(&mut self) {
+        if let (Some(state), Some(parked)) = (&self.state, self.parked.lock().unwrap().take()) {
+            let _entered = self.runtime.enter();
+            schedule_idle_dismount(state.clone(), parked);
+        }
+    }
+}
+
 /// Plan terminal metadata under exact-tape ownership without writing a barrier close.
 async fn plan_epoch_finalization(
     state: &ApiState,
     pool: &crate::write_owner::DrivePool,
     request: &crate::write_owner::ManualFinalizeTapeActorRequest,
+    tape: std::sync::Arc<crate::write_owner::TapeReservation>,
+    cancelled: impl Fn() -> bool,
 ) -> Result<remanence_parity::TerminalPrefixPlan, Status> {
     let library = resolve_tape_library_serial(state, pool, &request.tape_uuid)?;
     let (mount, reservation) =
         resolve_and_reserve_actor_mount(state, pool, &library, &request.tape_uuid).await?;
-    if let Some(slot) = mount.source_slot {
-        changer_move(pool, &mount.library_serial, slot, mount.bay).await?;
-    }
-    // Bind the generation before the actor retains a newly rebuilt planning state.
-    let parked = mount.home_slot.map(|home_slot| {
-        pool.parked_at(&mount.drive_key())
-            .filter(|p| p.seated.tape_uuid == Some(request.tape_uuid))
-            .unwrap_or_else(|| {
-                pool.park_cartridge(crate::write_owner::SeatedCartridge {
-                    bay: mount.bay,
-                    library_serial: mount.library_serial.clone(),
-                    barcode: mount.barcode.clone(),
-                    home_slot,
-                    tape_uuid: Some(request.tape_uuid),
-                    prior_session_id: None,
-                })
-            })
+    let ownership = std::sync::Arc::new(PlanningOwnership {
+        state: Some(state.clone()),
+        runtime: tokio::runtime::Handle::current(),
+        seated: mount
+            .home_slot
+            .map(|home_slot| crate::write_owner::SeatedCartridge {
+                bay: mount.bay,
+                library_serial: mount.library_serial.clone(),
+                barcode: mount.barcode.clone(),
+                home_slot,
+                tape_uuid: Some(request.tape_uuid),
+                prior_session_id: None,
+            }),
+        parked: std::sync::Mutex::new(None),
+        _drive: Some(reservation),
+        _tape: Some(tape),
     });
+    if let Some(slot) = mount.source_slot {
+        // Robotics reserves every drive in this library. Holding this drive
+        // and this tape excludes robotics and a competing mount of the source.
+        let changer = pool.changer_tx(&mount.library_serial)?;
+        let (reply, received) = oneshot::channel();
+        changer
+            .send(crate::write_owner::ChangerCommand::PlanningMove {
+                src: slot,
+                dst: mount.bay,
+                ownership: ownership.clone(),
+                reply,
+            })
+            .await
+            .map_err(|_| Status::unavailable("changer actor is unavailable"))?;
+        received
+            .await
+            .map_err(|_| Status::unavailable("changer actor stopped during planning"))?
+            .into_result()?;
+    } else {
+        ownership.moved();
+    }
+    if cancelled() {
+        return Err(Status::cancelled(
+            "finalization request dropped before acceptance",
+        ));
+    }
     let drive = pool.drive_tx(&mount.drive_key())?;
     let (reply, received) = oneshot::channel();
     drive
@@ -3123,18 +3293,15 @@ async fn plan_epoch_finalization(
             barcode: mount.barcode.clone(),
             source_slot: mount.source_slot,
             drive_serial: mount.drive_serial.clone(),
+            ownership: ownership.clone(),
             reply,
         })
         .await
         .map_err(|_| Status::unavailable("drive actor is unavailable"))?;
-    let result = received
+    received
         .await
-        .map_err(|_| Status::unavailable("drive actor stopped during epoch close"))?;
-    if let Some(parked) = parked {
-        schedule_idle_dismount(state.clone(), parked);
-    }
-    drop(reservation);
-    result
+        .map_err(|_| Status::unavailable("drive actor stopped during epoch close"))?
+        .into_result()
 }
 
 /// Exercise the real idle timer and eviction removal entry points with model actors.
@@ -4680,6 +4847,7 @@ mod tests {
             barrier_bundle: None,
             terminal_finalization: None,
             sealed_after_write: false,
+            seal_due: None,
         }
     }
 
@@ -5526,7 +5694,7 @@ mod tests {
             run_manual_finalize_worker_with_budget(
                 state.clone(),
                 pool.clone(),
-                guard,
+                guard.into(),
                 retry_request.clone(),
                 Duration::from_secs(900),
             ),
@@ -5551,7 +5719,7 @@ mod tests {
         let deadline_error = run_manual_finalize_worker_with_budget(
             state.clone(),
             pool.clone(),
-            guard,
+            guard.into(),
             retry_request,
             Duration::from_millis(20),
         )
@@ -5877,6 +6045,9 @@ mod tests {
         assert_eq!(error.code(), tonic::Code::NotFound);
         assert!(crate::readiness_wait::ReadinessFence::from_status(&error).is_none());
     }
+
+    #[path = "mount_planning_tests.rs"]
+    mod planning_tests;
 
     struct DismountHarness {
         _temp: tempfile::TempDir,

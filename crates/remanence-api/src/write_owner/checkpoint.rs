@@ -861,7 +861,7 @@ fn perform_checkpoint_barrier_mode(
         )),
         ));
     }
-    let record = remanence_state::CheckpointJournalRecord {
+    let mut record = remanence_state::CheckpointJournalRecord {
         ordinal: next_ordinal,
         committed_object_count: next_committed_count,
         eod_partition: captured.partition,
@@ -876,6 +876,7 @@ fn perform_checkpoint_barrier_mode(
         barrier_bundle,
         terminal_finalization: None,
         sealed_after_write: false,
+        seal_due: None,
     };
     let barrier_used_bytes = captured
         .lba
@@ -897,11 +898,22 @@ fn perform_checkpoint_barrier_mode(
     )
     .map_err(|err| CheckpointBarrierFailure::before_journal(status_from_pool_write_error(err)))?;
     #[cfg(test)]
-    let seal_reason = if cfg.io_memory.epoch_test_action.load(Ordering::Relaxed) == 7 {
-        Some(crate::pool_write::TapeSealReason::ReachedLowWatermark)
+    let seal_reason = if matches!(
+        cfg.io_memory.epoch_test_action.load(Ordering::Relaxed),
+        7 | 11
+    ) {
+        Some(crate::pool_write::TapeSealReason::HardwareEarlyWarning)
     } else {
         seal_reason
     };
+    record.seal_due = seal_reason
+        .filter(|_| !allow_finalization)
+        .map(|reason| match reason {
+            crate::pool_write::TapeSealReason::HardwareEarlyWarning => {
+                remanence_state::SealDueReason::HardwareEarlyWarning
+            }
+            _ => remanence_state::SealDueReason::ReachedLowWatermark,
+        });
     let filemark_drain = drain_started.elapsed();
     let projection_started = Instant::now();
     #[cfg(test)]
@@ -928,7 +940,10 @@ fn perform_checkpoint_barrier_mode(
     *tape_committed_object_count = next_committed_count;
     // Hold a competing SQLite writer only across projection, after journal sync.
     #[cfg(test)]
-    let projection_lock = if cfg.io_memory.epoch_test_action.load(Ordering::Relaxed) == 10 {
+    let projection_lock = if matches!(
+        cfg.io_memory.epoch_test_action.load(Ordering::Relaxed),
+        10 | 11
+    ) {
         let connection = rusqlite::Connection::open(&cfg.index_path).unwrap();
         connection.execute_batch("BEGIN IMMEDIATE").unwrap();
         Some(connection)
@@ -950,14 +965,7 @@ fn perform_checkpoint_barrier_mode(
             Status::internal("injected post-projection failure"),
         ));
     }
-    if let Some(reason) = seal_reason.filter(|_| !allow_finalization) {
-        let reason = match reason {
-            crate::pool_write::TapeSealReason::HardwareEarlyWarning => "hardware_early_warning",
-            _ => "reached_low_watermark",
-        };
-        index.record_tape_seal_due(tape_uuid, reason).map_err(|e| {
-            CheckpointBarrierFailure::after_projection(crate::status_from_state_error(e))
-        })?;
+    if record.seal_due.is_some() {
         tracing::info!(tape_uuid = %Uuid::from_bytes(tape_uuid), ?seal_reason,
             "terminal seal is due; removal leaves finalization to the next write session or explicit finalize");
     }
