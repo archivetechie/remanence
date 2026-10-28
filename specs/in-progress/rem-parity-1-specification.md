@@ -397,7 +397,15 @@ A single implementation may fill several roles.
   verification was performed, and it finds no failed data block, no failed
   parity shard and no finding about a sidecar or about the prefix. A finding
   about a copy of the ParityMap or its footer likewise leaves the tape not
-  complete. The
+  complete. A Verifier may perform its full verification in parts, at
+  different times and on different drives, provided every part reads the
+  same physical cartridge, not a copy of it, every part verifies against the
+  same edition digest and terminal-layout digest (Sections 8.3 and 10.4), and
+  the parts together make every check of a full verification. A Verifier
+  performs a verification in parts only when a terminal replica validates in
+  every part. The verification finishes when its last part finishes, and a
+  report that a tape verified in parts is complete states when the first part
+  began and the last part ended. The
   Verifier measures and classifies every tape file of the prefix, including
   when the replicas validate, and reports the damage it finds there. It may
   measure a tape file of the prefix from its reads of every block of that
@@ -4067,6 +4075,18 @@ an errata revision of draft.1.
     measurement, the classification and every finding are the walk's, no
     requirement is relaxed, and a Reader that measures by spacing remains
     conformant. No tape byte and no vector outcome changes.
+
+    Section 2.2 says that a Verifier may perform its full verification in
+    parts, at different times and on different drives, when every part reads
+    the same physical cartridge and verifies against the same edition and
+    terminal-layout digests, and the parts together make every check of a
+    full verification; it does so only when a terminal replica validates in
+    every part, the verification finishes when its last part finishes, and a
+    report that a tape verified in parts is complete states when the first
+    part began and the last part ended. This is a new permission: no
+    requirement is relaxed, and a single uninterrupted full verification
+    remains conformant and unchanged. No tape byte and no vector outcome
+    changes.
 - **2026-08-11 — 1.0.0-draft.4 — replacement review draft.** Replaces the
   geometric/checkpoint-bootstrap design with one BOT Bootstrap and exactly
   three complete terminal index replicas separated by two typed extents.
