@@ -355,12 +355,18 @@ pub struct PreparedPathSource(pub(crate) remanence_stream::PreparedFile);
 pub enum WriteObjectSource {
     /// Completed local file used by the legacy serial and in-process paths.
     Path(PathBuf),
-    /// Completed daemon logical-file spool with caller metadata, never spool timestamps.
+    /// Completed daemon append spool with caller metadata, never spool timestamps.
     Spool {
         /// Local completed spool owned by the write session.
         path: PathBuf,
         /// Optional validated decimal PAX timestamp supplied by the caller.
         mtime: Option<String>,
+        /// SHA-256 computed by the daemon while receiving the spool.
+        content_sha256: [u8; 32],
+        /// Byte count measured alongside the receipt digest.
+        received_bytes: u64,
+        /// Configured serial mode or the overlap admission condition that fails.
+        staging_reason: &'static str,
     },
     /// Prepared local file; the writer still validates every streamed byte.
     PreparedPath(PreparedPathSource),
@@ -371,7 +377,20 @@ pub enum WriteObjectSource {
 impl WriteObjectSource {
     pub(crate) fn size_bytes(&self) -> Result<u64, PoolWriteError> {
         match self {
-            Self::Path(path) | Self::Spool { path, .. } => source_file_size(path),
+            Self::Path(path) => source_file_size(path),
+            Self::Spool {
+                path,
+                received_bytes,
+                ..
+            } => {
+                let actual = source_file_size(path)?;
+                if actual != *received_bytes {
+                    return Err(PoolWriteError::InvalidInput(format!(
+                        "spool size differs from receipt: received {received_bytes} bytes, found {actual}"
+                    )));
+                }
+                Ok(*received_bytes)
+            }
             Self::PreparedPath(source) => Ok(source.0.spec.size_bytes),
             Self::Streamed(source) => Ok(source.size_bytes),
         }
@@ -379,7 +398,8 @@ impl WriteObjectSource {
 
     pub(crate) fn content_sha256(&self) -> Result<[u8; 32], PoolWriteError> {
         match self {
-            Self::Path(path) | Self::Spool { path, .. } => sha256_file(path),
+            Self::Path(path) => sha256_file(path),
+            Self::Spool { content_sha256, .. } => Ok(*content_sha256),
             Self::PreparedPath(source) => source.0.spec.file_sha256.ok_or_else(|| {
                 PoolWriteError::InvalidInput("prepared regular file has no digest".into())
             }),
@@ -571,6 +591,7 @@ pub(super) fn append_commit_info_from_pool_copy(
 /// Full report returned by `write_object_to_pool`.
 #[derive(Debug)]
 pub struct PoolWriteResult {
+    pub(crate) transfer_feed_wait: Duration,
     /// Locator/object record for the caller.
     pub object: PoolWriteObjectRecord,
     /// Lower-layer streaming write report when this call performed a new tape write.

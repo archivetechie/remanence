@@ -16898,6 +16898,7 @@ mod tests {
                 io_memory_ceiling: remanence_state::DEFAULT_IO_MEMORY_CEILING_BYTES,
                 append_staging_mode: remanence_state::AppendStagingMode::Serial,
                 append_ring_bytes: remanence_state::DEFAULT_APPEND_RING_BYTES,
+                append_overlap_min_bytes: None,
                 append_ring_high_pct: 90,
                 append_ring_low_pct: 25,
                 checkpoint_max_bytes: remanence_state::DEFAULT_CHECKPOINT_MAX_BYTES,

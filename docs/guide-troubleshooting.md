@@ -337,6 +337,51 @@ speed-matching floor.
 A host that has never been tuned can show both at once. Each is fixed at
 its own limit.
 
+### Per-object write diagnostics
+
+`remanence_write_diag` uses milliseconds for `elapsed_ms` and MiB/s
+(1,048,576 bytes/s) for `throughput_mib_s`. Plain and parity appends emit
+`prepare`, `transfer`, and `tail`. `prepare` covers validation, layout, and
+capacity reservation. `transfer` covers the object writer, including parity
+accumulation, CRC, hashes, copies, and object filemarks. `tail` covers the host
+projection and session detach after transfer; it emits on success or error
+and does not itself assert a commit. Shared checkpoint barriers retain their
+separate diagnostics.
+
+The parity `transfer` event adds `write_commands_ms`, the sum of time inside
+raw fixed-block WRITE calls, and `between_writes_ms`, the sum of intervals
+from one WRITE return to the next WRITE entry. Those intervals include host
+work and any intervening filemark or position calls. `transfer_host_ms` is
+`elapsed_ms - write_commands_ms`; it also includes work before the first and
+after the last WRITE. These are host-side elapsed measurements, not drive
+firmware counters. `object_id`, `pool_id`, and `tape_uuid` correlate phases.
+The plain path reports the same elapsed fields; its
+existing gap and staging-wait distributions describe command cadence.
+
+One `drive_append_total` line identifies each completed actor append by
+`object_id` and `caller_object_id` and reports:
+
+| Field | Meaning |
+|---|---|
+| `staging_mode` | `overlap` for the receive ring, `serial` for a completed spool or local file. |
+| `staging_reason` | `configured_overlap`, `configured_serial`, or the first failed admission condition: `no_declared_size`, `empty_object`, `no_start_digest`, `no_replay_capability`, `no_caller_object_id`, `below_overlap_min`, or `canonical_start`. In-process local files use `completed_path`. Unsupported manifests are refused before append. |
+| `prefill_lead_bytes` | Actual ring occupancy when prefill completes, or zero for a completed spool. |
+| `feed_wait_ms` | Ring consumer receive/resume wait time for overlap; elapsed time between WRITE calls for serial. |
+| `feed_wait_measure` | `ring_consumer_wait` or `between_write_calls`, naming the proxy used. The latter spans the first WRITE entry through the last WRITE return, minus time inside WRITEs. It includes host work and intervening non-WRITE commands, so it is an upper bound on feed starvation. An error without transfer measurements uses `unavailable`. |
+| `open_path` | `full`, the current session-open path. |
+
+`replay=true` reports no new tape transfer and a zero append rate. Errors
+carry `status=error` and may lack an object UUID. `drive_append_total` measures
+the actor append before a threshold-triggered shared checkpoint; spool receive
+and session open/close remain outside this rate.
+
+The write and dual benchmarks match the receipt's object UUID to a
+`drive_append_total` event within that command's log window. Their CSV and
+evidence summary retain the client wall rate, daemon append rate, and staging
+mode. The dual aggregate row names the append leg's object and daemon rate;
+the client aggregate rate includes the concurrent restore. Missing diagnostics
+are `unavailable`; the kit never substitutes another object's latest event.
+
 <!-- code-anchor: crates/remanence-api/src/pool_write.rs crates/remanence-parity/src/error.rs crates/remanence-api/src/pool_write/selection.rs crates/remanence-api/src/write_admission.rs @ 1dd451b2 -->
 ## Writes are refused
 

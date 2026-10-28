@@ -20,6 +20,8 @@ use super::no_parity::{
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct BlockSinkStats {
+    pub(crate) write_command_elapsed: Duration,
+    pub(crate) between_write_elapsed: Duration,
     pub(crate) block_write_calls: u64,
     pub(crate) block_write_bytes: u64,
     pub(crate) min_block_bytes: Option<u64>,
@@ -122,6 +124,7 @@ pub(crate) struct LiveCounterBlockSink<'a> {
 pub(crate) struct CountingBlockSink<'a, S: BlockSink + ?Sized> {
     pub(crate) inner: &'a mut S,
     pub(crate) stats: BlockSinkStats,
+    last_write_finished: Option<Instant>,
 }
 
 pub(crate) struct ObjectDigestBlockSink<'a, S: BlockSink + ?Sized> {
@@ -1451,6 +1454,7 @@ impl<'a, S: BlockSink + ?Sized> CountingBlockSink<'a, S> {
         let staging_ring_buffers = inner.staging_ring_buffers();
         Self {
             inner,
+            last_write_finished: None,
             stats: BlockSinkStats {
                 write_batch_blocks,
                 effective_batch_blocks,
@@ -1459,6 +1463,16 @@ impl<'a, S: BlockSink + ?Sized> CountingBlockSink<'a, S> {
                 ..BlockSinkStats::default()
             },
         }
+    }
+
+    /// Accumulate the command boundary and the elapsed host interval before it.
+    fn record_write_timing(&mut self, started: Instant) {
+        let finished = Instant::now();
+        self.stats.write_command_elapsed += finished.duration_since(started);
+        if let Some(previous) = self.last_write_finished {
+            self.stats.between_write_elapsed += started.duration_since(previous);
+        }
+        self.last_write_finished = Some(finished);
     }
 
     pub(crate) fn stats(&self) -> BlockSinkStats {
@@ -1654,7 +1668,10 @@ impl<'a> BlockSink for LiveCounterBlockSink<'a> {
 
 impl<'a, S: BlockSink + ?Sized> BlockSink for CountingBlockSink<'a, S> {
     fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
-        let outcome = self.inner.write_block(buf)?;
+        let started = Instant::now();
+        let result = self.inner.write_block(buf);
+        self.record_write_timing(started);
+        let outcome = result?;
         self.stats
             .record_block(u64::from(outcome.bytes_written), outcome.early_warning);
         Ok(outcome)
@@ -1665,7 +1682,10 @@ impl<'a, S: BlockSink + ?Sized> BlockSink for CountingBlockSink<'a, S> {
         buf: &[u8],
         block_size_bytes: u32,
     ) -> Result<WriteBatchOutcome, TapeIoError> {
-        let outcome = self.inner.write_block_batch(buf, block_size_bytes)?;
+        let started = Instant::now();
+        let result = self.inner.write_block_batch(buf, block_size_bytes);
+        self.record_write_timing(started);
+        let outcome = result?;
         self.stats
             .record_block(u64::from(outcome.bytes_written), outcome.early_warning);
         Ok(outcome)
@@ -1677,9 +1697,11 @@ impl<'a, S: BlockSink + ?Sized> BlockSink for CountingBlockSink<'a, S> {
         block_size_bytes: u32,
         cdb: &[u8],
     ) -> Result<WriteBatchOutcome, TapeIoError> {
+        let started = Instant::now();
         let result = self
             .inner
             .write_block_batch_pipelined(buf, block_size_bytes, cdb);
+        self.record_write_timing(started);
         match &result {
             Ok(outcome) => self
                 .stats
@@ -1823,5 +1845,73 @@ impl<'a, S: BlockSink + ?Sized> BlockSink for CountingBlockSink<'a, S> {
         let position = self.inner.position_pipelined()?;
         self.stats.record_position(position);
         Ok(position)
+    }
+}
+
+/// Observe raw parity commands without changing their arguments or order.
+pub(crate) struct TimedRawTapeSink<'a> {
+    pub(crate) inner: &'a mut dyn remanence_parity::RawTapeSink,
+    pub(crate) stats: &'a std::cell::Cell<BlockSinkStats>,
+    pub(crate) last_write_finished: Option<Instant>,
+}
+
+impl remanence_parity::RawTapeSink for TimedRawTapeSink<'_> {
+    fn locate_for_overwrite(
+        &mut self,
+        hint: remanence_parity::PhysicalPositionHint,
+    ) -> Result<(), remanence_parity::ParityError> {
+        self.inner.locate_for_overwrite(hint)
+    }
+
+    fn write_fixed_block(
+        &mut self,
+        buf: &[u8],
+    ) -> Result<remanence_parity::RawWriteOutcome, remanence_parity::ParityError> {
+        let started = Instant::now();
+        let result = self.inner.write_fixed_block(buf);
+        let finished = Instant::now();
+        let mut stats = self.stats.get();
+        stats.write_command_elapsed += finished.duration_since(started);
+        if let Some(previous) = self.last_write_finished {
+            stats.between_write_elapsed += started.duration_since(previous);
+        }
+        self.last_write_finished = Some(finished);
+        if let Ok(remanence_parity::RawWriteOutcome::WroteBlock {
+            bytes_written,
+            early_warning,
+            ..
+        }) = &result
+        {
+            stats.record_block(u64::from(*bytes_written), *early_warning);
+        }
+        self.stats.set(stats);
+        result
+    }
+
+    fn write_filemarks(
+        &mut self,
+        count: u32,
+        immed: bool,
+    ) -> Result<remanence_parity::RawWriteOutcome, remanence_parity::ParityError> {
+        let started = Instant::now();
+        let result = self.inner.write_filemarks(count, immed);
+        let mut stats = self.stats.get();
+        stats.record_filemarks(
+            count,
+            result.as_ref().is_ok_and(|outcome| outcome.early_warning()),
+            started.elapsed(),
+        );
+        self.stats.set(stats);
+        result
+    }
+
+    fn position(
+        &mut self,
+    ) -> Result<remanence_parity::PhysicalPositionHint, remanence_parity::ParityError> {
+        let result = self.inner.position();
+        let mut stats = self.stats.get();
+        stats.position_calls += 1;
+        self.stats.set(stats);
+        result
     }
 }

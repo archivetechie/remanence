@@ -3,6 +3,8 @@ set -euo pipefail
 
 if [[ -z "${BASH_VERSION:-}" ]]; then
   echo "error: lib.sh requires bash" >&2
+  # Sourced libraries return; direct invocation exits.
+  # shellcheck disable=SC2317
   return 1 2>/dev/null || exit 1
 fi
 
@@ -780,18 +782,93 @@ PY
 }
 
 fieldtest_bench_csv_header() {
-  printf 'metric,drive,block_size,payload,MB_s,seconds,bytes\n'
+  printf 'metric,drive,block_size,payload,MB_s,seconds,bytes,object_id,daemon_drive_append_mib_s,staging_mode,staging_reason,daemon_diagnostics,daemon_transfer_mib_s\n'
+}
+
+# Match a completed write to its daemon event within this invocation's log window.
+# Missing or rotated logs remain explicit unavailable evidence.
+fieldtest_daemon_write_figures() {
+  local receipt="$1" offset="${2:-0}" log
+  log="$(fieldtest_log_dir)/rem-daemon.log"
+  python3 - "$receipt" "$log" "$offset" <<'PYDATA'
+import json, sys, uuid
+from pathlib import Path
+receipt, log, offset = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3])
+object_id = "unavailable"
+match = None
+transfer = "unavailable"
+try:
+    object_id = str(uuid.UUID(json.loads(receipt.read_text())["object_id"]))
+    with log.open("rb") as stream:
+        if stream.seek(0, 2) < offset:
+            raise ValueError("log rotates during write")
+        stream.seek(offset)
+        for raw in stream:
+            try:
+                event = json.loads(raw)
+                event = event.get("fields", event)
+                if (str(uuid.UUID(event.get("object_id", ""))) == object_id
+                        and event.get("status", "ok") == "ok"
+                        and not event.get("replay", False)):
+                    if event.get("phase") == "drive_append_total":
+                        match = event
+                    elif event.get("phase") == "transfer":
+                        transfer = event.get("throughput_mib_s", "unavailable")
+            except (ValueError, TypeError):
+                continue
+except (OSError, ValueError, KeyError, TypeError):
+    pass
+if match is not None and match.get("throughput_mib_s") is not None and match.get("staging_mode") in ("serial", "overlap"):
+    print(object_id, match["throughput_mib_s"], match["staging_mode"], match.get("staging_reason", "unavailable"), "matched", transfer)
+else:
+    print(object_id, "unavailable unavailable unavailable unavailable unavailable")
+PYDATA
+}
+
+fieldtest_daemon_log_offset() {
+  local log
+  log="$(fieldtest_log_dir)/rem-daemon.log"
+  if [[ -f "$log" ]]; then stat -c '%s' "$log"; else printf '0\n'; fi
 }
 
 fieldtest_bench_record() {
   local metric="$1" drive="$2" block_size="$3" payload="$4" mb_s="$5" seconds="$6" bytes="$7"
-  local csv
+  local receipt="${8:-}" offset="${9:-0}" csv figures="${10:-n/a n/a n/a n/a n/a n/a}"
   csv="$(fieldtest_bench_csv_path)"
   mkdir -p "$(dirname -- "$csv")"
-  if [[ ! -f "$csv" ]]; then
-    fieldtest_bench_csv_header >"$csv"
+  if [[ -n "$receipt" && -z "${10:-}" ]]; then
+    figures="$(fieldtest_daemon_write_figures "$receipt" "$offset")"
   fi
-  printf '%s,%s,%s,%s,%s,%s,%s\n' "$metric" "$drive" "$block_size" "$payload" "$mb_s" "$seconds" "$bytes" >>"$csv"
+  # Upgrade an existing evidence CSV while retaining all prior rows.
+  python3 - "$csv" "$metric" "$drive" "$block_size" "$payload" "$mb_s" "$seconds" "$bytes" "$figures" <<'PYDATA'
+import csv, fcntl, os, stat, sys, tempfile
+from pathlib import Path
+path = Path(sys.argv[1])
+fields = "metric drive block_size payload MB_s seconds bytes object_id daemon_drive_append_mib_s staging_mode staging_reason daemon_diagnostics daemon_transfer_mib_s".split()
+# The stable lock covers read, schema upgrade, and atomic replacement.
+with path.with_suffix(path.suffix + ".lock").open("a") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    rows = []
+    mode = None
+    if path.exists():
+        mode = stat.S_IMODE(path.stat().st_mode)
+        with path.open(newline="") as stream:
+            rows = list(csv.DictReader(stream))
+    rows.append(dict(zip(fields, sys.argv[2:9] + sys.argv[9].split())))
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", newline="", dir=path.parent, delete=False) as stream:
+            temporary = stream.name
+            if mode is not None:
+                os.fchmod(stream.fileno(), mode)
+            writer = csv.DictWriter(stream, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+        os.replace(temporary, path)
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
+PYDATA
 }
 
 fieldtest_capture_tape_io_mode() {
@@ -884,9 +961,8 @@ PY
 }
 
 fieldtest_selected_library_serial() {
-  local path="$(
-    fieldtest_state_dir
-  )/selected-library"
+  local path
+  path="$(fieldtest_state_dir)/selected-library"
   if [[ -f "$path" ]]; then
     cat "$path"
     return 0
@@ -1166,13 +1242,12 @@ fieldtest_sudo_surface_lines() {
 }
 
 fieldtest_selftest() {
-  local tmpdir records bench_json allowlist config
+  local tmpdir records allowlist config
   tmpdir="$(mktemp -d)"
   mkdir -p "$tmpdir/home/bin" "$tmpdir/home/state" "$tmpdir/home/spool" "$tmpdir/home/log" "$tmpdir/home/evidence"
   allowlist="$tmpdir/home/allowlist.txt"
   config="$tmpdir/home/config.toml"
   records="$tmpdir/home/evidence/records.jsonl"
-  bench_json="$tmpdir/home/evidence/bench.csv"
   cat >"$allowlist" <<'EOF'
 S20001L9
 S20002L9
@@ -1242,7 +1317,7 @@ EOF
   [[ "${REMFIELD_ENV:-}" == vtl ]]
   fieldtest_require_allowlisted S20001L9
   fieldtest_require_allowlisted CLNU01L9
-  ! fieldtest_require_allowlisted BAD0001
+  if fieldtest_require_allowlisted BAD0001; then return 1; fi
   local record_path bench_path
   record_path="$(fieldtest_records_path)"
   fieldtest_evidence_record selftest t1 PASS "ok"
@@ -1370,23 +1445,31 @@ EOF
   return 1
 }
 
-# Refuse to start the daemon on a configuration whose append staging mode is
-# serial: the upload then waits for the whole object before any tape motion and
-# every write figure understates the product. FIELD_ALLOW_SERIAL_STAGING=1
-# overrides for a deliberate comparison run.
+# Require the product default for normal kit runs. FIELD_ALLOW_SERIAL_STAGING=1
+# permits explicit serial mode for a deliberate comparison run.
 fieldtest_require_overlap_staging() {
-  local config mode
+  local config mode threshold
   config="$(fieldtest_config_path)"
   [[ -f "$config" ]] || return 0
   mode="$(sed -nE 's/^append_staging_mode *= *"([a-z]+)".*/\1/p' "$config" | head -n 1)"
+  if [[ -z "$mode" ]]; then
+    echo "info: append_staging_mode is omitted; the daemon defaults to overlap" >&2
+    mode=overlap
+  fi
+  threshold="$(sed -nE 's/^append_overlap_min_bytes *= *"?([^" #]+)"?.*/\1/p' "$config" | head -n 1)"
+  if [[ -z "$threshold" ]]; then
+    threshold="$(sed -nE 's/^append_ring_bytes *= *"?([^" #]+)"?.*/\1/p' "$config" | head -n 1)"
+    threshold="${threshold:-8GiB} (derived from append_ring_bytes)"
+  fi
+  echo "info: append_staging_mode=$mode; append_overlap_min_bytes=$threshold; smaller objects use the spool. The kit config sets overlap and a 1GiB threshold for the 1GiB VTL and 2GiB real-drive bench objects." >&2
   if [[ "$mode" == overlap ]]; then
     return 0
   fi
   if [[ "${FIELD_ALLOW_SERIAL_STAGING:-0}" == 1 ]]; then
-    echo "warn: starting the daemon with append_staging_mode=${mode:-serial} (FIELD_ALLOW_SERIAL_STAGING=1)" >&2
+    echo "warn: starting the daemon with append_staging_mode=${mode:-overlap} (FIELD_ALLOW_SERIAL_STAGING=1)" >&2
     return 0
   fi
-  echo "error: $config has append_staging_mode=${mode:-serial}; the kit measures the product only in overlap mode. Add append_staging_mode = \"overlap\" under [daemon] (the generated config carries it), or set FIELD_ALLOW_SERIAL_STAGING=1 for a deliberate comparison run." >&2
+  echo "error: $config has append_staging_mode=${mode:-overlap}; the kit measures the product only in overlap mode. Add append_staging_mode = \"overlap\" and append_overlap_min_bytes = \"1GiB\" under [daemon] (the generated config carries it), or set FIELD_ALLOW_SERIAL_STAGING=1 for a deliberate comparison run." >&2
   return 1
 }
 
@@ -1531,9 +1614,9 @@ parts = [
     f'spool_dir = "{home / "spool"}"',
     'spool_tmpfs_ram_budget = "64GiB"',
     'io_memory_ceiling = "96GiB"',
-    # The upload overlaps the tape write; serial mode spools the whole object
-    # first and measures the product with its hands tied.
+    # Both the 1 GiB and 2 GiB bench objects qualify for the ring.
     'append_staging_mode = "overlap"',
+    'append_overlap_min_bytes = "1GiB"',
     "",
     "[[libraries]]",
     f'serial = "{selected}"',

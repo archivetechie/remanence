@@ -314,21 +314,31 @@ finalization.
 2. The actor prepares the drive: it rewinds, reads the bootstrap at BOT, and
    verifies that the tape UUID matches what the catalog expects. A tape that
    cannot prove its identity is never written.
-3. `AppendObject` streams chunks of the object to the daemon. The daemon
-   spools them to a private staging file (mode 0700, named
-   `spool-<uuid>.bin`) under a byte budget shared with every read reservoir in
-   the daemon (`daemon.io_memory_ceiling`, default 24 GiB). A spool on tmpfs
-   (a RAM-backed file system) additionally needs an operator-acknowledged
-   `spool_tmpfs_ram_budget`, and it is limited by the ceiling, not by the
-   currently available memory. The daemon checks the SHA-256 the caller
-   declared against the bytes it received before anything is written to tape.
-   When `rem-daemon` starts, it deletes spool files left by its own earlier
-   unclean exit before it resolves the budget.
+3. `AppendObject` streams chunks of the object to the daemon. The default
+   staging mode is `[daemon] append_staging_mode = "overlap"`. A logical append
+   uses a bounded ring when it supplies a nonempty caller object ID, a binding
+   start digest, replay-from-start capability, and a declared size at least
+   `append_overlap_min_bytes`. The threshold defaults to `append_ring_bytes`
+   (8 GiB). Smaller objects use the spool with reason `below_overlap_min` and
+   share checkpoint batches. The threshold sets no minimum accepted object size.
 
-   The default staging mode is `[daemon] append_staging_mode = "serial"`, which
-   spools the whole object first. The opt-in `"overlap"` mode admits an append
-   into a shared ring buffer before the whole object has arrived. It requires
-   the caller to attest that it can replay its source from byte zero. The
+   The ring reserves the smaller of its configured capacity and the declared
+   size rounded up to a 1 MiB slab. If the shared memory reservation is
+   unavailable, the append fails with `RESOURCE_EXHAUSTED` before payload receive.
+   The ring checks the received digest at the end while holding back the last
+   slab. A mismatch leaves the object incomplete and uncommitted. Its internal
+   checkpoint retains all committed receipts for the caller's next
+   `CheckpointSession` or close, including earlier objects in the same batch.
+
+   Other supported streams and explicit `"serial"` mode use a private staging
+   file (mode 0700, named `spool-<uuid>.bin`). Every spool hashes bytes as they
+   arrive. The daemon checks the caller's digest before writing to tape and
+   verifies that the completed spool size matches the received byte count
+   before motion. Preparation reuses the receipt digest; the writer also checks
+   the streamed bytes. Spool memory shares `daemon.io_memory_ceiling` (default
+   24 GiB) with rings and read reservoirs. A tmpfs spool also requires an
+   acknowledged `spool_tmpfs_ram_budget`. Startup deletes spool files left by
+   the daemon's earlier unclean exit before resolving the budget. The
    [configuration reference](reference-configuration.md) lists the admission
    settings.
 

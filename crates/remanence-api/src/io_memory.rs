@@ -25,6 +25,11 @@ impl IoMemoryReservation {
         }))
     }
 
+    /// Return the configured ceiling for admission diagnostics.
+    pub(crate) fn ceiling(&self) -> u64 {
+        self.ceiling
+    }
+
     #[cfg(test)]
     pub(crate) fn granted(&self) -> u64 {
         self.granted.load(Ordering::Acquire)

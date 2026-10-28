@@ -6,6 +6,7 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub(crate) struct Spool {
@@ -14,6 +15,7 @@ pub(crate) struct Spool {
     written: u64,
     cap: u64,
     keep: bool,
+    hasher: Sha256,
 }
 
 impl Spool {
@@ -32,6 +34,7 @@ impl Spool {
             written: 0,
             cap,
             keep: false,
+            hasher: Sha256::new(),
         })
     }
 
@@ -51,8 +54,14 @@ impl Spool {
         self.file.write_all(bytes).map_err(|err| {
             std::io::Error::new(err.kind(), format!("write {}: {err}", self.path.display()))
         })?;
+        self.hasher.update(bytes);
         self.written = next;
         Ok(())
+    }
+
+    /// Return the digest of accepted chunks without rereading the spool.
+    pub(crate) fn content_sha256(&self) -> [u8; 32] {
+        self.hasher.clone().finalize().into()
     }
 
     pub(crate) fn finish(mut self) -> std::io::Result<PathBuf> {

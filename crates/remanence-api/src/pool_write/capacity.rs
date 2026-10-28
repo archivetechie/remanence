@@ -473,6 +473,12 @@ pub(crate) fn batched_append_context_after_checkpoint(
     previous: &BatchedNoParityAppendContext,
     record: &remanence_state::CheckpointJournalRecord,
 ) -> Result<BatchedNoParityAppendContext, PoolWriteError> {
+    #[cfg(test)]
+    if crate::write_owner::tests::fail_append_context_now() {
+        return Err(PoolWriteError::MissingTapeGeometry(
+            "injected next append context failure".into(),
+        ));
+    }
     let previous_total_committed_ordinals = record
         .objects
         .last()

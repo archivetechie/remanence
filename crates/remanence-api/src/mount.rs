@@ -1479,6 +1479,9 @@ async fn open_read_session_on_mount(
 
 pub(crate) struct AppendFinishRequest {
     pub(crate) spool_path: std::path::PathBuf,
+    pub(crate) content_sha256: [u8; 32],
+    pub(crate) received_bytes: u64,
+    pub(crate) staging_reason: &'static str,
     pub(crate) mtime: Option<String>,
     pub(crate) archive_path: std::path::PathBuf,
     pub(crate) caller_object_id: String,
@@ -1503,13 +1506,12 @@ pub(crate) async fn append_finish(
     drive
         .send(crate::write_owner::DriveCommand::AppendFinish {
             session_id,
-            source: if request.input_kind == crate::WriteObjectInputKind::LogicalFile {
-                crate::WriteObjectSource::Spool {
-                    path: request.spool_path,
-                    mtime: request.mtime,
-                }
-            } else {
-                crate::WriteObjectSource::Path(request.spool_path)
+            source: crate::WriteObjectSource::Spool {
+                path: request.spool_path,
+                mtime: request.mtime,
+                content_sha256: request.content_sha256,
+                received_bytes: request.received_bytes,
+                staging_reason: request.staging_reason,
             },
             archive_path: request.archive_path,
             caller_object_id: request.caller_object_id,

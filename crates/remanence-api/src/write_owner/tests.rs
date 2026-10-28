@@ -46,6 +46,7 @@ use remanence_state::{
     OBJECT_COPY_REPRESENTATION_PLAINTEXT,
 };
 use remanence_stream::StreamingError;
+use sha2::{Digest, Sha256};
 use std::sync::atomic::AtomicU64;
 use time::{Duration, OffsetDateTime};
 use tokio::sync::{mpsc, oneshot};
@@ -4061,7 +4062,12 @@ fn canceled_checkpoint_reply_restores_unclaimed_committed_receipts() {
     let (reply, receiver) = oneshot::channel();
     drop(receiver);
 
-    send_checkpoint_actor_reply(reply, pb::WriteSession::default(), &mut receipts);
+    send_checkpoint_actor_reply(
+        reply,
+        pb::WriteSession::default(),
+        &mut receipts,
+        CheckpointTrigger::Explicit,
+    );
 
     assert_eq!(receipts.len(), 1);
     assert_eq!(receipts[0].object_id, vec![0x70; 16]);
@@ -5564,7 +5570,10 @@ async fn sequential_sessions_and_replay_return_catalog_copies_through_mount() {
             &state,
             session_id,
             crate::mount::AppendFinishRequest {
+                staging_reason: "configured_serial",
                 mtime: None,
+                content_sha256: Sha256::digest(std::fs::read(&source_path).unwrap()).into(),
+                received_bytes: std::fs::metadata(&source_path).unwrap().len(),
                 spool_path: source_path,
                 archive_path: PathBuf::from(format!("payload-{session_ordinal}.bin")),
                 caller_object_id: format!("batch-one-caller-{session_ordinal}"),
@@ -5651,7 +5660,10 @@ async fn sequential_sessions_and_replay_return_catalog_copies_through_mount() {
         &state,
         replay_session_id,
         crate::mount::AppendFinishRequest {
+            staging_reason: "configured_serial",
             mtime: None,
+            content_sha256: Sha256::digest(std::fs::read(&replay_source).unwrap()).into(),
+            received_bytes: std::fs::metadata(&replay_source).unwrap().len(),
             spool_path: replay_source,
             archive_path: PathBuf::from("payload-1.bin"),
             caller_object_id: "batch-one-caller-1".to_string(),
@@ -11483,4 +11495,412 @@ async fn attached_load_retry_follows_actor_refresh_and_release() {
             task.await.unwrap();
         }
     }
+}
+
+/// Exercise ingress, internal barriers, caller checkpoints, and close against virtual media.
+pub(crate) async fn check_overlap_batch_receipts(
+    state: &StateHandle,
+    world: Arc<Mutex<VirtualWorld>>,
+    selected: SelectedTape,
+    serial_mode: bool,
+) {
+    use crate::pb::write_session_service_server::WriteSessionService;
+    let mut config = state.config().clone();
+    assert_eq!(
+        config.daemon.append_staging_mode,
+        remanence_state::AppendStagingMode::Overlap
+    );
+    config.daemon.append_overlap_min_bytes = Some(1024 * 1024);
+    if serial_mode {
+        config.daemon.append_staging_mode = remanence_state::AppendStagingMode::Serial;
+    }
+    let mut api_state = crate::ApiState::new_with_config(
+        CatalogIndex::open(&state.paths().sqlite_path).unwrap(),
+        &config,
+    )
+    .unwrap();
+    let mut library = open_model_library(world);
+    let mut cfg = test_write_owner_config(
+        state.paths().sqlite_path.clone(),
+        state.paths().audit_dir.clone(),
+        &library,
+        library_snapshot_cell(library.library().clone()),
+    );
+    cfg.checkpoint_journal_dir = state.paths().journal_dir.join("checkpoints");
+    cfg.checkpoint_max_objects = 100;
+    cfg.checkpoint_max_age_seconds = 3600;
+    let serial = library.library().serial.clone();
+    let drive = library
+        .open_drive(
+            0x100,
+            &remanence_library::StaticAllowlist::new([serial.as_str()]),
+        )
+        .unwrap();
+    let tx = spawn_drive_actor(0x100, drive, cfg);
+    let (reply, rx) = oneshot::channel();
+    tx.send(DriveCommand::OpenWrite {
+        actor: remanence_state::AuditActor::System,
+        pool_cfg: state.config().tape_pools[0].clone(),
+        selected: selected.clone(),
+        target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
+        needs_drive_load: false,
+        library_serial: serial.clone(),
+        barcode: Some("HAND".into()),
+        source_slot: None,
+        drive_uuid: None,
+        drive_serial: None,
+        reply,
+    })
+    .await
+    .unwrap();
+    let session = rx.await.unwrap().unwrap();
+    let id = Uuid::from_slice(&session.session_id).unwrap();
+    let (changer_tx, _changer_rx) = mpsc::channel(1);
+    let pool = DrivePool::new_for_library(
+        &serial,
+        changer_tx,
+        HashMap::from([(0x100, tx)]),
+        Arc::new(HashMap::from([(0x100, AtomicBool::new(false))])),
+    );
+    pool.record_session(
+        id,
+        MountedSession {
+            bay: 0x100,
+            library_serial: serial,
+            barcode: Some("HAND".into()),
+            home_slot: None,
+            tape_uuid: selected.tape_uuid,
+            drive_uuid: None,
+        },
+    );
+    let spool = state.paths().state_dir.join("spool");
+    std::fs::create_dir_all(&spool).unwrap();
+    api_state.spool_dir = Some(Arc::new(spool));
+    api_state.spool_budget_bytes = Some(config.daemon.io_memory_ceiling);
+    api_state.drive_pool = Some(pool);
+    let api = api_state.write_session_service();
+    let append = |name: &'static str, size: usize| {
+        let api = api.clone();
+        async move {
+            let bytes = vec![0x61; size];
+            let digest = Sha256::digest(&bytes).to_vec();
+            let messages = vec![
+                pb::AppendObjectMessage {
+                    payload: Some(pb::append_object_message::Payload::Start(
+                        pb::AppendObjectStart {
+                            session_id: id.as_bytes().to_vec(),
+                            caller_object_id: name.into(),
+                            declared_size_bytes: Some(size as u64),
+                            expected_content_sha256: Some(digest.clone()),
+                            source_replay_capability: pb::SourceReplayCapability::ReplayFromStart
+                                as i32,
+                            ..Default::default()
+                        },
+                    )),
+                },
+                pb::AppendObjectMessage {
+                    payload: Some(pb::append_object_message::Payload::Chunk(
+                        pb::AppendObjectChunk {
+                            session_id: id.as_bytes().to_vec(),
+                            data: bytes,
+                        },
+                    )),
+                },
+                pb::AppendObjectMessage {
+                    payload: Some(pb::append_object_message::Payload::Finish(
+                        pb::AppendObjectFinish {
+                            session_id: id.as_bytes().to_vec(),
+                            expected_content_sha256: Some(digest),
+                            ..Default::default()
+                        },
+                    )),
+                },
+            ];
+            api.append_object_from_stream(tonic::Request::new(tokio_stream::iter(
+                messages.into_iter().map(Ok),
+            )))
+            .await
+            .unwrap()
+            .into_inner()
+        }
+    };
+    let checkpoint = || async {
+        api.checkpoint_session(tonic::Request::new(pb::CheckpointSessionRequest {
+            session_id: id.as_bytes().to_vec(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+    };
+    let mut seen = std::collections::HashSet::new();
+    for names in [
+        vec!["small-a", "small-b", "small-c"],
+        vec!["ring-a"],
+        vec!["mixed-a", "mixed-b", "ring-b"],
+    ] {
+        let mut expected = std::collections::HashSet::new();
+        for name in names {
+            let ring = name.starts_with("ring");
+            let record = append(name, if ring { 1024 * 1024 } else { 31 }).await;
+            assert_eq!(
+                record.append_commit_info.as_ref().unwrap().durability,
+                if ring && !serial_mode {
+                    pb::AppendDurability::Checkpointed
+                } else {
+                    pb::AppendDurability::Written
+                } as i32
+            );
+            expected.insert(record.object_id);
+        }
+        let reply = checkpoint().await;
+        assert_eq!(
+            reply
+                .committed_objects
+                .iter()
+                .map(|r| r.object_id.clone())
+                .collect::<std::collections::HashSet<_>>(),
+            expected
+        );
+        assert_eq!(reply.committed_objects.len(), expected.len());
+        for object in reply.committed_objects {
+            assert!(seen.insert(object.object_id));
+        }
+        assert!(checkpoint().await.committed_objects.is_empty());
+    }
+    // Close delivers a retained ring receipt when no caller checkpoint claims it.
+    let final_ring = append("ring-close", 1024 * 1024).await;
+    let closed = api
+        .close_write_session(tonic::Request::new(pb::CloseWriteSessionRequest {
+            session_id: id.as_bytes().to_vec(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(closed.committed_copies.len(), 1);
+    assert_eq!(
+        closed.checkpointed_objects[0].object_id,
+        final_ring.object_id
+    );
+    assert!(seen.insert(closed.checkpointed_objects[0].object_id.clone()));
+    assert_eq!(seen.len(), 8);
+    let journal = remanence_state::FileCheckpointJournal::open(
+        state.paths().journal_dir.join("checkpoints"),
+        selected.tape_uuid,
+    )
+    .unwrap();
+    let records = journal.replay().unwrap();
+    assert_eq!(
+        records.len(),
+        4,
+        "small objects share one barrier in either staging mode"
+    );
+    let sidecars = records
+        .iter()
+        .filter_map(|r| r.barrier_bundle.as_ref())
+        .flat_map(|b| &b.entries)
+        .filter(|e| e.kind == TapeFileKind::ParitySidecar)
+        .count();
+    assert_eq!(
+        sidecars,
+        if matches!(selected.parity_config, ParityConfig::None) {
+            0
+        } else {
+            4
+        }
+    );
+}
+
+thread_local! {
+    static FAIL_APPEND_CONTEXT_AFTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Fail one context renewal on the selected actor thread after a durable barrier.
+pub(crate) fn fail_append_context_now() -> bool {
+    FAIL_APPEND_CONTEXT_AFTER.with(|count| {
+        let remaining = count.get();
+        count.set(remaining.saturating_sub(1));
+        remaining == 1
+    })
+}
+
+/// Exercise each post-barrier error path and both subsequent receipt delivery paths.
+pub(crate) async fn check_context_failure_receipts(
+    state: &StateHandle,
+    world: Arc<Mutex<VirtualWorld>>,
+    selected: SelectedTape,
+    trigger: &str,
+    deliver_on_close: bool,
+) {
+    let mut library = open_model_library(world);
+    let mut cfg = test_write_owner_config(
+        state.paths().sqlite_path.clone(),
+        state.paths().audit_dir.clone(),
+        &library,
+        library_snapshot_cell(library.library().clone()),
+    );
+    cfg.checkpoint_journal_dir = state.paths().journal_dir.join("checkpoints");
+    cfg.checkpoint_max_objects = if trigger == "threshold" { 1 } else { 100 };
+    cfg.checkpoint_max_age_seconds = 3600;
+    let serial = library.library().serial.clone();
+    let mut drive = library
+        .open_drive(
+            0x100,
+            &remanence_library::StaticAllowlist::new([serial.as_str()]),
+        )
+        .unwrap();
+    let (tx, mut rx) = mpsc::channel(4);
+    let actor_tx = tx.clone();
+    let (open_reply, open_rx) = oneshot::channel();
+    let request = super::actor_runtime::OpenWriteActorRequest {
+        actor: AuditActor::System,
+        pool_cfg: state.config().tape_pools[0].clone(),
+        selected: selected.clone(),
+        target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
+        needs_drive_load: false,
+        library_serial: serial,
+        barcode: Some("HAND".into()),
+        source_slot: None,
+        drive_uuid: None,
+        drive_serial: None,
+        reply: open_reply,
+    };
+    let actor = tokio::task::spawn_blocking(move || {
+        let mut index = CatalogIndex::open(&cfg.index_path).unwrap();
+        FAIL_APPEND_CONTEXT_AFTER.with(|count| count.set(2));
+        handle_drive_open_write(
+            0x100, &mut index, &cfg, actor_tx, &mut rx, &mut drive, &mut 0, request,
+        );
+        assert_eq!(
+            FAIL_APPEND_CONTEXT_AFTER.with(|count| count.get()),
+            0,
+            "context failure is exercised"
+        );
+    });
+    let session = open_rx.await.unwrap().unwrap();
+    let id = Uuid::from_slice(&session.session_id).unwrap();
+    let first = append_actor_test_file(
+        &tx,
+        id,
+        state.paths().state_dir.join("first.bin"),
+        "first.bin",
+        "first",
+        b"first",
+    )
+    .await;
+    let checkpoint = |trigger| {
+        let tx = tx.clone();
+        async move {
+            let (reply, rx) = oneshot::channel();
+            tx.send(DriveCommand::Checkpoint {
+                session_id: id,
+                trigger,
+                expected_batch_id: None,
+                reply: Some(reply),
+            })
+            .await
+            .unwrap();
+            rx.await.unwrap()
+        }
+    };
+    // Internal checkpoint replies retain the receipt for the external caller.
+    let retained = checkpoint(CheckpointTrigger::Append).await.unwrap();
+    assert_eq!(retained.committed_objects.len(), 1);
+    assert_eq!(
+        retained.committed_objects[0].object_id,
+        first.record.object_id
+    );
+    let second = append_actor_test_file_result(
+        &tx,
+        id,
+        state.paths().state_dir.join("second.bin"),
+        "second.bin",
+        "second",
+        b"second",
+    )
+    .await;
+    let close = || {
+        let tx = tx.clone();
+        async move {
+            let (reply, rx) = oneshot::channel();
+            tx.send(DriveCommand::Close {
+                session_id: id,
+                reply,
+            })
+            .await
+            .unwrap();
+            rx.await.unwrap()
+        }
+    };
+    let error = match trigger {
+        "threshold" => second.expect_err("threshold context renewal fails"),
+        "explicit" => {
+            second.unwrap();
+            checkpoint(CheckpointTrigger::Explicit)
+                .await
+                .expect_err("explicit context renewal fails")
+        }
+        "close" => {
+            second.unwrap();
+            close().await.expect_err("close context renewal fails")
+        }
+        _ => panic!("unknown trigger"),
+    };
+    assert!(
+        error
+            .message()
+            .contains("injected next append context failure"),
+        "{error}"
+    );
+    let (session, receipts) = if deliver_on_close {
+        let closed = close().await.unwrap();
+        let receipts = closed.session.checkpointed_objects.clone();
+        (closed.session, receipts)
+    } else {
+        let recovered = checkpoint(CheckpointTrigger::Explicit).await.unwrap();
+        let empty = checkpoint(CheckpointTrigger::Explicit).await.unwrap();
+        assert!(empty.committed_objects.is_empty());
+        assert!(close()
+            .await
+            .unwrap()
+            .session
+            .checkpointed_objects
+            .is_empty());
+        (recovered.session, recovered.committed_objects)
+    };
+    assert_eq!(
+        receipts.len(),
+        2,
+        "both durable receipts survive {trigger} context failure"
+    );
+    assert_eq!(
+        receipts
+            .iter()
+            .map(|r| &r.object_id)
+            .collect::<HashSet<_>>()
+            .len(),
+        2
+    );
+    assert_eq!(session.objects_committed, 2);
+    assert_eq!(session.bytes_committed, 11);
+    for record in receipts {
+        assert_eq!(
+            record.append_commit_info.unwrap().durability,
+            pb::AppendDurability::Checkpointed as i32
+        );
+        let stored = CatalogIndex::open(&state.paths().sqlite_path)
+            .unwrap()
+            .get_native_object(&Uuid::from_slice(&record.object_id).unwrap().to_string())
+            .unwrap()
+            .unwrap();
+        assert!(stored.copies.iter().any(|copy| copy.status == "committed"));
+    }
+    actor.await.unwrap();
+    let journal = FileCheckpointJournal::open(
+        state.paths().journal_dir.join("checkpoints"),
+        selected.tape_uuid,
+    )
+    .unwrap();
+    assert_eq!(journal.replay().unwrap().len(), 2);
 }

@@ -999,12 +999,14 @@ fn overlap_admission_compatibility_table_routes_deterministically() {
     assert!(overlap_append_eligible(
         remanence_state::AppendStagingMode::Overlap,
         &eligible,
-        Some(&digest)
+        Some(&digest),
+        123,
     ));
     assert!(!overlap_append_eligible(
         remanence_state::AppendStagingMode::Serial,
         &eligible,
-        Some(&digest)
+        Some(&digest),
+        123,
     ));
 
     let mut missing_id = eligible.clone();
@@ -1029,13 +1031,15 @@ fn overlap_admission_compatibility_table_routes_deterministically() {
         assert!(!overlap_append_eligible(
             remanence_state::AppendStagingMode::Overlap,
             fallback,
-            Some(&digest)
+            Some(&digest),
+            123,
         ));
     }
     assert!(!overlap_append_eligible(
         remanence_state::AppendStagingMode::Overlap,
         &eligible,
-        None
+        None,
+        123,
     ));
 }
 
@@ -7742,7 +7746,10 @@ async fn append_finish_does_not_double_count() {
         &state,
         session_id,
         crate::mount::AppendFinishRequest {
+            staging_reason: "configured_serial",
             mtime: None,
+            content_sha256: Sha256::digest(b"spool").into(),
+            received_bytes: 5,
             spool_path,
             archive_path,
             caller_object_id: "caller-object".to_string(),
@@ -7793,6 +7800,7 @@ async fn overlap_consumer_failure_survives_ring_cancellation() {
     state.append_staging_mode = remanence_state::AppendStagingMode::Overlap;
     let ring_bytes = crate::append_ring::APPEND_RING_SLAB_BYTES as u64;
     state.append_ring_bytes = ring_bytes;
+    state.append_overlap_min_bytes = ring_bytes;
     state.append_ring_high_pct = 50;
     state.append_ring_low_pct = 25;
     state.io_memory = crate::io_memory::IoMemoryReservation::new(ring_bytes).expect("manager");
@@ -7892,6 +7900,7 @@ async fn overlap_idempotent_replay_cancels_the_live_receive_and_returns_the_reco
     state.append_staging_mode = remanence_state::AppendStagingMode::Overlap;
     let ring_bytes = crate::append_ring::APPEND_RING_SLAB_BYTES as u64;
     state.append_ring_bytes = ring_bytes;
+    state.append_overlap_min_bytes = ring_bytes;
     state.append_ring_high_pct = 50;
     state.append_ring_low_pct = 25;
     state.io_memory = crate::io_memory::IoMemoryReservation::new(ring_bytes).expect("manager");
@@ -7988,6 +7997,7 @@ async fn overlap_success_response_waits_for_checkpointed_receipt() {
     state.append_staging_mode = remanence_state::AppendStagingMode::Overlap;
     let ring_bytes = crate::append_ring::APPEND_RING_SLAB_BYTES as u64;
     state.append_ring_bytes = ring_bytes;
+    state.append_overlap_min_bytes = ring_bytes;
     state.append_ring_high_pct = 50;
     state.append_ring_low_pct = 25;
     state.io_memory = crate::io_memory::IoMemoryReservation::new(ring_bytes).expect("manager");
@@ -9204,5 +9214,370 @@ async fn verification_operation_progress_timestamps_and_terminal_filters() {
         for status in listed.operations {
             assert_eq!(status.state, pb::OperationState::Cancelled as i32);
         }
+    }
+}
+
+/// Exercise ingress routing, including the canonical start and unsupported manifests.
+#[tokio::test]
+async fn default_overlap_stream_fallbacks_reach_completed_spool() {
+    for reason in [
+        "no_declared_size",
+        "no_start_digest",
+        "no_replay_capability",
+        "canonical_start",
+        "configured_serial",
+        "empty_object",
+        "no_caller_object_id",
+        "below_overlap_min",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = state_with_spool(temp.path().to_path_buf(), 1024 * 1024);
+        assert_eq!(
+            state.append_staging_mode,
+            remanence_state::AppendStagingMode::Overlap
+        );
+        state.spool_budget_bytes = Some(crate::write_owner::SPOOL_MAX_BYTES);
+        if reason == "configured_serial" {
+            state.append_staging_mode = remanence_state::AppendStagingMode::Serial;
+        }
+        let session_id = Uuid::new_v4();
+        let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
+        let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel(1);
+        let pool = crate::write_owner::DrivePool::new_for_library(
+            "LIB-A",
+            changer_tx,
+            HashMap::from([(1, drive_tx)]),
+            Arc::new(HashMap::from([(
+                1,
+                std::sync::atomic::AtomicBool::new(false),
+            )])),
+        );
+        pool.record_session(
+            session_id,
+            crate::write_owner::MountedSession {
+                bay: 1,
+                library_serial: "LIB-A".into(),
+                barcode: None,
+                home_slot: None,
+                tape_uuid: [1; 16],
+                drive_uuid: None,
+            },
+        );
+        state.drive_pool = Some(pool);
+        let payload = if reason == "empty_object" {
+            Vec::new()
+        } else {
+            b"completed spool routing".to_vec()
+        };
+        let digest: [u8; 32] = Sha256::digest(&payload).into();
+        let mut start = append_start_message(session_id, payload.len() as u64);
+        if let Some(pb::append_object_message::Payload::Start(fields)) = start.payload.as_mut() {
+            fields.expected_content_sha256 = Some(digest.to_vec());
+            fields.source_replay_capability = pb::SourceReplayCapability::ReplayFromStart as i32;
+            match reason {
+                "no_caller_object_id" => fields.caller_object_id.clear(),
+                "no_declared_size" => fields.declared_size_bytes = None,
+                "no_start_digest" => fields.expected_content_sha256 = None,
+                "no_replay_capability" => {
+                    fields.source_replay_capability = pb::SourceReplayCapability::Unspecified as i32
+                }
+                _ => {}
+            }
+        }
+        if reason == "canonical_start" {
+            start.payload = Some(pb::append_object_message::Payload::CanonicalStart(
+                pb::AppendCanonicalPlaintextObjectStart {
+                    session_id: session_id.as_bytes().to_vec(),
+                    declared_size_bytes: payload.len() as u64,
+                    expected_plaintext_digest: Some(pb::Digest {
+                        algorithm: "sha256".into(),
+                        value: digest.to_vec(),
+                    }),
+                    source_replay_capability: pb::SourceReplayCapability::ReplayFromStart as i32,
+                    expected_object_id: Uuid::new_v4().as_bytes().to_vec(),
+                    expected_caller_object_id: "caller-object".into(),
+                },
+            ));
+        }
+        let expected_payload = payload.clone();
+        let actor = tokio::spawn(async move {
+            let crate::write_owner::DriveCommand::AppendFinish {
+                source,
+                input_kind,
+                reply,
+                ..
+            } = drive_rx.recv().await.unwrap()
+            else {
+                panic!("append command");
+            };
+            let crate::WriteObjectSource::Spool {
+                path,
+                content_sha256,
+                staging_reason,
+                ..
+            } = source
+            else {
+                panic!("completed spool required for {reason}");
+            };
+            assert_eq!(staging_reason, reason);
+            assert_eq!(std::fs::read(&path).unwrap(), expected_payload);
+            assert_eq!(content_sha256, digest);
+            assert_eq!(
+                input_kind == crate::WriteObjectInputKind::CanonicalPlaintextRemObject,
+                reason == "canonical_start"
+            );
+            std::fs::remove_file(path).unwrap();
+            reply
+                .send(Ok(crate::write_owner::AppendFinishOutcome {
+                    record: pb::ObjectRecord::default(),
+                    replay: false,
+                }))
+                .unwrap();
+        });
+        let api = WriteSessionApi { state };
+        api.append_object_stream(tokio_stream::iter(vec![
+            Ok(start),
+            Ok(append_chunk_message(session_id, payload)),
+            Ok(append_finish_message(session_id, digest)),
+        ]))
+        .await
+        .unwrap();
+        actor.await.unwrap();
+    }
+}
+
+/// Unsupported manifests and incorrect client hashes never reach the drive dispatcher.
+#[tokio::test]
+async fn spool_digest_mismatch_and_manifest_refuse_before_dispatch() {
+    for reason in ["manifest", "start_mismatch", "finish_mismatch"] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = state_with_spool(temp.path().to_path_buf(), 1024);
+        if reason != "manifest" {
+            state.append_staging_mode = remanence_state::AppendStagingMode::Serial;
+        }
+        let session_id = Uuid::new_v4();
+        let mut start = append_start_message(session_id, 3);
+        if let Some(pb::append_object_message::Payload::Start(fields)) = start.payload.as_mut() {
+            if reason == "manifest" {
+                fields.body_format_manifest = Some(Vec::new());
+            }
+            if reason == "start_mismatch" {
+                fields.expected_content_sha256 = Some(vec![0; 32]);
+            }
+        }
+        // There is no drive pool: reaching dispatch would report an internal error.
+        let api = WriteSessionApi { state };
+        let error = api
+            .append_object_stream(tokio_stream::iter(vec![
+                Ok(start),
+                Ok(append_chunk_message(session_id, b"abc".to_vec())),
+                Ok(append_finish_message(session_id, [0; 32])),
+            ]))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            if reason == "manifest" {
+                tonic::Code::Unimplemented
+            } else {
+                tonic::Code::FailedPrecondition
+            }
+        );
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+}
+
+/// A refused sized reservation never polls payload or creates a spool.
+#[tokio::test]
+async fn overlap_reservation_refuses_before_payload_receive() {
+    let temp = tempfile::tempdir().unwrap();
+    let slab = crate::append_ring::APPEND_RING_SLAB_BYTES as u64;
+    let mut state = state_with_spool(temp.path().to_path_buf(), 4 * slab);
+    state.append_staging_mode = remanence_state::AppendStagingMode::Overlap;
+    state.append_ring_bytes = 8 * slab;
+    state.append_overlap_min_bytes = slab;
+    state.io_memory = crate::io_memory::IoMemoryReservation::new(2 * slab).unwrap();
+    let held = slab - 1;
+    let _occupied = state.io_memory.try_reserve(held).unwrap();
+    let session_id = Uuid::new_v4();
+    let mut start = append_start_message(session_id, slab + 1);
+    if let Some(pb::append_object_message::Payload::Start(fields)) = start.payload.as_mut() {
+        fields.expected_content_sha256 = Some(vec![0; 32]);
+        fields.source_replay_capability = pb::SourceReplayCapability::ReplayFromStart as i32;
+    }
+    let mut first = Some(start);
+    let stream = tokio_stream::StreamExt::map(tokio_stream::iter([(), ()]), move |_| {
+        Ok(first
+            .take()
+            .expect("refusal must precede polling the first payload"))
+    });
+    let api = WriteSessionApi { state };
+    let error = api.append_object_stream(stream).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    assert!(error
+        .message()
+        .contains(&format!("reservation of {} bytes", 2 * slab)));
+    assert!(error
+        .message()
+        .contains(&format!("io_memory_ceiling={} bytes", 2 * slab)));
+    assert!(error.message().contains(&format!("held={held} bytes")));
+    assert!(error.message().contains("restore reservoirs"));
+    assert_eq!(api.state.io_memory.granted(), held);
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+}
+
+/// An explicit checkpoint can deliver a ring receipt before the internal barrier runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlap_checkpoint_interleaving_uses_committed_records_and_preserves_errors() {
+    for destination in ["catalog", "session", "checkpoint_error"] {
+        let mut state = populated_state();
+        let session_id = Uuid::new_v4();
+        let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
+        let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel(2);
+        let pool = crate::write_owner::DrivePool::new_for_library(
+            "LIB-A",
+            changer_tx,
+            std::collections::HashMap::from([(1, drive_tx)]),
+            Arc::new(std::collections::HashMap::from([(
+                1,
+                std::sync::atomic::AtomicBool::new(false),
+            )])),
+        );
+        pool.record_session(
+            session_id,
+            crate::write_owner::MountedSession {
+                bay: 1,
+                library_serial: "LIB-A".into(),
+                barcode: None,
+                home_slot: None,
+                tape_uuid: TAPE_UUID,
+                drive_uuid: None,
+            },
+        );
+        state.drive_pool = Some(pool);
+        let slab = crate::append_ring::APPEND_RING_SLAB_BYTES;
+        state.append_ring_bytes = slab as u64;
+        state.append_overlap_min_bytes = slab as u64;
+        let api = WriteSessionApi { state };
+        let explicit_api = api.clone();
+        let (append_seen_tx, append_seen_rx) = tokio::sync::oneshot::channel();
+        let actor = tokio::spawn(async move {
+            let crate::write_owner::DriveCommand::AppendFinish {
+                source,
+                reply: append_reply,
+                ..
+            } = drive_rx.recv().await.unwrap()
+            else {
+                panic!("append command")
+            };
+            let crate::WriteObjectSource::Streamed(streamed) = source else {
+                panic!("ring source")
+            };
+            tokio::task::spawn_blocking(move || streamed.read_all_for_test())
+                .await
+                .unwrap()
+                .unwrap();
+            let record = pb::ObjectRecord {
+                object_id: object_uuid().as_bytes().to_vec(),
+                append_commit_info: Some(pb::AppendCommitInfo {
+                    durability: pb::AppendDurability::Checkpointed as i32,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            append_seen_tx.send(()).unwrap();
+            // Hold the append reply until the caller checkpoint is queued and
+            // claims its receipt, so the internal checkpoint cannot win the race.
+            let crate::write_owner::DriveCommand::Checkpoint { reply, trigger, .. } =
+                drive_rx.recv().await.unwrap()
+            else {
+                panic!("explicit checkpoint")
+            };
+            assert_eq!(trigger, crate::write_owner::CheckpointTrigger::Explicit);
+            reply
+                .unwrap()
+                .send(Ok(crate::write_owner::CheckpointActorReply {
+                    session: pb::WriteSession::default(),
+                    committed_objects: vec![record.clone()],
+                }))
+                .unwrap();
+            let mut written = record.clone();
+            written.append_commit_info.as_mut().unwrap().durability =
+                pb::AppendDurability::Written as i32;
+            append_reply
+                .send(Ok(crate::write_owner::AppendFinishOutcome {
+                    record: written,
+                    replay: false,
+                }))
+                .unwrap();
+            let crate::write_owner::DriveCommand::Checkpoint { reply, trigger, .. } =
+                drive_rx.recv().await.unwrap()
+            else {
+                panic!("internal checkpoint")
+            };
+            assert_eq!(trigger, crate::write_owner::CheckpointTrigger::Append);
+            let result = if destination == "checkpoint_error" {
+                Err(tonic::Status::failed_precondition(
+                    "injected internal checkpoint cause",
+                ))
+            } else {
+                Ok(crate::write_owner::CheckpointActorReply {
+                    session: pb::WriteSession {
+                        checkpointed_objects: if destination == "session" {
+                            vec![record]
+                        } else {
+                            vec![]
+                        },
+                        ..Default::default()
+                    },
+                    committed_objects: vec![],
+                })
+            };
+            reply.unwrap().send(result).unwrap();
+        });
+        let payload = vec![0x6b; slab];
+        let digest: [u8; 32] = Sha256::digest(&payload).into();
+        let mut start = append_start_message(session_id, slab as u64);
+        if let Some(pb::append_object_message::Payload::Start(fields)) = start.payload.as_mut() {
+            fields.expected_content_sha256 = Some(digest.to_vec());
+            fields.source_replay_capability = pb::SourceReplayCapability::ReplayFromStart as i32;
+        }
+        let append = tokio::spawn(async move {
+            api.append_object_stream(tokio_stream::iter(vec![
+                Ok(start),
+                Ok(append_chunk_message(session_id, payload)),
+                Ok(append_finish_message(session_id, digest)),
+            ]))
+            .await
+        });
+        append_seen_rx.await.unwrap();
+        let claimed = crate::mount::checkpoint_write_session(
+            &explicit_api.state,
+            session_id,
+            crate::write_owner::CheckpointTrigger::Explicit,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            claimed.committed_objects[0].object_id,
+            object_uuid().as_bytes()
+        );
+        let response = tokio::time::timeout(Duration::from_secs(5), append)
+            .await
+            .unwrap()
+            .unwrap();
+        if destination == "checkpoint_error" {
+            let error = response.unwrap_err();
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            assert_eq!(error.message(), "injected internal checkpoint cause");
+        } else {
+            let record = response.unwrap().into_inner();
+            assert_eq!(record.object_id, object_uuid().as_bytes());
+            assert_eq!(
+                record.append_commit_info.unwrap().durability,
+                pb::AppendDurability::Checkpointed as i32
+            );
+        }
+        actor.await.unwrap();
     }
 }
