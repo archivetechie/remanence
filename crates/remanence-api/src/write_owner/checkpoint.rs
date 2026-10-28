@@ -1429,6 +1429,8 @@ pub(super) fn close_retained_before_removal(
     let mut closing_tape = epoch.as_ref().map(|e| e.selected.tape_uuid);
     let mut open_range = None;
     let mut epoch_closed = false;
+    // No failure can use the catalog's epoch range until authority projection succeeds.
+    let mut projection_failed = true;
     let shutdown = cfg
         .lifecycle
         .as_ref()
@@ -1468,18 +1470,22 @@ pub(super) fn close_retained_before_removal(
             );
             return Ok(());
         };
-        if tape.scheme_id.is_none()
-            || tape.highest_protected_ordinal == tape.total_committed_ordinals
-        {
-            tracing::info!(bay, "epoch close skipped: tape has no open parity epoch");
-            return Ok(());
-        }
         let tape_uuid = crate::catalog_conversion::decode_uuid_bytes(&tape.tape_uuid, "tape_uuid")?;
         closing_tape = Some(tape_uuid);
-        open_range = Some((
-            tape.highest_protected_ordinal,
-            tape.total_committed_ordinals,
-        ));
+        if !remanence_state::FileCheckpointJournal::exists(&cfg.checkpoint_journal_dir, tape_uuid)
+            .map_err(crate::status_from_state_error)?
+        {
+            tracing::info!(
+                bay,
+                "epoch close skipped: cartridge has no checkpoint journal"
+            );
+            return Ok(());
+        }
+        // Catalog evidence can only skip a close until journal projection succeeds.
+        if tape.scheme_id.is_none() {
+            tracing::info!(bay, "epoch close skipped: cartridge has no parity scheme");
+            return Ok(());
+        }
         let Some(pool) = cfg
             .tape_pools
             .iter()
@@ -1501,17 +1507,6 @@ pub(super) fn close_retained_before_removal(
                 "epoch close skipped: tape is not writable");
             return Ok(());
         }
-        let journal =
-            remanence_state::FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, tape_uuid)
-                .map_err(crate::status_from_state_error)?;
-        if journal
-            .terminal_finalization_intent()
-            .map_err(crate::status_from_state_error)?
-            .is_some()
-        {
-            tracing::info!(tape_uuid = %Uuid::from_bytes(tape_uuid), "epoch close skipped: terminal intent closes the epoch");
-            return Ok(());
-        }
         let fences = index
             .tape_io_admission_conflicts(&tape_uuid, tape.voltag.as_deref())
             .map_err(crate::status_from_state_error)?;
@@ -1520,6 +1515,42 @@ pub(super) fn close_retained_before_removal(
                 "fenced removal leaves the epoch open until append recovery");
             return Ok(());
         }
+        let journal =
+            remanence_state::FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, tape_uuid)
+                .map_err(crate::status_from_state_error)?;
+        let mut lease = if journal
+            .terminal_finalization_intent()
+            .map_err(crate::status_from_state_error)?
+            .is_some()
+        {
+            journal.acquire_exclusive_for_terminal_recovery()
+        } else {
+            journal.acquire_exclusive()
+        }
+        .map_err(crate::status_from_state_error)?;
+        let records = project_checkpoint_authority_bounded(index, &lease)
+            .map_err(crate::status_from_state_error)?;
+        let tape = index
+            .get_tape(&tape_uuid)
+            .map_err(crate::status_from_state_error)?
+            .ok_or_else(|| Status::failed_precondition("close tape disappears from catalog"))?;
+        if lease
+            .terminal_finalization_intent()
+            .map_err(crate::status_from_state_error)?
+            .is_some()
+        {
+            tracing::info!(tape_uuid = %Uuid::from_bytes(tape_uuid), "epoch close skipped: terminal intent closes the epoch");
+            return Ok(());
+        }
+        projection_failed = false;
+        if tape.highest_protected_ordinal == tape.total_committed_ordinals {
+            tracing::info!(bay, "epoch close skipped: journal has no open parity epoch");
+            return Ok(());
+        }
+        open_range = Some((
+            tape.highest_protected_ordinal,
+            tape.total_committed_ordinals,
+        ));
         let pool_id = tape.pool_id.as_deref().unwrap_or("(unpooled)");
         let (block_size, parity_config) = crate::pool_write::selected_tape_geometry(&tape, pool_id)
             .map_err(|e| Status::failed_precondition(e.to_string()))?;
@@ -1554,23 +1585,6 @@ pub(super) fn close_retained_before_removal(
                     })
             })
         });
-        let mut lease = journal
-            .acquire_exclusive()
-            .map_err(crate::status_from_state_error)?;
-        let records = project_checkpoint_authority_bounded(index, &lease)
-            .map_err(crate::status_from_state_error)?;
-        let projected = index
-            .get_tape(&tape_uuid)
-            .map_err(crate::status_from_state_error)?
-            .ok_or_else(|| Status::failed_precondition("close tape disappears from catalog"))?;
-        open_range = Some((
-            projected.highest_protected_ordinal,
-            projected.total_committed_ordinals,
-        ));
-        if projected.highest_protected_ordinal == projected.total_committed_ordinals {
-            tracing::info!(tape_uuid = %Uuid::from_bytes(tape_uuid), "epoch close skipped: journal already closes the epoch");
-            return Ok(());
-        }
         if shutdown
             && !epoch.as_ref().is_some_and(|e| {
                 parked_matches
@@ -1655,22 +1669,7 @@ pub(super) fn close_retained_before_removal(
         )
         .map_err(|error| {
             let status = Status::failed_precondition(error.to_string());
-            let contradiction = match &error {
-                crate::append_admission::AdmissionError::TailBeyondKnownState { .. } => true,
-                crate::append_admission::AdmissionError::Io(error) => {
-                    committed_io_contradiction(error, block_size, 1)
-                }
-                _ => false,
-            };
-            if contradiction {
-                fence_open_epoch(
-                    index,
-                    cfg,
-                    tape_uuid,
-                    open_range.expect("open tape range"),
-                    &status,
-                );
-            }
+            fence_admission_contradiction(index, cfg, tape_uuid, block_size, open_range, &error);
             status
         })?;
         let authority = validate_parity_actor_authority(cfg, &selected, &lease, &records)?;
@@ -1731,6 +1730,21 @@ pub(super) fn close_retained_before_removal(
     })();
     drive.clear_append_admission();
     if let Err(error) = result {
+        if projection_failed {
+            tracing::warn!(%error, bay, "epoch_projection_failed: epoch state is unknown until replay");
+            audit_removal_epoch(
+                index,
+                cfg,
+                bay,
+                closing_tape,
+                "epoch_projection_failed",
+                format!(
+                    "checkpoint projection fails; epoch state is unknown until replay: {error}"
+                ),
+                None,
+            );
+            return Ok(());
+        }
         // Projection may close the epoch before a later audit or seal-due write fails.
         // Read its current range; unavailable catalog evidence never supplies a range.
         let (range, closed) =
@@ -1834,6 +1848,65 @@ fn fence_open_epoch(
     range: (u64, u64),
     error: &Status,
 ) {
+    record_epoch_fence(
+        index,
+        cfg,
+        tape_uuid,
+        "epoch_close_failed",
+        serde_json::json!({
+            "open_epoch_start": range.0, "open_epoch_end": range.1,
+            "error": error.message(), "phase": "open_epoch"
+        })
+        .to_string(),
+    );
+}
+
+/// Fence admission contradictions with their phase and any known open range.
+pub(super) fn fence_admission_contradiction(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    tape_uuid: TapeUuid,
+    block_size: u32,
+    range: Option<(u64, u64)>,
+    error: &crate::append_admission::AdmissionError,
+) -> bool {
+    use crate::append_admission::AdmissionError;
+    let mut evidence = match error {
+        AdmissionError::TailBeyondKnownState {
+            expected_eod_lba, ..
+        } => serde_json::json!({
+            "phase": "append_suffix", "suffix_start_lba": expected_eod_lba,
+            "error": error.to_string()
+        }),
+        AdmissionError::Io(cause) if committed_io_contradiction(cause, block_size, 1) => {
+            serde_json::json!({ "phase": "append_admission", "error": error.to_string() })
+        }
+        _ => return false,
+    };
+    if matches!(error, AdmissionError::Io(_)) {
+        if let Some((w, t)) = range.filter(|(w, t)| w < t) {
+            evidence["open_epoch_start"] = w.into();
+            evidence["open_epoch_end"] = t.into();
+        }
+    }
+    record_epoch_fence(
+        index,
+        cfg,
+        tape_uuid,
+        "admission_contradiction",
+        evidence.to_string(),
+    );
+    true
+}
+
+/// Persist and audit a tape fence with the evidence supplied by its caller.
+fn record_epoch_fence(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    tape_uuid: TapeUuid,
+    reason: &str,
+    evidence: String,
+) {
     let tape = match index.get_tape(&tape_uuid) {
         Ok(Some(tape)) => tape,
         other => {
@@ -1847,15 +1920,10 @@ fn fence_open_epoch(
     {
         return;
     }
-    let evidence = serde_json::json!({
-        "open_epoch_start": range.0, "open_epoch_end": range.1,
-        "error": error.message(), "phase": "open_epoch"
-    })
-    .to_string();
     match index.record_tape_io_fence(remanence_state::TapeIoFenceInput {
         tape_uuid,
         barcode: tape.voltag,
-        reason: "epoch_close_failed".into(),
+        reason: reason.into(),
         evidence_json: Some(evidence),
     }) {
         Ok(fence) => {

@@ -11903,6 +11903,7 @@ pub(crate) enum RetentionInvalidation {
     Removal(&'static str, &'static str),
     AutomaticSeal,
     ProjectionBusy(bool, &'static str),
+    StaleProjection(bool, &'static str),
     ApiEpochFills,
 }
 
@@ -11921,7 +11922,9 @@ pub(crate) async fn check_seated_parity_sessions(
     let read_fault = Arc::new(AtomicU64::new(0));
     if matches!(
         invalidation,
-        RetentionInvalidation::Removal(_, _) | RetentionInvalidation::ProjectionBusy(_, _)
+        RetentionInvalidation::Removal(_, _)
+            | RetentionInvalidation::ProjectionBusy(_, _)
+            | RetentionInvalidation::StaleProjection(_, _)
     ) {
         let mut w = world.lock().unwrap();
         w.slots.push(remanence_chaos::model::SlotState {
@@ -11985,6 +11988,13 @@ pub(crate) async fn check_seated_parity_sessions(
     let tx = spawn_drive_actor(0x100, drive, cfg.clone());
     if invalidation == RetentionInvalidation::ApiEpochFills {
         check_api_epoch_fills(state, world, selected, cfg, lifecycle, tx, library).await;
+        return;
+    }
+    if let RetentionInvalidation::StaleProjection(fresh, path) = invalidation {
+        check_open_checkpoint_projection_busy(
+            state, world, selected, cfg, lifecycle, tx, library, fresh, path,
+        )
+        .await;
         return;
     }
     let mut prior_reads = None;
@@ -12800,6 +12810,259 @@ async fn check_session_projection_busy(
     );
 }
 
+/// A durable open checkpoint survives a stale closed or fresh catalog projection.
+#[allow(clippy::too_many_arguments)]
+async fn check_open_checkpoint_projection_busy(
+    state: &StateHandle,
+    world: Arc<Mutex<VirtualWorld>>,
+    selected: SelectedTape,
+    cfg: WriteOwnerConfig,
+    lifecycle: crate::drive_pool::DrivePoolLifecycle,
+    tx: mpsc::Sender<DriveCommand>,
+    library: remanence_library::LibraryHandle,
+    fresh: bool,
+    path: &str,
+) {
+    for number in 0..if fresh { 1 } else { 2 } {
+        let (reply, received) = oneshot::channel();
+        tx.send(DriveCommand::OpenWrite {
+            actor: AuditActor::System,
+            pool_cfg: cfg.tape_pools[0].clone(),
+            selected: selected.clone(),
+            target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
+            needs_drive_load: false,
+            library_serial: cfg.actor_library_serial.clone(),
+            barcode: Some("HAND".into()),
+            source_slot: Some(0x400),
+            drive_uuid: None,
+            drive_serial: None,
+            reply,
+        })
+        .await
+        .unwrap();
+        let id = Uuid::from_slice(&received.await.unwrap().unwrap().session_id).unwrap();
+        append_actor_test_file(
+            &tx,
+            id,
+            state
+                .paths()
+                .state_dir
+                .join(format!("projection-{number}.bin")),
+            "projection.bin",
+            &format!("projection-{number}"),
+            b"durable open checkpoint",
+        )
+        .await;
+        let fail_projection = fresh || number == 1;
+        let held = if fail_projection {
+            cfg.io_memory.epoch_test_action.store(10, Ordering::Relaxed);
+            None
+        } else {
+            // The first session leaves a closed epoch in both authorities.
+            Some(cfg.io_memory.try_reserve(cfg.io_memory.ceiling()).unwrap())
+        };
+        let (reply, received) = oneshot::channel();
+        tx.send(DriveCommand::Close {
+            session_id: id,
+            reply,
+        })
+        .await
+        .unwrap();
+        let result = received.await.unwrap();
+        if fail_projection {
+            let error = result.unwrap_err();
+            assert!(
+                error.message().contains("SQLite projection failed"),
+                "{error}"
+            );
+            assert!(error.message().contains("locked"), "{error}");
+            cfg.io_memory.epoch_test_action.store(0, Ordering::Relaxed);
+            let (reply, received) = oneshot::channel();
+            tx.send(DriveCommand::Close {
+                session_id: id,
+                reply,
+            })
+            .await
+            .unwrap();
+            received.await.unwrap().unwrap();
+        } else {
+            result.unwrap();
+        }
+        drop(held);
+    }
+    if path == "shutdown" {
+        let (reply, received) = oneshot::channel();
+        tx.send(DriveCommand::OpenRead {
+            tape_uuid: selected.tape_uuid,
+            needs_drive_load: false,
+            library_serial: cfg.actor_library_serial.clone(),
+            barcode: Some("HAND".into()),
+            source_slot: Some(0x400),
+            drive_uuid: None,
+            drive_serial: None,
+            resume_target: None,
+            daemon_epoch: 1,
+            reply,
+        })
+        .await
+        .unwrap();
+        let id = Uuid::from_slice(&received.await.unwrap().unwrap().session_id).unwrap();
+        let (reply, received) = oneshot::channel();
+        tx.send(DriveCommand::CloseRead {
+            session_id: id,
+            reply,
+        })
+        .await
+        .unwrap();
+        received.await.unwrap().unwrap();
+    }
+    if fresh {
+        // The failed first projection leaves no geometry in the fresh catalog row.
+        rusqlite::Connection::open(&state.paths().sqlite_path).unwrap().execute(
+                "UPDATE tapes SET scheme_id = NULL, data_blocks_per_stripe = NULL, parity_blocks_per_stripe = NULL, stripes_per_neighborhood = NULL WHERE tape_uuid = ?1",
+                [selected.tape_uuid.as_slice()],
+            ).unwrap();
+    }
+    let index = CatalogIndex::open(&state.paths().sqlite_path).unwrap();
+    let tape = index.get_tape(&selected.tape_uuid).unwrap().unwrap();
+    assert_eq!(
+        tape.highest_protected_ordinal,
+        tape.total_committed_ordinals
+    );
+    assert_eq!(tape.scheme_id.is_none(), fresh);
+    check_epoch_removal(
+        state,
+        world,
+        selected,
+        cfg,
+        lifecycle,
+        tx,
+        library,
+        if path == "shared_lease" {
+            "stale_shared_lease"
+        } else if fresh {
+            "no_scheme"
+        } else {
+            "stale_open"
+        },
+        if path == "shared_lease" { "idle" } else { path },
+        Arc::new(AtomicU64::new(0)),
+    )
+    .await;
+}
+
+/// Remove an adopted cartridge through the idle actor path before journal import.
+pub(crate) async fn unload_adopted_cartridge(
+    state: &StateHandle,
+    world: Arc<Mutex<VirtualWorld>>,
+    tape_uuid: TapeUuid,
+) {
+    {
+        let mut world = world.lock().unwrap();
+        world.slots.push(remanence_chaos::model::SlotState {
+            address: 0x400,
+            full: false,
+            barcode: None,
+            access: true,
+            except: false,
+        });
+        world.element_layout.slot_count = 1;
+        world.drive_source_slots.insert(0x100, Some(0x400));
+    }
+    let mut library = open_model_library(world.clone());
+    let mut cfg = test_write_owner_config(
+        state.paths().sqlite_path.clone(),
+        state.paths().audit_dir.clone(),
+        &library,
+        library_snapshot_cell(library.library().clone()),
+    );
+    cfg.checkpoint_journal_dir = state.paths().journal_dir.join("checkpoints");
+    cfg.tape_pools = state.config().tape_pools.clone();
+    let lifecycle = crate::drive_pool::DrivePoolLifecycle::default();
+    cfg.lifecycle = Some(lifecycle.clone());
+    let key = crate::drive_pool::DriveKey::new(&cfg.actor_library_serial, 0x100);
+    let drive = library.open_drive(0x100, &cfg.policy).unwrap();
+    let actor = spawn_drive_actor(0x100, drive, cfg.clone());
+    let changer = spawn_changer_actor(library.into_changer(), cfg.clone());
+    let pool = DrivePool::new_with_lifecycle(
+        HashMap::from([(cfg.actor_library_serial.clone(), changer)]),
+        HashMap::from([(key.clone(), actor)]),
+        Arc::new(HashMap::from([(key, AtomicBool::new(false))])),
+        lifecycle,
+    );
+    let seated = SeatedCartridge {
+        bay: 0x100,
+        library_serial: cfg.actor_library_serial.clone(),
+        barcode: Some("HAND".into()),
+        home_slot: 0x400,
+        tape_uuid: Some(tape_uuid),
+        prior_session_id: None,
+    };
+    pool.park_cartridge(seated.clone());
+    let mut api = crate::ApiState::new(CatalogIndex::open(&state.paths().sqlite_path).unwrap());
+    api.audit_dir = Arc::new(cfg.audit_dir.clone());
+    api.library_snapshot = Some(cfg.library_snapshot.clone());
+    api.drive_pool = Some(pool);
+    api.drive_idle_unload_seconds = 1;
+    crate::mount::test_remove_seated_epoch(&api, "idle", seated).await;
+    assert!(world.lock().unwrap().drive_bays[&0x100].is_none());
+    assert!(!FileCheckpointJournal::exists(&cfg.checkpoint_journal_dir, tape_uuid).unwrap());
+    assert!(
+        !cfg.checkpoint_journal_dir.exists(),
+        "idle removal creates no journal directory"
+    );
+    api.shutdown_drive_pool().await.unwrap();
+}
+
+/// Admission fences carry a reason, phase and only a nonempty known epoch range.
+#[test]
+fn admission_fence_evidence_omits_closed_and_unknown_ranges() {
+    for range in [None, Some((3, 3)), Some((3, 5))] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.sqlite");
+        let mut index = CatalogIndex::open(&path).unwrap();
+        let (_, library) = unthreaded_cartridge_world("LIB-ADMISSION");
+        let cfg = test_write_owner_config(
+            path,
+            temp.path().join("audit"),
+            &library,
+            library_snapshot_cell(library.library().clone()),
+        );
+        let uuid = [0x42; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: uuid,
+                voltag: "ADMISSION".into(),
+                block_size: 262144,
+                parity: remanence_parity::ParityConfig::None,
+                force: false,
+            })
+            .unwrap();
+        assert!(super::checkpoint::fence_admission_contradiction(
+            &mut index,
+            &cfg,
+            uuid,
+            262144,
+            range,
+            &crate::append_admission::AdmissionError::Io(TapeIoError::FilemarkEncountered),
+        ));
+        let fences = index.list_active_tape_io_fences().unwrap();
+        assert_eq!(fences.len(), 1);
+        assert_eq!(fences[0].reason, "admission_contradiction");
+        let evidence: serde_json::Value =
+            serde_json::from_str(fences[0].evidence_json.as_deref().unwrap()).unwrap();
+        assert_eq!(evidence["phase"], "append_admission");
+        assert_eq!(
+            evidence.get("open_epoch_start").is_some(),
+            range == Some((3, 5))
+        );
+        assert_eq!(
+            evidence.get("open_epoch_end").is_some(),
+            range == Some((3, 5))
+        );
+    }
+}
+
 /// Run removal through real drive and changer actors after changing close admission.
 #[allow(clippy::too_many_arguments)]
 async fn check_epoch_removal(
@@ -12817,7 +13080,10 @@ async fn check_epoch_removal(
     use pb::library_service_server::LibraryService;
     let mut index = CatalogIndex::open(&state.paths().sqlite_path).unwrap();
     let before = index.get_tape(&selected.tape_uuid).unwrap().unwrap();
-    assert!(before.highest_protected_ordinal < before.total_committed_ordinals);
+    assert!(
+        matches!(case, "stale_open" | "stale_shared_lease" | "no_scheme")
+            || before.highest_protected_ordinal < before.total_committed_ordinals
+    );
     let journal_before = if case == "replay_closed" {
         Some(
             FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, selected.tape_uuid)
@@ -12830,6 +13096,7 @@ async fn check_epoch_removal(
     };
     let mut lease = None;
     let mut preflight = None;
+    let mut shared_lease = None;
     match case {
         "retired" | "sealed" | "finalizing" | "ingested" | "foreign" => {
             let state_name = match case {
@@ -12844,6 +13111,27 @@ async fn check_epoch_removal(
                     rusqlite::params![state_name, selected.tape_uuid.as_slice()],
                 )
                 .unwrap();
+        }
+        "stale_shared_lease" => {
+            use std::os::fd::AsRawFd;
+            let journal =
+                FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, selected.tape_uuid)
+                    .unwrap();
+            let records = journal.replay().unwrap();
+            let last = records.last().unwrap();
+            let bundle = last.object_tape_file_bundles.last().unwrap();
+            assert!(bundle.highest_protected_ordinal < bundle.total_committed_ordinals);
+            assert_eq!(
+                before.highest_protected_ordinal,
+                before.total_committed_ordinals
+            );
+            let lock = std::fs::File::open(format!("{}.lock", journal.path().display())).unwrap();
+            // SAFETY: the file owns this valid descriptor for the lifetime of the shared lease.
+            assert_eq!(
+                unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
+                0
+            );
+            shared_lease = Some(lock);
         }
         "lease" => {
             lease = Some(
@@ -12880,7 +13168,10 @@ async fn check_epoch_removal(
         "missing_checkpoint" => {
             std::fs::remove_dir_all(&cfg.checkpoint_journal_dir).unwrap();
         }
-        "tail" => {
+        "tail" | "open_tail_catalog_read" => {
+            if case == "open_tail_catalog_read" {
+                read_fault.store(30, Ordering::SeqCst);
+            }
             let mut w = world.lock().unwrap();
             let tape = w.tapes.get_mut("HAND").unwrap();
             let end = 2
@@ -12896,7 +13187,42 @@ async fn check_epoch_removal(
             world.lock().unwrap().tapes.get_mut("HAND").unwrap().records[0] =
                 Record::Block(vec![0x55; selected.block_size as usize]);
         }
-        "success" | "replay_closed" => {}
+        "success" | "replay_closed" | "stale_open" => {}
+        "replay_failure" => {
+            rusqlite::Connection::open(&state.paths().sqlite_path).unwrap()
+                .execute_batch("UPDATE tapes SET written_extent_lba = NULL; CREATE TRIGGER fail_checkpoint_projection BEFORE UPDATE ON tapes BEGIN SELECT RAISE(FAIL, 'checkpoint projection unavailable'); END;")
+                .unwrap();
+        }
+        "suffix_medium"
+        | "suffix_scan_medium"
+        | "open_admission_blank"
+        | "open_admission_medium"
+        | "open_admission_unit_attention"
+        | "open_admission_not_ready"
+        | "open_admission_timeout" => {
+            if case == "suffix_scan_medium" {
+                let mut w = world.lock().unwrap();
+                let tape = w.tapes.get_mut("HAND").unwrap();
+                let end = 3 + tape.records[2..]
+                    .iter()
+                    .position(|r| matches!(r, Record::Filemark))
+                    .unwrap();
+                let object = tape.records[2..end].to_vec();
+                tape.records.extend(object);
+            }
+            read_fault.store(
+                match case {
+                    "suffix_medium" => 25,
+                    "suffix_scan_medium" => 28,
+                    "open_admission_blank" => 26,
+                    "open_admission_unit_attention" => 23,
+                    "open_admission_not_ready" => 24,
+                    "open_admission_timeout" => 27,
+                    _ => 21,
+                },
+                Ordering::SeqCst,
+            );
+        }
         "bot_filemark" => {
             world.lock().unwrap().tapes.get_mut("HAND").unwrap().records[0] = Record::Filemark;
         }
@@ -13091,8 +13417,23 @@ async fn check_epoch_removal(
                 .unwrap();
             }
         }
-        "no_pool" => {}
+        "no_pool" | "no_scheme" | "journal_corrupt" => {}
         _ => panic!("unknown removal case {case}"),
+    }
+    if matches!(
+        case,
+        "retired"
+            | "sealed"
+            | "finalizing"
+            | "ingested"
+            | "foreign"
+            | "no_pool"
+            | "journal_corrupt"
+            | "barcode_fence"
+    ) {
+        let journal =
+            FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, selected.tape_uuid).unwrap();
+        std::fs::write(journal.path(), b"unreadable checkpoint").unwrap();
     }
     if matches!(case, "tail" | "identity" | "absent_bootstrap") {
         // Journal replay restores this deliberately stale projection before fencing.
@@ -13110,8 +13451,19 @@ async fn check_epoch_removal(
             .unwrap();
     }
     if case.starts_with("open_") {
-        let transient = matches!(case, "open_unit_attention" | "open_timeout");
-        for attempt in 0..if transient { 1 } else { 2 } {
+        let transient = matches!(
+            case,
+            "open_unit_attention"
+                | "open_timeout"
+                | "open_admission_unit_attention"
+                | "open_admission_not_ready"
+                | "open_admission_timeout"
+        );
+        for attempt in 0..if transient || case == "open_tail_catalog_read" {
+            1
+        } else {
+            2
+        } {
             let commands = world.lock().unwrap().command_log.len();
             let (reply, received) = oneshot::channel();
             tx.send(DriveCommand::OpenWrite {
@@ -13130,12 +13482,34 @@ async fn check_epoch_removal(
             .await
             .unwrap();
             let error = received.await.unwrap().unwrap_err();
+            if case == "open_tail_catalog_read" {
+                let connection = rusqlite::Connection::open(&state.paths().sqlite_path).unwrap();
+                let recovery: String = connection
+                    .query_row(
+                        "SELECT state FROM tapes WHERE tape_uuid = ?1",
+                        [selected.tape_uuid.as_slice()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(recovery, "recovery_required", "{error}");
+                assert!(error.message().contains("TailBeyondKnownState"), "{error}");
+                assert_eq!(read_fault.load(Ordering::SeqCst), 0);
+                connection.execute_batch("ALTER TABLE tapes RENAME COLUMN unavailable_total TO total_committed_ordinals").unwrap();
+                break;
+            }
+            if case.starts_with("open_admission_") {
+                assert_eq!(
+                    read_fault.load(Ordering::SeqCst),
+                    0,
+                    "LOCATE fault is exercised"
+                );
+            }
             assert_eq!(
                 index.list_active_tape_io_fences().unwrap().len(),
                 usize::from(!transient),
                 "{case}: {error}"
             );
-            if transient {
+            if transient && !case.starts_with("open_admission_") {
                 assert!(
                     FileAuditLog::replay(&state.paths().audit_dir)
                         .unwrap()
@@ -13157,7 +13531,13 @@ async fn check_epoch_removal(
         if transient {
             // Keep the removal retry transient too, so it leaves the epoch open.
             read_fault.store(
-                if case == "open_unit_attention" { 5 } else { 6 },
+                match case {
+                    "open_unit_attention" => 5,
+                    "open_admission_unit_attention" => 23,
+                    "open_admission_not_ready" => 24,
+                    "open_admission_timeout" => 27,
+                    _ => 6,
+                },
                 Ordering::SeqCst,
             );
         }
@@ -13255,6 +13635,7 @@ async fn check_epoch_removal(
         _ => crate::mount::test_remove_seated_epoch(&api, path, seated).await,
     }
     drop(lease);
+    drop(shared_lease);
     if let Some((resume, task)) = preflight {
         resume.send(()).unwrap();
         task.await.unwrap().unwrap();
@@ -13269,8 +13650,92 @@ async fn check_epoch_removal(
             "a durable journal commit with SQLite busy never fences"
         );
     }
+    if matches!(case, "suffix_medium" | "suffix_scan_medium") {
+        assert_eq!(
+            read_fault.load(Ordering::SeqCst),
+            0,
+            "suffix read fault is exercised"
+        );
+    }
+    if case == "missing_checkpoint" {
+        assert!(
+            !cfg.checkpoint_journal_dir.exists(),
+            "removal never recreates an absent journal"
+        );
+    }
     let audit = FileAuditLog::replay(&state.paths().audit_dir).unwrap();
-    if matches!(case, "retired" | "foreign" | "barcode_fence") {
+    if matches!(case, "suffix_medium" | "suffix_scan_medium") {
+        assert!(
+            audit.iter().any(|record| matches!(
+                record.detail.get("abort_reason"), Some(CborValue::Text(reason))
+                    if reason.contains("append suffix at LBA")
+            )),
+            "{case} through {path}: suffix audit preserves the read location: {:?}",
+            audit
+                .iter()
+                .filter_map(|r| r.detail.get("abort_reason"))
+                .collect::<Vec<_>>()
+        );
+    }
+    if matches!(
+        case,
+        "replay_failure"
+            | "journal_corrupt"
+            | "lease"
+            | "finalize_lease"
+            | "stale_shared_lease"
+            | "catalog_read"
+    ) {
+        let failures: Vec<_> = audit
+            .iter()
+            .filter(|r| {
+                r.detail.get("session_kind")
+                    == Some(&CborValue::Text("epoch_projection_failed".into()))
+            })
+            .collect();
+        assert_eq!(failures.len(), 1, "projection failure has its own audit");
+        if case == "stale_shared_lease" {
+            assert!(
+                matches!(failures[0].detail.get("abort_reason"), Some(CborValue::Text(reason)) if reason.contains("lock checkpoint journal for write session"))
+            );
+            let tape = CatalogIndex::open(&state.paths().sqlite_path)
+                .unwrap()
+                .get_tape(&selected.tape_uuid)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                tape.total_committed_ordinals,
+                before.total_committed_ordinals
+            );
+            assert_eq!(
+                tape.highest_protected_ordinal,
+                before.highest_protected_ordinal
+            );
+        }
+        for record in failures {
+            assert!(!record.detail.contains_key("open_epoch_start"));
+            assert!(!record.detail.contains_key("open_epoch_end"));
+            assert!(
+                matches!(record.detail.get("abort_reason"), Some(CborValue::Text(reason)) if reason.contains("unknown until replay"))
+            );
+        }
+        assert!(audit
+            .iter()
+            .all(|r| r.detail.get("session_kind")
+                != Some(&CborValue::Text("epoch_left_open".into()))));
+    }
+    if matches!(
+        case,
+        "retired"
+            | "sealed"
+            | "finalizing"
+            | "ingested"
+            | "foreign"
+            | "no_pool"
+            | "no_scheme"
+            | "barcode_fence"
+            | "missing_checkpoint"
+    ) {
         assert!(
             audit
                 .iter()
@@ -13300,10 +13765,7 @@ async fn check_epoch_removal(
         );
     } else if matches!(
         case,
-        "lease"
-            | "finalize_lease"
-            | "mode_sense"
-            | "catalog_read"
+        "mode_sense"
             | "summary_mismatch"
             | "unit_attention"
             | "timeout"
@@ -13319,10 +13781,6 @@ async fn check_epoch_removal(
         );
         for record in open_audits {
             assert!(record.detail.contains_key("abort_reason"));
-            if case == "catalog_read" {
-                assert!(!record.detail.contains_key("open_epoch_start"));
-                assert!(!record.detail.contains_key("open_epoch_end"));
-            }
         }
     }
     let world = world.lock().unwrap();
@@ -13338,10 +13796,12 @@ async fn check_epoch_removal(
         Some("HAND")
     );
     assert!(
-        matches!(case, "post_projection" | "projection_busy" | "success")
-            || world.command_log[command_start..]
-                .iter()
-                .all(|c| !matches!(c.opcode, 0x0a | 0x10)),
+        matches!(
+            case,
+            "post_projection" | "projection_busy" | "success" | "stale_open"
+        ) || world.command_log[command_start..]
+            .iter()
+            .all(|c| !matches!(c.opcode, 0x0a | 0x10)),
         "{case} through {path}: failed or skipped close writes no media"
     );
     if matches!(case, "open_read" | "open_medium") {
@@ -13391,6 +13851,35 @@ async fn check_epoch_removal(
             tape.total_committed_ordinals
         );
     }
+    if case == "stale_open" {
+        let tape = index.get_tape(&selected.tape_uuid).unwrap().unwrap();
+        assert!(
+            tape.total_committed_ordinals > before.total_committed_ordinals,
+            "{path}: removal replays the open checkpoint"
+        );
+        if tape.highest_protected_ordinal < tape.total_committed_ordinals {
+            assert_eq!(path, "shutdown");
+            assert!(
+                audit.iter().any(|r| r.detail.get("session_kind")
+                    == Some(&CborValue::Text("epoch_left_open".into()))
+                    && r.detail.get("open_epoch_start")
+                        == Some(&CborValue::Integer(tape.highest_protected_ordinal.into()))
+                    && r.detail.get("open_epoch_end")
+                        == Some(&CborValue::Integer(tape.total_committed_ordinals.into()))),
+                "shutdown audits the replayed open range"
+            );
+        } else {
+            let records =
+                FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, selected.tape_uuid)
+                    .unwrap()
+                    .replay()
+                    .unwrap();
+            assert!(
+                records.last().unwrap().objects.is_empty(),
+                "removal commits a sidecar-only checkpoint"
+            );
+        }
+    }
     if let Some(before) = journal_before {
         let after = FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, selected.tape_uuid)
             .unwrap()
@@ -13408,8 +13897,7 @@ async fn check_epoch_removal(
     let fences = index.list_active_tape_io_fences().unwrap();
     let expect_fence = matches!(
         case,
-        "missing_checkpoint"
-            | "filemark"
+        "filemark"
             | "eod"
             | "blank_locate"
             | "admission_filemark"
@@ -13426,17 +13914,36 @@ async fn check_epoch_removal(
             | "medium"
             | "open_read"
             | "open_medium"
+            | "open_admission_blank"
+            | "open_admission_medium"
     ) && !(path == "shutdown"
         && matches!(case, "read" | "medium" | "identity" | "late_barcode_fence"));
     if expect_fence {
         assert_eq!(fences.len(), 1, "{case} through {path}");
+        assert!(
+            audit
+                .iter()
+                .any(|record| record.event == AuditEvent::TapeIoFenceRaised),
+            "{case}: contradiction fence has durable audit evidence"
+        );
         let evidence: serde_json::Value =
             serde_json::from_str(fences[0].evidence_json.as_deref().unwrap()).unwrap();
-        assert_eq!(
-            evidence["open_epoch_start"],
-            before.highest_protected_ordinal
-        );
-        assert_eq!(evidence["open_epoch_end"], before.total_committed_ordinals);
+        if case == "tail" {
+            assert_eq!(evidence["phase"], "append_suffix");
+            assert!(evidence["suffix_start_lba"].as_u64().unwrap() > 2);
+            assert!(evidence.get("open_epoch_start").is_none());
+            assert!(evidence.get("open_epoch_end").is_none());
+        } else {
+            assert_eq!(
+                evidence["open_epoch_start"],
+                before.highest_protected_ordinal
+            );
+            assert_eq!(evidence["open_epoch_end"], before.total_committed_ordinals);
+        }
+        if matches!(case, "open_admission_blank" | "open_admission_medium") {
+            assert_eq!(fences[0].reason, "admission_contradiction");
+            assert_eq!(evidence["phase"], "append_admission");
+        }
         assert!(!evidence["error"].as_str().unwrap().is_empty());
     } else if case == "barcode_fence" || (case == "late_barcode_fence" && path != "shutdown") {
         assert_eq!(fences.len(), 1);
@@ -13470,6 +13977,28 @@ impl SgTransport for EpochRemovalTransport {
             return Err(remanence_library::ScsiError::Io(std::io::Error::other(
                 "injected READ POSITION failure",
             )));
+        }
+        if cdb[0] == 0x08 && self.located > 2 {
+            let pending = self.fault.load(Ordering::SeqCst);
+            if pending == 30 {
+                self.fault.store(0, Ordering::SeqCst);
+                rusqlite::Connection::open(&self.index_path).unwrap().execute_batch(
+                    "ALTER TABLE tapes RENAME COLUMN total_committed_ordinals TO unavailable_total"
+                ).unwrap();
+            }
+            if pending == 25 {
+                self.fault.store(0, Ordering::SeqCst);
+                return Err(remanence_library::ScsiError::CheckCondition {
+                    sense: vec![0x70, 0, 3, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0x14, 3, 0, 0, 0, 0],
+                    bytes_transferred: 0,
+                });
+            }
+            if pending == 28 {
+                self.fault.store(29, Ordering::SeqCst);
+            }
+            if pending == 29 {
+                self.fault.store(25, Ordering::SeqCst);
+            }
         }
         let pending = self.fault.load(Ordering::SeqCst);
         if cdb[0] == 0x08
@@ -13541,12 +14070,13 @@ impl SgTransport for EpochRemovalTransport {
             _ => {}
         }
         let pending = self.fault.load(Ordering::SeqCst);
-        if matches!(cdb[0], 0x2b | 0x92) && self.located > 2 && matches!(pending, 20..=24) {
+        if matches!(cdb[0], 0x2b | 0x92) && self.located > 2 && matches!(pending, 20..=24 | 26 | 27)
+        {
             self.fault.store(0, Ordering::SeqCst);
-            if pending == 22 {
+            if matches!(pending, 22 | 27) {
                 return Err(remanence_library::ScsiError::TransportError {
                     status: 0,
-                    host_status: 7,
+                    host_status: if pending == 27 { 3 } else { 7 },
                     driver_status: 0,
                     info: 1,
                     sense: vec![],
@@ -13558,6 +14088,7 @@ impl SgTransport for EpochRemovalTransport {
                 20 => 0x80,
                 21 => 3,
                 23 => 6,
+                26 => 8,
                 _ => 2,
             };
             sense[7] = 10;

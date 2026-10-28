@@ -1859,6 +1859,25 @@ pub(super) fn handle_drive_open_write(
     let _admission = match crate::append_admission::admit_append_boundary(drive, authority, ctx) {
         Ok(admission) => admission,
         Err(error) => {
+            if matches!(error, crate::append_admission::AdmissionError::Io(_)) {
+                let range = index.get_tape(&tape_uuid).ok().flatten().map(|tape| {
+                    (
+                        tape.highest_protected_ordinal,
+                        tape.total_committed_ordinals,
+                    )
+                });
+                if super::checkpoint::fence_admission_contradiction(
+                    index,
+                    cfg,
+                    tape_uuid,
+                    selected.block_size,
+                    range,
+                    &error,
+                ) {
+                    let _ = reply.send(Err(Status::failed_precondition(error.to_string())));
+                    return;
+                }
+            }
             let status = crate::append_admission::daemon_admission_error(
                 actor.clone(),
                 index,
