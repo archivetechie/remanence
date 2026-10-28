@@ -45,32 +45,34 @@ fn random_data(blocks: usize, len: usize, mut state: u64) -> Vec<Vec<u8>> {
 /// Compare all coefficients with random input and existing accumulator bytes.
 #[test]
 fn slice_multiply_add_matches_table() {
-    for len in [0, 1, 15, 16, 31, 32, 33, 4095, 262144] {
-        let buffers = random_data(2, len + 96, 0x5eed_cafe);
-        for (input_offset, output_offset) in [(0, 0), (1, 3), (15, 17), (31, 1)] {
-            // Start from a 32-byte boundary so offsets exercise known alignment.
-            let input_start = buffers[0].as_ptr().align_offset(32) + input_offset;
-            let input = &buffers[0][input_start..input_start + len];
-            let mut actual = buffers[1].clone();
-            let output_start = actual.as_ptr().align_offset(32) + output_offset;
-            for coefficient in 0..=255 {
-                actual.copy_from_slice(&buffers[1]);
-                let mut expected = actual.clone();
-                table_mul_slice_xor(
-                    coefficient,
-                    input,
-                    &mut expected[output_start..output_start + len],
-                );
-                gf_mul_slice_xor(
-                    coefficient,
-                    input,
-                    &mut actual[output_start..output_start + len],
-                );
-                // Compare the guards too: bytes outside the output stay intact.
-                assert_eq!(
+    for kernel in kernels::supported() {
+        for len in (0..=65).chain([127, 255, 4095, 4096, 4097, 262143, 262144]) {
+            let buffers = random_data(2, len + 96, 0x5eed_cafe);
+            for (input_offset, output_offset) in [(0, 0), (1, 3), (15, 17), (31, 1)] {
+                // Start from a 32-byte boundary so offsets exercise known alignment.
+                let input_start = buffers[0].as_ptr().align_offset(32) + input_offset;
+                let input = &buffers[0][input_start..input_start + len];
+                let mut actual = buffers[1].clone();
+                let output_start = actual.as_ptr().align_offset(32) + output_offset;
+                for coefficient in 0..=255 {
+                    actual.copy_from_slice(&buffers[1]);
+                    let mut expected = actual.clone();
+                    table_mul_slice_xor(
+                        coefficient,
+                        input,
+                        &mut expected[output_start..output_start + len],
+                    );
+                    kernel.apply(
+                        coefficient,
+                        input,
+                        &mut actual[output_start..output_start + len],
+                    );
+                    // Compare the guards too: bytes outside the output stay intact.
+                    assert_eq!(
                     actual, expected,
-                    "coefficient={coefficient}, len={len}, offsets={input_offset}/{output_offset}"
+                    "kernel={kernel:?}, coefficient={coefficient}, len={len}, offsets={input_offset}/{output_offset}"
                 );
+                }
             }
         }
     }
@@ -90,7 +92,7 @@ fn table_accumulate(codec: &ReedSolomonCodec, index: usize, data: &[u8], parity:
 fn time_accumulation(
     codec: &ReedSolomonCodec,
     data: &[Vec<u8>],
-    table: bool,
+    kernel: Option<kernels::Kernel>,
 ) -> (Duration, Vec<Vec<u8>>) {
     let mut parity = codec.new_parity_accumulators(data[0].len());
     let start = Instant::now();
@@ -99,12 +101,16 @@ fn time_accumulation(
             out.fill(0);
         }
         for (index, block) in data.iter().enumerate() {
-            if table {
-                table_accumulate(black_box(codec), index, black_box(block), &mut parity);
+            if let Some(kernel) = kernel {
+                for (row, out) in parity.iter_mut().enumerate() {
+                    kernel.apply(
+                        black_box(codec.generator[row][index]),
+                        black_box(block),
+                        out,
+                    );
+                }
             } else {
-                black_box(codec)
-                    .accumulate(index, black_box(block), &mut parity)
-                    .unwrap();
+                table_accumulate(black_box(codec), index, black_box(block), &mut parity);
             }
         }
         black_box(&parity);
@@ -163,25 +169,29 @@ fn benchmark_write_kernels() {
         codec.accumulate(index, block, &mut accelerated).unwrap();
     }
     assert_eq!(reference, accelerated);
-    for sample in 1..=3 {
-        let mut outputs = Vec::new();
-        // Alternate order to reduce systematic warm-cache or clock bias.
-        for table in if sample % 2 == 1 {
-            [true, false]
-        } else {
-            [false, true]
-        } {
-            let (accumulation, parity) = time_accumulation(&codec, &data, table);
-            let (crc, sha) = time_checksums(&data);
-            let implementation = if table { "table" } else { "accelerated" };
+    println!("selected kernel: {}", encoding_kernel());
+    for kernel in std::iter::once(None).chain(kernels::supported().into_iter().map(Some)) {
+        let name = kernel.map_or("table", |k| k.name());
+        let mut samples = Vec::new();
+        for sample in 1..=3 {
+            let (elapsed, parity) = time_accumulation(&codec, &data, kernel);
+            assert_eq!(reference, parity);
+            samples.push(elapsed);
             println!(
-                "sample={sample} {implementation}: {:.6}, {:.6}, {:.6}",
-                accumulation.as_secs_f64(),
-                crc.as_secs_f64(),
-                sha.as_secs_f64()
+                "sample={sample} kernel={name}: {:.6} seconds/GiB",
+                elapsed.as_secs_f64()
             );
-            outputs.push(parity);
         }
-        assert_eq!(outputs[0], outputs[1]);
+        samples.sort();
+        println!(
+            "median kernel={name}: {:.6} seconds/GiB",
+            samples[1].as_secs_f64()
+        );
     }
+    let (crc, sha) = time_checksums(&data);
+    println!(
+        "CRC={:.6}, two SHA-256={:.6} seconds/GiB",
+        crc.as_secs_f64(),
+        sha.as_secs_f64()
+    );
 }

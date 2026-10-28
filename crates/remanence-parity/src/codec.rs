@@ -364,22 +364,16 @@ fn gf_mul(a: u8, b: u8) -> u8 {
     GF_MUL_TABLE[a as usize][b as usize]
 }
 
-/// Add a constant multiple over GF(2^8)/0x11D using the slice accelerator.
+mod kernels;
+
+/// CPU-selected GF(2^8) multiply-add kernel used for parity encoding.
+pub fn encoding_kernel() -> &'static str {
+    kernels::selected().name()
+}
+
+/// Add a constant multiple using the process-wide runtime CPU selection.
 fn gf_mul_slice_xor(coefficient: u8, input: &[u8], output: &mut [u8]) {
-    debug_assert_eq!(input.len(), output.len());
-    // The SIMD wrapper in reed-solomon-erasure 6 indexes the first byte.
-    if input.is_empty() {
-        return;
-    }
-    match coefficient {
-        0 => {}
-        1 => {
-            for (out, byte) in output.iter_mut().zip(input) {
-                *out ^= *byte;
-            }
-        }
-        _ => reed_solomon_erasure::galois_8::mul_slice_xor(coefficient, input, output),
-    }
+    kernels::selected().apply(coefficient, input, output);
 }
 
 #[cfg(test)]

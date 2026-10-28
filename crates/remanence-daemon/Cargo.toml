@@ -16,6 +16,7 @@ path = "src/main.rs"
 remanence-api = { path = "../remanence-api" }
 remanence-format-driver = { path = "../remanence-format-driver" }
 remanence-library = { path = "../remanence-library" }
+remanence-parity = { path = "../remanence-parity" }
 remanence-state = { path = "../remanence-state" }
 base64 = { workspace = true }
 clap = { workspace = true }
@@ -27,8 +28,9 @@ tokio-stream = { workspace = true, features = ["net"] }
 tonic = { workspace = true, features = ["tls-ring"] }
 tracing-subscriber = { workspace = true }
 
-[dev-dependencies]
 tracing = { workspace = true }
+
+[dev-dependencies]
 prost-types = { workspace = true }
 tempfile = { workspace = true }
 uuid = { workspace = true }
