@@ -2240,6 +2240,14 @@ pub(super) fn record_manual_finalize_request_with(
         )));
     }
     let record = if let Some(record) = exact {
+        // Admission replay must not overwrite the current attempt outcome.
+        if index
+            .get_operation(&request.candidate_operation_id.to_string())
+            .map_err(crate::status_from_state_error)?
+            .is_some()
+        {
+            return Ok(());
+        }
         record
     } else {
         let mut audit =

@@ -120,27 +120,24 @@ The most recent field window on the HPE MSL3040 with LTO-9 drives ran the
 library paths end to end: plaintext and encrypted writes and reads,
 multi-object writes, repeated appends, an overnight soak, and recovery after a
 killed write, a refused wrong tape, a retired and re-initialized cartridge and
-a catalog rebuild. It also found the following limitations, which are not yet
-fixed.
+a catalog rebuild. In the same window, a restore running beside a write session on
+another pool completes normally, and a concurrent restore and append against
+two pools on two drives run at an aggregate of about 218 MB/s.
+The following readiness and recovery behavior applies.
 
-**A readiness fence on one drive refuses a second write session.** On a
-library with several drives, the daemon gives a second write session an idle
-drive rather than the bay the first session holds. While any drive has a
-media-readiness fence, such as the one a cold load leaves until the drive
-reports ready, the daemon refuses every request in that library that needs the
-robot, and the clients' resume calls then find the fenced drive busy because
-only one caller at a time waits on it. Open write sessions one at a time until
-this is fixed. In the same window, a restore running beside a write session on
-another pool completed normally, and a concurrent restore and append against
-two pools on two drives ran at an aggregate of about 218 MB/s.
+**Readiness fences serialize robot moves while the drive becomes ready.**
+The daemon starts a wait for each resumable fence, including at startup, using
+a 9000 s timeout and 30 s steady polls. A second write session that needs the
+robot waits on the same operation through its client. Resume calls attach to
+that wait. Robot moves remain refused until the fence clears; other bays being
+idle does not bypass the rule. Release-only fences require operator action,
+and an operator-cancelled wait stays stopped until an explicit client resume.
 
-**A readiness fence clears when a client waits on it.** A drive that is
-becoming ready after a load leaves a media-readiness fence. Session opens
-and `rem tape verify-index` resume the readiness operation and wait until
-the drive is ready. Verification waits up to `15m`; `--ready-wait <DURATION>`
-sets the deadline, and `--ready-wait 0` returns the refusal immediately.
-Nothing re-probes a fence on its own, so it stays until a client resumes
-the readiness operation.
+Detached verification and manual finalization wait up to 15 minutes from the
+first readiness refusal before stopping their attempt. A stopped finalization
+attempt reports FAILED, retains FINALIZING intent, and resumes under the same
+operation id when the caller retries with the same idempotency key.
+`rem tape finalize --wait` exits with the attempt's error summary.
 
 **A cartridge left unthreaded by a hard kill needed a LOAD by hand.** When the
 field stop script killed the daemon outright during an unload, the cartridge

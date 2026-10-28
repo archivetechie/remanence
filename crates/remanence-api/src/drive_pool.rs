@@ -61,10 +61,34 @@ pub(crate) struct ParkedState {
     pub(crate) by_drive: HashMap<DriveKey, ParkedCartridge>,
 }
 
+/// Structured holder identity keeps readiness ownership separate from diagnostics.
+#[derive(Debug)]
+struct DriveHolder {
+    label: String,
+    kind: String,
+    operation_id: Option<Uuid>,
+}
+
+/// Catalog writers wake discovery without depending on an async runtime.
+#[derive(Debug, Default)]
+pub(crate) struct ReadinessWake {
+    pub(crate) notify: tokio::sync::Notify,
+    #[cfg(test)]
+    pub(crate) scans: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    pub(crate) start_attempts: std::sync::atomic::AtomicUsize,
+}
+impl remanence_state::index::MediaReadinessObserver for ReadinessWake {
+    fn changed(&self) {
+        self.notify.notify_one();
+    }
+}
+
 /// Shared actor/pool lifecycle maps used by timer-driven close-and-park.
 #[derive(Clone, Default)]
 pub(crate) struct DrivePoolLifecycle {
-    holders: Arc<Mutex<HashMap<DriveKey, String>>>,
+    pub(crate) readiness_wake: Arc<ReadinessWake>,
+    holders: Arc<Mutex<HashMap<DriveKey, DriveHolder>>>,
     pub(crate) sessions: Arc<Mutex<HashMap<Uuid, MountedSession>>>,
     pub(crate) parked: Arc<Mutex<ParkedState>>,
     pub(crate) timer_park_tx: Option<mpsc::UnboundedSender<ParkedCartridge>>,
@@ -90,8 +114,12 @@ impl DrivePoolLifecycle {
 }
 
 /// Render the reservation identity consistently for pool and actor updates.
-fn holder_label(drive: &DriveKey, serial: Option<&str>, kind: &str, id: Uuid) -> String {
-    format!("{} held by {kind} {id}", holder_drive_label(drive, serial))
+fn holder_label(drive: &DriveKey, serial: Option<&str>, kind: &str, id: Uuid) -> DriveHolder {
+    DriveHolder {
+        label: format!("{} held by {kind} {id}", holder_drive_label(drive, serial)),
+        kind: kind.into(),
+        operation_id: Some(id),
+    }
 }
 
 /// Identify a serialized drive or its library bay in reservation messages.
@@ -113,10 +141,11 @@ fn holder_drive_label(drive: &DriveKey, serial: Option<&str>) -> String {
 
 #[derive(Clone)]
 pub(crate) struct DrivePool {
+    pub(crate) readiness_wake: Arc<ReadinessWake>,
     changers: Arc<HashMap<String, mpsc::Sender<ChangerCommand>>>,
     drives: Arc<HashMap<DriveKey, mpsc::Sender<DriveCommand>>>,
     reservations: Arc<HashMap<DriveKey, AtomicBool>>,
-    holders: Arc<Mutex<HashMap<DriveKey, String>>>,
+    holders: Arc<Mutex<HashMap<DriveKey, DriveHolder>>>,
     pub(crate) sessions: Arc<Mutex<HashMap<Uuid, MountedSession>>>,
     tape_reservations: Arc<Mutex<HashSet<TapeUuid>>>,
     parked: Arc<Mutex<ParkedState>>,
@@ -172,6 +201,7 @@ impl DrivePool {
             drives: Arc::new(drives),
             reservations,
             holders: lifecycle.holders,
+            readiness_wake: lifecycle.readiness_wake,
             sessions: lifecycle.sessions,
             tape_reservations: Arc::new(Mutex::new(HashSet::new())),
             parked: lifecycle.parked,
@@ -184,6 +214,18 @@ impl DrivePool {
             .lock()
             .unwrap()
             .insert(drive.clone(), holder_label(drive, serial, kind, id));
+    }
+
+    /// True while this readiness wait or LoadDrive owns the reservation.
+    pub(crate) fn held_by_readiness_wait(&self, drive: &DriveKey, id: Uuid) -> bool {
+        let holders = self.holders.lock().unwrap();
+        self.reservations
+            .get(drive)
+            .is_some_and(|reserved| reserved.load(Ordering::SeqCst))
+            && holders.get(drive).is_some_and(|holder| {
+                matches!(holder.kind.as_str(), "media_readiness_wait" | "load_drive")
+                    && holder.operation_id == Some(id)
+            })
     }
 
     pub(crate) fn set_library_holder(&self, library: &str, kind: &str, id: Uuid) {
@@ -200,7 +242,11 @@ impl DrivePool {
     pub(crate) fn set_internal_holder(&self, drive: &DriveKey, serial: Option<&str>, kind: &str) {
         self.holders.lock().unwrap().insert(
             drive.clone(),
-            format!("{} held by {kind}", holder_drive_label(drive, serial)),
+            DriveHolder {
+                label: format!("{} held by {kind}", holder_drive_label(drive, serial)),
+                kind: kind.into(),
+                operation_id: None,
+            },
         );
     }
 
@@ -215,15 +261,17 @@ impl DrivePool {
             .reservations
             .iter()
             .filter(|(key, reserved)| include(key) && reserved.load(Ordering::SeqCst))
-            .filter_map(|(key, _)| holders.get(key).cloned())
+            .filter_map(|(key, _)| holders.get(key).map(|holder| holder.label.clone()))
             .collect::<Vec<_>>();
         labels.sort();
         if labels.is_empty() {
             error
         } else {
-            Status::new(
+            Status::with_details_and_metadata(
                 error.code(),
                 format!("{}; held by: {}", error.message(), labels.join(", ")),
+                error.details().to_vec().into(),
+                error.metadata().clone(),
             )
         }
     }
@@ -594,7 +642,7 @@ impl DrivePool {
 pub(crate) struct DriveReservation {
     drive: DriveKey,
     reservations: Arc<HashMap<DriveKey, AtomicBool>>,
-    holders: Arc<Mutex<HashMap<DriveKey, String>>>,
+    holders: Arc<Mutex<HashMap<DriveKey, DriveHolder>>>,
     armed: bool,
 }
 

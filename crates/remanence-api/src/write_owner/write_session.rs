@@ -239,9 +239,15 @@ impl WriteSessionState<'_> {
                         "write session already active",
                     )));
                 }
-                DriveCommand::WaitReady { handle, .. } => {
+                DriveCommand::WaitReady {
+                    handle,
+                    reservation,
+                    ..
+                } => {
                     handle
                         .publish_failed("write session already active", &[("phase", "admission")]);
+                    drop(reservation);
+                    handle.wake_readiness();
                 }
                 DriveCommand::Unload { reply } => {
                     let _ = reply.send(Err(Status::failed_precondition(

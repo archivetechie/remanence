@@ -9,7 +9,6 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::pin::Pin;
-use std::time::Duration;
 
 use ciborium::value::Value as CborValue;
 use remanence_library::{DriveBay, IePort, Library, Slot};
@@ -465,7 +464,19 @@ impl LibraryServiceApi {
             pool.release_library(&library_serial);
             return Err(err);
         }
-        let handle = self.state.operations.register(operation_id, operation_kind);
+        let mut handle = self.state.operations.register(operation_id, operation_kind);
+        if matches!(
+            action,
+            crate::write_owner::RoboticsAction::Load {
+                wait_ready: true,
+                ..
+            }
+        ) {
+            handle = handle.with_readiness_lifetime(
+                self.state.readiness_shutdown.clone(),
+                pool.readiness_wake.clone(),
+            );
+        }
         match changer.try_send(crate::write_owner::ChangerCommand::Robotics {
             library_serial: library_serial.clone(),
             action,
@@ -1026,143 +1037,17 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
             "media_readiness_operation_id",
         )?;
         let operation_id = Uuid::from_bytes(operation_uuid);
-        let record = self
-            .state
-            .index()?
-            .media_readiness_operation(operation_id)
-            .map_err(crate::startup_media_readiness::status_from_state_error)?
-            .ok_or_else(|| Status::not_found("media-readiness operation not found"))?;
-        const RESUMABLE_STATES: &[&str] = &[
-            "planned",
-            "pre_ready_loading",
-            "media_initializing",
-            "becoming_ready",
-            "target_busy",
-            "unit_attention",
-        ];
-        if !RESUMABLE_STATES.contains(&record.state.as_str()) {
-            return Err(Status::failed_precondition(format!(
-                "media-readiness operation {operation_id} is state {} and cannot be resumed",
-                record.state
-            )));
-        }
-        let remanence_state::DriveKey::Bay {
-            library_serial,
-            bay,
-        } = &record.endpoint
-        else {
-            return Err(Status::failed_precondition(
-                "this daemon operates library endpoints only",
-            ));
-        };
-        let bay = *bay;
-        if !self.state.operates_library(library_serial) {
-            return Err(Status::failed_precondition(format!("media-readiness operation {operation_id} belongs to library {library_serial}, which this daemon does not operate")));
-        }
-        let snapshot = self
-            .state
-            .current_library_snapshot()
-            .ok_or_else(|| Status::not_found("library snapshot unavailable"))?;
-        let library = snapshot
-            .report
-            .library(library_serial)
-            .ok_or_else(|| Status::not_found("media-readiness library not found"))?;
-        let drive_bay = library
-            .drive_bays
-            .iter()
-            .find(|candidate| candidate.element_address == bay)
-            .ok_or_else(|| Status::not_found("media-readiness drive bay not found"))?;
-        if let Some(expected) = record.drive_serial.as_deref() {
-            let actual = drive_bay
-                .installed
-                .as_ref()
-                .map(|drive| drive.serial.as_str());
-            if actual != Some(expected) {
-                return Err(Status::failed_precondition(format!(
-                    "media-readiness operation {operation_id} expected drive serial {expected}, snapshot has {}",
-                    actual.unwrap_or("(none)")
-                )));
-            }
-        }
-        if let Some(expected) = record.barcode.as_deref() {
-            if drive_bay.loaded_tape.as_deref() != Some(expected) {
-                return Err(Status::failed_precondition(format!(
-                    "media-readiness operation {operation_id} expected barcode {expected} in drive 0x{bay:04x}, snapshot has {}",
-                    drive_bay.loaded_tape.as_deref().unwrap_or("(none)")
-                )));
-            }
-        }
-
-        let pool = self.state.drive_pool()?.clone();
-        let drive_key = record.endpoint.clone();
-        // One caller at a time holds a fenced drive: the wait below keeps the
-        // reservation until it ends. A second caller is often a client whose
-        // open the same fence refused because that open needs the library
-        // robot, so the refusal names the serialization, not only the drive,
-        // and the fence's last sense when it has one.
-        let fence_sense =
-            crate::startup_media_readiness::media_readiness_record_sense_label(&record)
-                .map(|label| format!(", sense={label}"))
-                .unwrap_or_default();
-        let reservation = pool.reserve_drive(&drive_key).map_err(|error| {
-            if error.code() == tonic::Code::FailedPrecondition
-                && error.message().split("; held by: ").next() == Some(format!("{} is busy", drive_key.label()).as_str())
-            {
-                pool.append_holders(Status::failed_precondition(format!(
-                    "{} is busy: another caller holds this drive while media-readiness operation {operation_id} is unresolved{fence_sense}. Robot moves in library {library_serial} are refused until that operation finishes, even when other drive bays are idle; retry when operation {operation_id} finishes",
-                    drive_key.label()
-                )), |key| key == &drive_key)
-            } else {
-                error
-            }
-        })?;
-        pool.set_holder(
-            &drive_key,
-            drive_bay
-                .installed
-                .as_ref()
-                .map(|drive| drive.serial.as_str()),
-            "media_readiness_wait",
-            operation_id,
-        );
-        let drive_tx = pool.drive_tx(&drive_key)?;
-        let handle = self
-            .state
-            .operations
-            .register(operation_id, "media_readiness_wait");
-        let family = if record
-            .media_generation
-            .is_some_and(|generation| generation >= 9)
-        {
-            remanence_library::MediaFamily::Lto9OrLater
-        } else {
-            remanence_library::MediaFamily::Unknown
-        };
-        let command = crate::write_owner::DriveCommand::WaitReady {
-            operation_id,
-            family,
-            options: remanence_library::MediaReadinessWaitOptions {
-                wait: true,
-                timeout: Duration::from_secs(u64::from(request.timeout_seconds)),
-                poll_interval: Duration::from_secs(u64::from(request.poll_interval_seconds)),
-            },
-            cartridge_in_drive: drive_bay.loaded,
-            handle: handle.clone(),
-            reservation,
-        };
-        match drive_tx.try_send(command) {
-            Ok(()) => Ok(Response::new(pb::OperationRef {
-                operation_id: operation_id.as_bytes().to_vec(),
-            })),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                handle.publish_failed("drive-session owner is busy", &[("phase", "dispatch")]);
-                Err(Status::failed_precondition("drive-session owner is busy"))
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                handle.publish_failed("drive-session owner is stopped", &[("phase", "dispatch")]);
-                Err(Status::unavailable("drive-session owner is stopped"))
-            }
-        }
+        self.state
+            .start_readiness_wait(
+                operation_id,
+                request
+                    .timeout_seconds
+                    .max(crate::readiness_wait::DEFAULT_READY_TIMEOUT_SECONDS),
+                request.poll_interval_seconds,
+                "client",
+                "session_open",
+            )
+            .map(Response::new)
     }
 
     async fn unload_drive(
@@ -2556,5 +2441,693 @@ mod tests {
             .await
             .expect_err("no owner");
         assert_eq!(err.code(), tonic::Code::Unavailable);
+    }
+    /// Build a fenced drive with a controlled actor queue and real reservation pool.
+    fn auto_resume_fixture(
+        state_name: &str,
+    ) -> (
+        ApiState,
+        Uuid,
+        tokio::sync::mpsc::Receiver<crate::write_owner::DriveCommand>,
+    ) {
+        let mut state = state_with_snapshot();
+        let (changer, _) = tokio::sync::mpsc::channel(1);
+        let (drive, rx) = tokio::sync::mpsc::channel(4);
+        state.drive_pool = Some(crate::write_owner::DrivePool::new_for_library(
+            "DEC418146K_LL02",
+            changer,
+            HashMap::from([(1, drive)]),
+            Arc::new(HashMap::from([(1, AtomicBool::new(false))])),
+        ));
+        let id = Uuid::new_v4();
+        state
+            .index_write()
+            .unwrap()
+            .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+                operation_id: id,
+                run_id: None,
+                endpoint: remanence_state::DriveKey::new("DEC418146K_LL02", 1),
+                changer_sg: None,
+                drive_sg: None,
+                drive_serial: Some("8031BDC7D1".into()),
+                barcode: Some("S30002L9".into()),
+                source_slot: Some(0x040a),
+                media_generation: Some(9),
+                phase: "session_open_short_probe".into(),
+                state: state_name.into(),
+                dirty_scope: Some("drive+tape".into()),
+                deadline_at_utc: None,
+                evidence_path: None,
+            })
+            .unwrap();
+        (state, id, rx)
+    }
+
+    /// Client-first and daemon-first starts share one command and one reservation.
+    #[tokio::test]
+    async fn auto_resume_and_client_attach_in_both_orders() {
+        use crate::readiness_wait::*;
+        for client_first in [false, true] {
+            let (state, id, mut rx) = auto_resume_fixture("becoming_ready");
+            if client_first {
+                state
+                    .start_readiness_wait(
+                        id,
+                        DEFAULT_READY_TIMEOUT_SECONDS,
+                        DEFAULT_READY_POLL_SECONDS,
+                        "client",
+                        "session_open",
+                    )
+                    .unwrap();
+            }
+            spawn_auto_resume(state.clone());
+            let command = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let attached = state
+                .library_service()
+                .resume_media_readiness(Request::new(pb::ResumeMediaReadinessRequest {
+                    operation_id: id.as_bytes().to_vec(),
+                    timeout_seconds: 1,
+                    poll_interval_seconds: 1,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(attached.operation_id, id.as_bytes());
+            let crate::write_owner::DriveCommand::WaitReady {
+                options, handle, ..
+            } = &command
+            else {
+                panic!("wait command")
+            };
+            assert_eq!(options.timeout.as_secs(), 9_000);
+            assert_eq!(options.poll_interval.as_secs(), 30);
+            assert_eq!(
+                state.operations.latest(&id).unwrap().progress["started_by"],
+                if client_first { "client" } else { "daemon" }
+            );
+            handle.publish_state(pb::OperationState::Running, &[("state", "unit_attention")]);
+            assert!(state
+                .operations
+                .latest(&id)
+                .unwrap()
+                .progress
+                .contains_key("started_by"));
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert!(rx.try_recv().is_err());
+            state
+                .readiness_shutdown
+                .store(true, std::sync::atomic::Ordering::Release);
+            drop(command);
+        }
+    }
+
+    /// Runtime discovery retries the refusing caller's reservation and admits robotics after READY.
+    #[tokio::test]
+    async fn auto_resume_waits_for_reservation_release() {
+        let (state, id, mut rx) = auto_resume_fixture("becoming_ready");
+        let held = state
+            .drive_pool()
+            .unwrap()
+            .reserve_drive(&remanence_state::DriveKey::new("DEC418146K_LL02", 1))
+            .unwrap();
+        let load = state.operations.register(id, "load_drive");
+        load.publish_state(pb::OperationState::Running, &[]);
+        crate::readiness_wait::spawn_auto_resume(state.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(rx.try_recv().is_err());
+        assert!(
+            crate::startup_media_readiness::ensure_media_readiness_admitted(
+                &state.index().unwrap(),
+                "move",
+                "DEC418146K_LL02",
+                None,
+                None,
+                true
+            )
+            .is_err()
+        );
+        load.publish_failed("load leaves a resumable fence", &[]);
+        drop(held);
+        state
+            .drive_pool()
+            .unwrap()
+            .readiness_wake
+            .notify
+            .notify_one();
+        let command = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        crate::write_owner::run_readiness_test_command(&state, command).await;
+        crate::startup_media_readiness::ensure_media_readiness_admitted(
+            &state.index().unwrap(),
+            "move",
+            "DEC418146K_LL02",
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        state
+            .readiness_shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Release-only states and durable operator cancellation never dispatch automatically.
+    #[tokio::test]
+    async fn auto_resume_excludes_release_states_and_operator_cancel() {
+        for name in [
+            "aborted_unknown",
+            "timeout_unknown",
+            "transport_unknown",
+            "terminal_error",
+            "reservation_conflict",
+            "cancelled",
+        ] {
+            let (state, id, mut rx) = auto_resume_fixture(if name == "cancelled" {
+                "becoming_ready"
+            } else {
+                name
+            });
+            if name == "cancelled" {
+                state
+                    .start_readiness_wait(id, 9000, 30, "client", "session_open")
+                    .unwrap();
+                let command = rx.recv().await.unwrap();
+                state.operations.request_cancel(&id).unwrap();
+                crate::write_owner::run_readiness_test_command(&state, command).await;
+                assert_eq!(
+                    state
+                        .index()
+                        .unwrap()
+                        .media_readiness_operation(id)
+                        .unwrap()
+                        .unwrap()
+                        .cancel_source
+                        .as_deref(),
+                    Some("operator")
+                );
+            }
+            crate::readiness_wait::spawn_auto_resume(state.clone());
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert!(rx.try_recv().is_err(), "{name}");
+            if name == "cancelled" {
+                state
+                    .start_readiness_wait(id, 9000, 30, "client", "session_open")
+                    .unwrap();
+                assert!(rx.try_recv().is_ok());
+            }
+            state.begin_shutdown();
+        }
+    }
+
+    /// A single deadline and terminal readiness outcomes preserve the original refusal.
+    #[tokio::test]
+    async fn readiness_wait_deadline_failure_and_cancel_are_bounded() {
+        for outcome in [
+            pb::OperationState::Running,
+            pb::OperationState::Failed,
+            pb::OperationState::Cancelled,
+            pb::OperationState::CompletionUnknown,
+        ] {
+            let (state, id, _rx) = auto_resume_fixture("becoming_ready");
+            let readiness = state.operations.register(id, "media_readiness_wait");
+            readiness.publish_state(outcome, &[]);
+            let owner = state
+                .operations
+                .register(Uuid::new_v4(), "tape_verification");
+            let refusal =
+                crate::readiness_wait::ReadinessFence(id).status("original robot refusal");
+            let error = crate::readiness_wait::wait_after_refusal(
+                &state,
+                &owner,
+                refusal,
+                std::time::Duration::from_millis(20),
+                &mut None,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.message().starts_with("original robot refusal;"));
+            assert!(error.message().contains("becoming_ready"));
+            assert!(error.message().contains("deadline expired"));
+        }
+        let (state, id, _rx) = auto_resume_fixture("becoming_ready");
+        let readiness = state.operations.register(id, "media_readiness_wait");
+        readiness.publish_state(pb::OperationState::Running, &[]);
+        let owner = state
+            .operations
+            .register(Uuid::new_v4(), "tape_verification");
+        state
+            .operations
+            .request_cancel(&owner.op_id_uuid())
+            .unwrap();
+        let error = crate::readiness_wait::wait_after_refusal(
+            &state,
+            &owner,
+            crate::readiness_wait::ReadinessFence(id).status("refusal"),
+            std::time::Duration::from_secs(1),
+            &mut None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Cancelled);
+        assert!(!readiness.is_cancelled());
+    }
+    /// A recording failure keeps the row resumable and waits for the fixed sweep.
+    #[tokio::test(start_paused = true)]
+    async fn auto_resume_recording_failure_waits_for_sweep() {
+        let (state, id, mut rx) = auto_resume_fixture("becoming_ready");
+        crate::readiness_wait::spawn_auto_resume(state.clone());
+        discovery_turn().await;
+        let command = rx.try_recv().unwrap();
+        crate::write_owner::fail_readiness_test_command(&state, command);
+        assert_eq!(
+            state.operations.latest(&id).unwrap().progress["state"],
+            "recording_failed"
+        );
+        let pool = state.drive_pool().unwrap();
+        for _ in 0..119 {
+            pool.readiness_wake.notify.notify_one();
+            tokio::time::advance(std::time::Duration::from_millis(250)).await;
+            discovery_turn().await;
+            assert!(rx.try_recv().is_err());
+        }
+        assert_eq!(
+            pool.readiness_wake
+                .start_attempts
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        tokio::time::advance(std::time::Duration::from_millis(250)).await;
+        discovery_turn().await;
+        assert!(rx.try_recv().is_ok());
+        assert_eq!(
+            pool.readiness_wake
+                .start_attempts
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        state.begin_shutdown();
+    }
+
+    /// Allow notified discovery tasks to run without advancing the paused clock.
+    async fn discovery_turn() {
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A busy window expires despite repeated wakes; only the sweep retries it.
+    #[tokio::test(start_paused = true)]
+    async fn auto_resume_retries_after_reservation_window_expires() {
+        let (state, _id, mut rx) = auto_resume_fixture("becoming_ready");
+        let pool = state.drive_pool().unwrap();
+        let held = pool
+            .reserve_drive(&remanence_state::DriveKey::new("DEC418146K_LL02", 1))
+            .unwrap();
+        crate::readiness_wait::spawn_auto_resume(state.clone());
+        discovery_turn().await;
+        for _ in 0..24 {
+            pool.readiness_wake.notify.notify_one();
+            tokio::time::advance(std::time::Duration::from_millis(250)).await;
+            discovery_turn().await;
+        }
+        let attempts = pool
+            .readiness_wake
+            .start_attempts
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(attempts, 20);
+        drop(held);
+        pool.readiness_wake.notify.notify_one();
+        discovery_turn().await;
+        assert!(rx.try_recv().is_err());
+        tokio::time::advance(std::time::Duration::from_secs(24)).await;
+        discovery_turn().await;
+        assert!(rx.try_recv().is_ok());
+        state.begin_shutdown();
+    }
+
+    /// A non-busy refusal gets one attempt per sweep, regardless of wakes.
+    #[tokio::test(start_paused = true)]
+    async fn auto_resume_refused_start_waits_for_sweep() {
+        let (mut state, _id, mut rx) = auto_resume_fixture("becoming_ready");
+        state.default_library_serial = Some(Arc::new("OTHER".into()));
+        let snapshot = state.library_snapshot.as_ref().unwrap();
+        let mut updated = {
+            let current = snapshot.read().unwrap();
+            crate::live_status::LibrarySnapshot {
+                report: current.report.clone(),
+                captured_at: current.captured_at,
+            }
+        };
+        updated.report.libraries[0].drive_bays[0].loaded_tape = Some("DIFFERENT".into());
+        *snapshot.write().unwrap() = Arc::new(updated);
+        let pool = state.drive_pool().unwrap();
+        crate::readiness_wait::spawn_auto_resume(state.clone());
+        discovery_turn().await;
+        for _ in 0..119 {
+            pool.readiness_wake.notify.notify_one();
+            tokio::time::advance(std::time::Duration::from_millis(250)).await;
+            discovery_turn().await;
+        }
+        assert_eq!(
+            pool.readiness_wake
+                .start_attempts
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        tokio::time::advance(std::time::Duration::from_millis(250)).await;
+        discovery_turn().await;
+        assert_eq!(
+            pool.readiness_wake
+                .start_attempts
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        assert!(rx.try_recv().is_err());
+        state.begin_shutdown();
+    }
+
+    /// A live LoadDrive owns its fence id even before it publishes progress.
+    #[tokio::test(start_paused = true)]
+    async fn auto_resume_skips_live_load_operation() {
+        let (state, id, mut rx) = auto_resume_fixture("becoming_ready");
+        let load = state.operations.register(id, "load_drive");
+        let pool = state.drive_pool().unwrap();
+        crate::readiness_wait::spawn_auto_resume(state.clone());
+        for _ in 0..160 {
+            pool.readiness_wake.notify.notify_one();
+            tokio::time::advance(std::time::Duration::from_millis(250)).await;
+            discovery_turn().await;
+        }
+        assert_eq!(
+            pool.readiness_wake
+                .start_attempts
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        load.publish_failed("load leaves a resumable fence", &[]);
+        pool.readiness_wake.notify.notify_one();
+        discovery_turn().await;
+        assert!(rx.try_recv().is_ok());
+        assert_eq!(
+            pool.readiness_wake
+                .start_attempts
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        state.begin_shutdown();
+    }
+
+    /// Retried terminal waits do not terminate a verification or finalize observer.
+    #[tokio::test(start_paused = true)]
+    async fn readiness_observer_waits_through_retry_and_load_release() {
+        for kind in ["tape_verification", "finalize_tape"] {
+            for ended in [pb::OperationState::Failed, pb::OperationState::Cancelled] {
+                let (state, id, _rx) = auto_resume_fixture("becoming_ready");
+                let wait = state.operations.register(id, "media_readiness_wait");
+                wait.publish_state(ended, &[("phase", "shutdown")]);
+                let observer = state.operations.register(Uuid::new_v4(), kind);
+                let watching = state.clone();
+                let task = tokio::spawn(async move {
+                    crate::readiness_wait::wait_after_refusal(
+                        &watching,
+                        &observer,
+                        crate::readiness_wait::ReadinessFence(id).status("refusal"),
+                        std::time::Duration::from_secs(60),
+                        &mut None,
+                    )
+                    .await
+                });
+                discovery_turn().await;
+                assert!(!task.is_finished());
+                let load = state.operations.register(id, "load_drive");
+                load.publish_state(pb::OperationState::Running, &[]);
+                state
+                    .index_write()
+                    .unwrap()
+                    .record_media_readiness_transition(
+                        crate::startup_media_readiness::startup_media_readiness_probe_transition(
+                            id,
+                            &remanence_library::MediaReadiness::Ready,
+                        ),
+                    )
+                    .unwrap();
+                tokio::time::advance(std::time::Duration::from_secs(1)).await;
+                discovery_turn().await;
+                assert!(!task.is_finished());
+                load.publish_state(pb::OperationState::Succeeded, &[]);
+                tokio::time::advance(std::time::Duration::from_millis(250)).await;
+                discovery_turn().await;
+                task.await.unwrap().unwrap();
+            }
+        }
+    }
+
+    /// A fence observer retains its read connection between polls.
+    #[tokio::test(start_paused = true)]
+    async fn readiness_observer_reuses_open_catalog() {
+        assert_readiness_reuses_catalog(false).await;
+    }
+
+    /// Discovery passes its existing read connection into the start path.
+    #[tokio::test(start_paused = true)]
+    async fn readiness_discovery_reuses_open_catalog() {
+        assert_readiness_reuses_catalog(true).await;
+    }
+
+    /// Removing the path prevents reopening while existing connections still read.
+    async fn assert_readiness_reuses_catalog(discovery: bool) {
+        let (state, id, mut rx) = auto_resume_fixture("becoming_ready");
+        let pool = state.drive_pool().unwrap();
+        let held = pool
+            .reserve_drive(&remanence_state::DriveKey::new("DEC418146K_LL02", 1))
+            .unwrap();
+        let observer = state.operations.register(Uuid::new_v4(), "finalize_tape");
+        let watching = state.clone();
+        let task = if discovery {
+            crate::readiness_wait::spawn_auto_resume(state.clone());
+            None
+        } else {
+            Some(tokio::spawn(async move {
+                crate::readiness_wait::wait_after_refusal(
+                    &watching,
+                    &observer,
+                    crate::readiness_wait::ReadinessFence(id).status("refusal"),
+                    std::time::Duration::from_secs(60),
+                    &mut None,
+                )
+                .await
+            }))
+        };
+        discovery_turn().await;
+        let moved = state.index_path.with_extension("moved");
+        std::fs::rename(state.index_path.as_ref(), &moved).unwrap();
+        drop(held);
+        tokio::time::advance(std::time::Duration::from_millis(250)).await;
+        discovery_turn().await;
+        if discovery {
+            assert!(rx.try_recv().is_ok());
+        } else {
+            assert!(!task.as_ref().unwrap().is_finished());
+        }
+        std::fs::rename(&moved, state.index_path.as_ref()).unwrap();
+        if let Some(task) = task {
+            task.abort();
+        }
+        state.begin_shutdown();
+    }
+
+    /// LoadDrive admission attaches the same shutdown signal as standalone waits.
+    #[tokio::test]
+    async fn load_drive_wait_uses_readiness_shutdown_lifetime() {
+        let (mut state, _id, _rx) = auto_resume_fixture("ready");
+        let (changer, mut commands) = tokio::sync::mpsc::channel(1);
+        let (drive, _drive_rx) = tokio::sync::mpsc::channel(1);
+        state.drive_pool = Some(crate::write_owner::DrivePool::new_for_library(
+            "DEC418146K_LL02",
+            changer,
+            HashMap::from([(1, drive)]),
+            Arc::new(HashMap::from([(1, AtomicBool::new(false))])),
+        ));
+        state
+            .library_service()
+            .load_drive(Request::new(pb::LoadDriveRequest {
+                library_uuid: library_uuid("DEC418146K_LL02").to_vec(),
+                slot_element_address: 0x400,
+                drive_element_address: 1,
+                no_wait: false,
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let crate::write_owner::ChangerCommand::Robotics { handle, .. } =
+            commands.recv().await.unwrap()
+        else {
+            panic!("load")
+        };
+        assert!(!handle.is_shutting_down());
+        state.begin_shutdown();
+        assert!(handle.is_shutting_down());
+        state
+            .drive_pool()
+            .unwrap()
+            .release_library("DEC418146K_LL02");
+    }
+
+    /// Dispatch congestion does not permanently stop automatic admission.
+    #[tokio::test]
+    async fn auto_resume_retries_after_full_drive_channel() {
+        let (state, id, mut rx) = auto_resume_fixture("becoming_ready");
+        let tx = state
+            .drive_pool()
+            .unwrap()
+            .drive_tx(&remanence_state::DriveKey::new("DEC418146K_LL02", 1))
+            .unwrap();
+        for _ in 0..4 {
+            let (reply, _) = tokio::sync::oneshot::channel();
+            tx.try_send(crate::write_owner::DriveCommand::Unload { reply })
+                .unwrap();
+        }
+        assert!(state
+            .start_readiness_wait(id, 9000, 30, "daemon", "session_open")
+            .is_err());
+        assert_eq!(
+            state.operations.latest(&id).unwrap().state,
+            pb::OperationState::Failed as i32
+        );
+        for _ in 0..4 {
+            drop(rx.recv().await.unwrap());
+        }
+        crate::readiness_wait::spawn_auto_resume(state.clone());
+        let command = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        crate::write_owner::run_readiness_test_command(&state, command).await;
+        state.begin_shutdown();
+    }
+
+    /// A short caller deadline never becomes the daemon's physical wait deadline.
+    #[tokio::test]
+    async fn resume_starts_with_at_least_daemon_timeout() {
+        for (requested, expected) in [(1, 9000), (10000, 10000)] {
+            let (state, id, mut rx) = auto_resume_fixture("becoming_ready");
+            state
+                .library_service()
+                .resume_media_readiness(Request::new(pb::ResumeMediaReadinessRequest {
+                    operation_id: id.as_bytes().to_vec(),
+                    timeout_seconds: requested,
+                    poll_interval_seconds: 1,
+                }))
+                .await
+                .unwrap();
+            let command = rx.recv().await.unwrap();
+            let crate::write_owner::DriveCommand::WaitReady { options, .. } = &command else {
+                panic!("wait")
+            };
+            assert_eq!(options.timeout.as_secs(), expected);
+            drop(command);
+            state.begin_shutdown();
+        }
+    }
+
+    /// A LoadDrive failure with the fence id does not stop a readiness observer.
+    #[tokio::test]
+    async fn readiness_observer_ignores_other_operation_kinds() {
+        let (state, id, _rx) = auto_resume_fixture("ready");
+        state
+            .operations
+            .register(id, "load_drive")
+            .publish_failed("load left a fence", &[]);
+        let observer = state
+            .operations
+            .register(Uuid::new_v4(), "tape_verification");
+        crate::readiness_wait::wait_after_refusal(
+            &state,
+            &observer,
+            crate::readiness_wait::ReadinessFence(id).status("original refusal"),
+            std::time::Duration::from_secs(1),
+            &mut None,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Only the same readiness holder delays an observer of a ready row.
+    #[tokio::test]
+    async fn ready_fence_waits_only_for_its_own_holder() {
+        let (state, id, _rx) = auto_resume_fixture("ready");
+        let pool = state.drive_pool().unwrap();
+        let key = remanence_state::DriveKey::new("DEC418146K_LL02", 1);
+        let _held = pool.reserve_drive(&key).unwrap();
+        let observer = state.operations.register(Uuid::new_v4(), "finalize_tape");
+        for (kind, owner, blocked) in [
+            ("media_readiness_wait", id, true),
+            ("media_readiness_wait", Uuid::new_v4(), false),
+            ("read_session", id, false),
+        ] {
+            pool.set_holder(&key, None, kind, owner);
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_millis(40),
+                crate::readiness_wait::wait_after_refusal(
+                    &state,
+                    &observer,
+                    crate::readiness_wait::ReadinessFence(id).status("original refusal"),
+                    std::time::Duration::from_secs(1),
+                    &mut None,
+                ),
+            )
+            .await;
+            assert_eq!(outcome.is_err(), blocked);
+            if !blocked {
+                outcome.unwrap().unwrap();
+            }
+        }
+    }
+    /// A daemon without drive actors creates no discovery task or catalog polling.
+    #[test]
+    fn auto_resume_without_drive_pool_does_not_spawn() {
+        crate::readiness_wait::spawn_auto_resume(ApiState::new(test_index()));
+    }
+
+    /// Idle discovery performs no short-interval scans, including after a pending fence clears.
+    #[tokio::test]
+    async fn auto_resume_sleeps_when_idle_and_after_fence_clears() {
+        let (state, id, mut rx) = auto_resume_fixture("becoming_ready");
+        let pool = state.drive_pool().unwrap();
+        let _held = pool
+            .reserve_drive(&remanence_state::DriveKey::new("DEC418146K_LL02", 1))
+            .unwrap();
+        crate::readiness_wait::spawn_auto_resume(state.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // An independent readiness probe clears the row while discovery retries its reservation.
+        state
+            .index_write()
+            .unwrap()
+            .record_media_readiness_transition(
+                crate::startup_media_readiness::startup_media_readiness_probe_transition(
+                    id,
+                    &remanence_library::MediaReadiness::Ready,
+                ),
+            )
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let scans = pool
+            .readiness_wake
+            .scans
+            .load(std::sync::atomic::Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        assert_eq!(
+            pool.readiness_wake
+                .scans
+                .load(std::sync::atomic::Ordering::Relaxed),
+            scans
+        );
+        assert!(rx.try_recv().is_err());
+        state.begin_shutdown();
     }
 }

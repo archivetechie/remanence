@@ -47,6 +47,7 @@ pub struct ApiState {
     pub(crate) audit_dir: Arc<PathBuf>,
     pub(crate) audit_fsync: bool,
     pub(crate) audit_append_lock: Arc<std::sync::Mutex<()>>,
+    pub(crate) readiness_shutdown: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) operations: crate::operations::OperationRegistry,
     pub(crate) pool_configs: Arc<HashMap<String, TapePoolConfig>>,
     pub(crate) managed_library_serials: Arc<HashSet<String>>,
@@ -215,6 +216,7 @@ impl ApiState {
             audit_dir: Arc::new(audit_dir),
             audit_fsync,
             audit_append_lock,
+            readiness_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             operations: crate::operations::OperationRegistry::default(),
             pool_configs: Arc::new(pool_configs),
             managed_library_serials: Arc::new(managed_library_serials),
@@ -462,6 +464,7 @@ impl ApiState {
         state.reconcile_drive_catalog_from_report(config, &report)?;
         state.reconcile_clean_runs_from_report(&report)?;
         crate::mount::register_startup_seated_cartridges(&state, &report);
+        crate::readiness_wait::spawn_auto_resume(state.clone());
         crate::mount::spawn_startup_terminal_recoveries(state.clone());
         spawn_drive_collection_workers(
             index_path,
@@ -473,8 +476,23 @@ impl ApiState {
         Ok(state)
     }
 
+    /// Stop readiness admission and polling before gRPC drains.
+    pub fn begin_shutdown(&self) {
+        let _guard = self
+            .operations
+            .readiness_start
+            .lock()
+            .expect("readiness start lock");
+        self.readiness_shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(pool) = &self.drive_pool {
+            pool.readiness_wake.notify.notify_one();
+        }
+    }
+
     /// Rewind, unload, and return idle seated cartridges before daemon exit.
     pub async fn shutdown_drive_pool(&self) -> Result<(), Status> {
+        self.begin_shutdown();
         crate::mount::shutdown_drive_pool(self).await
     }
 
@@ -533,8 +551,12 @@ impl ApiState {
     }
 
     pub(crate) fn index_write(&self) -> Result<CatalogIndex, Status> {
-        CatalogIndex::open(self.index_path.as_ref())
-            .map_err(|err| Status::internal(err.to_string()))
+        let mut index = CatalogIndex::open(self.index_path.as_ref())
+            .map_err(|err| Status::internal(err.to_string()))?;
+        if let Some(pool) = &self.drive_pool {
+            index.set_readiness_observer(pool.readiness_wake.clone());
+        }
+        Ok(index)
     }
 
     /// Current inventory snapshot. S6b republishes into the shared cell.

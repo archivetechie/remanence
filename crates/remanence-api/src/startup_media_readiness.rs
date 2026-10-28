@@ -44,7 +44,11 @@ pub(crate) fn media_readiness_conflict_status(
     let Some(first) = conflicts.first() else {
         return Status::internal("media-readiness admission conflict called without conflicts");
     };
-    Status::failed_precondition(format!(
+    let id = match parse_media_readiness_operation_id(first) {
+        Ok(id) => id,
+        Err(error) => return error,
+    };
+    crate::readiness_wait::ReadinessFence(id).status(format!(
         "{action} is blocked by active media-readiness fence {} operation={} {} barcode={} state={}{}",
         first
             .quarantine_id
@@ -233,7 +237,7 @@ pub(crate) fn ensure_media_readiness_admitted(
         // Every conflict is a fence on some other drive. Robot moves in the
         // library stay refused while such a fence is active, so the request
         // waits for it even when other drive bays are idle.
-        return Err(Status::failed_precondition(format!(
+        return Err(crate::readiness_wait::ReadinessFence(parse_media_readiness_operation_id(first)?).status(format!(
             "{}; robot moves in library {library_serial} are refused while that fence is active, so this request needs operation {} to finish first, even when other drive bays are idle",
             status.message(),
             first.operation_id,
@@ -345,13 +349,16 @@ pub(crate) fn reconcile_library_media_readiness_records_on_startup(
                     .iter_mut()
                     .find(|(bay, _)| *bay == drive_element)
                 else {
-                    let transition = startup_media_readiness_unresolved_transition(
+                    let mut transition = startup_media_readiness_unresolved_transition(
                         operation_id,
                         format!(
                             "drive 0x{drive_element:04x} is not openable in selected library {}",
                             library.serial
                         ),
                     );
+                    if record.cancel_source.as_deref() == Some("operator") {
+                        transition.cancel_source = Some("operator".into());
+                    }
                     index
                         .record_media_readiness_transition(transition)
                         .map_err(status_from_state_error)?;
@@ -375,10 +382,13 @@ pub(crate) fn reconcile_library_media_readiness_records_on_startup(
                         load_budget,
                     )?
                 } else {
+                    let mut transition =
+                        startup_media_readiness_probe_transition(operation_id, &observed);
+                    if record.cancel_source.as_deref() == Some("operator") {
+                        transition.cancel_source = Some("operator".into());
+                    }
                     index
-                        .record_media_readiness_transition(
-                            startup_media_readiness_probe_transition(operation_id, &observed),
-                        )
+                        .record_media_readiness_transition(transition)
                         .map_err(status_from_state_error)?;
                     observed
                 };
@@ -393,7 +403,10 @@ pub(crate) fn reconcile_library_media_readiness_records_on_startup(
                 }
                 reconciled = reconciled.saturating_add(1);
             }
-            StartupReadinessPlan::KeepFenced { transition } => {
+            StartupReadinessPlan::KeepFenced { mut transition } => {
+                if record.cancel_source.as_deref() == Some("operator") {
+                    transition.cancel_source = Some("operator".into());
+                }
                 index
                     .record_media_readiness_transition(*transition)
                     .map_err(status_from_state_error)?;
@@ -430,6 +443,11 @@ fn startup_media_readiness_initializing_load(
     observed: MediaReadiness,
     load_budget: u32,
 ) -> Result<MediaReadiness, Status> {
+    let cancel_source = index
+        .media_readiness_operation(operation_id)
+        .map_err(status_from_state_error)?
+        .and_then(|record| record.cancel_source)
+        .filter(|source| source == "operator");
     let poll = drive
         .wait_for_media_readiness_with_initializing_load(
             family,
@@ -442,7 +460,7 @@ fn startup_media_readiness_initializing_load(
             load_budget,
             || None,
             |event| {
-                let transition = match event {
+                let mut transition = match event {
                     MediaReadinessWaitEvent::Poll(poll) => {
                         startup_media_readiness_probe_transition(operation_id, &poll.readiness)
                     }
@@ -468,6 +486,7 @@ fn startup_media_readiness_initializing_load(
                     }
                     MediaReadinessWaitEvent::Cancelled(_) => return Ok(()),
                 };
+                transition.cancel_source = cancel_source.clone();
                 index
                     .record_media_readiness_transition(transition)
                     .map(|_| ())

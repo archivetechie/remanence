@@ -20,7 +20,7 @@ use uuid::Uuid;
 use super::actor_protocol::ReadResumeTarget;
 use super::actor_protocol::{ChangerCommand, DriveCommand};
 use super::read_session::handle_drive_open_read;
-use super::readiness::{handle_drive_wait_ready, DriveReadinessPoll};
+use super::readiness::{handle_drive_wait_ready_and_release, DriveReadinessPoll};
 use super::reconcile::handle_reconcile;
 use super::robotics::{
     clear_library_snapshot_persist_alarm, handle_robotics, observe_refreshed_library,
@@ -114,6 +114,9 @@ pub(super) fn changer_loop(
             return;
         }
     };
+    if let Some(lifecycle) = &cfg.lifecycle {
+        index.set_readiness_observer(lifecycle.readiness_wake.clone());
+    }
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
             ChangerCommand::Move { src, dst, reply } => {
@@ -165,8 +168,10 @@ pub(super) fn changer_loop(
                     cfg.reservations.clone(),
                     cfg.actor_library_serial.clone(),
                 );
-                handle_robotics(&mut index, &cfg, library_serial, action, handle);
+                handle_robotics(&mut index, &cfg, library_serial, action, handle.clone());
                 refresh_actor_changer(changer, &cfg);
+                drop(_exclusive_guard);
+                handle.wake_readiness();
             }
         }
     }
@@ -222,6 +227,9 @@ pub(super) fn drive_loop(
             return;
         }
     };
+    if let Some(lifecycle) = &cfg.lifecycle {
+        index.set_readiness_observer(lifecycle.readiness_wake.clone());
+    }
     let mut snapshot_misses = 0u32;
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
@@ -231,8 +239,8 @@ pub(super) fn drive_loop(
                 options,
                 cartridge_in_drive,
                 handle,
-                reservation: _reservation,
-            } => handle_drive_wait_ready(
+                reservation,
+            } => handle_drive_wait_ready_and_release(
                 &mut index,
                 drive,
                 DriveReadinessPoll {
@@ -244,6 +252,7 @@ pub(super) fn drive_loop(
                     phase: "grpc_wait_ready",
                 },
                 &handle,
+                Some(reservation),
             ),
             DriveCommand::OpenWrite {
                 actor,
@@ -551,8 +560,14 @@ pub(super) fn drive_loop(
 pub(super) fn drain_failed_drive_commands(mut rx: mpsc::Receiver<DriveCommand>, message: String) {
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
-            DriveCommand::WaitReady { handle, .. } => {
+            DriveCommand::WaitReady {
+                handle,
+                reservation,
+                ..
+            } => {
                 handle.publish_failed(&message, &[("phase", "drive_actor")]);
+                drop(reservation);
+                handle.wake_readiness();
             }
             DriveCommand::OpenWrite { reply, .. } => {
                 let _ = reply.send(Err(Status::internal(message.clone())));

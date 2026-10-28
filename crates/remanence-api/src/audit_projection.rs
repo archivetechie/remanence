@@ -158,6 +158,7 @@ pub(crate) fn ensure_manual_finalize_finished_audit(
     let mut durable_count = 0usize;
     let mut conflict = None;
     let mut incompatible_terminal = None;
+    let mut failed_attempt = false;
     let mut latest_completion_unknown_sequence = None;
     FileAuditLog::replay_incremental(audit_dir, |record| {
         if record.operation_id != Some(operation_id) {
@@ -188,6 +189,19 @@ pub(crate) fn ensure_manual_finalize_finished_audit(
                 } else {
                     incompatible_terminal.get_or_insert(record);
                 }
+            }
+            AuditEvent::OperationFailed
+                if manual_finalize_audit_identity_matches(
+                    &record,
+                    tape_uuid,
+                    idempotency_key,
+                    manual,
+                ) && matches!(
+                    record.detail.get("finalize_attempt"),
+                    Some(CborValue::Bool(true))
+                ) =>
+            {
+                failed_attempt = true;
             }
             AuditEvent::OperationFailed
             | AuditEvent::CancelledBeforeDispatch
@@ -230,6 +244,7 @@ pub(crate) fn ensure_manual_finalize_finished_audit(
 
     match scope.terminal_state.as_deref() {
         None | Some("completion_unknown") => {}
+        Some("failed") if failed_attempt => {}
         Some("finished") => {
             return Err(Status::failed_precondition(
                 "manual finalization is projected finished without its durable completion audit",

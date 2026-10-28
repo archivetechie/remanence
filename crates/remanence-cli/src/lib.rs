@@ -2436,6 +2436,10 @@ impl TapeInitArgs {
 
 #[derive(Args, Debug)]
 struct TapeWaitReadyArgs {
+    /// Daemon endpoint; attach to its readiness wait without direct drive access.
+    #[arg(long, value_name = "URI", requires = "resume", conflicts_with_all = ["barcode", "drive_element"])]
+    endpoint: Option<String>,
+
     /// Resume a durable media-readiness operation without moving media.
     #[arg(long, value_name = "UUID", conflicts_with_all = ["barcode", "drive_element"])]
     resume: Option<Uuid>,
@@ -2479,6 +2483,9 @@ struct TapeWaitReadyArgs {
 
 impl TapeWaitReadyArgs {
     fn validate_before_discovery(&self) -> Result<(), String> {
+        if self.endpoint.is_some() && self.resume.is_none() {
+            return Err("tape wait-ready --endpoint requires --resume".into());
+        }
         if self.resume.is_none() && self.barcode.is_none() && self.drive_element.is_none() {
             return Err(
                 "tape wait-ready requires --resume, --barcode, or --drive-element".to_string(),
@@ -4495,6 +4502,18 @@ where
         if let Err(error) = command.validate_before_discovery() {
             let _ = writeln!(err, "error: {error}");
             return ExitCode::from(1);
+        }
+        if let TapeCommand::WaitReady(args) = command {
+            if let Some(endpoint) = &args.endpoint {
+                return media_readiness::run_daemon_wait_ready(
+                    endpoint,
+                    args.resume.expect("validated resume"),
+                    args.timeout,
+                    args.json,
+                    out,
+                    err,
+                );
+            }
         }
         if let TapeCommand::ReadRate(args) = command {
             return tape_read_rate::run(args, out, err);
@@ -19453,6 +19472,39 @@ mod tests {
         );
     }
 
+    /// An endpoint is valid only for resuming a daemon operation.
+    #[test]
+    fn tape_wait_ready_endpoint_requires_resume() {
+        assert!(Cli::try_parse_from([
+            "rem",
+            "tape",
+            "wait-ready",
+            "--endpoint",
+            "unix:/tmp/test.sock"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "rem",
+            "tape",
+            "wait-ready",
+            "--endpoint",
+            "unix:/tmp/test.sock",
+            "--barcode",
+            "TESTL9"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "rem",
+            "tape",
+            "wait-ready",
+            "--endpoint",
+            "unix:/tmp/test.sock",
+            "--resume",
+            "11111111-1111-4111-8111-111111111111"
+        ])
+        .is_ok());
+    }
+
     #[test]
     fn tape_wait_ready_accepts_resume_operation_id() {
         let operation_id = Uuid::from_u128(0xfeed);
@@ -19548,6 +19600,7 @@ mod tests {
         });
         let policy = StaticAllowlist::new(["LIB-WAIT"]);
         let args = TapeWaitReadyArgs {
+            endpoint: None,
             resume: Some(operation_id),
             barcode: None,
             drive_element: None,
@@ -19605,6 +19658,7 @@ mod tests {
         );
         let library = lto9_loaded_test_library("LIB-A", "AOX030L9");
         let args = TapeWaitReadyArgs {
+            endpoint: None,
             resume: None,
             barcode: Some("AOX030L9".to_string()),
             drive_element: None,

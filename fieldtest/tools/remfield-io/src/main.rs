@@ -352,6 +352,17 @@ fn drive_bay_busy(message: &str) -> bool {
         || lower.contains("drive-session owner is busy")
 }
 
+/// A completed fence permits another open even when it clears before resume.
+fn readiness_fence_cleared(status: &tonic::Status) -> bool {
+    if let Some(state) = status.metadata().get("remanence-readiness-state") {
+        return state.to_str().ok() == Some("ready");
+    }
+    status.code() == tonic::Code::FailedPrecondition
+        && status
+            .message()
+            .contains("is state ready and cannot be resumed")
+}
+
 async fn wait_for_media_readiness_operation(channel: Channel, operation_id: Uuid) -> AppResult<()> {
     let mut library = pb::library_service_client::LibraryServiceClient::new(channel.clone());
     let operation = library
@@ -360,8 +371,12 @@ async fn wait_for_media_readiness_operation(channel: Channel, operation_id: Uuid
             timeout_seconds: DEFAULT_READY_TIMEOUT_SECONDS,
             poll_interval_seconds: DEFAULT_READY_POLL_SECONDS,
         })
-        .await?
-        .into_inner();
+        .await;
+    let operation = match operation {
+        Ok(response) => response.into_inner(),
+        Err(error) if readiness_fence_cleared(&error) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
     let mut stream = pb::daemon_client::DaemonClient::new(channel)
         .watch_operation(pb::GetOperationRequest {
             operation_id: operation.operation_id,
@@ -1661,6 +1676,28 @@ mod tests {
             panic!("expected write command");
         };
         assert!(write.serial);
+    }
+
+    /// Cleared fences retry the open; structured state takes precedence over text.
+    #[test]
+    fn ready_resume_refusal_clears_fence() {
+        let mut status = tonic::Status::failed_precondition(
+            "media-readiness operation is state ready and cannot be resumed",
+        );
+        assert!(readiness_fence_cleared(&status));
+        status.metadata_mut().insert(
+            "remanence-readiness-state",
+            "terminal_error".parse().unwrap(),
+        );
+        assert!(!readiness_fence_cleared(&status));
+        let mut status = tonic::Status::failed_precondition("fence ends");
+        status
+            .metadata_mut()
+            .insert("remanence-readiness-state", "ready".parse().unwrap());
+        assert!(readiness_fence_cleared(&status));
+        assert!(!readiness_fence_cleared(&tonic::Status::unavailable(
+            "offline"
+        )));
     }
 
     #[test]

@@ -2,6 +2,8 @@
 set -euo pipefail
 
 SCRIPT_NAME="03-bringup"
+# Allow a far-positioned cartridge to unthread and return to its slot.
+DAEMON_STOP_TIMEOUT_SECONDS="${REMFIELD_STOP_TIMEOUT_SECONDS:-360}"
 # shellcheck disable=SC1091
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
@@ -72,36 +74,44 @@ main() {
       ;;
     --stop)
       fieldtest_init_layout
-      local session pid
+      local session pid started elapsed forced=0
       session="remfield"
-      # Ask the daemon to stop before the tmux session goes: killing the
-      # session first closes its terminal, and the daemon's shutdown messages
-      # (including an unthreaded-cartridge error) are then lost. A graceful
-      # stop may be unloading a cartridge, which takes the drive tens of
-      # seconds; give it a minute before the hard kill, which would leave the
-      # cartridge unthreaded. Kill by process match on OUR config path and
-      # verify it is gone, because tmux kill only HUPs and an orphan holding
-      # the devices was the root cause of wedged writes.
-      for _ in $(seq 1 60); do
+      if [[ ! "$DAEMON_STOP_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "REMFIELD_STOP_TIMEOUT_SECONDS must be a non-negative integer" >&2
+        exit 1
+      fi
+      started=$SECONDS
+      # Send SIGTERM once, then allow up to 360 seconds for SSC UNLOAD and
+      # the changer move. Keep tmux alive so shutdown diagnostics reach the log.
+      pid="$(pgrep -f "rem-daemon --config $(fieldtest_config_path)" | head -1 || true)"
+      if [[ -n "$pid" ]]; then
+        kill "$pid" 2>/dev/null || true
+      fi
+      while (( SECONDS - started < 10#$DAEMON_STOP_TIMEOUT_SECONDS )); do
         pid="$(pgrep -f "rem-daemon --config $(fieldtest_config_path)" | head -1 || true)"
         [[ -n "$pid" ]] || break
-        kill "$pid" 2>/dev/null || true
         sleep 1
       done
       pid="$(pgrep -f "rem-daemon --config $(fieldtest_config_path)" | head -1 || true)"
       if [[ -n "$pid" ]]; then
+        forced=1
         kill -9 "$pid" 2>/dev/null || true
         sleep 1
       fi
+      elapsed=$((SECONDS - started))
       if pgrep -f "rem-daemon --config $(fieldtest_config_path)" >/dev/null 2>&1; then
-        fieldtest_evidence_record "$SCRIPT_NAME" stop FAIL "rem-daemon would not die; investigate manually"
+        fieldtest_evidence_record "$SCRIPT_NAME" stop FAIL "rem-daemon would not die after ${elapsed}s; investigate manually" "" "{\"duration_seconds\":$elapsed}"
         exit 1
       fi
       if tmux has-session -t "$session" 2>/dev/null; then
         tmux kill-session -t "$session" || true
       fi
       rm -f -- "$(fieldtest_socket_path)"
-      fieldtest_evidence_record "$SCRIPT_NAME" stop PASS "daemon stopped and verified gone"
+      if (( forced )); then
+        fieldtest_evidence_record "$SCRIPT_NAME" stop WARN "daemon needs a hard kill after ${elapsed}s; at next start check rem top --once for a bay busy with no I/O and rem tape quarantine list" "" "{\"duration_seconds\":$elapsed}"
+      else
+        fieldtest_evidence_record "$SCRIPT_NAME" stop PASS "daemon stops gracefully and is gone after ${elapsed}s" "" "{\"duration_seconds\":$elapsed}"
+      fi
       exit 0
       ;;
     --status)

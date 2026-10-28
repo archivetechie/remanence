@@ -36,11 +36,14 @@ struct OpEntry {
 
 #[derive(Clone, Default)]
 pub(crate) struct OperationRegistry {
+    pub(crate) readiness_start: Arc<Mutex<()>>,
     ops: Arc<Mutex<HashMap<Uuid, OpEntry>>>,
 }
 
 #[derive(Clone)]
 pub(crate) struct OperationHandle {
+    readiness_shutdown: Option<Arc<AtomicBool>>,
+    readiness_wake: Option<Arc<crate::drive_pool::ReadinessWake>>,
     op_id: Uuid,
     operation_kind: String,
     cancel: Arc<AtomicBool>,
@@ -71,11 +74,22 @@ impl OperationRegistry {
         );
         drop(ops);
         OperationHandle {
+            readiness_shutdown: None,
+            readiness_wake: None,
             op_id,
             operation_kind,
             cancel,
             ops: self.ops.clone(),
         }
+    }
+
+    /// A registered operation owns its id until it publishes a terminal state.
+    pub(crate) fn is_live(&self, id: &Uuid) -> bool {
+        self.ops
+            .lock()
+            .expect("ops lock")
+            .get(id)
+            .is_some_and(|entry| entry.ring.back().is_none_or(|status| !is_terminal(status)))
     }
 
     pub(crate) fn latest(&self, id: &Uuid) -> Option<pb::OperationStatus> {
@@ -130,6 +144,30 @@ impl OperationRegistry {
 }
 
 impl OperationHandle {
+    /// Attach daemon lifetime controls only to readiness waits.
+    pub(crate) fn with_readiness_lifetime(
+        mut self,
+        shutdown: Arc<AtomicBool>,
+        wake: Arc<crate::drive_pool::ReadinessWake>,
+    ) -> Self {
+        self.readiness_shutdown = Some(shutdown);
+        self.readiness_wake = Some(wake);
+        self
+    }
+
+    pub(crate) fn is_shutting_down(&self) -> bool {
+        self.readiness_shutdown
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+    }
+
+    /// Retry discovery after an actor releases a readiness reservation.
+    pub(crate) fn wake_readiness(&self) {
+        if let Some(wake) = &self.readiness_wake {
+            wake.notify.notify_one();
+        }
+    }
+
     pub(crate) fn cancel_flag(&self) -> Arc<AtomicBool> {
         self.cancel.clone()
     }
@@ -274,6 +312,16 @@ fn build_watch_stream(
 }
 
 fn push_locked(entry: &mut OpEntry, mut status: pb::OperationStatus) {
+    if let Some(started_by) = entry
+        .ring
+        .back()
+        .and_then(|last| last.progress.get("started_by"))
+    {
+        status
+            .progress
+            .entry("started_by".into())
+            .or_insert_with(|| started_by.clone());
+    }
     status.created_at = Some(entry.created_at);
     if entry.ring.len() >= RING_CAP {
         entry.ring.pop_front();
@@ -305,7 +353,7 @@ fn prune_terminal_ops_locked(ops: &mut HashMap<Uuid, OpEntry>) {
     }
 }
 
-fn status_with_error(
+pub(crate) fn status_with_error(
     id: Uuid,
     kind: &str,
     state: pb::OperationState,
@@ -359,7 +407,10 @@ fn started_since(started_at_utc: &str, since_utc: &str) -> bool {
 fn is_terminal_state(state: pb::OperationState) -> bool {
     matches!(
         state,
-        pb::OperationState::Succeeded | pb::OperationState::Failed | pb::OperationState::Cancelled
+        pb::OperationState::Succeeded
+            | pb::OperationState::Failed
+            | pb::OperationState::Cancelled
+            | pb::OperationState::CompletionUnknown
     )
 }
 
