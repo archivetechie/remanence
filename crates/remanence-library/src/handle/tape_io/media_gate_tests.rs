@@ -578,10 +578,10 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
         (
             "remanence-api/src/write_owner/tests.rs",
             DispatchPolicy::Exact {
-                execute_out: 4,
-                execute_none: 4,
+                execute_out: 5,
+                execute_none: 5,
                 why: "cfg(test) TurScriptTransport, RecoveryReadFaultTransport, \
-                      VerificationCancelTransport and LoadRefreshGate forwarders only; \
+                      VerificationCancelTransport, EpochRemovalTransport and LoadRefreshGate forwarders only; \
                       LoadRefreshGate pauses in-memory changer refresh; production write_owner \
                       code dispatches through DriveHandle",
             },

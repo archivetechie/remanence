@@ -392,6 +392,43 @@ are refused before MODE SELECT or any tape write. These `rem-debug` commands
 also take the daemon's exclusive state lock, so stop the daemon before running
 them.
 
+Daemon write sessions keep a short epoch across barriers. Standalone writes
+(`rem-debug` and `OperatorMount`) close the epoch at every barrier.
+
+A checkpoint drains the drive, proves the end position, and commits the journals
+and catalog. A CHECKPOINTED receipt keeps this meaning on a parity pool even
+when the newest committed data awaits parity. A short epoch stays open across
+ordinary checkpoints. Completed epochs emit their sidecars after the Object
+filemark; finalization closes its short epoch with `FINAL_PARTIAL_EPOCH`.
+Cartridge removal attempts to close an admitted open epoch without automatic
+finalization. It records a due seal as `seal_due`, visible in `rem catalog tapes
+--json`; the next write session on that tape or explicit finalize completes it.
+
+While the cartridge stays seated, fewer than `S × k` committed data blocks can
+lack on-tape parity. At the default geometry this window is less than 16 GiB.
+The drive actor retains the accumulator between sessions under
+`daemon.io_memory_ceiling`. If it cannot reserve that memory, the barrier closes
+the short epoch instead. `rem catalog tapes --json` reports the pending range as
+`open_epoch_start` and `open_epoch_end`; `rem top` shows it on the loaded tape.
+Both fields clear when the sidecar commits.
+
+A new session proves tape identity and end of data before reusing retained state.
+A restart or mismatched state rebuilds the open epoch by reading its committed
+range before the next write. On shutdown, the daemon closes the epoch only if
+no read or other positioning follows the last write and the head remains at
+that end position. Otherwise it dismounts and logs and audits `epoch_left_open`
+with `[W,T)`; the next append rebuilds the epoch. Removal always proceeds.
+Non-writable, foreign, unconfigured, and terminal-finalizing tapes skip the close
+with a log entry. A close records a tape-I/O fence when the tape contradicts
+committed state or an append has uncertain durability. A contradiction fence
+carries the range and cause; a write-failure fence carries the batch evidence.
+Transient failures log and audit `epoch_left_open` without a fence. A durable
+journal commit stays closed when SQLite projection fails; startup replay
+projects it.
+A cartridge outside a drive has no open epoch except after a crash, a close that
+leaves the epoch open, or a shutdown that finds the head away from EOD. A fenced
+tape keeps its open epoch until append recovery clears the fence.
+
 ```sh
 rem-debug --allow <SERIAL> archive write \
     --library <SERIAL> --pool demo --file /path/to/payload.bin --json \

@@ -1206,7 +1206,30 @@ impl OperatorMount<'_> {
         let session_id = uuid::Uuid::new_v4();
         self.session(mounted.tape_uuid, session_id, AuditEvent::SessionOpened)?;
         let result = (|| {
-            if let Some(reply) = crate::write_owner::preflight_manual_finalize_tape(
+            let pending = remanence_state::FileCheckpointJournal::open(
+                &cfg.checkpoint_journal_dir,
+                request.tape_uuid,
+            )
+            .and_then(|journal| journal.terminal_finalization_intent())
+            .map_err(crate::status_from_state_error)?;
+            let (prefix, carried) = if pending.is_none()
+                && tape.scheme_id.is_some()
+                && tape.highest_protected_ordinal < tape.total_committed_ordinals
+            {
+                let (plan, state) = crate::write_owner::plan_unretained_epoch_finalization(
+                    self.state.catalog_index(),
+                    &cfg,
+                    &mut mounted.drive,
+                    &request,
+                )?;
+                (
+                    Some(plan),
+                    state.map(|state| (mounted.drive.identity_generation(), state)),
+                )
+            } else {
+                (None, None)
+            };
+            if let Some(reply) = crate::write_owner::preflight_manual_finalize_with_prefix(
                 self.state.catalog_index(),
                 crate::write_owner::ManualFinalizePreflightConfig {
                     checkpoint_journal_dir: &cfg.checkpoint_journal_dir,
@@ -1216,6 +1239,7 @@ impl OperatorMount<'_> {
                 },
                 tape.voltag.as_deref(),
                 &mut request,
+                prefix.as_ref(),
             )? {
                 return Ok(reply);
             }
@@ -1225,6 +1249,7 @@ impl OperatorMount<'_> {
                 &mut mounted.drive,
                 &request,
                 tape.voltag.as_deref(),
+                carried,
                 |_, drive| {
                     drive
                         .test_unit_ready()

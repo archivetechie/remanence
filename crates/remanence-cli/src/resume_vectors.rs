@@ -401,6 +401,10 @@ impl RawTapeSource for ReadTrace<'_> {
         let batch = self.raw.read_forward_records(buf, size, count);
         self.lbas
             .extend((0..batch.batch.records_read).map(|n| before.lba + u64::from(n)));
+        if !matches!(batch.batch.end, remanence_parity::raw::RawReadEnd::Complete) {
+            self.lbas
+                .push(before.lba + u64::from(batch.batch.records_read));
+        }
         batch
     }
     fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
@@ -498,7 +502,7 @@ pub fn append_object(
     };
     let mut sidecars = closed.sidecars_emitted;
     sidecars.extend(
-        sink.checkpoint()
+        sink.close_open_epoch(remanence_parity::CloseReason::Barrier)
             .map_err(|e| e.to_string())?
             .sidecars_emitted,
     );

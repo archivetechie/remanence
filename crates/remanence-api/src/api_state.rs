@@ -403,6 +403,7 @@ impl ApiState {
             managed_library_serials: Arc::new(managed_library_serials),
             cleaning: config.cleaning.clone(),
             tape_io: config.tape_io.clone(),
+            tape_pools: config.tape_pools.clone(),
             verification_route: config.verification.route,
             io_memory: Arc::clone(&io_memory),
             write_admissions: crate::write_owner::WriteAdmissionCoordinator::default(),
@@ -743,6 +744,19 @@ impl ApiState {
             };
 
             for drive in state.drives.iter_mut() {
+                if let Some(tape_uuid) = drive.loaded_tape_uuid.as_deref() {
+                    if let Some(tape) = index
+                        .get_tape(tape_uuid)
+                        .map_err(crate::status_from_state_error)?
+                    {
+                        if tape.scheme_id.is_some()
+                            && tape.highest_protected_ordinal < tape.total_committed_ordinals
+                        {
+                            drive.open_epoch_start = Some(tape.highest_protected_ordinal);
+                            drive.open_epoch_end = Some(tape.total_committed_ordinals);
+                        }
+                    }
+                }
                 self.live_status
                     .observe_mount(library.serial.as_str(), drive);
                 let bay = drive
@@ -1033,7 +1047,7 @@ impl ApiState {
     ) -> Result<crate::io_memory::IoMemoryPermit, Status> {
         self.io_memory.try_reserve(bytes).ok_or_else(|| {
             Status::resource_exhausted(format!(
-                "append spool growth of {bytes} bytes exceeds remaining daemon.io_memory_ceiling capacity"
+                "append spool growth of {bytes} bytes exceeds remaining daemon.io_memory_ceiling capacity; retained epochs [{}]", self.io_memory.retained_diagnostics()
             ))
         })
     }

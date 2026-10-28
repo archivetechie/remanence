@@ -469,6 +469,14 @@ pub trait TapeFileJournal {
         self.committed_snapshot_bounded_authority().map(Some)
     }
 
+    /// Reattach an immutable terminal plan across its one allowed orphan transition.
+    fn session_terminal_resume_snapshot(
+        &self,
+        _prefix: &CommittedBundle,
+    ) -> Result<Option<FileTapeFileJournalCommittedSnapshot>, JournalError> {
+        self.session_resume_snapshot()
+    }
+
     /// Freeze an allocation-bounded committed-prefix snapshot.
     ///
     /// Production append/resume must fail closed rather than fall back to
@@ -741,6 +749,20 @@ impl FileTapeFileJournalCommittedReplay {
 }
 
 impl FileTapeFileJournalCommittedSnapshot {
+    /// Retain the same frozen authority for a terminal planner and its sink.
+    pub fn try_clone(&self) -> Result<Self, JournalError> {
+        Ok(Self {
+            path: self.path.clone(),
+            _file: self._file.try_clone()?,
+            header: self.header.clone(),
+            committed_end: self.committed_end,
+            highest_protected_ordinal: self.highest_protected_ordinal,
+            total_committed_ordinals: self.total_committed_ordinals,
+            committed_entry_count: self.committed_entry_count,
+            metrics: self.metrics,
+        })
+    }
+
     /// Validation-pass and peak-allocation counters captured at freeze time.
     pub const fn metrics(&self) -> BoundedJournalReplayMetrics {
         self.metrics
@@ -1529,10 +1551,22 @@ impl TapeFileJournal for FileTapeFileJournal {
                     ));
                 }
                 let preserved = self.orphaned_bundles_preserved_on_open;
+                let previous_watermarks = (
+                    self.last_highest_protected_ordinal,
+                    self.last_total_committed_ordinals,
+                );
+                // The exact orphan is now reconciled. Its final partial sidecar
+                // can advance W beyond the last checkpoint loaded at open.
+                self.last_highest_protected_ordinal = prefix.highest_protected_ordinal;
+                self.last_total_committed_ordinals = prefix.total_committed_ordinals;
                 self.orphaned_bundles_preserved_on_open = 0;
                 let result = self.commit_bundle(checkpoint);
                 if result.is_err() {
                     self.orphaned_bundles_preserved_on_open = preserved;
+                    (
+                        self.last_highest_protected_ordinal,
+                        self.last_total_committed_ordinals,
+                    ) = previous_watermarks;
                 }
                 result
             }
@@ -1630,6 +1664,14 @@ impl TapeFileJournal for FileTapeFileJournal {
             return Err(JournalError::HeaderMismatch);
         }
         load_committed_from_reader(&mut file, file_len)
+    }
+
+    fn session_terminal_resume_snapshot(
+        &self,
+        prefix: &CommittedBundle,
+    ) -> Result<Option<FileTapeFileJournalCommittedSnapshot>, JournalError> {
+        self.planned_terminal_prefix_base_snapshot_bounded(prefix)
+            .map(Some)
     }
 
     fn committed_snapshot_bounded_authority(
@@ -2116,7 +2158,7 @@ fn rollback_failed_append(
     Ok(())
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct JournalHeader {
     tape_uuid: [u8; 16],
     block_size: u32,

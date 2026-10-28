@@ -2958,6 +2958,8 @@ fn no_parity_bootstrap_block(tape_uuid: [u8; 16]) -> Vec<u8> {
 
 fn writable_tape_record() -> TapeRecord {
     TapeRecord {
+        seal_due: None,
+        highest_protected_ordinal: 0,
         last_verified_at_utc: None,
         last_verification_state: None,
         last_verified_edition_digest: None,
@@ -2998,6 +3000,24 @@ fn recorded_generation_controls_capacity_without_a_label_fallback() {
     assert!(check_writability_preconditions(&tape, raw_capacity_bytes(LtoGen::Lto7) + 1).is_err());
     tape.voltag = None;
     check_writability_preconditions(&tape, 1).unwrap();
+}
+
+#[test]
+fn tape_proto_exposes_only_the_unprotected_parity_tail() {
+    let mut record = writable_tape_record();
+    record.scheme_id = Some("rs-cauchy-gf256-v1".into());
+    record.highest_protected_ordinal = 128;
+    record.total_committed_ordinals = 131;
+    let projected = tape_to_proto(record.clone());
+    assert_eq!(projected.open_epoch_start, Some(128));
+    assert_eq!(projected.open_epoch_end, Some(131));
+    record.highest_protected_ordinal = 131;
+    let projected = tape_to_proto(record.clone());
+    assert_eq!(projected.open_epoch_start, None);
+    assert_eq!(projected.open_epoch_end, None);
+    record.scheme_id = None;
+    record.highest_protected_ordinal = 0;
+    assert_eq!(tape_to_proto(record).open_epoch_end, None);
 }
 
 #[test]
@@ -6893,6 +6913,7 @@ async fn drive_target_read_open_uses_virtual_world_actor_and_proves_bot_identity
         managed_library_serials: Arc::new(HashSet::from([LIBRARY_SERIAL.to_string()])),
         cleaning: remanence_state::CleaningConfig::default(),
         tape_io: remanence_state::TapeIoConfig::default(),
+        tape_pools: Vec::new(),
         verification_route: remanence_parity::VerificationRoute::Walk,
         io_memory: crate::io_memory::IoMemoryReservation::new(
             remanence_state::DEFAULT_IO_MEMORY_CEILING_BYTES,

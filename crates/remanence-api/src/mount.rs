@@ -777,7 +777,21 @@ pub(crate) async fn manual_finalize_tape(
         .map_err(|error| Status::internal(error.to_string()))?;
     let (tape, mut actor_request) =
         prepare_manual_finalize_request(&index, admission, |pool_id| state.pool_config(pool_id))?;
-    if let Some(reply) = crate::write_owner::preflight_manual_finalize_tape(
+    let pending_intent = remanence_state::FileCheckpointJournal::open(
+        state.checkpoint_journal_dir.as_path(),
+        actor_request.tape_uuid,
+    )
+    .and_then(|j| j.terminal_finalization_intent())
+    .map_err(crate::status_from_state_error)?;
+    let prefix = if pending_intent.is_none()
+        && tape.scheme_id.is_some()
+        && tape.highest_protected_ordinal < tape.total_committed_ordinals
+    {
+        Some(plan_epoch_finalization(state, &pool, &actor_request).await?)
+    } else {
+        None
+    };
+    if let Some(reply) = crate::write_owner::preflight_manual_finalize_with_prefix(
         &mut index,
         crate::write_owner::ManualFinalizePreflightConfig {
             checkpoint_journal_dir: state.checkpoint_journal_dir.as_path(),
@@ -787,6 +801,7 @@ pub(crate) async fn manual_finalize_tape(
         },
         tape.voltag.as_deref(),
         &mut actor_request,
+        prefix.as_ref(),
     )? {
         return Ok(crate::write_owner::ManualFinalizeTapeResult::Accepted(
             reply,
@@ -2125,7 +2140,15 @@ fn schedule_idle_dismount(state: ApiState, parked: crate::write_owner::ParkedCar
         );
         return;
     };
-    runtime.spawn(async move {
+    let Ok(pool) = state.drive_pool().cloned() else {
+        return;
+    };
+    let key = parked.seated.drive_key();
+    let mut timers = pool.parked.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(previous) = timers.idle_timers.remove(&key) {
+        previous.abort();
+    }
+    let task = runtime.spawn(async move {
         let pool = match state.drive_pool() {
             Ok(pool) => pool.clone(),
             Err(_) => return,
@@ -2177,6 +2200,7 @@ fn schedule_idle_dismount(state: ApiState, parked: crate::write_owner::ParkedCar
             tokio::time::sleep(Duration::from_secs(timeout_seconds)).await;
         }
     });
+    timers.idle_timers.insert(key, task.abort_handle());
 }
 
 pub(crate) fn spawn_timer_idle_dismount_listener(
@@ -3061,6 +3085,82 @@ pub(crate) async fn supersede_tail(
     })
     .await
     .map_err(|e| Status::internal(e.to_string()))?
+}
+
+/// Plan terminal metadata under exact-tape ownership without writing a barrier close.
+async fn plan_epoch_finalization(
+    state: &ApiState,
+    pool: &crate::write_owner::DrivePool,
+    request: &crate::write_owner::ManualFinalizeTapeActorRequest,
+) -> Result<remanence_parity::TerminalPrefixPlan, Status> {
+    let library = resolve_tape_library_serial(state, pool, &request.tape_uuid)?;
+    let (mount, reservation) =
+        resolve_and_reserve_actor_mount(state, pool, &library, &request.tape_uuid).await?;
+    if let Some(slot) = mount.source_slot {
+        changer_move(pool, &mount.library_serial, slot, mount.bay).await?;
+    }
+    // Bind the generation before the actor retains a newly rebuilt planning state.
+    let parked = mount.home_slot.map(|home_slot| {
+        pool.parked_at(&mount.drive_key())
+            .filter(|p| p.seated.tape_uuid == Some(request.tape_uuid))
+            .unwrap_or_else(|| {
+                pool.park_cartridge(crate::write_owner::SeatedCartridge {
+                    bay: mount.bay,
+                    library_serial: mount.library_serial.clone(),
+                    barcode: mount.barcode.clone(),
+                    home_slot,
+                    tape_uuid: Some(request.tape_uuid),
+                    prior_session_id: None,
+                })
+            })
+    });
+    let drive = pool.drive_tx(&mount.drive_key())?;
+    let (reply, received) = oneshot::channel();
+    drive
+        .send(crate::write_owner::DriveCommand::PlanFinalization {
+            request: request.clone(),
+            needs_drive_load: mount.needs_drive_load,
+            barcode: mount.barcode.clone(),
+            source_slot: mount.source_slot,
+            drive_serial: mount.drive_serial.clone(),
+            reply,
+        })
+        .await
+        .map_err(|_| Status::unavailable("drive actor is unavailable"))?;
+    let result = received
+        .await
+        .map_err(|_| Status::unavailable("drive actor stopped during epoch close"))?;
+    if let Some(parked) = parked {
+        schedule_idle_dismount(state.clone(), parked);
+    }
+    drop(reservation);
+    result
+}
+
+/// Exercise the real idle timer and eviction removal entry points with model actors.
+#[cfg(test)]
+pub(crate) async fn test_remove_seated_epoch(
+    state: &ApiState,
+    path: &str,
+    seated: crate::write_owner::SeatedCartridge,
+) {
+    let pool = state.drive_pool().unwrap();
+    if path == "idle" {
+        let parked = pool.parked_at(&seated.drive_key()).unwrap();
+        schedule_idle_dismount(state.clone(), parked.clone());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while pool.parked_is_current(&parked) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("idle removal finishes");
+    } else {
+        let reservation = pool.reserve_drive(&seated.drive_key()).unwrap();
+        dismount_reserved_cartridge(state, pool, &seated, DismountReason::Evicted, reservation)
+            .await
+            .unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -4005,6 +4105,28 @@ mod tests {
         assert!(!harness.pool.parked_is_current(&parked));
     }
 
+    /// A physical unload failure prevents unsafe changer motion.
+    #[tokio::test]
+    async fn shutdown_physical_unload_failure_keeps_cartridge_out_of_the_changer_queue() {
+        let mut harness = dismount_harness(0);
+        let pool = harness.pool.clone();
+        let seated = harness.seated.clone();
+        let task =
+            tokio::spawn(
+                async move { dismount_pair(&pool, &seated, DismountReason::Shutdown).await },
+            );
+        let Some(crate::write_owner::DriveCommand::Unload { reply }) =
+            harness.drive_rx.recv().await
+        else {
+            panic!("shutdown starts at the drive actor");
+        };
+        reply
+            .send(Err(Status::unavailable("physical unload fails")))
+            .unwrap();
+        assert!(task.await.unwrap().is_err());
+        assert!(harness.changer_rx.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn idle_timeout_dispatches_the_canonical_dismount_tail() {
         let harness = dismount_harness(1);
@@ -4024,6 +4146,31 @@ mod tests {
         .await
         .expect("idle dismount must clear parked state");
         assert!(!harness.pool.parked_is_current(&parked));
+    }
+
+    /// Re-parking renews one timer even when the cartridge generation stays unchanged.
+    #[tokio::test]
+    async fn repark_renews_idle_deadline_without_duplicate_timer() {
+        let mut harness = dismount_harness(1);
+        let first = harness.pool.park_cartridge(harness.seated.clone());
+        schedule_idle_dismount(harness.state.clone(), first.clone());
+        tokio::time::sleep(Duration::from_millis(650)).await;
+        let second = harness.pool.park_cartridge(harness.seated.clone());
+        assert_eq!(first.generation, second.generation);
+        schedule_idle_dismount(harness.state.clone(), second);
+        assert_eq!(harness.pool.parked.lock().unwrap().idle_timers.len(), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), harness.drive_rx.recv())
+                .await
+                .is_err(),
+            "the old deadline must not unload the re-parked cartridge"
+        );
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            reply_to_dismount_commands(harness.drive_rx, harness.changer_rx),
+        )
+        .await
+        .expect("renewed timer dispatches once");
     }
 
     #[tokio::test]

@@ -348,6 +348,9 @@ message Drive {
   // How the drive catalog answered for this bay. Present on every row, so a
   // consumer never has to infer catalog state from an absent identity.
   DriveCatalogState catalog_state = 30;   // always known: UNSPECIFIED already says "unknown"
+  // Committed ordinals [W,T) awaiting parity on the seated cartridge.
+  optional uint64 open_epoch_start = 31;
+  optional uint64 open_epoch_end = 32;
 }
 
 // A row of the drive catalog. Field presence here MIRRORS the nullability of
@@ -810,6 +813,11 @@ message Tape {
   optional google.protobuf.Timestamp last_verified_at = 17;
   optional TapeIndexVerificationState last_verification_state = 18;
   optional bytes last_verified_edition_digest = 19;
+  // Committed ordinals [W,T) awaiting an on-tape sidecar; both absent when protected.
+  optional uint64 open_epoch_start = 20;
+  optional uint64 open_epoch_end = 21;
+  // Deferred automatic seal trigger; persists until terminal completion.
+  optional string seal_due = 22;
 }
 
 message FinalizeTapeRequest {
@@ -1639,6 +1647,10 @@ service WriteSessionService {
   // operation finishes; the daemon resumes resumable fences, and
   // LibraryService.ResumeMediaReadiness attaches to the same wait until
   // completion with one drive wait shared by attached callers.
+  //
+  // An open that completes a due automatic seal returns FAILED_PRECONDITION
+  // naming the seal. The client retries OpenWriteSession against the pool to
+  // select another tape; the sealed tape cannot accept more Objects.
   rpc OpenWriteSession   (OpenWriteSessionRequest)   returns (WriteSession);
 
   // Stream one object into the session. The first message in each call must

@@ -361,6 +361,16 @@ pub(super) fn handle_drive_open_read(
                 drop(reservation);
                 handle.wake_readiness();
             }
+            DriveCommand::PlanFinalization { reply, .. } => {
+                let _ = reply.send(Err(Status::failed_precondition(
+                    "drive actor cannot plan finalization in its current state",
+                )));
+            }
+            DriveCommand::PrepareRemoval { reply, .. } => {
+                let _ = reply.send(Err(Status::failed_precondition(
+                    "drive has an active session",
+                )));
+            }
             DriveCommand::Unload { reply } => {
                 let _ = reply.send(Err(Status::failed_precondition(
                     "read session already active",

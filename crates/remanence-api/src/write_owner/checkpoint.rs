@@ -4,12 +4,12 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::{Duration as StdDuration, Instant};
 
-use remanence_library::DriveHandle;
+use remanence_library::{DriveHandle, TapeIoError};
 use remanence_parity::{
-    checked_bounded_resume_summary, resume_record_result, BoundedResumeSummary,
-    BoundedResumeWriterSeed, CloseReason, DriveHandleRawSink, FileTapeFileJournal,
-    FileTapeFileJournalCommittedSnapshot, ParityError, ParitySink, ParitySinkSessionState,
-    PhysicalPositionHint, RawTapeSink, RawWriteOutcome,
+    checked_bounded_resume_summary, rebuild_open_epoch_from_bounded_summary, resume_record_result,
+    BoundedResumeSummary, BoundedResumeWriterSeed, CloseReason, DriveHandleRawSink,
+    DriveHandleRawSource, FileTapeFileJournal, FileTapeFileJournalCommittedSnapshot, ParityError,
+    ParitySink, ParitySinkSessionState, PhysicalPositionHint, RawTapeSink, RawWriteOutcome,
 };
 use remanence_state::{AuditEvent, CatalogIndex, TapePoolConfig};
 use tokio::sync::mpsc;
@@ -66,6 +66,35 @@ pub(super) struct ParityActorSession {
     pub(super) scheme: remanence_parity::ParityScheme,
     pub(super) sink_state: Option<ParitySinkSessionState>,
     pub(super) journal: Option<FileTapeFileJournal>,
+    pub(super) retention: Option<crate::io_memory::IoMemoryPermit>,
+    pub(super) close_at_barrier: bool,
+}
+
+/// One seated cartridge's accumulator, owned by its drive actor between sessions.
+pub(super) struct RetainedParityEpoch {
+    pub(super) state: ParitySinkSessionState,
+    pub(super) permit: crate::io_memory::IoMemoryPermit,
+    pub(super) selected: SelectedTape,
+    /// Zero denotes a seated cartridge without a known home slot.
+    pub(super) parked_generation: u64,
+    pub(super) identity_generation: u64,
+    pub(super) head_at_eod: bool,
+}
+
+/// Reserve parity shards, their vector headers, the codec matrix and a full epoch's CRCs.
+pub(super) fn retained_epoch_bytes(
+    scheme: &remanence_parity::ParityScheme,
+    block_size: u32,
+) -> u64 {
+    let stripes = u64::from(scheme.stripes_per_neighborhood);
+    let parity = u64::from(scheme.parity_blocks_per_stripe);
+    let data = u64::from(scheme.data_blocks_per_stripe);
+    let header = std::mem::size_of::<Vec<u8>>() as u64;
+    std::mem::size_of::<ParitySinkSessionState>() as u64
+        + stripes * parity * u64::from(block_size)
+        + (stripes * (parity + 1) + parity) * header
+        + (stripes * data).next_power_of_two().max(4) * 8
+        + parity * data
 }
 
 pub(super) struct ParityActorAuthority {
@@ -81,6 +110,8 @@ pub(super) struct ActivityTrackingRawTapeSink<'a> {
     inner: &'a mut dyn RawTapeSink,
     write_attempted: &'a mut bool,
     position_ready: bool,
+    #[cfg(test)]
+    fail_next_write: bool,
 }
 
 impl<'a> ActivityTrackingRawTapeSink<'a> {
@@ -89,6 +120,8 @@ impl<'a> ActivityTrackingRawTapeSink<'a> {
             inner,
             write_attempted,
             position_ready: false,
+            #[cfg(test)]
+            fail_next_write: false,
         }
     }
 
@@ -102,10 +135,21 @@ impl<'a> ActivityTrackingRawTapeSink<'a> {
 }
 
 impl RawTapeSink for ActivityTrackingRawTapeSink<'_> {
+    fn locate_for_overwrite(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
+        self.position_ready = false;
+        self.inner.locate_for_overwrite(hint)
+    }
+
     fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
         self.ensure_position_ready()?;
         *self.write_attempted = true;
         let result = self.inner.write_fixed_block(buf);
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_write) {
+            return Err(ParityError::Invariant(
+                "injected epoch close write completion failure",
+            ));
+        }
         if result.is_err() {
             self.position_ready = false;
         }
@@ -281,13 +325,43 @@ pub(super) fn open_parity_actor_session(
         let plan = summary
             .append_plan(&scheme)
             .map_err(|err| status_from_parity_error(&err, err.to_string()))?;
-        if !plan.sidecars_to_emit.is_empty()
-            || plan.highest_protected_ordinal_before_rebuild != plan.next_data_ordinal
-        {
-            return Err(Status::failed_precondition(
-                "checkpointed parity tape unexpectedly retains an open epoch",
-            ));
-        }
+        let live_epoch = if plan.highest_protected_ordinal_before_rebuild < plan.next_data_ordinal {
+            let mut source = EpochRebuildSource {
+                inner: DriveHandleRawSource::new(drive),
+                contradiction: false,
+            };
+            let rebuilt = rebuild_open_epoch_from_bounded_summary(
+                &mut source,
+                &summary,
+                &scheme,
+                selected.tape_uuid,
+                selected.block_size,
+            );
+            let contradiction = source.contradiction;
+            rebuilt
+                .map_err(|err| {
+                    let status = status_from_parity_error(&err, err.to_string());
+                    if contradiction {
+                        fence_open_epoch(
+                            index,
+                            cfg,
+                            selected.tape_uuid,
+                            (
+                                plan.highest_protected_ordinal_before_rebuild,
+                                plan.next_data_ordinal,
+                            ),
+                            &status,
+                        );
+                    }
+                    status
+                })?
+                .live_epoch
+        } else {
+            None
+        };
+        drive
+            .locate_admitted_append(checkpoint.eod_lba)
+            .map_err(|err| Status::unavailable(format!("restore parity append position: {err}")))?;
         let resume_result = plan
             .complete(Vec::new())
             .map_err(|err| status_from_parity_error(&err, err.to_string()))?;
@@ -302,7 +376,7 @@ pub(super) fn open_parity_actor_session(
                 committed_prefix_snapshot: snapshot,
                 committed_prefix_summary: summary,
                 resume_result: &resume_result,
-                live_epoch: None,
+                live_epoch,
             },
             remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION")),
         )
@@ -310,10 +384,35 @@ pub(super) fn open_parity_actor_session(
         sink.into_session_state()
             .map_err(|err| status_from_parity_error(&err, err.to_string()))?
     };
+    let needs_retention = sink_state
+        .terminal_triple_capacity_runtime_state()
+        .map_err(|error| status_from_parity_error(&error, error.to_string()))?
+        .current_epoch_fill_blocks
+        > 0;
+    let retention = if needs_retention {
+        cfg.io_memory.try_reserve_epoch(
+            retained_epoch_bytes(&scheme, selected.block_size),
+            format!(
+                "tape {} drive {:?}",
+                Uuid::from_bytes(selected.tape_uuid),
+                drive.endpoint().durable_key()
+            ),
+        )
+    } else {
+        None
+    };
+    if needs_retention && retention.is_none() {
+        tracing::info!(tape_uuid = %Uuid::from_bytes(selected.tape_uuid),
+            reservation = retained_epoch_bytes(&scheme, selected.block_size),
+            ceiling = cfg.io_memory.ceiling(), retained_epochs = %cfg.io_memory.retained_diagnostics(),
+            "session open refuses parity epoch retention at the memory ceiling");
+    }
     Ok(ParityActorSession {
         scheme,
         sink_state: Some(sink_state),
         journal: Some(journal),
+        retention,
+        close_at_barrier: false,
     })
 }
 
@@ -402,6 +501,8 @@ pub(super) fn project_checkpoint_authority_bounded(
 pub(super) struct CheckpointBarrierFailure {
     pub(super) status: Status,
     pub(super) journal_durable: bool,
+    /// The append lacks a proven durable journal boundary.
+    pub(super) durability_uncertain: bool,
     pub(super) catalog_projected: bool,
     pub(super) fence_handled: bool,
 }
@@ -411,6 +512,7 @@ impl CheckpointBarrierFailure {
         Self {
             status,
             journal_durable: false,
+            durability_uncertain: true,
             catalog_projected: false,
             fence_handled: false,
         }
@@ -420,6 +522,7 @@ impl CheckpointBarrierFailure {
         Self {
             status,
             journal_durable: false,
+            durability_uncertain: true,
             catalog_projected: false,
             fence_handled: true,
         }
@@ -429,8 +532,17 @@ impl CheckpointBarrierFailure {
         Self {
             status,
             journal_durable: true,
+            durability_uncertain: false,
             catalog_projected: false,
             fence_handled: false,
+        }
+    }
+
+    /// Preserve uncertain journal authority separately from a durable projection failure.
+    pub(super) fn uncertain_journal(status: Status) -> Self {
+        Self {
+            durability_uncertain: true,
+            ..Self::after_journal(status)
         }
     }
 
@@ -438,6 +550,7 @@ impl CheckpointBarrierFailure {
         Self {
             status,
             journal_durable: true,
+            durability_uncertain: false,
             catalog_projected: true,
             fence_handled: false,
         }
@@ -503,11 +616,50 @@ pub(super) fn perform_checkpoint_barrier(
     checkpoint_ordinal: &mut u64,
     tape_committed_object_count: &mut u64,
     batch: &PendingCheckpointBatch,
-    mut parity_session: Option<&mut ParityActorSession>,
+    parity_session: Option<&mut ParityActorSession>,
     selected: &SelectedTape,
     pool_cfg: &TapePoolConfig,
     cfg: &WriteOwnerConfig,
 ) -> Result<BarrierOutcome, CheckpointBarrierFailure> {
+    perform_checkpoint_barrier_mode(
+        index,
+        drive,
+        journal,
+        tape_uuid,
+        checkpoint_ordinal,
+        tape_committed_object_count,
+        batch,
+        parity_session,
+        selected,
+        pool_cfg,
+        cfg,
+        true,
+        &mut false,
+    )
+}
+
+/// Run the checkpoint funnel with an explicit terminal-transition policy.
+#[allow(clippy::too_many_arguments)]
+fn perform_checkpoint_barrier_mode(
+    index: &mut CatalogIndex,
+    drive: &mut DriveHandle,
+    journal: &mut remanence_state::FileCheckpointJournalLease,
+    tape_uuid: TapeUuid,
+    checkpoint_ordinal: &mut u64,
+    tape_committed_object_count: &mut u64,
+    batch: &PendingCheckpointBatch,
+    mut parity_session: Option<&mut ParityActorSession>,
+    selected: &SelectedTape,
+    pool_cfg: &TapePoolConfig,
+    cfg: &WriteOwnerConfig,
+    allow_finalization: bool,
+    media_written: &mut bool,
+) -> Result<BarrierOutcome, CheckpointBarrierFailure> {
+    let allow_finalization = allow_finalization
+        && !cfg
+            .lifecycle
+            .as_ref()
+            .is_some_and(|l| l.shutting_down.load(Ordering::SeqCst));
     let drain_started = Instant::now();
     let next_ordinal = checkpoint_ordinal.checked_add(1).ok_or_else(|| {
         CheckpointBarrierFailure::before_journal(Status::internal(
@@ -568,6 +720,22 @@ pub(super) fn perform_checkpoint_barrier(
                 "parity sink session state is unavailable",
             ))
         })?;
+        if parity_session.retention.is_none() && !parity_session.close_at_barrier {
+            let bytes = retained_epoch_bytes(&parity_session.scheme, selected.block_size);
+            parity_session.retention = cfg.io_memory.try_reserve_epoch(
+                bytes,
+                format!(
+                    "tape {} drive {:?}",
+                    Uuid::from_bytes(tape_uuid),
+                    drive.endpoint().durable_key()
+                ),
+            );
+            tracing::info!(target: "remanence_write_diag", phase = "parity_retention",
+                tape_uuid = %Uuid::from_bytes(tape_uuid), reserved_bytes = bytes,
+                retained = parity_session.retention.is_some(),
+                close_reason = if parity_session.retention.is_some() { "none" } else { "io_memory_ceiling" },
+                "remanence_write_diag");
+        }
         let parity_journal = parity_session.journal.as_mut().ok_or_else(|| {
             CheckpointBarrierFailure::before_journal(Status::internal(
                 "active parity session has no append journal",
@@ -577,13 +745,24 @@ pub(super) fn perform_checkpoint_barrier(
         let barrier_result = {
             let mut raw = DriveHandleRawSink::new(drive);
             let mut tracked = ActivityTrackingRawTapeSink::new(&mut raw, &mut raw_write_attempted);
+            #[cfg(test)]
+            {
+                tracked.fail_next_write =
+                    cfg.io_memory.epoch_test_action.load(Ordering::Relaxed) == 1;
+            }
             (|| -> Result<_, ParityError> {
                 let mut sink = ParitySink::from_session_state(&mut tracked, parity_journal, state)?;
-                let closed = sink.close_open_epoch(CloseReason::Barrier)?;
+                let closed =
+                    if parity_session.retention.is_some() && !parity_session.close_at_barrier {
+                        sink.checkpoint()?
+                    } else {
+                        sink.close_open_epoch(CloseReason::Barrier)?
+                    };
                 let sink_state = sink.into_session_state()?;
                 Ok((closed, sink_state))
             })()
         };
+        *media_written |= raw_write_attempted;
         let (closed, sink_state) = match barrier_result {
             Ok(result) => result,
             Err(err) => {
@@ -608,16 +787,23 @@ pub(super) fn perform_checkpoint_barrier(
             }
         };
         let parity_early_warning = sink_state.hardware_early_warning_seen();
+        if sink_state
+            .terminal_triple_capacity_runtime_state()
+            .is_ok_and(|runtime| runtime.current_epoch_fill_blocks == 0)
+        {
+            parity_session.retention = None;
+        }
         parity_session.sink_state = Some(sink_state);
         (
             closed.next_tape_file_number,
-            objects[0].block_size,
+            selected.block_size,
             closed.barrier_outcome,
             closed.committed_bundle,
             Some(parity_session.scheme.clone()),
             parity_early_warning,
         )
     } else {
+        *media_written = true;
         let sync = drive.write_filemarks(0).map_err(|err| {
             CheckpointBarrierFailure::before_journal(Status::unavailable(format!(
                 "checkpoint batch {} barrier failed; re-send all {} WRITTEN objects: {err}",
@@ -651,6 +837,15 @@ pub(super) fn perform_checkpoint_barrier(
             batch.objects.len()
         )))
     })?;
+    #[cfg(test)]
+    let captured = if cfg.io_memory.epoch_test_action.load(Ordering::Relaxed) == 2 {
+        remanence_library::TapePosition {
+            lba: captured.lba + 1,
+            ..captured
+        }
+    } else {
+        captured
+    };
     if captured.partition != sync.position_after.partition
         || captured.lba != sync.position_after.lba
     {
@@ -701,11 +896,23 @@ pub(super) fn perform_checkpoint_barrier(
         },
     )
     .map_err(|err| CheckpointBarrierFailure::before_journal(status_from_pool_write_error(err)))?;
+    #[cfg(test)]
+    let seal_reason = if cfg.io_memory.epoch_test_action.load(Ordering::Relaxed) == 7 {
+        Some(crate::pool_write::TapeSealReason::ReachedLowWatermark)
+    } else {
+        seal_reason
+    };
     let filemark_drain = drain_started.elapsed();
     let projection_started = Instant::now();
+    #[cfg(test)]
+    if cfg.io_memory.epoch_test_action.load(Ordering::Relaxed) == 3 {
+        return Err(CheckpointBarrierFailure::before_journal(Status::internal(
+            "injected checkpoint journal append failure",
+        )));
+    }
     if let Err(err) = journal.append(&record) {
         return Err(if err.is_checkpoint_append_authority_uncertain() {
-            CheckpointBarrierFailure::after_journal(Status::internal(format!(
+            CheckpointBarrierFailure::uncertain_journal(Status::internal(format!(
                 "checkpoint batch {} journal append failed with durable authority uncertain; close the session and retry only after journal reconciliation: {err}",
                 batch.batch_id,
             )))
@@ -719,93 +926,126 @@ pub(super) fn perform_checkpoint_barrier(
     }
     *checkpoint_ordinal = next_ordinal;
     *tape_committed_object_count = next_committed_count;
-    index
-        .project_checkpoint_record(&record)
-        .map_err(|err| {
+    // Hold a competing SQLite writer only across projection, after journal sync.
+    #[cfg(test)]
+    let projection_lock = if cfg.io_memory.epoch_test_action.load(Ordering::Relaxed) == 10 {
+        let connection = rusqlite::Connection::open(&cfg.index_path).unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        Some(connection)
+    } else {
+        None
+    };
+    let projection = index.project_checkpoint_record(&record);
+    #[cfg(test)]
+    drop(projection_lock);
+    projection.map_err(|err| {
+            tracing::error!(%err, "durable checkpoint awaits SQLite projection through journal replay");
             CheckpointBarrierFailure::after_journal(Status::internal(format!(
                 "checkpoint is durable in the journal but SQLite projection failed; close the session and retry after journal replay: {err}"
             )))
         })?;
-    let terminal_checkpoint_record = if let Some(reason) = seal_reason {
-        let trigger = match reason {
-            crate::pool_write::TapeSealReason::ReachedLowWatermark => {
-                remanence_state::TerminalFinalizationTrigger::ReachedLowWatermark
-            }
-            crate::pool_write::TapeSealReason::HardwareEarlyWarning => {
-                remanence_state::TerminalFinalizationTrigger::HardwareEarlyWarning
-            }
-            crate::pool_write::TapeSealReason::OperatorCloseOut => {
-                remanence_state::TerminalFinalizationTrigger::OperatorCloseOut
-            }
-            crate::pool_write::TapeSealReason::PoolCloseOut => {
-                remanence_state::TerminalFinalizationTrigger::PoolCloseOut
-            }
-            crate::pool_write::TapeSealReason::NoPendingObjectFits => {
-                remanence_state::TerminalFinalizationTrigger::NoPendingObjectFits
-            }
+    #[cfg(test)]
+    if cfg.io_memory.epoch_test_action.load(Ordering::Relaxed) == 9 {
+        return Err(CheckpointBarrierFailure::after_projection(
+            Status::internal("injected post-projection failure"),
+        ));
+    }
+    if let Some(reason) = seal_reason.filter(|_| !allow_finalization) {
+        let reason = match reason {
+            crate::pool_write::TapeSealReason::HardwareEarlyWarning => "hardware_early_warning",
+            _ => "reached_low_watermark",
         };
-        if trigger == remanence_state::TerminalFinalizationTrigger::OperatorCloseOut {
-            return Err(CheckpointBarrierFailure::after_projection(
-                Status::internal(
-                    "automatic checkpoint seal unexpectedly carried an operator trigger",
-                ),
-            ));
-        }
-        let drive_config = drive.read_config().map_err(|error| {
-            CheckpointBarrierFailure::after_projection(Status::unavailable(format!(
-                "read terminal-finalization drive config: {error}"
-            )))
+        index.record_tape_seal_due(tape_uuid, reason).map_err(|e| {
+            CheckpointBarrierFailure::after_projection(crate::status_from_state_error(e))
         })?;
-        if drive_config.write_protected {
-            return Err(CheckpointBarrierFailure::after_projection(
-                Status::failed_precondition(
-                    "tape became write-protected before terminal finalization",
-                ),
-            ));
-        }
-        let rewritable = matches!(
-            drive_config.worm,
-            remanence_library::WormMediaState::NotWorm
-        );
-        let spec = TerminalFinalizeSpec::automatic(selected, pool_cfg, trigger);
-        let result = match &selected.parity_config {
-            remanence_parity::ParityConfig::None => finalize_terminal_no_parity(
-                index, cfg, drive, journal, &record, None, &spec, selected, None, rewritable,
-            ),
-            remanence_parity::ParityConfig::Scheme(_) => {
-                let parity_journal = parity_session
-                    .and_then(|session| session.journal.take())
-                    .ok_or_else(|| {
-                        CheckpointBarrierFailure::after_projection(Status::internal(
-                            "automatic parity finalization has no session-owned append journal",
-                        ))
-                    })?;
-                finalize_terminal_with_parity_journal(
-                    index,
-                    cfg,
-                    drive,
-                    journal,
-                    &record,
-                    None,
-                    &spec,
-                    selected,
-                    None,
-                    parity_journal,
-                    rewritable,
-                )
+        tracing::info!(tape_uuid = %Uuid::from_bytes(tape_uuid), ?seal_reason,
+            "terminal seal is due; removal leaves finalization to the next write session or explicit finalize");
+    }
+    let terminal_checkpoint_record =
+        if let Some(reason) = seal_reason.filter(|_| allow_finalization) {
+            let trigger = match reason {
+                crate::pool_write::TapeSealReason::ReachedLowWatermark => {
+                    remanence_state::TerminalFinalizationTrigger::ReachedLowWatermark
+                }
+                crate::pool_write::TapeSealReason::HardwareEarlyWarning => {
+                    remanence_state::TerminalFinalizationTrigger::HardwareEarlyWarning
+                }
+                crate::pool_write::TapeSealReason::OperatorCloseOut => {
+                    remanence_state::TerminalFinalizationTrigger::OperatorCloseOut
+                }
+                crate::pool_write::TapeSealReason::PoolCloseOut => {
+                    remanence_state::TerminalFinalizationTrigger::PoolCloseOut
+                }
+                crate::pool_write::TapeSealReason::NoPendingObjectFits => {
+                    remanence_state::TerminalFinalizationTrigger::NoPendingObjectFits
+                }
+            };
+            if trigger == remanence_state::TerminalFinalizationTrigger::OperatorCloseOut {
+                return Err(CheckpointBarrierFailure::after_projection(
+                    Status::internal(
+                        "automatic checkpoint seal unexpectedly carried an operator trigger",
+                    ),
+                ));
             }
-        }
-        .map_err(CheckpointBarrierFailure::after_projection)?;
-        let final_record = result.final_record.ok_or_else(|| {
-            CheckpointBarrierFailure::after_projection(Status::unavailable(
-                "automatic terminal finalization requires recovery before sealing can complete",
-            ))
-        })?;
-        *checkpoint_ordinal = final_record.ordinal;
-        Some(final_record)
-    } else {
-        None
-    };
+            let drive_config = drive.read_config().map_err(|error| {
+                CheckpointBarrierFailure::after_projection(Status::unavailable(format!(
+                    "read terminal-finalization drive config: {error}"
+                )))
+            })?;
+            if drive_config.write_protected {
+                return Err(CheckpointBarrierFailure::after_projection(
+                    Status::failed_precondition(
+                        "tape became write-protected before terminal finalization",
+                    ),
+                ));
+            }
+            let rewritable = matches!(
+                drive_config.worm,
+                remanence_library::WormMediaState::NotWorm
+            );
+            let spec = TerminalFinalizeSpec::automatic(selected, pool_cfg, trigger);
+            let result = match &selected.parity_config {
+                remanence_parity::ParityConfig::None => finalize_terminal_no_parity(
+                    index, cfg, drive, journal, &record, None, &spec, selected, None, rewritable,
+                ),
+                remanence_parity::ParityConfig::Scheme(_) => {
+                    let carried = parity_session
+                        .as_deref_mut()
+                        .and_then(|s| s.sink_state.take());
+                    let parity_journal = parity_session
+                        .and_then(|session| session.journal.take())
+                        .ok_or_else(|| {
+                            CheckpointBarrierFailure::after_projection(Status::internal(
+                                "automatic parity finalization has no session-owned append journal",
+                            ))
+                        })?;
+                    finalize_terminal_with_parity_journal(
+                        index,
+                        cfg,
+                        drive,
+                        journal,
+                        &record,
+                        None,
+                        &spec,
+                        selected,
+                        None,
+                        parity_journal,
+                        rewritable,
+                        carried,
+                    )
+                }
+            }
+            .map_err(CheckpointBarrierFailure::after_projection)?;
+            let final_record = result.final_record.ok_or_else(|| {
+                CheckpointBarrierFailure::after_projection(Status::unavailable(
+                    "automatic terminal finalization requires recovery before sealing can complete",
+                ))
+            })?;
+            *checkpoint_ordinal = final_record.ordinal;
+            Some(final_record)
+        } else {
+            None
+        };
     let sealed_after_write = terminal_checkpoint_record.is_some();
     if sealed_after_write {
         if let Err(err) = append_tape_sealed_evidence(index, cfg, selected.tape_uuid) {
@@ -1114,4 +1354,627 @@ impl SessionAppendGate {
     pub(super) fn record_sealed(&mut self) {
         self.sealed = true;
     }
+}
+
+/// Close committed data with the same abandonment and fence discipline as session close.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn close_committed_epoch(
+    index: &mut CatalogIndex,
+    drive: &mut DriveHandle,
+    cfg: &WriteOwnerConfig,
+    lease: &mut remanence_state::FileCheckpointJournalLease,
+    ordinal: &mut u64,
+    count: &mut u64,
+    session: &mut ParityActorSession,
+    selected: &SelectedTape,
+    pool: &TapePoolConfig,
+    allow_finalization: bool,
+) -> Result<BarrierOutcome, CheckpointBarrierFailure> {
+    session.close_at_barrier = true;
+    let batch = PendingCheckpointBatch::new(StdDuration::ZERO);
+    let mut media_written = false;
+    match perform_checkpoint_barrier_mode(
+        index,
+        drive,
+        lease,
+        selected.tape_uuid,
+        ordinal,
+        count,
+        &batch,
+        Some(session),
+        selected,
+        pool,
+        cfg,
+        allow_finalization,
+        &mut media_written,
+    ) {
+        Ok(outcome) => Ok(outcome),
+        Err(mut failure) => {
+            if failure.fence_handled && failure.durability_uncertain {
+                if let Err(error) = crate::append_admission::abandon_pending_append(
+                    drive,
+                    lease,
+                    session.journal.as_mut(),
+                ) {
+                    tracing::error!(%error, "fenced epoch close abandonment marker fails");
+                }
+            } else if media_written && failure.durability_uncertain {
+                failure.status = fence_failed_checkpoint_batch(
+                    drive,
+                    lease,
+                    session.journal.as_mut(),
+                    index,
+                    cfg,
+                    selected,
+                    &batch,
+                    failure.status,
+                );
+            }
+            Err(failure)
+        }
+    }
+}
+
+/// Close a seated open epoch, rebuilding when no matching accumulator remains.
+/// A fenced cartridge keeps its epoch until append recovery clears the fence.
+pub(super) fn close_retained_before_removal(
+    index: &mut CatalogIndex,
+    drive: &mut DriveHandle,
+    cfg: &WriteOwnerConfig,
+    bay: u16,
+    retained: &mut Option<RetainedParityEpoch>,
+    progress: Option<&crate::operations::OperationHandle>,
+) -> Result<(), Status> {
+    let mut epoch = retained.take();
+    let mut closing_tape = epoch.as_ref().map(|e| e.selected.tape_uuid);
+    let mut open_range = None;
+    let mut epoch_closed = false;
+    let shutdown = cfg
+        .lifecycle
+        .as_ref()
+        .is_some_and(|l| l.shutting_down.load(Ordering::SeqCst));
+    let result = (|| -> Result<(), Status> {
+        let snapshot = cfg
+            .library_snapshot
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let barcode = snapshot
+            .report
+            .libraries
+            .iter()
+            .find(|l| l.serial == cfg.actor_library_serial)
+            .and_then(|l| {
+                l.drive_bays
+                    .iter()
+                    .find(|d| d.element_address == bay && d.loaded)
+            })
+            .and_then(|d| d.loaded_tape.as_deref());
+        let tape = if let Some(barcode) = barcode {
+            index
+                .get_tape_by_voltag(barcode)
+                .map_err(crate::status_from_state_error)?
+        } else if let Some(epoch) = epoch.as_ref() {
+            index
+                .get_tape(&epoch.selected.tape_uuid)
+                .map_err(crate::status_from_state_error)?
+        } else {
+            None
+        };
+        let Some(tape) = tape else {
+            tracing::info!(
+                bay,
+                "epoch close skipped: cartridge has no catalog write identity"
+            );
+            return Ok(());
+        };
+        if tape.scheme_id.is_none()
+            || tape.highest_protected_ordinal == tape.total_committed_ordinals
+        {
+            tracing::info!(bay, "epoch close skipped: tape has no open parity epoch");
+            return Ok(());
+        }
+        let tape_uuid = crate::catalog_conversion::decode_uuid_bytes(&tape.tape_uuid, "tape_uuid")?;
+        closing_tape = Some(tape_uuid);
+        open_range = Some((
+            tape.highest_protected_ordinal,
+            tape.total_committed_ordinals,
+        ));
+        let Some(pool) = cfg
+            .tape_pools
+            .iter()
+            .find(|p| Some(p.id.as_str()) == tape.pool_id.as_deref())
+            .cloned()
+        else {
+            tracing::info!(tape_uuid = %Uuid::from_bytes(tape_uuid), "epoch close skipped: no pool configuration");
+            return Ok(());
+        };
+        if tape.state != "ready"
+            || tape.kind != "data"
+            || tape.terminal_finalization.is_some()
+            || tape
+                .body_format
+                .as_deref()
+                .is_some_and(|format| format != "rem-object-v1")
+        {
+            tracing::info!(tape_uuid = %Uuid::from_bytes(tape_uuid), state = %tape.state,
+                "epoch close skipped: tape is not writable");
+            return Ok(());
+        }
+        let journal =
+            remanence_state::FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, tape_uuid)
+                .map_err(crate::status_from_state_error)?;
+        if journal
+            .terminal_finalization_intent()
+            .map_err(crate::status_from_state_error)?
+            .is_some()
+        {
+            tracing::info!(tape_uuid = %Uuid::from_bytes(tape_uuid), "epoch close skipped: terminal intent closes the epoch");
+            return Ok(());
+        }
+        let fences = index
+            .tape_io_admission_conflicts(&tape_uuid, tape.voltag.as_deref())
+            .map_err(crate::status_from_state_error)?;
+        if !fences.is_empty() {
+            tracing::info!(tape_uuid = %Uuid::from_bytes(tape_uuid),
+                "fenced removal leaves the epoch open until append recovery");
+            return Ok(());
+        }
+        let pool_id = tape.pool_id.as_deref().unwrap_or("(unpooled)");
+        let (block_size, parity_config) = crate::pool_write::selected_tape_geometry(&tape, pool_id)
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        let selected = SelectedTape {
+            standalone_endpoint: None,
+            tape_uuid,
+            block_size,
+            parity_config,
+            pool_id: pool_id.to_owned(),
+        };
+        if let Err(error) =
+            crate::pool_write::ensure_selected_tape_accepts_session_write(index, &pool, &selected)
+        {
+            if let crate::pool_write::PoolWriteError::State(error) = error {
+                return Err(crate::status_from_state_error(error));
+            }
+            tracing::info!(%error, tape_uuid = %Uuid::from_bytes(tape_uuid), "epoch close skipped: write admission refused");
+            return Ok(());
+        }
+        let parked_matches = epoch.as_ref().is_some_and(|e| {
+            cfg.lifecycle.as_ref().is_some_and(|l| {
+                l.parked
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .by_drive
+                    .get(&crate::drive_pool::DriveKey::new(
+                        &cfg.actor_library_serial,
+                        bay,
+                    ))
+                    .map_or(e.parked_generation == 0, |p| {
+                        p.generation == e.parked_generation && p.seated.tape_uuid == Some(tape_uuid)
+                    })
+            })
+        });
+        let mut lease = journal
+            .acquire_exclusive()
+            .map_err(crate::status_from_state_error)?;
+        let records = project_checkpoint_authority_bounded(index, &lease)
+            .map_err(crate::status_from_state_error)?;
+        let projected = index
+            .get_tape(&tape_uuid)
+            .map_err(crate::status_from_state_error)?
+            .ok_or_else(|| Status::failed_precondition("close tape disappears from catalog"))?;
+        open_range = Some((
+            projected.highest_protected_ordinal,
+            projected.total_committed_ordinals,
+        ));
+        if projected.highest_protected_ordinal == projected.total_committed_ordinals {
+            tracing::info!(tape_uuid = %Uuid::from_bytes(tape_uuid), "epoch close skipped: journal already closes the epoch");
+            return Ok(());
+        }
+        if shutdown
+            && !epoch.as_ref().is_some_and(|e| {
+                parked_matches
+                    && e.head_at_eod
+                    && e.identity_generation == drive.identity_generation()
+                    && drive
+                        .known_position()
+                        .is_some_and(|p| p.partition == 0 && p.lba == e.state.used_tape_blocks())
+            })
+        {
+            let (w, t) = open_range.expect("open tape range");
+            tracing::warn!(tape_uuid = %Uuid::from_bytes(tape_uuid), open_epoch_start = w, open_epoch_end = t,
+                "epoch_left_open: shutdown dismounts after positioning; the next append rebuilds the epoch");
+            audit_removal_epoch(
+                index,
+                cfg,
+                bay,
+                Some(tape_uuid),
+                "epoch_left_open",
+                format!("shutdown cannot prove the head is at EOD; [{w},{t})"),
+                Some((w, t)),
+            );
+            return Ok(());
+        }
+        let config = drive
+            .read_config()
+            .map_err(|e| Status::unavailable(e.to_string()))?;
+        if let Err(error) = crate::pool_write::require_rewritable_object_media(config) {
+            tracing::info!(%error, "epoch close skipped: medium is not writable");
+            return Ok(());
+        }
+        let last = records.last().ok_or_else(|| {
+            let error = Status::failed_precondition("open epoch has no checkpoint");
+            fence_open_epoch(
+                index,
+                cfg,
+                tape_uuid,
+                open_range.expect("open tape range"),
+                &error,
+            );
+            error
+        })?;
+        if !shutdown {
+            super::write_session::prepare_drive_for_write_observing_identity(
+                drive,
+                &tape_uuid,
+                block_size,
+                Uuid::new_v4(),
+                super::write_session::WriteMediaPolicy::RewritableObject,
+                |error| {
+                    let contradiction = match error {
+                        crate::pool_write::TapeIdentityError::Mismatch { .. }
+                        | crate::pool_write::TapeIdentityError::AbsentBootstrap(_) => true,
+                        crate::pool_write::TapeIdentityError::Io(error) => {
+                            committed_io_contradiction(error, block_size, 1)
+                        }
+                    };
+                    if contradiction {
+                        fence_open_epoch(
+                            index,
+                            cfg,
+                            tape_uuid,
+                            open_range.expect("open tape range"),
+                            &Status::failed_precondition(error.to_string()),
+                        );
+                    }
+                },
+            )?;
+        }
+        let context = crate::append_admission::context(
+            tape_uuid,
+            block_size,
+            last.eod_partition,
+            last.eod_lba,
+        );
+        let _admission = crate::append_admission::admit_append_boundary(
+            drive,
+            crate::append_admission::AppendAuthority::Checkpoint {
+                eod: context.boundary,
+            },
+            context,
+        )
+        .map_err(|error| {
+            let status = Status::failed_precondition(error.to_string());
+            let contradiction = match &error {
+                crate::append_admission::AdmissionError::TailBeyondKnownState { .. } => true,
+                crate::append_admission::AdmissionError::Io(error) => {
+                    committed_io_contradiction(error, block_size, 1)
+                }
+                _ => false,
+            };
+            if contradiction {
+                fence_open_epoch(
+                    index,
+                    cfg,
+                    tape_uuid,
+                    open_range.expect("open tape range"),
+                    &status,
+                );
+            }
+            status
+        })?;
+        let authority = validate_parity_actor_authority(cfg, &selected, &lease, &records)?;
+        #[cfg(test)]
+        let authority = if cfg.io_memory.epoch_test_action.load(Ordering::Relaxed) == 8 {
+            let mut authority = authority;
+            authority.summary.total_committed_ordinals += 1;
+            authority
+        } else {
+            authority
+        };
+        let carried = epoch.take().filter(|e| {
+            parked_matches
+                && e.selected.tape_uuid == tape_uuid
+                && e.identity_generation == drive.identity_generation()
+                && e.state.matches_committed_summary(&authority.summary)
+                && e.state.used_tape_blocks() == last.eod_lba
+        });
+        if shutdown && carried.is_none() {
+            return Err(Status::failed_precondition(
+                "shutdown retained epoch does not match checkpoint summary",
+            ));
+        }
+        if let Some(progress) = progress {
+            progress.publish_state(pb::OperationState::Running, &[("phase", "epoch_close")]);
+        }
+        let mut session = if let Some(e) = carried {
+            ParityActorSession {
+                scheme: authority.scheme,
+                sink_state: Some(e.state),
+                journal: Some(authority.journal),
+                retention: Some(e.permit),
+                close_at_barrier: true,
+            }
+        } else {
+            tracing::info!(tape_uuid = %Uuid::from_bytes(tape_uuid), "removal rebuilds the committed open epoch");
+            open_parity_actor_session(index, drive, cfg, &selected, &records, authority)?
+        };
+        let mut ordinal = last.ordinal;
+        let mut count = last.committed_object_count;
+        close_committed_epoch(
+            index,
+            drive,
+            cfg,
+            &mut lease,
+            &mut ordinal,
+            &mut count,
+            &mut session,
+            &selected,
+            &pool,
+            false,
+        )
+        .map_err(|failure| {
+            epoch_closed = failure.journal_durable && !failure.durability_uncertain;
+            failure.status
+        })?;
+        Ok(())
+    })();
+    drive.clear_append_admission();
+    if let Err(error) = result {
+        // Projection may close the epoch before a later audit or seal-due write fails.
+        // Read its current range; unavailable catalog evidence never supplies a range.
+        let (range, closed) =
+            closing_tape
+                .filter(|_| !epoch_closed)
+                .map_or((None, epoch_closed), |uuid| match index.get_tape(&uuid) {
+                    Ok(Some(tape))
+                        if tape.highest_protected_ordinal < tape.total_committed_ordinals =>
+                    {
+                        (
+                            Some((
+                                tape.highest_protected_ordinal,
+                                tape.total_committed_ordinals,
+                            )),
+                            false,
+                        )
+                    }
+                    Ok(Some(tape)) => (
+                        None,
+                        tape.highest_protected_ordinal == tape.total_committed_ordinals,
+                    ),
+                    Ok(None) => (None, false),
+                    Err(cause) => {
+                        tracing::warn!(%cause, "cannot read removal epoch evidence");
+                        (None, false)
+                    }
+                });
+        if closed {
+            tracing::error!(%error, bay, "durable epoch close follow-up fails");
+        } else {
+            tracing::warn!(%error, bay, "epoch_left_open: epoch close fails before removal");
+            audit_removal_epoch(
+                index,
+                cfg,
+                bay,
+                closing_tape,
+                "epoch_left_open",
+                error.to_string(),
+                range,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Audit an epoch left open by removal or a failed session open.
+pub(super) fn audit_removal_epoch(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    bay: u16,
+    tape_uuid: Option<TapeUuid>,
+    kind: &'static str,
+    reason: String,
+    range: Option<(u64, u64)>,
+) {
+    use ciborium::value::Value as CborValue;
+    let mut detail = std::collections::BTreeMap::from([
+        ("session_kind".into(), CborValue::Text(kind.into())),
+        ("abort_reason".into(), CborValue::Text(reason)),
+        (
+            "drive_bay".into(),
+            CborValue::Integer(u64::from(bay).into()),
+        ),
+        (
+            "library_serial".into(),
+            CborValue::Text(cfg.actor_library_serial.clone()),
+        ),
+    ]);
+    if let Some((w, t)) = range {
+        detail.insert("open_epoch_start".into(), CborValue::Integer(w.into()));
+        detail.insert("open_epoch_end".into(), CborValue::Integer(t.into()));
+    }
+    if let Some(uuid) = tape_uuid {
+        detail.insert("tape_uuid".into(), CborValue::Bytes(uuid.to_vec()));
+    }
+    if let Err(error) = crate::audit_projection::append_operation_audit(
+        index,
+        &cfg.audit_dir,
+        cfg.audit_fsync,
+        &cfg.audit_append_lock,
+        crate::audit_projection::OperationAuditInput {
+            actor: remanence_state::AuditActor::System,
+            operation_id: Uuid::new_v4(),
+            operation_kind: kind,
+            event: AuditEvent::OperationFailed,
+            subject_kind: "tape",
+            subject_id: tape_uuid.map(|u| Uuid::from_bytes(u).to_string()),
+            idempotency_key: None,
+            detail,
+        },
+    ) {
+        tracing::error!(%error,"cannot audit removal epoch");
+    }
+}
+
+/// Persist observed contradictions in a known committed open epoch.
+fn fence_open_epoch(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    tape_uuid: TapeUuid,
+    range: (u64, u64),
+    error: &Status,
+) {
+    let tape = match index.get_tape(&tape_uuid) {
+        Ok(Some(tape)) => tape,
+        other => {
+            tracing::error!(?other, "cannot read catalog for open epoch fence");
+            return;
+        }
+    };
+    if index
+        .tape_io_admission_conflicts(&tape_uuid, tape.voltag.as_deref())
+        .is_ok_and(|fences| !fences.is_empty())
+    {
+        return;
+    }
+    let evidence = serde_json::json!({
+        "open_epoch_start": range.0, "open_epoch_end": range.1,
+        "error": error.message(), "phase": "open_epoch"
+    })
+    .to_string();
+    match index.record_tape_io_fence(remanence_state::TapeIoFenceInput {
+        tape_uuid,
+        barcode: tape.voltag,
+        reason: "epoch_close_failed".into(),
+        evidence_json: Some(evidence),
+    }) {
+        Ok(fence) => {
+            if let Err(error) =
+                append_tape_io_fence_evidence(index, cfg, &fence, AuditEvent::TapeIoFenceRaised)
+            {
+                tracing::error!(%error, "open epoch fence audit fails");
+            }
+        }
+        Err(error) => tracing::error!(%error, "open epoch fence persistence fails"),
+    }
+}
+
+/// Classify committed-range failures with the verification reader's completion rules.
+fn committed_read_contradiction(error: &ParityError, size: u32, count: u32) -> bool {
+    let ParityError::TapeIo(error) = error else {
+        return false;
+    };
+    committed_io_contradiction(error, size, count)
+}
+
+/// Classify tape contradictions shared by identity, append admission and rebuild.
+fn committed_io_contradiction(error: &TapeIoError, size: u32, count: u32) -> bool {
+    if matches!(error, TapeIoError::GoodReadLengthMismatch { .. }) {
+        return false;
+    }
+    if matches!(error, TapeIoError::FilemarkEncountered) {
+        return true;
+    }
+    use remanence_library::VerificationReadCompletion as Completion;
+    matches!(
+        remanence_library::verification_read_completion(error, size, count).1,
+        Completion::MediumError
+            | Completion::WrongLength
+            | Completion::Filemark
+            | Completion::EndOfData
+    ) || error.check_condition_transfer().is_some_and(|(sense, _)| {
+        remanence_library::decode_scsi_sense(sense).is_some_and(|s| {
+            !s.is_deferred()
+                && (s.key == 8
+                    || (s.key == 0 && s.filemark)
+                    // Hardware errors qualify only for unrecovered reads or missing records.
+                    || (s.key == 4 && matches!(s.asc, 0x11 | 0x14)))
+        })
+    })
+}
+
+/// Track media contradictions without turning transient drive errors into fences.
+struct EpochRebuildSource<'a> {
+    inner: DriveHandleRawSource<'a>,
+    contradiction: bool,
+}
+impl remanence_parity::RawTapeSource for EpochRebuildSource<'_> {
+    fn verification_context(&self) -> remanence_library::verification_io::VerificationContext {
+        self.inner.verification_context()
+    }
+    fn configure_fixed_block_size(&mut self, size: u32) -> Result<(), ParityError> {
+        self.inner.configure_fixed_block_size(size)
+    }
+    fn locate_physical(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
+        let result = self.inner.locate_physical(hint);
+        self.contradiction |= result
+            .as_ref()
+            .is_err_and(|e| committed_read_contradiction(e, 1, 1));
+        result
+    }
+    fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+        self.inner.locate_end_of_data()
+    }
+    fn space_filemarks(
+        &mut self,
+        count: i64,
+    ) -> Result<remanence_parity::SpaceFilemarksOutcome, ParityError> {
+        self.inner.space_filemarks(count)
+    }
+    fn read_record(
+        &mut self,
+        buf: &mut [u8],
+    ) -> Result<remanence_parity::RawReadOutcome, ParityError> {
+        let result = self.inner.read_record(buf);
+        self.contradiction |= match &result {
+            Ok(remanence_parity::RawReadOutcome::Block { bytes, .. }) => *bytes != buf.len(),
+            Ok(_) => true,
+            Err(error) => committed_read_contradiction(error, buf.len() as u32, 1),
+        };
+        result
+    }
+    fn read_forward_records(
+        &mut self,
+        buf: &mut [u8],
+        size: u32,
+        count: u32,
+    ) -> remanence_parity::raw::RawForwardReadBatch {
+        let result = self.inner.read_forward_records(buf, size, count);
+        self.contradiction |= match &result.batch.end {
+            remanence_parity::raw::RawReadEnd::Complete => false,
+            remanence_parity::raw::RawReadEnd::Error(error) => {
+                committed_read_contradiction(error, size, count)
+            }
+            _ => true,
+        };
+        result
+    }
+    fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+        self.inner.position()
+    }
+}
+
+/// A GOOD completion with an inconsistent host count never proves a media contradiction.
+#[test]
+fn good_read_length_mismatch_stays_transient() {
+    let error = remanence_library::TapeIoError::GoodReadLengthMismatch {
+        requested_bytes: 4096,
+        bytes_transferred: 2048,
+    };
+    assert!(error.is_completion_unknown());
+    assert!(!committed_read_contradiction(
+        &ParityError::TapeIo(error),
+        4096,
+        1
+    ));
 }

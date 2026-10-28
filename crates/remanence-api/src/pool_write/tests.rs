@@ -2303,7 +2303,10 @@ fn parity_spool_shortfall_is_rejected_before_object_tape_motion() {
         .terminal_triple_capacity_runtime_state()
         .expect("runtime state")
         .used_tape_blocks;
-    let io_memory = crate::io_memory::IoMemoryReservation::new(1).expect("one-byte spool budget");
+    let io_memory = crate::io_memory::IoMemoryReservation::new(11).expect("spool budget");
+    let retained = io_memory
+        .try_reserve_epoch(10, "tape 01 drive A".into())
+        .unwrap();
 
     let error = reserve_parity_object_capacity(
         parity
@@ -2317,14 +2320,22 @@ fn parity_spool_shortfall_is_rejected_before_object_tape_motion() {
         &io_memory,
     )
     .expect_err("completed parity epoch exceeds the atomic spool budget");
+    assert!(error
+        .to_string()
+        .contains("retained epochs [tape 01 drive A]"));
+    assert!(
+        std::error::Error::source(&error).is_none(),
+        "the display already includes the capacity cause"
+    );
+    drop(retained);
     assert!(
         matches!(
             error,
-            PoolWriteError::Parity(ParityError::CapacityReserveExceeded {
-                cause: CapacityReserveCause::ParitySpoolCapacity,
-                remaining_spool_bytes: Some(1),
-                ..
-            })
+            PoolWriteError::ParitySpoolRefused { ref cause, .. } if matches!(cause.as_ref(), ParityError::CapacityReserveExceeded {
+                    cause: CapacityReserveCause::ParitySpoolCapacity,
+                    remaining_spool_bytes: Some(1),
+                    ..
+                })
         ),
         "{error}"
     );
@@ -2423,11 +2434,11 @@ fn direct_encrypted_parity_write_uses_configured_spool_ceiling_before_object_mot
     assert!(
         matches!(
             error,
-            PoolWriteError::Parity(ParityError::CapacityReserveExceeded {
-                cause: CapacityReserveCause::ParitySpoolCapacity,
-                remaining_spool_bytes: Some(1),
-                ..
-            })
+            PoolWriteError::ParitySpoolRefused { ref cause, .. } if matches!(cause.as_ref(), ParityError::CapacityReserveExceeded {
+                    cause: CapacityReserveCause::ParitySpoolCapacity,
+                    remaining_spool_bytes: Some(1),
+                    ..
+                })
         ),
         "{error}"
     );
@@ -2851,10 +2862,10 @@ fn batched_parity_post_motion_projection_failure_sets_dirty_after_retryable_spoo
     assert!(
         matches!(
             error,
-            PoolWriteError::Parity(ParityError::CapacityReserveExceeded {
-                cause: CapacityReserveCause::ParitySpoolCapacity,
-                ..
-            })
+            PoolWriteError::ParitySpoolRefused { ref cause, .. } if matches!(cause.as_ref(), ParityError::CapacityReserveExceeded {
+                    cause: CapacityReserveCause::ParitySpoolCapacity,
+                    ..
+                })
         ),
         "{error}"
     );
@@ -2958,6 +2969,8 @@ fn batched_parity_post_motion_projection_failure_sets_dirty_after_retryable_spoo
 
 fn capacity_tape_record() -> TapeRecord {
     TapeRecord {
+        seal_due: None,
+        highest_protected_ordinal: 0,
         last_verified_at_utc: None,
         last_verification_state: None,
         last_verified_edition_digest: None,
@@ -2987,6 +3000,7 @@ fn capacity_tape_record() -> TapeRecord {
 #[test]
 fn selected_tape_geometry_rejects_partial_parity_columns() {
     let partial = TapeRecord {
+        seal_due: None,
         last_verified_at_utc: None,
         last_verification_state: None,
         last_verified_edition_digest: None,
@@ -3006,6 +3020,7 @@ fn selected_tape_geometry_rejects_partial_parity_columns() {
 #[test]
 fn physical_extent_projection_prefers_authority_and_fails_closed_on_legacy_overflow() {
     let authoritative = TapeRecord {
+        seal_due: None,
         last_verified_at_utc: None,
         last_verification_state: None,
         last_verified_edition_digest: None,
@@ -3020,6 +3035,7 @@ fn physical_extent_projection_prefers_authority_and_fails_closed_on_legacy_overf
     assert_eq!(tape_physical_used_blocks(&empty).unwrap(), 0);
 
     let ordinal_only = TapeRecord {
+        seal_due: None,
         last_verified_at_utc: None,
         last_verification_state: None,
         last_verified_edition_digest: None,
@@ -3029,6 +3045,7 @@ fn physical_extent_projection_prefers_authority_and_fails_closed_on_legacy_overf
     assert_eq!(tape_physical_used_blocks(&ordinal_only).unwrap(), 20);
 
     let with_file_count = TapeRecord {
+        seal_due: None,
         last_verified_at_utc: None,
         last_verification_state: None,
         last_verified_edition_digest: None,
@@ -3039,6 +3056,7 @@ fn physical_extent_projection_prefers_authority_and_fails_closed_on_legacy_overf
     assert_eq!(tape_physical_used_blocks(&with_file_count).unwrap(), 17);
 
     let ordinal_overflow = TapeRecord {
+        seal_due: None,
         last_verified_at_utc: None,
         last_verification_state: None,
         last_verified_edition_digest: None,
@@ -3048,6 +3066,7 @@ fn physical_extent_projection_prefers_authority_and_fails_closed_on_legacy_overf
     assert!(tape_physical_used_blocks(&ordinal_overflow).is_err());
 
     let file_count_overflow = TapeRecord {
+        seal_due: None,
         last_verified_at_utc: None,
         last_verification_state: None,
         last_verified_edition_digest: None,
@@ -3076,6 +3095,7 @@ fn selector_fit_uses_barrier_proved_physical_extent_at_the_boundary() {
     let usable = watermark_floor_bytes(capacity, cfg.watermark_high).expect("usable bytes");
     let boundary_lba = usable / cfg.block_size_bytes;
     let full = TapeRecord {
+        seal_due: None,
         last_verified_at_utc: None,
         last_verification_state: None,
         last_verified_edition_digest: None,
@@ -3083,6 +3103,7 @@ fn selector_fit_uses_barrier_proved_physical_extent_at_the_boundary() {
         ..capacity_tape_record()
     };
     let fitting = TapeRecord {
+        seal_due: None,
         last_verified_at_utc: None,
         last_verification_state: None,
         last_verified_edition_digest: None,

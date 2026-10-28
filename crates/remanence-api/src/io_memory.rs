@@ -4,14 +4,19 @@
 //! back on refused allocations and when the owning stream/spool closes.
 //! Unlocked read-reservoir slabs retain their reservations.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Fixed-ceiling reservation manager shared by spools and read reservoirs.
 #[derive(Debug)]
 pub(crate) struct IoMemoryReservation {
     ceiling: u64,
     granted: AtomicU64,
+    retained_epochs: Mutex<BTreeMap<String, usize>>,
+    epoch_discards: AtomicU64,
+    #[cfg(test)]
+    pub(crate) epoch_test_action: AtomicU64,
 }
 
 impl IoMemoryReservation {
@@ -22,6 +27,10 @@ impl IoMemoryReservation {
         Ok(Arc::new(Self {
             ceiling,
             granted: AtomicU64::new(0),
+            retained_epochs: Mutex::new(BTreeMap::new()),
+            epoch_discards: AtomicU64::new(0),
+            #[cfg(test)]
+            epoch_test_action: AtomicU64::new(0),
         }))
     }
 
@@ -33,6 +42,44 @@ impl IoMemoryReservation {
     #[cfg(test)]
     pub(crate) fn granted(&self) -> u64 {
         self.granted.load(Ordering::Acquire)
+    }
+
+    /// Count rejected take-over state independently of device command batching.
+    pub(crate) fn record_epoch_discard(&self) {
+        self.epoch_discards.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn epoch_discards(&self) -> u64 {
+        self.epoch_discards.load(Ordering::Relaxed)
+    }
+
+    /// Name retained epochs and drives in later allocation refusals.
+    pub(crate) fn retained_diagnostics(&self) -> String {
+        self.retained_epochs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Attach an epoch owner to a granted reservation for its full lifetime.
+    pub(crate) fn try_reserve_epoch(
+        self: &Arc<Self>,
+        bytes: u64,
+        owner: String,
+    ) -> Option<IoMemoryPermit> {
+        let mut permit = self.try_reserve(bytes)?;
+        *self
+            .retained_epochs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(owner.clone())
+            .or_default() += 1;
+        permit.epoch_owner = Some(owner);
+        Some(permit)
     }
 
     pub(crate) fn try_reserve(self: &Arc<Self>, bytes: u64) -> Option<IoMemoryPermit> {
@@ -54,6 +101,7 @@ impl IoMemoryReservation {
             return Ok(IoMemoryPermit {
                 manager: Arc::clone(self),
                 bytes: 0,
+                epoch_owner: None,
             });
         }
         let mut current = self.granted.load(Ordering::Acquire);
@@ -75,6 +123,7 @@ impl IoMemoryReservation {
                     return Ok(IoMemoryPermit {
                         manager: Arc::clone(self),
                         bytes,
+                        epoch_owner: None,
                     });
                 }
                 Err(observed) => current = observed,
@@ -88,6 +137,7 @@ impl IoMemoryReservation {
 pub(crate) struct IoMemoryPermit {
     manager: Arc<IoMemoryReservation>,
     bytes: u64,
+    epoch_owner: Option<String>,
 }
 
 impl IoMemoryPermit {
@@ -99,6 +149,19 @@ impl IoMemoryPermit {
 
 impl Drop for IoMemoryPermit {
     fn drop(&mut self) {
+        if let Some(owner) = &self.epoch_owner {
+            let mut owners = self
+                .manager
+                .retained_epochs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(count) = owners.get_mut(owner) {
+                *count -= 1;
+                if *count == 0 {
+                    owners.remove(owner);
+                }
+            }
+        }
         let previous = self.manager.granted.fetch_sub(self.bytes, Ordering::AcqRel);
         debug_assert!(previous >= self.bytes);
     }
@@ -107,6 +170,27 @@ impl Drop for IoMemoryPermit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refusal keeps every retained epoch owner visible until its permit drops.
+    #[test]
+    fn retained_epoch_refusal_names_tapes_and_drives() {
+        let manager = IoMemoryReservation::new(10).unwrap();
+        let first = manager
+            .try_reserve_epoch(4, "tape 01 drive A".into())
+            .unwrap();
+        let second = manager
+            .try_reserve_epoch(4, "tape 02 drive B".into())
+            .unwrap();
+        assert_eq!(manager.try_reserve_with_available(3).unwrap_err(), 2);
+        assert_eq!(
+            manager.retained_diagnostics(),
+            "tape 01 drive A, tape 02 drive B"
+        );
+        drop(first);
+        assert_eq!(manager.retained_diagnostics(), "tape 02 drive B");
+        drop(second);
+        assert!(manager.retained_diagnostics().is_empty());
+    }
 
     #[test]
     fn concurrent_stream_and_spool_growth_never_exceeds_ceiling() {

@@ -987,6 +987,9 @@ pub(crate) fn status_from_pool_write_error(err: PoolWriteError) -> Status {
         }
         PoolWriteError::ReplayObjectInvalid { .. } => Status::internal(message),
         PoolWriteError::Streaming(streaming) => status_from_streaming_error(&streaming, message),
+        PoolWriteError::ParitySpoolRefused { cause, .. } => {
+            status_from_parity_error(&cause, message)
+        }
         PoolWriteError::Parity(parity) => status_from_parity_error(&parity, message),
         PoolWriteError::PhysicalUsedBytesOverflow { .. }
         | PoolWriteError::CheckpointReconciliation(_)

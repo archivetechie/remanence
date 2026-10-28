@@ -216,8 +216,8 @@ impl ResumeAppendPlan {
 
 /// One committed Object extent needed to reread the unprotected open epoch.
 ///
-/// A normal checkpoint has `W == T` and retains no extents. If a valid v1
-/// restart has an open epoch, only Objects intersecting `[W, T)` are kept;
+/// A checkpoint may retain an open epoch. Only Objects intersecting `[W, T)`
+/// are kept; a fully protected checkpoint has `W == T` and retains no extents;
 /// older Object and structural rows remain replayable in the journal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResumeOpenEpochObjectExtent {
@@ -326,20 +326,6 @@ impl BoundedResumeSummary {
             next_epoch_id: self.next_epoch_id,
             sidecars_to_emit: Vec::new(),
         })
-    }
-
-    fn position_for_open_epoch_ordinal(
-        &self,
-        ordinal: u64,
-    ) -> Result<PhysicalPositionHint, ParityError> {
-        for extent in &self.open_epoch_object_extents {
-            if let Some(position) = extent.position_for_ordinal(ordinal)? {
-                return Ok(position);
-            }
-        }
-        Err(resume_error(format!(
-            "open-epoch ordinal {ordinal} is absent from bounded resume extents"
-        )))
     }
 }
 
@@ -1372,9 +1358,96 @@ pub fn rebuild_open_epoch_from_bounded_summary(
         plan.highest_protected_ordinal_before_rebuild,
         plan.next_epoch_id,
     )?;
-    for ordinal in plan.highest_protected_ordinal_before_rebuild..plan.next_data_ordinal {
-        let block = read_bounded_open_epoch_object_block(source, summary, ordinal, block_size)?;
-        accumulator.push_block(ordinal, block)?;
+    // Each committed extent is contiguous. Limit buffers to the same batch
+    // geometry used by the forward verification reader.
+    let batch_blocks = remanence_library::DEFAULT_TAPE_IO_BATCH_BLOCKS;
+    let mut buffer = vec![
+        0;
+        ParityError::host_usize(
+            u64::from(block_size) * u64::from(batch_blocks),
+            "resume read buffer"
+        )?
+    ];
+    let mut ordinal = plan.highest_protected_ordinal_before_rebuild;
+    for extent in &summary.open_epoch_object_extents {
+        let start = extent.first_parity_data_ordinal.max(ordinal);
+        let end = extent.end_exclusive()?.min(plan.next_data_ordinal);
+        if start >= end {
+            continue;
+        }
+        if start != ordinal {
+            return Err(resume_error("open-epoch extents omit committed data"));
+        }
+        let physical = extent
+            .position_for_ordinal(start)?
+            .ok_or_else(|| resume_error("open-epoch extent omits its first ordinal"))?;
+        locate_committed_position(
+            source,
+            physical,
+            format_args!("committed extent at ordinal {start}"),
+        )?;
+        while ordinal < end {
+            let count = (end - ordinal).min(u64::from(batch_blocks)) as u32;
+            let forward = source.read_forward_records(&mut buffer, block_size, count);
+            let batch = forward.batch;
+            if batch.records_read > count {
+                return Err(ParityError::Invariant(
+                    "resume forward read exceeds requested count",
+                ));
+            }
+            // Only full records count; a short record, boundary or unclean
+            // command contradicts the extent or retains its original I/O error.
+            if let crate::raw::RawReadEnd::Error(error) = batch.end {
+                let length_refusal = match &error {
+                    ParityError::TapeIo(
+                        remanence_library::TapeIoError::InvalidRequest(_)
+                        | remanence_library::TapeIoError::ReadBufferTooSmall { .. },
+                    ) => true,
+                    ParityError::TapeIo(io) => {
+                        io.check_condition_transfer().is_some_and(|(sense, _)| {
+                            remanence_library::decode_scsi_sense(sense)
+                                .is_some_and(|s| !s.is_deferred() && s.key == 0 && s.ili)
+                        })
+                    }
+                    _ => false,
+                };
+                if length_refusal {
+                    // A fixed READ cannot always measure a malformed record.
+                    // Re-read this failed batch one record at a time to retain
+                    // the Resumer's length checks. Transport/medium errors do not retry.
+                    let position = extent
+                        .position_for_ordinal(ordinal)?
+                        .expect("validated extent");
+                    locate_committed_position(source, position, format_args!("malformed extent"))?;
+                    for offset in 0..u64::from(count) {
+                        reread_committed_data_block(
+                            source,
+                            ordinal + offset,
+                            PhysicalPositionHint::new(position.lba + offset),
+                            block_size,
+                        )?;
+                    }
+                }
+                return Err(error);
+            }
+            if forward.unconfirmed_boundary
+                || batch.records_read == 0
+                || !matches!(batch.end, crate::raw::RawReadEnd::Complete)
+            {
+                return Err(resume_error(format!(
+                    "resume rebuild ordinal {ordinal} encounters {:?} instead of {count} committed {block_size}-byte blocks",
+                    batch.end)));
+            }
+            for block in buffer[..batch.records_read as usize * block_size as usize]
+                .chunks_exact(block_size as usize)
+            {
+                accumulator.push_block(ordinal, block.to_vec())?;
+                ordinal += 1;
+            }
+        }
+    }
+    if ordinal != plan.next_data_ordinal {
+        return Err(resume_error("open-epoch extents omit committed data"));
     }
     let (rebuilt_sidecars, live_epoch) = accumulator.finish()?;
     if !rebuilt_sidecars.is_empty() {
@@ -2066,22 +2139,6 @@ fn read_committed_object_block(
             "resume rebuild could not map ordinal {ordinal} to a physical position: {err}"
         ))
     })?;
-    locate_committed_position(
-        source,
-        physical,
-        format_args!("committed data block of ordinal {ordinal}"),
-    )?;
-
-    reread_committed_data_block(source, ordinal, physical, block_size)
-}
-
-fn read_bounded_open_epoch_object_block(
-    source: &mut dyn RawTapeSource,
-    summary: &BoundedResumeSummary,
-    ordinal: u64,
-    block_size: u32,
-) -> Result<Vec<u8>, ParityError> {
-    let physical = summary.position_for_open_epoch_ordinal(ordinal)?;
     locate_committed_position(
         source,
         physical,
@@ -4992,6 +5049,106 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    /// A near-full default epoch uses one seek per extent and bounded forward reads.
+    #[test]
+    fn bounded_rebuild_batches_a_full_open_epoch() {
+        struct Counter {
+            cursor: u64,
+            locates: u64,
+            reads: u64,
+            positions: u64,
+        }
+        impl RawTapeSource for Counter {
+            fn configure_fixed_block_size(&mut self, _: u32) -> Result<(), ParityError> {
+                Ok(())
+            }
+            fn locate_physical(&mut self, p: PhysicalPositionHint) -> Result<(), ParityError> {
+                self.locates += 1;
+                self.cursor = p.lba;
+                Ok(())
+            }
+            fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+                self.positions += 1;
+                Ok(PhysicalPositionHint::new(self.cursor))
+            }
+            fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+                panic!("no EOD search")
+            }
+            fn space_filemarks(&mut self, _: i64) -> Result<SpaceFilemarksOutcome, ParityError> {
+                panic!("no SPACE")
+            }
+            fn read_record(&mut self, _: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
+                panic!("rebuild must batch")
+            }
+            fn read_forward_records(
+                &mut self,
+                buf: &mut [u8],
+                size: u32,
+                count: u32,
+            ) -> crate::raw::RawForwardReadBatch {
+                self.reads += 1;
+                buf[..size as usize * count as usize].fill(0x53);
+                self.cursor += u64::from(count);
+                crate::raw::RawForwardReadBatch {
+                    unconfirmed_boundary: false,
+                    batch: crate::raw::RawReadBatch {
+                        records_read: count,
+                        position_after: Some(PhysicalPositionHint::new(self.cursor)),
+                        end: crate::raw::RawReadEnd::Complete,
+                    },
+                }
+            }
+        }
+        let scheme = crate::default_scheme();
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = crate::FileTapeFileJournal::open(
+            dir.path().join("counts"),
+            [7; 16],
+            256,
+            scheme.clone(),
+        )
+        .unwrap();
+        for bundle in [
+            CommittedBundle {
+                kind: CommittedBundleKind::BotBootstrap,
+                entries: vec![journal_entry(0, TapeFileKind::Bootstrap, 1, None, None)],
+                highest_protected_ordinal: 0,
+                total_committed_ordinals: 0,
+            },
+            CommittedBundle {
+                kind: CommittedBundleKind::Object,
+                entries: vec![journal_entry(1, TapeFileKind::Object, 65535, Some(0), None)],
+                highest_protected_ordinal: 0,
+                total_committed_ordinals: 65535,
+            },
+            CommittedBundle {
+                kind: CommittedBundleKind::CheckpointedThrough,
+                entries: vec![],
+                highest_protected_ordinal: 0,
+                total_committed_ordinals: 65535,
+            },
+        ] {
+            journal.commit_bundle(&bundle).unwrap();
+        }
+        let summary =
+            checked_bounded_resume_summary(&journal.committed_snapshot_bounded().unwrap()).unwrap();
+        let mut source = Counter {
+            cursor: 0,
+            locates: 0,
+            reads: 0,
+            positions: 0,
+        };
+        let rebuilt =
+            rebuild_open_epoch_from_bounded_summary(&mut source, &summary, &scheme, [7; 16], 256)
+                .unwrap();
+        assert_eq!(rebuilt.live_epoch.unwrap().data_blocks_in_epoch, 65535);
+        assert_eq!(
+            (source.locates, source.reads, source.positions),
+            (2, 4096, 1)
+        );
+        // DriveHandleRawSource additionally proves each of the two LOCATEs with READ POSITION.
+    }
+
     #[test]
     fn bounded_resume_retains_and_rereads_only_the_open_epoch() {
         let tape_uuid = [0x96; 16];
@@ -5075,9 +5232,7 @@ mod tests {
                 RawCall::Configure(RESUME_TEST_BLOCK_SIZE),
                 RawCall::Locate(27),
                 RawCall::Read(27),
-                RawCall::Locate(28),
                 RawCall::Read(28),
-                RawCall::Locate(29),
                 RawCall::Read(29),
                 RawCall::Locate(31),
             ]
