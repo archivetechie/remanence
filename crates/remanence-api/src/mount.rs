@@ -5227,9 +5227,11 @@ mod tests {
         else {
             panic!("retry finalize open");
         };
-        state
-            .readiness_shutdown
-            .store(true, std::sync::atomic::Ordering::Release);
+        state.begin_shutdown();
+        // Let discovery observe shutdown before the test starts another attempt.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
         let polled =
             <crate::CatalogService as crate::pb::catalog_server::Catalog>::get_tape_finalization(
                 &state.catalog_service(),
@@ -5369,6 +5371,33 @@ mod tests {
                 state.pool_config(id)
             })
             .unwrap();
+        let guard = pool.reserve_tape(tape_uuid).unwrap();
+        let shutdown_error = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_manual_finalize_worker_with_budget(
+                state.clone(),
+                pool.clone(),
+                guard,
+                retry_request.clone(),
+                Duration::from_secs(900),
+            ),
+        )
+        .await
+        .expect("shutdown ends the finalize attempt")
+        .unwrap_err();
+        assert!(shutdown_error.message().contains("shutdown"));
+        assert!(shutdown_error.message().contains("same idempotency key"));
+        assert_eq!(
+            state
+                .operations
+                .latest(&accepted.operation_id)
+                .unwrap()
+                .state,
+            pb::OperationState::Failed as i32
+        );
+        state
+            .readiness_shutdown
+            .store(false, std::sync::atomic::Ordering::Release);
         let guard = pool.reserve_tape(tape_uuid).unwrap();
         let deadline_error = run_manual_finalize_worker_with_budget(
             state.clone(),

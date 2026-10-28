@@ -10613,7 +10613,14 @@ fn startup_reconciles_operator_cancelled_ready_and_absent_media() {
             1
         );
         let record = index.media_readiness_operation(id).unwrap().unwrap();
-        assert_eq!(record.cancel_source.as_deref(), Some("operator"));
+        assert_eq!(
+            record.cancel_source.as_deref(),
+            if absent {
+                Some("startup_reconcile")
+            } else {
+                None
+            }
+        );
         if absent {
             assert!(
                 crate::startup_media_readiness::media_readiness_state_requires_release(
@@ -10746,7 +10753,7 @@ pub(crate) fn fail_readiness_test_command(state: &crate::ApiState, command: Driv
     );
 }
 
-/// Startup keeps builder attribution unless an operator explicitly cancels the fence.
+/// Startup attributes every release-only transition to reconciliation.
 #[test]
 fn startup_release_transition_keeps_reconcile_cancel_source() {
     for source in [None, Some("transport"), Some("operator")] {
@@ -10779,14 +10786,7 @@ fn startup_release_transition_keeps_reconcile_cancel_source() {
             )
             .unwrap();
             let record = index.media_readiness_operation(id).unwrap().unwrap();
-            assert_eq!(
-                record.cancel_source.as_deref(),
-                Some(if source == Some("operator") {
-                    "operator"
-                } else {
-                    "startup_reconcile"
-                })
-            );
+            assert_eq!(record.cancel_source.as_deref(), Some("startup_reconcile"));
         }
     }
 }
@@ -10794,79 +10794,88 @@ fn startup_release_transition_keeps_reconcile_cancel_source() {
 /// A detached verifier waits for a LoadDrive library hold to end before opening.
 #[tokio::test]
 async fn detached_verification_waits_for_load_drive_release() {
-    let harness = VerificationActorHarness::with_tape_in_slot(true);
-    let id = Uuid::new_v4();
-    let pool = harness.state.drive_pool().unwrap();
-    pool.reserve_library_exclusive("LIB-VERIFY").unwrap();
-    pool.set_library_holder("LIB-VERIFY", "load_drive", id);
-    let load = harness.state.operations.register(id, "load_drive");
-    load.publish_state(pb::OperationState::Running, &[]);
-    harness
-        .state
-        .index_write()
-        .unwrap()
-        .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
-            operation_id: id,
-            run_id: None,
-            endpoint: DriveKey::new("LIB-VERIFY", 0x100),
-            changer_sg: None,
-            drive_sg: None,
-            drive_serial: None,
-            barcode: Some("VERIFY001L9".into()),
-            source_slot: Some(0x400),
-            media_generation: Some(9),
-            phase: "load_drive_readiness".into(),
-            state: "becoming_ready".into(),
-            dirty_scope: Some("drive+tape".into()),
-            deadline_at_utc: None,
-            evidence_path: None,
-        })
-        .unwrap();
-    let (operation, mut result) = crate::tape_verification::start(
-        &harness.state,
-        AuditActor::System,
-        harness.tape_uuid,
-        StdDuration::from_secs(10),
-    )
-    .unwrap();
-    let verify_id = Uuid::from_slice(&operation.operation_id).unwrap();
-    tokio::time::timeout(StdDuration::from_secs(2), async {
-        while harness
+    for publish_first in [false, true] {
+        let harness = VerificationActorHarness::with_tape_in_slot(true);
+        let id = Uuid::new_v4();
+        let pool = harness.state.drive_pool().unwrap();
+        pool.reserve_library_exclusive("LIB-VERIFY").unwrap();
+        pool.set_library_holder("LIB-VERIFY", "load_drive", id);
+        let load = harness.state.operations.register(id, "load_drive");
+        load.publish_state(pb::OperationState::Running, &[]);
+        harness
             .state
-            .operations
-            .latest(&verify_id)
-            .is_none_or(|s| s.progress.get("phase").is_none_or(|p| p != "readiness"))
-        {
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    harness
-        .state
-        .index_write()
-        .unwrap()
-        .record_media_readiness_transition(
-            crate::startup_media_readiness::startup_media_readiness_probe_transition(
-                id,
-                &remanence_library::MediaReadiness::Ready,
-            ),
+            .index_write()
+            .unwrap()
+            .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+                operation_id: id,
+                run_id: None,
+                endpoint: DriveKey::new("LIB-VERIFY", 0x100),
+                changer_sg: None,
+                drive_sg: None,
+                drive_serial: None,
+                barcode: Some("VERIFY001L9".into()),
+                source_slot: Some(0x400),
+                media_generation: Some(9),
+                phase: "load_drive_readiness".into(),
+                state: "becoming_ready".into(),
+                dirty_scope: Some("drive+tape".into()),
+                deadline_at_utc: None,
+                evidence_path: None,
+            })
+            .unwrap();
+        let (operation, mut result) = crate::tape_verification::start(
+            &harness.state,
+            AuditActor::System,
+            harness.tape_uuid,
+            StdDuration::from_secs(10),
         )
         .unwrap();
-    tokio::time::sleep(StdDuration::from_millis(400)).await;
-    assert!(result.try_recv().is_err());
-    pool.release_library("LIB-VERIFY");
-    load.publish_state(pb::OperationState::Succeeded, &[]);
-    let verdict = tokio::time::timeout(StdDuration::from_secs(5), result)
+        let verify_id = Uuid::from_slice(&operation.operation_id).unwrap();
+        tokio::time::timeout(StdDuration::from_secs(2), async {
+            while harness
+                .state
+                .operations
+                .latest(&verify_id)
+                .is_none_or(|s| s.progress.get("phase").is_none_or(|p| p != "readiness"))
+            {
+                tokio::time::sleep(StdDuration::from_millis(10)).await;
+            }
+        })
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
-    assert_eq!(
-        verdict.state,
-        pb::TapeIndexVerificationState::VerifiedComplete as i32
-    );
-    harness.state.shutdown_drive_pool().await.unwrap();
+        harness
+            .state
+            .index_write()
+            .unwrap()
+            .record_media_readiness_transition(
+                crate::startup_media_readiness::startup_media_readiness_probe_transition(
+                    id,
+                    &remanence_library::MediaReadiness::Ready,
+                ),
+            )
+            .unwrap();
+        tokio::time::sleep(StdDuration::from_millis(400)).await;
+        assert!(result.try_recv().is_err());
+        if publish_first {
+            load.publish_state(pb::OperationState::Succeeded, &[]);
+            tokio::time::sleep(StdDuration::from_millis(400)).await;
+            assert!(result.try_recv().is_err());
+            pool.release_library("LIB-VERIFY");
+        } else {
+            pool.release_library("LIB-VERIFY");
+            load.publish_state(pb::OperationState::Succeeded, &[]);
+        }
+        let verdict = tokio::time::timeout(StdDuration::from_secs(5), result)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            verdict.state,
+            pb::TapeIndexVerificationState::VerifiedComplete as i32
+        );
+        harness.state.shutdown_drive_pool().await.unwrap();
+    }
 }
 
 /// A LoadDrive poll observes shutdown promptly and leaves its durable fence resumable.
@@ -10875,7 +10884,7 @@ async fn load_drive_readiness_poll_stops_on_shutdown() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("state.sqlite");
     let mut index = CatalogIndex::open(&path).unwrap();
-    let id = Uuid::new_v4();
+    let id = Uuid::nil();
     let registry = crate::operations::OperationRegistry::default();
     let shutdown = Arc::new(AtomicBool::new(false));
     let handle = registry.register(id, "load_drive").with_readiness_lifetime(
@@ -10915,7 +10924,16 @@ async fn load_drive_readiness_poll_stops_on_shutdown() {
             .unwrap();
         let snapshot = library_snapshot_cell(library.library().clone());
         let cfg = test_write_owner_config(actor_path, audit_dir, &library, snapshot);
-        super::robotics::run_load_sequence(
+        record_library_event(
+            &mut index,
+            &cfg,
+            &handle,
+            "LIB-LOADSTOP",
+            AuditEvent::OperationStarted,
+            Default::default(),
+        )
+        .unwrap();
+        let result = super::robotics::run_load_sequence(
             &mut index,
             &cfg,
             &handle,
@@ -10923,7 +10941,16 @@ async fn load_drive_readiness_poll_stops_on_shutdown() {
             0x400,
             0x100,
             true,
-        )
+        );
+        super::robotics::finish_library_operation(
+            &mut index,
+            &cfg,
+            &handle,
+            "LIB-LOADSTOP",
+            result.clone(),
+            Ok(()),
+        );
+        result
     });
     tokio::time::timeout(StdDuration::from_secs(2), async {
         while !registry
@@ -10946,11 +10973,105 @@ async fn load_drive_readiness_poll_stops_on_shutdown() {
         error.contains(crate::readiness_wait::SHUTDOWN_REASON),
         "{error}"
     );
-    let record = CatalogIndex::open_read_only(path)
+    let record = CatalogIndex::open_read_only(&path)
         .unwrap()
         .media_readiness_operation(id)
         .unwrap()
         .unwrap();
     assert!(crate::readiness_wait::is_resumable(&record.state));
     assert_ne!(record.cancel_source.as_deref(), Some("operator"));
+    let mut state = crate::ApiState::new(CatalogIndex::open(&path).unwrap());
+    state.operations = registry.clone();
+    for n in 1..=2048 {
+        registry
+            .register(Uuid::from_u128(n), "retention_test")
+            .publish_state(pb::OperationState::Succeeded, &[]);
+    }
+    assert!(registry.latest(&id).is_none(), "load status is pruned");
+    for state in [
+        state,
+        crate::ApiState::new(CatalogIndex::open(&path).unwrap()),
+    ] {
+        use crate::pb::daemon_server::Daemon;
+        let status = state
+            .daemon_service()
+            .get_operation(tonic::Request::new(pb::GetOperationRequest {
+                operation_id: id.as_bytes().to_vec(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(status.state, pb::OperationState::Failed as i32);
+        assert!(status.error_summary.contains("shutdown"), "{status:?}");
+    }
+}
+
+/// Shutdown ends an open verification watch before the readiness deadline.
+#[tokio::test]
+async fn detached_verification_shutdown_ends_readiness_watch() {
+    use crate::pb::daemon_server::Daemon;
+    let harness = VerificationActorHarness::new();
+    harness.readiness.lock().unwrap().extend([(2, 4, 1); 100]);
+    crate::readiness_wait::spawn_auto_resume(harness.state.clone());
+    let (operation, result) = crate::tape_verification::start(
+        &harness.state,
+        AuditActor::System,
+        harness.tape_uuid,
+        StdDuration::from_secs(900),
+    )
+    .unwrap();
+    let id = Uuid::from_slice(&operation.operation_id).unwrap();
+    let mut watch = harness
+        .state
+        .daemon_service()
+        .watch_operation(tonic::Request::new(pb::GetOperationRequest {
+            operation_id: operation.operation_id,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    tokio::time::timeout(StdDuration::from_secs(2), async {
+        loop {
+            let event = watch
+                .next()
+                .await
+                .expect("watch stays open until readiness")
+                .unwrap();
+            if event
+                .progress
+                .get("phase")
+                .is_some_and(|p| p == "readiness")
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    harness.state.begin_shutdown();
+    let error = tokio::time::timeout(StdDuration::from_secs(2), result)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(error.message().contains("shutdown"), "{error}");
+    let events = tokio::time::timeout(StdDuration::from_secs(2), watch.collect::<Vec<_>>())
+        .await
+        .unwrap();
+    let terminal = events.last().unwrap().as_ref().unwrap();
+    assert_eq!(terminal.state, pb::OperationState::Failed as i32);
+    assert!(terminal.error_summary.contains("shutdown"));
+    assert!(!harness.state.operations.is_live(&id));
+    tokio::time::timeout(
+        StdDuration::from_secs(2),
+        harness.state.shutdown_drive_pool(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+}
+
+/// Drain readiness commands through the catalog-open failure path.
+pub(crate) fn fail_readiness_actor(rx: mpsc::Receiver<DriveCommand>) {
+    super::actor_runtime::drain_failed_drive_commands(rx, "open catalog: injected failure".into());
 }

@@ -2733,6 +2733,194 @@ mod tests {
         state.begin_shutdown();
     }
 
+    /// A cancelled wait whose write fails remains sweep-only, including repeated wakes.
+    #[tokio::test(start_paused = true)]
+    async fn auto_resume_unrecorded_cancel_waits_for_sweep() {
+        for client_first in [false, true] {
+            let (state, id, mut rx) = auto_resume_fixture("becoming_ready");
+            if client_first {
+                state
+                    .start_readiness_wait(id, 9000, 30, "client", "session_open")
+                    .unwrap();
+            }
+            crate::readiness_wait::spawn_auto_resume(state.clone());
+            discovery_turn().await;
+            let command = rx.try_recv().unwrap();
+            state.operations.request_cancel(&id).unwrap();
+            crate::write_owner::fail_readiness_test_command(&state, command);
+            let status = state.operations.latest(&id).unwrap();
+            assert_eq!(status.state, pb::OperationState::Failed as i32);
+            assert!(
+                status.error_summary.contains("cancel is not recorded"),
+                "{status:?}"
+            );
+            assert!(state
+                .index()
+                .unwrap()
+                .media_readiness_operation(id)
+                .unwrap()
+                .unwrap()
+                .cancel_source
+                .is_none());
+            for _ in 0..119 {
+                state
+                    .drive_pool()
+                    .unwrap()
+                    .readiness_wake
+                    .notify
+                    .notify_one();
+                tokio::time::advance(std::time::Duration::from_millis(250)).await;
+                discovery_turn().await;
+                assert!(rx.try_recv().is_err());
+            }
+            tokio::time::advance(std::time::Duration::from_millis(250)).await;
+            discovery_turn().await;
+            assert!(rx.try_recv().is_ok());
+            state.begin_shutdown();
+        }
+    }
+
+    /// A catalog-open failure ends callers promptly but discovery retains its sweep.
+    #[tokio::test(start_paused = true)]
+    async fn readiness_catalog_failure_ends_waiter() {
+        assert_permanent_readiness_failure(false).await;
+    }
+
+    /// A stopped actor ends callers promptly but discovery retains its sweep.
+    #[tokio::test(start_paused = true)]
+    async fn readiness_stopped_actor_ends_waiter() {
+        assert_permanent_readiness_failure(true).await;
+    }
+
+    /// Exercise permanent dispatch failure and fixed-sweep retry through the actor channel.
+    async fn assert_permanent_readiness_failure(closed: bool) {
+        let (state, id, rx) = auto_resume_fixture("becoming_ready");
+        let actor = if closed {
+            drop(rx);
+            None
+        } else {
+            Some(tokio::task::spawn_blocking(move || {
+                crate::write_owner::fail_readiness_actor(rx);
+            }))
+        };
+        crate::readiness_wait::spawn_auto_resume(state.clone());
+        // Yield to the blocking failed actor without advancing the discovery clock.
+        for _ in 0..10000 {
+            if state
+                .operations
+                .latest(&id)
+                .is_some_and(|s| s.state == pb::OperationState::Failed as i32)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let status = state.operations.latest(&id).unwrap();
+        assert_eq!(status.state, pb::OperationState::Failed as i32);
+        let owner = state
+            .operations
+            .register(Uuid::new_v4(), "tape_verification");
+        let error = {
+            let mut deadline = None;
+            let wait = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                crate::readiness_wait::wait_after_refusal(
+                    &state,
+                    &owner,
+                    crate::readiness_wait::ReadinessFence(id).status("original refusal"),
+                    std::time::Duration::from_secs(900),
+                    &mut deadline,
+                ),
+            );
+            tokio::pin!(wait);
+            tokio::select! {
+                biased;
+                result = &mut wait => result,
+                _ = tokio::task::yield_now() => {
+                    // A blocking actor prevents automatic advancement of paused time.
+                    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+                    wait.await
+                }
+            }
+        };
+        let error = match error {
+            Ok(result) => result.unwrap_err(),
+            Err(error) => {
+                state.begin_shutdown();
+                drop(state);
+                if let Some(actor) = actor {
+                    actor.await.unwrap();
+                }
+                panic!("permanent failure ends promptly: {error}");
+            }
+        };
+        assert!(error.message().contains(&status.error_summary), "{error}");
+        let pool = state.drive_pool().unwrap();
+        for _ in 0..119 {
+            pool.readiness_wake.notify.notify_one();
+            tokio::time::advance(std::time::Duration::from_millis(250)).await;
+            discovery_turn().await;
+        }
+        assert_eq!(
+            pool.readiness_wake
+                .start_attempts
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        tokio::time::advance(std::time::Duration::from_millis(250)).await;
+        discovery_turn().await;
+        assert_eq!(
+            pool.readiness_wake
+                .start_attempts
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        state.begin_shutdown();
+        drop(state);
+        if let Some(actor) = actor {
+            actor.await.unwrap();
+        }
+    }
+
+    /// Resume attaches to the live load and still refuses unrelated ownership.
+    #[tokio::test]
+    async fn readiness_resume_attaches_to_live_load_only() {
+        use tokio_stream::StreamExt;
+        for kind in ["load_drive", "media_readiness_wait", "tape_verification"] {
+            let (state, id, mut rx) = auto_resume_fixture("becoming_ready");
+            let handle = state.operations.register(id, kind);
+            handle.publish_state(pb::OperationState::Running, &[]);
+            let response = state
+                .library_service()
+                .resume_media_readiness(Request::new(pb::ResumeMediaReadinessRequest {
+                    operation_id: id.as_bytes().to_vec(),
+                    timeout_seconds: 9000,
+                    poll_interval_seconds: 30,
+                }))
+                .await;
+            if kind == "tape_verification" {
+                assert_eq!(
+                    response.unwrap_err().code(),
+                    tonic::Code::FailedPrecondition
+                );
+            } else {
+                assert_eq!(response.unwrap().into_inner().operation_id, id.as_bytes());
+                let mut watch = state.operations.watch(&id).unwrap();
+                assert_eq!(
+                    watch.next().await.unwrap().unwrap().state,
+                    pb::OperationState::Running as i32
+                );
+                handle.publish_state(pb::OperationState::Succeeded, &[]);
+                assert_eq!(
+                    watch.next().await.unwrap().unwrap().state,
+                    pb::OperationState::Succeeded as i32
+                );
+                assert!(watch.next().await.is_none());
+            }
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
     /// Allow notified discovery tasks to run without advancing the paused clock.
     async fn discovery_turn() {
         for _ in 0..10 {

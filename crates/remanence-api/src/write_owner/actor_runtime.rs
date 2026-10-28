@@ -565,7 +565,10 @@ pub(super) fn drain_failed_drive_commands(mut rx: mpsc::Receiver<DriveCommand>, 
                 reservation,
                 ..
             } => {
-                handle.publish_failed(&message, &[("phase", "drive_actor")]);
+                handle.publish_failed(
+                    &message,
+                    &[("phase", "drive_actor"), ("state", "dispatch_failed")],
+                );
                 drop(reservation);
                 handle.wake_readiness();
             }

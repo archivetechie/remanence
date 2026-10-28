@@ -349,16 +349,13 @@ pub(crate) fn reconcile_library_media_readiness_records_on_startup(
                     .iter_mut()
                     .find(|(bay, _)| *bay == drive_element)
                 else {
-                    let mut transition = startup_media_readiness_unresolved_transition(
+                    let transition = startup_media_readiness_unresolved_transition(
                         operation_id,
                         format!(
                             "drive 0x{drive_element:04x} is not openable in selected library {}",
                             library.serial
                         ),
                     );
-                    if record.cancel_source.as_deref() == Some("operator") {
-                        transition.cancel_source = Some("operator".into());
-                    }
                     index
                         .record_media_readiness_transition(transition)
                         .map_err(status_from_state_error)?;
@@ -384,7 +381,9 @@ pub(crate) fn reconcile_library_media_readiness_records_on_startup(
                 } else {
                     let mut transition =
                         startup_media_readiness_probe_transition(operation_id, &observed);
-                    if record.cancel_source.as_deref() == Some("operator") {
+                    if record.cancel_source.as_deref() == Some("operator")
+                        && crate::readiness_wait::is_resumable(&transition.state)
+                    {
                         transition.cancel_source = Some("operator".into());
                     }
                     index
@@ -403,10 +402,7 @@ pub(crate) fn reconcile_library_media_readiness_records_on_startup(
                 }
                 reconciled = reconciled.saturating_add(1);
             }
-            StartupReadinessPlan::KeepFenced { mut transition } => {
-                if record.cancel_source.as_deref() == Some("operator") {
-                    transition.cancel_source = Some("operator".into());
-                }
+            StartupReadinessPlan::KeepFenced { transition } => {
                 index
                     .record_media_readiness_transition(*transition)
                     .map_err(status_from_state_error)?;
@@ -486,7 +482,11 @@ fn startup_media_readiness_initializing_load(
                     }
                     MediaReadinessWaitEvent::Cancelled(_) => return Ok(()),
                 };
-                transition.cancel_source = cancel_source.clone();
+                if crate::readiness_wait::is_resumable(&transition.state) {
+                    transition.cancel_source = cancel_source.clone();
+                } else if media_readiness_state_requires_release(&transition.state) {
+                    transition.cancel_source = Some("startup_reconcile".into());
+                }
                 index
                     .record_media_readiness_transition(transition)
                     .map(|_| ())
@@ -659,7 +659,9 @@ pub(crate) fn startup_media_readiness_probe_transition(
         last_driver_status: None,
         target_status: media_readiness_target_status(readiness),
         transport_class: media_readiness_transport_class(readiness),
-        cancel_source: None,
+        cancel_source: quarantine_id
+            .as_ref()
+            .map(|_| "startup_reconcile".to_string()),
         signal: None,
         evidence_path: None,
         last_error_json: media_readiness_error_json(readiness),

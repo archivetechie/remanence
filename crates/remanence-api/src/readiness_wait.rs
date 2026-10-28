@@ -99,8 +99,10 @@ impl ApiState {
             ));
         }
         if let Some(status) = self.operations.latest(&operation_id) {
-            if status.operation_kind == "media_readiness_wait"
-                && !crate::operations::is_terminal(&status)
+            if matches!(
+                status.operation_kind.as_str(),
+                "media_readiness_wait" | "load_drive"
+            ) && !crate::operations::is_terminal(&status)
             {
                 return Ok(pb::OperationRef {
                     operation_id: operation_id.as_bytes().to_vec(),
@@ -262,7 +264,10 @@ impl ApiState {
                 Err(Status::failed_precondition("drive-session owner is busy"))
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                handle.publish_failed("drive-session owner is stopped", &[("phase", "dispatch")]);
+                handle.publish_failed(
+                    "drive-session owner is stopped",
+                    &[("phase", "dispatch"), ("state", "dispatch_failed")],
+                );
                 Err(Status::unavailable("drive-session owner is stopped"))
             }
         }
@@ -275,7 +280,6 @@ struct DiscoveryRetry {
     live: bool,
     fast_until: Option<tokio::time::Instant>,
     next_attempt: tokio::time::Instant,
-    started: bool,
     refusals: std::collections::HashSet<String>,
 }
 
@@ -333,7 +337,6 @@ pub(crate) fn spawn_auto_resume(state: ApiState) {
                                 live,
                                 fast_until: Some(now + Duration::from_secs(5)),
                                 next_attempt: now,
-                                started: false,
                                 refusals: Default::default(),
                             });
                             if retry.state != record.state || (retry.live && !live) {
@@ -345,13 +348,19 @@ pub(crate) fn spawn_auto_resume(state: ApiState) {
                             if live {
                                 continue;
                             }
-                            if retry.started {
-                                retry.started = false;
-                                if state.operations.latest(&id).is_some_and(|status| {
-                                    status.state == pb::OperationState::Failed as i32
-                                }) {
-                                    retry.fast_until = None;
-                                }
+                            if state.operations.latest(&id).is_some_and(|status| {
+                                status.operation_kind == "media_readiness_wait"
+                                    && status.state == pb::OperationState::Failed as i32
+                                    && (status
+                                        .progress
+                                        .get("phase")
+                                        .is_none_or(|phase| phase != "dispatch")
+                                        || status
+                                            .progress
+                                            .get("state")
+                                            .is_some_and(|state| state == "dispatch_failed"))
+                            }) {
+                                retry.fast_until = None;
                             }
                             if retry.fast_until.is_some_and(|until| now >= until) {
                                 retry.fast_until = None;
@@ -369,7 +378,6 @@ pub(crate) fn spawn_auto_resume(state: ApiState) {
                                 if startup { "startup" } else { "session_open" },
                             ) {
                                 Ok(_) => {
-                                    retry.started = true;
                                     retry.live = true;
                                     retry.fast_until = None;
                                 }
@@ -450,6 +458,15 @@ pub(crate) async fn wait_after_refusal(
     let deadline = *deadline;
     let index = state.index()?;
     loop {
+        if state
+            .readiness_shutdown
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Status::unavailable(format!(
+                "{original_refusal}; {}",
+                SHUTDOWN_REASON
+            )));
+        }
         if handle.is_cancelled() {
             return Err(Status::cancelled(
                 "operation cancelled during readiness wait",
@@ -462,7 +479,18 @@ pub(crate) async fn wait_after_refusal(
         let latest = state.operations.latest(&id);
         let cancelled = record.cancel_source.as_deref() == Some("operator");
         let expired = tokio::time::Instant::now() >= deadline;
-        if cancelled || expired || (!is_resumable(&record.state) && record.state != "ready") {
+        let dispatch_failed = latest.as_ref().is_some_and(|status| {
+            status.state == pb::OperationState::Failed as i32
+                && status
+                    .progress
+                    .get("state")
+                    .is_some_and(|state| state == "dispatch_failed")
+        });
+        if cancelled
+            || expired
+            || dispatch_failed
+            || (!is_resumable(&record.state) && record.state != "ready")
+        {
             let summary = latest
                 .as_ref()
                 .map(|s| s.error_summary.as_str())

@@ -12,7 +12,9 @@ mod bot_recovery;
 mod cleaning;
 mod readiness;
 #[cfg(test)]
-pub(crate) use tests::{fail_readiness_test_command, run_readiness_test_command};
+pub(crate) use tests::{
+    fail_readiness_actor, fail_readiness_test_command, run_readiness_test_command,
+};
 mod reconcile;
 mod restore;
 mod robotics;
