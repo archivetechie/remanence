@@ -23,6 +23,7 @@ pub(crate) fn start(
     state: &ApiState,
     actor: AuditActor,
     tape_uuid: [u8; 16],
+    ready_wait: Duration,
 ) -> Result<(pb::OperationRef, oneshot::Receiver<Verdict>), Status> {
     let id = Uuid::new_v4();
     state.record_request_received(actor, id, KIND, &tape_uuid, None)?;
@@ -36,7 +37,7 @@ pub(crate) fn start(
     let state = state.clone();
     let (tx, rx) = oneshot::channel();
     tokio::spawn(async move {
-        let result = async {
+        let result: Verdict = async {
             record(
                 &state,
                 &handle,
@@ -45,7 +46,29 @@ pub(crate) fn start(
                 BTreeMap::new(),
             )?;
             check_cancelled(&handle)?;
-            crate::mount::verify_tape_index(&state, tape_uuid, handle.clone(), progress).await
+            let mut deadline = None;
+            loop {
+                match crate::mount::verify_tape_index(
+                    &state,
+                    tape_uuid,
+                    handle.clone(),
+                    progress.clone(),
+                )
+                .await
+                {
+                    Ok(verdict) => break Ok(verdict),
+                    Err(error) => {
+                        crate::readiness_wait::wait_after_refusal(
+                            &state,
+                            &handle,
+                            error,
+                            ready_wait,
+                            &mut deadline,
+                        )
+                        .await?
+                    }
+                }
+            }
         }
         .await;
         // Mount ownership is released before a terminal status becomes visible.

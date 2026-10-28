@@ -120,6 +120,31 @@ until the fence is cleared. You will see messages like:
 run `rem tape quarantine show <id>` or wait-ready/resume before retrying
 ```
 
+The daemon resumes load-transient fences itself with a 9000 s timeout and
+30 s steady polls, including after startup reconciliation. Calls to
+`ResumeMediaReadiness` attach to a running wait for the same operation.
+`rem tape wait-ready --resume <UUID> --endpoint <URI>` watches that wait and
+prints readiness state changes. Its local `--timeout` returns 20 while the
+daemon keeps waiting. Without `--endpoint`, wait-ready uses direct SCSI and
+requires the daemon to be stopped. Operator cancellation leaves a wait stopped;
+an explicit resume may start it again. Startup still probes operator-cancelled
+fences and clears a ready drive or requires release when the cartridge is absent.
+Release-only states require release.
+
+Shutdown stops readiness discovery and ends running waits, including the wait
+inside LoadDrive, as Cancelled with a shutdown summary and their last durable
+readiness state. Their fences stay resumable without an operator cancellation;
+startup reconciliation and automatic discovery resume them on the next start.
+`wait-ready --resume --endpoint` returns 10 for this resumable shutdown end.
+Discovery retries failed waits and non-busy start refusals on its 30 s sweep;
+repeated readiness notifications do not restart the 5 s busy retry window.
+
+Detached verification and manual finalize workers wait up to 15 minutes for
+readiness. They keep waiting across failed or shutdown-cancelled readiness waits
+while the durable record stays resumable. A stopped finalize attempt reports
+FAILED with a summary while the intent stays FINALIZING. Reuse the same idempotency key to resume it;
+`rem tape finalize --wait` reports the stopped attempt and exits non-zero.
+
 `rem tape verify-index --tape-uuid <UUID>` resumes a media-readiness fence
 and waits up to `15m` before retrying verification. It prints each readiness
 state change to stderr. Use `--ready-wait <DURATION>` to set the wait, or
@@ -131,7 +156,8 @@ drive's last sense with its name, for example `sense=02/04/02 (initializing
 command required)`; a drive that reports `02/04/02` is covered under [A drive
 stays not ready after a daemon crash](#a-drive-stays-not-ready-after-a-daemon-crash).
 
-If the fence's operation can still be resumed, resume it. Otherwise, once you
+If an operator cancels a resumable wait, explicitly resume it to continue.
+For a release-only fence, once you
 have verified the physical state (inventory settled, cartridge where the
 library says it is), release it explicitly:
 

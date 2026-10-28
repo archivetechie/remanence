@@ -76,25 +76,31 @@ rem tape verify-index --tape-uuid TAPE_UUID --json
 ```
 
 A verification after a fresh load waits for the drive when a media-readiness
-fence blocks it. `verify-index` resumes the readiness operation with the daemon's
+fence blocks it. The daemon starts the wait itself; `verify-index` attaches with a
 9000 s timeout and watches locally for up to `15m`. It retries verification once
 the operation reports ready. Set `--ready-wait <DURATION>` to change only the
 local watch deadline, or `--ready-wait 0` to return the refusal immediately.
 The daemon keeps waiting after the command returns, so the fence clears when
-the drive becomes ready within its timeout. A later command resumes the
-readiness operation if the fence still blocks it.
+the drive becomes ready within its timeout. A timeout of the daemon wait
+requires operator release.
 
 Stderr announces the operation and wait duration when the wait starts, and
 announces expiry when the local deadline ends. Each `media readiness operation
 <UUID>: <state>` line reports a state change; `sense=KK/AA/QQ (name)` explains
 the drive's response when available, and `ready` ends the wait. At the deadline
-the command returns the daemon's original refusal. If another caller holds the
-drive for that readiness operation, verification watches it without resuming
-it. If the operation fails, is cancelled, or has an unknown completion, the
+the command returns the daemon's original refusal. A resume call attaches when
+that readiness operation already runs. If the operation fails, is cancelled,
+or has an unknown completion, the
 command returns the original refusal with the wait error appended after a
 semicolon; it does not retry verification. Resume and watch errors use the same
 form. A busy drive bay gets one retry after 1 s, including when the readiness
 operation reports success before releasing its reservation.
+
+Detached verification uses the daemon's own 15-minute readiness budget from the
+first refusal. Its operation reports `phase=readiness`, the readiness operation
+id, state and sense. Cancelling verification leaves the readiness wait running.
+A fence on another drive receives the same treatment when it blocks the robot.
+The unary RPC returns immediately; the CLI owns its `--ready-wait` budget.
 
 The drive is occupied for the whole run. Plan for that before you start; the
 section [How long a full verification takes](#how-long-a-full-verification-takes)

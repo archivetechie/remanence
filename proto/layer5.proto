@@ -212,14 +212,13 @@ service LibraryService {
   rpc ReinstateDrive    (ReinstateDriveRequest)       returns (ReinstateDriveResponse);
   rpc PollDrive         (PollDriveRequest)            returns (DriveHealthSnapshot);
   rpc CleanDrive        (CleanDriveRequest)           returns (OperationRef);
-  // Resume an existing durable media-readiness fence in place. Progress is
-  // observed through Daemon.WatchOperation using the returned operation id.
-  // The wait holds the fenced drive until it ends, so one caller at a time
-  // waits on a drive. A call while another caller holds that drive is
-  // refused with FAILED_PRECONDITION ("... is busy: another caller holds
-  // this drive while media-readiness operation ... is unresolved"), and the
-  // caller retries after the operation finishes. Any caller can follow a
-  // wait started through this RPC with Daemon.WatchOperation on the same id.
+  // Resume a durable media-readiness fence in place. A running wait for the
+  // same operation attaches and returns the same OperationRef, whether the
+  // daemon or a client starts it. WatchOperation reports started_by=daemon|client.
+  // The daemon starts resumable fences with a 9000 s timeout and 30 s steady
+  // polls. Release-only states and operator-cancelled waits need operator action.
+  // A different drive holder still returns FAILED_PRECONDITION with
+  // "another caller holds this drive while media-readiness operation ... is unresolved".
   rpc ResumeMediaReadiness (ResumeMediaReadinessRequest) returns (OperationRef);
   rpc ListAlarms        (ListAlarmsRequest)           returns (ListAlarmsResponse);
   rpc AckAlarm          (AckAlarmRequest)             returns (Alarm);
@@ -624,6 +623,9 @@ message LoadDriveRequest {
   bool no_wait                    = 5;
 }
 
+// Resume attaches to an existing wait or starts one with the larger of
+// timeout_seconds and the daemon readiness profile (9000 s). A caller with a
+// shorter deadline stops watching; its deadline does not stop the drive wait.
 message ResumeMediaReadinessRequest {
   // Durable media-readiness operation UUID returned in a readiness fence.
   bytes operation_id            = 1;
@@ -724,6 +726,10 @@ service Catalog {
   // boundary. This is valid below the pool low watermark and bypasses only
   // that automatic trigger; all fit, fence, ownership, and format checks stay
   // mandatory. An accepted request can never reopen the tape for Objects.
+  // The operation describes one attempt; TapeFinalization describes durable intent.
+  // A stopped worker publishes FAILED with a retry summary while intent remains
+  // FINALIZING and detail carries that summary. The same idempotency key resumes
+  // under the same operation id; retry and startup recovery publish RUNNING.
   rpc FinalizeTape     (FinalizeTapeRequest)      returns (TapeFinalization);
   rpc SupersedeTail    (SupersedeTailRequest)     returns (SupersedeTailResponse);
   rpc GetTapeFinalization (GetTapeFinalizationRequest) returns (TapeFinalization);
@@ -1201,6 +1207,8 @@ message ProtectedContentFinding {
   optional string detail = 3;
 }
 
+// FINALIZING can coexist with a failed attempt. Inspect GetOperation for the
+// attempt outcome and detail for its error summary; the same key resumes intent.
 message TapeFinalization {
   bytes tape_uuid = 1;
   // Operator finalization operation. Absent for BUSY, and for a finalization
@@ -1628,8 +1636,9 @@ service WriteSessionService {
   // FAILED_PRECONDITION naming that operation, even when other bays are
   // idle. The open probes readiness only briefly, so on real drives a cold
   // load commonly leaves such a fence. The caller retries the open once the
-  // operation finishes; LibraryService.ResumeMediaReadiness drives a fence to
-  // completion, one caller per drive at a time.
+  // operation finishes; the daemon resumes resumable fences, and
+  // LibraryService.ResumeMediaReadiness attaches to the same wait until
+  // completion with one drive wait shared by attached callers.
   rpc OpenWriteSession   (OpenWriteSessionRequest)   returns (WriteSession);
 
   // Stream one object into the session. The first message in each call must

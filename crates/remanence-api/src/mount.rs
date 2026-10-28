@@ -804,12 +804,20 @@ pub(crate) async fn manual_finalize_tape(
     };
     drop(index);
 
+    let handle = start_finalize_attempt(state, &actor_request)?;
     let worker_state = state.clone();
     tokio::spawn(async move {
         let tape_uuid = actor_request.tape_uuid;
         let operation_id = actor_request.candidate_operation_id;
-        if let Err(error) =
-            run_manual_finalize_worker(worker_state, pool, tape_reservation, actor_request).await
+        if let Err(error) = run_started_manual_finalize_worker(
+            worker_state,
+            pool,
+            tape_reservation,
+            actor_request,
+            Duration::from_secs(crate::readiness_wait::DEFAULT_OPERATION_READY_WAIT_SECONDS),
+            handle,
+        )
+        .await
         {
             tracing::error!(
                 tape_uuid = %Uuid::from_bytes(tape_uuid),
@@ -868,6 +876,159 @@ async fn run_manual_finalize_worker(
     state: ApiState,
     pool: crate::write_owner::DrivePool,
     _tape_reservation: crate::write_owner::TapeReservation,
+    actor_request: crate::write_owner::ManualFinalizeTapeActorRequest,
+) -> Result<(), Status> {
+    run_manual_finalize_worker_with_budget(
+        state,
+        pool,
+        _tape_reservation,
+        actor_request,
+        Duration::from_secs(crate::readiness_wait::DEFAULT_OPERATION_READY_WAIT_SECONDS),
+    )
+    .await
+}
+
+/// Keep one readiness deadline across every session-open attempt.
+async fn run_manual_finalize_worker_with_budget(
+    state: ApiState,
+    pool: crate::write_owner::DrivePool,
+    _tape_reservation: crate::write_owner::TapeReservation,
+    actor_request: crate::write_owner::ManualFinalizeTapeActorRequest,
+    ready_wait: Duration,
+) -> Result<(), Status> {
+    let handle = start_finalize_attempt(&state, &actor_request)?;
+    run_started_manual_finalize_worker(
+        state,
+        pool,
+        _tape_reservation,
+        actor_request,
+        ready_wait,
+        handle,
+    )
+    .await
+}
+
+/// Publish the new attempt before returning acceptance or launching its worker.
+fn start_finalize_attempt(
+    state: &ApiState,
+    request: &crate::write_owner::ManualFinalizeTapeActorRequest,
+) -> Result<crate::operations::OperationHandle, Status> {
+    record_finalize_attempt(
+        state,
+        request,
+        remanence_state::AuditEvent::OperationStarted,
+        None,
+    )?;
+    let handle = state
+        .operations
+        .register(request.candidate_operation_id, "finalize_tape");
+    handle.publish_state(pb::OperationState::Running, &[]);
+    Ok(handle)
+}
+
+/// Run an attempt whose durable and live RUNNING state is already visible.
+async fn run_started_manual_finalize_worker(
+    state: ApiState,
+    pool: crate::write_owner::DrivePool,
+    _tape_reservation: crate::write_owner::TapeReservation,
+    actor_request: crate::write_owner::ManualFinalizeTapeActorRequest,
+    ready_wait: Duration,
+    handle: crate::operations::OperationHandle,
+) -> Result<(), Status> {
+    let id = actor_request.candidate_operation_id;
+    let mut deadline = None;
+    let result: Result<(), Status> = async {
+        loop {
+            match manual_finalize_attempt(state.clone(), pool.clone(), actor_request.clone()).await
+            {
+                Ok(()) => break Ok(()),
+                Err(error) => {
+                    crate::readiness_wait::wait_after_refusal(
+                        &state,
+                        &handle,
+                        error,
+                        ready_wait,
+                        &mut deadline,
+                    )
+                    .await?
+                }
+            }
+        }
+    }
+    .await;
+    match result {
+        Ok(()) => {
+            handle.publish_state(pb::OperationState::Succeeded, &[]);
+            Ok(())
+        }
+        Err(error) => {
+            let summary = format!("{}; FinalizeTape with the same idempotency key resumes the finalization under the same operation id {id}", error.message());
+            let recorded = record_finalize_attempt(
+                &state,
+                &actor_request,
+                remanence_state::AuditEvent::OperationFailed,
+                Some(&summary),
+            );
+            handle.publish_failed(&summary, &[]);
+            if let Err(audit_error) = recorded {
+                return Err(Status::internal(format!(
+                    "{summary}; persist attempt failure: {audit_error}"
+                )));
+            }
+            Err(Status::new(error.code(), summary))
+        }
+    }
+}
+
+/// Persist attempt state independently of the durable finalization intent.
+fn record_finalize_attempt(
+    state: &ApiState,
+    request: &crate::write_owner::ManualFinalizeTapeActorRequest,
+    event: remanence_state::AuditEvent,
+    summary: Option<&str>,
+) -> Result<(), Status> {
+    let mut detail = std::collections::BTreeMap::from([
+        (
+            "finalize_attempt".into(),
+            ciborium::value::Value::Bool(true),
+        ),
+        (
+            "tape_uuid".into(),
+            ciborium::value::Value::Bytes(request.tape_uuid.to_vec()),
+        ),
+        (
+            "actor_fingerprint".into(),
+            ciborium::value::Value::Text(request.actor_fingerprint.clone()),
+        ),
+    ]);
+    if let Some(summary) = summary {
+        detail.insert(
+            "error_summary".into(),
+            ciborium::value::Value::Text(summary.into()),
+        );
+    }
+    crate::audit_projection::append_operation_audit(
+        &mut state.index_write()?,
+        state.audit_dir.as_ref(),
+        state.audit_fsync,
+        &state.audit_append_lock,
+        crate::audit_projection::OperationAuditInput {
+            actor: remanence_state::AuditActor::System,
+            operation_id: request.candidate_operation_id,
+            operation_kind: "finalize_tape",
+            event,
+            subject_kind: "tape",
+            subject_id: Some(Uuid::from_bytes(request.tape_uuid).to_string()),
+            idempotency_key: Some(request.idempotency_key),
+            detail,
+        },
+    )
+}
+
+/// Try the session open and physical finalization with one drive reservation.
+async fn manual_finalize_attempt(
+    state: ApiState,
+    pool: crate::write_owner::DrivePool,
     mut actor_request: crate::write_owner::ManualFinalizeTapeActorRequest,
 ) -> Result<(), Status> {
     let tape_uuid = actor_request.tape_uuid;
@@ -2101,6 +2262,7 @@ pub(crate) fn register_startup_seated_cartridges(
 }
 
 pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> {
+    state.begin_shutdown();
     let Ok(pool) = state.drive_pool() else {
         return Ok(());
     };
@@ -2504,6 +2666,22 @@ fn resolve_actor_mount(
         .iter()
         .find(|library| library.serial == library_serial)
         .ok_or_else(|| Status::not_found(format!("library {library_serial} not found")))?;
+    // Validate inventory before a library-wide fence masks a missing cartridge.
+    // Ignore reservations here so a readiness owner still yields its fence id.
+    resolve_actor_mount_plan_from_library(library, voltag.as_str(), &HashSet::new())?;
+    // Surface the fence identity even when its readiness waiter owns the bay.
+    let seated = library
+        .drive_bays
+        .iter()
+        .find(|bay| bay.loaded && bay.loaded_tape.as_deref() == Some(voltag.as_str()));
+    crate::startup_media_readiness::ensure_media_readiness_admitted(
+        &index,
+        "open session",
+        library_serial,
+        seated.map(|bay| bay.element_address),
+        barcode.as_deref(),
+        seated.is_none_or(|bay| bay.source_slot.is_some()),
+    )?;
     let mut plan = resolve_actor_mount_plan_from_library(library, voltag.as_str(), busy_bays)?;
     let mount = plan.mount_mut();
     mount.library_serial = library_serial.to_string();
@@ -4982,6 +5160,76 @@ mod tests {
             }
             _ => panic!("unexpected worker command"),
         };
+        let readiness_id = Uuid::new_v4();
+        state
+            .index_write()
+            .unwrap()
+            .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+                operation_id: readiness_id,
+                run_id: None,
+                endpoint: remanence_state::DriveKey::new("LIB001", 0x0101),
+                changer_sg: None,
+                drive_sg: None,
+                drive_serial: None,
+                barcode: Some("ASY001L9".into()),
+                source_slot: None,
+                media_generation: Some(9),
+                phase: "session_open_short_probe".into(),
+                state: "becoming_ready".into(),
+                dirty_scope: Some("drive+tape".into()),
+                deadline_at_utc: None,
+                evidence_path: None,
+            })
+            .unwrap();
+        first_reply
+            .send(Err(crate::readiness_wait::ReadinessFence(readiness_id)
+                .status("finalize session open: drive becomes ready")))
+            .unwrap();
+        crate::readiness_wait::spawn_auto_resume(state.clone());
+        let wait = tokio::time::timeout(Duration::from_secs(2), drive_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let crate::write_owner::DriveCommand::WaitReady {
+            handle,
+            reservation,
+            ..
+        } = wait
+        else {
+            panic!("automatic readiness command");
+        };
+        assert_eq!(
+            state
+                .operations
+                .latest(&accepted.operation_id)
+                .unwrap()
+                .progress["phase"],
+            "readiness"
+        );
+        state
+            .index_write()
+            .unwrap()
+            .record_media_readiness_transition(
+                crate::startup_media_readiness::startup_media_readiness_probe_transition(
+                    readiness_id,
+                    &remanence_library::MediaReadiness::Ready,
+                ),
+            )
+            .unwrap();
+        handle.publish_state(pb::OperationState::Succeeded, &[("state", "ready")]);
+        drop(reservation);
+        let crate::write_owner::DriveCommand::FinalizeTape {
+            reply: first_reply, ..
+        } = tokio::time::timeout(Duration::from_secs(2), drive_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("retry finalize open");
+        };
+        state
+            .readiness_shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
         let polled =
             <crate::CatalogService as crate::pb::catalog_server::Catalog>::get_tape_finalization(
                 &state.catalog_service(),
@@ -5066,6 +5314,103 @@ mod tests {
         })
         .await
         .expect("failed worker releases exact-tape ownership");
+        let failed = state
+            .index()
+            .unwrap()
+            .get_operation(&accepted.operation_id.to_string())
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.state, "failed");
+        let summary = failed.error_summary.unwrap();
+        assert!(summary.contains("same idempotency key"));
+        let polled =
+            <crate::CatalogService as crate::pb::catalog_server::Catalog>::get_tape_finalization(
+                &state.catalog_service(),
+                tonic::Request::new(pb::GetTapeFinalizationRequest {
+                    tape_uuid: tape_uuid.to_vec(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            polled.outcome,
+            pb::TapeFinalizationOutcome::Finalizing as i32
+        );
+        assert_eq!(polled.detail, summary);
+        // A fresh registry uses the durable audit projection for GetOperation.
+        let reopened = ApiState::new(CatalogIndex::open(&index_path).unwrap());
+        let stored = <crate::DaemonService as crate::pb::daemon_server::Daemon>::get_operation(
+            &reopened.daemon_service(),
+            tonic::Request::new(pb::GetOperationRequest {
+                operation_id: accepted.operation_id.as_bytes().to_vec(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(stored.state, pb::OperationState::Failed as i32);
+        assert_eq!(stored.error_summary, summary);
+        state
+            .index_write()
+            .unwrap()
+            .record_media_readiness_transition(
+                crate::startup_media_readiness::startup_media_readiness_probe_transition(
+                    readiness_id,
+                    &remanence_library::MediaReadiness::BecomingReady {
+                        ascq: 1,
+                        media_initializing: false,
+                    },
+                ),
+            )
+            .unwrap();
+        let (_, retry_request) =
+            prepare_manual_finalize_request(&state.index().unwrap(), admission.clone(), |id| {
+                state.pool_config(id)
+            })
+            .unwrap();
+        let guard = pool.reserve_tape(tape_uuid).unwrap();
+        let deadline_error = run_manual_finalize_worker_with_budget(
+            state.clone(),
+            pool.clone(),
+            guard,
+            retry_request,
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+        assert!(deadline_error.message().contains("deadline expired"));
+        assert!(deadline_error.message().contains("same idempotency key"));
+        assert_eq!(
+            state
+                .index()
+                .unwrap()
+                .get_operation(&accepted.operation_id.to_string())
+                .unwrap()
+                .unwrap()
+                .state,
+            "failed"
+        );
+        assert_eq!(
+            state
+                .index()
+                .unwrap()
+                .terminal_finalization(&tape_uuid)
+                .unwrap()
+                .unwrap()
+                .outcome,
+            remanence_state::TerminalFinalizationOutcome::InProgress
+        );
+        state
+            .index_write()
+            .unwrap()
+            .record_media_readiness_transition(
+                crate::startup_media_readiness::startup_media_readiness_probe_transition(
+                    readiness_id,
+                    &remanence_library::MediaReadiness::Ready,
+                ),
+            )
+            .unwrap();
         let mut recovery_index = CatalogIndex::open(&index_path).expect("open recovery projection");
         recovery_index
             .project_terminal_finalization(remanence_state::TerminalFinalizationProjectionInput {
@@ -5092,10 +5437,49 @@ mod tests {
             remanence_state::TerminalFinalizationOutcome::RecoveryRequired,
             "an explicit repair retry must retain the safety classification before redispatch"
         );
+        // A --wait poll immediately after acceptance sees the new attempt, before the worker runs.
+        assert_eq!(
+            state
+                .operations
+                .latest(&accepted.operation_id)
+                .unwrap()
+                .state,
+            pb::OperationState::Running as i32
+        );
+        assert_eq!(
+            state
+                .index()
+                .unwrap()
+                .get_operation(&accepted.operation_id.to_string())
+                .unwrap()
+                .unwrap()
+                .state,
+            "running"
+        );
+        let polled = <crate::DaemonService as crate::pb::daemon_server::Daemon>::get_operation(
+            &state.daemon_service(),
+            tonic::Request::new(pb::GetOperationRequest {
+                operation_id: accepted.operation_id.as_bytes().to_vec(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(polled.state, pb::OperationState::Running as i32);
         let retried_command = tokio::time::timeout(Duration::from_secs(1), drive_rx.recv())
             .await
             .expect("same-key retry redispatches")
             .expect("retry drive command");
+        assert_eq!(
+            state
+                .index()
+                .unwrap()
+                .get_operation(&accepted.operation_id.to_string())
+                .unwrap()
+                .unwrap()
+                .state,
+            "running"
+        );
         let retried_reply = match retried_command {
             crate::write_owner::DriveCommand::FinalizeTape { request, reply, .. } => {
                 assert_eq!(request.candidate_operation_id, accepted.operation_id);
@@ -5127,6 +5511,16 @@ mod tests {
             .await
             .expect("startup resumes manual intent")
             .expect("resumed drive command");
+        assert_eq!(
+            state
+                .index()
+                .unwrap()
+                .get_operation(&accepted.operation_id.to_string())
+                .unwrap()
+                .unwrap()
+                .state,
+            "running"
+        );
         match resumed {
             crate::write_owner::DriveCommand::FinalizeTape { request, reply, .. } => {
                 assert_eq!(request.candidate_operation_id, accepted.operation_id);
@@ -5238,6 +5632,20 @@ mod tests {
             completed.projection.outcome,
             remanence_state::TerminalFinalizationOutcome::Finalized
         );
+        let completed_operation =
+            <crate::DaemonService as crate::pb::daemon_server::Daemon>::get_operation(
+                &state.daemon_service(),
+                tonic::Request::new(pb::GetOperationRequest {
+                    operation_id: accepted.operation_id.as_bytes().to_vec(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            completed_operation.state,
+            pb::OperationState::Succeeded as i32
+        );
         assert!(
             drive_rx.try_recv().is_err(),
             "manual post-C API route reached drive actor"
@@ -5246,6 +5654,50 @@ mod tests {
             changer_rx.try_recv().is_err(),
             "manual post-C API route reached changer actor"
         );
+    }
+
+    /// An unrelated fence does not hide a catalogued cartridge absent from inventory.
+    #[test]
+    fn absent_tape_precedes_library_readiness_fence() {
+        let harness = dismount_harness(0);
+        let tape_uuid = [0x91; 16];
+        let mut index = harness.state.index_write().unwrap();
+        index
+            .provision_tape(remanence_state::ProvisionTapeInput {
+                tape_uuid,
+                voltag: "ABSENTL9".into(),
+                block_size: 262144,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .unwrap();
+        index
+            .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+                operation_id: Uuid::new_v4(),
+                run_id: None,
+                endpoint: remanence_state::DriveKey::new("LIB001", 0x101),
+                changer_sg: None,
+                drive_sg: None,
+                drive_serial: None,
+                barcode: Some("OLD001L9".into()),
+                source_slot: Some(0x401),
+                media_generation: Some(9),
+                phase: "readiness_poll".into(),
+                state: "becoming_ready".into(),
+                dirty_scope: Some("drive+tape".into()),
+                deadline_at_utc: None,
+                evidence_path: None,
+            })
+            .unwrap();
+        let error = resolve_actor_mount(
+            &harness.state,
+            "LIB001",
+            &tape_uuid,
+            &HashSet::from([0x101]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::NotFound);
+        assert!(crate::readiness_wait::ReadinessFence::from_status(&error).is_none());
     }
 
     struct DismountHarness {
@@ -5332,6 +5784,204 @@ mod tests {
         };
         assert_eq!((src, dst), (0x0101, 0x0401));
         reply.send(Ok(())).expect("move reply receiver");
+    }
+
+    /// A client can reuse the ready fenced bay while finalize mounts a slot tape in another bay.
+    #[tokio::test]
+    async fn finalize_waits_for_another_drive_fence_then_uses_free_bay() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        const BLOCK_SIZE: u32 = 256 * 1024;
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-manual-finalize-async")
+            .tempdir()
+            .expect("tempdir");
+        let index_path = temp.path().join("state.sqlite");
+        let checkpoint_dir = temp.path().join("checkpoints");
+        let tape_uuid = [0xA5; 16];
+        let pool_id = "async-finalize";
+        let pool_config = TapePoolConfig {
+            scheme: None,
+            id: pool_id.to_string(),
+            display_name: None,
+            copy_class: None,
+            content_class: None,
+            selection_policy: PoolSelectionPolicyName::CompleteOrFill,
+            watermark_low: 0.92,
+            watermark_high: 0.97,
+            capacity_cap_bytes: None,
+            block_size_bytes: u64::from(BLOCK_SIZE),
+            min_object_size_bytes: 0,
+        };
+        let mut index = CatalogIndex::open(&index_path).expect("open catalog");
+        index
+            .upsert_tape_pool_projection(TapePoolProjectionInput {
+                pool_id: pool_id.to_string(),
+                display_name: None,
+                copy_class: None,
+                content_class: None,
+                created_at_utc: None,
+            })
+            .expect("project pool");
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "ASY001L9".to_string(),
+                block_size: BLOCK_SIZE,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision tape");
+        index
+            .project_tape_pool_membership(tape_uuid, pool_id)
+            .expect("assign pool");
+        let checkpoint = manual_finalize_checkpoint(tape_uuid, BLOCK_SIZE);
+        remanence_state::FileCheckpointJournal::open(&checkpoint_dir, tape_uuid)
+            .expect("open checkpoint journal")
+            .append(&checkpoint)
+            .expect("append checkpoint");
+        index
+            .project_checkpoint_record(&checkpoint)
+            .expect("project checkpoint");
+
+        let mut state = ApiState::new_with_pool_configs(index, [pool_config]);
+        state.default_library_serial = Some(Arc::new("LIB001".to_string()));
+        let mut loaded = drive_bay(0x0101, false, None);
+        loaded.source_slot = None;
+        state.library_snapshot = Some(Arc::new(std::sync::RwLock::new(Arc::new(
+            crate::live_status::LibrarySnapshot {
+                report: remanence_library::DiscoveryReport {
+                    unattached_drives: Vec::new(),
+                    complete: true,
+                    incomplete_evidence: Vec::new(),
+                    libraries: vec![test_library(
+                        vec![drive_bay(0x0100, true, Some("OTHERL9")), loaded],
+                        vec![slot(0x0401, "ASY001L9")],
+                    )],
+                    warnings: Vec::new(),
+                },
+                captured_at: time::OffsetDateTime::UNIX_EPOCH,
+            },
+        ))));
+        let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel(2);
+        let (changer_tx, mut changer_rx) = tokio::sync::mpsc::channel(1);
+        let (foreign_tx, _foreign_rx) = tokio::sync::mpsc::channel(1);
+        let pool = crate::write_owner::DrivePool::new(
+            changer_tx,
+            std::collections::HashMap::from([(0x0100, foreign_tx), (0x0101, drive_tx)]),
+            Arc::new(std::collections::HashMap::from([
+                (0x0100, AtomicBool::new(false)),
+                (0x0101, AtomicBool::new(false)),
+            ])),
+        );
+        state.drive_pool = Some(pool.clone());
+        let admission = ManualFinalizeTapeAdmission {
+            candidate_operation_id: Uuid::from_u128(0xA503),
+            actor: remanence_state::AuditActor::User("async@example.invalid".to_string()),
+            actor_fingerprint: "sha256:async-finalize".to_string(),
+            idempotency_key: Uuid::from_u128(0xA504),
+            request_fingerprint: [0xA5; 32],
+            tape_uuid,
+            expected_pool_id: Some(pool_id.to_string()),
+            reason: "ship accepted tape".to_string(),
+        };
+
+        state.drive_idle_unload_seconds = 0;
+        let readiness_id = Uuid::new_v4();
+        state
+            .index_write()
+            .unwrap()
+            .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+                operation_id: readiness_id,
+                run_id: None,
+                endpoint: remanence_state::DriveKey::new("LIB001", 0x100),
+                changer_sg: None,
+                drive_sg: None,
+                drive_serial: Some("DRV0100".into()),
+                barcode: Some("OTHERL9".into()),
+                source_slot: None,
+                media_generation: Some(9),
+                phase: "session_open_short_probe".into(),
+                state: "becoming_ready".into(),
+                dirty_scope: Some("drive+tape".into()),
+                deadline_at_utc: None,
+                evidence_path: None,
+            })
+            .unwrap();
+        let key = remanence_state::DriveKey::new("LIB001", 0x100);
+        let readiness_reservation = pool.reserve_drive(&key).unwrap();
+        pool.set_holder(&key, None, "media_readiness_wait", readiness_id);
+        let result = manual_finalize_tape(&state, admission.clone())
+            .await
+            .unwrap();
+        let crate::write_owner::ManualFinalizeTapeResult::Accepted(accepted) = result else {
+            panic!("accept")
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !state
+                .operations
+                .latest(&accepted.operation_id)
+                .is_some_and(|s| {
+                    s.progress.get("readiness_operation_id") == Some(&readiness_id.to_string())
+                })
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        state
+            .index_write()
+            .unwrap()
+            .record_media_readiness_transition(
+                crate::startup_media_readiness::startup_media_readiness_probe_transition(
+                    readiness_id,
+                    &remanence_library::MediaReadiness::Ready,
+                ),
+            )
+            .unwrap();
+        drop(readiness_reservation);
+        let _client = pool.reserve_drive(&key).unwrap();
+        pool.set_holder(&key, None, "read_session", Uuid::new_v4());
+        let command = tokio::time::timeout(Duration::from_secs(2), changer_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let crate::write_owner::ChangerCommand::Move { src, dst, reply } = command else {
+            panic!("move")
+        };
+        assert_eq!((src, dst), (0x401, 0x101));
+        reply.send(Ok(())).unwrap();
+        let command = tokio::time::timeout(Duration::from_secs(1), drive_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let crate::write_owner::DriveCommand::FinalizeTape {
+            request,
+            needs_drive_load,
+            reply,
+            ..
+        } = command
+        else {
+            panic!("finalize")
+        };
+        assert!(needs_drive_load);
+        assert_eq!(request.candidate_operation_id, accepted.operation_id);
+        reply.send(Ok(accepted)).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state
+                .operations
+                .latest(&admission.candidate_operation_id)
+                .unwrap()
+                .state
+                != pb::OperationState::Succeeded as i32
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     fn test_library(drive_bays: Vec<DriveBay>, slots: Vec<Slot>) -> Library {

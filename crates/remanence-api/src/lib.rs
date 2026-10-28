@@ -121,6 +121,7 @@ mod pool_write;
 pub mod read_core;
 mod read_plan;
 mod read_session_service;
+pub mod readiness_wait;
 mod startup_checkpoint;
 mod startup_guard;
 mod startup_media_readiness;

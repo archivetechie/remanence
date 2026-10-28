@@ -71,11 +71,24 @@ pub(crate) fn session_open_short_probe_or_load(
     ))
 }
 
+/// Run a readiness wait without a pool reservation in transport tests.
+#[cfg(test)]
 pub(crate) fn handle_drive_wait_ready(
     index: &mut CatalogIndex,
     drive: &mut DriveHandle,
     request: DriveReadinessPoll<'_>,
     handle: &crate::operations::OperationHandle,
+) {
+    handle_drive_wait_ready_and_release(index, drive, request, handle, None);
+}
+
+/// Release drive ownership before terminal progress makes an open retry eligible.
+pub(crate) fn handle_drive_wait_ready_and_release(
+    index: &mut CatalogIndex,
+    drive: &mut DriveHandle,
+    request: DriveReadinessPoll<'_>,
+    handle: &crate::operations::OperationHandle,
+    reservation: Option<super::DriveReservation>,
 ) {
     let bay = request.bay;
     handle.publish_state(
@@ -83,6 +96,7 @@ pub(crate) fn handle_drive_wait_ready(
         &[("phase", "readiness_poll"), ("state", "starting")],
     );
     let result = poll_drive_media_readiness(index, drive, request, handle);
+    drop(reservation);
 
     match result {
         Ok(poll) if poll.readiness.is_ready() => handle.publish_state(
@@ -108,6 +122,9 @@ pub(crate) fn handle_drive_wait_ready(
             };
             handle.publish_failed(&summary, &[("phase", "readiness_poll"), ("state", state)]);
         }
+        Err(error) if error.contains(crate::readiness_wait::SHUTDOWN_REASON) => {
+            publish_readiness_shutdown(index, handle, &error);
+        }
         Err(error) if handle.is_cancelled() => handle.publish_state(
             pb::OperationState::Cancelled,
             &[("phase", "cancelled"), ("detail", error.as_str())],
@@ -117,6 +134,31 @@ pub(crate) fn handle_drive_wait_ready(
             &[("phase", "readiness_poll"), ("state", "recording_failed")],
         ),
     }
+    handle.wake_readiness();
+}
+
+/// A shutdown end reports the last durable state without changing the fence.
+pub(crate) fn publish_readiness_shutdown(
+    index: &CatalogIndex,
+    handle: &crate::operations::OperationHandle,
+    error: &str,
+) {
+    let state = index
+        .media_readiness_operation(handle.op_id_uuid())
+        .ok()
+        .flatten()
+        .map(|record| record.state)
+        .unwrap_or_else(|| "unknown".into());
+    handle.publish(crate::operations::status_with_error(
+        handle.op_id_uuid(),
+        handle.operation_kind(),
+        pb::OperationState::Cancelled,
+        std::collections::HashMap::from([
+            ("phase".into(), "shutdown".into()),
+            ("state".into(), state),
+        ]),
+        error,
+    ));
 }
 
 /// Durable state and sense triple of the last not-ready observation a wait
@@ -180,9 +222,11 @@ pub(crate) fn poll_drive_media_readiness(
         options,
         load_budget,
         || {
-            handle
-                .is_cancelled()
-                .then(|| "daemon cancellation".to_string())
+            if handle.is_shutting_down() {
+                Some(crate::readiness_wait::SHUTDOWN_REASON.to_string())
+            } else {
+                handle.is_cancelled().then(|| "operator cancels readiness wait".to_string())
+            }
         },
         |event| match event {
             MediaReadinessWaitEvent::Poll(poll) => {
@@ -271,7 +315,16 @@ pub(crate) fn poll_drive_media_readiness(
                 );
                 Ok(())
             }
-            MediaReadinessWaitEvent::Cancelled(_) => Ok(()),
+            MediaReadinessWaitEvent::Cancelled(reason) => {
+                if reason == crate::readiness_wait::SHUTDOWN_REASON { return Ok(()); }
+                let record = index.media_readiness_operation(operation_id).map_err(|e| e.to_string())?.ok_or("readiness operation missing")?;
+                let mut transition = crate::startup_media_readiness::startup_media_readiness_requires_release_transition(&record, operation_id);
+                transition.phase = Some("cancelled".into());
+                transition.cancel_source = Some("operator".into());
+                transition.last_error_json = Some(session_open_json_detail("cancelled", "operator cancels readiness wait; explicit resume continues it"));
+                transition.quarantine_id = record.quarantine_id;
+                index.record_media_readiness_transition(transition).map(|_| ()).map_err(|e| e.to_string())
+            },
         },
     )
 }
@@ -286,9 +339,10 @@ pub(crate) fn session_open_reject_admission_conflicts(
     if conflicts.is_empty() {
         return Ok(());
     }
-    Err(Status::failed_precondition(
-        session_open_admission_error_message(ctx, &conflicts),
-    ))
+    Err(crate::readiness_wait::ReadinessFence(
+        crate::startup_media_readiness::parse_media_readiness_operation_id(&conflicts[0])?,
+    )
+    .status(session_open_admission_error_message(ctx, &conflicts)))
 }
 
 pub(crate) fn session_open_admission_error_message(
@@ -473,12 +527,14 @@ pub(crate) fn record_session_open_command_fence_on_operation(
             &err,
         );
     }
-    Status::failed_precondition(session_open_readiness_error_message(
-        ctx,
-        operation_id,
-        "transport_unknown",
-        detail.as_str(),
-    ))
+    crate::readiness_wait::ReadinessFence(operation_id).status(
+        session_open_readiness_error_message(
+            ctx,
+            operation_id,
+            "transport_unknown",
+            detail.as_str(),
+        ),
+    )
 }
 
 pub(crate) fn record_session_open_mechanical_transition(
@@ -557,12 +613,14 @@ pub(crate) fn record_session_open_readiness_fence_on_operation(
         state,
         readiness,
     );
-    Status::failed_precondition(session_open_readiness_error_message(
-        ctx,
-        operation_id,
-        state,
-        session_open_readiness_summary(readiness).as_str(),
-    ))
+    crate::readiness_wait::ReadinessFence(operation_id).status(
+        session_open_readiness_error_message(
+            ctx,
+            operation_id,
+            state,
+            session_open_readiness_summary(readiness).as_str(),
+        ),
+    )
 }
 
 pub(crate) fn record_session_open_readiness_transition_on_operation(
@@ -686,14 +744,7 @@ pub(crate) fn session_open_readiness_state(readiness: &MediaReadiness) -> &'stat
 }
 
 pub(crate) fn session_open_state_requires_release(state: &str) -> bool {
-    matches!(
-        state,
-        "aborted_unknown"
-            | "timeout_unknown"
-            | "transport_unknown"
-            | "terminal_error"
-            | "reservation_conflict"
-    )
+    crate::startup_media_readiness::media_readiness_state_requires_release(state)
 }
 
 pub(crate) type SessionOpenReadinessEvidence = (

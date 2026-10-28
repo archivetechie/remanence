@@ -174,6 +174,7 @@ impl pb::daemon_server::Daemon for DaemonService {
             pb::OperationState::Succeeded
                 | pb::OperationState::Failed
                 | pb::OperationState::Cancelled
+                | pb::OperationState::CompletionUnknown
         ) {
             return Ok(Response::new(pb::CancelOperationResponse {
                 resulting_state: resulting_state as i32,
@@ -331,7 +332,14 @@ impl pb::catalog_server::Catalog for CatalogService {
     ) -> Result<Response<pb::OperationRef>, Status> {
         let actor = authorize_request(&request, AuthPermission::ReadTape)?;
         let tape_uuid = decode_uuid_bytes(&request.into_inner().tape_uuid, "tape_uuid")?;
-        let (operation, _) = crate::tape_verification::start(&self.state, actor, tape_uuid)?;
+        let (operation, _) = crate::tape_verification::start(
+            &self.state,
+            actor,
+            tape_uuid,
+            std::time::Duration::from_secs(
+                crate::readiness_wait::DEFAULT_OPERATION_READY_WAIT_SECONDS,
+            ),
+        )?;
         Ok(Response::new(operation))
     }
 
@@ -353,7 +361,12 @@ impl pb::catalog_server::Catalog for CatalogService {
     ) -> Result<Response<pb::TapeIndexVerification>, Status> {
         let actor = authorize_request(&request, AuthPermission::ReadTape)?;
         let tape_uuid = decode_uuid_bytes(&request.into_inner().tape_uuid, "tape_uuid")?;
-        let (_, result) = crate::tape_verification::start(&self.state, actor, tape_uuid)?;
+        let (_, result) = crate::tape_verification::start(
+            &self.state,
+            actor,
+            tape_uuid,
+            std::time::Duration::ZERO,
+        )?;
         let result = result
             .await
             .map_err(|_| Status::unavailable("verification task stopped"))??;
@@ -591,11 +604,21 @@ impl pb::catalog_server::Catalog for CatalogService {
         let projection = tape
             .terminal_finalization
             .ok_or_else(|| Status::not_found("tape has no terminal-finalization authority"))?;
-        Ok(Response::new(tape_finalization_to_proto(
-            tape_uuid,
-            projection.operation_id,
-            projection,
-        )))
+        let operation_id = projection.operation_id;
+        let mut response = tape_finalization_to_proto(tape_uuid, operation_id, projection);
+        if response.outcome == pb::TapeFinalizationOutcome::Finalizing as i32 {
+            if let Some(id) = operation_id {
+                if let Some(operation) = index
+                    .get_operation(&id.to_string())
+                    .map_err(status_from_state_error)?
+                {
+                    if let Some(summary) = operation.error_summary {
+                        response.detail = summary;
+                    }
+                }
+            }
+        }
+        Ok(Response::new(response))
     }
 
     async fn list_files_in_object(
@@ -718,7 +741,15 @@ impl pb::catalog_server::Catalog for CatalogService {
 
 /// Keep durable operation semantics while exposing process-local verification progress.
 fn overlay_operation(state: &ApiState, mut stored: pb::OperationStatus) -> pb::OperationStatus {
-    if stored.operation_kind != "tape_verification" {
+    if !matches!(
+        stored.operation_kind.as_str(),
+        "tape_verification" | "finalize_tape"
+    ) {
+        return stored;
+    }
+    if stored.operation_kind == "finalize_tape"
+        && stored.state == pb::OperationState::Succeeded as i32
+    {
         return stored;
     }
     let live = Uuid::from_slice(&stored.operation_id)

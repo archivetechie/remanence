@@ -7,14 +7,12 @@ use std::time::Duration;
 use tonic::transport::Channel;
 use uuid::Uuid;
 
-// Media-readiness waits mirror remfield-io: a cold library may need minutes
-// of load/position work before the first open succeeds.
-pub(crate) const DEFAULT_READY_TIMEOUT_SECONDS: u32 = 9_000;
-const DEFAULT_READY_POLL_SECONDS: u32 = 30;
+use remanence_api::readiness_wait::DEFAULT_READY_POLL_SECONDS;
+pub(crate) use remanence_api::readiness_wait::DEFAULT_READY_TIMEOUT_SECONDS;
 const DRIVE_BUSY_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// The daemon reports readiness fences as FailedPrecondition message tokens.
-/// It supplies no structured status detail for these refusals.
+/// Structured metadata also carries the durable state when resume is refused.
 pub(crate) fn readiness_operation(status: &tonic::Status) -> Option<Uuid> {
     retryable_precondition(status)
         .then(|| {
@@ -179,14 +177,19 @@ pub(crate) async fn wait_for_media_readiness_operation(
     state_changes_only: bool,
     err: &mut dyn Write,
 ) -> Result<(), DaemonClientError> {
-    client
+    if let Err(error) = client
         .resume(pb::ResumeMediaReadinessRequest {
             operation_id: operation_id.as_bytes().to_vec(),
             timeout_seconds,
             poll_interval_seconds: DEFAULT_READY_POLL_SECONDS.min(timeout_seconds).max(1),
         })
         .await
-        .map_err(status_error)?;
+    {
+        if readiness_state(&error) == Some("ready") {
+            return Ok(());
+        }
+        return Err(status_error(error));
+    }
     watch_media_readiness_operation(client, operation_id, state_changes_only, err).await
 }
 
@@ -207,6 +210,9 @@ pub(crate) async fn wait_for_verification_readiness(
         })
         .await
     {
+        if readiness_state(&error) == Some("ready") {
+            return Ok(());
+        }
         if held_readiness_operation(&error) != Some(operation_id) {
             return Err(status_error(error));
         }
@@ -272,6 +278,171 @@ async fn watch_media_readiness_operation(
     )))
 }
 
+/// Attach to a daemon wait; the command deadline never cancels the drive wait.
+pub(crate) fn run_daemon_wait_ready(
+    endpoint: &str,
+    operation: Uuid,
+    timeout: Duration,
+    json: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> std::process::ExitCode {
+    let result = (|| {
+        let runtime = crate::daemon_runtime().map_err(|e| e.message)?;
+        runtime.block_on(async {
+            let channel = crate::connect_daemon(endpoint).await?;
+            let mut client = DaemonReadinessClient::new(channel);
+            Ok::<_, String>(watch_daemon_wait_ready(&mut client, operation, timeout, err).await)
+        })
+    })();
+    let code = match result {
+        Ok(code) => code,
+        Err(error) => {
+            let _ = writeln!(err, "{error}");
+            40
+        }
+    };
+    if json {
+        let _ = writeln!(
+            out,
+            "{}",
+            serde_json::json!({"schema": "rem.tape.wait_ready_resume.v1", "operation_id": operation.to_string(), "exit_code": code})
+        );
+    }
+    std::process::ExitCode::from(code)
+}
+
+/// Read the durable classification when a fence completes before a resume arrives.
+fn readiness_state(status: &tonic::Status) -> Option<&str> {
+    status
+        .metadata()
+        .get("remanence-readiness-state")
+        .and_then(|value| value.to_str().ok())
+}
+
+/// Map daemon readiness state and operation outcomes to the wait-ready exit table.
+fn daemon_wait_ready_exit(status: &pb::OperationStatus) -> Option<u8> {
+    let state = status
+        .progress
+        .get("state")
+        .map(String::as_str)
+        .unwrap_or("");
+    if status.state == pb::OperationState::Cancelled as i32
+        && status
+            .progress
+            .get("phase")
+            .is_some_and(|phase| phase == "shutdown")
+        && remanence_api::readiness_wait::is_resumable(state)
+    {
+        return Some(10);
+    }
+    match pb::OperationState::try_from(status.state) {
+        Ok(pb::OperationState::Succeeded) => Some(0),
+        Ok(
+            pb::OperationState::Failed
+            | pb::OperationState::Cancelled
+            | pb::OperationState::CompletionUnknown,
+        ) => Some(match state {
+            "timeout_unknown" => 20,
+            "transport_unknown" | "aborted_unknown" => 40,
+            "reservation_conflict" => 50,
+            _ => 30,
+        }),
+        _ => None,
+    }
+}
+
+/// Print each readiness state once per change while watching the attached operation.
+async fn watch_daemon_wait_ready(
+    client: &mut impl ReadinessClient,
+    operation: Uuid,
+    timeout: Duration,
+    err: &mut dyn Write,
+) -> u8 {
+    let watch = async {
+        if let Err(error) = client
+            .resume(pb::ResumeMediaReadinessRequest {
+                operation_id: operation.as_bytes().to_vec(),
+                timeout_seconds: DEFAULT_READY_TIMEOUT_SECONDS,
+                poll_interval_seconds: DEFAULT_READY_POLL_SECONDS,
+            })
+            .await
+        {
+            if readiness_state(&error) == Some("ready") {
+                let _ = writeln!(err, "media readiness operation {operation}: ready");
+                return 0;
+            }
+            let _ = writeln!(err, "{error}");
+            if let Some(state) = readiness_state(&error) {
+                return match state {
+                    "timeout_unknown" => 20,
+                    "transport_unknown" | "aborted_unknown" => 40,
+                    "reservation_conflict" => 50,
+                    _ => 30,
+                };
+            }
+            return match error.code() {
+                tonic::Code::PermissionDenied
+                | tonic::Code::Unauthenticated
+                | tonic::Code::NotFound
+                | tonic::Code::InvalidArgument
+                | tonic::Code::FailedPrecondition => 50,
+                tonic::Code::DeadlineExceeded => 20,
+                tonic::Code::Unavailable | tonic::Code::Unknown => 40,
+                _ => 30,
+            };
+        }
+        let mut previous = None;
+        loop {
+            let status = match client.next().await {
+                Ok(Some(status)) => status,
+                Ok(None) => {
+                    let _ = writeln!(err, "readiness watch ends before a terminal state");
+                    return 40;
+                }
+                Err(error) => {
+                    let _ = writeln!(err, "{error}");
+                    return if error.code() == tonic::Code::DeadlineExceeded {
+                        20
+                    } else {
+                        40
+                    };
+                }
+            };
+            let state = status
+                .progress
+                .get("state")
+                .map(String::as_str)
+                .unwrap_or("unknown");
+            if previous.as_deref() != Some(state) {
+                let (sense_key, name_key) = remanence_library::MEDIA_READINESS_SENSE_PROGRESS_KEYS;
+                let sense = status
+                    .progress
+                    .get(sense_key)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                let name = status
+                    .progress
+                    .get(name_key)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                let _ = writeln!(
+                    err,
+                    "media readiness operation {operation}: {state} sense={sense} {name}"
+                );
+                previous = Some(state.to_owned());
+            }
+            if let Some(code) = daemon_wait_ready_exit(&status) {
+                if !status.error_summary.is_empty() {
+                    let _ = writeln!(err, "{}", status.error_summary);
+                }
+                return code;
+            }
+        }
+    };
+    tokio::time::timeout(timeout, watch).await.unwrap_or(20)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,6 +489,236 @@ mod tests {
             assert_eq!(
                 readiness_operation(&tonic::Status::failed_precondition(message)),
                 None
+            );
+        }
+    }
+    /// A fake stream keeps the daemon wait independent of the CLI deadline.
+    struct FakeReadiness {
+        events: std::collections::VecDeque<pb::OperationStatus>,
+        resumes: Vec<pb::ResumeMediaReadinessRequest>,
+        resume_error: Option<tonic::Status>,
+    }
+    impl ReadinessClient for FakeReadiness {
+        async fn resume(
+            &mut self,
+            request: pb::ResumeMediaReadinessRequest,
+        ) -> Result<(), tonic::Status> {
+            self.resumes.push(request);
+            match &self.resume_error {
+                Some(error) => Err(error.clone()),
+                None => Ok(()),
+            }
+        }
+        async fn watch(&mut self, _id: Uuid) -> Result<(), tonic::Status> {
+            Ok(())
+        }
+        async fn next(&mut self) -> Result<Option<pb::OperationStatus>, tonic::Status> {
+            if let Some(status) = self.events.pop_front() {
+                return Ok(Some(status));
+            }
+            std::future::pending().await
+        }
+    }
+
+    /// Daemon attachment uses the long wait and maps every command outcome.
+    #[tokio::test]
+    async fn daemon_wait_ready_attach_exit_codes_and_state_changes() {
+        for (state, operation_state, expected) in [
+            ("ready", pb::OperationState::Succeeded, 0),
+            ("becoming_ready", pb::OperationState::Running, 20),
+            ("timeout_unknown", pb::OperationState::Failed, 20),
+            ("terminal_error", pb::OperationState::Failed, 30),
+            ("transport_unknown", pb::OperationState::Failed, 40),
+            ("reservation_conflict", pb::OperationState::Failed, 50),
+        ] {
+            let event = |state: &str, op| pb::OperationStatus {
+                state: op as i32,
+                progress: std::collections::HashMap::from([("state".into(), state.into())]),
+                ..Default::default()
+            };
+            let mut client = FakeReadiness {
+                events: [
+                    event("becoming_ready", pb::OperationState::Running),
+                    event("becoming_ready", pb::OperationState::Running),
+                    event(state, operation_state),
+                ]
+                .into(),
+                resumes: vec![],
+                resume_error: None,
+            };
+            let mut err = vec![];
+            assert_eq!(
+                watch_daemon_wait_ready(
+                    &mut client,
+                    Uuid::new_v4(),
+                    Duration::from_millis(20),
+                    &mut err
+                )
+                .await,
+                expected
+            );
+            assert_eq!(client.resumes.len(), 1);
+            assert_eq!(client.resumes[0].timeout_seconds, 9000);
+            assert_eq!(client.resumes[0].poll_interval_seconds, 30);
+            let lines = String::from_utf8(err).unwrap();
+            assert_eq!(lines.matches(": becoming_ready sense=").count(), 1);
+        }
+    }
+
+    /// Shutdown of a resumable wait uses the still-not-ready exit code.
+    #[tokio::test]
+    async fn daemon_wait_ready_shutdown_preserves_resumable_exit() {
+        for readiness in [
+            "planned",
+            "pre_ready_loading",
+            "media_initializing",
+            "becoming_ready",
+            "target_busy",
+            "unit_attention",
+        ] {
+            let mut client = FakeReadiness {
+                events: [pb::OperationStatus {
+                    state: pb::OperationState::Cancelled as i32,
+                    progress: std::collections::HashMap::from([
+                        ("state".into(), readiness.into()),
+                        ("phase".into(), "shutdown".into()),
+                    ]),
+                    ..Default::default()
+                }]
+                .into(),
+                resumes: vec![],
+                resume_error: None,
+            };
+            assert_eq!(
+                watch_daemon_wait_ready(
+                    &mut client,
+                    Uuid::new_v4(),
+                    Duration::from_secs(1),
+                    &mut vec![]
+                )
+                .await,
+                10
+            );
+        }
+        let status = pb::OperationStatus {
+            state: pb::OperationState::Cancelled as i32,
+            progress: std::collections::HashMap::from([
+                ("state".into(), "becoming_ready".into()),
+                ("phase".into(), "cancelled".into()),
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(daemon_wait_ready_exit(&status), Some(30));
+    }
+
+    /// Open retry consumes the same attached wait for either initiating caller.
+    #[tokio::test]
+    async fn open_retry_watches_attached_wait_from_either_initiator() {
+        for started_by in ["daemon", "client"] {
+            let mut client = FakeReadiness {
+                events: [pb::OperationStatus {
+                    state: pb::OperationState::Succeeded as i32,
+                    progress: std::collections::HashMap::from([
+                        ("state".into(), "ready".into()),
+                        ("started_by".into(), started_by.into()),
+                    ]),
+                    ..Default::default()
+                }]
+                .into(),
+                resumes: vec![],
+                resume_error: None,
+            };
+            wait_for_media_readiness_operation(
+                &mut client,
+                Uuid::new_v4(),
+                DEFAULT_READY_TIMEOUT_SECONDS,
+                false,
+                &mut vec![],
+            )
+            .await
+            .unwrap();
+            assert_eq!(client.resumes.len(), 1);
+        }
+    }
+    /// Completion between the refused open and resume still permits the retry.
+    #[tokio::test]
+    async fn readiness_completes_before_resume_retries_open() {
+        let mut error =
+            tonic::Status::failed_precondition("operation is ready and cannot be resumed");
+        error
+            .metadata_mut()
+            .insert("remanence-readiness-state", "ready".parse().unwrap());
+        let mut client = FakeReadiness {
+            events: Default::default(),
+            resumes: vec![],
+            resume_error: Some(error),
+        };
+        let id = Uuid::new_v4();
+        wait_for_media_readiness_operation(&mut client, id, 9000, false, &mut vec![])
+            .await
+            .unwrap();
+        wait_for_verification_readiness(
+            &mut client,
+            id,
+            &tonic::Status::failed_precondition("fence"),
+            &mut vec![],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            watch_daemon_wait_ready(&mut client, id, Duration::from_secs(1), &mut vec![]).await,
+            0
+        );
+    }
+    /// Resume has its own JSON shape and never advertises the direct-device schema.
+    #[test]
+    fn daemon_wait_ready_json_uses_resume_schema() {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let id = Uuid::new_v4();
+        assert_eq!(
+            run_daemon_wait_ready(
+                "http://[",
+                id,
+                Duration::from_secs(1),
+                true,
+                &mut out,
+                &mut err
+            ),
+            std::process::ExitCode::from(40)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value["schema"], "rem.tape.wait_ready_resume.v1");
+        assert_eq!(value["operation_id"], id.to_string());
+        assert_eq!(value["exit_code"], 40);
+        assert!(String::from_utf8(err)
+            .unwrap()
+            .contains("invalid daemon endpoint"));
+    }
+
+    /// Timeouts before a watch starts use the same exit table as observed timeouts.
+    #[tokio::test]
+    async fn daemon_wait_ready_maps_resume_timeouts() {
+        let mut stored = tonic::Status::failed_precondition("wait timed out");
+        stored.metadata_mut().insert(
+            "remanence-readiness-state",
+            "timeout_unknown".parse().unwrap(),
+        );
+        for error in [stored, tonic::Status::deadline_exceeded("resume timed out")] {
+            let mut client = FakeReadiness {
+                events: Default::default(),
+                resumes: vec![],
+                resume_error: Some(error),
+            };
+            assert_eq!(
+                watch_daemon_wait_ready(
+                    &mut client,
+                    Uuid::new_v4(),
+                    Duration::from_secs(1),
+                    &mut vec![]
+                )
+                .await,
+                20
             );
         }
     }

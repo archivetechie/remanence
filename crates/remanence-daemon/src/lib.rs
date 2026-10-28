@@ -124,8 +124,10 @@ pub async fn serve(
     };
 
     let unix_shutdown = shutdown_future(shutdown_rx);
+    let shutdown_state = state.clone();
     tokio::spawn(async move {
         shutdown.await;
+        shutdown_state.begin_shutdown();
         let _ = shutdown_tx.send(true);
     });
 

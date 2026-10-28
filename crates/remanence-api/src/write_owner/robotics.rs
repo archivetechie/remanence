@@ -186,6 +186,9 @@ pub(crate) fn handle_robotics(
                 &[("phase", "catalog")],
             );
         }
+        (Err(message), _) if message.contains(crate::readiness_wait::SHUTDOWN_REASON) => {
+            super::readiness::publish_readiness_shutdown(index, &handle, &message);
+        }
         (Err(message), _) => {
             fail_library_operation(
                 index,
@@ -260,7 +263,9 @@ pub(crate) fn run_load_sequence(
             state: "planned".to_string(),
             dirty_scope: Some("drive+tape".to_string()),
             deadline_at_utc: OffsetDateTime::now_utc()
-                .checked_add(Duration::seconds(9_000))
+                .checked_add(Duration::seconds(i64::from(
+                    crate::readiness_wait::DEFAULT_READY_TIMEOUT_SECONDS,
+                )))
                 .and_then(|deadline| deadline.format(&Rfc3339).ok()),
             evidence_path: None,
         })

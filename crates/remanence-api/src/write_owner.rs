@@ -11,6 +11,8 @@ use tonic::Status;
 mod bot_recovery;
 mod cleaning;
 mod readiness;
+#[cfg(test)]
+pub(crate) use tests::{fail_readiness_test_command, run_readiness_test_command};
 mod reconcile;
 mod restore;
 mod robotics;
@@ -31,8 +33,10 @@ use crate::pool_write::SelectedTape;
 use crate::{pb, TapeUuid};
 
 pub(crate) const SPOOL_MAX_BYTES: u64 = crate::APPEND_SPOOL_MAX_BYTES;
-const LOAD_READY_TIMEOUT: StdDuration = StdDuration::from_secs(9_000);
-const LOAD_READY_POLL_INTERVAL: StdDuration = StdDuration::from_secs(30);
+const LOAD_READY_TIMEOUT: StdDuration =
+    StdDuration::from_secs(crate::readiness_wait::DEFAULT_READY_TIMEOUT_SECONDS as u64);
+const LOAD_READY_POLL_INTERVAL: StdDuration =
+    StdDuration::from_secs(crate::readiness_wait::DEFAULT_READY_POLL_SECONDS as u64);
 
 mod actor_protocol;
 pub(crate) use actor_protocol::*;

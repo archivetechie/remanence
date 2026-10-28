@@ -139,6 +139,13 @@ pub const OBJECT_COPY_REPRESENTATION_UNKNOWN: &str = "unknown";
 pub struct CatalogIndex {
     conn: Connection,
     path: PathBuf,
+    readiness_observer: Option<std::sync::Arc<dyn MediaReadinessObserver>>,
+}
+
+/// Process-local notification after durable readiness changes.
+pub trait MediaReadinessObserver: std::fmt::Debug + Send + Sync {
+    /// Wake the owner that discovers resumable readiness operations.
+    fn changed(&self);
 }
 
 /// Input metadata for indexing one consumed 3c journal replay.
@@ -1341,6 +1348,11 @@ pub struct TapeFileRecord {
 }
 
 impl CatalogIndex {
+    /// Subscribe this connection to durable readiness changes.
+    pub fn set_readiness_observer(&mut self, observer: std::sync::Arc<dyn MediaReadinessObserver>) {
+        self.readiness_observer = Some(observer);
+    }
+
     /// Open the SQLite projection and apply idempotent migrations.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StateError> {
         let path = path.as_ref().to_path_buf();
@@ -1351,7 +1363,11 @@ impl CatalogIndex {
         let conn = Connection::open(&path).map_err(|err| sqlite_open_error(&path, err))?;
         configure_sqlite(&conn)?;
         migrate(&conn)?;
-        Ok(Self { conn, path })
+        Ok(Self {
+            conn,
+            path,
+            readiness_observer: None,
+        })
     }
 
     /// Open the SQLite projection for read-only query serving.
@@ -1365,7 +1381,11 @@ impl CatalogIndex {
             .map_err(|err| sqlite_open_error(&path, err))?;
         configure_read_only_sqlite(&conn)?;
         validate_schema(&conn)?;
-        Ok(Self { conn, path })
+        Ok(Self {
+            conn,
+            path,
+            readiness_observer: None,
+        })
     }
 
     /// Query the catalog in place without a temporary copy or writable read marks.
@@ -1407,7 +1427,11 @@ impl CatalogIndex {
         conn.pragma_update(None, "temp_store", "MEMORY")
             .map_err(|e| sqlite_error("set inventory temp store", e))?;
         validate_schema(&conn)?;
-        Ok(Self { conn, path })
+        Ok(Self {
+            conn,
+            path,
+            readiness_observer: None,
+        })
     }
 
     /// Read only the tape identities needed to admit an exact full-catalog
@@ -1570,6 +1594,9 @@ impl CatalogIndex {
                 ],
             )
             .map_err(|err| sqlite_error("record media readiness operation", err))?;
+        if let Some(observer) = &self.readiness_observer {
+            observer.changed();
+        }
         self.media_readiness_operation(input.operation_id)?
             .ok_or_else(|| StateError::IndexCorrupt("media readiness operation vanished".into()))
     }
@@ -1672,6 +1699,9 @@ impl CatalogIndex {
                 ],
             )
             .map_err(|err| sqlite_error("record media readiness transition history", err))?;
+        if let Some(observer) = &self.readiness_observer {
+            observer.changed();
+        }
         self.media_readiness_operation(input.operation_id)?
             .ok_or_else(|| StateError::IndexCorrupt("media readiness operation vanished".into()))
     }

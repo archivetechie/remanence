@@ -127,6 +127,10 @@ trait FinalizationTransport {
     ) -> Result<pb::TapeFinalization, DaemonClientError>;
 
     fn get(&mut self, tape_uuid: Vec<u8>) -> Result<pb::TapeFinalization, PollFinalizationError>;
+    fn operation(
+        &mut self,
+        operation_id: Vec<u8>,
+    ) -> Result<pb::OperationStatus, PollFinalizationError>;
 }
 
 #[derive(Debug)]
@@ -139,6 +143,7 @@ struct DaemonFinalizationTransport {
     json: bool,
     endpoint: String,
     runtime: tokio::runtime::Runtime,
+    daemon: Option<pb::daemon_client::DaemonClient<Channel>>,
     client: Option<pb::catalog_client::CatalogClient<Channel>>,
 }
 
@@ -148,6 +153,7 @@ impl DaemonFinalizationTransport {
             endpoint: endpoint.to_string(),
             json,
             runtime: daemon_runtime()?,
+            daemon: None,
             client: None,
         })
     }
@@ -158,6 +164,7 @@ impl DaemonFinalizationTransport {
             self.runtime
                 .block_on(crate::observe_daemon(&channel, self.json))
                 .map_err(|e| e.message)?;
+            self.daemon = Some(pb::daemon_client::DaemonClient::new(channel.clone()));
             self.client = Some(pb::catalog_client::CatalogClient::new(channel));
         }
         Ok(())
@@ -179,6 +186,31 @@ impl FinalizationTransport for DaemonFinalizationTransport {
         response
             .map(tonic::Response::into_inner)
             .map_err(DaemonClientError::status)
+    }
+
+    fn operation(
+        &mut self,
+        operation_id: Vec<u8>,
+    ) -> Result<pb::OperationStatus, PollFinalizationError> {
+        if self.connect().is_err() {
+            self.client = None;
+            return Err(PollFinalizationError::Retryable);
+        }
+        match self.runtime.block_on(
+            self.daemon
+                .as_mut()
+                .expect("connected daemon client")
+                .get_operation(pb::GetOperationRequest { operation_id }),
+        ) {
+            Ok(response) => Ok(response.into_inner()),
+            Err(error) if is_retryable_poll_status(error.code()) => {
+                self.client = None;
+                Err(PollFinalizationError::Retryable)
+            }
+            Err(error) => Err(PollFinalizationError::Fatal(DaemonClientError::status(
+                error,
+            ))),
+        }
     }
 
     fn get(&mut self, tape_uuid: Vec<u8>) -> Result<pb::TapeFinalization, PollFinalizationError> {
@@ -313,6 +345,19 @@ fn execute_with_transport<T: FinalizationTransport>(
         validate_status(&status, &validated.tape_uuid, Some(&operation_id))?;
         if is_terminal(status.outcome)? {
             return Ok(status);
+        }
+        let operation = match transport.operation(operation_id.to_vec()) {
+            Ok(operation) => operation,
+            Err(PollFinalizationError::Retryable) => continue,
+            Err(PollFinalizationError::Fatal(error)) => return Err(error),
+        };
+        if matches!(
+            pb::OperationState::try_from(operation.state),
+            Ok(pb::OperationState::Failed
+                | pb::OperationState::Cancelled
+                | pb::OperationState::CompletionUnknown)
+        ) {
+            return Err(DaemonClientError::client(operation.error_summary));
         }
     }
 }
@@ -851,6 +896,7 @@ mod tests {
         get_calls: Vec<Vec<u8>>,
         finalize_response: Option<pb::TapeFinalization>,
         polls: VecDeque<Result<pb::TapeFinalization, PollFinalizationError>>,
+        attempt: Option<pb::OperationStatus>,
     }
 
     impl FinalizationTransport for MockTransport {
@@ -860,6 +906,17 @@ mod tests {
         ) -> Result<pb::TapeFinalization, DaemonClientError> {
             self.finalize_calls.push(request);
             Ok(self.finalize_response.take().expect("finalize response"))
+        }
+
+        fn operation(
+            &mut self,
+            operation_id: Vec<u8>,
+        ) -> Result<pb::OperationStatus, PollFinalizationError> {
+            Ok(self.attempt.clone().unwrap_or(pb::OperationStatus {
+                operation_id,
+                state: pb::OperationState::Running as i32,
+                ..Default::default()
+            }))
         }
 
         fn get(
@@ -1427,5 +1484,37 @@ mod tests {
             .unwrap_err()
             .message
             .contains("2 replica-progress rows"));
+    }
+    /// A durable intent does not keep --wait alive after its attempt stops.
+    #[test]
+    fn finalize_wait_exits_on_stopped_attempt() {
+        for state in [
+            pb::OperationState::Failed,
+            pb::OperationState::Cancelled,
+            pb::OperationState::CompletionUnknown,
+        ] {
+            let mut transport = MockTransport {
+                finalize_response: Some(status(pb::TapeFinalizationOutcome::Finalizing)),
+                polls: [Ok(status(pb::TapeFinalizationOutcome::Finalizing))].into(),
+                attempt: Some(pb::OperationStatus {
+                    state: state as i32,
+                    error_summary: "drive not ready; reuse the same idempotency key".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let error = execute_with_transport(
+                &mut transport,
+                args().validate().unwrap(),
+                true,
+                Duration::ZERO,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.message,
+                "drive not ready; reuse the same idempotency key"
+            );
+            assert_eq!(transport.finalize_calls.len(), 1);
+        }
     }
 }

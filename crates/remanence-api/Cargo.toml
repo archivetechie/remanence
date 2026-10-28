@@ -51,6 +51,7 @@ tonic-prost-build.workspace = true
 default = []
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 remanence-chaos = { path = "../remanence-chaos" }
 rusqlite = { workspace = true }
 serde_json = { workspace = true }

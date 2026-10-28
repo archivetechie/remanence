@@ -14,6 +14,13 @@ use super::{
     print_json_envelope, DaemonClientError, DEFAULT_DAEMON_ENDPOINT,
 };
 
+static DEFAULT_READY_WAIT_ARG: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "{}s",
+        remanence_api::readiness_wait::DEFAULT_OPERATION_READY_WAIT_SECONDS
+    )
+});
+
 const INVENTORY_JSON_SCHEMA: &str = "rem.tape.inventory.v1";
 const INVENTORY_STREAM_JSON_SCHEMA: &str = "rem.tape.inventory.stream.v1";
 const VERIFY_INDEX_JSON_SCHEMA: &str = "rem.tape.verify-index.v1";
@@ -41,7 +48,7 @@ pub(crate) struct TapeVerifyIndexArgs {
     inventory: TapeVerificationTargetArgs,
 
     /// Wait for a media-readiness fence. Accepts ms/s/m/h; 0 returns the refusal.
-    #[arg(long, value_name = "DURATION", default_value = "15m", value_parser = crate::parse_wait_duration_arg)]
+    #[arg(long, value_name = "DURATION", default_value = DEFAULT_READY_WAIT_ARG.as_str(), value_parser = crate::parse_wait_duration_arg)]
     ready_wait: std::time::Duration,
 
     /// Start a watchable verification and print its operation UUID.

@@ -70,3 +70,45 @@ are deprecated rather than reused or removed, and new behavior is introduced
 through new fields, RPCs, or services. The wire-presence census in CI prevents
 new scalar fields from entering the contract without an explicit presence
 decision.
+
+## Readiness and finalization operations
+
+`ResumeMediaReadiness` attaches to a running wait for the same operation id,
+whether the daemon or a client starts it. A different holder keeps the busy
+refusal. `WatchOperation` progress includes `started_by=daemon|client`, readiness
+state and decoded sense. The daemon starts resumable fences after session-open
+refusals and startup reconciliation, with a 9000 s timeout and 30 s steady polls.
+Release-only states require operator release. An operator-cancelled wait stays
+stopped until a client explicitly resumes it. Startup still reconciles that fence:
+a ready drive clears it, an absent cartridge requires release, and a resumable
+fence preserves the operator cancellation.
+
+Shutdown stops readiness admission before the servers drain and ends every
+running readiness wait, including the wait inside LoadDrive, as Cancelled with a
+shutdown summary and its last durable readiness state. Its durable fence
+keeps its resumable state without an operator cancellation, so startup
+reconciliation and automatic discovery resume it on the next start. Discovery
+wakes on durable changes and wait completion and keeps a 30 s safety sweep.
+Any live operation owns its fence id. Newly eligible or changed records get one
+5 s window of busy retries; notifications do not extend it. Failed waits and
+non-busy start refusals wait for the sweep. Each distinct start refusal logs once.
+A resume starts a wait with at least the daemon's 9000 s profile; a shorter
+client deadline stops watching without shortening the drive wait.
+
+`StartTapeVerification` waits on readiness fences, including fences on another
+drive that block robotics, for one 15-minute budget from the first refusal.
+Progress reports `phase=readiness`, `readiness_operation_id`, `state`, `sense`
+and `sense_name`. Cancellation stops verification within one 250 ms poll and
+leaves the readiness wait running. A failed or shutdown-cancelled readiness wait
+with a resumable record keeps the observer waiting. Release-only state, operator
+cancellation or deadline expiry includes the original refusal, readiness state
+and error summary. Unary `VerifyTapeIndex`
+returns the immediate refusal; its client controls the wait budget.
+
+`FinalizeTape` uses the same readiness wait. Its operation represents the
+attempt; `TapeFinalization` represents durable intent. If the worker stops,
+`GetOperation` reports FAILED with a durable error summary, and the projection
+stays FINALIZING with that summary in `detail`. FAILED persists until a same-key
+retry or startup recovery relaunches the worker. A retry publishes RUNNING before
+`FinalizeTape` returns. After a restart, recovery relaunches the worker under the
+same operation id and it reports RUNNING.

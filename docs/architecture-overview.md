@@ -301,15 +301,16 @@ finalization.
    Robot moves in one library are serialized behind media readiness. A load
    records a media-readiness fence until the drive reports READY, and the
    open probes readiness only briefly, so on real drives a cold load commonly
-   leaves a fence for the client to resume. While a fence is active, every
-   other request in that library that needs the robot is refused with the
-   fence's operation id, even when other bays are idle. One caller at a time
-   waits on a fenced drive, so a second client that tries to resume the same
-   operation gets `<library> drive bay 0x<bay> is busy: another caller holds
-   this drive while media-readiness operation <id> is unresolved`. It retries
-   the open after that operation finishes. [Media-readiness fences and
-   quarantine](guide-troubleshooting.md#media-readiness-fences-and-quarantine)
-   covers fences in general.
+   leaves a resumable fence. The daemon starts its readiness wait after the
+   refusing caller releases the drive, and also resumes eligible startup fences.
+   The wait uses a 9000 s timeout and 30 s steady polls. While a fence is active,
+   every request in that library that needs the robot is refused with the fence's
+   operation id, even when other bays are idle. Resume calls attach to the same
+   running wait. A different drive holder keeps the busy refusal. Detached
+   verification and manual finalization watch the fence and retry their open
+   within one 15-minute budget. Release-only fences and operator-cancelled waits
+   require operator action. [Media-readiness fences and quarantine](guide-troubleshooting.md#media-readiness-fences-and-quarantine)
+   covers these states.
 2. The actor prepares the drive: it rewinds, reads the bootstrap at BOT, and
    verifies that the tape UUID matches what the catalog expects. A tape that
    cannot prove its identity is never written.
