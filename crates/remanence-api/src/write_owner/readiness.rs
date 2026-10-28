@@ -122,21 +122,62 @@ pub(crate) fn handle_drive_wait_ready_and_release(
             };
             handle.publish_failed(&summary, &[("phase", "readiness_poll"), ("state", state)]);
         }
-        Err(error) if error.contains(crate::readiness_wait::SHUTDOWN_REASON) => {
-            publish_readiness_shutdown(index, handle, &error);
+        Err(DriveReadinessError::Shutdown) => {
+            publish_readiness_shutdown(index, handle, crate::readiness_wait::SHUTDOWN_REASON);
         }
-        Err(error) if error == "media readiness interrupted by operator cancels readiness wait" => {
-            handle.publish_state(
-                pb::OperationState::Cancelled,
-                &[("phase", "cancelled"), ("detail", error.as_str())],
-            )
-        }
-        Err(error) => handle.publish_failed(
+        Err(DriveReadinessError::CancelRecorded) => handle.publish_state(
+            pb::OperationState::Cancelled,
+            &[
+                ("phase", "cancelled"),
+                ("detail", "operator cancels readiness wait"),
+            ],
+        ),
+        Err(DriveReadinessError::Failed(error)) => handle.publish_failed(
             error.as_str(),
             &[("phase", "readiness_poll"), ("state", "recording_failed")],
         ),
     }
     handle.wake_readiness();
+}
+
+/// Carry a confirmed cancellation separately from persistence failures and shutdown.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum DriveReadinessError {
+    #[error("operator cancels readiness wait")]
+    CancelRecorded,
+    #[error("{0}", crate::readiness_wait::SHUTDOWN_REASON)]
+    Shutdown,
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<String> for DriveReadinessError {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
+/// Use the durable state and sense triple when a readiness owner ends.
+pub(crate) fn durable_readiness_progress(
+    record: &remanence_state::MediaReadinessOperationRecord,
+) -> std::collections::HashMap<String, String> {
+    let sense = match (record.last_sense_key, record.last_asc, record.last_ascq) {
+        (Some(k), Some(a), Some(q)) => format!("{k:02x}/{a:02x}/{q:02x}"),
+        _ => String::new(),
+    };
+    let name = match (record.last_asc, record.last_ascq) {
+        (Some(a), Some(q)) => {
+            remanence_library::media_readiness_sense_name(a as u8, q as u8).unwrap_or("")
+        }
+        _ => "",
+    };
+    let (sense_key, name_key) = remanence_library::MEDIA_READINESS_SENSE_PROGRESS_KEYS;
+    [
+        ("state".into(), record.state.clone()),
+        (sense_key.into(), sense),
+        (name_key.into(), name.into()),
+    ]
+    .into()
 }
 
 /// A shutdown end reports the last durable state without changing the fence.
@@ -145,20 +186,18 @@ pub(crate) fn publish_readiness_shutdown(
     handle: &crate::operations::OperationHandle,
     error: &str,
 ) {
-    let state = index
+    let mut progress = index
         .media_readiness_operation(handle.op_id_uuid())
         .ok()
         .flatten()
-        .map(|record| record.state)
-        .unwrap_or_else(|| "unknown".into());
+        .map(|record| durable_readiness_progress(&record))
+        .unwrap_or_else(|| [("state".into(), "unknown".into())].into());
+    progress.insert("phase".into(), "shutdown".into());
     handle.publish(crate::operations::status_with_error(
         handle.op_id_uuid(),
         handle.operation_kind(),
         pb::OperationState::Cancelled,
-        std::collections::HashMap::from([
-            ("phase".into(), "shutdown".into()),
-            ("state".into(), state),
-        ]),
+        progress,
         error,
     ));
 }
@@ -195,7 +234,7 @@ pub(crate) fn poll_drive_media_readiness(
     drive: &mut DriveHandle,
     request: DriveReadinessPoll<'_>,
     handle: &crate::operations::OperationHandle,
-) -> Result<MediaReadinessPoll, String> {
+) -> Result<MediaReadinessPoll, DriveReadinessError> {
     let DriveReadinessPoll {
         bay,
         operation_id,
@@ -218,6 +257,7 @@ pub(crate) fn poll_drive_media_readiness(
         .map(|serial| format!("library={serial} drive=0x{bay:04x}"))
         .unwrap_or_else(|| format!("drive=0x{bay:04x}"));
     let mut last_logged: Option<LoggedReadiness> = None;
+    let mut interruption = None;
     drive.wait_for_media_readiness_with_initializing_load(
         family,
         None,
@@ -318,17 +358,22 @@ pub(crate) fn poll_drive_media_readiness(
                 Ok(())
             }
             MediaReadinessWaitEvent::Cancelled(reason) => {
-                if reason == crate::readiness_wait::SHUTDOWN_REASON { return Ok(()); }
+                if reason == crate::readiness_wait::SHUTDOWN_REASON {
+                    interruption = Some(DriveReadinessError::Shutdown);
+                    return Ok(());
+                }
                 let record = index.media_readiness_operation(operation_id).map_err(|e| format!("operator cancel is not recorded: {e}"))?.ok_or("operator cancel is not recorded: readiness operation missing")?;
                 let mut transition = crate::startup_media_readiness::startup_media_readiness_requires_release_transition(&record, operation_id);
                 transition.phase = Some("cancelled".into());
                 transition.cancel_source = Some("operator".into());
                 transition.last_error_json = Some(session_open_json_detail("cancelled", "operator cancels readiness wait; explicit resume continues it"));
                 transition.quarantine_id = record.quarantine_id;
-                index.record_media_readiness_transition(transition).map(|_| ()).map_err(|e| format!("operator cancel is not recorded: {e}"))
+                index.record_media_readiness_transition(transition).map_err(|e| format!("operator cancel is not recorded: {e}"))?;
+                interruption = Some(DriveReadinessError::CancelRecorded);
+                Ok(())
             },
         },
-    )
+    ).map_err(|error| interruption.unwrap_or(DriveReadinessError::Failed(error)))
 }
 
 pub(crate) fn session_open_reject_admission_conflicts(

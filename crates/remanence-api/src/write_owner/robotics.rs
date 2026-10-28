@@ -29,101 +29,115 @@ use crate::audit_projection::{append_operation_audit, OperationAuditInput};
 use crate::drive_collection::observe_drive_catalog_from_libraries;
 use crate::pb;
 
+/// Defer every terminal path until the changer actor releases library ownership.
+pub(crate) enum RoboticsOutcome {
+    Completed {
+        action: Result<(), String>,
+        observation: Result<(), String>,
+    },
+    Failed {
+        message: String,
+        phase: &'static str,
+    },
+    Cancelled,
+}
+
+impl RoboticsOutcome {
+    /// Persist and publish an outcome after the actor refresh and guard release.
+    pub(crate) fn publish(
+        self,
+        index: &mut CatalogIndex,
+        cfg: &WriteOwnerConfig,
+        handle: &crate::operations::OperationHandle,
+        library_serial: &str,
+    ) {
+        match self {
+            Self::Completed {
+                action,
+                observation,
+            } => finish_library_operation(index, cfg, handle, library_serial, action, observation),
+            Self::Failed { message, phase } => fail_library_operation(
+                index,
+                cfg,
+                handle,
+                library_serial,
+                &message,
+                &[("phase", phase)],
+            ),
+            Self::Cancelled => cancel_library_operation(
+                index,
+                cfg,
+                handle,
+                library_serial,
+                "cancelled before dispatch",
+            ),
+        }
+    }
+}
+
 pub(crate) fn handle_robotics(
     index: &mut CatalogIndex,
     cfg: &WriteOwnerConfig,
-    library_serial: String,
+    library_serial: &str,
     action: RoboticsAction,
-    handle: crate::operations::OperationHandle,
-) {
+    handle: &crate::operations::OperationHandle,
+) -> RoboticsOutcome {
     if library_serial != cfg.actor_library_serial {
-        fail_library_operation(
-            index,
-            cfg,
-            &handle,
-            &library_serial,
-            &format!(
+        return RoboticsOutcome::Failed {
+            message: format!(
                 "robotics request for library {library_serial} reached actor for {}",
                 cfg.actor_library_serial
             ),
-            &[("phase", "routing")],
-        );
-        return;
+            phase: "routing",
+        };
     }
     if handle.is_cancelled() {
-        cancel_library_operation(
-            index,
-            cfg,
-            &handle,
-            &library_serial,
-            "cancelled before dispatch",
-        );
-        return;
+        return RoboticsOutcome::Cancelled;
     }
-    publish_running(&handle, &[("phase", "open")]);
+    publish_running(handle, &[("phase", "open")]);
     if let Err(err) = record_library_event(
         index,
         cfg,
-        &handle,
-        &library_serial,
+        handle,
+        library_serial,
         AuditEvent::OperationStarted,
         robotics_detail(&action),
     ) {
-        fail_library_operation(
-            index,
-            cfg,
-            &handle,
-            &library_serial,
-            &format!("record operation start audit: {err}"),
-            &[("phase", "audit")],
-        );
-        return;
+        return RoboticsOutcome::Failed {
+            message: format!("record operation start audit: {err}"),
+            phase: "audit",
+        };
     }
 
-    let lib = match cfg.report.library(&library_serial) {
+    let lib = match cfg.report.library(library_serial) {
         Some(lib) => lib,
         None => {
-            fail_library_operation(
-                index,
-                cfg,
-                &handle,
-                &library_serial,
-                &format!("library {library_serial} not found in discovery report"),
-                &[("phase", "open")],
-            );
-            return;
+            return RoboticsOutcome::Failed {
+                message: format!("library {library_serial} not found in discovery report"),
+                phase: "open",
+            }
         }
     };
     let mut library = match lib.open(&cfg.policy) {
         Ok(handle) => handle,
         Err(err) => {
-            fail_library_operation(
-                index,
-                cfg,
-                &handle,
-                &library_serial,
-                &format!("open library: {err}"),
-                &[("phase", "open")],
-            );
-            return;
+            return RoboticsOutcome::Failed {
+                message: format!("open library: {err}"),
+                phase: "open",
+            }
         }
     };
 
-    publish_running(&handle, &[("phase", "refresh")]);
+    publish_running(handle, &[("phase", "refresh")]);
     if let Err(err) = library.refresh() {
-        fail_library_operation(
-            index,
-            cfg,
-            &handle,
-            &library_serial,
-            &format!("refresh inventory: {err}"),
-            &[("phase", "refresh")],
-        );
-        return;
+        return RoboticsOutcome::Failed {
+            message: format!("refresh inventory: {err}"),
+            phase: "refresh",
+        };
     }
 
-    publish_running(&handle, &[("phase", "execute")]);
-    let action_result = match &action {
+    publish_running(handle, &[("phase", "execute")]);
+    let action = match &action {
         RoboticsAction::Refresh => Ok(()),
         RoboticsAction::Move { src, dst } => library
             .move_medium(*src, *dst, &cfg.policy)
@@ -132,7 +146,7 @@ pub(crate) fn handle_robotics(
             slot,
             bay,
             wait_ready,
-        } => run_load_sequence(index, cfg, &handle, &mut library, *slot, *bay, *wait_ready),
+        } => run_load_sequence(index, cfg, handle, &mut library, *slot, *bay, *wait_ready),
         RoboticsAction::Unload { bay, destination } => library
             .unload(*bay, *destination, &cfg.policy)
             .map_err(|err| err.to_string()),
@@ -142,7 +156,7 @@ pub(crate) fn handle_robotics(
         } => run_cleaning_sequence(
             index,
             cfg,
-            &handle,
+            handle,
             &mut library,
             drive_uuid.as_slice(),
             trigger.as_str(),
@@ -150,18 +164,13 @@ pub(crate) fn handle_robotics(
         .map_err(|err| err.to_string()),
     };
 
-    let observe_result = observe_refreshed_library(index, cfg, library.library())
+    let observation = observe_refreshed_library(index, cfg, library.library())
         .map_err(|err| err.message().to_string());
     publish_library_snapshot(&cfg.library_snapshot, library.library().clone());
-
-    finish_library_operation(
-        index,
-        cfg,
-        &handle,
-        &library_serial,
-        action_result,
-        observe_result,
-    );
+    RoboticsOutcome::Completed {
+        action,
+        observation,
+    }
 }
 
 /// Persist the robotics outcome before publishing its terminal status.
@@ -193,7 +202,14 @@ pub(crate) fn finish_library_operation(
                 );
                 return;
             }
-            handle.publish_state(pb::OperationState::Succeeded, &[("phase", "done")]);
+            let progress = library_operation_progress(index, handle, &[("phase", "done")]);
+            handle.publish(crate::operations::status_with_error(
+                handle.op_id_uuid(),
+                handle.operation_kind(),
+                pb::OperationState::Succeeded,
+                progress,
+                "",
+            ));
         }
         (Ok(()), Err(message)) => {
             fail_library_operation(
@@ -332,7 +348,8 @@ pub(crate) fn run_load_sequence(
             phase: "load_drive_readiness",
         },
         handle,
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     if !poll.readiness.is_ready() {
         let state = if poll.timed_out {
             "timeout_unknown"
@@ -475,6 +492,32 @@ pub(crate) fn record_library_event(
     )
 }
 
+/// Load completion carries the last durable classification, including its sense keys.
+fn library_operation_progress(
+    index: &CatalogIndex,
+    handle: &crate::operations::OperationHandle,
+    progress: &[(&str, &str)],
+) -> std::collections::HashMap<String, String> {
+    let mut progress: std::collections::HashMap<String, String> = progress
+        .iter()
+        .map(|(key, value)| ((*key).into(), (*value).into()))
+        .collect();
+    if handle.operation_kind() == "load_drive" {
+        match index.media_readiness_operation(handle.op_id_uuid()) {
+            Ok(Some(record)) => {
+                progress.extend(super::readiness::durable_readiness_progress(&record))
+            }
+            result => {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "read load readiness at completion");
+                }
+                progress.insert("state".into(), "unknown".into());
+            }
+        }
+    }
+    progress
+}
+
 pub(crate) fn fail_library_operation(
     index: &mut CatalogIndex,
     cfg: &WriteOwnerConfig,
@@ -483,14 +526,26 @@ pub(crate) fn fail_library_operation(
     error_summary: &str,
     progress: &[(&str, &str)],
 ) {
-    tracing::error!(
-        target: "remanence_library_operation",
-        operation_id = %handle.op_id_uuid(),
-        operation_kind = %handle.operation_kind(),
-        library_serial,
-        error_summary,
-        "library operation failed"
-    );
+    if progress.contains(&("phase", "shutdown")) {
+        tracing::info!(
+            target: "remanence_library_operation",
+            operation_id = %handle.op_id_uuid(),
+            operation_kind = %handle.operation_kind(),
+            library_serial,
+            error_summary,
+            "library operation stops for shutdown"
+        );
+    } else {
+        tracing::error!(
+            target: "remanence_library_operation",
+            operation_id = %handle.op_id_uuid(),
+            operation_kind = %handle.operation_kind(),
+            library_serial,
+            error_summary,
+            "library operation failed"
+        );
+    }
+    let progress = library_operation_progress(index, handle, progress);
     let mut detail = BTreeMap::new();
     detail.insert(
         "error_summary".to_string(),
@@ -505,9 +560,21 @@ pub(crate) fn fail_library_operation(
         detail,
     ) {
         let audit_error = format!("{error_summary}; audit record failed: {err}");
-        handle.publish_failed(audit_error.as_str(), progress);
+        handle.publish(crate::operations::status_with_error(
+            handle.op_id_uuid(),
+            handle.operation_kind(),
+            pb::OperationState::Failed,
+            progress,
+            &audit_error,
+        ));
     } else {
-        handle.publish_failed(error_summary, progress);
+        handle.publish(crate::operations::status_with_error(
+            handle.op_id_uuid(),
+            handle.operation_kind(),
+            pb::OperationState::Failed,
+            progress,
+            error_summary,
+        ));
     }
 }
 
@@ -532,12 +599,25 @@ pub(crate) fn cancel_library_operation(
         detail,
     ) {
         let audit_error = format!("{detail_message}; audit record failed: {err}");
-        handle.publish_failed(audit_error.as_str(), &[("phase", "audit")]);
+        handle.publish(crate::operations::status_with_error(
+            handle.op_id_uuid(),
+            handle.operation_kind(),
+            pb::OperationState::Failed,
+            library_operation_progress(index, handle, &[("phase", "audit")]),
+            &audit_error,
+        ));
     } else {
-        handle.publish_state(
+        handle.publish(crate::operations::status_with_error(
+            handle.op_id_uuid(),
+            handle.operation_kind(),
             pb::OperationState::Cancelled,
-            &[("phase", "cancelled"), ("detail", detail_message)],
-        );
+            library_operation_progress(
+                index,
+                handle,
+                &[("phase", "cancelled"), ("detail", detail_message)],
+            ),
+            "",
+        ));
     }
 }
 

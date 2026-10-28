@@ -327,11 +327,13 @@ fn daemon_wait_ready_exit(status: &pb::OperationStatus) -> Option<u8> {
         .get("state")
         .map(String::as_str)
         .unwrap_or("");
-    if status.state == pb::OperationState::Cancelled as i32
-        && status
-            .progress
-            .get("phase")
-            .is_some_and(|phase| phase == "shutdown")
+    if matches!(
+        pb::OperationState::try_from(status.state),
+        Ok(pb::OperationState::Cancelled | pb::OperationState::Failed)
+    ) && status
+        .progress
+        .get("phase")
+        .is_some_and(|phase| phase == "shutdown")
         && remanence_api::readiness_wait::is_resumable(state)
     {
         return Some(10);
@@ -520,56 +522,106 @@ mod tests {
         }
     }
 
-    /// Both wait-ready and verification watch a live LoadDrive until it ends.
+    /// Attached load clients wait for completion and classify shutdown and failure ends.
     #[tokio::test]
     async fn live_load_clients_wait_until_terminal() {
-        struct LoadClient(tokio::sync::mpsc::Receiver<pb::OperationStatus>);
+        struct LoadClient {
+            id: Uuid,
+            events: tokio::sync::mpsc::Receiver<pb::OperationStatus>,
+            attached: bool,
+        }
         impl ReadinessClient for LoadClient {
             async fn resume(
                 &mut self,
-                _: pb::ResumeMediaReadinessRequest,
+                request: pb::ResumeMediaReadinessRequest,
             ) -> Result<(), tonic::Status> {
+                assert_eq!(request.operation_id, self.id.as_bytes());
+                assert_eq!(request.timeout_seconds, DEFAULT_READY_TIMEOUT_SECONDS);
+                assert!(!self.attached, "attach once to the running load");
+                self.attached = true;
                 Ok(())
             }
             async fn watch(&mut self, _: Uuid) -> Result<(), tonic::Status> {
-                Ok(())
+                panic!("an attached load uses the resume watch");
             }
             async fn next(&mut self) -> Result<Option<pb::OperationStatus>, tonic::Status> {
-                Ok(self.0.recv().await)
+                assert!(self.attached, "resume attaches before consuming progress");
+                Ok(self.events.recv().await)
             }
         }
-        for verification in [false, true] {
-            let id = Uuid::new_v4();
-            let (tx, rx) = tokio::sync::mpsc::channel(2);
-            let mut client = LoadClient(rx);
-            let event = |state| pb::OperationStatus {
-                operation_id: id.as_bytes().to_vec(),
-                operation_kind: "load_drive".into(),
-                state: state as i32,
-                progress: [("state".into(), "becoming_ready".into())].into(),
-                ..Default::default()
-            };
-            tx.send(event(pb::OperationState::Running)).await.unwrap();
-            let mut err = Vec::new();
-            let refusal =
-                tonic::Status::failed_precondition(format!("media-readiness operation={id}"));
-            let wait = async {
-                if verification {
-                    wait_for_verification_readiness(&mut client, id, &refusal, &mut err)
-                        .await
-                        .unwrap();
-                    0
-                } else {
-                    watch_daemon_wait_ready(&mut client, id, Duration::from_secs(1), &mut err).await
+        for (terminal, phase, readiness, expected) in [
+            (pb::OperationState::Succeeded, "done", "ready", 0),
+            (pb::OperationState::Failed, "shutdown", "becoming_ready", 10),
+            (
+                pb::OperationState::Cancelled,
+                "shutdown",
+                "becoming_ready",
+                10,
+            ),
+            (pb::OperationState::Failed, "execute", "timeout_unknown", 20),
+            (pb::OperationState::Failed, "execute", "terminal_error", 30),
+            (
+                pb::OperationState::Failed,
+                "execute",
+                "transport_unknown",
+                40,
+            ),
+            (
+                pb::OperationState::Failed,
+                "execute",
+                "reservation_conflict",
+                50,
+            ),
+        ] {
+            for verification in [false, true] {
+                let id = Uuid::new_v4();
+                let (tx, rx) = tokio::sync::mpsc::channel(2);
+                let mut client = LoadClient {
+                    id,
+                    events: rx,
+                    attached: false,
+                };
+                let event = |state, phase: &str, readiness: &str| pb::OperationStatus {
+                    operation_id: id.as_bytes().to_vec(),
+                    operation_kind: "load_drive".into(),
+                    state: state as i32,
+                    progress: [
+                        ("state".into(), readiness.into()),
+                        ("phase".into(), phase.into()),
+                    ]
+                    .into(),
+                    ..Default::default()
+                };
+                tx.send(event(
+                    pb::OperationState::Running,
+                    "readiness_poll",
+                    "becoming_ready",
+                ))
+                .await
+                .unwrap();
+                let mut err = Vec::new();
+                let refusal =
+                    tonic::Status::failed_precondition(format!("media-readiness operation={id}"));
+                let wait = async {
+                    if verification {
+                        let result =
+                            wait_for_verification_readiness(&mut client, id, &refusal, &mut err)
+                                .await;
+                        assert_eq!(result.is_ok(), expected == 0);
+                        expected
+                    } else {
+                        watch_daemon_wait_ready(&mut client, id, Duration::from_secs(1), &mut err)
+                            .await
+                    }
+                };
+                tokio::pin!(wait);
+                tokio::select! {
+                    code = &mut wait => panic!("live load returns early with exit {code}"),
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => {}
                 }
-            };
-            tokio::pin!(wait);
-            tokio::select! {
-                code = &mut wait => panic!("live load returns early with exit {code}"),
-                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                tx.send(event(terminal, phase, readiness)).await.unwrap();
+                assert_eq!(wait.await, expected, "{terminal:?} {readiness}");
             }
-            tx.send(event(pb::OperationState::Succeeded)).await.unwrap();
-            assert_eq!(wait.await, 0);
         }
     }
 

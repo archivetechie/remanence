@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -300,7 +301,7 @@ async fn wait_before_open_retry(
     status: &tonic::Status,
     retry: &mut OpenRetry,
 ) -> AppResult<()> {
-    wait_before_open_retry_with(status, retry, |id| {
+    wait_before_open_retry_with(status, retry, &mut std::io::stderr(), |id| {
         wait_for_media_readiness_operation(channel, id)
     })
     .await
@@ -310,6 +311,7 @@ async fn wait_before_open_retry(
 async fn wait_before_open_retry_with<F, Fut>(
     status: &tonic::Status,
     retry: &mut OpenRetry,
+    err: &mut (impl Write + Send),
     wait: F,
 ) -> AppResult<()>
 where
@@ -324,16 +326,25 @@ where
             tokio::time::Instant::now()
                 + Duration::from_secs(u64::from(DEFAULT_READY_TIMEOUT_SECONDS))
         });
-        if tokio::time::Instant::now() >= deadline || !retry.fences_waited.insert(operation_id) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let expired = || {
+            AppError::new(format!(
+                "media readiness operation {operation_id} wait deadline expired"
+            ))
+        };
+        if remaining.is_zero() {
+            return Err(expired());
+        }
+        if !retry.fences_waited.insert(operation_id) {
             return Err(status.clone().into());
         }
-        eprintln!(
-            "remfield-io: open fenced by media readiness operation {operation_id}; waiting up to {}s",
-            DEFAULT_READY_TIMEOUT_SECONDS
+        let _ = writeln!(err,
+            "remfield-io: open fenced by media readiness operation {operation_id}; waiting up to {:.3}s",
+            remaining.as_secs_f64()
         );
         tokio::time::timeout_at(deadline, wait(operation_id))
             .await
-            .map_err(|_| AppError::new("media readiness wait deadline expired"))??;
+            .map_err(|_| expired())??;
         // Time spent on the fence does not count against the busy-bay wait.
         retry.busy_since = None;
         return Ok(());
@@ -1672,17 +1683,46 @@ mod tests {
         let refusal =
             |id| tonic::Status::failed_precondition(format!("media-readiness operation={id}"));
         let mut observed = vec![];
+        let mut output = vec![];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+        retry.readiness_deadline = Some(deadline);
         for id in [first, second] {
-            wait_before_open_retry_with(&refusal(id), &mut retry, |id| {
+            wait_before_open_retry_with(&refusal(id), &mut retry, &mut output, |id| {
                 observed.push(id);
-                std::future::ready(Ok(()))
+                async {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Ok(())
+                }
             })
             .await
             .unwrap();
         }
         assert_eq!(observed, [first, second]);
+        assert_eq!(retry.readiness_deadline, Some(deadline));
+        let text = String::from_utf8(output.clone()).unwrap();
+        let second_line = text.lines().nth(1).unwrap();
+        assert!(second_line.contains(&second.to_string()));
+        let seconds: f64 = second_line
+            .split_once("waiting up to ")
+            .unwrap()
+            .1
+            .trim_end_matches('s')
+            .parse()
+            .unwrap();
+        assert!(seconds > 0.0 && seconds < 12.0, "{second_line}");
+        let first_seconds: f64 = text
+            .lines()
+            .next()
+            .unwrap()
+            .split_once("waiting up to ")
+            .unwrap()
+            .1
+            .trim_end_matches('s')
+            .parse()
+            .unwrap();
+        assert!(seconds < first_seconds, "{text}");
         assert!(
-            wait_before_open_retry_with(&refusal(first), &mut retry, |_| {
+            wait_before_open_retry_with(&refusal(first), &mut retry, &mut output, |_| {
                 panic!("a fence is never waited on twice");
                 #[allow(unreachable_code)]
                 std::future::ready(Ok(()))
@@ -1690,22 +1730,35 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    /// Both an expiring watch and an expired admission identify the current fence.
+    #[tokio::test]
+    async fn open_retry_deadline_names_fence() {
+        let mut retry = OpenRetry::from_env().unwrap();
+        let mut output = vec![];
+        let refusal =
+            |id| tonic::Status::failed_precondition(format!("media-readiness operation={id}"));
         retry.readiness_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(20));
-        let error = wait_before_open_retry_with(&refusal(Uuid::new_v4()), &mut retry, |_| {
-            std::future::pending::<AppResult<()>>()
+        let expired_id = Uuid::new_v4();
+        let error =
+            wait_before_open_retry_with(&refusal(expired_id), &mut retry, &mut output, |_| {
+                std::future::pending::<AppResult<()>>()
+            })
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("deadline expired"));
+        assert!(error.message.contains(&expired_id.to_string()));
+        let next_id = Uuid::new_v4();
+        let error = wait_before_open_retry_with(&refusal(next_id), &mut retry, &mut output, |_| {
+            panic!("the shared deadline prevents another wait");
+            #[allow(unreachable_code)]
+            std::future::ready(Ok(()))
         })
         .await
         .unwrap_err();
         assert!(error.message.contains("deadline expired"));
-        assert!(
-            wait_before_open_retry_with(&refusal(Uuid::new_v4()), &mut retry, |_| {
-                panic!("the shared deadline prevents another wait");
-                #[allow(unreachable_code)]
-                std::future::ready(Ok(()))
-            })
-            .await
-            .is_err()
-        );
+        assert!(error.message.contains(&next_id.to_string()));
     }
 
     #[test]

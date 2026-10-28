@@ -168,13 +168,35 @@ pub(super) fn changer_loop(
                     cfg.reservations.clone(),
                     cfg.actor_library_serial.clone(),
                 );
-                handle_robotics(&mut index, &cfg, library_serial, action, handle.clone());
-                refresh_actor_changer(changer, &cfg);
-                drop(_exclusive_guard);
-                handle.wake_readiness();
+                let outcome = handle_robotics(&mut index, &cfg, &library_serial, action, &handle);
+                finish_robotics_and_release(
+                    &mut index,
+                    &cfg,
+                    changer,
+                    &library_serial,
+                    &handle,
+                    outcome,
+                    _exclusive_guard,
+                );
             }
         }
     }
+}
+
+/// A terminal watcher can retry only after refreshed inventory and released ownership.
+pub(super) fn finish_robotics_and_release(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    changer: &mut ChangerHandle,
+    library_serial: &str,
+    handle: &crate::operations::OperationHandle,
+    outcome: super::robotics::RoboticsOutcome,
+    guard: ExclusiveGuard,
+) {
+    refresh_actor_changer(changer, cfg);
+    drop(guard);
+    outcome.publish(index, cfg, handle, library_serial);
+    handle.wake_readiness();
 }
 
 pub(super) fn refresh_actor_changer(changer: &mut ChangerHandle, cfg: &WriteOwnerConfig) {
@@ -206,8 +228,11 @@ pub(super) fn drain_failed_changer_commands(
                 let _ = reply.send(Err(Status::internal(message.clone())));
             }
             ChangerCommand::Reconcile { handle, .. } | ChangerCommand::Robotics { handle, .. } => {
-                handle.publish_failed(message.as_str(), &[("phase", "catalog")]);
                 crate::drive_pool::release_library_reservations(&reservations, &library_serial);
+                handle.publish_failed(
+                    message.as_str(),
+                    &[("phase", "catalog"), ("state", "unknown")],
+                );
             }
         }
     }

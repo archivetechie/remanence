@@ -10980,6 +10980,13 @@ async fn load_drive_readiness_poll_stops_on_shutdown() {
         .unwrap();
     assert!(crate::readiness_wait::is_resumable(&record.state));
     assert_ne!(record.cancel_source.as_deref(), Some("operator"));
+    let terminal = registry.latest(&id).unwrap();
+    assert_eq!(terminal.progress.get("state"), Some(&record.state));
+    assert_eq!(terminal.progress["sense"], "02/04/01");
+    assert_eq!(
+        terminal.progress["sense_name"],
+        remanence_library::media_readiness_sense_name(4, 1).unwrap()
+    );
     let mut state = crate::ApiState::new(CatalogIndex::open(&path).unwrap());
     state.operations = registry.clone();
     for n in 1..=2048 {
@@ -11074,4 +11081,406 @@ async fn detached_verification_shutdown_ends_readiness_watch() {
 /// Drain readiness commands through the catalog-open failure path.
 pub(crate) fn fail_readiness_actor(rx: mpsc::Receiver<DriveCommand>) {
     super::actor_runtime::drain_failed_drive_commands(rx, "open catalog: injected failure".into());
+}
+
+/// Every load outcome retains the durable classification and sense evidence.
+#[test]
+fn load_drive_terminal_progress_uses_durable_readiness() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("state.sqlite");
+    let mut index = CatalogIndex::open(&path).unwrap();
+    let (_, library) = unthreaded_cartridge_world("LIB-END");
+    let cfg = test_write_owner_config(
+        path,
+        temp.path().join("audit"),
+        &library,
+        library_snapshot_cell(library.library().clone()),
+    );
+    let registry = crate::operations::OperationRegistry::default();
+    for state in [
+        "ready",
+        "becoming_ready",
+        "timeout_unknown",
+        "terminal_error",
+        "transport_unknown",
+        "reservation_conflict",
+    ] {
+        let id = Uuid::new_v4();
+        let handle = registry.register(id, "load_drive");
+        record_unthreaded_readiness_operation(&mut index, "LIB-END", id);
+        let mut transition =
+            crate::startup_media_readiness::startup_media_readiness_probe_transition(
+                id,
+                &MediaReadiness::BecomingReady {
+                    ascq: 1,
+                    media_initializing: false,
+                },
+            );
+        transition.state = state.into();
+        index.record_media_readiness_transition(transition).unwrap();
+        record_library_event(
+            &mut index,
+            &cfg,
+            &handle,
+            "LIB-END",
+            AuditEvent::OperationStarted,
+            Default::default(),
+        )
+        .unwrap();
+        let action = match state {
+            "ready" => Ok(()),
+            "becoming_ready" => Err(crate::readiness_wait::SHUTDOWN_REASON.into()),
+            _ => Err("load does not reach READY".into()),
+        };
+        finish_library_operation(&mut index, &cfg, &handle, "LIB-END", action, Ok(()));
+        let status = registry.latest(&id).unwrap();
+        assert_eq!(
+            status.progress.get("state").map(String::as_str),
+            Some(state),
+            "{status:?}"
+        );
+        assert_eq!(status.progress["sense"], "02/04/01");
+        assert_eq!(
+            status.progress["sense_name"],
+            remanence_library::media_readiness_sense_name(4, 1).unwrap()
+        );
+        assert_eq!(
+            status.progress["phase"],
+            match state {
+                "ready" => "done",
+                "becoming_ready" => "shutdown",
+                _ => "execute",
+            }
+        );
+        assert_eq!(
+            status.state,
+            if state == "ready" {
+                pb::OperationState::Succeeded
+            } else {
+                pb::OperationState::Failed
+            } as i32
+        );
+        // Catalog and pre-dispatch cancellation paths retain the same evidence.
+        finish_library_operation(
+            &mut index,
+            &cfg,
+            &handle,
+            "LIB-END",
+            Ok(()),
+            Err("catalog unavailable".into()),
+        );
+        assert_eq!(registry.latest(&id).unwrap().progress["state"], state);
+        cancel_library_operation(
+            &mut index,
+            &cfg,
+            &handle,
+            "LIB-END",
+            "cancelled before dispatch",
+        );
+        assert_eq!(registry.latest(&id).unwrap().progress["state"], state);
+    }
+}
+
+/// Shutdown is an informational end, with the fence available for resumption.
+#[test]
+fn load_drive_shutdown_logs_at_info() {
+    let temp = tempfile::tempdir().unwrap();
+    let log_path = temp.path().join("shutdown.log");
+    let file = std::fs::File::create(&log_path).unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || file.try_clone().unwrap())
+        .finish();
+    let _log = tracing::subscriber::set_default(subscriber);
+    let path = temp.path().join("state.sqlite");
+    let mut index = CatalogIndex::open(&path).unwrap();
+    let (_, library) = unthreaded_cartridge_world("LIB-LOG");
+    let cfg = test_write_owner_config(
+        path,
+        temp.path().join("audit"),
+        &library,
+        library_snapshot_cell(library.library().clone()),
+    );
+    let registry = crate::operations::OperationRegistry::default();
+    let id = Uuid::new_v4();
+    let handle = registry.register(id, "load_drive");
+    record_unthreaded_readiness_operation(&mut index, "LIB-LOG", id);
+    record_library_event(
+        &mut index,
+        &cfg,
+        &handle,
+        "LIB-LOG",
+        AuditEvent::OperationStarted,
+        Default::default(),
+    )
+    .unwrap();
+    finish_library_operation(
+        &mut index,
+        &cfg,
+        &handle,
+        "LIB-LOG",
+        Err(crate::readiness_wait::SHUTDOWN_REASON.into()),
+        Ok(()),
+    );
+    let log = std::fs::read_to_string(log_path).unwrap();
+    assert!(
+        log.contains("INFO") && log.contains("library operation stops for shutdown"),
+        "{log}"
+    );
+    assert!(!log.contains("ERROR"), "{log}");
+}
+
+/// A cancellation is terminal only after its durable transition succeeds.
+#[test]
+fn readiness_operator_cancel_requires_recorded_transition() {
+    for writable in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.sqlite");
+        let mut index = CatalogIndex::open(&path).unwrap();
+        let id = Uuid::new_v4();
+        record_unthreaded_readiness_operation(&mut index, "LIB-CANCEL", id);
+        if !writable {
+            index = CatalogIndex::open_read_only(&path).unwrap();
+        }
+        let (_, mut library) = unthreaded_cartridge_world("LIB-CANCEL");
+        let policy = remanence_library::StaticAllowlist::new(["LIB-CANCEL"]);
+        let mut drive = library.open_drive(0x100, &policy).unwrap();
+        let registry = crate::operations::OperationRegistry::default();
+        let handle = registry.register(id, "media_readiness_wait");
+        registry.request_cancel(&id).unwrap();
+        handle_drive_wait_ready(
+            &mut index,
+            &mut drive,
+            DriveReadinessPoll {
+                bay: 0x100,
+                operation_id: id,
+                family: MediaFamily::Unknown,
+                options: remanence_library::MediaReadinessWaitOptions {
+                    wait: true,
+                    timeout: StdDuration::from_secs(1),
+                    poll_interval: StdDuration::from_millis(1),
+                },
+                cartridge_in_drive: false,
+                phase: "readiness_poll",
+            },
+            &handle,
+        );
+        let status = registry.latest(&id).unwrap();
+        let record = index.media_readiness_operation(id).unwrap().unwrap();
+        if writable {
+            assert_eq!(status.state, pb::OperationState::Cancelled as i32);
+            assert_eq!(record.cancel_source.as_deref(), Some("operator"));
+        } else {
+            assert_eq!(status.state, pb::OperationState::Failed as i32);
+            assert_eq!(status.progress["state"], "recording_failed");
+            assert!(status
+                .error_summary
+                .contains("operator cancel is not recorded"));
+            assert_ne!(record.cancel_source.as_deref(), Some("operator"));
+        }
+    }
+}
+
+/// Pause the actor's final inventory refresh so terminal ordering is observable.
+struct LoadRefreshGate {
+    inner: ModelTransport,
+    armed: Arc<AtomicBool>,
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl SgTransport for LoadRefreshGate {
+    fn execute_in(
+        &mut self,
+        cdb: &[u8],
+        buf: &mut [u8],
+    ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError> {
+        if cdb.first() == Some(&0xb8) && self.armed.swap(false, Ordering::SeqCst) {
+            self.entered.send(()).unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(StdDuration::from_secs(5))
+                .unwrap();
+        }
+        self.inner.execute_in(cdb, buf)
+    }
+    fn execute_none(&mut self, cdb: &[u8]) -> Result<(), remanence_library::ScsiError> {
+        self.inner.execute_none(cdb)
+    }
+    fn execute_out(
+        &mut self,
+        cdb: &[u8],
+        buf: &[u8],
+    ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError> {
+        self.inner.execute_out(cdb, buf)
+    }
+}
+
+/// An attached load watcher can reserve the drive on its first terminal retry.
+#[tokio::test]
+async fn attached_load_retry_follows_actor_refresh_and_release() {
+    for cancelled in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.sqlite");
+        let mut index = CatalogIndex::open(&path).unwrap();
+        let id = Uuid::new_v4();
+        let registry = crate::operations::OperationRegistry::default();
+        let handle = registry.register(id, "load_drive");
+        handle.publish_state(pb::OperationState::Running, &[("phase", "execute")]);
+        let mut world = VirtualWorld::single_drive("LIB-RETRY", 0x100, "DRV-RETRY", 0x400, 1);
+        world.put_tape_in_slot(
+            0x400,
+            "RETRY001L9",
+            VirtualTape::empty(1024 * 1024, 256 * 1024),
+        );
+        let world = Arc::new(Mutex::new(world));
+        let model = world.lock().unwrap().library_snapshot();
+        let armed = Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let mut library = model
+            .open_with(&remanence_library::StaticAllowlist::new(["LIB-RETRY"]), {
+                let armed = armed.clone();
+                move |path| {
+                    let role = world.lock().unwrap().role_for_path(path).unwrap();
+                    Ok(Box::new(LoadRefreshGate {
+                        inner: ModelTransport::new(world.clone(), role),
+                        armed: armed.clone(),
+                        entered: entered_tx.clone(),
+                        release: release_rx.clone(),
+                    }) as Box<dyn SgTransport>)
+                }
+            })
+            .unwrap();
+        let snapshot = library_snapshot_cell(library.library().clone());
+        let mut cfg = test_write_owner_config(
+            path.clone(),
+            temp.path().join("audit"),
+            &library,
+            snapshot.clone(),
+        );
+        let key = DriveKey::new("LIB-RETRY", 0x100);
+        cfg.reservations = Arc::new(HashMap::from([(key.clone(), AtomicBool::new(true))]));
+        let reservations = cfg.reservations.clone();
+        let (drive_tx, _drive_rx) = mpsc::channel(1);
+        let (changer_tx, _changer_rx) = mpsc::channel(1);
+        let pool = DrivePool::new_with_lifecycle(
+            HashMap::from([("LIB-RETRY".into(), changer_tx)]),
+            HashMap::from([(key.clone(), drive_tx)]),
+            reservations.clone(),
+            crate::drive_pool::DrivePoolLifecycle::default(),
+        );
+        let mut state = crate::ApiState::new(CatalogIndex::open(&path).unwrap());
+        state.operations = registry.clone();
+        let attached = state
+            .start_readiness_wait(id, 9000, 30, "client", "session_open")
+            .unwrap();
+        assert_eq!(attached.operation_id, id.as_bytes());
+        let mut watch = registry.watch(&id).unwrap();
+        let task = if cancelled {
+            registry.request_cancel(&id).unwrap();
+            armed.store(true, Ordering::SeqCst);
+            let actor = spawn_changer_actor(library.into_changer(), cfg);
+            actor
+                .send(ChangerCommand::Robotics {
+                    library_serial: "LIB-RETRY".into(),
+                    action: super::actor_protocol::RoboticsAction::Load {
+                        slot: 0x400,
+                        bay: 0x100,
+                        wait_ready: true,
+                    },
+                    handle,
+                })
+                .await
+                .unwrap();
+            None
+        } else {
+            record_library_event(
+                &mut index,
+                &cfg,
+                &handle,
+                "LIB-RETRY",
+                AuditEvent::OperationStarted,
+                Default::default(),
+            )
+            .unwrap();
+            let action =
+                run_load_sequence(&mut index, &cfg, &handle, &mut library, 0x400, 0x100, true);
+            assert!(action.is_ok(), "{action:?}");
+            let mut changer = library.into_changer();
+            armed.store(true, Ordering::SeqCst);
+            Some(tokio::task::spawn_blocking(move || {
+                let guard =
+                    ExclusiveGuard::from_reserved_library(cfg.reservations.clone(), "LIB-RETRY");
+                super::actor_runtime::finish_robotics_and_release(
+                    &mut index,
+                    &cfg,
+                    &mut changer,
+                    "LIB-RETRY",
+                    &handle,
+                    RoboticsOutcome::Completed {
+                        action,
+                        observation: Ok(()),
+                    },
+                    guard,
+                );
+            }))
+        };
+        tokio::task::spawn_blocking(move || {
+            entered_rx.recv_timeout(StdDuration::from_secs(5)).unwrap()
+        })
+        .await
+        .unwrap();
+        let live_during_refresh = registry.is_live(&id);
+        let reserved_during_refresh = reservations[&key].load(Ordering::Acquire);
+        release_tx.send(()).unwrap();
+        assert!(
+            live_during_refresh,
+            "terminal status precedes the actor refresh"
+        );
+        assert!(reserved_during_refresh);
+        let terminal = tokio::time::timeout(StdDuration::from_secs(5), async {
+            loop {
+                let status = watch.next().await.unwrap().unwrap();
+                if crate::operations::is_terminal(&status) {
+                    break status;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            terminal.state,
+            if cancelled {
+                pb::OperationState::Cancelled
+            } else {
+                pb::OperationState::Succeeded
+            } as i32
+        );
+        let retry = pool
+            .reserve_drive(&key)
+            .expect("first attached-client retry acquires the drive");
+        if !cancelled {
+            assert!(
+                snapshot
+                    .read()
+                    .unwrap()
+                    .report
+                    .library("LIB-RETRY")
+                    .unwrap()
+                    .drive_bays[0]
+                    .loaded
+            );
+        }
+        drop(retry);
+        pool.reserve_library_exclusive("LIB-RETRY")
+            .expect("the library is free for a retry that needs the robot");
+        pool.release_library("LIB-RETRY");
+        if let Some(task) = task {
+            task.await.unwrap();
+        }
+    }
 }
