@@ -122,9 +122,10 @@ run `rem tape quarantine show <id>` or wait-ready/resume before retrying
 
 The daemon resumes load-transient fences itself with a 9000 s timeout and
 30 s steady polls, including after startup reconciliation. Calls to
-`ResumeMediaReadiness` attach to a running wait for the same operation.
-`rem tape wait-ready --resume <UUID> --endpoint <URI>` watches that wait and
-prints readiness state changes. Its local `--timeout` returns 20 while the
+`ResumeMediaReadiness` attach to a running readiness wait or LoadDrive for the
+same operation. `rem tape wait-ready --resume <UUID> --endpoint <URI>` watches
+that operation and prints readiness state changes. Its local `--timeout` returns
+20 while the
 daemon keeps waiting. Without `--endpoint`, wait-ready uses direct SCSI and
 requires the daemon to be stopped. Operator cancellation leaves a wait stopped;
 an explicit resume may start it again. Startup still probes operator-cancelled
@@ -132,17 +133,25 @@ fences and clears a ready drive or requires release when the cartridge is absent
 Release-only states require release.
 
 Shutdown stops readiness discovery and ends running waits, including the wait
-inside LoadDrive, as Cancelled with a shutdown summary and their last durable
-readiness state. Their fences stay resumable without an operator cancellation;
+inside LoadDrive, with a shutdown summary and their last durable readiness state
+and sense keys. A standalone wait ends as Cancelled; LoadDrive ends as Failed.
+LoadDrive publishes its terminal status after the changer refresh and release of
+library ownership, so an attached client's open retry can acquire the library.
+Shutdown fences stay resumable without an operator cancellation;
 startup reconciliation and automatic discovery resume them on the next start.
-`wait-ready --resume --endpoint` returns 10 for this resumable shutdown end.
+`wait-ready --resume --endpoint` returns 10 for either resumable shutdown end,
+0 for success, 20 for `timeout_unknown`, 40 for `transport_unknown` or
+`aborted_unknown`, 50 for `reservation_conflict`, and 30 for other failed or
+cancelled ends.
 Discovery retries failed waits and non-busy start refusals on its 30 s sweep;
 repeated readiness notifications do not restart the 5 s busy retry window.
 
 Detached verification and manual finalize workers wait up to 15 minutes for
-readiness. They keep waiting across failed or shutdown-cancelled readiness waits
-while the durable record stays resumable. A stopped finalize attempt reports
-FAILED with a summary while the intent stays FINALIZING. Reuse the same idempotency key to resume it;
+readiness. They keep waiting across failed readiness waits while the durable
+record stays resumable, but stop on daemon shutdown, operator cancellation,
+dispatch failure, release-only states, or their deadline. A stopped finalize attempt
+reports FAILED with a summary while the intent stays FINALIZING. Reuse the same
+idempotency key to resume it;
 `rem tape finalize --wait` reports the stopped attempt and exits non-zero.
 
 `rem tape verify-index --tape-uuid <UUID>` resumes a media-readiness fence
