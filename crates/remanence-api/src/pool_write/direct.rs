@@ -1442,6 +1442,7 @@ pub(crate) fn write_batched_parity_to_selected_tape_after_replay_check(
     io_memory: &Arc<crate::io_memory::IoMemoryReservation>,
     raw_write_attempted: &mut bool,
 ) -> Result<PoolWriteResult, PoolWriteError> {
+    let prepare_started = Instant::now();
     ensure_request_pool_matches_config(&request, pool_cfg)?;
     ensure_selected_tape_accepts_session_write(state, pool_cfg, &selected)?;
     if matches!(selected.parity_config, ParityConfig::None) {
@@ -1497,8 +1498,24 @@ pub(crate) fn write_batched_parity_to_selected_tape_after_replay_check(
     let detached = session_state.take().ok_or_else(|| {
         PoolWriteError::InvalidInput("parity sink session state is unavailable".to_string())
     })?;
+    let prepare_elapsed = prepare_started.elapsed();
+    let payload_bytes = prepared_payload_bytes(&prepared);
+    tracing::info!(target: "remanence_write_diag", phase = "prepare",
+        pool_id = %selected.pool_id, tape_uuid = %uuid_text(selected.tape_uuid),
+        object_id = %prepared.object_uuid, caller_object_id = %request.caller_object_id,
+        parity = parity_label(&selected.parity_config), representation = stored.representation_label(),
+        payload_bytes, selected_block_size_bytes = selected.block_size,
+        projected_object_blocks, elapsed_ms = crate::diagnostics::duration_ms(prepare_elapsed),
+        throughput_mib_s = crate::diagnostics::mib_per_s(payload_bytes, prepare_elapsed), "remanence_write_diag");
+    let transfer_started = Instant::now();
+    let stats = Cell::new(super::staging::BlockSinkStats::default());
+    let mut timed = super::staging::TimedRawTapeSink {
+        inner: raw,
+        stats: &stats,
+        last_write_finished: None,
+    };
     let write_attempted = Cell::new(false);
-    let mut tracked = CapacityTrackingRawTapeSink::new(raw, &write_attempted);
+    let mut tracked = CapacityTrackingRawTapeSink::new(&mut timed, &write_attempted);
     let mut parity = match ParitySink::try_from_session_state(&mut tracked, journal, detached) {
         Ok(parity) => parity,
         Err((error, detached)) => {
@@ -1538,6 +1555,21 @@ pub(crate) fn write_batched_parity_to_selected_tape_after_replay_check(
             capacity,
         ),
     };
+    let transfer_elapsed = transfer_started.elapsed();
+    let error_text = write_report.as_ref().err().map(ToString::to_string);
+    super::prepare::log_transfer_diagnostics(
+        &request,
+        &selected,
+        &prepared,
+        projected_object_blocks,
+        true,
+        super::prepare::TransferDiagnosticOutcome {
+            stats: stats.get(),
+            elapsed: transfer_elapsed,
+            status: if error_text.is_some() { "error" } else { "ok" },
+            error: error_text.as_deref(),
+        },
+    );
     let write_report = match write_report {
         Ok(report) => report,
         Err(error) => {
@@ -1555,6 +1587,13 @@ pub(crate) fn write_batched_parity_to_selected_tape_after_replay_check(
     // can fail so the owner cannot mistake a post-motion error for a safe
     // retry.
     *raw_write_attempted |= write_attempted.get();
+    let _tail = crate::diagnostics::WriteTailTimer::new(
+        prepared.object_uuid,
+        &selected.pool_id,
+        selected.tape_uuid,
+        parity_label(&selected.parity_config),
+        payload_bytes,
+    );
     parity_post_write_projection_gate()?;
     let mut checkpoint_projection = checkpoint_projection_for_no_parity_write(
         &selected,
@@ -1580,6 +1619,7 @@ pub(crate) fn write_batched_parity_to_selected_tape_after_replay_check(
     let detached = parity.into_session_state()?;
     result.hardware_early_warning |= detached.hardware_early_warning_seen();
     *session_state = Some(detached);
+    result.transfer_feed_wait = stats.get().between_write_elapsed;
     Ok(result)
 }
 
@@ -1687,6 +1727,8 @@ pub(super) fn write_to_selected_tape_inner<S: BlockSink + ?Sized>(
     tracing::info!(
         target: "remanence_write_diag",
         phase = "prepare",
+        object_id = %prepared.object_uuid,
+        caller_object_id = %request.caller_object_id,
         pool_id = %selected.pool_id,
         tape_uuid = %uuid_text(selected.tape_uuid),
         parity = parity_label(&selected.parity_config),

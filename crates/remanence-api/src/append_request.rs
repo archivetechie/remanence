@@ -57,18 +57,49 @@ pub(crate) fn overlap_append_eligible(
     mode: remanence_state::AppendStagingMode,
     start: &pb::AppendObjectStart,
     start_digest: Option<&[u8; 32]>,
+    overlap_min_bytes: u64,
 ) -> bool {
-    mode == remanence_state::AppendStagingMode::Overlap
-        && !start.caller_object_id.trim().is_empty()
-        // An exact size, because the overlap receive path holds the stream to
-        // it byte for byte. A declared zero is an empty object, which has
-        // nothing to overlap; absent is a caller that does not know.
-        && start.declared_size_bytes.is_some_and(|size| size != 0)
-        && start_digest.is_some()
-        && start.source_replay_capability == pb::SourceReplayCapability::ReplayFromStart as i32
-        // Supplying an empty manifest is still supplying one, and manifests
-        // are unwired -- so only their absence is eligible.
-        && start.body_format_manifest.is_none()
+    append_staging_reason(mode, Some(start), start_digest, overlap_min_bytes)
+        == "configured_overlap"
+}
+
+/// Explain the per-stream staging choice, including canonical spool admission.
+pub(crate) fn append_staging_reason(
+    mode: remanence_state::AppendStagingMode,
+    start: Option<&pb::AppendObjectStart>,
+    start_digest: Option<&[u8; 32]>,
+    overlap_min_bytes: u64,
+) -> &'static str {
+    if mode == remanence_state::AppendStagingMode::Serial {
+        return "configured_serial";
+    }
+    let Some(start) = start else {
+        return "canonical_start";
+    };
+    if start.body_format_manifest.is_some() {
+        return "manifest";
+    }
+    if start.caller_object_id.trim().is_empty() {
+        return "no_caller_object_id";
+    }
+    match start.declared_size_bytes {
+        None => return "no_declared_size",
+        Some(0) => return "empty_object",
+        _ => {}
+    }
+    if start_digest.is_none() {
+        return "no_start_digest";
+    }
+    if start.source_replay_capability != pb::SourceReplayCapability::ReplayFromStart as i32 {
+        return "no_replay_capability";
+    }
+    if start
+        .declared_size_bytes
+        .is_some_and(|size| size < overlap_min_bytes)
+    {
+        return "below_overlap_min";
+    }
+    "configured_overlap"
 }
 
 /// Request-shape validation for a pinned-tape write target.

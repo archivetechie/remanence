@@ -6,7 +6,7 @@
 //! accumulating one permit per incoming chunk.
 
 use std::io::{self, Read};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -35,6 +35,8 @@ pub(crate) struct AppendRingControl {
     changed: Condvar,
     async_changed: Notify,
     tape_started: AtomicBool,
+    feed_wait_us: AtomicU64,
+    prefill_lead_bytes: AtomicU64,
     _reservation: IoMemoryPermit,
 }
 
@@ -65,6 +67,8 @@ impl AppendRingControl {
             changed: Condvar::new(),
             async_changed: Notify::new(),
             tape_started: AtomicBool::new(false),
+            feed_wait_us: AtomicU64::new(0),
+            prefill_lead_bytes: AtomicU64::new(0),
             _reservation: reservation,
         }
     }
@@ -137,6 +141,7 @@ impl AppendRingControl {
     }
 
     pub(crate) fn wait_for_resume(&self) -> Result<(), io::Error> {
+        let started = Instant::now();
         let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
         while state.occupancy_bytes < self.high_bytes
             && !state.producer_finished
@@ -147,11 +152,33 @@ impl AppendRingControl {
                 .wait(state)
                 .unwrap_or_else(|err| err.into_inner());
         }
+        self.record_feed_wait(started.elapsed());
         if let Some(message) = &state.failure {
             Err(io::Error::other(message.clone()))
         } else {
             Ok(())
         }
+    }
+
+    /// Count consumer receive and resume waits; this excludes WRITE execution.
+    fn record_feed_wait(&self, elapsed: Duration) {
+        self.feed_wait_us.fetch_add(
+            u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    pub(crate) fn feed_wait(&self) -> Duration {
+        Duration::from_micros(self.feed_wait_us.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn record_prefill_lead(&self) {
+        self.prefill_lead_bytes
+            .store(self.occupancy_bytes(), Ordering::Relaxed);
+    }
+
+    pub(crate) fn prefill_lead_bytes(&self) -> u64 {
+        self.prefill_lead_bytes.load(Ordering::Relaxed)
     }
 
     pub(crate) fn mark_tape_started(&self) {
@@ -322,7 +349,10 @@ impl Read for AppendRingConsumer {
             if self.complete {
                 return Ok(0);
             }
-            match self.rx.blocking_recv() {
+            let started = Instant::now();
+            let message = self.rx.blocking_recv();
+            self.control.record_feed_wait(started.elapsed());
+            match message {
                 Some(RingMessage::Data(slab)) => self.current = Some(slab),
                 Some(RingMessage::Complete) => self.complete = true,
                 Some(RingMessage::Error(message)) => {
@@ -339,29 +369,37 @@ impl Read for AppendRingConsumer {
     }
 }
 
-/// Construct one ring after atomically reserving its complete configured size.
+/// Producer, consumer, and occupancy control sharing one memory reservation.
+pub(crate) type AppendRing = (
+    AppendRingProducer,
+    AppendRingConsumer,
+    Arc<AppendRingControl>,
+);
+
+/// Reserve only the slabs needed by this object, bounded by the configured ring.
 pub(crate) fn create_append_ring(
     io_memory: &Arc<IoMemoryReservation>,
     capacity_bytes: u64,
     high_pct: u8,
     low_pct: u8,
     declared_size_bytes: u64,
-) -> Result<
-    (
-        AppendRingProducer,
-        AppendRingConsumer,
-        Arc<AppendRingControl>,
-    ),
-    Status,
-> {
+) -> Result<AppendRing, Status> {
     if capacity_bytes == 0 {
         return Err(Status::invalid_argument(
             "append ring capacity must be nonzero",
         ));
     }
-    let reservation = io_memory.try_reserve(capacity_bytes).ok_or_else(|| {
+    let slab = APPEND_RING_SLAB_BYTES as u64;
+    let rounded_size = declared_size_bytes
+        .max(1)
+        .div_ceil(slab)
+        .saturating_mul(slab);
+    let capacity_bytes = capacity_bytes.min(rounded_size);
+    let reservation = io_memory.try_reserve_with_available(capacity_bytes).map_err(|available| {
+        let ceiling = io_memory.ceiling();
+        let held = ceiling.saturating_sub(available);
         Status::resource_exhausted(format!(
-            "append ring reservation of {capacity_bytes} bytes exceeds remaining daemon.io_memory_ceiling capacity"
+            "append ring reservation of {capacity_bytes} bytes exceeds available io_memory capacity: daemon.io_memory_ceiling={ceiling} bytes, available={available} bytes, held={held} bytes by active append rings, spools, and restore reservoirs"
         ))
     })?;
     let slab_bytes_u64 = capacity_bytes.min(APPEND_RING_SLAB_BYTES as u64);
@@ -429,6 +467,26 @@ pub(crate) fn log_ring_sample(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Small declared objects reserve whole slabs without charging for unused ring capacity.
+    #[test]
+    fn reservation_tracks_rounded_object_size_and_releases() {
+        let slab = APPEND_RING_SLAB_BYTES as u64;
+        let manager = IoMemoryReservation::new(8 * slab).unwrap();
+        for (size, expected) in [
+            (1, slab),
+            (slab, slab),
+            (slab + 1, 2 * slab),
+            (9 * slab, 8 * slab),
+            (u64::MAX, 8 * slab),
+        ] {
+            let ring = create_append_ring(&manager, 8 * slab, 90, 25, size).unwrap();
+            assert_eq!(manager.granted(), expected);
+            assert_eq!(ring.2.capacity_bytes(), expected);
+            drop(ring);
+            assert_eq!(manager.granted(), 0);
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fast_producer_stalled_consumer_stays_bounded_and_recycles() {

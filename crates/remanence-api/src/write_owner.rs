@@ -55,6 +55,8 @@ pub(crate) struct AppendFinishOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CheckpointTrigger {
     Explicit,
+    /// Internal append barrier preserves receipts for the caller.
+    Append,
     Timer,
     Shutdown,
 }
@@ -65,11 +67,20 @@ pub(crate) struct CheckpointActorReply {
     pub(crate) committed_objects: Vec<pb::ObjectRecord>,
 }
 
+/// Internal append barriers report durability while preserving caller-owned receipts.
 fn send_checkpoint_actor_reply(
     reply: oneshot::Sender<Result<CheckpointActorReply, Status>>,
     session: pb::WriteSession,
     committed_receipts: &mut Vec<pb::ObjectRecord>,
+    trigger: CheckpointTrigger,
 ) {
+    if trigger == CheckpointTrigger::Append {
+        let _ = reply.send(Ok(CheckpointActorReply {
+            session,
+            committed_objects: committed_receipts.clone(),
+        }));
+        return;
+    }
     let committed_objects = std::mem::take(committed_receipts);
     if let Err(Ok(unsent)) = reply.send(Ok(CheckpointActorReply {
         session,
@@ -79,13 +90,13 @@ fn send_checkpoint_actor_reply(
     }
 }
 
-/// Retain a catalog-replayed object until an explicit checkpoint can claim its durable copy.
+/// Retain each durable object once until a caller checkpoint or close claims its copy.
 ///
 /// A replay has no pending checkpoint batch because its copy was committed by an earlier
 /// session. Append still reports that durable record to the current caller, whose batch contract
 /// releases it only from `CheckpointSession`; coalescing by object id also prevents duplicate
 /// receipts when the same replay arrives before that checkpoint.
-fn retain_replayed_committed_receipt(
+fn retain_committed_receipt(
     committed_receipts: &mut Vec<pb::ObjectRecord>,
     record: &pb::ObjectRecord,
 ) {

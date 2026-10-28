@@ -53,12 +53,12 @@ if records.exists():
     lines.append("")
 if bench.exists():
     lines.append("## Benchmarks")
-    lines.append("| Metric | Drive | Block Size | Payload | MB/s | Seconds | Bytes |")
-    lines.append("|---|---|---|---|---|---|---|")
+    lines.append("| Metric | Drive | Block Size | Payload | MB/s | Seconds | Bytes | Object | Daemon append MiB/s | Staging | Diagnostics |")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
     with bench.open(newline="") as fh:
         reader = csv.DictReader(fh)
         for row in reader:
-            lines.append(f"| {row['metric']} | {row['drive']} | {row['block_size']} | {row['payload']} | {row['MB_s']} | {row['seconds']} | {row['bytes']} |")
+            lines.append(f"| {row['metric']} | {row['drive']} | {row['block_size']} | {row['payload']} | {row['MB_s']} | {row['seconds']} | {row['bytes']} | {row.get('object_id', '')} | {row.get('daemon_drive_append_mib_s', '')} | {row.get('staging_mode', '')} | {row.get('daemon_diagnostics', '')} |")
 summary.write_text("\n".join(lines) + "\n")
 PY
   python3 - "$evidence_dir" "$pack_path" <<'PY'

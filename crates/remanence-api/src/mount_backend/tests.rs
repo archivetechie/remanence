@@ -2033,3 +2033,58 @@ fn device_lock_release_frees_the_drive_while_a_duplicate_descriptor_lives() {
     drop(reacquired);
     drop(inherited);
 }
+
+/// Omitted staging mode reaches the real ingress and writer on both tape layouts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn default_overlap_batches_small_objects_and_retains_mixed_receipts() {
+    for parity_on in [false, true] {
+        for serial in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let parity = rollback_parity(parity_on);
+            let world = world();
+            set_rollback_bootstrap(&world, parity.clone());
+            let state = state_with_parity(root.path(), true, parity.clone());
+            crate::write_owner::tests::check_overlap_batch_receipts(
+                &state,
+                world,
+                crate::SelectedTape {
+                    standalone_endpoint: None,
+                    pool_id: "default".into(),
+                    tape_uuid: UUID,
+                    block_size: BLOCK,
+                    parity_config: parity,
+                },
+                serial,
+            )
+            .await;
+        }
+    }
+}
+
+/// Durable receipts remain deliverable when the next append context cannot renew.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn committed_barrier_context_failures_preserve_receipts() {
+    for trigger in ["threshold", "explicit", "close"] {
+        for deliver_on_close in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let parity = rollback_parity(false);
+            let world = world();
+            set_rollback_bootstrap(&world, parity.clone());
+            let state = state_with_parity(root.path(), true, parity.clone());
+            crate::write_owner::tests::check_context_failure_receipts(
+                &state,
+                world,
+                crate::SelectedTape {
+                    standalone_endpoint: None,
+                    pool_id: "default".into(),
+                    tape_uuid: UUID,
+                    block_size: BLOCK,
+                    parity_config: parity,
+                },
+                trigger,
+                deliver_on_close,
+            )
+            .await;
+        }
+    }
+}

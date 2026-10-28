@@ -57,6 +57,7 @@ pub struct ApiState {
     pub(crate) io_memory: Arc<crate::io_memory::IoMemoryReservation>,
     pub(crate) append_staging_mode: remanence_state::AppendStagingMode,
     pub(crate) append_ring_bytes: u64,
+    pub(crate) append_overlap_min_bytes: u64,
     pub(crate) append_ring_high_pct: u8,
     pub(crate) append_ring_low_pct: u8,
     pub(crate) checkpoint_journal_dir: Arc<PathBuf>,
@@ -162,6 +163,7 @@ impl ApiState {
         );
         state.append_staging_mode = config.daemon.append_staging_mode;
         state.append_ring_bytes = config.daemon.append_ring_bytes;
+        state.append_overlap_min_bytes = config.daemon.append_overlap_min_bytes();
         state.append_ring_high_pct = config.daemon.append_ring_high_pct;
         state.append_ring_low_pct = config.daemon.append_ring_low_pct;
         state.checkpoint_journal_dir = Arc::new(config.journal.dir.join("checkpoints"));
@@ -227,8 +229,9 @@ impl ApiState {
                 remanence_state::DEFAULT_IO_MEMORY_CEILING_BYTES,
             )
             .expect("nonzero default I/O memory ceiling"),
-            append_staging_mode: remanence_state::AppendStagingMode::Serial,
+            append_staging_mode: remanence_state::AppendStagingMode::default(),
             append_ring_bytes: remanence_state::DEFAULT_APPEND_RING_BYTES,
+            append_overlap_min_bytes: remanence_state::DEFAULT_APPEND_RING_BYTES,
             append_ring_high_pct: 90,
             append_ring_low_pct: 25,
             checkpoint_journal_dir: Arc::new(checkpoint_journal_dir),
@@ -450,6 +453,7 @@ impl ApiState {
         state.io_memory = io_memory;
         state.append_staging_mode = config.daemon.append_staging_mode;
         state.append_ring_bytes = config.daemon.append_ring_bytes;
+        state.append_overlap_min_bytes = config.daemon.append_overlap_min_bytes();
         state.append_ring_high_pct = config.daemon.append_ring_high_pct;
         state.append_ring_low_pct = config.daemon.append_ring_low_pct;
         state.checkpoint_journal_dir = Arc::new(config.journal.dir.join("checkpoints"));

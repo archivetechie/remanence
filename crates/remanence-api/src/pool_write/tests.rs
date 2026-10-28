@@ -2691,6 +2691,30 @@ fn parity_capacity_distinguishes_fresh_media_limit_from_current_tape_shortfall()
 
 #[test]
 fn batched_parity_post_motion_projection_failure_sets_dirty_after_retryable_spool_rejection() {
+    // Isolate tracing's process-wide callsite cache from concurrent test subscribers.
+    const CHILD: &str = "REMANENCE_PARITY_DIAGNOSTIC_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "pool_write::tests::batched_parity_post_motion_projection_failure_sets_dirty_after_retryable_spool_rejection", "--nocapture"])
+            .env(CHILD, "1").output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains("1 passed"));
+        println!("{stdout}");
+        return;
+    }
+    let diagnostic_file = tempfile::tempfile().unwrap();
+    let reader = diagnostic_file.try_clone().unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .flatten_event(true)
+        .with_writer(move || diagnostic_file.try_clone().unwrap())
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
     let temp = tempfile::Builder::new()
         .prefix("remanence-parity-session-retention-")
         .tempdir()
@@ -2754,8 +2778,38 @@ fn batched_parity_post_motion_projection_failure_sets_dirty_after_retryable_spoo
         representation: PoolWriteRepresentation::Plaintext,
     };
 
+    // A position-query delay is outside WRITE commands but inside transfer.
+    struct HostDelayRaw<'a> {
+        inner: BlockSinkRawTapeSink<'a>,
+        delay: &'a std::cell::Cell<bool>,
+    }
+    impl RawTapeSink for HostDelayRaw<'_> {
+        fn write_fixed_block(
+            &mut self,
+            bytes: &[u8],
+        ) -> Result<remanence_parity::RawWriteOutcome, ParityError> {
+            self.inner.write_fixed_block(bytes)
+        }
+        fn write_filemarks(
+            &mut self,
+            count: u32,
+            immed: bool,
+        ) -> Result<remanence_parity::RawWriteOutcome, ParityError> {
+            self.inner.write_filemarks(count, immed)
+        }
+        fn position(&mut self) -> Result<remanence_parity::PhysicalPositionHint, ParityError> {
+            if self.delay.replace(false) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            self.inner.position()
+        }
+    }
     let mut backing = VecBlockSink::new();
-    let mut raw = BlockSinkRawTapeSink::new(&mut backing);
+    let host_delay = std::cell::Cell::new(false);
+    let mut raw = HostDelayRaw {
+        inner: BlockSinkRawTapeSink::new(&mut backing),
+        delay: &host_delay,
+    };
     let mut journal = PerObjectTestJournal {
         tape_uuid,
         bundles: Vec::new(),
@@ -2816,6 +2870,7 @@ fn batched_parity_post_motion_projection_failure_sets_dirty_after_retryable_spoo
 
     let ample_memory = crate::io_memory::IoMemoryReservation::new(64 * 1024 * 1024)
         .expect("ample shared spool budget");
+    host_delay.set(true);
     let result = write_batched_parity_to_selected_tape_after_replay_check(
         &state,
         &mut raw,
@@ -2829,6 +2884,45 @@ fn batched_parity_post_motion_projection_failure_sets_dirty_after_retryable_spoo
     )
     .expect("the same retained session accepts a later retry");
     assert!(!result.is_replay());
+    {
+        use std::io::{Read, Seek};
+        let mut reader = reader;
+        reader.rewind().unwrap();
+        let mut text = String::new();
+        reader.read_to_string(&mut text).unwrap();
+        let events: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let object_id = Uuid::from_bytes(result.object.object_id).to_string();
+        for phase in ["prepare", "transfer", "tail"] {
+            let event = events
+                .iter()
+                .find(|event| event["phase"] == phase && event["object_id"] == object_id)
+                .unwrap_or_else(|| panic!("missing {phase} for {object_id}: {text}"));
+            assert_eq!(event["parity"], "scheme");
+            assert!(event["elapsed_ms"].as_f64().unwrap() >= 0.0);
+            if phase == "transfer" {
+                let host = event["transfer_host_ms"].as_f64().unwrap();
+                let between = event["between_writes_ms"].as_f64().unwrap();
+                assert!(
+                    !host_delay.get(),
+                    "transfer executes the delayed position query"
+                );
+                assert!(
+                    host >= 20.0,
+                    "position-query time belongs to host time: {event}"
+                );
+                assert!(between <= host);
+                assert!(
+                    (crate::diagnostics::duration_ms(result.transfer_feed_wait) - between).abs()
+                        < 0.001
+                );
+                assert!(event["block_write_calls"].as_u64().unwrap() > 0);
+                println!("{event}");
+            }
+        }
+    }
     assert!(raw_write_attempted);
     assert!(session_state.is_some());
 
@@ -5461,4 +5555,174 @@ async fn overlap_and_staged_filemarks_advance_positions() {
             assert_eq!(sink.position().unwrap().lba, 3);
         }
     }
+}
+
+/// The receive digest replaces both file scans and remains a write-time guard.
+#[test]
+fn spool_receive_digest_matches_file_passes_and_large_multichunk_stream() {
+    use sha2::{Digest, Sha256};
+    let temp = tempfile::tempdir().unwrap();
+    let large: Vec<u8> = (0..17 * 1024 * 1024 + 37)
+        .map(|n| (n % 251) as u8)
+        .collect();
+    let fixtures =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/rem-object/objects");
+    let d1 = std::fs::read(fixtures.join("rem-object-tv-d1-encrypted.rem-object")).unwrap();
+    let e2 = std::fs::read(fixtures.join("rem-object-tv-e2.rem-object")).unwrap();
+    for payload in [
+        b"".as_slice(),
+        b"abc",
+        b"hello world",
+        d1.as_slice(),
+        e2.as_slice(),
+        large.as_slice(),
+    ] {
+        let mut spool =
+            crate::append_spool::Spool::create(temp.path(), payload.len() as u64).unwrap();
+        for chunk in payload.chunks(65537) {
+            spool.write_chunk(chunk).unwrap();
+        }
+        let received = spool.content_sha256();
+        let path = spool.finish().unwrap();
+        assert_eq!(received, <[u8; 32]>::from(Sha256::digest(payload)));
+        assert_eq!(received, sha256_file(&path).unwrap());
+        let old = remanence_stream::prepare_regular_file(&path, "payload.bin", "member").unwrap();
+        assert_eq!(Some(received), old.spec.file_sha256);
+        let request = WriteObjectToPoolRequest {
+            pool_id: "digest-test".into(),
+            source: WriteObjectSource::Spool {
+                path: path.clone(),
+                mtime: Some("123.5".into()),
+                content_sha256: received,
+                received_bytes: payload.len() as u64,
+                staging_reason: "configured_serial",
+            },
+            archive_path: PathBuf::from("payload.bin"),
+            caller_object_id: "digest-test".into(),
+            expected_content_sha256: Some(received),
+            expected_object_id: None,
+            input_kind: crate::WriteObjectInputKind::LogicalFile,
+            representation: PoolWriteRepresentation::Plaintext,
+        };
+        // A cached digest survives source modification at preparation; the byte writer
+        // retains responsibility for checking that the bytes written match this digest.
+        if !payload.is_empty() {
+            std::fs::write(&path, vec![0xff; payload.len()]).unwrap();
+        }
+        let prepared = prepare_pool_object(&request, 256 * 1024).unwrap();
+        assert_eq!(prepared.content_sha256, received);
+        assert_eq!(prepared.files[0].spec.file_sha256, old.spec.file_sha256);
+        assert_eq!(prepared.files[0].spec.size_bytes, old.spec.size_bytes);
+        assert_eq!(prepared.files[0].spec.mtime.as_deref(), Some("123.5"));
+        if !payload.is_empty() {
+            let mut readers = open_prepared_readers(&prepared).unwrap();
+            let mut streams = vec![remanence_format::RemTarFileStream::new(
+                prepared.files[0].spec.clone(),
+                readers[0].as_mut(),
+            )];
+            let error = remanence_format::write_rem_tar_object_from_readers(
+                &mut VecBlockSink::new(),
+                &prepared.options,
+                &mut streams,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("streamed data hash"), "{error}");
+        }
+        // Both truncation and growth disagree with the measured receipt before motion.
+        for length in [payload.len().saturating_sub(1), payload.len() + 1] {
+            if length == payload.len() {
+                continue;
+            }
+            std::fs::write(&path, vec![0; length]).unwrap();
+            assert!(prepare_pool_object(&request, 256 * 1024)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("spool size differs from receipt"));
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+/// Timing observes successful and failed calls while forwarding bytes and ordering.
+#[test]
+fn parity_raw_timing_separates_commands_from_host_gaps() {
+    use remanence_parity::{PhysicalPositionHint, RawWriteOutcome};
+    struct Raw {
+        calls: Vec<String>,
+    }
+    impl RawTapeSink for Raw {
+        fn locate_for_overwrite(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
+            self.calls.push(format!("locate:{}", hint.lba));
+            Ok(())
+        }
+        fn write_fixed_block(&mut self, bytes: &[u8]) -> Result<RawWriteOutcome, ParityError> {
+            self.calls.push(format!("block:{bytes:?}"));
+            std::thread::sleep(Duration::from_millis(3));
+            if bytes == b"fail" {
+                return Err(ParityError::TapeIo(TapeIoError::OperationFailed(
+                    "injected".into(),
+                )));
+            }
+            Ok(RawWriteOutcome::WroteBlock {
+                bytes_written: bytes.len() as u32,
+                position_after: PhysicalPositionHint::new(1),
+                early_warning: false,
+                end_of_medium: false,
+            })
+        }
+        fn write_filemarks(
+            &mut self,
+            count: u32,
+            immed: bool,
+        ) -> Result<RawWriteOutcome, ParityError> {
+            self.calls.push(format!("filemarks:{count}:{immed}"));
+            Ok(RawWriteOutcome::WroteFilemark {
+                position_after: PhysicalPositionHint::new(2),
+                early_warning: false,
+                end_of_medium: false,
+            })
+        }
+        fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+            self.calls.push("position".into());
+            Ok(PhysicalPositionHint::new(2))
+        }
+    }
+    let mut raw = Raw { calls: Vec::new() };
+    let stats = std::cell::Cell::new(BlockSinkStats::default());
+    {
+        let mut timed = TimedRawTapeSink {
+            inner: &mut raw,
+            stats: &stats,
+            last_write_finished: None,
+        };
+        assert_eq!(
+            timed.write_fixed_block(b"ok").unwrap().position_after().lba,
+            1
+        );
+        let before = stats.get().write_command_elapsed;
+        std::thread::sleep(Duration::from_millis(5));
+        timed.write_filemarks(1, true).unwrap();
+        assert_eq!(timed.position().unwrap().lba, 2);
+        timed
+            .locate_for_overwrite(PhysicalPositionHint::new(7))
+            .unwrap();
+        let error = timed.write_fixed_block(b"fail").unwrap_err();
+        assert!(error.to_string().contains("injected"));
+        assert!(stats.get().write_command_elapsed >= before + Duration::from_millis(3));
+        assert!(stats.get().between_write_elapsed >= Duration::from_millis(5));
+    }
+    assert_eq!(
+        raw.calls,
+        [
+            "block:[111, 107]",
+            "filemarks:1:true",
+            "position",
+            "locate:7",
+            "block:[102, 97, 105, 108]"
+        ]
+    );
+    assert_eq!(stats.get().block_write_bytes, 2);
+    assert_eq!(stats.get().filemark_calls, 1);
+    assert_eq!(stats.get().position_calls, 1);
 }

@@ -325,20 +325,35 @@ impl WriteSessionApi {
                 ));
             }
         };
+        let staging_reason = crate::append_request::append_staging_reason(
+            self.state.append_staging_mode,
+            logical_start.as_ref(),
+            start_digest.as_ref(),
+            self.state.append_overlap_min_bytes,
+        );
         let mtime = logical_start.as_ref().and_then(|s| s.mtime.clone());
         if let Some(start) = logical_start {
             let overlap_eligible = overlap_append_eligible(
                 self.state.append_staging_mode,
                 &start,
                 start_digest.as_ref(),
+                self.state.append_overlap_min_bytes,
             );
             if overlap_eligible {
+                let ring = crate::append_ring::create_append_ring(
+                    &self.state.io_memory,
+                    self.state.append_ring_bytes,
+                    self.state.append_ring_high_pct,
+                    self.state.append_ring_low_pct,
+                    start.declared_size_bytes.expect("overlap requires a size"),
+                )?;
                 return self
                     .append_object_overlap(
                         stream,
                         start,
                         session_id,
-                        start_digest.expect("overlap eligibility requires a start digest"),
+                        start_digest.expect("overlap requires a start digest"),
+                        ring,
                     )
                     .await;
             }
@@ -422,6 +437,18 @@ impl WriteSessionApi {
             )));
         }
         let expected_content_sha256 = start_digest.or(finish_digest);
+        let content_sha256 = spool.content_sha256();
+        if let Some(expected) =
+            expected_content_sha256.filter(|expected| *expected != content_sha256)
+        {
+            return Err(Status::failed_precondition(
+                crate::PoolWriteError::ContentHashMismatch {
+                    expected: bytes_to_hex(&expected),
+                    actual: bytes_to_hex(&content_sha256),
+                }
+                .to_string(),
+            ));
+        }
         let spool_path = finish_append_spool(spool).await?;
         let spool_elapsed = spool_started.elapsed();
         tracing::info!(
@@ -441,6 +468,9 @@ impl WriteSessionApi {
             session_id,
             crate::mount::AppendFinishRequest {
                 spool_path: spool_path.clone(),
+                content_sha256,
+                received_bytes: spool_bytes,
+                staging_reason,
                 mtime,
                 archive_path,
                 caller_object_id,
@@ -476,6 +506,7 @@ impl WriteSessionApi {
         start: pb::AppendObjectStart,
         session_id: Uuid,
         start_digest: [u8; 32],
+        ring: crate::append_ring::AppendRing,
     ) -> Result<Response<pb::ObjectRecord>, Status>
     where
         S: Stream<Item = Result<pb::AppendObjectMessage, Status>> + Unpin + Send + 'static,
@@ -485,13 +516,7 @@ impl WriteSessionApi {
         let declared_size_bytes = start
             .declared_size_bytes
             .expect("overlap eligibility requires a declared size");
-        let (producer, consumer, control) = crate::append_ring::create_append_ring(
-            &self.state.io_memory,
-            self.state.append_ring_bytes,
-            self.state.append_ring_high_pct,
-            self.state.append_ring_low_pct,
-            declared_size_bytes,
-        )?;
+        let (producer, consumer, control) = ring;
         let receive_control = Arc::clone(&control);
         let receive_task = tokio::spawn(receive_overlap_messages(
             stream,
@@ -507,6 +532,7 @@ impl WriteSessionApi {
             })?;
             return Err(receive.err().unwrap_or(status));
         }
+        control.record_prefill_lead();
         tracing::info!(
             target: "remanence_write_diag",
             phase = "overlap_prefill",
@@ -551,23 +577,20 @@ impl WriteSessionApi {
                 let checkpoint = crate::mount::checkpoint_write_session(
                     &self.state,
                     session_id,
-                    crate::write_owner::CheckpointTrigger::Explicit,
+                    crate::write_owner::CheckpointTrigger::Append,
                 )
                 .await;
                 match checkpoint {
-                    Ok(checkpoint) => {
-                        outcome.record = checkpoint
-                            .committed_objects
-                            .into_iter()
-                            .find(|record| record.object_id == object_id)
-                            .ok_or_else(|| {
-                                Status::internal(
-                                    "overlap checkpoint omitted the just-written object",
-                                )
-                            })?;
-                        Ok(outcome)
+                    Ok(checkpoint) => committed_overlap_record(&self.state, object_id, checkpoint)
+                        .map(|record| {
+                            outcome.record = record;
+                            outcome
+                        }),
+                    Err(err) => {
+                        receive_task.abort();
+                        let _ = receive_task.await;
+                        return Err(err);
                     }
-                    Err(err) => Err(err),
                 }
             }
             other => other,
@@ -829,4 +852,34 @@ pub(crate) fn log_append_object_failure(spool_dir: &str, status: &Status) {
             message,
         );
     }
+}
+
+/// Resolve a durable ring object even when a concurrent caller claims its receipt.
+fn committed_overlap_record(
+    state: &ApiState,
+    object_id: Vec<u8>,
+    checkpoint: crate::write_owner::CheckpointActorReply,
+) -> Result<pb::ObjectRecord, Status> {
+    if let Some(record) = checkpoint
+        .committed_objects
+        .into_iter()
+        .chain(checkpoint.session.checkpointed_objects)
+        .find(|record| record.object_id == object_id)
+    {
+        return Ok(record);
+    }
+    // An explicit checkpoint can claim the receipt while the internal checkpoint
+    // waits in the actor queue. The catalog retains the committed object by ID.
+    let mut record = crate::catalog_conversion::find_object_for_key(
+        state,
+        Some(pb::get_object_request::Key::ObjectId(object_id)),
+    )?
+    .ok_or_else(|| Status::internal("overlap checkpoint has no committed object record"))?;
+    record.copies.retain(|copy| copy.status == "committed");
+    if record.copies.is_empty() {
+        return Err(Status::internal(
+            "overlap checkpoint has no committed object copy",
+        ));
+    }
+    crate::catalog_conversion::object_record_to_proto(record)
 }

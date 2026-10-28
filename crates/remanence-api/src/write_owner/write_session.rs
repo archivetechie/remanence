@@ -36,10 +36,9 @@ use super::terminal_finalize::{
 };
 use super::terminal_types::TerminalFinalizeSpec;
 use super::{
-    retain_replayed_committed_receipt, send_checkpoint_actor_reply,
-    validate_provisional_replay_guards, AppendFinishOutcome, CheckpointTrigger,
-    CloseWriteActorDiagnostics, CloseWriteActorReply, SelectedTape, SessionOpenReadinessContext,
-    TapeUuid,
+    retain_committed_receipt, send_checkpoint_actor_reply, validate_provisional_replay_guards,
+    AppendFinishOutcome, CheckpointTrigger, CloseWriteActorDiagnostics, CloseWriteActorReply,
+    SelectedTape, SessionOpenReadinessContext, TapeUuid,
 };
 use crate::audit_projection::{
     append_and_project_audit, ensure_tape_sealed_audit, ProjectedAuditInput,
@@ -177,6 +176,26 @@ pub(super) struct WriteSessionState<'a> {
 }
 
 impl WriteSessionState<'_> {
+    /// Retain durable receipts and accounting before any fallible context renewal.
+    fn retain_checkpoint_outcome(&mut self, outcome: &super::checkpoint::BarrierOutcome) {
+        extend_durable_checkpoint_records(&mut self.durable_checkpoint_records, outcome);
+        for record in &outcome.committed_objects {
+            retain_committed_receipt(&mut self.committed_receipts, record);
+        }
+        self.objects_committed = self.objects_committed.saturating_add(outcome.object_count);
+        self.bytes_committed = self.bytes_committed.saturating_add(outcome.logical_bytes);
+        self.last_checkpoint_at_utc =
+            Some(now_rfc3339().unwrap_or_else(|_| self.opened_at_utc.clone()));
+        self.append_commit_diagnostics
+            .accumulate(crate::pool_write::AppendCommitDiagnostics {
+                filemark_write_drain: outcome.filemark_drain,
+                catalog_journal_fsync: outcome.journal_projection,
+            });
+        if outcome.sealed_after_write {
+            self.append_gate.record_sealed();
+        }
+    }
+
     /// Dispatch commands until a close transition releases the drive actor.
     ///
     /// A successful close reply is returned to the caller so the outer owner
@@ -340,6 +359,11 @@ impl WriteSessionState<'_> {
         self.timer_checkpoint_waiting = None;
         let source_size = source.size_bytes().unwrap_or(0);
         let stream_control = source.stream_control();
+        let (staging_mode, staging_reason) = match &source {
+            crate::WriteObjectSource::Streamed(_) => ("overlap", "configured_overlap"),
+            crate::WriteObjectSource::Spool { staging_reason, .. } => ("serial", *staging_reason),
+            _ => ("serial", "completed_path"),
+        };
         let cleanup_path =
             match &source {
                 crate::WriteObjectSource::Path(path)
@@ -487,6 +511,9 @@ impl WriteSessionState<'_> {
         }
         match result {
             Ok(result) => {
+                let feed_wait = stream_control
+                    .as_ref()
+                    .map_or(result.transfer_feed_wait, |control| control.feed_wait());
                 let logical_size = result.object.logical_size_bytes;
                 let replay = result.is_replay();
                 self.append_commit_diagnostics
@@ -561,6 +588,7 @@ impl WriteSessionState<'_> {
                         );
                         match outcome {
                             Ok(outcome) => {
+                                self.retain_checkpoint_outcome(&outcome);
                                 if let Some(previous) = self.next_batched_append.as_ref() {
                                     let checkpoint_context = match crate::pool_write::batched_append_context_after_checkpoint(
                                         previous,
@@ -568,10 +596,6 @@ impl WriteSessionState<'_> {
                                     ) {
                                         Ok(context) => context,
                                         Err(err) => {
-                                            extend_durable_checkpoint_records(
-                                                &mut self.durable_checkpoint_records,
-                                                &outcome,
-                                            );
                                             self.append_gate.record_failure();
                                             self.pending_batch = None;
                                             let _ = reply.send(Err(status_from_pool_write_error(err)));
@@ -580,32 +604,12 @@ impl WriteSessionState<'_> {
                                     };
                                     self.next_batched_append = Some(checkpoint_context);
                                 }
-                                extend_durable_checkpoint_records(
-                                    &mut self.durable_checkpoint_records,
-                                    &outcome,
-                                );
-                                self.objects_committed =
-                                    self.objects_committed.saturating_add(outcome.object_count);
-                                self.bytes_committed =
-                                    self.bytes_committed.saturating_add(outcome.logical_bytes);
-                                self.last_checkpoint_at_utc =
-                                    Some(now_rfc3339().unwrap_or_else(|_| opened_at_utc.clone()));
-                                self.append_commit_diagnostics.accumulate(
-                                    crate::pool_write::AppendCommitDiagnostics {
-                                        filemark_write_drain: outcome.filemark_drain,
-                                        catalog_journal_fsync: outcome.journal_projection,
-                                    },
-                                );
-                                if outcome.sealed_after_write {
-                                    self.append_gate.record_sealed();
-                                }
                                 let committed = outcome
                                     .committed_objects
                                     .iter()
                                     .find(|record| record.object_id == object_id)
                                     .cloned()
                                     .expect("threshold checkpoint returns current object");
-                                self.committed_receipts.extend(outcome.committed_objects);
                                 self.pending_batch = None;
                                 committed
                             }
@@ -667,8 +671,16 @@ impl WriteSessionState<'_> {
                 tracing::info!(
                     target: "remanence_write_diag",
                     phase = "drive_append_total",
+                    staging_mode,
+                    staging_reason,
+                    prefill_lead_bytes = stream_control.as_ref().map_or(0, |control| control.prefill_lead_bytes()),
+                    open_path = "full",
                     session_id = %session_id,
                     tape_uuid = %Uuid::from_bytes(tape_uuid),
+                    object_id = %Uuid::from_slice(&response_record.object_id).unwrap_or(Uuid::nil()),
+                    caller_object_id = %current_caller_object_id,
+                    feed_wait_ms = crate::diagnostics::duration_ms(feed_wait),
+                    feed_wait_measure = if stream_control.is_some() { "ring_consumer_wait" } else { "between_write_calls" },
                     payload_bytes = source_size,
                     block_size_bytes = selected.block_size,
                     replay,
@@ -681,10 +693,7 @@ impl WriteSessionState<'_> {
                     "remanence_write_diag",
                 );
                 if replay {
-                    retain_replayed_committed_receipt(
-                        &mut self.committed_receipts,
-                        &response_record,
-                    );
+                    retain_committed_receipt(&mut self.committed_receipts, &response_record);
                 }
                 let _ = reply.send(Ok(AppendFinishOutcome {
                     record: response_record,
@@ -901,10 +910,17 @@ impl WriteSessionState<'_> {
                 tracing::info!(
                     target: "remanence_write_diag",
                     phase = "drive_append_total",
+                    staging_mode,
+                    staging_reason,
+                    prefill_lead_bytes = stream_control.as_ref().map_or(0, |control| control.prefill_lead_bytes()),
+                    open_path = "full",
                     session_id = %session_id,
                     tape_uuid = %Uuid::from_bytes(tape_uuid),
                     payload_bytes = source_size,
                     block_size_bytes = selected.block_size,
+                    caller_object_id = %current_caller_object_id,
+                    feed_wait_ms = stream_control.as_ref().map(|control| crate::diagnostics::duration_ms(control.feed_wait())),
+                    feed_wait_measure = if stream_control.is_some() { "ring_consumer_wait" } else { "unavailable" },
                     status = "error",
                     error = %status,
                     elapsed_ms = crate::diagnostics::duration_ms(append_elapsed),
@@ -974,7 +990,7 @@ impl WriteSessionState<'_> {
                     drive_element_address: bay,
                     pending_batch: None,
                 });
-                send_checkpoint_actor_reply(reply, session, &mut self.committed_receipts);
+                send_checkpoint_actor_reply(reply, session, &mut self.committed_receipts, trigger);
             }
             return;
         };
@@ -1015,6 +1031,7 @@ impl WriteSessionState<'_> {
             cfg,
         ) {
             Ok(outcome) => {
+                self.retain_checkpoint_outcome(&outcome);
                 if let Some(previous) = self.next_batched_append.as_ref() {
                     let checkpoint_context =
                         match crate::pool_write::batched_append_context_after_checkpoint(
@@ -1023,10 +1040,6 @@ impl WriteSessionState<'_> {
                         ) {
                             Ok(context) => context,
                             Err(err) => {
-                                extend_durable_checkpoint_records(
-                                    &mut self.durable_checkpoint_records,
-                                    &outcome,
-                                );
                                 self.append_gate.record_failure();
                                 self.pending_batch = None;
                                 let status = status_from_pool_write_error(err);
@@ -1039,21 +1052,6 @@ impl WriteSessionState<'_> {
                             }
                         };
                     self.next_batched_append = Some(checkpoint_context);
-                }
-                extend_durable_checkpoint_records(&mut self.durable_checkpoint_records, &outcome);
-                self.objects_committed =
-                    self.objects_committed.saturating_add(outcome.object_count);
-                self.bytes_committed = self.bytes_committed.saturating_add(outcome.logical_bytes);
-                self.last_checkpoint_at_utc =
-                    Some(now_rfc3339().unwrap_or_else(|_| opened_at_utc.clone()));
-                self.append_commit_diagnostics.accumulate(
-                    crate::pool_write::AppendCommitDiagnostics {
-                        filemark_write_drain: outcome.filemark_drain,
-                        catalog_journal_fsync: outcome.journal_projection,
-                    },
-                );
-                if outcome.sealed_after_write {
-                    self.append_gate.record_sealed();
                 }
                 self.pending_batch = None;
                 let condition_key = format!("checkpoint-barrier-overdue:{session_id}");
@@ -1087,7 +1085,6 @@ impl WriteSessionState<'_> {
                         );
                     }
                 }
-                self.committed_receipts.extend(outcome.committed_objects);
                 let session = session_proto(WriteSessionProtoInput {
                     session_id,
                     tape_uuid: &tape_uuid,
@@ -1101,7 +1098,12 @@ impl WriteSessionState<'_> {
                     pending_batch: None,
                 });
                 if let Some(reply) = reply {
-                    send_checkpoint_actor_reply(reply, session, &mut self.committed_receipts);
+                    send_checkpoint_actor_reply(
+                        reply,
+                        session,
+                        &mut self.committed_receipts,
+                        trigger,
+                    );
                 }
             }
             Err(failure) => {
@@ -1249,6 +1251,7 @@ impl WriteSessionState<'_> {
                 cfg,
             ) {
                 Ok(outcome) => {
+                    self.retain_checkpoint_outcome(&outcome);
                     if let Some(previous) = self.next_batched_append.as_ref() {
                         let checkpoint_context =
                             match crate::pool_write::batched_append_context_after_checkpoint(
@@ -1257,10 +1260,6 @@ impl WriteSessionState<'_> {
                             ) {
                                 Ok(context) => context,
                                 Err(err) => {
-                                    extend_durable_checkpoint_records(
-                                        &mut self.durable_checkpoint_records,
-                                        &outcome,
-                                    );
                                     self.append_gate.record_failure();
                                     self.pending_batch = None;
                                     let _ = reply.send(Err(status_from_pool_write_error(err)));
@@ -1269,26 +1268,6 @@ impl WriteSessionState<'_> {
                             };
                         self.next_batched_append = Some(checkpoint_context);
                     }
-                    extend_durable_checkpoint_records(
-                        &mut self.durable_checkpoint_records,
-                        &outcome,
-                    );
-                    self.objects_committed =
-                        self.objects_committed.saturating_add(outcome.object_count);
-                    self.bytes_committed =
-                        self.bytes_committed.saturating_add(outcome.logical_bytes);
-                    self.last_checkpoint_at_utc =
-                        Some(now_rfc3339().unwrap_or_else(|_| opened_at_utc.clone()));
-                    self.append_commit_diagnostics.accumulate(
-                        crate::pool_write::AppendCommitDiagnostics {
-                            filemark_write_drain: outcome.filemark_drain,
-                            catalog_journal_fsync: outcome.journal_projection,
-                        },
-                    );
-                    if outcome.sealed_after_write {
-                        self.append_gate.record_sealed();
-                    }
-                    self.committed_receipts.extend(outcome.committed_objects);
                     self.pending_batch = None;
                 }
                 Err(failure) => {

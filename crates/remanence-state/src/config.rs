@@ -103,13 +103,13 @@ pub struct DaemonConfig {
     /// Required operator acknowledgment when `spool_dir` is RAM-backed tmpfs.
     #[serde(default, deserialize_with = "deserialize_optional_byte_size")]
     pub spool_tmpfs_ram_budget: Option<u64>,
-    /// Fixed aggregate budget for spool and read-reservoir memory.
+    /// Fixed aggregate budget for spool, overlap-ring, and read-reservoir memory.
     #[serde(
         default = "default_io_memory_ceiling",
         deserialize_with = "deserialize_byte_size"
     )]
     pub io_memory_ceiling: u64,
-    /// Append receive strategy. The v0.1 rollout remains opt-in.
+    /// Append receive strategy. Qualifying large objects use overlap by default.
     #[serde(default)]
     pub append_staging_mode: AppendStagingMode,
     /// Target byte capacity of one overlap append receive ring.
@@ -118,6 +118,9 @@ pub struct DaemonConfig {
         deserialize_with = "deserialize_byte_size"
     )]
     pub append_ring_bytes: u64,
+    /// Minimum declared size for overlap; absent uses the configured ring capacity.
+    #[serde(default, deserialize_with = "deserialize_optional_byte_size")]
+    pub append_overlap_min_bytes: Option<u64>,
     /// Start or resume tape submission at this ring occupancy percentage.
     #[serde(default = "default_append_ring_high_pct")]
     pub append_ring_high_pct: u8,
@@ -163,13 +166,19 @@ pub struct DaemonConfig {
 #[serde(rename_all = "lowercase")]
 pub enum AppendStagingMode {
     /// Receive the complete object into the legacy spool before tape writing.
-    #[default]
     Serial,
     /// Use a bounded live receive ring when the caller supplies every proof.
+    #[default]
     Overlap,
 }
 
 impl DaemonConfig {
+    /// Resolve the overlap threshold against this daemon's ring capacity.
+    pub fn append_overlap_min_bytes(&self) -> u64 {
+        self.append_overlap_min_bytes
+            .unwrap_or(self.append_ring_bytes)
+    }
+
     /// Resolve the listen socket: explicit `socket_path`, else `<state_dir>/rem.sock`.
     pub fn socket_path_or_default(&self) -> PathBuf {
         self.socket_path
@@ -624,6 +633,23 @@ pub fn validate_config(config: &RemConfig) -> Result<(), StateError> {
         return Err(StateError::ConfigInvalid(
             "daemon.append_ring_bytes must be non-zero".to_string(),
         ));
+    }
+    if config.daemon.append_staging_mode == AppendStagingMode::Overlap
+        && config.daemon.append_ring_bytes > config.daemon.io_memory_ceiling
+    {
+        return Err(StateError::ConfigInvalid(
+            "daemon.append_ring_bytes must not exceed daemon.io_memory_ceiling".into(),
+        ));
+    }
+    if config.daemon.append_overlap_min_bytes() < 1024 * 1024 {
+        let setting = if config.daemon.append_overlap_min_bytes.is_some() {
+            "append_overlap_min_bytes"
+        } else {
+            "append_ring_bytes"
+        };
+        return Err(StateError::ConfigInvalid(format!(
+            "daemon.{setting} must be at least one slab (1 MiB)"
+        )));
     }
     if config.daemon.append_ring_low_pct == 0
         || config.daemon.append_ring_low_pct >= config.daemon.append_ring_high_pct
@@ -1395,7 +1421,10 @@ client_ca = "/ca"
             config.daemon.io_memory_ceiling,
             DEFAULT_IO_MEMORY_CEILING_BYTES
         );
-        assert_eq!(config.daemon.append_staging_mode, AppendStagingMode::Serial);
+        assert_eq!(
+            config.daemon.append_staging_mode,
+            AppendStagingMode::Overlap
+        );
         assert_eq!(config.daemon.append_ring_bytes, DEFAULT_APPEND_RING_BYTES);
         assert_eq!(config.daemon.append_ring_high_pct, 90);
         assert_eq!(config.daemon.append_ring_low_pct, 25);
@@ -1445,6 +1474,18 @@ client_ca = "/ca"
         assert_eq!(config.daemon.append_ring_high_pct, 80);
         assert_eq!(config.daemon.append_ring_low_pct, 20);
 
+        let serial = configured.replace(
+            "append_staging_mode = \"overlap\"",
+            "append_staging_mode = \"serial\"",
+        );
+        assert_eq!(
+            parse_config_toml(&serial)
+                .unwrap()
+                .daemon
+                .append_staging_mode,
+            AppendStagingMode::Serial
+        );
+
         let bad_mode = configured.replace(
             "append_staging_mode = \"overlap\"",
             "append_staging_mode = \"auto\"",
@@ -1467,9 +1508,67 @@ client_ca = "/ca"
             "append_ring_bytes = \"4GiB\"",
             "append_ring_bytes = \"16GiB\"",
         );
-        let config = parse_config_toml(&over_ceiling)
-            .expect("reservation, not serial-mode config parsing, enforces shared ceiling");
-        assert_eq!(config.daemon.append_ring_bytes, 16 * 1024 * 1024 * 1024);
+        assert!(parse_config_toml(&over_ceiling)
+            .unwrap_err()
+            .to_string()
+            .contains("io_memory_ceiling"));
+        assert_eq!(
+            config.daemon.append_overlap_min_bytes(),
+            config.daemon.append_ring_bytes
+        );
+        for value in ["0", "1048575"] {
+            let text = configured.replace(
+                "append_ring_high_pct = 80",
+                &format!("append_ring_high_pct = 80\nappend_overlap_min_bytes = {value}"),
+            );
+            assert!(parse_config_toml(&text)
+                .unwrap_err()
+                .to_string()
+                .contains("append_overlap_min_bytes"));
+        }
+        for value in [1048576, 2 * 1024 * 1024 * 1024, u64::MAX] {
+            let text = configured.replace(
+                "append_ring_high_pct = 80",
+                &format!("append_ring_high_pct = 80\nappend_overlap_min_bytes = \"{value}\""),
+            );
+            assert_eq!(
+                parse_config_toml(&text)
+                    .unwrap()
+                    .daemon
+                    .append_overlap_min_bytes(),
+                value
+            );
+        }
+    }
+
+    /// Serial mode does not reserve a ring; inferred bounds name the written setting.
+    #[test]
+    fn overlap_validation_scopes_ceiling_and_names_inferred_ring_bound() {
+        let mut serial =
+            with_daemon_lines("append_staging_mode = \"serial\"\nio_memory_ceiling = \"1GiB\"\n");
+        serial.push_str("\n[tape_io]\nread_reservoir_bytes = \"1GiB\"\n");
+        let config = parse_config_toml(&serial).expect("serial allows the unused default ring");
+        assert!(config.daemon.append_ring_bytes > config.daemon.io_memory_ceiling);
+        let overlap = serial.replace(
+            "append_staging_mode = \"serial\"",
+            "append_staging_mode = \"overlap\"",
+        );
+        assert!(parse_config_toml(&overlap)
+            .unwrap_err()
+            .to_string()
+            .contains("io_memory_ceiling"));
+        let small = with_daemon_lines("append_ring_bytes = \"512KiB\"\n");
+        let error = parse_config_toml(&small).unwrap_err().to_string();
+        assert!(error.contains("daemon.append_ring_bytes"), "{error}");
+        assert!(!error.contains("append_overlap_min_bytes"), "{error}");
+        let explicit = with_daemon_lines("append_overlap_min_bytes = \"512KiB\"\n");
+        assert!(parse_config_toml(&explicit)
+            .unwrap_err()
+            .to_string()
+            .contains("append_overlap_min_bytes"));
+        let inferred =
+            parse_config_toml(&with_daemon_lines("append_ring_bytes = \"2MiB\"\n")).unwrap();
+        assert_eq!(inferred.daemon.append_overlap_min_bytes(), 2 * 1024 * 1024);
     }
 
     #[test]

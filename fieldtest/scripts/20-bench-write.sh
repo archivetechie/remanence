@@ -80,7 +80,7 @@ sample_top() {
 
 bench_write_case() {
   local serial="$1" source="$2" pool="$3" label="$4"
-  local start end seconds mb_s bytes top_stop stamp out_path
+  local start end seconds mb_s bytes top_stop stamp out_path log_offset
   stamp="$(fieldtest_timestamp_id)"
   out_path="$(fieldtest_artifact_path "$SCRIPT_NAME" "$label" "$stamp")"
   top_stop="$out_path.stop"
@@ -88,6 +88,7 @@ bench_write_case() {
   rm -f -- "$top_stop"
   sample_top "$top_stop" 9>&- &
   local sampler_pid=$!
+  log_offset="$(fieldtest_daemon_log_offset)"
   start="$(python3 -c 'import time; print(f"{time.monotonic():.9f}")')"
   if ! fieldtest_capture_io_json "$out_path" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$serial" --file "$source" --pool "$pool"; then
     touch "$top_stop"
@@ -112,14 +113,11 @@ seconds = float(sys.argv[2])
 print(f"{(bytes_count / seconds) / (1024 * 1024):.2f}" if seconds > 0 else "inf")
 PY
 )"
-  fieldtest_bench_record "write-$label" "$serial" "n/a" "$pool" "$mb_s" "$seconds" "$bytes"
-  fieldtest_evidence_record "$SCRIPT_NAME" "$label" PASS "wrote $bytes bytes at ${mb_s} MB/s" "$out_path"
-  local daemon_total daemon_transfer
-  daemon_total="$(fieldtest_daemon_phase_rate drive_append_total)"
-  daemon_transfer="$(fieldtest_daemon_phase_rate transfer)"
-  if [[ -n "$daemon_total" || -n "$daemon_transfer" ]]; then
-    fieldtest_evidence_record "$SCRIPT_NAME" "$label-daemon" INFO "daemon drive-side: whole append ${daemon_total%% *} MiB/s, transfer phase ${daemon_transfer%% *} MiB/s (the kit figure spans the whole client call)" "$out_path"
-  fi
+  local object_id daemon_rate staging_mode staging_reason diagnostic_status transfer_rate figures
+  figures="$(fieldtest_daemon_write_figures "$out_path" "$log_offset")"
+  read -r object_id daemon_rate staging_mode staging_reason diagnostic_status transfer_rate <<<"$figures"
+  fieldtest_bench_record "write-$label" "$serial" "n/a" "$pool" "$mb_s" "$seconds" "$bytes" "$out_path" "$log_offset" "$figures"
+  fieldtest_evidence_record "$SCRIPT_NAME" "$label" PASS "wrote $bytes bytes at ${mb_s} MB/s; object=$object_id daemon drive_append_total=${daemon_rate} MiB/s transfer=${transfer_rate} MiB/s staging=$staging_mode reason=$staging_reason diagnostics=$diagnostic_status" "$out_path"
 }
 
 bench_write_batch_list() {

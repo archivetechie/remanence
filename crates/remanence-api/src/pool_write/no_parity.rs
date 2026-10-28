@@ -233,6 +233,13 @@ pub(super) fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
         }
     };
     let (write_report, _transfer_stats) = write_report;
+    let _tail = crate::diagnostics::WriteTailTimer::new(
+        prepared.object_uuid,
+        &selected.pool_id,
+        selected.tape_uuid,
+        "none",
+        super::prepare::prepared_payload_bytes(&prepared),
+    );
 
     match durability {
         PoolWriteDurability::Batched(_) => {
@@ -314,6 +321,10 @@ pub(super) fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
             )
         }
     }
+    .map(|mut result| {
+        result.transfer_feed_wait = _transfer_stats.between_write_elapsed;
+        result
+    })
 }
 
 pub(super) fn record_tape_io_fence_for_transfer_error(
@@ -628,6 +639,7 @@ pub(super) fn pool_write_result(
     };
 
     Ok(PoolWriteResult {
+        transfer_feed_wait: Duration::ZERO,
         object,
         write_report: Some(write_report),
         append_commit_diagnostics,
@@ -762,6 +774,7 @@ pub(crate) fn maybe_replay_pool_write(
         });
     }
     Ok(Some(PoolWriteResult {
+        transfer_feed_wait: Duration::ZERO,
         object: pool_write_object_record_from_native(existing, pool_cfg.id.as_str())?,
         write_report: None,
         append_commit_diagnostics: AppendCommitDiagnostics::default(),

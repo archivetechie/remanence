@@ -38,7 +38,7 @@ PY
 
 default_bench_bytes() {
   if [[ "${REMFIELD_ENV:-unknown}" == vtl ]]; then
-    printf '%s\n' "${FIELD_BENCH_DUAL_BYTES_VTL:-536870912}"
+    printf '%s\n' "${FIELD_BENCH_DUAL_BYTES_VTL:-1073741824}"
   else
     printf '%s\n' "${FIELD_BENCH_DUAL_BYTES:-2147483648}"
   fi
@@ -46,6 +46,7 @@ default_bench_bytes() {
 
 bench_one() {
   local serial="$1" source="$2" pool="$3" out="$4"
+  fieldtest_daemon_log_offset >"$out.log-offset"
   local start end seconds bytes mb_s
   start="$(python3 -c 'import time; print(f"{time.monotonic():.9f}")')"
   if ! fieldtest_capture_io_json "$out" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$serial" --file "$source" --pool "$pool"; then
@@ -182,16 +183,20 @@ print(f"{(total_bytes / seconds) / (1024 * 1024):.2f}" if seconds > 0 else "inf"
 PY
 )"
   fieldtest_bench_record dual-restore "$serial" n/a fieldtest-a "$mb_a" "$seconds_a" "$(( total_bytes - bytes_b ))"
-  fieldtest_bench_record dual-b "$serial" n/a fieldtest-b "$mb_b" "$seconds_b" "$bytes_b"
+  local log_offset object_id daemon_rate staging_mode staging_reason diagnostic_status transfer_rate figures
+  log_offset="$(cat "$out_b.log-offset")"
+  figures="$(fieldtest_daemon_write_figures "$out_b" "$log_offset")"
+  read -r object_id daemon_rate staging_mode staging_reason diagnostic_status transfer_rate <<<"$figures"
+  fieldtest_bench_record dual-b "$serial" n/a fieldtest-b "$mb_b" "$seconds_b" "$bytes_b" "$out_b" "$log_offset" "$figures"
   fieldtest_bench_record dual-aggregate "$serial" n/a concurrent "$total_mb" "$(python3 - "$start" "$end" <<'PY'
 import sys
 print(float(sys.argv[2]) - float(sys.argv[1]))
 PY
-)" "$total_bytes"
+)" "$total_bytes" "$out_b" "$log_offset" "$figures"
   if [[ "${REMFIELD_ENV:-unknown}" == vtl ]]; then
     fieldtest_evidence_record "$SCRIPT_NAME" summary INFO "concurrent restore+append ran on VTL; numbers are not physically meaningful"
   else
-    fieldtest_evidence_record "$SCRIPT_NAME" summary PASS "concurrent restore+append completed against two pools; aggregate ${total_mb} MB/s" "$workdir"
+    fieldtest_evidence_record "$SCRIPT_NAME" summary PASS "concurrent restore+append completed against two pools; aggregate ${total_mb} MB/s; append object=$object_id daemon drive_append_total=${daemon_rate} MiB/s transfer=${transfer_rate} MiB/s staging=$staging_mode reason=$staging_reason diagnostics=$diagnostic_status" "$workdir"
   fi
   rm -rf -- "$workdir"
 }

@@ -32,7 +32,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::capacity::{now_rfc3339, sha256_file, source_file_size, uuid_text};
+use super::capacity::{now_rfc3339, uuid_text};
 use super::direct::{build_tape_bootstrap, write_tape_bootstrap};
 use super::model::{
     NoParityAppendContext, PoolWriteDurability, PoolWriteError, PoolWriteRepresentation,
@@ -181,7 +181,7 @@ pub(crate) fn parity_label(parity: &ParityConfig) -> &'static str {
 }
 
 pub(crate) fn log_transfer_diagnostics(
-    _request: &WriteObjectToPoolRequest,
+    request: &WriteObjectToPoolRequest,
     selected: &SelectedTape,
     prepared: &PreparedPoolObject,
     stored_projected_blocks: u64,
@@ -195,6 +195,8 @@ pub(crate) fn log_transfer_diagnostics(
         pool_id = %selected.pool_id,
         tape_uuid = %uuid_text(selected.tape_uuid),
         parity = parity_label(&selected.parity_config),
+        object_id = %prepared.object_uuid,
+        caller_object_id = %request.caller_object_id,
         status = outcome.status,
         error = outcome.error.unwrap_or(""),
         payload_bytes,
@@ -212,7 +214,10 @@ pub(crate) fn log_transfer_diagnostics(
         ),
         position_calls = outcome.stats.position_calls,
         early_warning = outcome.stats.early_warning,
-        scsi_write_cdb = "WRITE6_FIXED_BATCH",
+        scsi_write_cdb = if matches!(selected.parity_config, ParityConfig::None) { "WRITE6_FIXED_BATCH" } else { "WRITE6_FIXED" },
+        write_commands_ms = crate::diagnostics::duration_ms(outcome.stats.write_command_elapsed),
+        between_writes_ms = crate::diagnostics::duration_ms(outcome.stats.between_write_elapsed),
+        transfer_host_ms = crate::diagnostics::duration_ms(outcome.elapsed.saturating_sub(outcome.stats.write_command_elapsed)),
         write_batch_blocks = outcome.stats.write_batch_blocks,
         effective_batch_blocks = outcome.stats.effective_batch_blocks,
         position_check_bytes = outcome.stats.position_check_bytes,
@@ -271,7 +276,7 @@ pub(crate) struct TransferDiagnosticOutcome<'a> {
 
 #[cfg(test)]
 pub(crate) fn log_commit_diagnostics(
-    _request: &WriteObjectToPoolRequest,
+    request: &WriteObjectToPoolRequest,
     selected: &SelectedTape,
     prepared: &PreparedPoolObject,
     elapsed: Duration,
@@ -285,6 +290,8 @@ pub(crate) fn log_commit_diagnostics(
         pool_id = %selected.pool_id,
         tape_uuid = %uuid_text(selected.tape_uuid),
         parity = parity_label(&selected.parity_config),
+        object_id = %prepared.object_uuid,
+        caller_object_id = %request.caller_object_id,
         status,
         error = error.unwrap_or(""),
         payload_bytes,
@@ -314,19 +321,30 @@ pub(crate) fn prepare_pool_object(
     );
     options.chunk_size = block_size as usize;
     let (files, source) = match &request.source {
-        WriteObjectSource::Path(source_path)
-        | WriteObjectSource::Spool {
-            path: source_path, ..
-        } => {
-            let mut file = prepare_regular_file(
+        WriteObjectSource::Path(source_path) => {
+            let file = prepare_regular_file(
                 source_path,
                 &request.archive_path,
                 Uuid::new_v4().to_string(),
             )?;
-            if let WriteObjectSource::Spool { mtime, .. } = &request.source {
-                file.spec.mtime = mtime.clone();
-            }
             (vec![file], PreparedPoolSource::Paths)
+        }
+        WriteObjectSource::Spool { path, mtime, .. } => {
+            let mut spec = RemTarFileSpec::new(
+                remanence_stream::normalize_archive_path(&request.archive_path)?,
+                Uuid::new_v4().to_string(),
+                request.source.size_bytes()?,
+                content_sha256,
+            );
+            spec.mtime = mtime.clone();
+            spec.executable = Some(false);
+            (
+                vec![PreparedFile {
+                    source_path: path.clone(),
+                    spec,
+                }],
+                PreparedPoolSource::Paths,
+            )
         }
         WriteObjectSource::PreparedPath(source) => {
             if Path::new(&source.0.spec.path) != request.archive_path {
@@ -591,16 +609,14 @@ pub(crate) fn prepare_canonical_plaintext_pool_object(
         ));
     }
     let source_path = match &request.source {
-        WriteObjectSource::Path(path) => path,
-        WriteObjectSource::Streamed(_)
-        | WriteObjectSource::Spool { .. }
-        | WriteObjectSource::PreparedPath(_) => {
+        WriteObjectSource::Path(path) | WriteObjectSource::Spool { path, .. } => path,
+        WriteObjectSource::Streamed(_) | WriteObjectSource::PreparedPath(_) => {
             return Err(PoolWriteError::InvalidInput(
                 "canonical plaintext REM objects require a completed spool".to_string(),
             ));
         }
     };
-    let source_size = source_file_size(source_path)?;
+    let source_size = request.source.size_bytes()?;
     if source_size == 0 || !source_size.is_multiple_of(u64::from(block_size)) {
         return Err(PoolWriteError::InvalidInput(format!(
             "canonical plaintext REM object size {source_size} is not a nonzero multiple of selected block size {block_size}"
@@ -763,7 +779,7 @@ pub(crate) fn prepare_canonical_plaintext_pool_object(
             "canonical plaintext REM bytes do not match the deterministic layout plan".to_string(),
         ));
     }
-    let content_sha256 = sha256_file(source_path)?;
+    let content_sha256 = request.source.content_sha256()?;
     let (_regenerated_layout, regenerated_sha256) =
         regenerate_canonical_plaintext_digest(source_path, &options, &files, &report.entries)?;
     if regenerated_sha256 != content_sha256 {
