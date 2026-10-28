@@ -273,7 +273,7 @@ pub(crate) fn write_tape_image_with_init(
         sidecars.extend(closed.sidecars_emitted);
         if inputs.checkpoint_after_objects.contains(&object_index) {
             let checkpoint = parity
-                .checkpoint()
+                .close_open_epoch(remanence_parity::CloseReason::Barrier)
                 .map_err(|error| format!("write intermediate checkpoint: {error}"))?;
             sidecars.extend(checkpoint.sidecars_emitted);
         }

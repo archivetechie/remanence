@@ -1002,3 +1002,35 @@ fn cancelled_protected_pass_has_no_verdict_and_can_restart() {
             .is_clean()
     );
 }
+
+/// Clean restores cross the protected watermark without demanding a missing sidecar.
+#[test]
+fn restore_crosses_unprotected_committed_tail() {
+    use remanence_library::BlockRead;
+    let (mut map, scheme, mut tape) = fixture(&[File::Object(6), File::Sidecar(0)]);
+    map.scope = crate::filemark_map::MapScope::Complete {
+        highest_protected_ordinal: 4,
+    };
+    assert_eq!(map.scope.watermark(), 4);
+    assert_eq!(map.map.total_data_ordinals(), 6);
+    let mut source = crate::ObjectParitySource::open(
+        &mut tape,
+        scheme,
+        UUID,
+        map,
+        SIZE,
+        1,
+        crate::OpenTrust::RequireValidated,
+    )
+    .unwrap();
+    for ordinal in 0..6 {
+        let mut bytes = vec![0; SIZE as usize];
+        assert_eq!(source.read_block(&mut bytes).unwrap(), SIZE as usize);
+        assert_eq!(bytes, vec![ordinal; SIZE as usize]);
+    }
+    drop(source);
+    assert!(
+        tape.reads.contains(&6) && tape.reads.contains(&7),
+        "unprotected ordinals are read from tape"
+    );
+}

@@ -52,6 +52,7 @@ pub(crate) struct WriteOwnerConfig {
     pub managed_library_serials: Arc<HashSet<String>>,
     pub cleaning: CleaningConfig,
     pub tape_io: TapeIoConfig,
+    pub tape_pools: Vec<TapePoolConfig>,
     pub verification_route: remanence_parity::VerificationRoute,
     pub io_memory: Arc<crate::io_memory::IoMemoryReservation>,
     /// Cross-drive claims that make replay-key and canonical-UUID admission
@@ -256,7 +257,39 @@ pub(super) fn drive_loop(
         index.set_readiness_observer(lifecycle.readiness_wake.clone());
     }
     let mut snapshot_misses = 0u32;
+    let mut retained: Option<super::checkpoint::RetainedParityEpoch> = None;
     while let Some(cmd) = rx.blocking_recv() {
+        #[cfg(test)]
+        match cfg
+            .io_memory
+            .epoch_test_action
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            4 => {
+                retained = None;
+            }
+            5 => {
+                if let Some(e) = retained.as_mut() {
+                    e.identity_generation = e.identity_generation.wrapping_add(1);
+                }
+            }
+            _ => {}
+        }
+        if matches!(
+            &cmd,
+            DriveCommand::OpenWrite { .. }
+                | DriveCommand::OpenRead { .. }
+                | DriveCommand::TapeInventory { .. }
+                | DriveCommand::VerifyTapeIndex { .. }
+                | DriveCommand::WaitReady { .. }
+                | DriveCommand::FinalizeTape { .. }
+                | DriveCommand::SupersedeTail { .. }
+                | DriveCommand::PlanFinalization { .. }
+        ) {
+            if let Some(epoch) = retained.as_mut() {
+                epoch.head_at_eod = false;
+            }
+        }
         match cmd {
             DriveCommand::WaitReady {
                 operation_id,
@@ -312,6 +345,7 @@ pub(super) fn drive_loop(
                     drive_serial,
                     reply,
                 },
+                &mut retained,
             ),
             DriveCommand::OpenRead {
                 tape_uuid,
@@ -512,10 +546,70 @@ pub(super) fn drive_loop(
                         drive_uuid,
                         drive_serial,
                     },
+                    &mut retained,
+                );
+                if result.is_ok() {
+                    retained = None;
+                }
+                let _ = reply.send(result);
+            }
+            DriveCommand::PlanFinalization {
+                request,
+                needs_drive_load,
+                barcode,
+                source_slot,
+                drive_serial,
+                reply,
+            } => {
+                let result = super::readiness::session_open_short_probe_or_load(
+                    &mut index,
+                    drive,
+                    super::SessionOpenReadinessContext {
+                        action: "plan terminal finalization",
+                        bay,
+                        library_serial: &cfg.actor_library_serial,
+                        barcode: barcode.as_deref(),
+                        source_slot,
+                        drive_serial: drive_serial.as_deref(),
+                        needs_drive_load,
+                    },
+                )
+                .and_then(|()| {
+                    super::terminal_finalize::plan_mounted_epoch_finalization(
+                        &mut index,
+                        &cfg,
+                        drive,
+                        bay,
+                        &request,
+                        needs_drive_load,
+                        &mut retained,
+                    )
+                });
+
+                let _ = reply.send(result);
+            }
+            DriveCommand::PrepareRemoval { reply, progress } => {
+                let result = super::checkpoint::close_retained_before_removal(
+                    &mut index,
+                    drive,
+                    &cfg,
+                    bay,
+                    &mut retained,
+                    progress.as_ref(),
                 );
                 let _ = reply.send(result);
             }
             DriveCommand::Unload { reply } => {
+                if let Err(error) = super::checkpoint::close_retained_before_removal(
+                    &mut index,
+                    drive,
+                    &cfg,
+                    bay,
+                    &mut retained,
+                    None,
+                ) {
+                    tracing::error!(%error, "epoch close fails; unloading cartridge");
+                }
                 let started = Instant::now();
                 let result = drive
                     .unload()
@@ -613,6 +707,14 @@ pub(super) fn drain_failed_drive_commands(mut rx: mpsc::Receiver<DriveCommand>, 
                 let _ = reply.send(Err(Status::unavailable("drive actor unavailable")));
             }
             DriveCommand::FinalizeTape { reply, .. } => {
+                let _ = reply.send(Err(Status::internal(message.clone())));
+            }
+            DriveCommand::PlanFinalization { reply, .. } => {
+                let _ = reply.send(Err(Status::failed_precondition(
+                    "drive actor cannot plan finalization in its current state",
+                )));
+            }
+            DriveCommand::PrepareRemoval { reply, .. } => {
                 let _ = reply.send(Err(Status::internal(message.clone())));
             }
             DriveCommand::Unload { reply } => {

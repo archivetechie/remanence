@@ -3558,6 +3558,7 @@ pub(crate) struct ValidatedParityCheckpointLayout<'a> {
     pub(crate) first_tape_file: &'a remanence_parity::TapeFileEntry,
     pub(crate) last_tape_file: &'a remanence_parity::TapeFileEntry,
     pub(crate) starting_total_committed_ordinals: u64,
+    pub(crate) starting_highest_protected_ordinal: u64,
     pub(crate) highest_protected_ordinal: u64,
     pub(crate) total_committed_ordinals: u64,
 }
@@ -3589,6 +3590,7 @@ pub(crate) fn validate_parity_barrier_bundles(
     let mut highest_protected_ordinal = None;
     let mut total_committed_ordinals = None;
     let mut starting_total_committed_ordinals = None;
+    let mut starting_highest_protected_ordinal = None;
 
     for (projection, bundle) in record.objects.iter().zip(&record.object_tape_file_bundles) {
         remanence_parity::validate_committed_bundle_shape(bundle).map_err(|err| {
@@ -3638,7 +3640,14 @@ pub(crate) fn validate_parity_barrier_bundles(
             Some(total) => total,
             None => {
                 starting_total_committed_ordinals = Some(object_first_ordinal);
-                highest_protected_ordinal = Some(object_first_ordinal);
+                let start = bundle_start_watermark(bundle);
+                if start > object_first_ordinal {
+                    return Err(barrier_bundle_shape_error(
+                        "checkpoint protection starts beyond its prior data",
+                    ));
+                }
+                highest_protected_ordinal = Some(start);
+                starting_highest_protected_ordinal = Some(start);
                 object_first_ordinal
             }
         };
@@ -3672,17 +3681,39 @@ pub(crate) fn validate_parity_barrier_bundles(
                 projection.object.object_id, bundle.highest_protected_ordinal
             )));
         }
+        let scheme = record.scheme.as_ref().expect("parity scheme checked");
+        let epoch_blocks =
+            u64::from(scheme.data_blocks_per_stripe) * u64::from(scheme.stripes_per_neighborhood);
+        if next_total
+            .checked_sub(next_highest)
+            .is_none_or(|tail| tail >= epoch_blocks)
+        {
+            return Err(barrier_bundle_shape_error(format!(
+                "object {} exceeds the open epoch bound: W={next_highest}, T={next_total}",
+                projection.object.object_id
+            )));
+        }
         highest_protected_ordinal = Some(next_highest);
         total_committed_ordinals = Some(next_total);
         prior_last_tape_file = bundle.entries.last();
     }
 
-    let first_tape_file = first_tape_file.ok_or_else(|| {
-        barrier_bundle_shape_error("parity checkpoint must commit at least one object")
-    })?;
-    let total_committed_ordinals =
-        total_committed_ordinals.expect("a validated parity checkpoint has at least one object");
-    let mut final_highest = highest_protected_ordinal.expect("a validated parity checkpoint has W");
+    if first_tape_file.is_none() {
+        let bundle = record
+            .barrier_bundle
+            .as_ref()
+            .ok_or_else(|| barrier_bundle_shape_error("empty checkpoint has no sidecar bundle"))?;
+        first_tape_file = bundle.entries.first();
+        total_committed_ordinals = Some(bundle.total_committed_ordinals);
+        starting_total_committed_ordinals = total_committed_ordinals;
+        let start = bundle_start_watermark(bundle);
+        highest_protected_ordinal = Some(start);
+        starting_highest_protected_ordinal = Some(start);
+    }
+    let first_tape_file = first_tape_file
+        .ok_or_else(|| barrier_bundle_shape_error("checkpoint contains no tape files"))?;
+    let total_committed_ordinals = total_committed_ordinals.expect("checkpoint has data watermark");
+    let mut final_highest = highest_protected_ordinal.expect("checkpoint has protection watermark");
     if let Some(barrier_bundle) = record.barrier_bundle.as_ref() {
         remanence_parity::validate_committed_bundle_shape(barrier_bundle)
             .map_err(|err| barrier_bundle_shape_error(format!("checkpoint barrier: {err}")))?;
@@ -3721,9 +3752,15 @@ pub(crate) fn validate_parity_barrier_bundles(
         }
         prior_last_tape_file = barrier_bundle.entries.last();
     }
-    if final_highest != total_committed_ordinals {
+    let scheme = record.scheme.as_ref().expect("parity scheme checked");
+    let epoch_blocks =
+        u64::from(scheme.data_blocks_per_stripe) * u64::from(scheme.stripes_per_neighborhood);
+    if total_committed_ordinals
+        .checked_sub(final_highest)
+        .is_none_or(|tail| tail >= epoch_blocks)
+    {
         return Err(barrier_bundle_shape_error(format!(
-            "checkpoint barrier left ordinals unprotected: W={final_highest}, T={total_committed_ordinals}"
+            "checkpoint exceeds the open epoch bound: W={final_highest}, T={total_committed_ordinals}"
         )));
     }
     let last_tape_file = prior_last_tape_file.expect("validated checkpoint has an Object row");
@@ -3743,6 +3780,8 @@ pub(crate) fn validate_parity_barrier_bundles(
         last_tape_file,
         starting_total_committed_ordinals: starting_total_committed_ordinals
             .expect("a validated parity checkpoint has a starting ordinal"),
+        starting_highest_protected_ordinal: starting_highest_protected_ordinal
+            .expect("checkpoint has initial protection watermark"),
         highest_protected_ordinal: final_highest,
         total_committed_ordinals,
     })
@@ -3947,6 +3986,16 @@ fn validate_next_bundle_file(
     Ok(())
 }
 
+/// Recover the protection watermark before the first sidecar in a bundle.
+fn bundle_start_watermark(bundle: &remanence_parity::CommittedBundle) -> u64 {
+    bundle
+        .entries
+        .iter()
+        .find(|entry| entry.kind == remanence_parity::TapeFileKind::ParitySidecar)
+        .and_then(|entry| entry.protected_ordinal_start)
+        .unwrap_or(bundle.highest_protected_ordinal)
+}
+
 pub(crate) fn validate_sidecar_watermark_transition(
     mut highest_protected_ordinal: u64,
     total_committed_ordinals: u64,
@@ -4048,7 +4097,7 @@ fn validate_next_record(
             "non-terminal checkpoint carries terminal finalization completion".to_string(),
         ));
     }
-    if record.objects.is_empty() {
+    if record.objects.is_empty() && !parity_record {
         return Err(StateError::JournalReplayFailed(
             "non-terminal checkpoint record must commit at least one object".to_string(),
         ));
@@ -4073,9 +4122,21 @@ fn validate_next_record(
                 layout.first_tape_file.tape_file_number
             )));
         }
-        let expected_starting_total = previous
-            .and_then(|prior| prior.objects.last())
-            .map_or(0, |projection| projection.total_committed_ordinals);
+        let prior_layout = previous
+            .map(validate_parity_barrier_bundles)
+            .transpose()
+            .map_err(|err| StateError::JournalReplayFailed(err.to_string()))?;
+        let expected_starting_total = prior_layout
+            .as_ref()
+            .map_or(0, |layout| layout.total_committed_ordinals);
+        let expected_starting_highest = prior_layout
+            .as_ref()
+            .map_or(0, |layout| layout.highest_protected_ordinal);
+        if layout.starting_highest_protected_ordinal != expected_starting_highest {
+            return Err(StateError::JournalReplayFailed(
+                "checkpoint protection watermark does not continue its prior prefix".into(),
+            ));
+        }
         if layout.starting_total_committed_ordinals != expected_starting_total {
             return Err(StateError::JournalReplayFailed(format!(
                 "parity checkpoint starts at ordinal {}, expected {expected_starting_total}",
@@ -5292,16 +5353,34 @@ mod tests {
         }
     }
 
+    /// A later barrier must not hide an invalid full epoch at Object close.
     #[test]
-    fn parity_checkpoint_validator_rejects_unprotected_or_misnumbered_barriers() {
+    fn parity_checkpoint_rejects_per_object_epoch_overflow_before_barrier() {
+        let mut record = partial_epoch_parity_record([0x28; 16]);
+        record.scheme.as_mut().unwrap().data_blocks_per_stripe = 3;
+        let error = validate_parity_barrier_bundles(&record)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("object") && error.contains("open epoch bound"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn parity_checkpoint_validator_accepts_open_epoch_and_rejects_misnumbered_barriers() {
         let tape_uuid = [0x27; 16];
         let mut unprotected = partial_epoch_parity_record(tape_uuid);
         unprotected.barrier_bundle = None;
         unprotected.next_tape_file_number = 2;
-        assert!(validate_parity_barrier_bundles(&unprotected)
-            .expect_err("checkpoint must close the open epoch")
-            .to_string()
-            .contains("left ordinals unprotected"));
+        let layout = validate_parity_barrier_bundles(&unprotected).expect("short epoch stays open");
+        assert_eq!(
+            (
+                layout.highest_protected_ordinal,
+                layout.total_committed_ordinals
+            ),
+            (0, 3)
+        );
 
         let mut misnumbered = partial_epoch_parity_record(tape_uuid);
         misnumbered.next_tape_file_number = 9;

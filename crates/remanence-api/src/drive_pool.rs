@@ -59,6 +59,7 @@ pub(crate) struct ParkedCartridge {
 pub(crate) struct ParkedState {
     pub(crate) next_generation: u64,
     pub(crate) by_drive: HashMap<DriveKey, ParkedCartridge>,
+    pub(crate) idle_timers: HashMap<DriveKey, tokio::task::AbortHandle>,
 }
 
 /// Structured holder identity keeps readiness ownership separate from diagnostics.
@@ -91,6 +92,7 @@ pub(crate) struct DrivePoolLifecycle {
     holders: Arc<Mutex<HashMap<DriveKey, DriveHolder>>>,
     pub(crate) sessions: Arc<Mutex<HashMap<Uuid, MountedSession>>>,
     pub(crate) parked: Arc<Mutex<ParkedState>>,
+    pub(crate) shutting_down: Arc<AtomicBool>,
     pub(crate) timer_park_tx: Option<mpsc::UnboundedSender<ParkedCartridge>>,
 }
 
@@ -148,7 +150,7 @@ pub(crate) struct DrivePool {
     holders: Arc<Mutex<HashMap<DriveKey, DriveHolder>>>,
     pub(crate) sessions: Arc<Mutex<HashMap<Uuid, MountedSession>>>,
     tape_reservations: Arc<Mutex<HashSet<TapeUuid>>>,
-    parked: Arc<Mutex<ParkedState>>,
+    pub(crate) parked: Arc<Mutex<ParkedState>>,
     shutting_down: Arc<AtomicBool>,
 }
 
@@ -205,7 +207,7 @@ impl DrivePool {
             sessions: lifecycle.sessions,
             tape_reservations: Arc::new(Mutex::new(HashSet::new())),
             parked: lifecycle.parked,
-            shutting_down: Arc::new(AtomicBool::new(false)),
+            shutting_down: lifecycle.shutting_down,
         }
     }
 
@@ -560,6 +562,11 @@ impl DrivePool {
 
     pub(crate) fn park_cartridge(&self, seated: SeatedCartridge) -> ParkedCartridge {
         let mut state = self.parked.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(parked) = state.by_drive.get(&seated.drive_key()) {
+            if parked.seated == seated {
+                return parked.clone();
+            }
+        }
         state.next_generation = state.next_generation.wrapping_add(1).max(1);
         let parked = ParkedCartridge {
             seated,

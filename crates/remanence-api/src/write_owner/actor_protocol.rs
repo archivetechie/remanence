@@ -148,6 +148,18 @@ pub(crate) enum DriveCommand {
         drive_serial: Option<String>,
         reply: oneshot::Sender<Result<ManualFinalizeTapeActorReply, Status>>,
     },
+    PlanFinalization {
+        request: ManualFinalizeTapeActorRequest,
+        needs_drive_load: bool,
+        barcode: Option<String>,
+        source_slot: Option<u16>,
+        drive_serial: Option<String>,
+        reply: oneshot::Sender<Result<remanence_parity::TerminalPrefixPlan, Status>>,
+    },
+    PrepareRemoval {
+        progress: Option<crate::operations::OperationHandle>,
+        reply: oneshot::Sender<Result<(), Status>>,
+    },
     Unload {
         reply: oneshot::Sender<Result<StdDuration, Status>>,
     },

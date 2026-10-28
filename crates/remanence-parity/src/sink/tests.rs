@@ -298,6 +298,24 @@ impl RawTapeSink for RecordingRawTapeSink {
         })
     }
 
+    fn locate_for_overwrite(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
+        let mut source = RecordingRawTapeSource::from_sink(self);
+        source.records.truncate(hint.lba as usize);
+        self.events.clear();
+        self.blocks.clear();
+        for record in source.records {
+            match record {
+                RecordedTapeRecord::Block(bytes) => {
+                    self.events.push(RawSinkEvent::WriteBlock(bytes.len()));
+                    self.blocks.push(bytes);
+                }
+                RecordedTapeRecord::Filemark => self.events.push(RawSinkEvent::WriteFilemark),
+            }
+        }
+        self.cursor = hint.lba;
+        Ok(())
+    }
+
     fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
         self.events.push(RawSinkEvent::Position);
         Ok(PhysicalPositionHint::new(self.cursor))
@@ -1363,20 +1381,17 @@ fn checkpoint_returns_committed_prefix_summary() {
         sink.checkpoint().expect("checkpoint writes")
     };
 
-    assert_eq!(checkpoint.next_tape_file_number, 3);
-    assert_eq!(checkpoint.highest_protected_ordinal, 3);
+    assert_eq!(checkpoint.next_tape_file_number, 2);
+    assert_eq!(checkpoint.highest_protected_ordinal, 0);
     assert_eq!(checkpoint.total_committed_ordinals, 3);
-    assert_eq!(checkpoint.sidecars_emitted.len(), 1);
-    assert_eq!(journal.bundles.len(), 4);
+    assert!(checkpoint.sidecars_emitted.is_empty());
+    assert_eq!(journal.bundles.len(), 3);
     assert_eq!(
         journal.bundles[2].kind,
-        CommittedBundleKind::CheckpointSidecars
-    );
-    assert_eq!(journal.bundles[2].total_committed_ordinals, 3);
-    assert_eq!(
-        journal.bundles[3].kind,
         CommittedBundleKind::CheckpointedThrough
     );
+    assert_eq!(journal.bundles[2].total_committed_ordinals, 3);
+    assert_eq!(journal.bundles[2].highest_protected_ordinal, 0);
 }
 
 #[test]
@@ -5594,4 +5609,251 @@ fn begin_object_combined_tape_and_spool_shortfall_reports_tape_capacity_first() 
         raw.events.is_empty(),
         "combined reserve rejection must happen before any raw tape operation"
     );
+}
+
+/// Checkpoint and session handoff preserve the same epoch math as uninterrupted writing.
+#[test]
+fn checkpoint_handoffs_and_crash_rebuild_preserve_epoch_parity() {
+    const BLOCK: u32 = 1024;
+    let scheme = ParityScheme {
+        stripes_per_neighborhood: 4,
+        ..small_scheme()
+    };
+    let data = (0..37)
+        .map(|i| fixed_block(i + 1, BLOCK))
+        .collect::<Vec<_>>();
+    let mut reference = None;
+    // All modes use identical multi-block objects; the epoch fills across sessions.
+    for mode in [
+        "scratch", "carry", "reopen", "rebuild", "orphan", "complete", "torn",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parity.journal");
+        let mut journal =
+            crate::FileTapeFileJournal::open(&path, sample_uuid(), BLOCK, scheme.clone()).unwrap();
+        let mut raw = RecordingRawTapeSink::default();
+        let identity =
+            crate::WriterIdentity::fixed("test".into(), std::time::SystemTime::UNIX_EPOCH.into());
+        let mut sink = ParitySink::new_with_journal(
+            &mut raw,
+            &mut journal,
+            scheme.clone(),
+            sample_uuid(),
+            BLOCK,
+            identity.clone(),
+        )
+        .unwrap();
+        sink.write_bootstrap().unwrap();
+        let mut state = sink.into_session_state().unwrap();
+        for (number, blocks) in data.chunks(5).enumerate() {
+            let mut sink = ParitySink::from_session_state(&mut raw, &mut journal, state).unwrap();
+            let mut input = capacity_input_with_block_size(blocks.len() as u64, 10_000, BLOCK);
+            input.data_shards_per_epoch = 16;
+            input.parity_shards_per_epoch = 8;
+            begin_object_with_runtime_capacity(&mut sink, input).unwrap();
+            for block in blocks {
+                sink.write_block(block).unwrap();
+            }
+            sink.finish_object().unwrap();
+            if mode != "scratch" {
+                sink.checkpoint().unwrap();
+            }
+            state = sink.into_session_state().unwrap();
+            if mode == "carry" && number == 1 {
+                let mut summary =
+                    checked_bounded_resume_summary(&journal.committed_snapshot_bounded().unwrap())
+                        .unwrap();
+                assert!(state.matches_committed_summary(&summary));
+                summary.highest_protected_ordinal += 1;
+                assert!(!state.matches_committed_summary(&summary));
+                summary.highest_protected_ordinal -= 1;
+                summary.committed_tape_file_count += 1;
+                assert!(!state.matches_committed_summary(&summary));
+                summary.committed_tape_file_count -= 1;
+                state.has_uncheckpointed_bundles = true;
+                assert!(!state.matches_committed_summary(&summary));
+                state.has_uncheckpointed_bundles = false;
+            }
+            if mode == "reopen" || (mode == "rebuild" && number == 1) {
+                drop(journal);
+                journal =
+                    crate::FileTapeFileJournal::open(&path, sample_uuid(), BLOCK, scheme.clone())
+                        .unwrap();
+            }
+            if mode == "rebuild" && number == 1 {
+                drop(state);
+                let snapshot = journal.committed_snapshot_bounded().unwrap();
+                let summary = checked_bounded_resume_summary(&snapshot).unwrap();
+                let mut source = RecordingRawTapeSource::from_sink(&raw);
+                let rebuilt = crate::rebuild_open_epoch_from_bounded_summary(
+                    &mut source,
+                    &summary,
+                    &scheme,
+                    sample_uuid(),
+                    BLOCK,
+                )
+                .unwrap();
+                let result = rebuilt.plan.complete(Vec::new()).unwrap();
+                state = ParitySink::new_sidecar_only_from_bounded_resume(
+                    &mut raw,
+                    &mut journal,
+                    scheme.clone(),
+                    sample_uuid(),
+                    BLOCK,
+                    BoundedResumeWriterSeed {
+                        committed_prefix_snapshot: snapshot,
+                        committed_prefix_summary: summary,
+                        resume_result: &result,
+                        live_epoch: rebuilt.live_epoch,
+                    },
+                    identity.clone(),
+                )
+                .unwrap()
+                .into_session_state()
+                .unwrap();
+            }
+        }
+        let sink = ParitySink::from_session_state(&mut raw, &mut journal, state).unwrap();
+        let plan = sink
+            .plan_terminal_index_close(identity.capture().unwrap())
+            .unwrap();
+        assert_ne!(
+            plan.sidecar_directory_entries.last().unwrap().flags
+                & SIDECAR_DIRECTORY_FLAG_FINAL_PARTIAL_EPOCH,
+            0
+        );
+        if matches!(mode, "complete" | "torn") {
+            let state = sink.into_session_state().unwrap();
+            let snapshot = journal.committed_snapshot_bounded().unwrap();
+            let summary = checked_bounded_resume_summary(&snapshot).unwrap();
+            assert!(summary.highest_protected_ordinal < summary.total_committed_ordinals);
+            let mut source = RecordingRawTapeSource::from_sink(&raw);
+            let rebuilt = crate::rebuild_open_epoch_from_bounded_summary(
+                &mut source,
+                &summary,
+                &scheme,
+                sample_uuid(),
+                BLOCK,
+            )
+            .unwrap();
+            let result = rebuilt.plan.complete(Vec::new()).unwrap();
+            let saved = std::fs::read(&path).unwrap();
+            let other = ParitySink::new_sidecar_only_from_bounded_resume(
+                &mut raw,
+                &mut journal,
+                scheme.clone(),
+                sample_uuid(),
+                BLOCK,
+                BoundedResumeWriterSeed {
+                    committed_prefix_snapshot: snapshot,
+                    committed_prefix_summary: summary,
+                    resume_result: &result,
+                    live_epoch: rebuilt.live_epoch,
+                },
+                identity.clone(),
+            )
+            .unwrap();
+            other
+                .close_for_terminal_index(&plan, TerminalPrefixReconcileEvidence::Absent)
+                .unwrap();
+            drop(journal);
+            std::fs::write(&path, saved).unwrap();
+            journal = crate::FileTapeFileJournal::open(&path, sample_uuid(), BLOCK, scheme.clone())
+                .unwrap();
+            if mode == "torn" {
+                let source = RecordingRawTapeSource::from_sink(&raw);
+                let block_index = source.records[..plan.start_lba as usize]
+                    .iter()
+                    .filter(|r| matches!(r, RecordedTapeRecord::Block(_)))
+                    .count();
+                raw.blocks[block_index
+                    + plan.sidecar_directory_entries[0].sidecar_header_block_count as usize][0] ^=
+                    0x80;
+            }
+            let mut source = RecordingRawTapeSource::from_sink(&raw);
+            let evidence =
+                reconcile_terminal_prefix(&mut source, &plan, &sample_uuid(), BLOCK, true);
+            assert_eq!(
+                evidence,
+                if mode == "complete" {
+                    TerminalPrefixReconcileEvidence::Complete
+                } else {
+                    TerminalPrefixReconcileEvidence::TornRewritable
+                }
+            );
+            raw.cursor = source.cursor;
+            let blocks_before = raw.blocks.len();
+            let recovered = ParitySink::from_session_state_for_terminal_close(
+                &mut raw,
+                &mut journal,
+                state,
+                &plan,
+                evidence,
+            )
+            .unwrap()
+            .close_for_terminal_index(&plan, evidence)
+            .unwrap();
+            assert_eq!(recovered.used_tape_blocks, plan.tail_start_lba);
+            if mode == "complete" {
+                assert_eq!(
+                    raw.blocks.len(),
+                    blocks_before,
+                    "complete evidence writes no duplicate prefix"
+                );
+            }
+        } else if mode == "orphan" {
+            let state = sink.into_session_state().unwrap();
+            journal.commit_bundle(&plan.committed_bundle).unwrap();
+            drop(journal);
+            journal = crate::FileTapeFileJournal::open(&path, sample_uuid(), BLOCK, scheme.clone())
+                .unwrap();
+            ParitySink::from_session_state_for_terminal_close(
+                &mut raw,
+                &mut journal,
+                state,
+                &plan,
+                TerminalPrefixReconcileEvidence::Absent,
+            )
+            .unwrap()
+            .close_for_terminal_index(&plan, TerminalPrefixReconcileEvidence::Absent)
+            .unwrap();
+        } else {
+            sink.close_for_terminal_index(&plan, TerminalPrefixReconcileEvidence::Absent)
+                .unwrap();
+        }
+        let committed = journal.load_committed().unwrap();
+        let source = RecordingRawTapeSource::from_sink(&raw);
+        let sidecars = committed
+            .entries
+            .iter()
+            .filter(|e| e.kind == TapeFileKind::ParitySidecar)
+            .enumerate()
+            .map(|(epoch, entry)| {
+                let start = entry.physical_start_hint.unwrap() as usize;
+                let blocks = source.records[start..start + entry.block_count as usize]
+                    .iter()
+                    .map(|r| match r {
+                        RecordedTapeRecord::Block(bytes) => bytes.clone(),
+                        _ => panic!("sidecar filemark"),
+                    })
+                    .collect::<Vec<_>>();
+                let parsed = parse_sidecar_tape_file(&blocks, &sample_uuid()).unwrap();
+                assert_eq!(
+                    parsed.parity_shards,
+                    expected_epoch_parity(
+                        &scheme,
+                        &data[epoch * 16..((epoch + 1) * 16).min(data.len())],
+                        BLOCK
+                    )
+                );
+                blocks
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sidecars.len(), 3);
+        if let Some(expected) = &reference {
+            assert_eq!(&sidecars, expected, "{mode}");
+        } else {
+            reference = Some(sidecars);
+        }
+    }
 }

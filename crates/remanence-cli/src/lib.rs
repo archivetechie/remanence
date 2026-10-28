@@ -7156,6 +7156,9 @@ fn tape_json(tape: &pb::Tape) -> Value {
         "stripes_per_neighborhood": tape.stripes_per_neighborhood,
         "last_committed_tape_file": tape.last_committed_tape_file.map(|value| value.to_string()),
         "written_extent_lba": tape.written_extent_lba.map(|value| value.to_string()),
+        "seal_due": tape.seal_due,
+        "open_epoch_start": tape.open_epoch_start.map(|value| value.to_string()),
+        "open_epoch_end": tape.open_epoch_end.map(|value| value.to_string()),
         "kind": tape.kind,
         "scheme_id": tape.scheme_id,
         "assignment_generation": tape.assignment_generation,
@@ -18165,6 +18168,23 @@ mod tests {
             ),
             ambiguous_fixture
         );
+    }
+
+    #[test]
+    fn tape_json_exposes_and_clears_unprotected_range() {
+        let tape = pb::Tape {
+            seal_due: Some("hardware_early_warning".into()),
+            open_epoch_start: Some(128),
+            open_epoch_end: Some(131),
+            ..Default::default()
+        };
+        let rendered = tape_json(&tape);
+        assert_eq!(rendered["seal_due"], "hardware_early_warning");
+        assert_eq!(rendered["open_epoch_start"], "128");
+        assert_eq!(rendered["open_epoch_end"], "131");
+        let closed = tape_json(&pb::Tape::default());
+        assert!(closed["open_epoch_start"].is_null());
+        assert!(closed["open_epoch_end"].is_null());
     }
 
     #[test]

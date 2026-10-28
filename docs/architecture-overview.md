@@ -369,6 +369,37 @@ finalization.
    whose outcome is unknown records a durable tape-I/O fence, which blocks
    further writes, and daemon startup, until an operator releases it.
 
+Daemon parity checkpoints preserve a short open epoch. Standalone writes close
+the epoch at every barrier. Each Object close emits any
+completed epochs before its checkpoint; the remaining committed range `[W,T)`
+contains fewer than `S × k` data blocks. The drive actor reserves the accumulator
+against the shared I/O memory ceiling and retains it while the cartridge stays
+seated. Reuse requires the tape UUID, parked-cartridge generation, drive identity
+generation, and the new session's end-of-data proof to match. Otherwise append
+rebuilds `[W,T)` from the committed tape prefix. Memory refusal closes the epoch
+at the barrier and appears in write diagnostics.
+
+Idle unload, eviction, and operator removal attempt a sidecar-only checkpoint
+before moving the cartridge. Removal always proceeds. The close uses write-session
+admission: non-writable, foreign, unconfigured, and terminal-finalizing tapes skip
+it with a log entry. A close fences the tape when it contradicts committed state
+or an append has uncertain durability. A contradiction fence carries `[W,T)` and
+the cause; a write-failure fence carries the batch evidence. Transient failures log and audit `epoch_left_open` without a fence. A durable
+journal commit with a failed SQLite projection stays closed; startup replay
+projects it. Shutdown attempts the close only with the head still at the last
+write EOD. Otherwise it dismounts and logs and audits `epoch_left_open` with
+`[W,T)`; the next append rebuilds that range.
+
+A cartridge outside a drive has no open epoch except after a crash, a close that
+leaves the epoch open, or a shutdown that finds the head away from EOD. A fenced
+tape keeps its epoch until append recovery clears the fence. Removal records a deferred
+automatic seal as `seal_due` in the tape's write state. The next write session
+on that tape completes the seal before accepting Objects; explicit finalization
+also completes it. `rem catalog tapes --json` exposes the pending trigger.
+Finalization plans the terminal sidecar before freezing its layout, reuses its
+live or rebuilt accumulator, and closes through the terminal funnel with
+`FINAL_PARTIAL_EPOCH`.
+
 ### Retries and idempotency
 
 A repeat of the same `(pool, caller_object_id)`, input kind, content, and copy

@@ -85,6 +85,8 @@ pub(crate) fn project_drive(
     let busy = busy_bays.contains(&bay.element_address);
     let fenced = fenced_bays.contains(&bay.element_address);
     pb::Drive {
+        open_epoch_start: None,
+        open_epoch_end: None,
         // Known here, because the changer just told us: the bay, whether it is
         // fenced, and whatever a host-side INQUIRY managed to resolve.
         element_address: Some(u32::from(bay.element_address)),
@@ -477,14 +479,47 @@ impl LibraryServiceApi {
                 pool.readiness_wake.clone(),
             );
         }
-        match changer.try_send(crate::write_owner::ChangerCommand::Robotics {
-            library_serial: library_serial.clone(),
-            action,
-            handle: handle.clone(),
-        }) {
-            Ok(()) => Ok(Response::new(pb::OperationRef {
-                operation_id: operation_id.as_bytes().to_vec(),
-            })),
+        match changer.try_reserve_owned() {
+            Ok(permit) => {
+                tokio::spawn(async move {
+                    handle.publish_state(
+                        pb::OperationState::Running,
+                        &[("phase", "prepare_removal")],
+                    );
+                    let source_bay = match &action {
+                        crate::write_owner::RoboticsAction::Unload { bay, .. } => Some(*bay),
+                        crate::write_owner::RoboticsAction::Move { src, .. } => Some(*src),
+                        _ => None,
+                    };
+                    if let Some(bay) = source_bay {
+                        if let Ok(drive) =
+                            pool.drive_tx(&crate::drive_pool::DriveKey::new(&library_serial, bay))
+                        {
+                            let (reply, received) = tokio::sync::oneshot::channel();
+                            if drive
+                                .send(crate::write_owner::DriveCommand::PrepareRemoval {
+                                    reply,
+                                    progress: Some(handle.clone()),
+                                })
+                                .await
+                                .is_ok()
+                            {
+                                if let Ok(Err(error)) = received.await {
+                                    tracing::error!(%error, "epoch close fails; removing cartridge");
+                                }
+                            }
+                        }
+                    }
+                    permit.send(crate::write_owner::ChangerCommand::Robotics {
+                        library_serial,
+                        action,
+                        handle,
+                    });
+                });
+                Ok(Response::new(pb::OperationRef {
+                    operation_id: operation_id.as_bytes().to_vec(),
+                }))
+            }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 let error = "drive-session owner is busy";
                 pool.release_library(&library_serial);
@@ -1728,6 +1763,74 @@ mod tests {
             .await
             .expect_err("missing snapshot");
         assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    /// The robotics RPC returns before epoch closure and publishes that work as progress.
+    #[tokio::test]
+    async fn robotics_returns_operation_while_epoch_close_waits() {
+        let mut state = state_with_snapshot();
+        let (changer_tx, mut changer_rx) = tokio::sync::mpsc::channel(1);
+        let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel(1);
+        let pool = crate::write_owner::DrivePool::new_for_library(
+            "DEC418146K_LL02",
+            changer_tx,
+            HashMap::from([(1, drive_tx)]),
+            Arc::new(HashMap::from([(1, AtomicBool::new(false))])),
+        );
+        state.drive_pool = Some(pool.clone());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            state.library_service().dispatch_robotics(
+                remanence_state::AuditActor::System,
+                &[],
+                "unload_drive",
+                crate::write_owner::RoboticsAction::Unload {
+                    bay: 1,
+                    destination: None,
+                },
+                BTreeMap::new(),
+            ),
+        )
+        .await
+        .expect("RPC does not wait for epoch close")
+        .unwrap()
+        .into_inner();
+        let id = Uuid::from_slice(&result.operation_id).unwrap();
+        let crate::write_owner::DriveCommand::PrepareRemoval { reply, progress } =
+            drive_rx.recv().await.unwrap()
+        else {
+            panic!("removal preparation precedes robotics");
+        };
+        assert!(changer_rx.try_recv().is_err());
+        assert_eq!(
+            state
+                .operations
+                .latest(&id)
+                .unwrap()
+                .progress
+                .get("phase")
+                .map(String::as_str),
+            Some("prepare_removal")
+        );
+        progress
+            .unwrap()
+            .publish_state(pb::OperationState::Running, &[("phase", "epoch_close")]);
+        assert_eq!(
+            state
+                .operations
+                .latest(&id)
+                .unwrap()
+                .progress
+                .get("phase")
+                .map(String::as_str),
+            Some("epoch_close")
+        );
+        reply.send(Ok(())).unwrap();
+        assert!(matches!(
+            changer_rx.recv().await.unwrap(),
+            crate::write_owner::ChangerCommand::Robotics { .. }
+        ));
+        pool.release_library("DEC418146K_LL02");
     }
 
     #[tokio::test]

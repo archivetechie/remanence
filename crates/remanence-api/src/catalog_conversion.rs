@@ -212,7 +212,12 @@ pub(crate) fn operation_state(value: &str) -> pb::OperationState {
 }
 
 pub(crate) fn tape_to_proto(record: TapeRecord) -> pb::Tape {
+    let open = record.scheme_id.is_some()
+        && record.highest_protected_ordinal < record.total_committed_ordinals;
     pb::Tape {
+        seal_due: record.seal_due,
+        open_epoch_start: open.then_some(record.highest_protected_ordinal),
+        open_epoch_end: open.then_some(record.total_committed_ordinals),
         last_verified_at: record
             .last_verified_at_utc
             .as_deref()

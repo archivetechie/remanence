@@ -833,3 +833,34 @@ fn contradictory_no_parity_bootstrap_preserves_walk_outcome() {
     }
     println!("contradictory bootstrap: prefix=2 success=1 rejected=1 reasons={{tape_io: 1}} direct_walk=0");
 }
+
+/// Both full-verification routes accept committed data beyond the last sidecar.
+#[test]
+fn full_verification_routes_accept_unprotected_committed_tail() {
+    let protected = protected_fixture();
+    let mut records = protected.records[..19].to_vec();
+    records.extend([
+        Record::Block(vec![0x73; BLOCK_SIZE as usize]),
+        Record::Block(vec![0x74; BLOCK_SIZE as usize]),
+        Record::Filemark,
+    ]);
+    let mut results = Vec::new();
+    for route in [VerificationRoute::Walk, VerificationRoute::OnePass] {
+        let result = verify_terminal_index_full_with_route(
+            &mut RecordingSource::new(records.clone()),
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            None,
+            ScanMode::Standard,
+            route,
+            |_| {},
+        )
+        .unwrap();
+        assert!(result.protected().is_clean(), "{route:?}: {result:?}");
+        assert_eq!(result.protected().sidecars.len(), 1);
+        assert_eq!(result.protected().unprotected_ordinals, Some(4..6));
+        assert!(!result.is_complete_tape());
+        results.push(result);
+    }
+    assert_eq!(results[0], results[1]);
+}

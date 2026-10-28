@@ -704,6 +704,13 @@ pub(crate) fn selected_tape_seal_reason_at_barrier(
     let tape = state.get_tape(&selected.tape_uuid)?.ok_or_else(|| {
         PoolWriteError::MissingTapeGeometry("selected tape row is missing".into())
     })?;
+    if let Some(reason) = tape.seal_due.as_deref() {
+        return Ok(Some(if reason == "hardware_early_warning" {
+            TapeSealReason::HardwareEarlyWarning
+        } else {
+            TapeSealReason::ReachedLowWatermark
+        }));
+    }
     let raw_capacity = tape_capacity_bytes(&tape)
         .map_err(|err| PoolWriteError::MissingTapeGeometry(err.to_string()))?;
     let capacity = effective_tape_pool_capacity_bytes(pool_cfg, raw_capacity)
@@ -1033,13 +1040,25 @@ pub(crate) fn reserve_parity_object_capacity(
     let required_spool_bytes = report.required_spool_bytes;
     let spool_permit = io_memory
         .try_reserve_with_available(required_spool_bytes)
-        .map_err(|available| ParityError::CapacityReserveExceeded {
-            cause: CapacityReserveCause::ParitySpoolCapacity,
-            projected_object_blocks,
-            remaining_blocks: None,
-            reserve_blocks: None,
-            remaining_spool_bytes: Some(available),
-            required_spool_bytes: Some(required_spool_bytes),
+        .map_err(|available| {
+            let retained_epochs = io_memory.retained_diagnostics();
+            tracing::warn!(
+                required_spool_bytes,
+                available,
+                %retained_epochs,
+                "parity spool reservation exceeds available memory"
+            );
+            PoolWriteError::ParitySpoolRefused {
+                retained_epochs,
+                cause: Box::new(ParityError::CapacityReserveExceeded {
+                    cause: CapacityReserveCause::ParitySpoolCapacity,
+                    projected_object_blocks,
+                    remaining_blocks: None,
+                    reserve_blocks: None,
+                    remaining_spool_bytes: Some(available),
+                    required_spool_bytes: Some(required_spool_bytes),
+                }),
+            }
         })?;
     input.remaining_spool_bytes = required_spool_bytes;
     let reservation = input.reserve_object()?;

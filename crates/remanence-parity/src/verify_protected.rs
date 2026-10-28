@@ -223,6 +223,8 @@ pub struct ParityMapFinding {
 /// The full verification of every sidecar's protected content.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProtectedContentVerification {
+    /// Measured Object ordinals beyond the protection watermark; no parity is claimed.
+    pub unprotected_ordinals: Option<std::ops::Range<u64>>,
     /// One entry per sidecar, in tape-file order.
     pub sidecars: Vec<SidecarVerification>,
     /// ParityMap copies that were unreadable or invalid, reported even when
@@ -252,6 +254,7 @@ impl ProtectedContentVerification {
     /// A tape with no parity protects no content: nothing to verify.
     pub fn none_protected() -> Self {
         Self {
+            unprotected_ordinals: None,
             sidecars: Vec::new(),
             parity_map_findings: Vec::new(),
             not_performed: None,
@@ -262,6 +265,7 @@ impl ProtectedContentVerification {
     /// A pass that could not be performed, with the reason.
     pub fn not_performed(reason: impl Into<String>) -> Self {
         Self {
+            unprotected_ordinals: None,
             sidecars: Vec::new(),
             parity_map_findings: Vec::new(),
             not_performed: Some(reason.into()),
@@ -1018,7 +1022,10 @@ fn verify_pass<const BUFFER_SIDECAR: bool>(
         )?);
         pending.release(entry.tape_file_number);
     }
+    let w = scoped_map.scope.watermark();
+    let t = scoped_map.map.total_data_ordinals();
     Ok(ProtectedContentVerification {
+        unprotected_ordinals: (w < t).then_some(w..t),
         sidecars,
         parity_map_findings,
         not_performed: None,

@@ -46,7 +46,7 @@ use crate::error::StateError;
 use crate::{DriveKey, LabelProvenance, MediaObservation};
 
 /// Current Layer 4 SQLite schema version.
-pub const SCHEMA_VERSION: u32 = 21;
+pub const SCHEMA_VERSION: u32 = 22;
 
 /// Oldest clean-break catalog whose tape table can be inspected safely by the
 /// exact full-catalog erase admission path. Ordinary opens migrate the supported
@@ -1291,6 +1291,8 @@ pub struct TapeRecord {
     pub stripes_per_neighborhood: Option<u32>,
     /// Last committed filemark-delimited tape-file number.
     pub last_committed_tape_file: Option<u64>,
+    /// Exclusive end of committed data protected by on-tape sidecars.
+    pub highest_protected_ordinal: u64,
     /// Total committed object-data ordinals on this tape.
     pub total_committed_ordinals: u64,
     /// Written extent: the maximum barrier-proved EOD LBA over this
@@ -1299,6 +1301,8 @@ pub struct TapeRecord {
     /// rollup over object commits. Absent when no barrier has proved one;
     /// absent is never zero.
     pub written_extent_lba: Option<u64>,
+    /// Deferred automatic seal trigger, consumed before the next Object write.
+    pub seal_due: Option<String>,
     /// Durable terminal-finalization state, when Object admission is closed.
     pub terminal_finalization: Option<TerminalFinalizationProjection>,
     /// Projection state.
@@ -2528,7 +2532,7 @@ impl CatalogIndex {
                                       and media_readiness_ops.state not in ('ready', 'released')
                                       and coalesce(media_readiness_ops.dirty_scope, 'drive+tape') <> 'none'),
                         tapes.voltag_source, tapes.cartridge_generation, tapes.generation_source,
-                        tapes.last_verified_at_utc, tapes.last_verification_state, tapes.last_verified_edition_digest
+                        tapes.last_verified_at_utc, tapes.last_verification_state, tapes.last_verified_edition_digest, tapes.seal_due
                  from tapes
                  where tapes.voltag = ?1
                  order by hex(tapes.tape_uuid)",
@@ -2752,8 +2756,28 @@ impl CatalogIndex {
         Ok(())
     }
 
+    /// Persist a deferred seal on the exact tape until terminal completion clears it.
+    pub fn record_tape_seal_due(
+        &mut self,
+        tape_uuid: [u8; 16],
+        reason: &str,
+    ) -> Result<(), StateError> {
+        let changed = self
+            .conn
+            .execute(
+                "update tapes set seal_due = ?2 where tape_uuid = ?1 and state = 'ready'",
+                params![tape_uuid.as_slice(), reason],
+            )
+            .map_err(|e| sqlite_error("record seal due", e))?;
+        if changed != 1 {
+            return Err(StateError::IndexCorrupt(
+                "seal due requires a ready tape".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Mark a tape closed to future writes while preserving its catalog rows.
-    ///
     /// The pool selector treats any non-`ready` tape as unwritable, so this
     /// state transition is enough to exclude a tape after eager sealing.
     pub fn seal_tape(&mut self, tape_uuid: [u8; 16]) -> Result<(), StateError> {
@@ -2762,7 +2786,7 @@ impl CatalogIndex {
             .conn
             .execute(
                 "update tapes
-                 set state = 'sealed',
+                 set state = 'sealed', seal_due = null,
                      updated_at_utc = ?2
                  where tape_uuid = ?1",
                 params![tape_uuid.to_vec(), updated_at],
@@ -4210,16 +4234,20 @@ impl CatalogIndex {
             if record.sealed_after_write {
                 return self.project_terminal_checkpoint_record(record);
             }
-            return Err(StateError::IndexCorrupt(
-                "checkpoint record has no object projections".to_string(),
-            ));
+            if record.scheme.is_none() || record.barrier_bundle.is_none() {
+                return Err(StateError::IndexCorrupt(
+                    "checkpoint record has no object projections or parity sidecars".into(),
+                ));
+            }
         }
         if record.scheme.is_some() && record.object_tape_file_bundles.len() != projections.len() {
             return Err(StateError::IndexCorrupt(
                 "parity checkpoint bundle count does not match object projection count".to_string(),
             ));
         }
-        let tape_uuid = projections[0].copy.tape_uuid;
+        let tape_uuid = projections
+            .first()
+            .map_or(record.tape_uuid, |projection| projection.copy.tape_uuid);
         if record.tape_uuid != tape_uuid {
             return Err(StateError::IndexCorrupt(format!(
                 "checkpoint record tape {} does not match object tape {}",
@@ -5396,7 +5424,7 @@ impl CatalogIndex {
                     finalization_trigger, finalization_operation_id,
                     finalization_edition_digest, finalization_layout_digest,
                     completed_replicas, finalization_outcome,
-                    voltag_source, cartridge_generation, generation_source, last_verified_at_utc, last_verification_state, last_verified_edition_digest
+                    voltag_source, cartridge_generation, generation_source, last_verified_at_utc, last_verification_state, last_verified_edition_digest, highest_protected_ordinal, seal_due
              from tapes{where_clause}
              order by hex(tapes.tape_uuid)"
         );
@@ -5546,7 +5574,7 @@ impl CatalogIndex {
                         finalization_trigger, finalization_operation_id,
                         finalization_edition_digest, finalization_layout_digest,
                         completed_replicas, finalization_outcome,
-                    voltag_source, cartridge_generation, generation_source, last_verified_at_utc, last_verification_state, last_verified_edition_digest
+                    voltag_source, cartridge_generation, generation_source, last_verified_at_utc, last_verification_state, last_verified_edition_digest, highest_protected_ordinal, seal_due
                  from tapes
                  where tapes.tape_uuid = ?1",
             )
@@ -5592,7 +5620,7 @@ impl CatalogIndex {
                         finalization_trigger, finalization_operation_id,
                         finalization_edition_digest, finalization_layout_digest,
                         completed_replicas, finalization_outcome,
-                    voltag_source, cartridge_generation, generation_source, last_verified_at_utc, last_verification_state, last_verified_edition_digest
+                    voltag_source, cartridge_generation, generation_source, last_verified_at_utc, last_verification_state, last_verified_edition_digest, highest_protected_ordinal, seal_due
                  from tapes
                  where tapes.voltag = ?1",
             )
@@ -7579,6 +7607,7 @@ fn reprovision_tape_tx(
              finalization_layout_digest = null,
              completed_replicas = null,
              finalization_outcome = null,
+             seal_due = null,
              updated_at_utc = ?10
          where tape_uuid = ?1",
         params![
@@ -8508,6 +8537,11 @@ fn validate_checkpoint_record_bundle_shape(
     }
 
     let expected_next_tape_file_number = last_new_tape_file
+        .or_else(|| {
+            parity_layout
+                .as_ref()
+                .map(|layout| layout.last_tape_file.tape_file_number)
+        })
         .and_then(|last| last.checked_add(1))
         .ok_or_else(|| {
             StateError::IndexCorrupt("checkpoint has no object tape-file prefix".into())
@@ -11648,7 +11682,7 @@ fn project_checkpoint_tape_seal_tx(
     let changed = tx
         .execute(
             "update tapes
-             set state = case when state = 'retired' then state else 'sealed' end,
+             set state = case when state = 'retired' then state else 'sealed' end, seal_due = null,
                  updated_at_utc = ?2
              where tape_uuid = ?1",
             params![tape_uuid.to_vec(), updated_at_utc],
@@ -12167,6 +12201,7 @@ fn project_terminal_finalization_tx(
                  completed_replicas = ?7,
                  finalization_outcome = ?8,
                  state = ?9,
+                 seal_due = case when ?9 in ('sealed', 'finalized_degraded') then null else seal_due end,
                  updated_at_utc = ?10
              where tape_uuid = ?1",
             params![
@@ -13064,6 +13099,13 @@ fn tape_from_row(row: &rusqlite::Row<'_>) -> Result<TapeRecord, StateError> {
         }
     };
     Ok(TapeRecord {
+        seal_due: row
+            .get("seal_due")
+            .map_err(|e| sqlite_error("read seal due", e))?,
+        highest_protected_ordinal: row
+            .get::<_, SqliteU64>("highest_protected_ordinal")
+            .map_err(|error| sqlite_error("read protection watermark", error))?
+            .get(),
         last_verified_at_utc: row
             .get("last_verified_at_utc")
             .map_err(|e| sqlite_error("read verification time", e))?,
@@ -13871,9 +13913,11 @@ fn legacy_catalog_reset_tape_from_row(row: &rusqlite::Row<'_>) -> Result<TapeRec
             )
         })?;
     Ok(TapeRecord {
+        highest_protected_ordinal: 0,
         last_verified_at_utc: None,
         last_verification_state: None,
         last_verified_edition_digest: None,
+        seal_due: None,
         tape_uuid: row_get(row, 0, "tapes.tape_uuid")?,
         voltag: row_get(row, 1, "tapes.voltag")?,
         voltag_source: Some(LabelProvenance::Changer),
@@ -14245,6 +14289,7 @@ fn migrate(conn: &Connection) -> Result<(), StateError> {
 
 /// Add verification projection fields without replaying historical backfills.
 fn migrate_verification_columns(conn: &Connection) -> Result<(), StateError> {
+    ensure_column(conn, "tapes", "seal_due", "seal_due text")?;
     ensure_column(
         conn,
         "tapes",
@@ -14289,6 +14334,12 @@ fn migrate_inner(conn: &Connection) -> Result<(), StateError> {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|e| sqlite_error("update verification schema version", e))?;
         return validate_unsigned_structural_schema(conn);
+    }
+    if current == 21 {
+        ensure_column(conn, "tapes", "seal_due", "seal_due text")?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(|e| sqlite_error("update seal due schema version", e))?;
+        current = SCHEMA_VERSION;
     }
     if current == SCHEMA_VERSION {
         conn.execute_batch(TAPE_AUDIT_CURSOR_SCHEMA)
@@ -14581,6 +14632,7 @@ fn validate_unsigned_structural_schema(conn: &Connection) -> Result<(), StateErr
         ("last_verified_at_utc", "TEXT"),
         ("last_verification_state", "INTEGER"),
         ("last_verified_edition_digest", "BLOB"),
+        ("seal_due", "TEXT"),
     ] {
         let declared: Option<String> = conn
             .query_row(
@@ -15257,6 +15309,50 @@ mod tests {
     }
 
     /// Upgrading recent catalogs must not rerun generation or assignment backfills.
+    /// Schema upgrades preserve exact tape identity and deferred seals survive reopen.
+    #[test]
+    fn schema_21_seal_due_upgrade_survives_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("index.sqlite");
+        let mut index = CatalogIndex::open(&path).unwrap();
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: [0x62; 16],
+                voltag: "DUE001".into(),
+                block_size: 4096,
+                parity: remanence_parity::ParityConfig::None,
+                force: false,
+            })
+            .unwrap();
+        index
+            .conn
+            .execute_batch("alter table tapes drop column seal_due; PRAGMA user_version=21;")
+            .unwrap();
+        drop(index);
+        let mut index = CatalogIndex::open(&path).unwrap();
+        assert_eq!(index.schema_version().unwrap(), SCHEMA_VERSION);
+        assert!(index
+            .get_tape(&[0x62; 16])
+            .unwrap()
+            .unwrap()
+            .seal_due
+            .is_none());
+        index
+            .record_tape_seal_due([0x62; 16], "hardware_early_warning")
+            .unwrap();
+        drop(index);
+        let index = CatalogIndex::open_read_only(&path).unwrap();
+        assert_eq!(
+            index
+                .get_tape(&[0x62; 16])
+                .unwrap()
+                .unwrap()
+                .seal_due
+                .as_deref(),
+            Some("hardware_early_warning")
+        );
+    }
+
     #[test]
     fn schema_20_verification_upgrade_does_not_backfill_evidence() {
         let root = tempfile::tempdir().unwrap();
@@ -15285,7 +15381,7 @@ mod tests {
             .unwrap();
         drop(index);
         let index = CatalogIndex::open(&path).unwrap();
-        assert_eq!(index.schema_version().unwrap(), 21);
+        assert_eq!(index.schema_version().unwrap(), SCHEMA_VERSION);
         let tape = index.get_tape(&[9; 16]).unwrap().unwrap();
         assert!(tape.cartridge_generation.is_none());
         assert!(tape.generation_source.is_none());
@@ -16783,6 +16879,54 @@ mod tests {
             count_rows_for_tape(&index, "catalog_units", old_tape_uuid),
             0
         );
+    }
+
+    /// Forced initialization clears a due seal on a ready, written tape.
+    #[test]
+    fn force_reprovision_clears_seal_due() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut index = CatalogIndex::open(temp.path().join("index.sqlite")).unwrap();
+        let old_uuid = [0x60; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: old_uuid,
+                voltag: "DUE001".into(),
+                block_size: 8192,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .unwrap();
+        index
+            .conn
+            .execute(
+                "update tapes set written_extent_lba = X'0000000000000007' where tape_uuid = ?1",
+                [old_uuid.as_slice()],
+            )
+            .unwrap();
+        index
+            .record_tape_seal_due(old_uuid, "reached_low_watermark")
+            .unwrap();
+        assert!(index
+            .get_tape(&old_uuid)
+            .unwrap()
+            .unwrap()
+            .seal_due
+            .is_some());
+        let new_uuid = [0x61; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: new_uuid,
+                voltag: "DUE001".into(),
+                block_size: 8192,
+                parity: ParityConfig::None,
+                force: true,
+            })
+            .unwrap();
+        assert!(index.get_tape(&old_uuid).unwrap().is_none());
+        let tape = index.get_tape(&new_uuid).unwrap().unwrap();
+        assert_eq!(tape.state, "ready");
+        assert_eq!(tape.seal_due, None);
+        assert_eq!(tape.total_committed_ordinals, 0);
     }
 
     #[test]

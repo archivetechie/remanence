@@ -2088,3 +2088,365 @@ async fn committed_barrier_context_failures_preserve_receipts() {
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seated_parity_sessions_close_before_unload_and_shutdown() {
+    use crate::write_owner::tests::RetentionInvalidation::{
+        AutomaticSeal, Discarded, Disconnected, ExpectedEnd, Fenced, Finalize, FinalizeRebuilt,
+        IdentityGeneration, JournalFailure, NoHomeSlot, NoWriteShutdown, None as Unchanged,
+        OtherDrive, ParkedGeneration, PositionFailure, ProjectionBusy, SealDue, ShutdownSealDue,
+        WriteFailure,
+    };
+    for (refuse_memory, shutdown, read_before_shutdown, invalidation, failed_close) in [
+        (false, false, false, Unchanged, false),
+        (false, false, false, NoHomeSlot, false),
+        (false, true, false, Unchanged, false),
+        (true, false, false, Unchanged, false),
+        (false, true, true, Unchanged, false),
+        (false, true, true, OtherDrive, false),
+        (false, false, false, ParkedGeneration, false),
+        (false, false, false, IdentityGeneration, false),
+        (false, false, false, ExpectedEnd, false),
+        (false, false, false, Unchanged, true),
+        (false, false, false, Discarded, false),
+        (false, false, false, Fenced, false),
+        (false, false, false, WriteFailure, false),
+        (false, false, false, PositionFailure, false),
+        (false, false, false, JournalFailure, false),
+        (false, true, false, NoWriteShutdown, false),
+        (false, false, false, Finalize, false),
+        (false, false, false, FinalizeRebuilt, false),
+        (false, false, false, SealDue, false),
+        (false, true, false, ShutdownSealDue, false),
+        (false, false, false, Disconnected, false),
+        (false, false, false, AutomaticSeal, false),
+        (false, false, false, ProjectionBusy(false, "startup"), false),
+        (false, false, false, ProjectionBusy(true, "startup"), false),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let parity = crate::ParityConfig::Scheme(remanence_parity::ParityScheme {
+            id: remanence_parity::SchemeId::new_static("seated"),
+            data_blocks_per_stripe: 128,
+            parity_blocks_per_stripe: 1,
+            stripes_per_neighborhood: 1,
+        });
+        let world = world();
+        set_rollback_bootstrap(&world, parity.clone());
+        let state = state_with_parity(root.path(), true, parity.clone());
+        crate::write_owner::tests::check_seated_parity_sessions(
+            &state,
+            world,
+            crate::SelectedTape {
+                standalone_endpoint: None,
+                pool_id: "default".into(),
+                tape_uuid: UUID,
+                block_size: BLOCK,
+                parity_config: parity,
+            },
+            refuse_memory,
+            shutdown,
+            read_before_shutdown,
+            invalidation,
+            failed_close,
+        )
+        .await;
+    }
+}
+
+/// Every removal entry point releases cartridges after skipped or failed epoch closes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn epoch_removal_admission_failure_matrix() {
+    const CHILD: &str = "REMOVAL_MATRIX_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "mount_backend::tests::epoch_removal_admission_failure_matrix",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let logs = tempfile::tempdir().unwrap();
+    let log_path = logs.path().join("removal.log");
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(std::fs::File::create(&log_path).unwrap())
+        .try_init()
+        .unwrap();
+
+    let requested_case = std::env::var("REMOVAL_MATRIX_CASE").ok();
+    let mut exercised = 0;
+    for case in [
+        "unit_attention",
+        "timeout",
+        "not_ready",
+        "transport",
+        "position_read",
+        "wrong_length",
+        "hardware_44",
+        "hardware_15",
+        "bot_filemark",
+        "bot_blank",
+        "bot_medium",
+        "bot_oversized",
+        "bot_transport",
+        "admission_filemark",
+        "admission_medium",
+        "admission_transport",
+        "admission_unit_attention",
+        "admission_not_ready",
+        "open_unit_attention",
+        "open_timeout",
+        "filemark",
+        "eod",
+        "blank_locate",
+        "absent_bootstrap",
+        "projection_busy",
+        "success",
+        "retired",
+        "sealed",
+        "finalizing",
+        "ingested",
+        "foreign",
+        "no_pool",
+        "pending",
+        "lease",
+        "finalize_lease",
+        "mode_sense",
+        "catalog_read",
+        "post_projection",
+        "summary_mismatch",
+        "tail",
+        "identity",
+        "read",
+        "medium",
+        "open_read",
+        "open_medium",
+        "missing_checkpoint",
+        "barcode_fence",
+        "late_barcode_fence",
+        "write_protected",
+    ] {
+        if requested_case
+            .as_deref()
+            .is_some_and(|requested| requested != case)
+        {
+            continue;
+        }
+        exercised += 1;
+        for path in ["idle", "eviction", "operator", "shutdown"] {
+            if matches!(
+                case,
+                "unit_attention"
+                    | "timeout"
+                    | "not_ready"
+                    | "transport"
+                    | "position_read"
+                    | "wrong_length"
+                    | "hardware_44"
+                    | "hardware_15"
+                    | "bot_filemark"
+                    | "bot_blank"
+                    | "bot_medium"
+                    | "bot_oversized"
+                    | "bot_transport"
+                    | "admission_filemark"
+                    | "admission_medium"
+                    | "admission_transport"
+                    | "admission_unit_attention"
+                    | "admission_not_ready"
+                    | "open_unit_attention"
+                    | "open_timeout"
+                    | "filemark"
+                    | "eod"
+                    | "blank_locate"
+                    | "absent_bootstrap"
+                    | "projection_busy"
+                    | "success"
+            ) && !matches!(path, "idle" | "operator")
+            {
+                continue;
+            }
+            if (case == "summary_mismatch" && path != "shutdown")
+                || (case == "finalize_lease" && path != "eviction")
+            {
+                continue;
+            }
+            let log_start = std::fs::metadata(&log_path).unwrap().len() as usize;
+            let root = tempfile::tempdir().unwrap();
+            let parity = crate::ParityConfig::Scheme(remanence_parity::ParityScheme {
+                id: remanence_parity::SchemeId::new_static("seated"),
+                data_blocks_per_stripe: 4,
+                parity_blocks_per_stripe: 2,
+                stripes_per_neighborhood: 32,
+            });
+            let world = world();
+            set_rollback_bootstrap(&world, parity.clone());
+            let state = state_with_parity(root.path(), true, parity.clone());
+            crate::write_owner::tests::check_seated_parity_sessions(
+                &state,
+                world,
+                crate::SelectedTape {
+                    standalone_endpoint: None,
+                    pool_id: "default".into(),
+                    tape_uuid: UUID,
+                    block_size: BLOCK,
+                    parity_config: parity,
+                },
+                false,
+                false,
+                false,
+                crate::write_owner::tests::RetentionInvalidation::Removal(case, path),
+                false,
+            )
+            .await;
+            let log = std::fs::read_to_string(&log_path).unwrap();
+            let log = &log[log_start..];
+            let expected = if case == "success" {
+                ""
+            } else if matches!(case, "post_projection" | "projection_busy") {
+                "durable epoch close follow-up fails"
+            } else if matches!(
+                case,
+                "finalize_lease"
+                    | "mode_sense"
+                    | "catalog_read"
+                    | "summary_mismatch"
+                    | "unit_attention"
+                    | "timeout"
+                    | "not_ready"
+                    | "transport"
+                    | "position_read"
+                    | "wrong_length"
+                    | "hardware_44"
+                    | "hardware_15"
+                    | "bot_filemark"
+                    | "bot_blank"
+                    | "bot_medium"
+                    | "bot_oversized"
+                    | "bot_transport"
+                    | "admission_filemark"
+                    | "admission_medium"
+                    | "admission_transport"
+                    | "admission_unit_attention"
+                    | "admission_not_ready"
+                    | "open_unit_attention"
+                    | "open_timeout"
+                    | "filemark"
+                    | "eod"
+                    | "blank_locate"
+                    | "absent_bootstrap"
+            ) || (path == "shutdown"
+                && matches!(case, "read" | "medium" | "identity" | "late_barcode_fence"))
+            {
+                "epoch_left_open"
+            } else if matches!(
+                case,
+                "lease"
+                    | "tail"
+                    | "identity"
+                    | "read"
+                    | "medium"
+                    | "missing_checkpoint"
+                    | "late_barcode_fence"
+            ) {
+                "epoch close fails before removal"
+            } else if matches!(case, "barcode_fence" | "open_read" | "open_medium") {
+                "fenced removal leaves the epoch open"
+            } else {
+                "epoch close skipped"
+            };
+            assert!(
+                log.contains(expected),
+                "{case} through {path}: missing {expected}: {log}"
+            );
+        }
+    }
+    assert!(exercised > 0, "requested removal case does not exist");
+}
+
+/// Removal replays a durable session close without writing a second checkpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn durable_session_close_survives_removal_after_projection_busy() {
+    let requested = std::env::var("SESSION_PROJECTION_PATH").ok();
+    let mut exercised = 0;
+    for path in ["idle", "eviction", "shutdown"] {
+        if requested
+            .as_deref()
+            .is_some_and(|requested| requested != path)
+        {
+            continue;
+        }
+        exercised += 1;
+        let root = tempfile::tempdir().unwrap();
+        let parity = crate::ParityConfig::Scheme(remanence_parity::ParityScheme {
+            id: remanence_parity::SchemeId::new_static("seated"),
+            data_blocks_per_stripe: 4,
+            parity_blocks_per_stripe: 2,
+            stripes_per_neighborhood: 32,
+        });
+        let world = world();
+        set_rollback_bootstrap(&world, parity.clone());
+        let state = state_with_parity(root.path(), true, parity.clone());
+        crate::write_owner::tests::check_seated_parity_sessions(
+            &state,
+            world,
+            crate::SelectedTape {
+                standalone_endpoint: None,
+                pool_id: "default".into(),
+                tape_uuid: UUID,
+                block_size: BLOCK,
+                parity_config: parity,
+            },
+            false,
+            false,
+            false,
+            crate::write_owner::tests::RetentionInvalidation::ProjectionBusy(false, path),
+            false,
+        )
+        .await;
+    }
+    assert!(exercised > 0, "requested removal path does not exist");
+}
+
+/// An epoch spans API sessions with multiple stripes and fills while the tape stays seated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_epoch_fills_across_seated_sessions() {
+    let root = tempfile::tempdir().unwrap();
+    let parity = crate::ParityConfig::Scheme(remanence_parity::ParityScheme {
+        id: remanence_parity::SchemeId::new_static("seated"),
+        data_blocks_per_stripe: 4,
+        parity_blocks_per_stripe: 2,
+        stripes_per_neighborhood: 4,
+    });
+    let world = world();
+    set_rollback_bootstrap(&world, parity.clone());
+    let state = state_with_parity(root.path(), true, parity.clone());
+    crate::write_owner::tests::check_seated_parity_sessions(
+        &state,
+        world,
+        crate::SelectedTape {
+            standalone_endpoint: None,
+            pool_id: "default".into(),
+            tape_uuid: UUID,
+            block_size: BLOCK,
+            parity_config: parity,
+        },
+        false,
+        false,
+        false,
+        crate::write_owner::tests::RetentionInvalidation::ApiEpochFills,
+        false,
+    )
+    .await;
+}

@@ -399,7 +399,7 @@ pub(crate) fn create_append_ring(
         let ceiling = io_memory.ceiling();
         let held = ceiling.saturating_sub(available);
         Status::resource_exhausted(format!(
-            "append ring reservation of {capacity_bytes} bytes exceeds available io_memory capacity: daemon.io_memory_ceiling={ceiling} bytes, available={available} bytes, held={held} bytes by active append rings, spools, and restore reservoirs"
+            "append ring reservation of {capacity_bytes} bytes exceeds available io_memory capacity: daemon.io_memory_ceiling={ceiling} bytes, available={available} bytes, held={held} bytes by active append rings, spools, restore reservoirs and retained epochs [{}]", io_memory.retained_diagnostics()
         ))
     })?;
     let slab_bytes_u64 = capacity_bytes.min(APPEND_RING_SLAB_BYTES as u64);

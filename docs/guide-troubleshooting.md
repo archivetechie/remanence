@@ -196,7 +196,15 @@ cartridge in the drive. They record the attempt in the operation before the
 LOAD and send no second one until the drive has reported ready, also across
 a restart. The daemon finishes every dismount it starts before it exits on
 SIGTERM, SIGINT or SIGHUP, so give a stopping daemon time for a rewind, an
-unload and a move before any hard kill.
+unload and a move before any hard kill. Epoch closing never prevents removal.
+When shutdown finds the head away from the last write EOD, it dismounts and
+logs and audits `epoch_left_open` with the committed range `[W,T)`. The next
+append rebuilds that range before writing. A close fences the tape only when
+the tape contradicts committed state or an append has uncertain durability.
+Transient failures log and audit `epoch_left_open` without a fence, and removal
+proceeds. A durable journal commit stays closed when SQLite projection fails;
+startup replay projects it. A tape outside write admission skips the close with
+a log entry.
 
 When that LOAD fails, was already spent, or is never sent because changer
 inventory does not show the cartridge in the drive, the fence stays. The
@@ -347,6 +355,26 @@ accumulation, CRC, hashes, copies, and object filemarks. `tail` covers the host
 projection and session detach after transfer; it emits on success or error
 and does not itself assert a commit. Shared checkpoint barriers retain their
 separate diagnostics.
+
+`parity_retention` reports whether the drive actor reserves the open epoch
+between sessions. `reserved_bytes` gives the requested accumulator reservation;
+`retained=true` confirms the grant. `retained=false` with
+`close_reason=io_memory_ceiling` means the barrier emits a short-epoch sidecar.
+The reservation covers the parity shards, CRC capacity, vector headers, codec
+matrix, and inline detached state. The reservation releases when the epoch
+closes or the actor discards it. Ordinary checkpoints keep their barrier cadence.
+Daemon sidecars normally appear when an epoch fills, at finalization, or before
+removal. Standalone writes close at every barrier. A fenced removal leaves the
+epoch open until append recovery clears the fence. Removal does not seal the tape.
+
+A committed tail without a sidecar appears as `[open_epoch_start, open_epoch_end)`
+in catalog and live drive status. It contains fewer than one epoch of data.
+Restore reads that range as unprotected data; verification does not invent a
+missing sidecar or claim parity coverage for it. Shutdown closes a retained
+epoch only at the unchanged write EOD with a matching retained summary. Otherwise
+it dismounts with the epoch open and logs and audits `epoch_left_open`; the next
+append rebuilds the epoch. A failed removal-time close is logged and audited;
+a fenced failure still permits unload.
 
 The parity `transfer` event adds `write_commands_ms`, the sum of time inside
 raw fixed-block WRITE calls, and `between_writes_ms`, the sum of intervals

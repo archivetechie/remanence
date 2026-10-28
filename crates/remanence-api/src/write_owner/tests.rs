@@ -1270,6 +1270,7 @@ fn verification_names_every_protected_content_failure_and_is_never_complete() {
         }],
     };
     let protected = ProtectedContentVerification {
+        unprotected_ordinals: None,
         sidecars: vec![sidecar],
         parity_map_findings: vec![ParityMapFinding {
             tape_file_number: 3,
@@ -2557,6 +2558,8 @@ fn automatic_terminal_transition_transfers_the_session_parity_journal_lock() {
         scheme: scheme.clone(),
         sink_state: None,
         journal: Some(journal),
+        retention: None,
+        close_at_barrier: false,
     };
 
     let contended = FileTapeFileJournal::open(&path, tape_uuid, 256 * 1024, scheme.clone())
@@ -2810,34 +2813,16 @@ async fn partial_epoch_checkpoint_projects_replays_and_first_post_checkpoint_sho
     assert!(
         record.object_tape_file_bundles[0].total_committed_ordinals
             < u64::from(scheme.data_blocks_per_stripe),
-        "the regression must close a genuinely partial parity epoch"
+        "the regression keeps a partial parity epoch"
     );
-    let barrier_bundle = record
-        .barrier_bundle
-        .as_ref()
-        .expect("parity checkpoint sidecar bundle");
-    assert_eq!(
-        barrier_bundle
-            .entries
-            .iter()
-            .map(|entry| entry.kind)
-            .collect::<Vec<_>>(),
-        vec![TapeFileKind::ParitySidecar],
-        "the barrier must journal exactly the short sidecar"
+    assert!(
+        record.barrier_bundle.is_none(),
+        "ordinary checkpoints keep a short epoch open"
     );
+    assert_eq!(record.next_tape_file_number, 2);
     assert_eq!(
-        barrier_bundle
-            .entries
-            .last()
-            .expect("checkpoint sidecar")
-            .tape_file_number
-            .checked_add(1)
-            .expect("next tape-file number"),
-        record.next_tape_file_number,
-    );
-    assert_eq!(
-        barrier_bundle.highest_protected_ordinal,
-        barrier_bundle.total_committed_ordinals
+        record.object_tape_file_bundles[0].highest_protected_ordinal,
+        0
     );
     let mut replay_index = CatalogIndex::open(&index_path).expect("open replay projection");
     replay_index
@@ -3901,6 +3886,7 @@ fn test_write_owner_config(
         managed_library_serials: Arc::new(HashSet::from([serial])),
         cleaning: remanence_state::CleaningConfig::default(),
         tape_io: remanence_state::TapeIoConfig::default(),
+        tape_pools: Vec::new(),
         verification_route: remanence_parity::VerificationRoute::Walk,
         io_memory: crate::io_memory::IoMemoryReservation::new(
             remanence_state::DEFAULT_IO_MEMORY_CEILING_BYTES,
@@ -6081,6 +6067,7 @@ async fn changer_move_succeeds_and_publishes_snapshot_when_catalog_observation_f
         managed_library_serials: Arc::new(HashSet::from([library.serial.clone()])),
         cleaning: remanence_state::CleaningConfig::default(),
         tape_io: remanence_state::TapeIoConfig::default(),
+        tape_pools: Vec::new(),
         verification_route: remanence_parity::VerificationRoute::Walk,
         io_memory: test_io_memory(),
         write_admissions: WriteAdmissionCoordinator::default(),
@@ -8951,16 +8938,11 @@ fn resume_vectors_layer5_authorities(refusal: Option<&str>) {
         scheme: Some(vector.written.inputs.scheme.clone()),
         object_tape_file_bundles: vec![CommittedBundle {
             kind: CommittedBundleKind::Object,
-            entries: vec![entry],
-            highest_protected_ordinal: 0,
-            total_committed_ordinals: 4,
-        }],
-        barrier_bundle: Some(CommittedBundle {
-            kind: CommittedBundleKind::CheckpointSidecars,
-            entries: vec![committed.entries[2].clone()],
+            entries: vec![entry, committed.entries[2].clone()],
             highest_protected_ordinal: 4,
             total_committed_ordinals: 4,
-        }),
+        }],
+        barrier_bundle: None,
         terminal_finalization: None,
         sealed_after_write: false,
     };
@@ -11702,14 +11684,7 @@ pub(crate) async fn check_overlap_batch_receipts(
         .flat_map(|b| &b.entries)
         .filter(|e| e.kind == TapeFileKind::ParitySidecar)
         .count();
-    assert_eq!(
-        sidecars,
-        if matches!(selected.parity_config, ParityConfig::None) {
-            0
-        } else {
-            4
-        }
-    );
+    assert_eq!(sidecars, 0, "ordinary barriers leave the short epoch open");
 }
 
 thread_local! {
@@ -11770,7 +11745,7 @@ pub(crate) async fn check_context_failure_receipts(
         let mut index = CatalogIndex::open(&cfg.index_path).unwrap();
         FAIL_APPEND_CONTEXT_AFTER.with(|count| count.set(2));
         handle_drive_open_write(
-            0x100, &mut index, &cfg, actor_tx, &mut rx, &mut drive, &mut 0, request,
+            0x100, &mut index, &cfg, actor_tx, &mut rx, &mut drive, &mut 0, request, &mut None,
         );
         assert_eq!(
             FAIL_APPEND_CONTEXT_AFTER.with(|count| count.get()),
@@ -11903,4 +11878,1913 @@ pub(crate) async fn check_context_failure_receipts(
     )
     .unwrap();
     assert_eq!(journal.replay().unwrap().len(), 2);
+}
+
+/// Changes that invalidate a seated accumulator before the next session.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetentionInvalidation {
+    None,
+    ParkedGeneration,
+    IdentityGeneration,
+    ExpectedEnd,
+    OtherDrive,
+    NoHomeSlot,
+    Discarded,
+    Fenced,
+    WriteFailure,
+    PositionFailure,
+    JournalFailure,
+    NoWriteShutdown,
+    Finalize,
+    FinalizeRebuilt,
+    SealDue,
+    ShutdownSealDue,
+    Disconnected,
+    Removal(&'static str, &'static str),
+    AutomaticSeal,
+    ProjectionBusy(bool, &'static str),
+    ApiEpochFills,
+}
+
+/// Seated one-object sessions retain their accumulator and removal commits its sidecar.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn check_seated_parity_sessions(
+    state: &StateHandle,
+    world: Arc<Mutex<VirtualWorld>>,
+    selected: SelectedTape,
+    refuse_memory: bool,
+    shutdown: bool,
+    read_before_shutdown: bool,
+    invalidation: RetentionInvalidation,
+    failed_close: bool,
+) {
+    let read_fault = Arc::new(AtomicU64::new(0));
+    if matches!(
+        invalidation,
+        RetentionInvalidation::Removal(_, _) | RetentionInvalidation::ProjectionBusy(_, _)
+    ) {
+        let mut w = world.lock().unwrap();
+        w.slots.push(remanence_chaos::model::SlotState {
+            address: 0x400,
+            full: false,
+            barcode: None,
+            access: true,
+            except: false,
+        });
+        w.element_layout.slot_count = 1;
+        w.drive_source_slots.insert(0x100, Some(0x400));
+    }
+    let model = world.lock().unwrap().library_snapshot();
+    let mut library = model
+        .open_with(
+            &remanence_library::StaticAllowlist::new([model.serial.as_str()]),
+            {
+                let world = world.clone();
+                let fault = read_fault.clone();
+                let index_path = state.paths().sqlite_path.clone();
+                move |path| {
+                    let role = world.lock().unwrap().role_for_path(path).unwrap();
+                    Ok(Box::new(EpochRemovalTransport {
+                        inner: ModelTransport::new(world.clone(), role),
+                        world: world.clone(),
+                        fault: fault.clone(),
+                        located: 0,
+                        index_path: index_path.clone(),
+                    }))
+                }
+            },
+        )
+        .unwrap();
+    let mut cfg = test_write_owner_config(
+        state.paths().sqlite_path.clone(),
+        state.paths().audit_dir.clone(),
+        &library,
+        library_snapshot_cell(library.library().clone()),
+    );
+    cfg.tape_pools = state.config().tape_pools.clone();
+    if matches!(invalidation, RetentionInvalidation::Removal("no_pool", _)) {
+        cfg.tape_pools.clear();
+    }
+    if invalidation == RetentionInvalidation::SealDue {
+        cfg.tape_pools[0].watermark_low = 1e-12;
+    }
+
+    cfg.checkpoint_journal_dir = state.paths().journal_dir.join("checkpoints");
+    cfg.checkpoint_max_age_seconds = 3600;
+    let lifecycle = crate::drive_pool::DrivePoolLifecycle::default();
+    cfg.lifecycle = Some(lifecycle.clone());
+    let memory = cfg.io_memory.clone();
+    let mut held = None;
+    let serial = library.library().serial.clone();
+    let drive = library
+        .open_drive(
+            0x100,
+            &remanence_library::StaticAllowlist::new([serial.as_str()]),
+        )
+        .unwrap();
+    let tx = spawn_drive_actor(0x100, drive, cfg.clone());
+    if invalidation == RetentionInvalidation::ApiEpochFills {
+        check_api_epoch_fills(state, world, selected, cfg, lifecycle, tx, library).await;
+        return;
+    }
+    let mut prior_reads = None;
+    for number in 0..if invalidation == RetentionInvalidation::NoWriteShutdown {
+        3
+    } else {
+        2
+    } {
+        drop(held.take());
+        if number == 1 && invalidation == RetentionInvalidation::ParkedGeneration {
+            let mut parked = lifecycle.parked.lock().unwrap();
+            for entry in parked.by_drive.values_mut() {
+                entry.generation += 1;
+            }
+        }
+        if number == 1 && invalidation == RetentionInvalidation::ExpectedEnd {
+            // Another owner advances durable authority while the original
+            // actor still has the earlier accumulator and parked generation.
+            let drive = library
+                .open_drive(
+                    0x100,
+                    &remanence_library::StaticAllowlist::new([serial.as_str()]),
+                )
+                .unwrap();
+            let mut other_cfg = cfg.clone();
+            other_cfg.lifecycle = None;
+            let other = spawn_drive_actor(0x100, drive, other_cfg);
+            let (reply, received) = oneshot::channel();
+            other
+                .send(DriveCommand::OpenWrite {
+                    actor: remanence_state::AuditActor::System,
+                    pool_cfg: state.config().tape_pools[0].clone(),
+                    selected: selected.clone(),
+                    target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
+                    needs_drive_load: false,
+                    library_serial: serial.clone(),
+                    barcode: Some("HAND".into()),
+                    source_slot: None,
+                    drive_uuid: None,
+                    drive_serial: None,
+                    reply,
+                })
+                .await
+                .unwrap();
+            let id = Uuid::from_slice(&received.await.unwrap().unwrap().session_id).unwrap();
+            append_actor_test_file(
+                &other,
+                id,
+                state.paths().state_dir.join("intervening.bin"),
+                "intervening.bin",
+                "intervening",
+                b"intervening committed payload",
+            )
+            .await;
+            let (reply, received) = oneshot::channel();
+            other
+                .send(DriveCommand::Close {
+                    session_id: id,
+                    reply,
+                })
+                .await
+                .unwrap();
+            received.await.unwrap().unwrap();
+        }
+        if number == 1 && invalidation == RetentionInvalidation::IdentityGeneration {
+            memory.epoch_test_action.store(5, Ordering::Relaxed);
+        }
+        let discards_before = memory.epoch_discards();
+        let before = world.lock().unwrap().command_log.len();
+        let (reply, received) = oneshot::channel();
+        let mut session_pool = state.config().tape_pools[0].clone();
+        if number == 1 && invalidation == RetentionInvalidation::AutomaticSeal {
+            let tape = CatalogIndex::open(&state.paths().sqlite_path)
+                .unwrap()
+                .get_tape(&selected.tape_uuid)
+                .unwrap()
+                .unwrap();
+            // The second Object crosses this physical low watermark while its epoch remains short.
+            session_pool.capacity_cap_bytes = Some(128 * 1024 * 1024 * 1024);
+            session_pool.watermark_low = ((tape.written_extent_lba.unwrap() + 1)
+                * u64::from(selected.block_size)) as f64
+                / session_pool.capacity_cap_bytes.unwrap() as f64;
+        }
+        tx.send(DriveCommand::OpenWrite {
+            actor: remanence_state::AuditActor::System,
+            pool_cfg: session_pool,
+            selected: selected.clone(),
+            target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
+            needs_drive_load: false,
+            library_serial: serial.clone(),
+            barcode: Some("HAND".into()),
+            source_slot: None,
+            drive_uuid: None,
+            drive_serial: None,
+            reply,
+        })
+        .await
+        .unwrap();
+        let opened = received.await.unwrap().unwrap();
+        memory.epoch_test_action.store(0, Ordering::Relaxed);
+        let reads = world.lock().unwrap().command_log[before..]
+            .iter()
+            .filter(|command| command.opcode == 0x08)
+            .count();
+        if !refuse_memory {
+            if let Some(first) = prior_reads {
+                if matches!(
+                    invalidation,
+                    RetentionInvalidation::ParkedGeneration
+                        | RetentionInvalidation::IdentityGeneration
+                        | RetentionInvalidation::ExpectedEnd
+                ) {
+                    assert_eq!(
+                        memory.epoch_discards(),
+                        discards_before + 1,
+                        "changed generation discards the epoch"
+                    );
+                } else {
+                    assert!(
+                        reads <= first,
+                        "retained epoch avoids Object rereads: {reads} > {first}"
+                    );
+                }
+            }
+        }
+        prior_reads = Some(reads);
+        let id = Uuid::from_slice(&opened.session_id).unwrap();
+        lifecycle.sessions.lock().unwrap().insert(
+            id,
+            MountedSession {
+                bay: 0x100,
+                library_serial: serial.clone(),
+                barcode: Some("HAND".into()),
+                home_slot: (invalidation != RetentionInvalidation::NoHomeSlot).then_some(0x400),
+                tape_uuid: selected.tape_uuid,
+                drive_uuid: None,
+            },
+        );
+        if number < 2 {
+            append_actor_test_file(
+                &tx,
+                id,
+                state.paths().state_dir.join(format!("seated-{number}.bin")),
+                "seated.bin",
+                &format!("seated-{number}"),
+                b"committed seated payload",
+            )
+            .await;
+        }
+        if refuse_memory {
+            held = memory.try_reserve(memory.ceiling());
+            assert!(held.is_some());
+        }
+        if number == 1 && invalidation == RetentionInvalidation::ShutdownSealDue {
+            lifecycle.shutting_down.store(true, Ordering::SeqCst);
+            memory.epoch_test_action.store(7, Ordering::Relaxed);
+        }
+        let (reply, received) = oneshot::channel();
+        if number == 1 && invalidation == RetentionInvalidation::AutomaticSeal {
+            read_fault.store(1, Ordering::SeqCst);
+        }
+        tx.send(DriveCommand::Close {
+            session_id: id,
+            reply,
+        })
+        .await
+        .unwrap();
+        received.await.unwrap().unwrap();
+        memory.epoch_test_action.store(0, Ordering::Relaxed);
+        lifecycle.sessions.lock().unwrap().remove(&id);
+        let index = CatalogIndex::open(&state.paths().sqlite_path).unwrap();
+        let tape = index.get_tape(&selected.tape_uuid).unwrap().unwrap();
+        if number == 1 && invalidation == RetentionInvalidation::AutomaticSeal {
+            assert_eq!(tape.state, "sealed");
+            assert_eq!(
+                read_fault.load(Ordering::SeqCst),
+                1,
+                "live automatic seal never rebuilds"
+            );
+            let journal = FileTapeFileJournal::open(
+                super::checkpoint::parity_journal_path(&cfg, selected.tape_uuid).unwrap(),
+                selected.tape_uuid,
+                selected.block_size,
+                match &selected.parity_config {
+                    ParityConfig::Scheme(s) => s.clone(),
+                    _ => unreachable!(),
+                },
+            )
+            .unwrap();
+            let committed = journal.load_committed().unwrap();
+            let entry = committed
+                .entries
+                .iter()
+                .find(|e| e.kind == TapeFileKind::ParityMap)
+                .unwrap();
+            let w = world.lock().unwrap();
+            let start = entry.physical_start_hint.unwrap() as usize;
+            let blocks = w.tapes["HAND"].records[start..start + entry.block_count as usize]
+                .iter()
+                .map(|r| match r {
+                    Record::Block(b) => b.clone(),
+                    _ => panic!("map block"),
+                })
+                .collect::<Vec<_>>();
+            let map = parse_parity_map_tape_file(&blocks, &selected.tape_uuid).unwrap();
+            assert_ne!(
+                map.payload.directory.entries.last().unwrap().flags
+                    & SIDECAR_DIRECTORY_FLAG_FINAL_PARTIAL_EPOCH,
+                0
+            );
+            assert_eq!(memory.granted(), 0);
+            return;
+        }
+        assert!(tape.total_committed_ordinals > 0);
+        assert_eq!(
+            tape.highest_protected_ordinal == tape.total_committed_ordinals,
+            refuse_memory
+        );
+    }
+    drop(held);
+    if !refuse_memory {
+        assert!(memory.granted() > 0);
+    }
+    if let RetentionInvalidation::ProjectionBusy(append, path) = invalidation {
+        check_session_projection_busy(
+            state, world, selected, cfg, library, lifecycle, append, path,
+        )
+        .await;
+        return;
+    }
+    if let RetentionInvalidation::Removal(case, path) = invalidation {
+        check_epoch_removal(
+            state, world, selected, cfg, lifecycle, tx, library, case, path, read_fault,
+        )
+        .await;
+        return;
+    }
+    if matches!(
+        invalidation,
+        RetentionInvalidation::Finalize | RetentionInvalidation::FinalizeRebuilt
+    ) {
+        let mut index = CatalogIndex::open(&state.paths().sqlite_path).unwrap();
+        let assignment_generation = index
+            .get_tape_assignment_snapshot(&selected.tape_uuid)
+            .unwrap()
+            .unwrap()
+            .assignment_generation;
+        let mut request = ManualFinalizeTapeActorRequest {
+            candidate_operation_id: Uuid::new_v4(),
+            actor: AuditActor::System,
+            actor_fingerprint: "epoch-test".into(),
+            idempotency_key: Uuid::new_v4(),
+            request_fingerprint: [0x51; 32],
+            tape_uuid: selected.tape_uuid,
+            expected_pool_id: Some(selected.pool_id.clone()),
+            assignment_generation,
+            reason: "close committed epoch".into(),
+            block_size: selected.block_size,
+            parity_config: selected.parity_config.clone(),
+            pool_config: Some(state.config().tape_pools[0].clone()),
+        };
+        if invalidation == RetentionInvalidation::FinalizeRebuilt {
+            memory.epoch_test_action.store(4, Ordering::Relaxed);
+        }
+        let before = world.lock().unwrap().command_log.len();
+        let (reply, received) = oneshot::channel();
+        tx.send(DriveCommand::PlanFinalization {
+            request: request.clone(),
+            needs_drive_load: false,
+            barcode: Some("HAND".into()),
+            source_slot: None,
+            drive_serial: None,
+            reply,
+        })
+        .await
+        .unwrap();
+        let prefix = received.await.unwrap().unwrap();
+        memory.epoch_test_action.store(0, Ordering::Relaxed);
+        assert!(world.lock().unwrap().command_log[before..]
+            .iter()
+            .all(|c| !matches!(c.opcode, 0x0a | 0x10)));
+        super::terminal_finalize::preflight_manual_finalize_with_prefix(
+            &mut index,
+            ManualFinalizePreflightConfig {
+                checkpoint_journal_dir: &cfg.checkpoint_journal_dir,
+                audit_dir: &cfg.audit_dir,
+                audit_fsync: cfg.audit_fsync,
+                audit_append_lock: &cfg.audit_append_lock,
+            },
+            Some("HAND"),
+            &mut request,
+            Some(&prefix),
+        )
+        .unwrap();
+        read_fault.store(1, Ordering::SeqCst);
+        let (reply, received) = oneshot::channel();
+        tx.send(DriveCommand::FinalizeTape {
+            request,
+            needs_drive_load: false,
+            library_serial: serial,
+            barcode: Some("HAND".into()),
+            source_slot: None,
+            drive_serial: None,
+            drive_uuid: None,
+            reply,
+        })
+        .await
+        .unwrap();
+        received.await.unwrap().unwrap();
+        assert_eq!(
+            read_fault.load(Ordering::SeqCst),
+            1,
+            "terminal execution never rereads the Object prefix"
+        );
+        let entry = prefix
+            .committed_bundle
+            .entries
+            .iter()
+            .find(|e| e.kind == TapeFileKind::ParityMap)
+            .unwrap();
+        let world = world.lock().unwrap();
+        let start = entry.physical_start_hint.unwrap() as usize;
+        let blocks = world.tapes["HAND"].records[start..start + entry.block_count as usize]
+            .iter()
+            .map(|r| match r {
+                Record::Block(b) => b.clone(),
+                _ => panic!("ParityMap delimiter inside payload"),
+            })
+            .collect::<Vec<_>>();
+        let parsed =
+            remanence_parity::parse_parity_map_tape_file(&blocks, &selected.tape_uuid).unwrap();
+        assert_ne!(
+            parsed.payload.directory.entries.last().unwrap().flags
+                & remanence_parity::SIDECAR_DIRECTORY_FLAG_FINAL_PARTIAL_EPOCH,
+            0
+        );
+        let records = FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, selected.tape_uuid)
+            .unwrap()
+            .replay()
+            .unwrap();
+        assert_eq!(
+            records.len(),
+            3,
+            "finalization has no intervening barrier close"
+        );
+        assert!(records.last().unwrap().sealed_after_write);
+        assert_eq!(memory.granted(), 0);
+        return;
+    }
+    if invalidation == RetentionInvalidation::Disconnected {
+        let (reply, received) = oneshot::channel();
+        drop(received);
+        tx.send(DriveCommand::OpenWrite {
+            actor: AuditActor::System,
+            pool_cfg: state.config().tape_pools[0].clone(),
+            selected: selected.clone(),
+            target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
+            needs_drive_load: false,
+            library_serial: serial.clone(),
+            barcode: Some("HAND".into()),
+            source_slot: None,
+            drive_uuid: None,
+            drive_serial: None,
+            reply,
+        })
+        .await
+        .unwrap();
+    }
+    let fault = match invalidation {
+        RetentionInvalidation::WriteFailure => 1,
+        RetentionInvalidation::PositionFailure => 2,
+        RetentionInvalidation::JournalFailure => 3,
+        RetentionInvalidation::Discarded => 4,
+        RetentionInvalidation::SealDue => 0,
+        _ => 0,
+    };
+    if fault != 0 {
+        memory.epoch_test_action.store(fault, Ordering::Relaxed);
+    }
+    if invalidation == RetentionInvalidation::Fenced {
+        CatalogIndex::open(&state.paths().sqlite_path)
+            .unwrap()
+            .record_tape_io_fence(remanence_state::TapeIoFenceInput {
+                tape_uuid: selected.tape_uuid,
+                barcode: Some("HAND".into()),
+                reason: "transfer_error".into(),
+                evidence_json: None,
+            })
+            .unwrap();
+    }
+    if read_before_shutdown {
+        let before = world.lock().unwrap().command_log.len();
+        let (stream_tx, mut stream_rx) = mpsc::channel(64);
+        let drain = tokio::spawn(async move { while stream_rx.recv().await.is_some() {} });
+        let (reply, received) = oneshot::channel();
+        tx.send(DriveCommand::TapeInventory {
+            tape_uuid: selected.tape_uuid,
+            needs_drive_load: false,
+            library_serial: serial.clone(),
+            barcode: Some("HAND".into()),
+            source_slot: None,
+            drive_serial: None,
+            stream_tx,
+            reply,
+        })
+        .await
+        .unwrap();
+        let _ = received.await.unwrap();
+        drain.await.unwrap();
+        assert!(world.lock().unwrap().command_log[before..]
+            .iter()
+            .any(|command| command.opcode == 0x08));
+    }
+    if !shutdown && !failed_close && !refuse_memory && invalidation == RetentionInvalidation::None {
+        let (reply, received) = oneshot::channel();
+        tx.send(DriveCommand::PrepareRemoval {
+            reply,
+            progress: None,
+        })
+        .await
+        .unwrap();
+        received.await.unwrap().unwrap();
+        let index = CatalogIndex::open(&state.paths().sqlite_path).unwrap();
+        let tape = index.get_tape(&selected.tape_uuid).unwrap().unwrap();
+        assert_eq!(
+            tape.highest_protected_ordinal,
+            tape.total_committed_ordinals
+        );
+        assert_eq!(memory.granted(), 0);
+    }
+    let saved_bootstrap = if failed_close {
+        let mut world = world.lock().unwrap();
+        let tape = world.tapes.get_mut("HAND").unwrap();
+        let saved = tape.records[0].clone();
+        let bootstrap = crate::build_tape_bootstrap(
+            [0x44; 16],
+            selected.block_size,
+            selected.parity_config.clone(),
+            "2026-10-28T00:00:00Z",
+            "test",
+        );
+        let mut bytes = vec![0; selected.block_size as usize];
+        remanence_parity::bootstrap::write_bootstrap_block(&bootstrap, &mut bytes).unwrap();
+        tape.records[0] = Record::Block(bytes);
+        Some(saved)
+    } else {
+        None
+    };
+    lifecycle.shutting_down.store(shutdown, Ordering::SeqCst);
+    let before_unload = world.lock().unwrap().command_log.len();
+    let (reply, received) = oneshot::channel();
+    tx.send(DriveCommand::Unload { reply }).await.unwrap();
+    let unloaded = received.await.unwrap();
+    unloaded.unwrap();
+    assert!(world.lock().unwrap().command_log[before_unload..]
+        .iter()
+        .any(|c| c.opcode == 0x1b));
+    if read_before_shutdown {
+        assert!(world.lock().unwrap().command_log[before_unload..]
+            .iter()
+            .all(|c| !matches!(c.opcode, 0x08 | 0x0a | 0x10 | 0x2b | 0x92)));
+        assert!(FileAuditLog::replay(&state.paths().audit_dir)
+            .unwrap()
+            .iter()
+            .any(|record| record.detail.get("session_kind")
+                == Some(&CborValue::Text("epoch_left_open".into()))));
+    }
+    if (1..=3).contains(&fault) || invalidation == RetentionInvalidation::Fenced {
+        let index = CatalogIndex::open(&state.paths().sqlite_path).unwrap();
+        assert!(!index.list_active_tape_io_fences().unwrap().is_empty());
+        let tape = index.get_tape(&selected.tape_uuid).unwrap().unwrap();
+        assert!(tape.highest_protected_ordinal < tape.total_committed_ordinals);
+        memory.epoch_test_action.store(0, Ordering::Relaxed);
+        let before = world.lock().unwrap().command_log.len();
+        let (reply, received) = oneshot::channel();
+        tx.send(DriveCommand::PrepareRemoval {
+            reply,
+            progress: None,
+        })
+        .await
+        .unwrap();
+        received.await.unwrap().unwrap();
+        assert!(world.lock().unwrap().command_log[before..]
+            .iter()
+            .all(|c| !matches!(c.opcode, 0x0a | 0x10)));
+        assert_eq!(memory.granted(), 0);
+        return;
+    }
+    assert_eq!(memory.granted(), 0);
+    if let Some(_saved) = saved_bootstrap {
+        let index = CatalogIndex::open(&state.paths().sqlite_path).unwrap();
+        let fences = index.list_active_tape_io_fences().unwrap();
+        assert_eq!(fences.len(), 1);
+        let evidence: serde_json::Value =
+            serde_json::from_str(fences[0].evidence_json.as_deref().unwrap()).unwrap();
+        assert!(evidence["error"].as_str().unwrap().contains("identity"));
+        assert!(
+            evidence["open_epoch_start"].as_u64().unwrap()
+                < evidence["open_epoch_end"].as_u64().unwrap()
+        );
+        return;
+    }
+    let index = CatalogIndex::open(&state.paths().sqlite_path).unwrap();
+    let tape = index.get_tape(&selected.tape_uuid).unwrap().unwrap();
+    assert_eq!(
+        tape.highest_protected_ordinal == tape.total_committed_ordinals,
+        !read_before_shutdown,
+        "audit: {:?}",
+        FileAuditLog::replay(&state.paths().audit_dir).unwrap()
+    );
+    let records = remanence_state::FileCheckpointJournal::open(
+        state.paths().journal_dir.join("checkpoints"),
+        selected.tape_uuid,
+    )
+    .unwrap()
+    .replay()
+    .unwrap();
+    assert!(
+        records.iter().all(|r| !r.sealed_after_write),
+        "removal never finalizes"
+    );
+    assert_eq!(
+        records.len(),
+        if refuse_memory || read_before_shutdown {
+            2
+        } else if invalidation == RetentionInvalidation::ExpectedEnd {
+            4
+        } else {
+            3
+        }
+    );
+    if !refuse_memory && !read_before_shutdown {
+        assert!(records.last().unwrap().objects.is_empty());
+        assert!(records.last().unwrap().barrier_bundle.is_some());
+    }
+    if matches!(
+        invalidation,
+        RetentionInvalidation::SealDue | RetentionInvalidation::ShutdownSealDue
+    ) {
+        assert!(tape.seal_due.is_some());
+        assert!(crate::catalog_conversion::tape_to_proto(tape)
+            .seal_due
+            .is_some());
+        let mut other_index = CatalogIndex::open(&state.paths().sqlite_path).unwrap();
+        let other_uuid = [0x29; 16];
+        other_index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: other_uuid,
+                voltag: "AAAOTHER".into(),
+                block_size: selected.block_size,
+                parity: selected.parity_config.clone(),
+                force: false,
+            })
+            .unwrap();
+        other_index
+            .set_tape_generation(
+                other_uuid,
+                remanence_state::MediaObservation {
+                    generation: remanence_state::LtoGen::Lto9,
+                    source: remanence_state::GenerationSource::Operator,
+                },
+            )
+            .unwrap();
+        other_index
+            .project_tape_pool_membership(other_uuid, &selected.pool_id)
+            .unwrap();
+        let other = crate::select_tape_in_pool(
+            &other_index,
+            &state.config().tape_pools[0],
+            1,
+            &HashSet::from([selected.tape_uuid]),
+        )
+        .unwrap();
+        assert_eq!(other.tape_uuid, other_uuid);
+        assert!(other_index
+            .get_tape(&selected.tape_uuid)
+            .unwrap()
+            .unwrap()
+            .seal_due
+            .is_some());
+        lifecycle.shutting_down.store(false, Ordering::SeqCst);
+        memory.epoch_test_action.store(0, Ordering::Relaxed);
+        let (reply, received) = oneshot::channel();
+        tx.send(DriveCommand::OpenWrite {
+            actor: AuditActor::System,
+            pool_cfg: state.config().tape_pools[0].clone(),
+            selected: selected.clone(),
+            target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
+            needs_drive_load: true,
+            library_serial: serial.clone(),
+            barcode: Some("HAND".into()),
+            source_slot: None,
+            drive_uuid: None,
+            drive_serial: None,
+            reply,
+        })
+        .await
+        .unwrap();
+        let error = received.await.unwrap().unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            error.message().contains("seal") && error.message().contains("retry OpenWriteSession"),
+            "{error}"
+        );
+        let tape = index.get_tape(&selected.tape_uuid).unwrap().unwrap();
+        assert_eq!(tape.state, "sealed");
+        assert!(tape.seal_due.is_none());
+    }
+    if read_before_shutdown {
+        // A fresh actor has no accumulator from the stopped actor. Its open
+        // rebuilds the committed range before another Object reaches media.
+        lifecycle.shutting_down.store(false, Ordering::SeqCst);
+        let bay = if invalidation == RetentionInvalidation::OtherDrive {
+            let mut world = world.lock().unwrap();
+            let cartridge = world.drive_bays.get_mut(&0x100).unwrap().take();
+            world.drive_bays.insert(0x101, cartridge);
+            world.drive_serials.insert(0x101, "SECOND-DRIVE".into());
+            world.drive_source_slots.insert(0x101, None);
+            world.drive_states.insert(0x101, Default::default());
+            world.drive_alert_flags.insert(0x101, Default::default());
+            world.element_layout.drive_count = 2;
+            0x101
+        } else {
+            0x100
+        };
+        let mut library = open_model_library(world.clone());
+        let drive = library
+            .open_drive(
+                bay,
+                &remanence_library::StaticAllowlist::new([serial.as_str()]),
+            )
+            .unwrap();
+        let tx = spawn_drive_actor(bay, drive, cfg);
+        let (reply, received) = oneshot::channel();
+        tx.send(DriveCommand::OpenWrite {
+            actor: remanence_state::AuditActor::System,
+            pool_cfg: state.config().tape_pools[0].clone(),
+            selected: selected.clone(),
+            target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
+            needs_drive_load: true,
+            library_serial: serial.clone(),
+            barcode: Some("HAND".into()),
+            source_slot: None,
+            drive_uuid: None,
+            drive_serial: None,
+            reply,
+        })
+        .await
+        .unwrap();
+        let id = Uuid::from_slice(&received.await.unwrap().unwrap().session_id).unwrap();
+        lifecycle.sessions.lock().unwrap().insert(
+            id,
+            MountedSession {
+                bay,
+                library_serial: serial,
+                barcode: Some("HAND".into()),
+                home_slot: Some(0x400),
+                tape_uuid: selected.tape_uuid,
+                drive_uuid: None,
+            },
+        );
+        append_actor_test_file(
+            &tx,
+            id,
+            state.paths().state_dir.join("after-restart.bin"),
+            "after-restart.bin",
+            "after-restart",
+            b"new committed payload",
+        )
+        .await;
+        let (reply, received) = oneshot::channel();
+        tx.send(DriveCommand::Close {
+            session_id: id,
+            reply,
+        })
+        .await
+        .unwrap();
+        received.await.unwrap().unwrap();
+        lifecycle.sessions.lock().unwrap().remove(&id);
+        let (reply, received) = oneshot::channel();
+        tx.send(DriveCommand::Unload { reply }).await.unwrap();
+        received.await.unwrap().unwrap();
+        assert_eq!(memory.granted(), 0);
+        let tape = index.get_tape(&selected.tape_uuid).unwrap().unwrap();
+        assert_eq!(
+            tape.highest_protected_ordinal,
+            tape.total_committed_ordinals
+        );
+    }
+}
+/// A resumed session with no retention grant preserves a durable close on SQLite busy.
+#[allow(clippy::too_many_arguments)]
+async fn check_session_projection_busy(
+    state: &StateHandle,
+    world: Arc<Mutex<VirtualWorld>>,
+    selected: SelectedTape,
+    cfg: WriteOwnerConfig,
+    mut library: remanence_library::LibraryHandle,
+    lifecycle: crate::drive_pool::DrivePoolLifecycle,
+    append: bool,
+    path: &str,
+) {
+    let memory = cfg.io_memory.clone();
+    let held = memory
+        .try_reserve(memory.ceiling() - memory.granted())
+        .unwrap();
+    let drive = library
+        .open_drive(
+            0x100,
+            &remanence_library::StaticAllowlist::new([cfg.actor_library_serial.as_str()]),
+        )
+        .unwrap();
+    let tx = spawn_drive_actor(0x100, drive, cfg.clone());
+    let (reply, received) = oneshot::channel();
+    tx.send(DriveCommand::OpenWrite {
+        actor: AuditActor::System,
+        pool_cfg: cfg.tape_pools[0].clone(),
+        selected: selected.clone(),
+        target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
+        needs_drive_load: false,
+        library_serial: cfg.actor_library_serial.clone(),
+        barcode: Some("HAND".into()),
+        source_slot: None,
+        drive_uuid: None,
+        drive_serial: None,
+        reply,
+    })
+    .await
+    .unwrap();
+    let session = received.await.unwrap().unwrap();
+    let id = Uuid::from_slice(&session.session_id).unwrap();
+    drop(held);
+    if append {
+        append_actor_test_file(
+            &tx,
+            id,
+            state.paths().state_dir.join("projection.bin"),
+            "projection.bin",
+            "projection",
+            b"committed before SQLite projection",
+        )
+        .await;
+    }
+    let _held = memory
+        .try_reserve(memory.ceiling() - memory.granted())
+        .unwrap();
+    memory.epoch_test_action.store(10, Ordering::Relaxed);
+    let (reply, received) = oneshot::channel();
+    tx.send(DriveCommand::Close {
+        session_id: id,
+        reply,
+    })
+    .await
+    .unwrap();
+    let error = received.await.unwrap().unwrap_err();
+    assert!(
+        error.message().contains("SQLite projection failed"),
+        "{error}"
+    );
+    assert!(
+        error.message().contains("locked"),
+        "real SQLite busy: {error}"
+    );
+    memory.epoch_test_action.store(0, Ordering::Relaxed);
+    let (reply, received) = oneshot::channel();
+    tx.send(DriveCommand::Close {
+        session_id: id,
+        reply,
+    })
+    .await
+    .unwrap();
+    received.await.unwrap().unwrap();
+    let mut index = CatalogIndex::open(&state.paths().sqlite_path).unwrap();
+    assert!(index.list_active_tape_io_fences().unwrap().is_empty());
+    let tape = index.get_tape(&selected.tape_uuid).unwrap().unwrap();
+    assert!(tape.highest_protected_ordinal < tape.total_committed_ordinals);
+    if path != "startup" {
+        check_epoch_removal(
+            state,
+            world,
+            selected,
+            cfg,
+            lifecycle,
+            tx,
+            library,
+            "replay_closed",
+            path,
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
+        return;
+    }
+    crate::startup_checkpoint::replay_checkpoint_journal_projections_with_audit(
+        &mut index,
+        &cfg.checkpoint_journal_dir,
+        &cfg.audit_dir,
+        &cfg.audit_append_lock,
+    )
+    .unwrap();
+    let records = FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, selected.tape_uuid)
+        .unwrap()
+        .replay()
+        .unwrap();
+    assert_eq!(
+        records.last().unwrap().eod_lba as usize,
+        world.lock().unwrap().tapes["HAND"].records.len(),
+        "no abandonment filemark follows the durable EOD"
+    );
+    let tape = index.get_tape(&selected.tape_uuid).unwrap().unwrap();
+    assert_eq!(
+        tape.highest_protected_ordinal,
+        tape.total_committed_ordinals
+    );
+}
+
+/// Run removal through real drive and changer actors after changing close admission.
+#[allow(clippy::too_many_arguments)]
+async fn check_epoch_removal(
+    state: &StateHandle,
+    world: Arc<Mutex<VirtualWorld>>,
+    selected: SelectedTape,
+    cfg: WriteOwnerConfig,
+    lifecycle: crate::drive_pool::DrivePoolLifecycle,
+    tx: mpsc::Sender<DriveCommand>,
+    library: remanence_library::LibraryHandle,
+    case: &str,
+    path: &str,
+    read_fault: Arc<AtomicU64>,
+) {
+    use pb::library_service_server::LibraryService;
+    let mut index = CatalogIndex::open(&state.paths().sqlite_path).unwrap();
+    let before = index.get_tape(&selected.tape_uuid).unwrap().unwrap();
+    assert!(before.highest_protected_ordinal < before.total_committed_ordinals);
+    let journal_before = if case == "replay_closed" {
+        Some(
+            FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, selected.tape_uuid)
+                .unwrap()
+                .replay()
+                .unwrap(),
+        )
+    } else {
+        None
+    };
+    let mut lease = None;
+    let mut preflight = None;
+    match case {
+        "retired" | "sealed" | "finalizing" | "ingested" | "foreign" => {
+            let state_name = match case {
+                "ingested" => "ingestion_pending",
+                "foreign" => "inventoried",
+                other => other,
+            };
+            rusqlite::Connection::open(&state.paths().sqlite_path)
+                .unwrap()
+                .execute(
+                    "update tapes set state=?1 where tape_uuid=?2",
+                    rusqlite::params![state_name, selected.tape_uuid.as_slice()],
+                )
+                .unwrap();
+        }
+        "lease" => {
+            lease = Some(
+                FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, selected.tape_uuid)
+                    .unwrap()
+                    .acquire_exclusive()
+                    .unwrap(),
+            );
+        }
+        "mode_sense" => {
+            read_fault.store(4, Ordering::SeqCst);
+        }
+        "catalog_read" => {
+            let connection = rusqlite::Connection::open(&state.paths().sqlite_path).unwrap();
+            connection
+                .pragma_update(None, "ignore_check_constraints", true)
+                .unwrap();
+            connection
+                .execute(
+                    "update tapes set total_committed_ordinals = X'01' where tape_uuid = ?1",
+                    [selected.tape_uuid.as_slice()],
+                )
+                .unwrap();
+        }
+        "summary_mismatch" => {
+            cfg.io_memory.epoch_test_action.store(8, Ordering::Relaxed);
+        }
+        "projection_busy" => {
+            cfg.io_memory.epoch_test_action.store(10, Ordering::Relaxed);
+        }
+        "post_projection" => {
+            cfg.io_memory.epoch_test_action.store(9, Ordering::Relaxed);
+        }
+        "missing_checkpoint" => {
+            std::fs::remove_dir_all(&cfg.checkpoint_journal_dir).unwrap();
+        }
+        "tail" => {
+            let mut w = world.lock().unwrap();
+            let tape = w.tapes.get_mut("HAND").unwrap();
+            let end = 2
+                + tape.records[2..]
+                    .iter()
+                    .position(|r| matches!(r, Record::Filemark))
+                    .unwrap()
+                + 1;
+            let object = tape.records[2..end].to_vec();
+            tape.records.extend(object);
+        }
+        "absent_bootstrap" => {
+            world.lock().unwrap().tapes.get_mut("HAND").unwrap().records[0] =
+                Record::Block(vec![0x55; selected.block_size as usize]);
+        }
+        "success" | "replay_closed" => {}
+        "bot_filemark" => {
+            world.lock().unwrap().tapes.get_mut("HAND").unwrap().records[0] = Record::Filemark;
+        }
+        "bot_blank" => {
+            world
+                .lock()
+                .unwrap()
+                .tapes
+                .get_mut("HAND")
+                .unwrap()
+                .records
+                .clear();
+        }
+        "bot_medium" | "bot_oversized" | "bot_transport" => {
+            read_fault.store(
+                match case {
+                    "bot_medium" => 17,
+                    "bot_oversized" => 18,
+                    _ => 19,
+                },
+                Ordering::SeqCst,
+            );
+        }
+        "admission_filemark"
+        | "admission_medium"
+        | "admission_transport"
+        | "admission_unit_attention"
+        | "admission_not_ready" => {
+            read_fault.store(
+                match case {
+                    "admission_filemark" => 20,
+                    "admission_medium" => 21,
+                    "admission_transport" => 22,
+                    "admission_unit_attention" => 23,
+                    _ => 24,
+                },
+                Ordering::SeqCst,
+            );
+        }
+        "blank_locate" => {
+            cfg.io_memory.epoch_test_action.store(4, Ordering::Relaxed);
+            let mut w = world.lock().unwrap();
+            let tape = w.tapes.get_mut("HAND").unwrap();
+            let end = tape.records.len() - 1;
+            assert!(end > 2);
+            tape.records[2] = Record::Block(vec![0x55; selected.block_size as usize]);
+            tape.records.truncate(end);
+            read_fault.store(9, Ordering::SeqCst);
+        }
+        "identity" => {
+            if path == "shutdown" {
+                cfg.io_memory.epoch_test_action.store(5, Ordering::Relaxed);
+            }
+            let bootstrap = crate::build_tape_bootstrap(
+                [0x44; 16],
+                selected.block_size,
+                selected.parity_config.clone(),
+                "2026-10-28T00:00:00Z",
+                "test",
+            );
+            let mut bytes = vec![0; selected.block_size as usize];
+            write_bootstrap_block(&bootstrap, &mut bytes).unwrap();
+            world.lock().unwrap().tapes.get_mut("HAND").unwrap().records[0] = Record::Block(bytes);
+        }
+        "unit_attention"
+        | "timeout"
+        | "not_ready"
+        | "position_read"
+        | "transport"
+        | "open_unit_attention"
+        | "open_timeout"
+        | "filemark"
+        | "eod"
+        | "hardware_44"
+        | "hardware_15"
+        | "wrong_length"
+        | "read"
+        | "medium"
+        | "open_read"
+        | "open_medium"
+        | "late_barcode_fence" => {
+            cfg.io_memory.epoch_test_action.store(4, Ordering::Relaxed);
+            read_fault.store(
+                match case {
+                    "read" | "open_read" => 1,
+                    "medium" | "open_medium" => 2,
+                    "unit_attention" | "open_unit_attention" => 5,
+                    "timeout" | "open_timeout" => 6,
+                    "filemark" => 7,
+                    "eod" => 8,
+                    "hardware_44" => 15,
+                    "hardware_15" => 16,
+                    "not_ready" => 10,
+                    "transport" => 11,
+                    "position_read" => 12,
+                    "wrong_length" => 13,
+                    _ => 3,
+                },
+                Ordering::SeqCst,
+            );
+        }
+        "barcode_fence" => {
+            index
+                .record_tape_io_fence(TapeIoFenceInput {
+                    tape_uuid: [0x55; 16],
+                    barcode: Some("HAND".into()),
+                    reason: "transfer_error".into(),
+                    evidence_json: None,
+                })
+                .unwrap();
+        }
+        "write_protected" => {
+            world
+                .lock()
+                .unwrap()
+                .tapes
+                .get_mut("HAND")
+                .unwrap()
+                .write_protected = true;
+        }
+        "pending" | "finalize_lease" => {
+            let mut request = ManualFinalizeTapeActorRequest {
+                candidate_operation_id: Uuid::new_v4(),
+                actor: AuditActor::System,
+                actor_fingerprint: "epoch-test".into(),
+                idempotency_key: Uuid::new_v4(),
+                request_fingerprint: [0x51; 32],
+                tape_uuid: selected.tape_uuid,
+                expected_pool_id: Some(selected.pool_id.clone()),
+                assignment_generation: before.assignment_generation,
+                reason: "close committed epoch".into(),
+                block_size: selected.block_size,
+                parity_config: selected.parity_config.clone(),
+                pool_config: Some(state.config().tape_pools[0].clone()),
+            };
+            let (reply, received) = oneshot::channel();
+            tx.send(DriveCommand::PlanFinalization {
+                request: request.clone(),
+                needs_drive_load: false,
+                barcode: Some("HAND".into()),
+                source_slot: None,
+                drive_serial: None,
+                reply,
+            })
+            .await
+            .unwrap();
+            let prefix = received.await.unwrap().unwrap();
+            if case == "finalize_lease" {
+                let (ready, received) = oneshot::channel();
+                let (resume, resumed) = std::sync::mpsc::channel();
+                let cfg = cfg.clone();
+                let path = state.paths().sqlite_path.clone();
+                let task = tokio::task::spawn_blocking(move || {
+                    super::terminal_finalize::PREFLIGHT_LEASE_HOOK.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(move || {
+                            ready.send(()).unwrap();
+                            resumed.recv_timeout(StdDuration::from_secs(20)).unwrap();
+                        }));
+                    });
+                    let mut index = CatalogIndex::open(path).unwrap();
+                    super::terminal_finalize::preflight_manual_finalize_with_prefix(
+                        &mut index,
+                        ManualFinalizePreflightConfig {
+                            checkpoint_journal_dir: &cfg.checkpoint_journal_dir,
+                            audit_dir: &cfg.audit_dir,
+                            audit_fsync: cfg.audit_fsync,
+                            audit_append_lock: &cfg.audit_append_lock,
+                        },
+                        Some("HAND"),
+                        &mut request,
+                        Some(&prefix),
+                    )
+                });
+                tokio::time::timeout(StdDuration::from_secs(10), received)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                preflight = Some((resume, task));
+            } else {
+                super::terminal_finalize::preflight_manual_finalize_with_prefix(
+                    &mut index,
+                    ManualFinalizePreflightConfig {
+                        checkpoint_journal_dir: &cfg.checkpoint_journal_dir,
+                        audit_dir: &cfg.audit_dir,
+                        audit_fsync: cfg.audit_fsync,
+                        audit_append_lock: &cfg.audit_append_lock,
+                    },
+                    Some("HAND"),
+                    &mut request,
+                    Some(&prefix),
+                )
+                .unwrap();
+            }
+        }
+        "no_pool" => {}
+        _ => panic!("unknown removal case {case}"),
+    }
+    if matches!(case, "tail" | "identity" | "absent_bootstrap") {
+        // Journal replay restores this deliberately stale projection before fencing.
+        rusqlite::Connection::open(&state.paths().sqlite_path)
+            .unwrap()
+            .execute(
+                "update tapes set total_committed_ordinals = ?2 where tape_uuid = ?1",
+                rusqlite::params![
+                    selected.tape_uuid.as_slice(),
+                    (before.total_committed_ordinals - 1)
+                        .to_be_bytes()
+                        .as_slice()
+                ],
+            )
+            .unwrap();
+    }
+    if case.starts_with("open_") {
+        let transient = matches!(case, "open_unit_attention" | "open_timeout");
+        for attempt in 0..if transient { 1 } else { 2 } {
+            let commands = world.lock().unwrap().command_log.len();
+            let (reply, received) = oneshot::channel();
+            tx.send(DriveCommand::OpenWrite {
+                actor: AuditActor::System,
+                pool_cfg: state.config().tape_pools[0].clone(),
+                selected: selected.clone(),
+                target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
+                needs_drive_load: false,
+                library_serial: cfg.actor_library_serial.clone(),
+                barcode: Some("HAND".into()),
+                source_slot: Some(0x400),
+                drive_uuid: None,
+                drive_serial: None,
+                reply,
+            })
+            .await
+            .unwrap();
+            let error = received.await.unwrap().unwrap_err();
+            assert_eq!(
+                index.list_active_tape_io_fences().unwrap().len(),
+                usize::from(!transient),
+                "{case}: {error}"
+            );
+            if transient {
+                assert!(
+                    FileAuditLog::replay(&state.paths().audit_dir)
+                        .unwrap()
+                        .iter()
+                        .any(|record| record.detail.get("session_kind")
+                            == Some(&CborValue::Text("epoch_left_open".into()))),
+                    "transient open failure audits the unclosed epoch"
+                );
+            }
+            if attempt == 1 {
+                assert!(
+                    world.lock().unwrap().command_log[commands..]
+                        .iter()
+                        .all(|c| c.opcode != 0x08),
+                    "later opens never reread the failing range"
+                );
+            }
+        }
+        if transient {
+            // Keep the removal retry transient too, so it leaves the epoch open.
+            read_fault.store(
+                if case == "open_unit_attention" { 5 } else { 6 },
+                Ordering::SeqCst,
+            );
+        }
+    }
+    let mut api = crate::ApiState::new(index);
+    api.audit_dir = Arc::new(cfg.audit_dir.clone());
+    api.library_snapshot = Some(cfg.library_snapshot.clone());
+    api.default_library_serial = Some(Arc::new(cfg.actor_library_serial.clone()));
+    api.drive_idle_unload_seconds = 1;
+    let key = crate::drive_pool::DriveKey::new(&cfg.actor_library_serial, 0x100);
+    let changer = if path == "operator" {
+        // Inject the model library at the robotics execution boundary; the API still
+        // dispatches PrepareRemoval to the real drive actor before this command.
+        let (sender, mut receiver) = mpsc::channel(4);
+        let policy = cfg.policy.clone();
+        let model_world = world.clone();
+        drop(library);
+        tokio::task::spawn_blocking(move || {
+            let mut library = open_model_library(model_world);
+            let Some(ChangerCommand::Robotics {
+                action: RoboticsAction::Unload { bay, destination },
+                handle,
+                ..
+            }) = receiver.blocking_recv()
+            else {
+                panic!("operator unload command")
+            };
+            library.unload(bay, destination, &policy).unwrap();
+            handle.publish_state(pb::OperationState::Succeeded, &[]);
+        });
+        sender
+    } else {
+        spawn_changer_actor(library.into_changer(), cfg.clone())
+    };
+    let pool = DrivePool::new_with_lifecycle(
+        HashMap::from([(cfg.actor_library_serial.clone(), changer)]),
+        HashMap::from([(key.clone(), tx)]),
+        Arc::new(HashMap::from([(key, AtomicBool::new(false))])),
+        lifecycle,
+    );
+    let seated = SeatedCartridge {
+        bay: 0x100,
+        library_serial: cfg.actor_library_serial.clone(),
+        barcode: Some("HAND".into()),
+        home_slot: 0x400,
+        tape_uuid: Some(selected.tape_uuid),
+        prior_session_id: None,
+    };
+    if pool.parked_at(&seated.drive_key()).is_none() {
+        pool.park_cartridge(seated.clone());
+    }
+    api.drive_pool = Some(pool);
+    let command_start = world.lock().unwrap().command_log.len();
+    match path {
+        "shutdown" => api.shutdown_drive_pool().await.unwrap(),
+        "operator" => {
+            let operation = api
+                .library_service()
+                .unload_drive(tonic::Request::new(pb::UnloadDriveRequest {
+                    library_uuid: crate::library::library_uuid(&cfg.actor_library_serial).to_vec(),
+                    drive_element_address: 0x100,
+                    destination_slot_address: 0x400,
+                    idempotency_key: None,
+                }))
+                .await
+                .unwrap();
+            tokio::time::timeout(StdDuration::from_secs(10), async {
+                while world.lock().unwrap().drive_bays[&0x100].is_some() {
+                    tokio::time::sleep(StdDuration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("operator removal completes");
+            let id = Uuid::from_slice(&operation.into_inner().operation_id).unwrap();
+            let mut events = api.operations.watch(&id).unwrap();
+            let mut closes = false;
+            use tokio_stream::StreamExt;
+            while let Some(event) = tokio::time::timeout(StdDuration::from_secs(10), events.next())
+                .await
+                .unwrap()
+            {
+                let event = event.unwrap();
+                closes |= event
+                    .progress
+                    .get("phase")
+                    .is_some_and(|p| p == "epoch_close");
+            }
+            if case == "success" {
+                assert!(closes, "real close publishes phase=epoch_close");
+            }
+            if matches!(case, "retired" | "foreign" | "barcode_fence") {
+                assert!(!closes, "skipped close publishes no epoch_close phase");
+            }
+        }
+        _ => crate::mount::test_remove_seated_epoch(&api, path, seated).await,
+    }
+    drop(lease);
+    if let Some((resume, task)) = preflight {
+        resume.send(()).unwrap();
+        task.await.unwrap().unwrap();
+    }
+    if case == "projection_busy" {
+        assert!(
+            CatalogIndex::open(&state.paths().sqlite_path)
+                .unwrap()
+                .list_active_tape_io_fences()
+                .unwrap()
+                .is_empty(),
+            "a durable journal commit with SQLite busy never fences"
+        );
+    }
+    let audit = FileAuditLog::replay(&state.paths().audit_dir).unwrap();
+    if matches!(case, "retired" | "foreign" | "barcode_fence") {
+        assert!(
+            audit
+                .iter()
+                .all(|record| record.event != AuditEvent::OperationFailed),
+            "a skipped close records no OperationFailed audit"
+        );
+    }
+    let open_audits: Vec<_> = audit
+        .iter()
+        .filter(|record| {
+            record.detail.get("session_kind") == Some(&CborValue::Text("epoch_left_open".into()))
+        })
+        .collect();
+    if matches!(
+        case,
+        "post_projection"
+            | "projection_busy"
+            | "success"
+            | "replay_closed"
+            | "retired"
+            | "foreign"
+            | "barcode_fence"
+    ) {
+        assert!(
+            open_audits.is_empty(),
+            "closed epochs leave no stale range audit"
+        );
+    } else if matches!(
+        case,
+        "lease"
+            | "finalize_lease"
+            | "mode_sense"
+            | "catalog_read"
+            | "summary_mismatch"
+            | "unit_attention"
+            | "timeout"
+            | "not_ready"
+            | "transport"
+            | "position_read"
+            | "open_unit_attention"
+            | "open_timeout"
+    ) {
+        assert!(
+            !open_audits.is_empty(),
+            "{case}: epoch_left_open audit is present"
+        );
+        for record in open_audits {
+            assert!(record.detail.contains_key("abort_reason"));
+            if case == "catalog_read" {
+                assert!(!record.detail.contains_key("open_epoch_start"));
+                assert!(!record.detail.contains_key("open_epoch_end"));
+            }
+        }
+    }
+    let world = world.lock().unwrap();
+    assert!(world.drive_bays[&0x100].is_none(), "{case} through {path}");
+    assert_eq!(
+        world
+            .slots
+            .iter()
+            .find(|s| s.address == 0x400)
+            .unwrap()
+            .barcode
+            .as_deref(),
+        Some("HAND")
+    );
+    assert!(
+        matches!(case, "post_projection" | "projection_busy" | "success")
+            || world.command_log[command_start..]
+                .iter()
+                .all(|c| !matches!(c.opcode, 0x0a | 0x10)),
+        "{case} through {path}: failed or skipped close writes no media"
+    );
+    if matches!(case, "open_read" | "open_medium") {
+        assert!(
+            world.command_log[command_start..]
+                .iter()
+                .all(|c| c.opcode != 0x08),
+            "open compensation never rereads the failing range"
+        );
+    }
+    let mut index = CatalogIndex::open(&state.paths().sqlite_path).unwrap();
+    if case == "projection_busy" {
+        crate::startup_checkpoint::replay_checkpoint_journal_projections_with_audit(
+            &mut index,
+            &cfg.checkpoint_journal_dir,
+            &cfg.audit_dir,
+            &cfg.audit_append_lock,
+        )
+        .unwrap();
+        let records = FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, selected.tape_uuid)
+            .unwrap()
+            .replay()
+            .unwrap();
+        assert_eq!(
+            records.last().unwrap().eod_lba as usize,
+            world.tapes["HAND"].records.len(),
+            "durable close writes no abandonment filemark after journal EOD"
+        );
+    }
+    if case == "summary_mismatch" && path == "shutdown" {
+        assert!(
+            world.command_log[command_start..]
+                .iter()
+                .filter(|c| c.opcode == 0x08)
+                .count()
+                <= 1,
+            "shutdown never rebuilds a mismatching retained summary"
+        );
+    }
+    if matches!(
+        case,
+        "post_projection" | "projection_busy" | "success" | "replay_closed"
+    ) {
+        let tape = index.get_tape(&selected.tape_uuid).unwrap().unwrap();
+        assert_eq!(
+            tape.highest_protected_ordinal,
+            tape.total_committed_ordinals
+        );
+    }
+    if let Some(before) = journal_before {
+        let after = FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, selected.tape_uuid)
+            .unwrap()
+            .replay()
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "removal appends no checkpoint after the durable close"
+        );
+        assert_eq!(
+            after.last().unwrap().eod_lba as usize,
+            world.tapes["HAND"].records.len()
+        );
+    }
+    let fences = index.list_active_tape_io_fences().unwrap();
+    let expect_fence = matches!(
+        case,
+        "missing_checkpoint"
+            | "filemark"
+            | "eod"
+            | "blank_locate"
+            | "admission_filemark"
+            | "admission_medium"
+            | "bot_filemark"
+            | "bot_blank"
+            | "bot_medium"
+            | "bot_oversized"
+            | "wrong_length"
+            | "absent_bootstrap"
+            | "tail"
+            | "identity"
+            | "read"
+            | "medium"
+            | "open_read"
+            | "open_medium"
+    ) && !(path == "shutdown"
+        && matches!(case, "read" | "medium" | "identity" | "late_barcode_fence"));
+    if expect_fence {
+        assert_eq!(fences.len(), 1, "{case} through {path}");
+        let evidence: serde_json::Value =
+            serde_json::from_str(fences[0].evidence_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            evidence["open_epoch_start"],
+            before.highest_protected_ordinal
+        );
+        assert_eq!(evidence["open_epoch_end"], before.total_committed_ordinals);
+        assert!(!evidence["error"].as_str().unwrap().is_empty());
+    } else if case == "barcode_fence" || (case == "late_barcode_fence" && path != "shutdown") {
+        assert_eq!(fences.len(), 1);
+    } else {
+        assert!(fences.is_empty(), "{case} through {path}: {fences:?}");
+    }
+}
+
+/// Inject failures at BOT, the append boundary or the committed Object prefix.
+struct EpochRemovalTransport {
+    inner: ModelTransport,
+    world: Arc<Mutex<VirtualWorld>>,
+    fault: Arc<AtomicU64>,
+    located: u64,
+    index_path: PathBuf,
+}
+impl SgTransport for EpochRemovalTransport {
+    fn execute_in(
+        &mut self,
+        cdb: &[u8],
+        data: &mut [u8],
+    ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError> {
+        if matches!(cdb[0], 0x1a | 0x5a) && self.fault.load(Ordering::SeqCst) == 4 {
+            self.fault.store(0, Ordering::SeqCst);
+            return Err(remanence_library::ScsiError::Io(std::io::Error::other(
+                "injected MODE SENSE failure",
+            )));
+        }
+        if cdb[0] == 0x34 && self.located == 2 && self.fault.load(Ordering::SeqCst) == 12 {
+            self.fault.store(0, Ordering::SeqCst);
+            return Err(remanence_library::ScsiError::Io(std::io::Error::other(
+                "injected READ POSITION failure",
+            )));
+        }
+        let pending = self.fault.load(Ordering::SeqCst);
+        if cdb[0] == 0x08
+            && ((self.located == 2 && pending != 9)
+                || (self.located == 0 && matches!(pending, 17..=19)))
+        {
+            let fault = self.fault.swap(0, Ordering::SeqCst);
+            if fault != 0 {
+                if fault == 3 {
+                    CatalogIndex::open(&self.index_path)
+                        .unwrap()
+                        .record_tape_io_fence(TapeIoFenceInput {
+                            tape_uuid: [0x55; 16],
+                            barcode: Some("HAND".into()),
+                            reason: "transfer_error".into(),
+                            evidence_json: None,
+                        })
+                        .unwrap();
+                }
+                if matches!(fault, 6 | 11 | 19) {
+                    return Err(remanence_library::ScsiError::TransportError {
+                        status: 0,
+                        host_status: if fault == 6 { 3 } else { 7 },
+                        driver_status: 0,
+                        info: 1,
+                        sense: vec![],
+                    });
+                }
+                let mut sense = vec![0; 18];
+                sense[0] = if fault == 18 { 0xf0 } else { 0x70 };
+                if fault == 18 {
+                    sense[3..7].copy_from_slice(&(-1i32).to_be_bytes());
+                }
+                sense[2] = match fault {
+                    1 | 15 | 16 => 4,
+                    5 => 6,
+                    7 => 0x80,
+                    8 => 8,
+                    10 => 2,
+                    13 | 18 => 0x20,
+                    _ => 3,
+                };
+                sense[7] = 10;
+                sense[12] = match fault {
+                    15 => 0x44,
+                    16 => 0x15,
+                    _ => 0x11,
+                };
+                return Err(remanence_library::ScsiError::CheckCondition {
+                    sense,
+                    bytes_transferred: 0,
+                });
+            }
+        }
+        self.inner.execute_in(cdb, data)
+    }
+    fn execute_out(
+        &mut self,
+        cdb: &[u8],
+        data: &[u8],
+    ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError> {
+        self.inner.execute_out(cdb, data)
+    }
+    fn execute_none(&mut self, cdb: &[u8]) -> Result<(), remanence_library::ScsiError> {
+        match cdb[0] {
+            0x01 => self.located = 0,
+            0x2b => self.located = u64::from(u32::from_be_bytes(cdb[3..7].try_into().unwrap())),
+            0x92 => self.located = u64::from_be_bytes(cdb[4..12].try_into().unwrap()),
+            _ => {}
+        }
+        let pending = self.fault.load(Ordering::SeqCst);
+        if matches!(cdb[0], 0x2b | 0x92) && self.located > 2 && matches!(pending, 20..=24) {
+            self.fault.store(0, Ordering::SeqCst);
+            if pending == 22 {
+                return Err(remanence_library::ScsiError::TransportError {
+                    status: 0,
+                    host_status: 7,
+                    driver_status: 0,
+                    info: 1,
+                    sense: vec![],
+                });
+            }
+            let mut sense = vec![0; 18];
+            sense[0] = 0x70;
+            sense[2] = match pending {
+                20 => 0x80,
+                21 => 3,
+                23 => 6,
+                _ => 2,
+            };
+            sense[7] = 10;
+            sense[12] = 0x11;
+            return Err(remanence_library::ScsiError::CheckCondition {
+                sense,
+                bytes_transferred: 0,
+            });
+        }
+        if matches!(cdb[0], 0x2b | 0x92)
+            && self.fault.load(Ordering::SeqCst) == 9
+            && self.located > self.world.lock().unwrap().tapes["HAND"].records.len() as u64
+        {
+            let mut sense = vec![0; 18];
+            sense[0] = 0x70;
+            sense[2] = 8;
+            sense[7] = 10;
+            return Err(remanence_library::ScsiError::CheckCondition {
+                sense,
+                bytes_transferred: 0,
+            });
+        }
+        self.inner.execute_none(cdb)
+    }
+    fn set_timeout_for(&mut self, class: remanence_library::TimeoutClass) {
+        self.inner.set_timeout_for(class);
+    }
+}
+/// Public session admission and close retain an epoch until it fills across sessions.
+#[allow(clippy::too_many_arguments)]
+async fn check_api_epoch_fills(
+    state: &StateHandle,
+    world: Arc<Mutex<VirtualWorld>>,
+    selected: SelectedTape,
+    cfg: WriteOwnerConfig,
+    lifecycle: crate::drive_pool::DrivePoolLifecycle,
+    tx: mpsc::Sender<DriveCommand>,
+    library: remanence_library::LibraryHandle,
+) {
+    use pb::write_session_service_server::WriteSessionService;
+    let mut api = crate::ApiState::new(CatalogIndex::open(&state.paths().sqlite_path).unwrap());
+    api.pool_configs = Arc::new(
+        cfg.tape_pools
+            .iter()
+            .map(|p| (p.id.clone(), p.clone()))
+            .collect(),
+    );
+    api.library_snapshot = Some(cfg.library_snapshot.clone());
+    api.default_library_serial = Some(Arc::new(cfg.actor_library_serial.clone()));
+    api.checkpoint_journal_dir = Arc::new(cfg.checkpoint_journal_dir.clone());
+    api.audit_dir = Arc::new(cfg.audit_dir.clone());
+    api.audit_append_lock = cfg.audit_append_lock.clone();
+    api.drive_idle_unload_seconds = 0;
+    api.io_memory = cfg.io_memory.clone();
+    let key = crate::drive_pool::DriveKey::new(&cfg.actor_library_serial, 0x100);
+    let changer = spawn_changer_actor(library.into_changer(), cfg.clone());
+    api.drive_pool = Some(DrivePool::new_with_lifecycle(
+        HashMap::from([(cfg.actor_library_serial.clone(), changer)]),
+        HashMap::from([(key.clone(), tx.clone())]),
+        Arc::new(HashMap::from([(key, AtomicBool::new(false))])),
+        lifecycle,
+    ));
+    let service = api.write_session_service();
+    let mut protected = 0;
+    let mut baseline_reads = None;
+    for number in 0..7 {
+        let start = world.lock().unwrap().command_log.len();
+        let session = service
+            .open_write_session(tonic::Request::new(pb::OpenWriteSessionRequest {
+                target: Some(pb::open_write_session_request::Target::TapeTarget(
+                    pb::TapeTarget {
+                        tape_uuid: selected.tape_uuid.to_vec(),
+                        mount_if_needed: true,
+                        required_pool_id: selected.pool_id.clone(),
+                        allow_unpooled: false,
+                    },
+                )),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let reads = world.lock().unwrap().command_log[start..]
+            .iter()
+            .filter(|c| c.opcode == 0x08)
+            .count();
+        assert!(
+            reads <= *baseline_reads.get_or_insert(reads),
+            "session open rereads epoch: {reads}"
+        );
+        let id = Uuid::from_slice(&session.session_id).unwrap();
+        let payload = vec![number as u8; selected.block_size as usize * 2 + 19];
+        let spool = state.paths().state_dir.join(format!("api-epoch-{number}"));
+        std::fs::write(&spool, &payload).unwrap();
+        crate::mount::append_finish(
+            &api,
+            id,
+            crate::mount::AppendFinishRequest {
+                staging_reason: "configured_serial",
+                mtime: None,
+                content_sha256: Sha256::digest(&payload).into(),
+                received_bytes: payload.len() as u64,
+                spool_path: spool,
+                archive_path: PathBuf::from("epoch.bin"),
+                caller_object_id: format!("api-epoch-{number}"),
+                expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
+            },
+        )
+        .await
+        .unwrap();
+        service
+            .close_write_session(tonic::Request::new(pb::CloseWriteSessionRequest {
+                session_id: session.session_id,
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let tape = api
+            .index()
+            .unwrap()
+            .get_tape(&selected.tape_uuid)
+            .unwrap()
+            .unwrap();
+        if number == 0 {
+            assert_eq!(tape.highest_protected_ordinal, 0);
+            assert!(tape.total_committed_ordinals < 16);
+        }
+        assert_eq!(
+            tape.highest_protected_ordinal,
+            (tape.total_committed_ordinals / 16) * 16
+        );
+        protected = tape.highest_protected_ordinal;
+        assert!(world.lock().unwrap().drive_bays[&0x100].is_some());
+    }
+    assert!(protected >= 16, "an epoch fills across sessions");
+    let (reply, received) = oneshot::channel();
+    tx.send(DriveCommand::Unload { reply }).await.unwrap();
+    received.await.unwrap().unwrap();
+    assert_eq!(api.io_memory.granted(), 0);
+}
+
+/// Recovery-persistence failure cannot bypass the raw-write fence.
+#[test]
+fn terminal_prefix_fence_precedes_recovery_persistence_failure() {
+    check_terminal_fence_precedes_recovery_failure(false);
+}
+
+/// Tail failures keep their fence when recovery marking itself fails.
+#[test]
+fn terminal_tail_fence_precedes_recovery_persistence_failure() {
+    check_terminal_fence_precedes_recovery_failure(true);
+}
+
+/// Exercise the production failure handlers without a recoverable terminal intent.
+fn check_terminal_fence_precedes_recovery_failure(tail: bool) {
+    let root = tempfile::tempdir().unwrap();
+    let mut index = CatalogIndex::open(root.path().join("index.sqlite")).unwrap();
+    let uuid = [0x68; 16];
+    index
+        .provision_tape(ProvisionTapeInput {
+            tape_uuid: uuid,
+            voltag: "FENCE001".into(),
+            block_size: 4096,
+            parity: ParityConfig::None,
+            force: false,
+        })
+        .unwrap();
+    let cfg = super::terminal_types::TerminalWriteConfig {
+        checkpoint_journal_dir: root.path().join("checkpoints"),
+        audit_dir: root.path().join("audit"),
+        audit_fsync: true,
+        audit_append_lock: Arc::new(Mutex::new(())),
+    };
+    let mut lease = FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, uuid)
+        .unwrap()
+        .acquire_exclusive()
+        .unwrap();
+    let selected = SelectedTape {
+        standalone_endpoint: None,
+        tape_uuid: uuid,
+        block_size: 4096,
+        parity_config: ParityConfig::None,
+        pool_id: "default".into(),
+    };
+    let spec = super::terminal_types::TerminalFinalizeSpec {
+        actor: AuditActor::System,
+        tape_uuid: uuid,
+        block_size: 4096,
+        pool_config: None,
+        trigger: TerminalFinalizationTrigger::ReachedLowWatermark,
+        operation_id: None,
+        manual: None,
+    };
+    let status = if tail {
+        super::terminal_finalize::terminal_tail_write_failure(
+            &mut index,
+            &cfg,
+            &mut lease,
+            &spec,
+            &selected,
+            None,
+            &remanence_parity::TerminalTailWriteError::Media(ParityError::Invariant(
+                "terminal write fails",
+            )),
+        )
+    } else {
+        super::terminal_finalize::terminal_prefix_write_failure(
+            &mut index,
+            &cfg,
+            &mut lease,
+            &spec,
+            &selected,
+            true,
+            &ParityError::Invariant("terminal write fails"),
+        )
+    };
+    assert!(
+        status.message().contains("persist terminal recovery"),
+        "{status}"
+    );
+    let fences = index.list_active_tape_io_fences().unwrap();
+    assert_eq!(fences.len(), 1);
+    assert!(fences[0]
+        .evidence_json
+        .as_deref()
+        .unwrap()
+        .contains("terminal write fails"));
 }

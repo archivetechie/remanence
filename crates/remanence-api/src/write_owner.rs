@@ -151,8 +151,8 @@ pub(crate) use write_session::{
 };
 
 mod terminal_finalize;
-pub(crate) use terminal_finalize::finalize_mounted_tape;
 pub(crate) use terminal_finalize::*;
+pub(crate) use terminal_finalize::{finalize_mounted_tape, preflight_manual_finalize_with_prefix};
 
 mod read_session;
 

@@ -1048,13 +1048,26 @@ pub(super) fn write_to_selected_tape_checkpointed_after_preflight(
                     })?;
                     sink.locate(checkpoint.eod_lba)?;
                     let plan = summary.append_plan(parity_scheme)?;
-                    if !plan.sidecars_to_emit.is_empty()
-                        || plan.highest_protected_ordinal_before_rebuild != plan.next_data_ordinal
-                    {
-                        return Err(PoolWriteError::InvalidInput(
-                            "checkpointed parity tape retains an open epoch".to_string(),
-                        ));
-                    }
+                    let live_epoch =
+                        if plan.highest_protected_ordinal_before_rebuild < plan.next_data_ordinal {
+                            let drive = sink.append_admission_drive().ok_or_else(|| {
+                                PoolWriteError::InvalidInput(
+                                    "open epoch rebuild requires a readable admitted drive".into(),
+                                )
+                            })?;
+                            let mut source = remanence_parity::DriveHandleRawSource::new(drive);
+                            remanence_parity::rebuild_open_epoch_from_bounded_summary(
+                                &mut source,
+                                &summary,
+                                parity_scheme,
+                                selected.tape_uuid,
+                                selected.block_size,
+                            )?
+                            .live_epoch
+                        } else {
+                            None
+                        };
+                    sink.locate(checkpoint.eod_lba)?;
                     let resume_result = plan.complete(Vec::new())?;
                     let resume_session_state = {
                         let mut raw = BlockSinkRawTapeSink::new(sink);
@@ -1068,7 +1081,7 @@ pub(super) fn write_to_selected_tape_checkpointed_after_preflight(
                                 committed_prefix_snapshot: snapshot,
                                 committed_prefix_summary: summary,
                                 resume_result: &resume_result,
-                                live_epoch: None,
+                                live_epoch,
                             },
                             remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION")),
                         )?;

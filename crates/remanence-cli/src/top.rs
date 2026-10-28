@@ -254,6 +254,19 @@ fn render_pinned_band(frame: &mut Frame<'_>, area: Rect, state: &TopState) {
             .selected_library
             .min(live.libraries.len().saturating_sub(1)),
     );
+    let pending_parity = library
+        .into_iter()
+        .flat_map(|library| &library.drives)
+        .filter_map(|drive| {
+            Some(format!(
+                "{} parity pending [{},{})",
+                drive.loaded_tape_barcode.as_deref().unwrap_or(DASH),
+                drive.open_epoch_start?,
+                drive.open_epoch_end?,
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join("  ");
     let rows = library
         .map(|library| {
             library
@@ -325,6 +338,7 @@ fn render_pinned_band(frame: &mut Frame<'_>, area: Rect, state: &TopState) {
     .block(
         Block::default()
             .title(format!("alarms: {alarms}"))
+            .title_bottom(pending_parity)
             .borders(Borders::ALL),
     );
     frame.render_widget(table, area);
@@ -541,13 +555,15 @@ mod tests {
     fn renders_pinned_band_and_paused_banner() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
-        let state = TopState {
+        let mut state = TopState {
             live: Some(sample_response()),
             show_slots: true,
             paused: true,
             help: true,
             ..Default::default()
         };
+        state.live.as_mut().unwrap().libraries[0].drives[0].open_epoch_start = Some(128);
+        state.live.as_mut().unwrap().libraries[0].drives[0].open_epoch_end = Some(131);
         terminal
             .draw(|frame| render_top(frame, &state))
             .expect("draw");
@@ -563,6 +579,7 @@ mod tests {
         assert!(text.contains("DRV-01"));
         assert!(text.contains("CLN001"));
         assert!(text.contains("1m23s"));
+        assert!(text.contains("parity pending [128,131)"));
     }
 
     #[test]

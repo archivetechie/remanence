@@ -872,6 +872,22 @@ impl ParitySinkSessionState {
         self.filemark_map.total_data_ordinals()
     }
 
+    /// Whether every emitted bundle is covered by the sink checkpoint marker.
+    pub fn is_checkpointed(&self) -> bool {
+        !self.has_uncheckpointed_bundles
+    }
+
+    /// Check every logical checkpoint key before carrying an accumulator.
+    pub fn matches_committed_summary(&self, summary: &crate::BoundedResumeSummary) -> bool {
+        !self.has_uncheckpointed_bundles
+            && self.scheme() == summary.scheme()
+            && self.highest_protected_ordinal == summary.highest_protected_ordinal
+            && self.total_committed_ordinals().ok() == Some(summary.total_committed_ordinals)
+            && self.filemark_map.next_tape_file_number().ok()
+                == Some(summary.committed_tape_file_count)
+            && self.used_tape_blocks() == summary.append_position.lba
+    }
+
     /// Last physical LBA proved by the sink.
     pub fn used_tape_blocks(&self) -> u64 {
         self.last_physical_lba
@@ -1183,12 +1199,47 @@ impl<'a> ParitySink<'a> {
         Self::try_from_session_state(inner, journal, state).map_err(|(error, _state)| error)
     }
 
+    /// Reattach a planned terminal close at its reconciled base or complete prefix end.
+    /// The close operation recomputes the complete immutable plan before writing.
+    pub fn from_session_state_for_terminal_close(
+        inner: &'a mut dyn RawTapeSink,
+        journal: &'a mut dyn TapeFileJournal,
+        state: ParitySinkSessionState,
+        plan: &TerminalPrefixPlan,
+        evidence: TerminalPrefixReconcileEvidence,
+    ) -> Result<Self, ParityError> {
+        if plan.start_lba != state.used_tape_blocks() {
+            return Err(ParityError::Invariant(
+                "terminal plan does not start at the session boundary",
+            ));
+        }
+        let position = match evidence {
+            TerminalPrefixReconcileEvidence::Complete => Some(plan.tail_start_lba),
+            // Torn reconciliation leaves the head at its evidence position.
+            // close_for_terminal_index locates and proves the planned overwrite boundary.
+            TerminalPrefixReconcileEvidence::TornRewritable => Some(inner.position()?.lba),
+            _ => None,
+        };
+        Self::try_from_session_state_at_position(inner, journal, state, position, Some(plan))
+            .map_err(|(e, _)| e)
+    }
+
     /// Reattach actor-carried state without destroying it when validation of
     /// the transport or journal fails before any tape motion.
     pub fn try_from_session_state(
         inner: &'a mut dyn RawTapeSink,
         journal: &'a mut dyn TapeFileJournal,
+        state: ParitySinkSessionState,
+    ) -> Result<Self, (ParityError, Box<ParitySinkSessionState>)> {
+        Self::try_from_session_state_at_position(inner, journal, state, None, None)
+    }
+
+    fn try_from_session_state_at_position(
+        inner: &'a mut dyn RawTapeSink,
+        journal: &'a mut dyn TapeFileJournal,
         mut state: ParitySinkSessionState,
+        terminal_position: Option<u64>,
+        terminal_plan: Option<&TerminalPrefixPlan>,
     ) -> Result<Self, (ParityError, Box<ParitySinkSessionState>)> {
         if journal.tape_uuid() != state.tape_uuid {
             return Err((
@@ -1203,7 +1254,11 @@ impl<'a> ParitySink<'a> {
         let snapshot = if state.has_uncheckpointed_bundles {
             None
         } else {
-            match resume_record_result(journal.session_resume_snapshot()) {
+            let snapshot = match terminal_plan {
+                Some(plan) => journal.session_terminal_resume_snapshot(&plan.committed_bundle),
+                None => journal.session_resume_snapshot(),
+            };
+            match resume_record_result(snapshot) {
                 Ok(Some(snapshot)) => Some(snapshot),
                 Ok(None) if state.committed_prefix_snapshot.is_none() => None,
                 Ok(None) => {
@@ -1249,7 +1304,9 @@ impl<'a> ParitySink<'a> {
             Ok(observed) => observed,
             Err(error) => return Err((error, Box::new(state))),
         };
-        if observed.partition != 0 || observed.lba != state.last_physical_lba {
+        if observed.partition != 0
+            || observed.lba != terminal_position.unwrap_or(state.last_physical_lba)
+        {
             return Err((
                 ParityError::SessionOpen(format!(
                     "parity session transport is at partition {} lba {}, expected partition 0 lba {}",
@@ -1900,9 +1957,9 @@ impl<'a> ParitySink<'a> {
         Ok(tape_file_number)
     }
 
-    /// Close the open epoch as needed and commit a resumable journal checkpoint.
+    /// Commit a resumable checkpoint while keeping the short epoch open.
     pub fn checkpoint(&mut self) -> Result<CheckpointResult, ParityError> {
-        self.close_open_epoch(CloseReason::Barrier)
+        self.checkpoint_epoch(None)
     }
 
     fn peek_parity_map_sequence(&self) -> Result<u64, ParityError> {
@@ -2789,6 +2846,14 @@ impl<'a> ParitySink<'a> {
         &mut self,
         reason: CloseReason,
     ) -> Result<CheckpointResult, ParityError> {
+        self.checkpoint_epoch(Some(reason))
+    }
+
+    /// Drain complete sidecars and publish the durable prefix, optionally closing its tail.
+    fn checkpoint_epoch(
+        &mut self,
+        reason: Option<CloseReason>,
+    ) -> Result<CheckpointResult, ParityError> {
         if self.poisoned {
             return Err(ParityError::Invariant(
                 "close_open_epoch called on poisoned parity sink",
@@ -2799,9 +2864,9 @@ impl<'a> ParitySink<'a> {
                 "close_open_epoch called while an object is active",
             ));
         }
-        let is_terminal = reason == CloseReason::Finish;
+        let is_terminal = reason == Some(CloseReason::Finish);
         let bundle_start = self.filemark_map.next_tape_file_number()?;
-        if self.data_blocks_in_neighborhood > 0 {
+        if reason.is_some() && self.data_blocks_in_neighborhood > 0 {
             let block_size = self.block_size.ok_or(ParityError::Invariant(
                 "open epoch contains data but block size is unpinned",
             ))?;
