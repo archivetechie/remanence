@@ -402,12 +402,23 @@ at the last write EOD. Otherwise it dismounts and logs and audits
 A cartridge outside a drive has no open epoch except after a crash, a close that
 leaves the epoch open, or a shutdown that finds the head away from EOD. A fenced
 tape keeps its epoch until append recovery clears the fence. Removal records a
-deferred automatic seal as `seal_due` in the tape's write state. The next write
+deferred automatic seal as the optional `seal_due` field in the checkpoint
+journal record, in the same fsync as the checkpoint. Its values are
+`hardware_early_warning` and `reached_low_watermark`. Older records omit the
+field and read as no new obligation. SQLite projects this field while the tape
+is ready; ordinary checkpoints preserve it, and terminal completion, sealing,
+retirement, or reprovisioning clears it. Startup and catalog rebuild use the
+same projection. Rebuild preserves a legacy catalog-only obligation until
+replayed authority resolves it and reports the preserved fallback. The next write
 session on that tape completes the seal before accepting Objects; explicit
 finalization also completes it. `rem catalog tapes --json` exposes the pending
 trigger. Finalization plans the terminal sidecar before freezing its layout,
 reuses its live or rebuilt accumulator, and closes through the terminal funnel
-with `FINAL_PARTIAL_EPOCH`.
+with `FINAL_PARTIAL_EPOCH`. Planning owns the tape in a detached task. Changer
+and planning commands retain its reservations until their work ends; cleanup
+schedules idle dismount before releasing them. Planning waits through resumable
+readiness refusals within the worker's readiness budget. A dropped request
+before acceptance leaves no finalization intent; retrying its key plans again.
 
 ### Retries and idempotency
 

@@ -828,6 +828,26 @@ pub struct CheckpointObjectProjection {
     pub object_recovery_row: CheckpointObjectRecoveryRow,
 }
 
+/// A durable obligation to finalize before another object is appended.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SealDueReason {
+    /// The drive reports its early-warning boundary.
+    HardwareEarlyWarning,
+    /// The measured capacity reaches the pool's low watermark.
+    ReachedLowWatermark,
+}
+
+impl SealDueReason {
+    /// Stable catalog spelling of the journal reason.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HardwareEarlyWarning => "hardware_early_warning",
+            Self::ReachedLowWatermark => "reached_low_watermark",
+        }
+    }
+}
+
 /// One fsynced checkpoint or terminal-seal authority record.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct CheckpointJournalRecord {
@@ -878,6 +898,9 @@ pub struct CheckpointJournalRecord {
     /// empty `objects` list and an exact structured replica-C completion. The record is appended only
     /// after terminal media and its synchronous barrier have succeeded.
     pub sealed_after_write: bool,
+    /// Deferred terminal finalization, durable in the checkpoint's own fsync.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seal_due: Option<SealDueReason>,
 }
 
 /// Checked final-prefix scope/counts streamed into each terminal replica.
@@ -4040,6 +4063,11 @@ fn validate_next_record(
     previous: Option<&CheckpointJournalRecord>,
     record: &CheckpointJournalRecord,
 ) -> Result<(), StateError> {
+    if record.sealed_after_write && record.seal_due.is_some() {
+        return Err(StateError::JournalReplayFailed(
+            "terminal checkpoint carries a pending seal".into(),
+        ));
+    }
     if previous.is_some_and(|prior| prior.sealed_after_write) {
         return Err(StateError::JournalReplayFailed(
             "checkpoint record follows a terminal sealed checkpoint".to_string(),
@@ -4479,6 +4507,7 @@ mod tests {
             barrier_bundle: None,
             terminal_finalization: None,
             sealed_after_write: false,
+            seal_due: None,
         }
     }
 
@@ -4597,6 +4626,34 @@ mod tests {
         assert_eq!(rows[0].tape_file_number, 1);
     }
 
+    /// Absent obligations keep the historical CBOR map and decode as None.
+    #[test]
+    fn checkpoint_seal_due_is_optional_and_round_trips() {
+        let mut source = record([0x72; 16]);
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&source, &mut bytes).unwrap();
+        let value: ciborium::value::Value = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        let ciborium::value::Value::Map(fields) = value else {
+            panic!("record map")
+        };
+        assert!(!fields
+            .iter()
+            .any(|(key, _)| key.as_text() == Some("seal_due")));
+        let decoded: CheckpointJournalRecord = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(decoded, source);
+        for reason in [
+            SealDueReason::HardwareEarlyWarning,
+            SealDueReason::ReachedLowWatermark,
+        ] {
+            source.seal_due = Some(reason);
+            bytes.clear();
+            ciborium::ser::into_writer(&source, &mut bytes).unwrap();
+            let decoded: CheckpointJournalRecord =
+                ciborium::de::from_reader(bytes.as_slice()).unwrap();
+            assert_eq!(decoded, source);
+        }
+    }
+
     #[test]
     fn checkpoint_carriers_preserve_tape_file_numbers_beyond_u32() {
         let tape_uuid = [0x7A; 16];
@@ -4707,6 +4764,7 @@ mod tests {
             }),
             terminal_finalization: Some(finalization),
             sealed_after_write: true,
+            seal_due: None,
         }
     }
 

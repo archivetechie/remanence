@@ -401,7 +401,8 @@ when the newest committed data awaits parity. A short epoch stays open across
 ordinary checkpoints. Completed epochs emit their sidecars after the Object
 filemark; finalization closes its short epoch with `FINAL_PARTIAL_EPOCH`.
 Cartridge removal attempts to close an admitted open epoch without automatic
-finalization. It records a due seal as `seal_due`, visible in `rem catalog tapes
+finalization. It records a due seal as `seal_due` in the fsynced checkpoint journal and
+projects it into the catalog, visible in `rem catalog tapes
 --json`; the next write session on that tape or explicit finalize completes it.
 
 While the cartridge stays seated, fewer than `S × k` committed data blocks can

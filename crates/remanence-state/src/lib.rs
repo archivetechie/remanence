@@ -40,7 +40,7 @@ pub use checkpoint::{
     CheckpointObjectProjection, CheckpointObjectRecoveryRepresentation,
     CheckpointObjectRecoveryRow, CheckpointTerminalIndexRecordSource,
     CheckpointTerminalRecoveryAuthority, FileCheckpointJournal, FileCheckpointJournalLease,
-    ManualTerminalFinalizationIdentity, TerminalFinalizationComponent,
+    ManualTerminalFinalizationIdentity, SealDueReason, TerminalFinalizationComponent,
     TerminalFinalizationComponentKind, TerminalFinalizationIntent, TerminalFinalizationLayout,
     TerminalFinalizationPrefixPlan, TerminalFinalizationProgress,
     TerminalFinalizationSidecarDirectoryEntry, TerminalFinalizationTrigger,

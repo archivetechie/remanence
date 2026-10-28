@@ -2123,7 +2123,7 @@ async fn seated_parity_sessions_close_before_unload_and_shutdown() {
         AutomaticSeal, Discarded, Disconnected, ExpectedEnd, Fenced, Finalize, FinalizeRebuilt,
         IdentityGeneration, JournalFailure, NoHomeSlot, NoWriteShutdown, None as Unchanged,
         OtherDrive, ParkedGeneration, PositionFailure, ProjectionBusy, SealDue, ShutdownSealDue,
-        WriteFailure,
+        ShutdownSealDueBusy, WriteFailure,
     };
     for (refuse_memory, shutdown, read_before_shutdown, invalidation, failed_close) in [
         (false, false, false, Unchanged, false),
@@ -2148,6 +2148,7 @@ async fn seated_parity_sessions_close_before_unload_and_shutdown() {
         (false, true, false, ShutdownSealDue, false),
         (false, false, false, Disconnected, false),
         (false, false, false, AutomaticSeal, false),
+        (false, false, false, ShutdownSealDueBusy, false),
         (false, false, false, ProjectionBusy(false, "startup"), false),
         (false, false, false, ProjectionBusy(true, "startup"), false),
     ] {
@@ -2160,9 +2161,9 @@ async fn seated_parity_sessions_close_before_unload_and_shutdown() {
         });
         let world = world();
         set_rollback_bootstrap(&world, parity.clone());
-        let state = state_with_parity(root.path(), true, parity.clone());
+        let mut state = state_with_parity(root.path(), true, parity.clone());
         crate::write_owner::tests::check_seated_parity_sessions(
-            &state,
+            &mut state,
             world,
             crate::SelectedTape {
                 standalone_endpoint: None,
@@ -2330,9 +2331,9 @@ async fn epoch_removal_admission_failure_matrix() {
             });
             let world = world();
             set_rollback_bootstrap(&world, parity.clone());
-            let state = state_with_parity(root.path(), true, parity.clone());
+            let mut state = state_with_parity(root.path(), true, parity.clone());
             crate::write_owner::tests::check_seated_parity_sessions(
-                &state,
+                &mut state,
                 world,
                 crate::SelectedTape {
                     standalone_endpoint: None,
@@ -2443,9 +2444,9 @@ async fn durable_session_close_survives_removal_after_projection_busy() {
         });
         let world = world();
         set_rollback_bootstrap(&world, parity.clone());
-        let state = state_with_parity(root.path(), true, parity.clone());
+        let mut state = state_with_parity(root.path(), true, parity.clone());
         crate::write_owner::tests::check_seated_parity_sessions(
-            &state,
+            &mut state,
             world,
             crate::SelectedTape {
                 standalone_endpoint: None,
@@ -2495,9 +2496,9 @@ async fn check_open_checkpoint_removal(fresh: bool, paths: &[&'static str]) {
         });
         let world = world();
         set_rollback_bootstrap(&world, parity.clone());
-        let state = state_with_parity(root.path(), true, parity.clone());
+        let mut state = state_with_parity(root.path(), true, parity.clone());
         crate::write_owner::tests::check_seated_parity_sessions(
-            &state,
+            &mut state,
             world,
             crate::SelectedTape {
                 standalone_endpoint: None,
@@ -2528,9 +2529,9 @@ async fn api_epoch_fills_across_seated_sessions() {
     });
     let world = world();
     set_rollback_bootstrap(&world, parity.clone());
-    let state = state_with_parity(root.path(), true, parity.clone());
+    let mut state = state_with_parity(root.path(), true, parity.clone());
     crate::write_owner::tests::check_seated_parity_sessions(
-        &state,
+        &mut state,
         world,
         crate::SelectedTape {
             standalone_endpoint: None,
@@ -2546,4 +2547,85 @@ async fn api_epoch_fills_across_seated_sessions() {
         false,
     )
     .await;
+}
+
+/// One catalog contains live histories for a removed epoch, a pending seal,
+/// a completed finalization, and a write failure fence on distinct cartridges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_tape_write_history_rebuild_preserves_safety_projections() {
+    use crate::write_owner::tests::RetentionInvalidation::{
+        DeferredSealOnly, Finalize, None as Unchanged, WriteFailure,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let mut state = configured_state(root.path(), true);
+    let parity = crate::ParityConfig::Scheme(remanence_parity::ParityScheme {
+        id: remanence_parity::SchemeId::new_static("seated"),
+        data_blocks_per_stripe: 128,
+        parity_blocks_per_stripe: 1,
+        stripes_per_neighborhood: 1,
+    });
+    for (i, history) in [Unchanged, DeferredSealOnly, Finalize, WriteFailure]
+        .into_iter()
+        .enumerate()
+    {
+        let uuid = [0x81 + i as u8; 16];
+        state
+            .catalog_index()
+            .provision_tape(remanence_state::ProvisionTapeInput {
+                tape_uuid: uuid,
+                voltag: format!("HISTORY{i}L9"),
+                block_size: BLOCK,
+                parity: parity.clone(),
+                force: false,
+            })
+            .unwrap();
+        state
+            .catalog_index()
+            .set_tape_generation(
+                uuid,
+                remanence_state::MediaObservation {
+                    generation: LtoGen::Lto9,
+                    source: GenerationSource::Operator,
+                },
+            )
+            .unwrap();
+        state
+            .catalog_index()
+            .project_tape_pool_membership(uuid, "default")
+            .unwrap();
+        let world = world();
+        let bootstrap = crate::build_tape_bootstrap(
+            uuid,
+            BLOCK,
+            parity.clone(),
+            "2026-10-23T00:00:00Z",
+            "test",
+        );
+        let mut bytes = vec![0; BLOCK as usize];
+        remanence_parity::bootstrap::write_bootstrap_block(&bootstrap, &mut bytes).unwrap();
+        world.lock().unwrap().tapes.get_mut("HAND").unwrap().records[0] = Record::Block(bytes);
+        {
+            let mut w = world.lock().unwrap();
+            let tape = w.tapes.remove("HAND").unwrap();
+            w.put_tape_in_drive(BAY, format!("HISTORY{i}L9"), None, tape);
+        }
+        crate::write_owner::tests::check_seated_parity_sessions(
+            &mut state,
+            world,
+            crate::SelectedTape {
+                standalone_endpoint: None,
+                pool_id: "default".into(),
+                tape_uuid: uuid,
+                block_size: BLOCK,
+                parity_config: parity.clone(),
+            },
+            false,
+            false,
+            false,
+            history,
+            false,
+        )
+        .await;
+    }
+    crate::write_owner::tests::assert_rebuild_safety_equivalent(&mut state);
 }

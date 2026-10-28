@@ -629,6 +629,7 @@ fn one_transition_ahead_sink_journal_reconciles_before_media_is_available() {
             barrier_bundle: None,
             terminal_finalization: None,
             sealed_after_write: false,
+            seal_due: None,
         })
         .expect("append base checkpoint");
     let mut checkpoint = checkpoint_journal
@@ -8945,6 +8946,7 @@ fn resume_vectors_layer5_authorities(refusal: Option<&str>) {
         barrier_bundle: None,
         terminal_finalization: None,
         sealed_after_write: false,
+        seal_due: None,
     };
     drop(journal);
     let checkpoint = remanence_state::FileCheckpointJournal::open(
@@ -11899,6 +11901,8 @@ pub(crate) enum RetentionInvalidation {
     FinalizeRebuilt,
     SealDue,
     ShutdownSealDue,
+    ShutdownSealDueBusy,
+    DeferredSealOnly,
     Disconnected,
     Removal(&'static str, &'static str),
     AutomaticSeal,
@@ -11907,10 +11911,57 @@ pub(crate) enum RetentionInvalidation {
     ApiEpochFills,
 }
 
+/// Release the host lock before reopening the same durable state for recovery.
+fn restart_state_for_replay(state: &mut StateHandle) {
+    let paths = state.paths().clone();
+    let config = state.config().clone();
+    let temporary = tempfile::tempdir().unwrap();
+    let mut placeholder = config.clone();
+    placeholder.daemon.state_dir = temporary.path().to_path_buf();
+    placeholder.audit.dir = temporary.path().join("audit");
+    placeholder.journal.dir = temporary.path().join("journals");
+    placeholder.index.sqlite_path = temporary.path().join("index.sqlite");
+    placeholder.cache.tape_catalog_dir = temporary.path().join("cache");
+    let placeholder_paths = remanence_state::StatePaths::from_config(
+        temporary.path().join("config.toml"),
+        &placeholder,
+    );
+    let placeholder = StateHandle::open_with_config(placeholder_paths, placeholder).unwrap();
+    drop(std::mem::replace(state, placeholder));
+    *state = StateHandle::open_with_config(paths, config).unwrap();
+}
+
+/// Compare every tape's safety projection and active fences across authoritative replay.
+pub(crate) fn assert_rebuild_safety_equivalent(state: &mut StateHandle) {
+    fn snapshot(state: &StateHandle) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+        let conn = rusqlite::Connection::open(&state.paths().sqlite_path).unwrap();
+        ["select tape_uuid, state, seal_due, highest_protected_ordinal, total_committed_ordinals,
+            finalization_progress, finalization_trigger, finalization_operation_id,
+            finalization_edition_digest, finalization_layout_digest, completed_replicas, finalization_outcome
+            from tapes order by tape_uuid",
+         "select tape_uuid, barcode, state, reason, evidence_json, quarantine_id, release_ack, endpoint_key
+            from tape_io_fences where state = 'active' order by quarantine_id"]
+            .into_iter().map(|sql| {
+                let mut statement = conn.prepare(sql).unwrap();
+                let columns = statement.column_count();
+                statement.query_map([], |row| (0..columns).map(|i| row.get(i)).collect::<Result<Vec<_>, _>>())
+                    .unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+            }).collect()
+    }
+    let before = snapshot(state);
+    state.rebuild_index_from_journals().unwrap();
+    crate::reconcile_checkpoint_journal_projections(state).unwrap();
+    assert_eq!(
+        snapshot(state),
+        before,
+        "live and rebuilt safety projections differ"
+    );
+}
+
 /// Seated one-object sessions retain their accumulator and removal commits its sidecar.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn check_seated_parity_sessions(
-    state: &StateHandle,
+    state: &mut StateHandle,
     world: Arc<Mutex<VirtualWorld>>,
     selected: SelectedTape,
     refuse_memory: bool,
@@ -11919,6 +11970,13 @@ pub(crate) async fn check_seated_parity_sessions(
     invalidation: RetentionInvalidation,
     failed_close: bool,
 ) {
+    let barcode = CatalogIndex::open(&state.paths().sqlite_path)
+        .unwrap()
+        .get_tape(&selected.tape_uuid)
+        .unwrap()
+        .unwrap()
+        .voltag
+        .unwrap();
     let read_fault = Arc::new(AtomicU64::new(0));
     if matches!(
         invalidation,
@@ -11968,7 +12026,10 @@ pub(crate) async fn check_seated_parity_sessions(
     if matches!(invalidation, RetentionInvalidation::Removal("no_pool", _)) {
         cfg.tape_pools.clear();
     }
-    if invalidation == RetentionInvalidation::SealDue {
+    if matches!(
+        invalidation,
+        RetentionInvalidation::SealDue | RetentionInvalidation::DeferredSealOnly
+    ) {
         cfg.tape_pools[0].watermark_low = 1e-12;
     }
 
@@ -11985,7 +12046,7 @@ pub(crate) async fn check_seated_parity_sessions(
             &remanence_library::StaticAllowlist::new([serial.as_str()]),
         )
         .unwrap();
-    let tx = spawn_drive_actor(0x100, drive, cfg.clone());
+    let mut tx = spawn_drive_actor(0x100, drive, cfg.clone());
     if invalidation == RetentionInvalidation::ApiEpochFills {
         check_api_epoch_fills(state, world, selected, cfg, lifecycle, tx, library).await;
         return;
@@ -12031,7 +12092,7 @@ pub(crate) async fn check_seated_parity_sessions(
                     target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
                     needs_drive_load: false,
                     library_serial: serial.clone(),
-                    barcode: Some("HAND".into()),
+                    barcode: Some(barcode.as_str().into()),
                     source_slot: None,
                     drive_uuid: None,
                     drive_serial: None,
@@ -12085,7 +12146,7 @@ pub(crate) async fn check_seated_parity_sessions(
             target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
             needs_drive_load: false,
             library_serial: serial.clone(),
-            barcode: Some("HAND".into()),
+            barcode: Some(barcode.as_str().into()),
             source_slot: None,
             drive_uuid: None,
             drive_serial: None,
@@ -12127,7 +12188,7 @@ pub(crate) async fn check_seated_parity_sessions(
             MountedSession {
                 bay: 0x100,
                 library_serial: serial.clone(),
-                barcode: Some("HAND".into()),
+                barcode: Some(barcode.as_str().into()),
                 home_slot: (invalidation != RetentionInvalidation::NoHomeSlot).then_some(0x400),
                 tape_uuid: selected.tape_uuid,
                 drive_uuid: None,
@@ -12139,8 +12200,15 @@ pub(crate) async fn check_seated_parity_sessions(
                 id,
                 state.paths().state_dir.join(format!("seated-{number}.bin")),
                 "seated.bin",
-                &format!("seated-{number}"),
-                b"committed seated payload",
+                &format!(
+                    "seated-{}-{number}",
+                    crate::bytes_to_hex(&selected.tape_uuid)
+                ),
+                format!(
+                    "committed seated payload {}",
+                    crate::bytes_to_hex(&selected.tape_uuid)
+                )
+                .as_bytes(),
             )
             .await;
         }
@@ -12148,9 +12216,21 @@ pub(crate) async fn check_seated_parity_sessions(
             held = memory.try_reserve(memory.ceiling());
             assert!(held.is_some());
         }
-        if number == 1 && invalidation == RetentionInvalidation::ShutdownSealDue {
+        if number == 1
+            && matches!(
+                invalidation,
+                RetentionInvalidation::ShutdownSealDue | RetentionInvalidation::ShutdownSealDueBusy
+            )
+        {
             lifecycle.shutting_down.store(true, Ordering::SeqCst);
-            memory.epoch_test_action.store(7, Ordering::Relaxed);
+            memory.epoch_test_action.store(
+                if invalidation == RetentionInvalidation::ShutdownSealDueBusy {
+                    11
+                } else {
+                    7
+                },
+                Ordering::Relaxed,
+            );
         }
         let (reply, received) = oneshot::channel();
         if number == 1 && invalidation == RetentionInvalidation::AutomaticSeal {
@@ -12162,7 +12242,48 @@ pub(crate) async fn check_seated_parity_sessions(
         })
         .await
         .unwrap();
-        received.await.unwrap().unwrap();
+        let result = received.await.unwrap();
+        if number == 1 && invalidation == RetentionInvalidation::ShutdownSealDueBusy {
+            assert!(result
+                .unwrap_err()
+                .message()
+                .contains("SQLite projection failed"));
+            memory.epoch_test_action.store(0, Ordering::Relaxed);
+            let (reply, received) = oneshot::channel();
+            tx.send(DriveCommand::Close {
+                session_id: id,
+                reply,
+            })
+            .await
+            .unwrap();
+            received.await.unwrap().unwrap();
+            let journal =
+                FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, selected.tape_uuid)
+                    .unwrap();
+            assert_eq!(
+                journal.last().unwrap().unwrap().seal_due,
+                Some(remanence_state::SealDueReason::HardwareEarlyWarning)
+            );
+            let before = CatalogIndex::open(&state.paths().sqlite_path)
+                .unwrap()
+                .get_tape(&selected.tape_uuid)
+                .unwrap()
+                .unwrap();
+            assert!(before.seal_due.is_none());
+            crate::reconcile_checkpoint_journal_projections(state).unwrap();
+            assert_eq!(
+                CatalogIndex::open(&state.paths().sqlite_path)
+                    .unwrap()
+                    .get_tape(&selected.tape_uuid)
+                    .unwrap()
+                    .unwrap()
+                    .seal_due
+                    .as_deref(),
+                Some("hardware_early_warning")
+            );
+        } else {
+            result.unwrap();
+        }
         memory.epoch_test_action.store(0, Ordering::Relaxed);
         lifecycle.sessions.lock().unwrap().remove(&id);
         let index = CatalogIndex::open(&state.paths().sqlite_path).unwrap();
@@ -12192,7 +12313,8 @@ pub(crate) async fn check_seated_parity_sessions(
                 .unwrap();
             let w = world.lock().unwrap();
             let start = entry.physical_start_hint.unwrap() as usize;
-            let blocks = w.tapes["HAND"].records[start..start + entry.block_count as usize]
+            let blocks = w.tapes[barcode.as_str()].records
+                [start..start + entry.block_count as usize]
                 .iter()
                 .map(|r| match r {
                     Record::Block(b) => b.clone(),
@@ -12215,7 +12337,7 @@ pub(crate) async fn check_seated_parity_sessions(
         );
     }
     drop(held);
-    if !refuse_memory {
+    if !refuse_memory && invalidation != RetentionInvalidation::ShutdownSealDueBusy {
         assert!(memory.granted() > 0);
     }
     if let RetentionInvalidation::ProjectionBusy(append, path) = invalidation {
@@ -12262,16 +12384,17 @@ pub(crate) async fn check_seated_parity_sessions(
         let before = world.lock().unwrap().command_log.len();
         let (reply, received) = oneshot::channel();
         tx.send(DriveCommand::PlanFinalization {
+            ownership: crate::mount::PlanningOwnership::model(),
             request: request.clone(),
             needs_drive_load: false,
-            barcode: Some("HAND".into()),
+            barcode: Some(barcode.as_str().into()),
             source_slot: None,
             drive_serial: None,
             reply,
         })
         .await
         .unwrap();
-        let prefix = received.await.unwrap().unwrap();
+        let prefix = received.await.unwrap().into_result().unwrap();
         memory.epoch_test_action.store(0, Ordering::Relaxed);
         assert!(world.lock().unwrap().command_log[before..]
             .iter()
@@ -12284,7 +12407,7 @@ pub(crate) async fn check_seated_parity_sessions(
                 audit_fsync: cfg.audit_fsync,
                 audit_append_lock: &cfg.audit_append_lock,
             },
-            Some("HAND"),
+            Some(barcode.as_str()),
             &mut request,
             Some(&prefix),
         )
@@ -12295,7 +12418,7 @@ pub(crate) async fn check_seated_parity_sessions(
             request,
             needs_drive_load: false,
             library_serial: serial,
-            barcode: Some("HAND".into()),
+            barcode: Some(barcode.as_str().into()),
             source_slot: None,
             drive_serial: None,
             drive_uuid: None,
@@ -12317,7 +12440,8 @@ pub(crate) async fn check_seated_parity_sessions(
             .unwrap();
         let world = world.lock().unwrap();
         let start = entry.physical_start_hint.unwrap() as usize;
-        let blocks = world.tapes["HAND"].records[start..start + entry.block_count as usize]
+        let blocks = world.tapes[barcode.as_str()].records
+            [start..start + entry.block_count as usize]
             .iter()
             .map(|r| match r {
                 Record::Block(b) => b.clone(),
@@ -12342,6 +12466,8 @@ pub(crate) async fn check_seated_parity_sessions(
         );
         assert!(records.last().unwrap().sealed_after_write);
         assert_eq!(memory.granted(), 0);
+        drop(world);
+        assert_rebuild_safety_equivalent(state);
         return;
     }
     if invalidation == RetentionInvalidation::Disconnected {
@@ -12354,7 +12480,7 @@ pub(crate) async fn check_seated_parity_sessions(
             target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
             needs_drive_load: false,
             library_serial: serial.clone(),
-            barcode: Some("HAND".into()),
+            barcode: Some(barcode.as_str().into()),
             source_slot: None,
             drive_uuid: None,
             drive_serial: None,
@@ -12379,7 +12505,7 @@ pub(crate) async fn check_seated_parity_sessions(
             .unwrap()
             .record_tape_io_fence(remanence_state::TapeIoFenceInput {
                 tape_uuid: selected.tape_uuid,
-                barcode: Some("HAND".into()),
+                barcode: Some(barcode.as_str().into()),
                 reason: "transfer_error".into(),
                 evidence_json: None,
             })
@@ -12394,7 +12520,7 @@ pub(crate) async fn check_seated_parity_sessions(
             tape_uuid: selected.tape_uuid,
             needs_drive_load: false,
             library_serial: serial.clone(),
-            barcode: Some("HAND".into()),
+            barcode: Some(barcode.as_str().into()),
             source_slot: None,
             drive_serial: None,
             stream_tx,
@@ -12427,7 +12553,7 @@ pub(crate) async fn check_seated_parity_sessions(
     }
     let saved_bootstrap = if failed_close {
         let mut world = world.lock().unwrap();
-        let tape = world.tapes.get_mut("HAND").unwrap();
+        let tape = world.tapes.get_mut(barcode.as_str()).unwrap();
         let saved = tape.records[0].clone();
         let bootstrap = crate::build_tape_bootstrap(
             [0x44; 16],
@@ -12481,6 +12607,7 @@ pub(crate) async fn check_seated_parity_sessions(
             .iter()
             .all(|c| !matches!(c.opcode, 0x0a | 0x10)));
         assert_eq!(memory.granted(), 0);
+        assert_rebuild_safety_equivalent(state);
         return;
     }
     assert_eq!(memory.granted(), 0);
@@ -12532,12 +12659,49 @@ pub(crate) async fn check_seated_parity_sessions(
     }
     if matches!(
         invalidation,
-        RetentionInvalidation::SealDue | RetentionInvalidation::ShutdownSealDue
+        RetentionInvalidation::SealDue
+            | RetentionInvalidation::DeferredSealOnly
+            | RetentionInvalidation::ShutdownSealDue
+            | RetentionInvalidation::ShutdownSealDueBusy
     ) {
-        assert!(tape.seal_due.is_some());
+        let expected_reason = if matches!(
+            invalidation,
+            RetentionInvalidation::SealDue | RetentionInvalidation::DeferredSealOnly
+        ) {
+            "reached_low_watermark"
+        } else {
+            "hardware_early_warning"
+        };
+        assert_eq!(tape.seal_due.as_deref(), Some(expected_reason));
+        lifecycle.shutting_down.store(false, Ordering::SeqCst);
+        memory.epoch_test_action.store(0, Ordering::Relaxed);
+        // Disconnect the old actor and reopen host state before startup and rebuild.
+        // No retained accumulator or session state supplies the pending trigger.
+        let drive = library
+            .open_drive(
+                0x100,
+                &remanence_library::StaticAllowlist::new([serial.as_str()]),
+            )
+            .unwrap();
+        tx = spawn_drive_actor(0x100, drive, cfg.clone());
+        restart_state_for_replay(state);
+        crate::reconcile_checkpoint_journal_projections(state).unwrap();
+        assert_rebuild_safety_equivalent(state);
+        assert_eq!(
+            index
+                .get_tape(&selected.tape_uuid)
+                .unwrap()
+                .unwrap()
+                .seal_due
+                .as_deref(),
+            Some(expected_reason)
+        );
         assert!(crate::catalog_conversion::tape_to_proto(tape)
             .seal_due
             .is_some());
+        if invalidation == RetentionInvalidation::DeferredSealOnly {
+            return;
+        }
         let mut other_index = CatalogIndex::open(&state.paths().sqlite_path).unwrap();
         let other_uuid = [0x29; 16];
         other_index
@@ -12575,8 +12739,7 @@ pub(crate) async fn check_seated_parity_sessions(
             .unwrap()
             .seal_due
             .is_some());
-        lifecycle.shutting_down.store(false, Ordering::SeqCst);
-        memory.epoch_test_action.store(0, Ordering::Relaxed);
+        let object_count = records.last().unwrap().committed_object_count;
         let (reply, received) = oneshot::channel();
         tx.send(DriveCommand::OpenWrite {
             actor: AuditActor::System,
@@ -12585,7 +12748,7 @@ pub(crate) async fn check_seated_parity_sessions(
             target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
             needs_drive_load: true,
             library_serial: serial.clone(),
-            barcode: Some("HAND".into()),
+            barcode: Some(barcode.as_str().into()),
             source_slot: None,
             drive_uuid: None,
             drive_serial: None,
@@ -12599,9 +12762,38 @@ pub(crate) async fn check_seated_parity_sessions(
             error.message().contains("seal") && error.message().contains("retry OpenWriteSession"),
             "{error}"
         );
+        let recovered =
+            FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, selected.tape_uuid)
+                .unwrap()
+                .replay()
+                .unwrap();
+        assert_eq!(
+            recovered.last().unwrap().committed_object_count,
+            object_count
+        );
+        assert!(recovered.last().unwrap().objects.is_empty());
         let tape = index.get_tape(&selected.tape_uuid).unwrap().unwrap();
         assert_eq!(tape.state, "sealed");
         assert!(tape.seal_due.is_none());
+        let expected_trigger = if matches!(
+            invalidation,
+            RetentionInvalidation::SealDue | RetentionInvalidation::DeferredSealOnly
+        ) {
+            remanence_state::TerminalFinalizationTrigger::ReachedLowWatermark
+        } else {
+            remanence_state::TerminalFinalizationTrigger::HardwareEarlyWarning
+        };
+        assert_eq!(
+            tape.terminal_finalization.unwrap().trigger,
+            expected_trigger
+        );
+        assert_rebuild_safety_equivalent(state);
+        assert!(index
+            .get_tape(&selected.tape_uuid)
+            .unwrap()
+            .unwrap()
+            .seal_due
+            .is_none());
     }
     if read_before_shutdown {
         // A fresh actor has no accumulator from the stopped actor. Its open
@@ -12636,7 +12828,7 @@ pub(crate) async fn check_seated_parity_sessions(
             target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
             needs_drive_load: true,
             library_serial: serial.clone(),
-            barcode: Some("HAND".into()),
+            barcode: Some(barcode.as_str().into()),
             source_slot: None,
             drive_uuid: None,
             drive_serial: None,
@@ -12650,7 +12842,7 @@ pub(crate) async fn check_seated_parity_sessions(
             MountedSession {
                 bay,
                 library_serial: serial,
-                barcode: Some("HAND".into()),
+                barcode: Some(barcode.as_str().into()),
                 home_slot: Some(0x400),
                 tape_uuid: selected.tape_uuid,
                 drive_uuid: None,
@@ -13360,6 +13552,7 @@ async fn check_epoch_removal(
             };
             let (reply, received) = oneshot::channel();
             tx.send(DriveCommand::PlanFinalization {
+                ownership: crate::mount::PlanningOwnership::model(),
                 request: request.clone(),
                 needs_drive_load: false,
                 barcode: Some("HAND".into()),
@@ -13369,7 +13562,7 @@ async fn check_epoch_removal(
             })
             .await
             .unwrap();
-            let prefix = received.await.unwrap().unwrap();
+            let prefix = received.await.unwrap().into_result().unwrap();
             if case == "finalize_lease" {
                 let (ready, received) = oneshot::channel();
                 let (resume, resumed) = std::sync::mpsc::channel();
