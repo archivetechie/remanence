@@ -3004,7 +3004,7 @@ fn ensure_mounted_session_media_readiness_admitted(
 ) -> Result<(), Status> {
     let index = CatalogIndex::open_read_only(state.index_path.as_ref())
         .map_err(|err| Status::internal(err.to_string()))?;
-    crate::startup_media_readiness::ensure_media_readiness_admitted(
+    crate::startup_media_readiness::ensure_media_readiness_unconflicted(
         &index,
         action,
         mounted.library_serial.as_str(),
