@@ -26,13 +26,14 @@
   "pinned": false,
   "quotes": [
     "If a record the Resumer relies on is missing, their claims conflict, or their combination is incomplete or ambiguous, resume MUST fail as `ResumeAppend`.",
-    "**Position to the append point (`Σ(block_count + 1)` over the prefix) before writing anything.**"
+    "A Writer starts writing only immediately after the committed prefix, at a position it has proved, and then writes contiguously."
   ],
   "sections": [
     "3.2",
     "3.4",
     "14",
-    "2.4"
+    "2.4",
+    "11.3"
   ],
   "shadowed": "Possibly by step 2 ('the prefix's final object entry MUST end exactly at T', 'T − W < S × k'); every candidate check names ResumeAppend.",
   "target": "the Resumer (Section 14 steps 1, 2 and 4)",

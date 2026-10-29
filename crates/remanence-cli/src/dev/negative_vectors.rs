@@ -32,7 +32,7 @@ pub fn fixture_root() -> PathBuf {
 /// Reject edits to the verbatim specification-authored source.
 pub fn parse_source(bytes: &[u8]) -> Result<Value, String> {
     if hex(&Sha256::digest(bytes))
-        != "e8336e36351a3da7c8c2c78a4aa15a40a0147892e7bbcb25ba94a3a5644cc92b"
+        != "10f820433f570e9c357c0d7e328b5fd5e0dd15cdc765c4c39f6870e8e2540da9"
     {
         return Err("frozen negative-cases.json SHA-256 differs".into());
     }

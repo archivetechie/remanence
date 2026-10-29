@@ -30,5 +30,6 @@
       "tape_file_number": 2
     }
   ],
+  "data_shard_crc64": [],
   "image": "unfinalized-closed"
 }

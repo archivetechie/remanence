@@ -1464,7 +1464,7 @@ def build_image(inputs: Mapping[str, Any], name: str) -> ImageBuild:
             files.append(TapeFile(len(files), kind, component, True, info))
     elif stop.get("kind") == "session-end":
         # Not a fixture stop kind: the session ends after its last Object and a
-        # barrier closes the open epoch, even a short one (Section 11.2). Used
+        # fixture ends its open epoch before the barrier (Section 11.4, W4). Used
         # only to build the uninterrupted-session check for the resume cases.
         if ordinal > epoch_start:
             emit_sidecar(next_epoch, epoch_start, ordinal, directory_flags)
@@ -2233,7 +2233,7 @@ QUOTES.update({
     'unread_payload': ('12.6', "A Scanner need not read every replica's payload (Section 8.4 step 2), so a replica whose payload it did not read is not found invalid for that reason; a Verifier's full check reports every replica."),
     'lost_count_def': ('13.5', '`lost_count` is the number of erasures in the stripe, including the failed block, and `limit` is `m`.'),
     'resume_finalizing': ('14', "A committed prefix that records a terminal component or a final ParityMap describes a tape whose finalization has begun, and Section 3.4's transition to `Finalizing` permanently disables Object admission, so it is refused as `ResumeAppend` too."),
-    'resume_step3_errors': ('14', 'A read that finds a filemark, EOD or a record shorter or longer than one block where the committed prefix places a data block contradicts the commit record, and is `ResumeAppend`; a medium or transport failure is `TapeIo`.'),
+    'resume_step3_errors': ('11.5', 'A boundary or wrong-length read there, or a block that does not reproduce the evidence, is `ResumeAppend`; a medium or transport failure is `TapeIo`.'),
     'boot_names_level': ('15', 'The bootstrap names depend on the level at which a Reader meets the block.'),
     'boot_parser_name': ('15', 'A parser given one block as the bootstrap reports a breach of Section 8 as `BootstrapParse`, including a missing magic and a failed CRC, except that a parity bootstrap recording drive compression is `DriveCompressionEnabled`.'),
     'boot_discovery_name': ('15', 'Discovery over the candidate block sizes, without supplied values, reports `NoBootstrapFound` when it finds no usable bootstrap at any candidate, and `DriveCompressionEnabled` when a parity bootstrap records compression; a record of another length only rules out that candidate.'),
@@ -2246,13 +2246,13 @@ QUOTES.update({
     'pm_block_size': ('10.1.3', "`block_size` MUST equal the tape's block size, which is the length of every block read, as the sidecar header's `block_size` must (Section 9.2)."),
     'pm_agreement_all': ('10.1.4', 'The agreement between a header copy and the footer covers every field that both carry, other than `copy_kind` and the CRC, not only the locator fields.'),
     "err_drive_compression": ("15", "DriveCompressionEnabled         compression detected on / recorded for a parity tape"),
-    "compression_rejects": ("8.4", "`drive_compression = true` on a parity bootstrap still rejects the tape (Sections 11.4, 16.3)."),
+    "compression_rejects": ("8.4", "`drive_compression = true` on a parity bootstrap still rejects the tape (Sections 11.1, 16.3)."),
     "no_parity_may_omit": ("8.2", "It MUST omit the scheme record (key 1) and MAY omit the digest record (key 2). A Reader MUST NOT require those records on it. A no-parity bootstrap's payload carries no parity scheme; one that does is `BootstrapParse`."),
-    "compression_key_rule": ("8.2", "`true` on a parity bootstrap MUST be rejected (Sections 8.4, 11.4)"),
+    "compression_key_rule": ("8.2", "`true` on a parity bootstrap MUST be rejected (Sections 8.4, 11.1)"),
     "canonical_reject": ("5.3", "When a Reader decodes any CBOR item of this format, it MUST reject duplicate keys and non-canonical encoding, and MUST ignore unknown integer keys at every map level."),
     'footer_uuid': ('9.6', "The footer's `tape_uuid` MUST match the bootstrap or, when the bootstrap is unreadable, the tape UUID supplied under Section 8.4.1, as each header copy's `tape_uuid` must (Section 9.2)."),
     'short_read_failure': ('13.4', 'A record shorter or longer than one block is a read failure (Section 3.5).'),
-    'compression_parity_only': ('16.3', 'Both sentences concern a parity tape (Section 11.4): a no-parity bootstrap may record compression.'),
+    'compression_parity_only': ('16.3', 'Both sentences concern a parity tape (Section 11.1): a no-parity bootstrap may record compression.'),
     'full_verification': ('2.2', "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."),
     'report_by_address': ('2.2', "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."),
     'opaque_bytes': ('2.2', 'It reads those blocks as opaque bytes and does not interpret Object content (Section 1.1, goal 2).'),
@@ -4015,24 +4015,25 @@ def recover_address(ctx: RecoveryContext, address: list[int]) -> dict[str, Any]:
 QUOTES.update({
     "resume_after": ("14", "A later session appends **after the last committed tape file** — not after the last object, and not at the watermark."),
     "resume_step1": ("14", "Derive the committed prefix from the off-tape commit records (Section 3.4), dropping the tape's torn tail, if any, and compute `W` and `T` from it."),
-    "resume_step2": ("14", "Enforce the version-1 bound: `T − W < S × k` (at most one open epoch)."),
+    'resume_step2': ('14', 'Validate the commit records: `T − W < S × k` (the bound Section 11.4 (W4) maintains);'),
+    "resume_w5": ("11.5", "Before computing parity from blocks read back from the committed prefix, a Writer proves that they are the committed bytes."),
     "resume_step2_rules": ("14", "`W ≤ T`; committed sidecar ranges MUST be contiguous from zero through `W`; epoch ids MUST be consecutive; and the prefix's final object entry MUST end exactly at `T`. A violation is `ResumeAppend`."),
-    "resume_step3": ("14", "Rebuild the open epoch by **re-reading ordinals `[W, T)` from the committed prefix on tape** — a boundary or short read where data is expected is fatal — recomputing per-block CRCs and re-accumulating parity."),
-    "resume_step4": ("14", "**Position to the append point (`Σ(block_count + 1)` over the prefix) before writing anything.**"),
-    "resume_first_block": ("14", "The first block written lands exactly at the append point; a write issued anywhere else could land over committed data or short of the append point."),
+    'resume_step3': ('14', 'Apply Section 11.5 (W5) to the blocks of `[W, T)`.'),
+    'resume_step4': ('14', 'Apply Section 11.3 (W3) before appending.'),
+    'resume_first_block': ('11.3', 'A Writer starts writing only immediately after the committed prefix, at a position it has proved, and then writes contiguously.'),
     "resume_superseded": ("14", "Anything physically on tape beyond the committed prefix is superseded by the next append and MUST NOT be trusted for recovery."),
     "resume_validated_records": ("3.4", "Before a Resumer positions to an append point or writes, the validated combination of the records it relies on MUST determine exactly one committed prefix and its append point."),
     "append_point": ("3.2", "The append point after a committed prefix is `Σ(block_count + 1)` over all committed files."),
     "w_le_t": ("2.3", "Always `W ≤ T`."),
     "derived_scalars": ("7.2", "Tape file numbers are dense from 0. Object first-ordinals are dense and contiguous from 0 in tape order (Section 3.2)."),
     "epoch_ids": ("9.2", "Epoch ids MUST increase by one but carry no range arithmetic."),
-    "epoch_close": ("11.2", "At `S × k` data blocks the epoch closes into a **pending** sidecar; no tape I/O occurs mid-object."),
-    "pending_emit": ("11.2", "Pending sidecars are emitted as tape files when the current object closes."),
-    "barrier_short": ("11.2", "A barrier may close a non-empty short epoch and emit its sidecar without `FINAL_PARTIAL_EPOCH`."),
+    'epoch_close': ('11.4', 'Each epoch is the next contiguous run of at most `S × k` ordinals, with the next epoch id.'),
+    'pending_emit': ('11.4', "An ended epoch's sidecar (Section 9; always `S × m` parity shards) is its own tape file, written before the next Object begins."),
+    'barrier_short': ('10.1.5', 'A Writer MUST set `FINAL_PARTIAL_EPOCH` on the short epoch that the finalization sequence ends, and only there (Section 11.6); it MUST leave it clear on every short epoch ended before finalization.'),
     "boundary_outcomes": ("3.5", "Fixed-block reads and writes only; a read returning other than exactly one block is an error, with two classified boundary outcomes: **Filemark** and **EndOfData**."),
-    "err_resume": ("15", "ResumeAppend                    Section 14 invariant violation"),
+    'err_resume': ('15', 'ResumeAppend                    Section 11.5 or Section 14 invariant violation'),
     "torn_superseded": ("3.4", "There is no on-tape commit marker and no on-tape \"unclean\" marker: an interrupted tail simply lies beyond the last committed file and is physically superseded on resume (Section 14)."),
-    "finalized_no_append": ("11.3", "A finalized tape accepts no further appends."),
+    'finalized_no_append': ('11.6', 'Finalization begins between Objects, at a durable decision that ends Object admission for good.'),
 })
 
 
@@ -4168,8 +4169,8 @@ def resume_case(case: Mapping[str, Any], image: ImageBuild,
             return refuse("step 2", "ResumeAppend", ["resume_step2_rules", "resume_finalizing", "err_resume"])
         return refuse("step 2", "ResumeAppend", ["resume_step2_rules", "err_resume"])
 
-    # The step-2 bound needs S and k, which the prefix does not carry. The text
-    # does not say where a Resumer obtains them; this one reads the bootstrap.
+    # The step-2 bound needs S and k, which the prefix does not carry. Section 14
+    # permits records or bootstrap as the source; this one reads the bootstrap.
     try:
         block = read(0)
         boot = parse_bootstrap(block, len(block))
@@ -4217,6 +4218,14 @@ def resume_case(case: Mapping[str, Any], image: ImageBuild,
             step3.update(result="fatal", failure=f"ordinal {ordinal} at LBA {lba}: {found} where data is expected")
             step3["citations"].append(cite("boundary_outcomes"))
             return refuse("step 3", "ResumeAppend", ["resume_step3", "resume_step3_errors", "err_resume"])
+        evidence = case.get("data_shard_crc64")
+        index = ordinal - watermark
+        if (not isinstance(evidence, list) or len(evidence) != total - watermark
+                or not isinstance(evidence[index], str)
+                or not re.fullmatch(r"[0-9a-fA-F]{16}", evidence[index])
+                or crc64_xz(value) != int(evidence[index], 16)):
+            step3.update(result="fatal", failure=f"ordinal {ordinal} at LBA {lba}: W5 evidence missing or mismatched")
+            return refuse("step 3", "ResumeAppend", ["resume_step3", "resume_w5", "err_resume"])
         open_blocks[ordinal] = value
     step3["result"] = "run"
 
@@ -7049,7 +7058,7 @@ def _check_record_edits(edits: Any, where: str) -> None:
 
 # Every key a resume case's inputs may carry. `append_object` is needed only
 # by a case that reaches step 4; `tape_faults` damages the tape it re-reads.
-RESUME_KEYS = {"T", "W", "append_object", "committed_prefix", "image", "tape_faults"}
+RESUME_KEYS = {"data_shard_crc64", "T", "W", "append_object", "committed_prefix", "image", "tape_faults"}
 RESUME_REQUIRED = {"T", "W", "committed_prefix", "image"}
 PREFIX_ENTRY_KEYS = {"block_count", "epoch_id", "first_parity_data_ordinal", "kind", "protected_ordinal_end_exclusive",
                      "protected_ordinal_start", "tape_file_number"}

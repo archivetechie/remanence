@@ -49,6 +49,10 @@
         "tape_file_number": 3
       }
     ],
+    "data_shard_crc64": [
+      "6fd6c1a73fd2dd52",
+      "51c28f14b95548a8"
+    ],
     "image": "unfinalized-open"
   },
   "edits": [],

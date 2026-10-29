@@ -93,7 +93,7 @@ The rule is applied to each assertion, and not to each concept. A concept usuall
 
 **Precedence.** An assertion that a format defines has one home, the specification. This guide and an implementation's interface description cite it and never restate it. The guide adds the operational practice around it, and an interface description defines only what the implementation adds. For example, that a Writer does not report a tape as finalized with fewer than three complete replicas belongs to REM-PARITY alone (REM-PARITY §3.4, The Durable Boundary). The global encoding of `caller_object_id` belongs to REM-OBJECT, and idempotency over it belongs to the implementation.
 
-**States reached by a decision.** Finalization is a format state. The specification fixes what may be recorded and claimed about it, and that no object is admitted and nothing appended after it begins (REM-PARITY §11.3, Finalization). The decision to finalize is made above the format. Other tape states are not defined by any format: a tape closed to new writes before finalization, a retired tape, and the states of recycling. They are documented by the implementation, as mechanism, and by policy, as the decision of when to use them. As an example of the three levels, the room that a writer must keep to be able to finalize is a format invariant, how much allowance to add is advice in the chapter "Capacity admission", and the fill fractions at which Remanence stops choosing a tape are Remanence's configuration.
+**States reached by a decision.** Finalization is a format state. The specification fixes what may be recorded and claimed about it, that Object admission ends when it begins, and that only its remaining files may then be written (REM-PARITY §11.6, Finalization (W6)). The decision to finalize is made above the format. Other tape states are not defined by any format: a tape closed to new writes before finalization, a retired tape, and the states of recycling. They are documented by the implementation, as mechanism, and by policy, as the decision of when to use them. As an example of the three levels, the room that a writer must keep to be able to finalize is a format invariant, how much allowance to add is advice in the chapter "Capacity admission", and the fill fractions at which Remanence stops choosing a tape are Remanence's configuration.
 
 **Contracts between layers.** An implementation adds contracts that no format defines. Examples are idempotency over `caller_object_id`, the locator that pins a copy to a medium, the mapping from a pool to its tapes, the rules of a write session, and the projection of copy health. An implementation should document each of them in its own documentation, under an "Interface" heading, written for "an orchestrator" in general. The orchestrator's documents then point to it. Remanence will publish interface sections; until then its reference documents hold the facts.
 
@@ -103,10 +103,10 @@ One row for each concept that crosses a boundary. The columns are what the forma
 
 | Concept | What the formats fix | Guide practice | What an implementation documents (Remanence) | What an orchestrator decides |
 | --- | --- | --- | --- | --- |
-| Copies and placement, with the identity chain | A copy is one stored representation of a canonical object, and copies of one object share a `plaintext_digest` (REM-OBJECT §3.3, Identities and Digests). The replicas A, B and C belong to a tape's index (REM-PARITY §11.3, Finalization). The formats do not say how many copies exist or where. Preparing. | "Catalogs and indexes": join copies by their shared identity. Published. | Remanence records each copy with its tape, position and pool, and labels pools with a copy class ([glossary](https://github.com/archivetechie/remanence/blob/main/docs/reference-glossary.md), "copy class / content class"). Implemented. | How many copies, in which classes, and how many families of implementation. It keeps the whole identity chain of section 2.3. Published here. |
+| Copies and placement, with the identity chain | A copy is one stored representation of a canonical object, and copies of one object share a `plaintext_digest` (REM-OBJECT §3.3, Identities and Digests). The replicas A, B and C belong to a tape's index (REM-PARITY §11.6, Finalization (W6)). The formats do not say how many copies exist or where. Preparing. | "Catalogs and indexes": join copies by their shared identity. Published. | Remanence records each copy with its tape, position and pool, and labels pools with a copy class ([glossary](https://github.com/archivetechie/remanence/blob/main/docs/reference-glossary.md), "copy class / content class"). Implemented. | How many copies, in which classes, and how many families of implementation. It keeps the whole identity chain of section 2.3. Published here. |
 | The four properties of independence | Nothing; no revision in preparation says anything. | This chapter, section 2.3. Published. | Pool ids and copy classes are labels that Remanence accepts as configured. It enforces none of the four properties. Implemented as labels; not implemented as enforcement. | Establishes each of the four (section 2.3). Published here. |
 | Tape pools | The specifications do not mention pools. REM-PARITY says it does not define placement policy (REM-PARITY §1.4, Non-Goals). Preparing. | No chapter. This one names pools so that they can be found. Published. | A pool is an operator-defined group of tapes. A write session names a pool, and Remanence picks the tape ([configuration reference](https://github.com/archivetechie/remanence/blob/main/docs/reference-configuration.md#tape_pools-and-tape_pool_rules)). Implemented. | Which pools exist, what each is for, and which pool receives each copy. Published here. |
-| The tape lifecycle: finalize, close to writes, retire, recycle | Finalization only: what is written, that nothing is appended after it, and what may be claimed (REM-PARITY §11.3, Finalization; REM-PARITY §3.4, The Durable Boundary). Closing to writes, retiring and recycling are not defined. Preparing. | "Finalizing a tape and recovering from a crash"; "Retiring and recycling media". Published. | Remanence finalizes tapes, can close a tape to new writes (state `sealed`), and retires a tape identity in its catalog, which erases nothing ([lifecycle explainer](https://github.com/archivetechie/remanence/blob/main/docs/tape-identity-lifecycle-explainer.md)). Implemented. Recycling is not implemented. | When to finalize, when to stop writing to a tape, and when a medium may be released. Published here. |
+| The tape lifecycle: finalize, close to writes, retire, recycle | Finalization only: what is written, that nothing is appended after it, and what may be claimed (REM-PARITY §11.6, Finalization (W6); REM-PARITY §3.4, The Durable Boundary). Closing to writes, retiring and recycling are not defined. Preparing. | "Finalizing a tape and recovering from a crash"; "Retiring and recycling media". Published. | Remanence finalizes tapes, can close a tape to new writes (state `sealed`), and retires a tape identity in its catalog, which erases nothing ([lifecycle explainer](https://github.com/archivetechie/remanence/blob/main/docs/tape-identity-lifecycle-explainer.md)). Implemented. Recycling is not implemented. | When to finalize, when to stop writing to a tape, and when a medium may be released. Published here. |
 | Writer parameters | The legal values and their encodings: block sizes, `chunk_size`, parity scheme parameters (REM-PARITY §6.6, Scheme Parameters and Profiles; REM-OBJECT §4.2, Chunks and `chunk_size`). Choosing among them is not specified. Preparing. | "Ingest" (chunk size) and "Capacity admission" (separation extent, safety allowance). Published. | Defaults and keys are in the [configuration reference](https://github.com/archivetechie/remanence/blob/main/docs/reference-configuration.md) (block size, watermarks, minimum object size) and the [sizing guide](https://github.com/archivetechie/remanence/blob/main/docs/guide-object-sizing.md). Implemented. | Which values suit which content, and the object size it promises. Published here. |
 | Catalog, locators and commit records | No catalog: every copy can be read without one. A durable off-tape commit record is required, in a form the implementation chooses (REM-PARITY §3.4, The Durable Boundary). Preparing. | "Catalogs and indexes"; "Writing tapes: sessions, commit and resume". Published. | Per-tape journals are the durable truth, and the SQLite index is a rebuildable projection. A locator is emitted after each write ([glossary](https://github.com/archivetechie/remanence/blob/main/docs/reference-glossary.md), "catalog"). Implemented. | Its own catalog of assets and copies, reconciled with the implementation's. Published here. |
 | Object identity and `caller_object_id` | `object_id` and the four digests (REM-OBJECT §3.3, Identities and Digests). `REMANENCE.caller_object_id` is an opaque identifier assigned by the archiving system (REM-OBJECT §4.5.1, Keywords). Preparing. | "Catalogs and indexes", section 6.2. Published. | A repeat of the same pool, `caller_object_id` and content is idempotent, and different content under a reused id is a conflict ([glossary](https://github.com/archivetechie/remanence/blob/main/docs/reference-glossary.md), "caller object id"). Implemented. | Assigns the id, and decides what a logical asset is. Published here. |
@@ -145,17 +145,17 @@ Some words appear in more than one document with different meanings, and some ca
 | Word | Meanings, and where each is used |
 | --- | --- |
 | pool | A tape pool: an operator-defined group of tapes that a write targets (Remanence configuration). An orchestrator may also use the word for a set of resources that it schedules, such as drives. The specifications do not use the word. |
-| copy, replica | A copy is one stored representation of an object on a medium (REM-OBJECT §3.3, Identities and Digests). A replica is one of the three complete terminal inventories of a tape, A, B and C (REM-PARITY §11.3, Finalization). The sidecar and the ParityMap also have header copies and tail copies (REM-PARITY §9.2, The Header Block (Block 0 of Each Copy) — All Little-Endian; REM-PARITY §10.1.2, Copy Layout). Three replicas of the index are not three copies of the data. |
+| copy, replica | A copy is one stored representation of an object on a medium (REM-OBJECT §3.3, Identities and Digests). A replica is one of the three complete terminal inventories of a tape, A, B and C (REM-PARITY §11.6, Finalization (W6)). The sidecar and the ParityMap also have header copies and tail copies (REM-PARITY §9.2, The Header Block (Block 0 of Each Copy) — All Little-Endian; REM-PARITY §10.1.2, Copy Layout). Three replicas of the index are not three copies of the data. |
 | verify | Seven things go by the name. Write-path verification, post-write re-verification and scrub by `stored_digest` (REM-OBJECT §7.2, Write-Path Verification (No Extra Reads); REM-OBJECT §7.3, Post-Write Re-Verification; REM-OBJECT §7.5, Scrub). Full verification of a tape (REM-PARITY §2.2, Conformance Roles). The state `verified` that Remanence reports when a verification has run to its end, where `complete` says whether the tape passed. The health `OK` of a copy, which is not a verification. An orchestrator's comparison of a measured digest with a reference digest. |
 | seal | In REM-ENCRYPT, to wrap an object in an encrypted envelope (REM-ENCRYPT §5.9, Sealing). In Remanence, the state `sealed` of a tape that is closed to new writes before it is finalized, and the audit fact `TapeSealed` that is recorded when a tape is sealed. |
 | retire | In Remanence, to retire a tape identity in the catalog, or a drive from the fleet. In this guide, to stop using an epoch's key. An orchestrator may also retire a pool or a copy. |
 | epoch | A parity epoch: one protection unit of a tape (REM-PARITY §2.3, Definitions). A recipient epoch: one key pair and its 16-byte identifier (REM-ENCRYPT §5.3, The Key Frame and HPKE Wrapping). In Remanence, a daemon epoch, which detects a restarted daemon, and a write epoch, which is a counter in the media-write fence. |
 | suspect | In Remanence, the health `SUSPECT` of a copy whose catalog status is anything but `committed`. It says that nothing has been proved, and does not say that anything is wrong. An orchestrator may also use the word of an asset whose content it doubts, which is a different claim. |
-| session | The Writer's session, whose drive settings are fixed at its start (REM-PARITY §11.4, Session Preconditions), and the practice of chapter 9. In Remanence, the daemon's write or read transaction, with an identifier that never survives a restart. |
-| finalize | To write a tape's terminal replicas and separation extents, after which nothing is appended (REM-PARITY §11.3, Finalization). It differs from closing a tape to new writes, and an orchestrator may use "finalized" of an asset whose archiving is complete. |
+| session | In this guide, a period of tape writing; we recommend keeping its drive settings fixed from the start (chapter 9). In Remanence, the daemon's write or read transaction, with an identifier that never survives a restart. |
+| finalize | To write a tape's terminal replicas and separation extents, after which nothing is appended (REM-PARITY §11.6, Finalization (W6)). It differs from closing a tape to new writes, and an orchestrator may use "finalized" of an asset whose archiving is complete. |
 | catalog | Any record of what exists, kept outside an object. In Remanence, journals with a rebuildable SQLite projection. An orchestrator keeps its own, of assets and copies, and the two are reconciled. |
 | policy | In the specifications, the change policy that governs revisions. In Remanence, an operator's policy for extensions, a pool's selection policy and a medium's rewrite policy. For an archive, a decision about what is stored, how many copies, where, for how long, who may restore it and what may be disclosed. |
-| bundle | An orchestrator's bundle is files packed into one archive object, and REM-OBJECT uses the word in the same sense for the payloads that one object holds. REM-PARITY does not use it: what it commits as one atomic unit at an Object's close, the Object and the sidecars emitted at that close, is an *object-close commit group* (REM-PARITY §11.1, Commit Discipline (per Tape File)). |
+| bundle | An orchestrator's bundle is files packed into one archive object, and REM-OBJECT uses the word in the same sense for the payloads that one object holds. REM-PARITY permits one barrier and one commit record to cover several tape files (REM-PARITY §11.2, Commit (W2)). |
 
 ### In plain terms
 
@@ -1078,12 +1078,21 @@ needs, leaves a later session unable to find the true append point, and a write
 at the wrong point overwrites committed data.
 
 We recommend that each commit record hold the tape file's filemark-map entry
-(REM-PARITY §7.1) and enough state to seed a resumed writer (section 9.9). An
-object and the sidecars emitted at its close can share one durable
-transaction, because they are committed together. How the record is stored is
-the implementation's own choice: "The commit record's format is
+(REM-PARITY §7.1), enough state to seed a resumed writer (section 9.9), and the
+evidence required by REM-PARITY §11.5 (W5): each block's `data_shard_crc64` or
+one check value over them in ascending ordinal order. For the check value, we
+recommend CRC-64/XZ over the whole-block CRCs, each encoded as eight
+little-endian bytes in ascending ordinal order, as pinned by
+[`fixtures/rem-writer-check-value/`](../../fixtures/rem-writer-check-value/).
+The record that commits the Object completing a full epoch also commits that
+epoch's sidecar (REM-PARITY §11.4). How the record is stored is the
+implementation's own choice: "The commit record's format is
 implementation-defined (a journal, a database row, a replicated log entry)."
-(REM-PARITY §3.4).
+(REM-PARITY §3.4). That choice remains constrained by W5's required evidence.
+
+An open tape whose commit records are lost can still be read, but cannot be
+resumed or finalized, so it never gains terminal replicas (REM-PARITY §3.4).
+We recommend copying its objects to another tape and retiring it.
 
 Serves REM-PARITY §3.4, The Durable Boundary.
 
@@ -1123,11 +1132,12 @@ keeps, in memory, a projection of the filemark map and a record of its durable
 boundary. We recommend adding a tape file's entry to that projection, and
 advancing the boundary past the file, only once the file's synchronization is
 proved: at its own synchronous filemark, or, under deferral, at the barrier,
-for every file the barrier covers. The specification fixes when the batch counts as committed. Of the
-barrier it says: "It MUST complete before the commit record of any file it
-covers takes effect." (REM-PARITY §11.1).
+for every file the barrier covers. The specification fixes when the batch counts as committed:
+"A tape file is committed when a synchronizing barrier (Section 3.5) has proved
+its blocks and filemark on the medium and a durable off-tape commit record,
+written after that barrier, names it." (REM-PARITY §11.2).
 
-Serves REM-PARITY §11.1, Commit Discipline (per Tape File).
+Serves REM-PARITY §11.2, Commit (W2).
 
 ### 9.4. Treat staged records as uncommitted until their barrier
 
@@ -1141,7 +1151,7 @@ commit marker written after its barrier. Remanence, for example, keeps such
 records as orphan evidence and refuses to append to the tape until they have
 been reconciled with the tape's physical tail.
 
-Serves REM-PARITY §11.1, Commit Discipline (per Tape File).
+Serves REM-PARITY §11.2, Commit (W2).
 
 ### 9.5. Stop the session when an outcome is unknown
 
@@ -1153,14 +1163,15 @@ We recommend poisoning the writer in each of these cases, and after any failure
 whose completion is unknown: a poisoned writer refuses every further operation
 in the session. A write failure whose completion is known, one that consumed no
 position, can leave the writer usable. The specification fixes what may be
-claimed: after such an outcome "every file the barrier would have covered
-remains uncommitted" (REM-PARITY §11.1), and "Failure at any step MUST abandon
-the in-flight file." (REM-PARITY §11.1). Remanence, for example, poisons its
+claimed: "A write, filemark or barrier that fails, reports end-of-medium, or
+whose completion is unknown, leaves every file it would have covered
+uncommitted, and an Object is never truncated to fit." (REM-PARITY §11.2). It also requires a new start under the append-point rule after failure
+or unknown completion (REM-PARITY §11.3). Remanence, for example, poisons its
 parity sink after a barrier error, an end-of-medium report or a failed position
 check, and keeps it usable after a block write that failed without consuming a
 position.
 
-Serves REM-PARITY §11.1, Commit Discipline (per Tape File).
+Serves REM-PARITY §11.2, Commit (W2).
 
 ### 9.6. Write with memory bounded by the geometry
 
@@ -1174,7 +1185,7 @@ accumulators take 512 MiB (REM-PARITY Appendix A.1). A sidecar that is complete
 but not yet written can wait in memory or in a spool file until the current
 object closes.
 
-Serves REM-PARITY §11.2, Epochs and Sidecars.
+Serves REM-PARITY §11.4, Epochs and sidecars (W4).
 
 ### 9.7. Prove that compression is off before writing parity
 
@@ -1185,12 +1196,11 @@ command can change it.
 
 We recommend setting the drive's compression off and then reading the setting
 back, before the first parity write of a session, and refusing to write if the
-read-back does not confirm it. The specification requires the outcome: "Drive
-hardware compression MUST be verified off before any parity write." (REM-PARITY
-§11.4). Remanence, for example, sends MODE SELECT, checks the result with MODE
+read-back does not confirm it. The specification requires the outcome:
+"Hardware compression is verified off before any parity write, and recorded." (REM-PARITY §11.1). Remanence, for example, sends MODE SELECT, checks the result with MODE
 SENSE, and records the observed value as bootstrap key 5.
 
-Serves REM-PARITY §11.4, Session Preconditions.
+Serves REM-PARITY §11.1, Tape files (W1).
 
 ### 9.8. Know where the head is before writing
 
@@ -1203,7 +1213,8 @@ Dead reckoning is fine between checks. We recommend resynchronizing with a
 positional query, for example SCSI READ POSITION, after any boundary or
 unclassified error, and verifying the append point by a positional query before
 the first block a resumed session writes. The specification fixes the outcome:
-"The first block written lands exactly at the append point" (REM-PARITY §14).
+"A Writer starts writing only immediately after the committed prefix, at a
+position it has proved, and then writes contiguously." (REM-PARITY §11.3).
 Remanence, for example, locates to the append point on resume, reads the
 position back with READ POSITION, and refuses to write if the two differ.
 
@@ -1220,7 +1231,7 @@ produces a sidecar or a terminal inventory that disagrees with the tape.
 We recommend seeding a resumed writer with the complete replayable prefix map,
 the Object recovery rows, one full directory entry for every committed sidecar,
 the durable boundary, `W`, the next epoch id, and the open epoch `[W, T)`
-rebuilt from the tape (REM-PARITY §14, step 3). That source should stay
+rebuilt from committed ordinals `[W, T)` under REM-PARITY §11.5 (W5). That source should stay
 replayable, so that finalization can later emit the final ParityMap and stream
 the same snapshot into replicas A, B and C. A generation-2 tape carries at most
 one ParityMap, so its `sequence` counter has no consequence for a reader.
@@ -1283,7 +1294,7 @@ A count of completed replicas is a convenient summary, but it is not enough to r
 from: after a complete separation extent, only the six-point record says that
 the extent must not be written again.
 
-Serves REM-PARITY §3.4, The Durable Boundary; REM-PARITY §11.3, Finalization;
+Serves REM-PARITY §3.4, The Durable Boundary; REM-PARITY §11.6, Finalization (W6);
 and REM-PARITY §12.6, Terminal Completeness.
 
 ### 10.3. Finish the host steps on restart without moving the tape
@@ -1441,7 +1452,7 @@ The revision should be a digest over a canonical encoding of the recording's ide
 
 At the moment of release the implementation should take a consistent snapshot, install a durable fence against writes, appends, recovery of terminal files and initialisation (reads continue), recompute the revision, and compare it with the one in the request. It should refuse if coverage is not complete, if the revision differs, or if the proof has expired. It should refuse a medium with an open session or an unfinished operation that mutates it. A repeat of the same request returns the same receipt. A proof that expires before the recycle needs a renewal, tied to the receipt of the release. Remanence does not implement any of this yet.
 
-Serves REM-PARITY §3.4, The Durable Boundary; and REM-PARITY §11.3, Finalization.
+Serves REM-PARITY §3.4, The Durable Boundary; and REM-PARITY §11.6, Finalization (W6).
 
 ### 11.5. Reserve the copies the proof relies on
 
@@ -1869,8 +1880,7 @@ refuses with `CapacityReserveExceeded` when the reserve would not remain, and
 with `ObjectTooLargeForEmptyTape` when the Object and the reserve could not fit
 even on an empty tape.
 
-Serves REM-PARITY §10.3, Object Recovery Rows, and REM-PARITY §11.4, Session
-Preconditions.
+Serves REM-PARITY §10.3, Object Recovery Rows.
 
 ### 13.2. Keep a safety allowance
 
@@ -1882,7 +1892,7 @@ example, adds 4 blocks. Capacity charges, including a conservative charge for
 each filemark, are not on-media locations and have no part in the terminal
 layout digest (REM-PARITY §8.3).
 
-Serves REM-PARITY §11.4, Session Preconditions.
+The safety allowance is Guide practice.
 
 ### 13.3. Do not reapply caps after the tail is proved
 
@@ -2045,7 +2055,7 @@ written by a different version of it than the bootstrap it accompanies, so each
 should record the software responsible for its bytes. An implementation that
 fixes a ParityMap's bytes in a plan before writing them may record the planning
 software in key 6. This is a property of such implementations: REM-PARITY does
-not require a ParityMap's bytes to be planned (REM-PARITY §11.3). Readers
+not require a ParityMap's bytes to be planned (REM-PARITY §11.6). Readers
 tolerate the absence of both keys, as the specification requires: "A Reader
 MUST tolerate the absence of either key" (REM-PARITY §8.2). A tape written
 without them, or before this recommendation, therefore remains fully readable.

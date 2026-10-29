@@ -1,6 +1,6 @@
 # Resume review candidates
 
-The frozen specification-authored expected-cases.json is copied verbatim. Per-case expected.json retains each literal JSON object. Never regenerate expectations from reference behavior. Inputs are the image name, the mutated Section 7.1 committed prefix, W and T, and complete appended Object inputs where applicable. Kinds use their names and absent fields are null.
+The frozen specification-authored expected-cases.json is copied verbatim. Per-case expected.json retains each literal JSON object. Never regenerate expectations from reference behavior. Inputs are the image name, the mutated Section 7.1 committed prefix, W and T, the ordered data_shard_crc64 values for [W, T), and complete appended Object inputs where applicable. The CRC values are 16-digit hexadecimal strings computed from the original committed Object blocks before tape faults; the executor compares them to the actual read-back before parity accumulation. Existing expected outcomes remain unchanged; resume-evidence-mismatch changes one recorded CRC and expects ResumeAppend. These off-tape values are not Section 7.1 wire fields. Kinds use their names and absent fields are null.
 
 MANIFEST.tsv pins every resumed tape file and ALL using the parent manifest's convention. Image bytes are regenerated, not checked in. resume-open-uninterrupted is the same three Objects written by write_tape_image in one session, stopped at CommittedPrefix with zero torn records. The generator's --check checks all resume descriptors, digests and the file set.
 

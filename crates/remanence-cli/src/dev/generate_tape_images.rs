@@ -59,6 +59,40 @@ fn files_under(
 }
 
 pub fn run(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    // Explicitly refresh only review resume inputs after a contract revision.
+    // Existing expected outcomes and all tape-byte manifests remain immutable.
+    if args.as_slice() == ["--refresh-resume-inputs"] {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/rem-parity-terminal-index-draft/tape-images/resume");
+        for literal in resume::literal_cases() {
+            let case: Value = serde_json::from_str(literal)?;
+            let id = case["id"].as_str().unwrap();
+            let directory = root.join(id);
+            fs::create_dir_all(&directory)?;
+            let expected = directory.join("expected.json");
+            if expected.exists() {
+                assert_eq!(
+                    fs::read(&expected)?,
+                    literal.as_bytes(),
+                    "existing outcome changed: {id}"
+                );
+            } else {
+                fs::write(expected, literal)?;
+            }
+            if case["portable"] != false {
+                let vector = generate(case["image"].as_str().unwrap())?;
+                fs::write(
+                    directory.join("inputs.json"),
+                    serde_json::to_vec_pretty(&resume::portable_input(id, &vector))?,
+                )?;
+            }
+        }
+        fs::write(root.join("README.md"), resume::README)?;
+        println!(
+            "refreshed review resume inputs; existing expectations and tape digests unchanged"
+        );
+        return Ok(());
+    }
     let supplement_path = if let Some(i) = args.iter().position(|s| s == "--negative-supplement") {
         if i + 1 >= args.len() {
             return Err("--negative-supplement requires a path".into());

@@ -18,7 +18,7 @@ use std::{
 /// Parse the specification-authored supplement without accepting corpus drift.
 pub fn parse_source(bytes: &[u8]) -> Result<Value, String> {
     if hex(&Sha256::digest(bytes))
-        != "d0d83517ab405be5a216fbe4d33281d5ea40bf6fef499699d23dcab0dc2977e2"
+        != "b86e9bd1bd967e3d8ac3d8c7bbfbf52d7adec4857ebea3ff7f1105b1d7d9b277"
     {
         return Err("negative-cases-supplement.json SHA-256 differs".into());
     }

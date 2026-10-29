@@ -501,7 +501,8 @@ APPEND_OBJECT = {"files": [], "options": {
 def synthetic_resume_cases():
     image = impl.build_image(impl.load_image_inputs("unfinalized-open"), "unfinalized-open")
     prefix = [entry_json(e) for e in image.prefix_entries]
-    accepted = {"image": "unfinalized-open", "committed_prefix": prefix, "W": 4, "T": 6, "append_object": APPEND_OBJECT}
+    accepted = {"image": "unfinalized-open", "committed_prefix": prefix, "W": 4, "T": 6, "append_object": APPEND_OBJECT,
+                "data_shard_crc64": [f"{impl.crc64_xz(block):016x}" for block in image.files[3].blocks]}
     gapped = json.loads(json.dumps(accepted))
     gapped["committed_prefix"][2]["epoch_id"] = 1
     return {"synthetic-accepted": accepted, "synthetic-epoch-gap": gapped}
@@ -538,6 +539,54 @@ class ResumeTests(unittest.TestCase):
                   if r["image"] == "unfinalized-open"}
         for tape_file in ("0", "1", "2", "3"):
             self.assertEqual(rows[int(tape_file)]["sha256"], pinned[tape_file])
+
+    def test_w5_evidence_is_checked_against_read_bytes(self) -> None:
+        original = synthetic_resume_cases()["synthetic-accepted"]
+        for change in ("missing", "short", "long", "changed", "reordered", "malformed", "changed-image"):
+            with self.subTest(change=change):
+                case = json.loads(json.dumps(original))
+                image = impl.build_image(impl.load_image_inputs("unfinalized-open"), "unfinalized-open")
+                if change == "missing":
+                    del case["data_shard_crc64"]
+                elif change == "short":
+                    case["data_shard_crc64"].pop()
+                elif change == "long":
+                    case["data_shard_crc64"].append("0000000000000000")
+                elif change == "changed":
+                    case["data_shard_crc64"][0] = f"{int(case['data_shard_crc64'][0], 16) ^ 1:016x}"
+                elif change == "reordered":
+                    case["data_shard_crc64"].reverse()
+                elif change == "malformed":
+                    case["data_shard_crc64"][0] = "invalid"
+                else:
+                    block = image.files[3].blocks[0]
+                    image.files[3].blocks[0] = bytes([block[0] ^ 1]) + block[1:]
+                decision, resumed = impl.resume_case(case, image, {})
+                self.assertIsNone(resumed)
+                self.assertEqual(decision["decision"]["error"], "ResumeAppend")
+                self.assertEqual(decision["decision"]["refused_at"], "step 3")
+                self.assertEqual(decision["step4"]["result"], "not_run")
+                self.assertTrue(decision["decision"]["before_any_write"])
+
+    def test_pinned_resume_inputs_and_outcomes(self) -> None:
+        root = impl.FIXTURE_ROOT / "tape-images" / "resume"
+        manifest = json.loads((root / "expected-cases.json").read_text())
+        for expected in manifest["cases"]:
+            if expected.get("portable") is False:
+                continue
+            with self.subTest(case=expected["id"]):
+                case = impl.load_resume_case(root / expected["id"] / "inputs.json")
+                self.assertIn("data_shard_crc64", case)
+                self.assertEqual(len(case["data_shard_crc64"]), max(0, case["T"] - case["W"]))
+                image = impl.build_image(impl.load_image_inputs(case["image"]), case["image"])
+                result, _ = impl.resume_case(case, image, {})
+                wanted = expected["expected"]
+                if "accepted" in wanted:
+                    self.assertEqual(result["decision"]["result"] == "accepted", wanted["accepted"])
+                if "error" in wanted:
+                    self.assertEqual(result["decision"]["error"], wanted["error"])
+                if wanted.get("accepted") is False or "error" in wanted:
+                    self.assertTrue(result["decision"]["before_any_write"])
 
     def test_step2_refusal_reads_nothing(self) -> None:
         out = impl.run_resume([self.synthetic["synthetic-epoch-gap"]], SCRATCH / "resume-gap.json")
@@ -884,6 +933,9 @@ class RevisedTextTests(unittest.TestCase):
         case = copy.deepcopy(synthetic_resume_cases()["synthetic-accepted"])
         case["committed_prefix"][-1]["block_count"] += 1
         case["T"] += 1
+        # The invalid claim includes evidence for the nonexistent data block;
+        # reaching its filemark, rather than a missing CRC, is this case's failure.
+        case["data_shard_crc64"].append("0000000000000000")
         decision, appended = impl.resume_case(case, impl._image_cache("unfinalized-open"), {})
         self.assertIsNone(appended)
         self.assertEqual((decision["decision"]["result"], decision["decision"]["error"], decision["decision"]["refused_at"]),
@@ -1051,7 +1103,7 @@ class FaultMapTests(unittest.TestCase):
 
 class NegativeE1Tests(unittest.TestCase):
     def test_a_no_parity_bootstrap_may_record_compression(self) -> None:
-        # 16.3: "Both sentences concern a parity tape (Section 11.4): a no-parity bootstrap may record compression."
+        # 16.3: "Both sentences concern a parity tape (Section 11.1): a no-parity bootstrap may record compression."
         path = impl.BLIND_INPUTS / "negatives-e1-blind.json"
         first, second = SCRATCH / "negative-e1-first.json", SCRATCH / "negative-e1-second.json"
         out = impl.run_negatives(path, first, impl.e1_negatives_table())
