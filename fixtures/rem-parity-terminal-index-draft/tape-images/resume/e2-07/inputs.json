@@ -39,5 +39,6 @@
       "tape_file_number": 3
     }
   ],
+  "data_shard_crc64": [],
   "image": "a4-minimal"
 }

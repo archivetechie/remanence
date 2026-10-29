@@ -1010,14 +1010,9 @@
       "expected": {
         "error": "ResumeAppend"
       },
-      "sections": [
-        "3.2",
-        "3.4",
-        "14",
-        "2.4"
-      ],
+      "sections": ["3.2", "3.4", "14", "2.4", "11.3"],
       "quotes": [
-        "**Position to the append point (`Σ(block_count + 1)` over the prefix) before writing anything.**"
+        "A Writer starts writing only immediately after the committed prefix, at a position it has proved, and then writes contiguously."
       ],
       "pinned": false,
       "pin_reason": "As the parent: commit-record values are off-tape, and Section 2.4 names 'values read from tape'."

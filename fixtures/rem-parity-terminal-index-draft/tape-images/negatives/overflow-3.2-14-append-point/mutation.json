@@ -51,6 +51,7 @@
           "tape_file_number": 3
         }
       ],
+      "data_shard_crc64": [],
       "image": "unfinalized-open"
     },
     "framing": "the claimed T = 4 + (2^64 − 1) does not fit the reference journal's u64 watermark field, so the watermarks keep the last claims that fit (T = W = 4, the end of every claim before tape file 3); tape file 3's record keeps its claimed block count, and every row keeps its measured start, so the adapter does no arithmetic on the claimed count. The §14 step-2 bound T − W < S × k therefore passes, and the refusal is the commit record's own"

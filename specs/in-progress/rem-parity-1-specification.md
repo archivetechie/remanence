@@ -37,6 +37,13 @@ The criterion remains open until the items that Appendix D item TT-2 lists are
 closed and the companion archive carries the fixtures at freeze. Candidate
 vectors are not publication artifacts until the freeze gates close.
 
+Section 11 states six Writer rules for tape files, commits, append positions,
+epochs, parity from read-back and finalization; Sections 3.4 and 14 use that
+contract. Barrier timing and short-epoch boundaries are Writer choices; this
+change alters no tape byte, valid tape or Reader rule. Resume-vector inputs
+add ordered block CRC evidence; existing outcomes stay unchanged, and one
+negative case rejects a changed recorded CRC.
+
 **Comments close on 30 April 2027, and the documents freeze on 31 July 2027**,
 one year after publication. On that date the finality promise below takes
 effect and the change policy governs every revision after it. The three months
@@ -235,8 +242,8 @@ priority order:
    tolerates a contiguous burst of up to `S × m` blocks (~512 MiB) per epoch —
    **including bursts that straddle the data→sidecar boundary** (Section 9.1,
    Appendix B.2) — while the Writer holds only `S × m` parity accumulators
-   (~512 MiB at the default geometry), regardless of object sizes. A short final
-   or checkpoint epoch that closes fewer than `S` real data blocks (< 128 MiB at
+   (~512 MiB at the default geometry), regardless of object sizes. A short
+   epoch that closes fewer than `S` real data blocks (< 128 MiB at
    the default geometry) has a reduced boundary tolerance of `≈ (m − 1) × S`
    (~384 MiB), because its data shards sit adjacent to the full parity region
    (Appendix B.2).
@@ -246,7 +253,7 @@ priority order:
    unrelated epoch unrecoverable (Sections 12.4, 12.5, 13.3).
 6. **Fail-closed durability.** A tape file either completed its blocks, its
    trailing filemark synchronized to medium, and its durable off-tape commit
-   record, or it does not exist for recovery purposes (Sections 3.4, 11.1).
+   record, or it does not exist for recovery purposes (Sections 3.4, 11.2).
 7. **Long-term recoverability.** A future implementer holding only this
    document and its static test vectors can read every conformant tape;
    every cryptographic and arithmetic primitive is fully parameterized here.
@@ -291,7 +298,7 @@ never an empty inventory.
   they implement, and Section 14 defines how a Resumer uses the committed
   prefix they describe.
 - Drive hardware compression is required to be off for parity-protected
-  tapes (Section 11.4): block bytes must map 1:1 to media so damage
+  tapes (Section 11.1): block bytes must map 1:1 to media so damage
   geometry and parity coverage correspond.
 
 This document cites its own sections as “Section 8.2” and a section of a
@@ -444,7 +451,7 @@ A single implementation may fill several roles.
 - **`ParityDataOrdinal` (ordinal)**: the dense index of an object data block
   in the tape's protection stream (Section 3.2).
 - **Watermark `W`** (`highest_protected_ordinal`): ordinals `< W` are
-  covered by emitted sidecars. **Total `T`** (`map_total_data_ordinals`):
+  covered by committed sidecars. **Total `T`** (`map_total_data_ordinals`):
   ordinals `< T` exist as committed data. Always `W ≤ T`.
 - **Committed**: inside the durable boundary (Section 3.4).
 - **Synchronizing barrier**: a tape I/O operation whose successful
@@ -579,7 +586,7 @@ some last committed file `F`. Bytes and filemarks physically present after
   position space; their mapping to physical media damage holds only under the
   block-to-media identity of Section 16.3 (one logical block ⇔ one block's worth
   of media), which is why drive compression is rejected on a parity tape
-  (Sections 8.4, 11.4).
+  (Sections 8.4, 11.1).
 - **`ParityDataOrdinal`** (u64): the dense numbering of object data blocks
   only, in tape order, skipping filemarks and all non-object tape files. For
   an object tape file whose first block has ordinal `F`, block `b` of the
@@ -626,19 +633,16 @@ boundary, not only within object data (Appendix B.2).
 
 ### 3.4. The Durable Boundary
 
-A tape file is **committed** only when all of the following hold, in order:
-its blocks and its trailing filemark are written; blocks and filemark are
-**synchronized to medium** — by a synchronous filemark, or by a later
-synchronizing barrier (Section 11.1) completing before the commit record; and
-a durable off-tape **commit record** exists. The commit record's format is
-implementation-defined (a journal, a database row, a replicated log entry).
+A tape file is **committed** when a synchronizing barrier (Section 3.5)
+has proved its blocks and trailing filemark on the medium and a durable
+off-tape **commit record**, written after that barrier, names it
+(Section 11.2, W2). The commit record's format is implementation-defined
+(a journal, a database row, a replicated log entry).
 There is no on-tape commit marker and no on-tape "unclean" marker: an
 interrupted tail simply lies beyond the last committed file and is physically
-superseded on resume (Section 14). Tape files are written and numbered
-strictly sequentially (next = last committed + 1, first = 0, at most one in
-flight). A Recoverer seeded from a *prefix*-scoped map (Section 7.4) MUST
-treat rows beyond the validated prefix as forensic only, never as recovery
-inputs.
+superseded on resume (Section 14). A Recoverer seeded from a *prefix*-scoped
+map (Section 7.4) MUST treat rows beyond the validated prefix as forensic
+only, never as recovery inputs.
 
 An implementation MAY store the contents of this logical commit
 record in more than one durable off-tape record. Before a Resumer positions to
@@ -649,8 +653,10 @@ combination is incomplete or ambiguous, resume MUST fail as `ResumeAppend`. A
 record the implementation does not treat as commit authority, such as a
 rebuildable catalog or cache, does not commit a tape file.
 
-Recommended practice for commit records is described in the REM Implementation
-and Operations Guide, under “Writing tapes: sessions, commit and resume”.
+An open tape whose commit records are lost can be read, but cannot be resumed
+or finalized, so it never gains terminal replicas. Recommended practice for
+commit records and this loss is described in the REM Implementation and
+Operations Guide, under “Writing tapes: sessions, commit and resume”.
 
 Finalization has a separate irreversible lifecycle:
 
@@ -667,9 +673,10 @@ Finalization is not a pause: no failure, restart, recovery action, or degraded
 acceptance may transition the tape back to `Open`.
 
 A component failure or completion-unknown result enters or retains
-`RecoveryRequired`. From there a Writer may repair only missing tape files of
-the terminal suffix, at proved locations. It MUST NOT write an Object or
-append a second terminal suffix. A Writer MUST NOT report a tape as
+`RecoveryRequired`. From there a Writer may only complete the remaining tape
+files of the finalization sequence (Section 11.6), at proved locations.
+It MUST NOT write an Object or append a second terminal suffix. A Writer
+MUST NOT report a tape as
 `Finalized` while fewer than three complete replicas exist. A distinct audited
 operator action MAY accept a proved set of one or two complete replicas as
 `FinalizedDegraded`. This document does not define that action. Zero complete
@@ -729,13 +736,13 @@ bytes, indistinguishable from content to this format.
 ### 4.2. What the Format Provides to Objects
 
 For every **protected** object block — every block whose ordinal is below
-the watermark `W`, i.e. whose epoch's sidecar has been emitted — this
+the watermark `W`, i.e. whose epoch's sidecar has been committed — this
 format holds a CRC-64/XZ of the block in that sidecar (Section 9.3) and
 protects the block with Reed–Solomon parity (Section 6) at the epoch's
-geometry. Between sidecar emissions, fewer than one epoch's worth of
-committed data is pending (`W ≤ ordinal < T`, Section 11.2): durable, but
+geometry. Between sidecar commits, fewer than one epoch's worth of
+committed data is pending (`W ≤ ordinal < T`, Section 11.4): durable, but
 not yet repairable, and recovery refuses it as such (Section 13.2).
-Finalization (Section 11.3) closes the final epoch, so on a finalized tape
+Finalization (Section 11.6) closes the final epoch, so on a finalized tape
 every object block is protected. The format provides:
 
 1. **Structural addressing.** `(tape_file_number, object_block_index)`
@@ -920,7 +927,7 @@ zero-initialized accumulators. Incremental and batch encodings MUST be
 byte-identical.
 
 *Rationale.* This is what lets a Writer stream object data without buffering
-an epoch (Section 11.2).
+an epoch (Section 11.4).
 
 ### 6.4. Implicit Zeros
 
@@ -964,6 +971,13 @@ informative Writer defaults, with `S` chosen as
 | --- | ---: | ---: | --- | --- | ---: |
 | Default | 128 | 4 | 512 MiB | S = 512; epoch = 65,536 data + 2,048 parity blocks; tolerance 2,048 contiguous blocks | 3.125% |
 | Conservative | 64 | 6 | 384 MiB | S = 256; tolerance 1,536 contiguous blocks | 9.375% |
+
+*Rationale.* Every sidecar carries `S × m` parity shards, even for a short
+epoch. Each short epoch therefore costs a full sidecar's parity region, plus
+its metadata. The table's parity overhead assumes full epochs. Actual overhead
+depends on how often a Writer ends epochs early, not on object size: an epoch
+can span many Objects, and an Object can span several epochs. Grouping Objects
+into fewer short epochs reduces that overhead.
 
 ### 6.7. Per-Shard CRCs
 
@@ -1190,7 +1204,7 @@ A single integer-keyed map (Section 5.3):
 | 2 | map | REQUIRED unless no-parity | BOT-only digest record: `{1: bytes .size 32 sha256, 2: uint tape_file_count=1, 3: uint map_total_data_ordinals=0, 4: uint highest_protected_ordinal=0, 5: bool is_final_map=false}` |
 | 3 | tstr, ≤ 128 bytes | OPTIONAL | writing-implementation identity; printable US-ASCII only |
 | 4 | tstr, ≤ 64 bytes | OPTIONAL | [RFC3339] write timestamp |
-| 5 | bool | REQUIRED. A Writer MUST write it. A Reader MUST treat its absence as false | `drive_compression` — effective hardware compression at session open. `true` on a parity bootstrap MUST be rejected (Sections 8.4, 11.4) |
+| 5 | bool | REQUIRED. A Writer MUST write it. A Reader MUST treat its absence as false | `drive_compression` — effective hardware compression at session open. `true` on a parity bootstrap MUST be rejected (Sections 8.4, 11.1) |
 | 20 | — | reserved; MUST be absent | reserved |
 | 21 | — | reserved; MUST be absent | reserved |
 | 30 | — | reserved; MUST be absent | reserved |
@@ -1447,7 +1461,7 @@ miss invalidates that candidate. A medium error invalidates the affected
 candidate, while a non-medium transport error aborts discovery. A record of
 the wrong length invalidates the candidate in the same way (Section 3.5).
 `drive_compression = true` on a parity bootstrap still rejects the tape
-(Sections 11.4, 16.3).
+(Sections 11.1, 16.3).
 
 #### 8.4.1. All-Replicas-Invalid BOT Walk
 
@@ -1603,8 +1617,8 @@ start equal to the preceding end. Epoch ids MUST increase by one but carry no
 range arithmetic. `real_data_shard_count` MUST equal
 `protected_ordinal_end_exclusive − protected_ordinal_start` and MUST be in
 `1..=S × k`. A value below `S × k` marks a short epoch whose missing logical
-positions are implicit zeros (Section 6.4). Short epochs are legal at any
-checkpoint boundary, including mid-tape. A header whose
+positions are implicit zeros (Section 6.4). A Writer may end a short epoch at
+any Object boundary, including mid-tape (Section 11.4, W4). A header whose
 `sidecar_total_block_count` differs from `2H + P + 1`, with `H` and `P` its
 own fields, is invalid.
 
@@ -1886,9 +1900,9 @@ tail-copy-known-good. Unknown flag bits MUST be rejected.
 and footer byte at 0x90 to 1. The directory's unprotected range
 `[scope_highest_protected_ordinal, scope_total_data_ordinals)` is empty,
 because finalization closes the partial epoch before it writes the ParityMap
-(Section 11.3). A Writer MUST set `FINAL_PARTIAL_EPOCH` only on the short
-epoch closed by the finalization sequence (Section 11.3), and MUST leave it
-clear on a short epoch closed by a checkpoint barrier.
+(Section 11.6). A Writer MUST set `FINAL_PARTIAL_EPOCH` on the short epoch
+that the finalization sequence ends, and only there (Section 11.6); it MUST
+leave it clear on every short epoch ended before finalization.
 
 **Reader rules.** Whenever a Reader decodes a sidecar epoch directory, it MUST
 validate all of the following invariants; a violation is `DirectoryInvalid`
@@ -1901,7 +1915,7 @@ time what Section 9.2 requires of the on-tape sidecar-header sequence:
   `parity_shard_block_count`;
 - `scope_highest_protected_ordinal ≤ scope_total_data_ordinals` (the range
   `[scope_highest_protected_ordinal, scope_total_data_ordinals)` is the tail of
-  committed-but-unprotected ordinals permitted by Section 11.2);
+  committed-but-unprotected ordinals permitted by Section 11.4);
 - the protected ranges **partition `[0, scope_highest_protected_ordinal)`**:
   taken in ascending `tape_file_number` order, the first
   `protected_ordinal_start` is `0`, each entry's `protected_ordinal_start` equals
@@ -2354,86 +2368,67 @@ and MUST NOT report the terminal suffix as complete.
 
 ## 11. Writer Obligations
 
-### 11.1. Commit Discipline (per Tape File)
+### 11.1. Tape files (W1)
 
-Every tape file — object, sidecar, bootstrap, ParityMap, terminal replica, or
-separation extent — goes through one cycle:
+Tape file 0 is the bootstrap. Every later tape file is one or more blocks of
+the tape's fixed size followed by exactly one filemark, and a Writer writes
+no other filemark. An Object is one tape file whose length is a positive
+multiple of the block size. Hardware compression is verified off before any
+parity write, and recorded.
 
-```text
-begin                      (at the durable boundary; dense numbering; one in flight)
-→ write blocks             (any short write / EOM / completion-unknown ⇒ abandon)
-→ trailing filemark        (immediate or synchronous; same failure rule;
-                           EOM here ⇒ abandon — never commit)
-→ synchronization proof    (the filemark's synchronous completion, or a
-                           later shared barrier — see below; under
-                           deferral, this step moves to the barrier for
-                           every file it covers)
-→ [object close only] emit queued sidecars (each its own write cycle)
-→ off-tape commit record   (THE commit point, Section 3.4; at object close,
-                           one record — or one durable transaction — covers
-                           the object and every sidecar emitted at its close)
-```
+### 11.2. Commit (W2)
 
-A synchronizing barrier (Section 3.5) covers every tape file written since
-the previous synchronization proof, or since session start. It MUST complete
-before the commit record of any file it covers takes effect. After a
-completion-unknown, end-of-medium, or failed outcome at the barrier, every file
-the barrier would have covered remains uncommitted. The per-file synchronous
-filemark of the basic cycle is the one-file case of this rule.
+A tape file is committed when a synchronizing barrier (Section 3.5) has proved
+its blocks and filemark on the medium and a durable off-tape commit record,
+written after that barrier, names it. One barrier and one record may cover
+many files. A write, filemark or barrier that fails, reports end-of-medium,
+or whose completion is unknown, leaves every file it would have covered
+uncommitted, and an Object is never truncated to fit. An Object is reported
+complete only once committed.
 
-A session that ends before a barrier commits nothing since the last completed
-synchronization proof; resume proceeds per Section 14.
+### 11.3. Append point (W3)
 
-The object-close bundle is durable atomically: a crash before the bundle's
-commit record leaves the object *and* the sidecars emitted at its close
-beyond the durable boundary — a torn tail, physically superseded on resume
-(Section 14) — so a committed prefix always satisfies the Section 11.2
-bounded-restart rule.
+A Writer starts writing only immediately after the committed prefix, at a
+position it has proved, and then writes contiguously. After a write, filemark
+or barrier that fails or whose completion is unknown, it starts again under
+this rule. It treats anything beyond the committed prefix that it has not
+written since it started as superseded. Its commit records determine exactly
+one committed prefix, or it does not append (`ResumeAppend`).
 
-Failure at any step MUST abandon the in-flight file. The
-watermark `W` advances only after a sidecar's boundary commit.
+### 11.4. Epochs and sidecars (W4)
 
-Recommended practice for write sessions is described in the REM Implementation
-and Operations Guide, under “Writing tapes: sessions, commit and resume”.
+Object blocks take consecutive data ordinals from 0. Each epoch is the next
+contiguous run of at most `S × k` ordinals, with the next epoch id. A Writer
+may end an epoch at any Object boundary. An ended epoch's sidecar (Section 9;
+always `S × m` parity shards) is its own tape file, written before the next
+Object begins. Every commit record leaves fewer than `S × k` committed
+ordinals beyond those covered by committed sidecars (`T − W < S × k`), so the
+record that commits the Object completing a full epoch also commits that
+epoch's sidecar.
 
-### 11.2. Epochs and Sidecars
+### 11.5. Parity from read-back (W5)
 
-Parity accumulates incrementally per data block (Section 6.3). At `S × k` data
-blocks the epoch closes into a **pending** sidecar; no tape I/O occurs
-mid-object. Pending sidecars are emitted as tape files when the current object
-closes. A barrier may close a non-empty short epoch and emit its sidecar
-without `FINAL_PARTIAL_EPOCH`. Finalization performs the same funnel with a
-terminal reason: its short epoch, if any, carries `FINAL_PARTIAL_EPOCH`, after
-which the Writer emits the final ParityMap when required and then the terminal
-suffix. Implicit-zero positions never cause padding blocks to be written
-(Section 6.4).
+Before computing parity from blocks read back from the committed prefix, a
+Writer proves that they are the committed bytes. Its commit records, written
+no later than each block's commit, bind every such block's `data_shard_crc64`
+(Section 6.7), either value by value or through one check value, the CRC-64/XZ
+(Section 5.1) of their little-endian encodings in ascending ordinal order,
+and the blocks read back reproduce that evidence. A boundary or wrong-length read there, or a block that does not
+reproduce the evidence, is `ResumeAppend`; a medium or transport failure is
+`TapeIo`. Bytes that fail the proof are never covered by a sidecar.
 
-After each Object's close-and-emit bundle, unprotected ordinals MUST number
-fewer than `S × k`. This is the version-1 bounded-restart rule: at most one
-open epoch ever needs rebuilding (Section 14 step 2).
+### 11.6. Finalization (W6)
 
-### 11.3. Finalization
+Finalization begins between Objects, at a durable decision that ends Object
+admission for good. It ends any open epoch and writes its sidecar, writes the
+final ParityMap when any sidecar exists, then exactly A, AB, B, BC and C, each
+committed in turn. After a failure a Writer only completes the remaining
+files of this sequence, at proved positions. A tape is reported finalized
+only with three complete replicas.
 
-Finalization is permitted only between objects; a mid-object request MUST be
-refused. It closes the partial epoch, emits all remaining sidecars, writes one
-final ParityMap when the resulting sidecar epoch directory is nonempty, fixes
-one immutable snapshot including that structural row, and writes exactly
-replica A, separation extent AB, replica B, separation extent BC, and replica
-C, each followed by a filemark and persistence barrier. A finalized tape
-accepts no further appends.
-
-The first finalization transition permanently disables Object admission.
-Failure enters `RecoveryRequired`; recovery may emit only missing tape files
-of the terminal suffix, at proved positions. It cannot reopen the tape or
-write a second terminal suffix (Section 3.4).
-
-### 11.4. Session Preconditions
-
-Drive hardware compression MUST be verified off before any parity write. The
-effective value is recorded as bootstrap key 5. A parity bootstrap recording
-`true` MUST be rejected by Readers and Writers alike (Section 16.3). A Writer
-MUST treat hard end-of-medium mid-file as a commit failure (Section 11.1),
-never as a signal to truncate an object.
+When to take barriers, when to end a short epoch, whether a resumed Writer
+ends or continues its open epoch, and how commit records are stored are the
+Writer's choice; the Guide recommends practice.
 
 ## 12. Scanner Obligations
 
@@ -2975,7 +2970,8 @@ the last object, and not at the watermark.
 1. Derive the committed prefix from the off-tape commit records
    (Section 3.4), dropping the tape's torn tail, if any, and compute `W` and
    `T` from it.
-2. Enforce the version-1 bound: `T − W < S × k` (at most one open epoch).
+2. Validate the commit records: `T − W < S × k` (the bound Section 11.4
+   (W4) maintains);
    `W ≤ T`; committed sidecar ranges MUST be contiguous from zero through
    `W`; epoch ids MUST be consecutive; and the prefix's final object entry
    MUST end exactly at `T`. A violation is `ResumeAppend`. A committed prefix
@@ -2983,20 +2979,9 @@ the last object, and not at the watermark.
    whose finalization has begun, and Section 3.4's transition to `Finalizing`
    permanently disables Object admission, so it is refused as
    `ResumeAppend` too.
-3. Rebuild the open epoch by **re-reading ordinals `[W, T)` from the
-   committed prefix on tape** — a boundary or short read where data is
-   expected is fatal — recomputing per-block CRCs and re-accumulating
-   parity. A read that finds a filemark, EOD or a record shorter or longer
-   than one block where the committed prefix places a data block contradicts
-   the commit record, and is `ResumeAppend`; a medium or transport failure is
-   `TapeIo`. (Under the step-2 bound, `[W, T)` is the next open epoch range;
-   a committed prefix never contains a complete unprotected epoch,
-   because an object and the sidecars emitted at its close commit as one
-   bundle — Section 11.1.)
-4. **Position to the append point (`Σ(block_count + 1)` over the prefix)
-   before writing anything.** The first block written lands exactly at the
-   append point; a write issued anywhere else could land over committed data
-   or short of the append point.
+   A Resumer may take `S` and `k` from its commit records or from the bootstrap.
+3. Apply Section 11.5 (W5) to the blocks of `[W, T)`.
+4. Apply Section 11.3 (W3) before appending.
 
 Anything physically on tape beyond the committed prefix is superseded by
 the next append and MUST NOT be trusted for recovery.
@@ -3031,8 +3016,8 @@ Unrecoverable{stripe, lost_count, limit}   more than m erasures in a stripe
 ReedSolomon                     matrix inversion or codec failure
 CapacityReserveExceeded         exact terminal/parity reserve is unavailable
 ObjectTooLargeForEmptyTape      object plus exact close reserve cannot fit
-TerminalRecoveryRequired       failed finalization permits only terminal repair
-ResumeAppend                    Section 14 invariant violation
+TerminalRecoveryRequired       failed finalization permits only completing its sequence
+ResumeAppend                    Section 11.5 or Section 14 invariant violation
 DriveCompressionEnabled         compression detected on / recorded for a parity tape
 DriveCompressionModeUnknown     compression state could not be verified
 Invariant                       internal consistency failure (implementation defect)
@@ -3123,10 +3108,10 @@ Parity correctness assumes block-to-media identity: the damage geometry model
 (Section 3.3) is meaningful only if the Nth logical block occupies the Nth
 physical block's worth of media. Hardware compression silently breaks that
 correspondence while appearing to work. Hence the dual defense. The Writer
-verifies compression off before writing (Section 11.4). The recorded
+verifies compression off before writing (Section 11.1). The recorded
 `drive_compression` flag (bootstrap key 5) makes a tape written with
 compression enabled identify itself as nonconformant. A Reader MUST reject
-such a tape. Both sentences concern a parity tape (Section 11.4): a no-parity
+such a tape. Both sentences concern a parity tape (Section 11.1): a no-parity
 bootstrap may record compression.
 
 ### 16.4. Structure Leakage and Confidential Payloads
@@ -3238,17 +3223,22 @@ Section 13.3 for `parity-map-and-sidecar`, and what a Verifier reports for 14
 cases.
 
 The resume vectors, `tape-images/resume/`, give a committed prefix over an
-image as Section 7.1 entries, with `W` and `T`. Two resumes of unfinalized
-images are accepted, one at `W = T` and one at `W < T`, and the resumed tapes
-are pinned; the second one's sidecar equals the one an uninterrupted session
-writes. Six prefixes, four over the unfinalized images and two over the
-two-epoch image, break a Section 14 rule and are refused. Three more, `e2-05`
-to `e2-07`, are refused before positioning or writing: a wrong-length record
-at the re-read of step 3 and a committed prefix that records a final ParityMap
-give `ResumeAppend`, and a medium failure at the re-read gives `TapeIo`. The
-commit-record
-cases of Section 3.4 depend on an implementation-defined record format and are
-not portable.
+image as Section 7.1 entries, with `W` and `T`. Their off-tape commit inputs
+also carry `data_shard_crc64`: the ordered whole-block CRC-64/XZ values for
+`[W, T)` as 16-digit hexadecimal strings, binding the read-back under
+Section 11.5 (W5). These are commit evidence, not additional Section 7.1
+fields. Two resumes of unfinalized images are accepted, one at `W = T` and
+one at `W < T`, and the resumed tapes are pinned; the second one's sidecar
+equals the one an uninterrupted session writes. Six prefixes, four over the
+unfinalized images and two over the two-epoch image, break a Section 14 rule
+and are refused. The negative case `resume-evidence-mismatch` uses the same
+`W < T` prefix and image with one recorded CRC changed; it is `ResumeAppend`.
+The added input field preserves every existing expected outcome.
+Three more cases, `e2-05` to `e2-07`, are refused before positioning or
+writing: a wrong-length record at the re-read of step 3 and a committed
+prefix that records a final ParityMap give `ResumeAppend`, and a medium
+failure at the re-read gives `TapeIo`. The commit-record cases of Section 3.4
+depend on an implementation-defined record format and are not portable.
 
 The negative vectors, `tape-images/negatives/`, hold 58 cases and a supplement
 of 48 variants. They cover the sidecar, the ParityMap, the bootstrap, the
@@ -3492,7 +3482,7 @@ the binding constraint, at exactly `m·S = 2048` blocks = 512 MiB. The `1 + H`
 phase offset raises the boundary threshold; it never subtracts from the
 guarantee.
 
-**Short-epoch residual.** A short final or checkpoint epoch with `R < S` real
+**Short-epoch residual.** A short epoch with `R < S` real
 data blocks (Section 6.4 implicit zeros) still writes the full `S × m` parity
 region, but its `R` data shards occupy LBA `0 .. R−1`, adjacent to the parity
 region rather than a full `S·k` run away. Destroying stripe `s < R` (its single
@@ -3561,9 +3551,10 @@ a split authority.
 ### B.8. Checkpoint Authority Stays off Tape
 
 Open-tape commit state lives in durable off-tape commit records (Section 3.4).
-Ordinary checkpoint barriers close any pending parity epoch, prove the covered
-files durable, and advance those records; they do not append a bootstrap or an
-index. On restart, the Writer reconciles the measured physical prefix against
+Ordinary commit barriers prove the covered files durable and advance those
+records; they do not append a bootstrap or an index. Epochs end as
+Section 11.4 (W4) allows, not at every barrier. On restart, the Writer
+reconciles the measured physical prefix against
 that host authority before it may append. Bare-tape inventory becomes complete
 only when finalization writes the three identical terminal replicas. If none
 survives, Section 8.4.1 offers structural recovery evidence without inventing
@@ -3577,14 +3568,6 @@ bytes (Section 12.3). This is what payload independence means physically: a
 tape of foreign objects is mappable by any conformant implementation, an
 unreadable object head block cannot derail the walk, and object formats
 need no registered magics with this layer.
-
-### B.10. At Most One Open Epoch
-
-The bounded-restart rule (Section 11.2) caps unprotected ordinals below
-`S × k` at every object boundary, so a Resumer rebuilds at most one open epoch
-by re-reading at most `S × k − 1` blocks (16 GiB at the default geometry).
-Without it, resume cost would grow with the number of epochs left open —
-unbounded re-read of a tape that was supposedly fine.
 
 ### B.11. Sidecar Metadata Is Replicated Head and Tail, With a Locator
 
@@ -3622,6 +3605,19 @@ for the open items. This lineage's "1.0.0-draft.2" entry (2026-08-02) is not
 the published revision 1.0.0-draft.2 (2026-09-06, SHA-256
 `1e4ad796bd77291f731d8d2611231984ba778f3650c1597f80eebdc7ba359fd2`), which is
 an errata revision of draft.1.
+
+- **2026-10-29 — 1.0.0-draft.5 — draft milestone (Writer contract).**
+  Section 11 states six Writer rules for tape files, commits, append positions,
+  epochs, parity from read-back and finalization. Sections 3.4 and 14 use that
+  contract. The atomic object-and-sidecar bundle, the one-file-in-flight rule
+  and the object-boundary restart prescription are removed; the commit bound
+  remains. Writers choose barrier timing and short-epoch boundaries, and prove
+  read-back bytes against evidence recorded no later than commit. Sections 3.4
+  and 6.6 state the Writer-side catalog-less limit and the cost of short epochs.
+  This is a substantive change of Writer and Resumer obligations in the review
+  draft; no tape byte, valid tape or Reader rule changes. Resume-vector inputs
+  add ordered block CRC evidence; existing outcomes stay unchanged, and one
+  negative case rejects a changed recorded CRC.
 
 - **2026-09-06 — 1.0.0-draft.5 — replacement review draft.** States that the
   concept DOI remains reserved pending the first deposit, corrects the
@@ -4417,6 +4413,11 @@ This is the live preparing-copy snapshot for generation 2.
      `GAPS.md` and the notes in `tape-images/negatives/` list these and the
      other places where this document is silent or ambiguous. Each is to be
      decided, or listed here, before freeze.
+   - The source of resume geometry is decided: Section 14 step 2 permits a
+     Resumer to take `S` and `k` from its commit records or from the bootstrap.
+     Section 11.5 (W5) requires evidence recorded no later than commit before
+     parity is computed from read-back. These Writer-side clarifications do
+     not close the remaining Reader questions or vector coverage items.
    - Section 12.3 (item 4) finds a ParityMap whose block 0 is unreadable, or
      damaged so that no head rung takes it, through its footer and tail header
      copy, and the replica route survives that damage by locating it through

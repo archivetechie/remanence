@@ -598,8 +598,8 @@
       "integrity_repair": ["none on tape; the record must be self-consistent in whatever commit-record format the implementation uses"],
       "shadowed": "Possibly by step 2 ('the prefix's final object entry MUST end exactly at T', 'T − W < S × k'); every candidate check names ResumeAppend.",
       "expected": {"error": "ResumeAppend"},
-      "sections": ["3.2", "3.4", "14", "2.4"],
-      "quotes": ["If a record the Resumer relies on is missing, their claims conflict, or their combination is incomplete or ambiguous, resume MUST fail as `ResumeAppend`.", "**Position to the append point (`Σ(block_count + 1)` over the prefix) before writing anything.**"],
+      "sections": ["3.2", "3.4", "14", "2.4", "11.3"],
+      "quotes": ["If a record the Resumer relies on is missing, their claims conflict, or their combination is incomplete or ambiguous, resume MUST fail as `ResumeAppend`.", "A Writer starts writing only immediately after the committed prefix, at a position it has proved, and then writes contiguously."],
       "pinned": false,
       "pin_reason": "Section 2.4 covers 'values read from tape'; commit records are off-tape, so the overflow rule applies only by extension, and an overflowing sum is ResumeAppend only if it counts as an 'incomplete or ambiguous' combination.",
       "freeze_blocker": false
@@ -1118,8 +1118,8 @@
       "integrity_repair": ["none on tape"],
       "shadowed": "By 'W ≤ T' if checked first; same name.",
       "expected": {"error": "ResumeAppend"},
-      "sections": ["14", "3.4", "2.4"],
-      "quotes": ["Enforce the version-1 bound: `T − W < S × k` (at most one open epoch). `W ≤ T`; committed sidecar ranges MUST be contiguous from zero through `W`; epoch ids MUST be consecutive; and the prefix's final object entry MUST end exactly at `T`. A violation is `ResumeAppend`."],
+      "sections": ["14", "3.4", "2.4", "11.4"],
+      "quotes": ["Validate the commit records: `T − W < S × k` (the bound Section 11.4 (W4) maintains); `W ≤ T`; committed sidecar ranges MUST be contiguous from zero through `W`; epoch ids MUST be consecutive; and the prefix's final object entry MUST end exactly at `T`. A violation is `ResumeAppend`."],
       "pinned": true,
       "freeze_blocker": false
     }

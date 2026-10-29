@@ -24,12 +24,13 @@
   ],
   "pinned": true,
   "quotes": [
-    "Enforce the version-1 bound: `T − W < S × k` (at most one open epoch). `W ≤ T`; committed sidecar ranges MUST be contiguous from zero through `W`; epoch ids MUST be consecutive; and the prefix's final object entry MUST end exactly at `T`. A violation is `ResumeAppend`."
+    "Validate the commit records: `T − W < S × k` (the bound Section 11.4 (W4) maintains); `W ≤ T`; committed sidecar ranges MUST be contiguous from zero through `W`; epoch ids MUST be consecutive; and the prefix's final object entry MUST end exactly at `T`. A violation is `ResumeAppend`."
   ],
   "sections": [
     "14",
     "3.4",
-    "2.4"
+    "2.4",
+    "11.4"
   ],
   "shadowed": "By 'W ≤ T' if checked first; same name.",
   "target": "the Resumer (Section 14 step 2)",

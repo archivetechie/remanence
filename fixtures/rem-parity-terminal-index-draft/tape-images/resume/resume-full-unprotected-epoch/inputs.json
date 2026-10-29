@@ -21,5 +21,11 @@
       "tape_file_number": 1
     }
   ],
+  "data_shard_crc64": [
+    "1726d45384731368",
+    "e2bb443972900183",
+    "791daaf80121e998",
+    "d2368283bc53a068"
+  ],
   "image": "unfinalized-closed"
 }

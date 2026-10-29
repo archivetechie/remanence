@@ -1,0 +1,2 @@
+{"id": "resume-evidence-mismatch", "image": "unfinalized-open", "prefix_mutation": "the resume-open committed prefix and W5 evidence, with the first recorded data_shard_crc64 changed by one bit", "W": 4, "T": 6,
+     "expected": {"accepted": false, "error": "ResumeAppend", "before_any_write": true}, "pinned": true, "sections": ["11.5", "14 step 3"]}

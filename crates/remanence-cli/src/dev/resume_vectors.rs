@@ -45,7 +45,7 @@ pub fn portable_input(id: &str, vector: &VectorImage) -> Value {
         prefix.truncate(4);
     }
     match id {
-        "resume-closed" | "resume-open" => {}
+        "resume-closed" | "resume-open" | "resume-evidence-mismatch" => {}
         "resume-w-greater-than-t" => prefix[1].block_count = 3,
         "resume-full-unprotected-epoch" => prefix.truncate(2),
         "resume-final-object-not-at-t" => prefix[3].first_parity_data_ordinal = Some(1),
@@ -78,7 +78,12 @@ pub fn portable_input(id: &str, vector: &VectorImage) -> Value {
         "two-epoch"
     } else if matches!(
         id,
-        "resume-open" | "resume-final-object-not-at-t" | "resume-boundary-read" | "e2-05" | "e2-06"
+        "resume-open"
+            | "resume-evidence-mismatch"
+            | "resume-final-object-not-at-t"
+            | "resume-boundary-read"
+            | "e2-05"
+            | "e2-06"
     ) {
         "unfinalized-open"
     } else if id == "e2-07" {
@@ -86,13 +91,47 @@ pub fn portable_input(id: &str, vector: &VectorImage) -> Value {
     } else {
         "unfinalized-closed"
     };
-    let mut result = json!({"image":name,"committed_prefix":rows,"W":w,"T":t});
+    // Commit evidence comes from the original Object bytes, before any tape
+    // fault is applied. Invalid claims beyond the real data use zero evidence;
+    // their boundary read must still refuse, never synthesize committed bytes.
+    let committed_crcs: Vec<_> = vector
+        .written
+        .map
+        .entries()
+        .iter()
+        .filter(|entry| entry.kind == TapeFileKind::Object)
+        .flat_map(|entry| {
+            vector.image.files[entry.tape_file_number as usize]
+                .bytes
+                .chunks_exact(BLOCK as usize)
+        })
+        .map(crc64_xz)
+        .collect();
+    let mut evidence: Vec<_> = (w..t)
+        .map(|ordinal| {
+            format!(
+                "{:016x}",
+                committed_crcs.get(ordinal as usize).copied().unwrap_or(0)
+            )
+        })
+        .collect();
+    if id == "resume-evidence-mismatch" {
+        evidence[0] = format!(
+            "{:016x}",
+            u64::from_str_radix(&evidence[0], 16).unwrap() ^ 1
+        );
+    }
+    let mut result = json!({"image":name,"committed_prefix":rows,"W":w,"T":t,
+        "data_shard_crc64": evidence});
     if let Some(fault) = frozen_case(id).and_then(|case| case.get("tape_fault").cloned()) {
         result["tape_faults"] = resolve_tape_fault(id, &fault, vector);
     }
-    if matches!(id, "resume-closed" | "resume-open") {
+    if matches!(
+        id,
+        "resume-closed" | "resume-open" | "resume-evidence-mismatch"
+    ) {
         let mut appended = inputs(name);
-        appended.objects = vec![object(2, if id == "resume-open" { 2 } else { 1 })];
+        appended.objects = vec![object(2, if id == "resume-closed" { 1 } else { 2 })];
         result["append_object"] = recipe(&appended)["objects"][0].clone();
     }
     result
@@ -339,15 +378,70 @@ struct ReadTrace<'a> {
     lbas: Vec<u64>,
     locates: Vec<u64>,
     end_of_data_locates: usize,
+    evidence: Value,
+    evidence_count: u64,
+    evidence_start: u64,
+    evidence_extents: Vec<(u64, u64, u64)>,
 }
 impl<'a> ReadTrace<'a> {
-    fn new(raw: DriveHandleRawSource<'a>) -> Self {
+    fn new(raw: DriveHandleRawSource<'a>, input: &Value) -> Self {
+        let mut lba = 0u64;
+        let mut evidence_extents = Vec::new();
+        for entry in input["committed_prefix"].as_array().unwrap() {
+            let blocks = entry["block_count"].as_u64().unwrap();
+            if let Some(first) = entry["first_parity_data_ordinal"].as_u64() {
+                // Retain offsets relative to W; only validated open extents are read.
+                evidence_extents.push((lba, first, blocks));
+            }
+            lba = lba.saturating_add(blocks).saturating_add(1);
+        }
         Self {
             raw,
             lbas: Vec::new(),
             locates: Vec::new(),
             end_of_data_locates: 0,
+            evidence: input["data_shard_crc64"].clone(),
+            evidence_start: input["W"].as_u64().unwrap(),
+            evidence_count: input["T"]
+                .as_u64()
+                .unwrap()
+                .saturating_sub(input["W"].as_u64().unwrap()),
+            evidence_extents,
         }
+    }
+    /// Compare a full block read from the drive with its recorded W5 CRC.
+    /// Missing, malformed or incomplete evidence is a resume refusal.
+    fn prove_block(&self, lba: u64, block: &[u8]) -> Result<(), ParityError> {
+        let bad = || {
+            ParityError::ResumeAppend("W5 read-back evidence is missing or does not match".into())
+        };
+        let values = self.evidence.as_array().ok_or_else(bad)?;
+        if values.len() as u64 != self.evidence_count {
+            return Err(bad());
+        }
+        let ordinal = self
+            .evidence_extents
+            .iter()
+            .find_map(|&(start, first, count)| {
+                let offset = lba.checked_sub(start)?;
+                (offset < count)
+                    .then(|| first.checked_add(offset))
+                    .flatten()
+            })
+            .ok_or_else(bad)?;
+        let index = ordinal
+            .checked_sub(self.evidence_start)
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(bad)?;
+        let value = values.get(index).and_then(Value::as_str).ok_or_else(bad)?;
+        if value.len() != 16 || !value.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err(bad());
+        }
+        let expected = u64::from_str_radix(value, 16).map_err(|_| bad())?;
+        if crc64_xz(block) != expected {
+            return Err(bad());
+        }
+        Ok(())
     }
 }
 impl RawTapeSource for ReadTrace<'_> {
@@ -374,9 +468,24 @@ impl RawTapeSource for ReadTrace<'_> {
                 }
             }
         };
-        let batch = self.raw.read_records(buf, size, count, remaining);
+        let mut batch = self.raw.read_records(buf, size, count, remaining);
         self.lbas
             .extend((0..batch.records_read).map(|n| before.lba + u64::from(n)));
+        // Preserve transport/medium and length failures for the Resumer's classifier.
+        if matches!(batch.end, remanence_parity::raw::RawReadEnd::Error(_)) {
+            return batch;
+        }
+        for index in 0..batch.records_read {
+            let start = index as usize * size as usize;
+            if let Err(error) = self.prove_block(
+                before.lba + u64::from(index),
+                &buf[start..start + size as usize],
+            ) {
+                batch.records_read = index;
+                batch.end = remanence_parity::raw::RawReadEnd::Error(error);
+                break;
+            }
+        }
         batch
     }
     fn read_forward_records(
@@ -398,12 +507,26 @@ impl RawTapeSource for ReadTrace<'_> {
                 }
             }
         };
-        let batch = self.raw.read_forward_records(buf, size, count);
+        let mut batch = self.raw.read_forward_records(buf, size, count);
         self.lbas
             .extend((0..batch.batch.records_read).map(|n| before.lba + u64::from(n)));
         if !matches!(batch.batch.end, remanence_parity::raw::RawReadEnd::Complete) {
             self.lbas
                 .push(before.lba + u64::from(batch.batch.records_read));
+        }
+        if matches!(batch.batch.end, remanence_parity::raw::RawReadEnd::Error(_)) {
+            return batch;
+        }
+        for index in 0..batch.batch.records_read {
+            let start = index as usize * size as usize;
+            if let Err(error) = self.prove_block(
+                before.lba + u64::from(index),
+                &buf[start..start + size as usize],
+            ) {
+                batch.batch.records_read = index;
+                batch.batch.end = remanence_parity::raw::RawReadEnd::Error(error);
+                break;
+            }
         }
         batch
     }
@@ -422,8 +545,15 @@ impl RawTapeSource for ReadTrace<'_> {
         self.raw.locate_physical(hint)
     }
     fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
-        self.lbas.push(self.raw.position()?.lba);
-        self.raw.read_record(buf)
+        let lba = self.raw.position()?.lba;
+        self.lbas.push(lba);
+        let outcome = self.raw.read_record(buf)?;
+        if let RawReadOutcome::Block { bytes, .. } = outcome {
+            if bytes == BLOCK as usize {
+                self.prove_block(lba, &buf[..bytes])?;
+            }
+        }
+        Ok(outcome)
     }
     fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
         self.raw.position()
@@ -526,7 +656,7 @@ pub fn execute_positive(input: &Value, vector: &VectorImage) -> Result<Resumed, 
     let summary = checked_bounded_resume_summary(&snapshot).map_err(|e| e.to_string())?;
     let append = summary.append_position.lba;
     let (mut drive, world, _) = model(vector, input);
-    let mut trace = ReadTrace::new(DriveHandleRawSource::new(&mut drive));
+    let mut trace = ReadTrace::new(DriveHandleRawSource::new(&mut drive), input);
     let rebuild = rebuild_open_epoch_from_bounded_summary(
         &mut trace,
         &summary,
@@ -655,7 +785,7 @@ pub fn assert_expected(id: &str, expected: &Value, actual: &Value) {
     assert!(agrees, "{id}: expected {expected}; actual {actual}");
 }
 
-pub const README: &str = "# Resume review candidates\n\nThe frozen specification-authored expected-cases.json is copied verbatim. Per-case expected.json retains each literal JSON object. Never regenerate expectations from reference behavior. Inputs are the image name, the mutated Section 7.1 committed prefix, W and T, and complete appended Object inputs where applicable. Kinds use their names and absent fields are null.\n\nMANIFEST.tsv pins every resumed tape file and ALL using the parent manifest's convention. Image bytes are regenerated, not checked in. resume-open-uninterrupted is the same three Objects written by write_tape_image in one session, stopped at CommittedPrefix with zero torn records. The generator's --check checks all resume descriptors, digests and the file set.\n\nThe reference adapter frames v4 off-tape journal records from these claims, then uses FileTapeFileJournal replay and checked_bounded_resume_summary. It does not prevalidate or repair negative inputs. Sidecar metadata hashes are taken from the source image; they are reference journal details, not portable authority. The closed case enters write_owner::checkpoint::open_parity_actor_session and resumes its ordinary ParitySink session; the open case uses rebuild_open_epoch_from_bounded_summary and new_sidecar_only_from_bounded_resume. Both append with ordinary capacity reservation, REM-OBJECT writing, finish_object and checkpoint. No test-only committed-prefix planner is used.\n\nRun cargo test -p remanence-cli -p remanence-api --lib resume_vectors -- --nocapture for PASS, INFORMATIVE and DISAGREEMENT lines. Informative annotations never decide a pass. Pinned errors assert the frozen expectations; record-content failures are classified at the production Resumer boundary.\n\n## Commit-record reporting layer\n\nresume-commit-records is not portable: the journal format is implementation-defined. Existing reference coverage is in remanence-parity's journal::tests::shared_bundle_validator_rejects_ambiguous_or_non_dense_shapes, journal::tests::journal_cbor_rejects_duplicate_and_non_integer_keys, journal::tests::file_journal_preserves_torn_trailing_record_and_fails_closed, journal::tests::file_journal_rejects_header_mismatch, journal::tests::bounded_committed_replay_matches_flattened_authority_and_rejects_orphans, and resume::tests::bounded_resume_fails_closed_on_bot_orphan_and_epoch_discontinuity. These do not establish all four required ResumeAppend outcomes before tape positioning.\n\nThe added reference executor tests are resume_vectors::tests::resume_vectors_commit_records_missing (missing Bootstrap record), resume_vectors::tests::resume_vectors_commit_records_conflicting (two different claims for one Object file), resume_vectors::tests::resume_vectors_commit_records_incomplete (torn checkpoint checksum), and resume_vectors::tests::resume_vectors_commit_records_ambiguous (duplicate Object authority). Each runs journal replay and bounded validation, asserts an empty chaos command log before refusal, and asserts the frozen ResumeAppend error. They are shared with the Layer-5 test build. resume_vectors::tests::resume_vectors_commit_records_checkpoint_w_conflict and resume_vectors_commit_records_checkpoint_t_conflict give a checkpoint marker whose W or T disagrees with the preceding bundle, which reaches the watermark validator rather than the density check. The Layer-5 tests resume_vectors_cross_record_conflict and resume_vectors_empty_checkpoint_authority cover the cross-record checks (the checkpoint journal against the parity journal, and a committed prefix with no checkpoint authority), which report ResumeAppend through one shared helper.\n\nResolved by REM-PARITY §14 step 2 and §3.4: resume-w-greater-than-t and incomplete commit records are ResumeAppend refusals. The shared production resume_record_result boundary preserves journal diagnostics and leaves operational failures unchanged. Both are refused before tape reads or writes; the executor uses that same boundary.\n";
+pub const README: &str = "# Resume review candidates\n\nThe frozen specification-authored expected-cases.json is copied verbatim. Per-case expected.json retains each literal JSON object. Never regenerate expectations from reference behavior. Inputs are the image name, the mutated Section 7.1 committed prefix, W and T, the ordered data_shard_crc64 values for [W, T), and complete appended Object inputs where applicable. The CRC values are 16-digit hexadecimal strings computed from the original committed Object blocks before tape faults; the executor compares them to the actual read-back before parity accumulation. Existing expected outcomes remain unchanged; resume-evidence-mismatch changes one recorded CRC and expects ResumeAppend. These off-tape values are not Section 7.1 wire fields. Kinds use their names and absent fields are null.\n\nMANIFEST.tsv pins every resumed tape file and ALL using the parent manifest's convention. Image bytes are regenerated, not checked in. resume-open-uninterrupted is the same three Objects written by write_tape_image in one session, stopped at CommittedPrefix with zero torn records. The generator's --check checks all resume descriptors, digests and the file set.\n\nThe reference adapter frames v4 off-tape journal records from these claims, then uses FileTapeFileJournal replay and checked_bounded_resume_summary. It does not prevalidate or repair negative inputs. Sidecar metadata hashes are taken from the source image; they are reference journal details, not portable authority. The closed case enters write_owner::checkpoint::open_parity_actor_session and resumes its ordinary ParitySink session; the open case uses rebuild_open_epoch_from_bounded_summary and new_sidecar_only_from_bounded_resume. Both append with ordinary capacity reservation, REM-OBJECT writing, finish_object and checkpoint. No test-only committed-prefix planner is used.\n\nRun cargo test -p remanence-cli -p remanence-api --lib resume_vectors -- --nocapture for PASS, INFORMATIVE and DISAGREEMENT lines. Informative annotations never decide a pass. Pinned errors assert the frozen expectations; record-content failures are classified at the production Resumer boundary.\n\n## Commit-record reporting layer\n\nresume-commit-records is not portable: the journal format is implementation-defined. Existing reference coverage is in remanence-parity's journal::tests::shared_bundle_validator_rejects_ambiguous_or_non_dense_shapes, journal::tests::journal_cbor_rejects_duplicate_and_non_integer_keys, journal::tests::file_journal_preserves_torn_trailing_record_and_fails_closed, journal::tests::file_journal_rejects_header_mismatch, journal::tests::bounded_committed_replay_matches_flattened_authority_and_rejects_orphans, and resume::tests::bounded_resume_fails_closed_on_bot_orphan_and_epoch_discontinuity. These do not establish all four required ResumeAppend outcomes before tape positioning.\n\nThe added reference executor tests are resume_vectors::tests::resume_vectors_commit_records_missing (missing Bootstrap record), resume_vectors::tests::resume_vectors_commit_records_conflicting (two different claims for one Object file), resume_vectors::tests::resume_vectors_commit_records_incomplete (torn checkpoint checksum), and resume_vectors::tests::resume_vectors_commit_records_ambiguous (duplicate Object authority). Each runs journal replay and bounded validation, asserts an empty chaos command log before refusal, and asserts the frozen ResumeAppend error. They are shared with the Layer-5 test build. resume_vectors::tests::resume_vectors_commit_records_checkpoint_w_conflict and resume_vectors_commit_records_checkpoint_t_conflict give a checkpoint marker whose W or T disagrees with the preceding bundle, which reaches the watermark validator rather than the density check. The Layer-5 tests resume_vectors_cross_record_conflict and resume_vectors_empty_checkpoint_authority cover the cross-record checks (the checkpoint journal against the parity journal, and a committed prefix with no checkpoint authority), which report ResumeAppend through one shared helper.\n\nResolved by REM-PARITY §14 step 2 and §3.4: resume-w-greater-than-t and incomplete commit records are ResumeAppend refusals. The shared production resume_record_result boundary preserves journal diagnostics and leaves operational failures unchanged. Both are refused before tape reads or writes; the executor uses that same boundary.\n";
 
 /// Read the emitted portable input; missing fixtures are a hard test failure.
 pub fn recorded_input(id: &str) -> Value {
@@ -842,6 +972,37 @@ mod tests {
     }
 
     #[test]
+    fn resume_vectors_inputs_reproduce() {
+        let source: Value = serde_json::from_str(EXPECTATIONS).unwrap();
+        for case in source["cases"].as_array().unwrap() {
+            if case["portable"] == false {
+                continue;
+            }
+            let id = case["id"].as_str().unwrap();
+            let vector = generate(case["image"].as_str().unwrap()).unwrap();
+            let generated = portable_input(id, &vector);
+            assert_eq!(
+                generated,
+                recorded_input(id),
+                "{id}: recorded input differs"
+            );
+            assert_eq!(
+                generated["data_shard_crc64"].as_array().unwrap().len() as u64,
+                generated["T"]
+                    .as_u64()
+                    .unwrap()
+                    .saturating_sub(generated["W"].as_u64().unwrap())
+            );
+        }
+        let open = recorded_input("resume-open");
+        let mut negative = recorded_input("resume-evidence-mismatch");
+        let old =
+            u64::from_str_radix(negative["data_shard_crc64"][0].as_str().unwrap(), 16).unwrap();
+        negative["data_shard_crc64"][0] = json!(format!("{:016x}", old ^ 1));
+        assert_eq!(negative, open, "negative differs only in its CRC");
+    }
+
+    #[test]
     fn resume_vectors_open() {
         let source: Value = serde_json::from_str(EXPECTATIONS).unwrap();
         let case = source["cases"]
@@ -946,7 +1107,7 @@ mod tests {
             let input = recorded_input(id);
             let temp = tempfile::tempdir().unwrap();
             let (mut drive, world, engine) = model(&vector, &input);
-            let mut trace = ReadTrace::new(DriveHandleRawSource::new(&mut drive));
+            let mut trace = ReadTrace::new(DriveHandleRawSource::new(&mut drive), &input);
             let mut append_lba = None;
             let actual = (|| -> Result<(), ParityError> {
                 let journal = adapt(&input, &vector, &temp.path().join("resume.journal"))?;
@@ -1109,7 +1270,7 @@ mod tests {
             let summary = checked_bounded_resume_summary(&snapshot).unwrap();
             let (fail_at, error) = fail_at.unwrap_or((u64::MAX, locate_timeout));
             let mut source = LocateFault {
-                trace: ReadTrace::new(DriveHandleRawSource::new(&mut drive)),
+                trace: ReadTrace::new(DriveHandleRawSource::new(&mut drive), &input),
                 fail_at,
                 error,
             };
@@ -1187,7 +1348,7 @@ mod tests {
             let input = recorded_input(id);
             let temp = tempfile::tempdir().unwrap();
             let (mut drive, world, engine) = model(&vector, &input);
-            let mut trace = ReadTrace::new(DriveHandleRawSource::new(&mut drive));
+            let mut trace = ReadTrace::new(DriveHandleRawSource::new(&mut drive), &input);
             let actual = (|| -> Result<(), ParityError> {
                 let journal = adapt(&input, &vector, &temp.path().join("resume.journal"))?;
                 let snapshot = resume_record_result(journal.committed_snapshot_bounded())?;

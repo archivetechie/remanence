@@ -96,20 +96,13 @@
           "expected": {
             "result": "refused before any re-read, positioning or write. Step 1 computes T from the commit records as first_parity_data_ordinal(3) + block_count(3) = 4 + (2^64 − 1) = 2^64 + 3, which does not fit in u64. The append point (1+1)+(4+1)+(7+1)+(2^64 − 1 + 1) = 2^64 + 15 does not fit either. Commit-record values that do not fit are ResumeAppend. The exact-value bound T − W < S × k also fails. Nothing on tape is read for [W, T) and no block is written.",
             "error": "ResumeAppend",
-            "sections": [
-              "2.4",
-              "3.2",
-              "3.4",
-              "14",
-              "15",
-              "7.2"
-            ],
+            "sections": ["2.4", "3.2", "3.4", "14", "15", "7.2", "11.3", "11.4"],
             "quotes": [
               "The same rule applies to values from off-tape commit records, which are `ResumeAppend` when they do not fit (Sections 3.4 and 14), and to positions a device reports, which are `TapeIo` when they do not fit or when they go backwards: the device, not the tape, is then at fault.",
               "`TerminalIndexReplicaParse` includes a replica map that describes a position that does not fit (Section 7.2). `ResumeAppend` includes a commit record whose values do not fit, and `TapeIo` a device-reported position that does not fit or goes backwards (Section 2.4).",
               "Derive the committed prefix from the off-tape commit records (Section 3.4), dropping the tape's torn tail, if any, and compute `W` and `T` from it.",
-              "Enforce the version-1 bound: `T − W < S × k` (at most one open epoch).",
-              "**Position to the append point (`Σ(block_count + 1)` over the prefix) before writing anything.**",
+              "Validate the commit records: `T − W < S × k` (the bound Section 11.4 (W4) maintains);",
+              "A Writer starts writing only immediately after the committed prefix, at a position it has proved, and then writes contiguously.",
               "Before a Resumer positions to an append point or writes, the validated combination of the records it relies on MUST determine exactly one committed prefix and its append point.",
               "The append position after the last filemark is not a validity rule of the map; it is a Writer and Resumer concern (Sections 3.4 and 14).",
               "The append point's inputs come from commit records, so its overflow is `ResumeAppend`, and the walk length's inputs are device reports, so its overflow is `TapeIo` (Section 2.4)."
@@ -284,15 +277,10 @@
           "expected": {
             "result": "no rejection. S × k = 2^63 × 2 = 2^64 is only compared in the named roles. The Section 13.3 pin compares k, m and S individually and the ordinal range, and Section 14's bound is T − W < S × k. So the product is compared exactly and never too large: for any u64 T − W the bound holds. No wrapped product (0) may be used; with a wrapped product the bound would wrongly fail.",
             "error": null,
-            "sections": [
-              "2.4",
-              "9.2",
-              "13.3",
-              "14"
-            ],
+            "sections": ["2.4", "9.2", "13.3", "14", "11.4"],
             "quotes": [
               "A value that is only compared is compared exactly, and is never too large.",
-              "Enforce the version-1 bound: `T − W < S × k` (at most one open epoch).",
+              "Validate the commit records: `T − W < S × k` (the bound Section 11.4 (W4) maintains);",
               "Arithmetic on values read from tape MUST be checked; overflow is rejection, never wraparound (Section 16.2)."
             ]
           }

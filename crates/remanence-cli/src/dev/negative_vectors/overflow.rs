@@ -582,6 +582,7 @@ fn hostile_append_point_inputs() -> Result<Value, String> {
     }
     input["committed_prefix"][3]["block_count"] = json!(u64::MAX);
     input["T"] = json!(4);
+    input["data_shard_crc64"] = json!([]); // The claimed [W, T) is empty.
     input.as_object_mut().unwrap().remove("append_object");
     Ok(input)
 }

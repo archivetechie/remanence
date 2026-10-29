@@ -19,13 +19,14 @@
   "pin_reason": "As the parent: commit-record values are off-tape, and Section 2.4 names 'values read from tape'.",
   "pinned": false,
   "quotes": [
-    "**Position to the append point (`Σ(block_count + 1)` over the prefix) before writing anything.**"
+    "A Writer starts writing only immediately after the committed prefix, at a position it has proved, and then writes contiguously."
   ],
   "sections": [
     "3.2",
     "3.4",
     "14",
-    "2.4"
+    "2.4",
+    "11.3"
   ],
   "target": "the Resumer's Σ(block_count + 1) over the prefix (Section 3.2, used at Section 14 step 4 and by any LBA-based positioning in step 3)",
   "violates_only": "Checked evaluation of Σ(block_count + 1): (1+1) + (4+1) + (2^64 - 1 + 1) overflows"
