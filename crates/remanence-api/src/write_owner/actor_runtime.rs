@@ -172,16 +172,6 @@ pub(super) fn changer_loop(
                 }
                 let _ = reply.send(result);
             }
-            ChangerCommand::Refresh { reply } => {
-                let result = changer
-                    .refresh()
-                    .map_err(|err| Status::internal(format!("refresh inventory: {err}")))
-                    .and_then(|()| observe_refreshed_library(&mut index, &cfg, changer.library()));
-                if result.is_ok() {
-                    publish_library_snapshot(&cfg.library_snapshot, changer.library().clone());
-                }
-                let _ = reply.send(result);
-            }
             ChangerCommand::Reconcile { tape_uuid, handle } => {
                 let _exclusive_guard = ExclusiveGuard::from_reserved_library(
                     cfg.reservations.clone(),
@@ -258,9 +248,6 @@ pub(super) fn drain_failed_changer_commands(
                 let _ = reply.send(ownership.complete(Err(Status::internal(message.clone()))));
             }
             ChangerCommand::Move { reply, .. } => {
-                let _ = reply.send(Err(Status::internal(message.clone())));
-            }
-            ChangerCommand::Refresh { reply } => {
                 let _ = reply.send(Err(Status::internal(message.clone())));
             }
             ChangerCommand::Reconcile { handle, .. } | ChangerCommand::Robotics { handle, .. } => {

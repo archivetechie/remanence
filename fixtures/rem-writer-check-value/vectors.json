@@ -1,0 +1,41 @@
+{
+  "cases": [
+    {
+      "name": "empty",
+      "block_crcs": [],
+      "expected": "0000000000000000"
+    },
+    {
+      "name": "one_entry",
+      "block_crcs": [
+        "0123456789abcdef"
+      ],
+      "expected": "5322e1f655ec4276"
+    },
+    {
+      "name": "three_entries",
+      "block_crcs": [
+        "0000000000000000",
+        "0123456789abcdef",
+        "ffffffffffffffff"
+      ],
+      "expected": "8684a1538335fcb5"
+    },
+    {
+      "name": "four_pattern_blocks",
+      "block_pattern": {
+        "block_count": 4,
+        "block_size": 262144,
+        "block_multiplier": 31,
+        "modulus": 251
+      },
+      "block_crcs": [
+        "3889ea9f35e1a9b9",
+        "af1c6dfe0777cbec",
+        "14881fb9c604dba4",
+        "05e064e5da14dc29"
+      ],
+      "expected": "7f60c3b7bc9da364"
+    }
+  ]
+}

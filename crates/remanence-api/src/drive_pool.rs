@@ -305,38 +305,6 @@ impl DrivePool {
             .ok_or_else(|| Status::not_found(format!("{} not available", drive.label())))
     }
 
-    #[cfg(test)]
-    pub(crate) fn reserve_free_drive(&self, library_serial: &str) -> Result<DriveKey, Status> {
-        let mut drives = self
-            .reservations
-            .keys()
-            .filter(|drive| drive.library_serial() == Some(library_serial))
-            .cloned()
-            .collect::<Vec<_>>();
-        drives.sort();
-        drives
-            .into_iter()
-            .find(|drive| {
-                self.reservations.get(drive).is_some_and(|reservation| {
-                    if reservation
-                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                        .is_ok()
-                    {
-                        self.holders.lock().unwrap().remove(drive);
-                        true
-                    } else {
-                        false
-                    }
-                })
-            })
-            .ok_or_else(|| {
-                self.append_holders(
-                    Status::failed_precondition("all drives are busy"),
-                    |drive| drive.library_serial() == Some(library_serial),
-                )
-            })
-    }
-
     pub(crate) fn reserve_drive(&self, drive: &DriveKey) -> Result<DriveReservation, Status> {
         if self.is_shutting_down() {
             return Err(Status::unavailable("drive pool is shutting down"));
@@ -739,8 +707,46 @@ pub(crate) fn release_library_reservations(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Reserve an available library drive for reservation tests.
+    pub(crate) trait ReserveFreeDrive {
+        fn reserve_free_drive(&self, library_serial: &str) -> Result<DriveKey, Status>;
+    }
+
+    impl ReserveFreeDrive for DrivePool {
+        fn reserve_free_drive(&self, library_serial: &str) -> Result<DriveKey, Status> {
+            let mut drives = self
+                .reservations
+                .keys()
+                .filter(|drive| drive.library_serial() == Some(library_serial))
+                .cloned()
+                .collect::<Vec<_>>();
+            drives.sort();
+            drives
+                .into_iter()
+                .find(|drive| {
+                    self.reservations.get(drive).is_some_and(|reservation| {
+                        if reservation
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                        {
+                            self.holders.lock().unwrap().remove(drive);
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                })
+                .ok_or_else(|| {
+                    self.append_holders(
+                        Status::failed_precondition("all drives are busy"),
+                        |drive| drive.library_serial() == Some(library_serial),
+                    )
+                })
+        }
+    }
 
     fn test_pool() -> DrivePool {
         let (changer_a, _) = mpsc::channel(1);

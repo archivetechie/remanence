@@ -38,7 +38,7 @@ import re
 import struct
 import sys
 import uuid as uuid_module
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -151,6 +151,15 @@ def le32(value: int) -> bytes:
 
 def le64(value: int) -> bytes:
     return struct.pack("<Q", value)
+
+
+def check_value(block_crcs: Iterable[int]) -> int:
+    """Compute the Guide's writer check over ordered little-endian block CRCs.
+
+    This detects accidental differences, not deliberate tampering, and is not
+    part of the REM-PARITY format. The implementation uses only Python CRC code.
+    """
+    return crc64_xz(b"".join(le64(block_crc) for block_crc in block_crcs))
 
 
 def digest(data: bytes) -> bytes:

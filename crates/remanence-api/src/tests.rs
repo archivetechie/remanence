@@ -1,3 +1,4 @@
+use crate::drive_pool::tests::ReserveFreeDrive;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::io::Read as _;

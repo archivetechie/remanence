@@ -35,6 +35,7 @@ pub mod bootstrap;
 pub mod bot_recovery;
 pub mod capacity;
 mod cbor;
+pub mod check_value;
 pub mod codec;
 mod diagnostic_text;
 mod durable;
@@ -84,6 +85,7 @@ pub use capacity::{
     CapacityReserveCause, CapacityReserveRemedy, TerminalTripleCloseInput,
     TerminalTripleCloseReport, TerminalTripleObjectReservation,
 };
+pub use check_value::{check_value, CheckValue, CheckValueBuilder};
 pub use diagnostic_text::escape_member_name;
 pub use error::{BootstrapRefusedField, ParityError};
 pub use filemark_map::{

@@ -7,6 +7,78 @@ per-release summaries.
 <!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_backend.rs crates/remanence-state/src/index.rs crates/remanence-library/src/discovery.rs @ 638210f7 -->
 ## Unreleased
 
+- Full verification offers `[verification] route = "one_pass"` in the daemon;
+  the default remains `"walk"`. The one-pass route reads the terminal index
+  first, then reads the protected prefix forward from BOT, measuring files at
+  their filemarks. A clean pass returns the same complete verdict as the walk.
+  An unsuccessful attempt falls back to a fresh walk, except on cancellation;
+  tapes without protected data take the walk directly. Progress and diagnostics
+  report the route, fallback reason and prefix I/O phase. Standalone full
+  verification keeps the walk. The final parity-map read is shared, and recovery
+  of retracted object observations uses batched reads.
+
+- Media readiness resumes automatically after a transient load refusal and
+  after startup reconciliation. Operator-cancelled waits and fences that need
+  release remain under operator control. `rem tape wait-ready --resume <UUID>
+  --endpoint <URI>` attaches to an existing readiness wait or robot load.
+  Detached verification and manual finalization wait up to 15 minutes for a
+  blocking drive to become ready, then retry. A stopped finalization attempt
+  reports failure with a same-key retry instruction and remains resumable.
+- Readiness waits end on shutdown or when their drive actor stops. Robot load
+  operations publish completion after refreshing inventory and releasing the
+  library, and include the durable readiness state and sense. A shutdown that
+  leaves readiness resumable returns exit 10 from `rem tape wait-ready`.
+  The field I/O tool waits through successive fences within one deadline and
+  reports the remaining time and the fence that reaches the deadline.
+
+- Write throughput: `append_staging_mode` defaults to `"overlap"`. Qualified
+  large objects stream to tape through a memory ring while they arrive; the
+  default minimum size is the configured ring capacity, 8 GiB. Admission needs
+  a caller object ID, declared size, binding digest and replay capability.
+  Smaller or unqualified objects use the spool and retain checkpoint batching.
+  Spooling hashes the input once and checks its size before tape motion.
+  Ring admission reserves the smaller of capacity and object size and refuses
+  unavailable memory before receiving payload. Append and checkpoint replies
+  retain committed receipts across pipelined checkpoints and renewal failures.
+- Write throughput: parity encoding selects AVX2, SSSE3 or the portable routine
+  at run time and logs the selected kernel at daemon startup. Releases run on
+  x86-64 CPUs without AVX2, and encoded bytes remain unchanged. Per-object
+  diagnostics report staging mode and reason, prefill lead, feed wait, prepare,
+  transfer and tail timing, time in WRITE commands and host time between them.
+  The field kit records these figures alongside its own measurements and safely
+  shares its CSV output between concurrent callers.
+- Write throughput: daemon checkpoints leave a short parity epoch open and
+  emit sidecars for full epochs. A seated cartridge retains its accumulator
+  between sessions when identity and committed coordinates match; otherwise
+  rebuilding reads each extent forward in batches. Finalization and cartridge
+  removal close the open epoch. Standalone checkpoints still close it at every
+  barrier. Readers treat the open range as unprotected, and `rem catalog tapes
+  --json` and `rem top` show its committed ordinals. Catalog schema 22 records
+  deferred sealing obligations for the next session or finalization.
+
+- Epoch-close fixes: removal projects the checkpoint journal before deciding
+  whether an epoch is open. Cartridges without a journal acquire none on
+  removal; sealed and finalized tapes skip replay. Unknown state and transient
+  failures are audited without fencing, and removal proceeds. Contradictions
+  in committed tape data or uncertain write durability fence the tape;
+  admission contradictions also fence a session open. A medium error beyond
+  the committed end is reported at that suffix location.
+- Checkpoint and finalization fixes: a deferred seal is recorded in the same
+  journal fsync as its checkpoint and survives catalog rebuild. Terminal
+  checkpoint replay also advances the protected ordinal. Finalization planning
+  retains tape and drive reservations until its commands finish, even if the
+  request is cancelled, and waits for media readiness. Disconnecting after
+  durable acceptance leaves finalization running; an earlier disconnect allows
+  the same idempotency key to plan again.
+
+- Tape-position reporting includes the logical file identifier and its validity
+  flags. Reads ending at a filemark or end of data credit only confirmed whole
+  blocks, and an unknown logical position invalidates cached cursors.
+  `rem-debug tape read-rate` reports `unconfirmed_boundary` when the transfer
+  count cannot establish the boundary. The in-progress REM-PARITY specification
+  permits a full verification in parts when every part validates a terminal
+  replica and the report gives the first start and last completion times.
+
 - Full tape verification runs as a watchable, cancellable daemon operation.
   `rem tape verify-index --detach` starts it and `--result <UUID>` fetches its
   retained verdict. Drive refusals name reservation holders; completed verdicts
