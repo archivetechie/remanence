@@ -54,3 +54,14 @@ pub(crate) use no_parity::maybe_replay_pool_write;
 
 #[cfg(test)]
 mod tests;
+
+/// Give each test catalog its own durable audit authority.
+#[cfg(test)]
+fn test_fence_config(root: &std::path::Path) -> crate::write_owner::TerminalWriteConfig {
+    crate::write_owner::TerminalWriteConfig {
+        checkpoint_journal_dir: root.join("checkpoints"),
+        audit_dir: root.join("audit"),
+        audit_fsync: true,
+        audit_append_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+    }
+}

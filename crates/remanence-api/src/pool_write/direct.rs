@@ -106,6 +106,7 @@ pub fn write_object_to_pool(
     pool_cfg: &TapePoolConfig,
     request: WriteObjectToPoolRequest,
 ) -> Result<PoolWriteResult, PoolWriteError> {
+    let fence_cfg = &super::test_fence_config(state.path().parent().expect("catalog parent"));
     ensure_request_pool_matches_config(&request, pool_cfg)?;
     if let Some(result) = maybe_replay_pool_write(state, pool_cfg, &request)? {
         return Ok(result);
@@ -115,6 +116,7 @@ pub fn write_object_to_pool(
     let selected = select_tape_in_pool(state, pool_cfg, source_size, &reserved_tape_uuids)?;
     write_to_selected_tape_inner(
         state,
+        fence_cfg,
         sink,
         pool_cfg,
         request,
@@ -329,6 +331,7 @@ pub(super) fn build_direct_terminal_plan(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn execute_direct_terminal_tail(
     state: &mut CatalogIndex,
+    fence_cfg: &crate::write_owner::TerminalWriteConfig,
     sink: &mut dyn BlockSink,
     checkpoint: &mut remanence_state::FileCheckpointJournalLease,
     previous: &remanence_state::CheckpointJournalRecord,
@@ -465,6 +468,7 @@ pub(super) fn execute_direct_terminal_tail(
             };
             Err(fence_after_terminal_motion(
                 state,
+                fence_cfg,
                 selected,
                 "terminal_finalization",
                 error,
@@ -497,6 +501,7 @@ pub(super) fn publish_direct_terminal_intent(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn finalize_direct_checkpoint_prefix(
     state: &mut CatalogIndex,
+    fence_cfg: &crate::write_owner::TerminalWriteConfig,
     pool_cfg: &TapePoolConfig,
     sink: &mut dyn BlockSink,
     checkpoint: &mut remanence_state::FileCheckpointJournalLease,
@@ -539,6 +544,7 @@ pub(super) fn finalize_direct_checkpoint_prefix(
             publish_direct_terminal_intent(state, checkpoint, selected, &intent)?;
             execute_direct_terminal_tail(
                 state,
+                fence_cfg,
                 sink,
                 checkpoint,
                 previous,
@@ -584,6 +590,7 @@ pub(super) fn finalize_direct_checkpoint_prefix(
             publish_direct_terminal_intent(state, checkpoint, selected, &intent)?;
             execute_direct_terminal_tail(
                 state,
+                fence_cfg,
                 sink,
                 checkpoint,
                 previous,
@@ -636,6 +643,12 @@ pub(crate) fn write_to_selected_drive_checkpointed_reconciled(
     request: WriteObjectToPoolRequest,
     selected: SelectedTape,
 ) -> Result<PoolWriteResult, PoolWriteError> {
+    let fence_cfg = &crate::write_owner::TerminalWriteConfig {
+        checkpoint_journal_dir: state.paths().journal_dir.join("checkpoints"),
+        audit_dir: state.paths().audit_dir.clone(),
+        audit_fsync: true,
+        audit_append_lock: Arc::new(std::sync::Mutex::new(())),
+    };
     let pool_cfg = configured_direct_pool(state, &request.pool_id)?;
     let checkpoint_journal_dir = state.paths().journal_dir.join("checkpoints");
     let parity_journal_path = state.journal_path(selected.tape_uuid);
@@ -646,6 +659,7 @@ pub(crate) fn write_to_selected_drive_checkpointed_reconciled(
     .map_err(PoolWriteError::InvalidInput)?;
     let result = write_to_selected_drive_checkpointed_with_catalog(
         state.catalog_index(),
+        fence_cfg,
         drive,
         &pool_cfg,
         request,
@@ -653,7 +667,9 @@ pub(crate) fn write_to_selected_drive_checkpointed_reconciled(
         checkpoint_journal_dir.as_path(),
         parity_journal_path.as_path(),
         &resources,
-    )?;
+    );
+    state.refresh_audit_append_cursor()?;
+    let result = result?;
     finish_direct_write_host_suffix(state, &result)?;
     Ok(result)
 }
@@ -717,6 +733,7 @@ pub(super) fn configured_direct_pool(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn write_to_selected_drive_checkpointed_with_catalog(
     state: &mut CatalogIndex,
+    fence_cfg: &crate::write_owner::TerminalWriteConfig,
     drive: &mut DriveHandle,
     pool_cfg: &TapePoolConfig,
     request: WriteObjectToPoolRequest,
@@ -774,6 +791,7 @@ pub(super) fn write_to_selected_drive_checkpointed_with_catalog(
         .map_err(|e| PoolWriteError::InvalidInput(e.to_string()))?;
     let appended = write_to_selected_tape_checkpointed_after_preflight(
         state,
+        fence_cfg,
         &mut DriveHandleSink(drive),
         pool_cfg,
         request,
@@ -789,6 +807,7 @@ pub(super) fn write_to_selected_drive_checkpointed_with_catalog(
     }
     finish_checkpointed_append(
         state,
+        fence_cfg,
         &mut DriveHandleSink(drive),
         pool_cfg,
         &selected,
@@ -879,6 +898,7 @@ pub(super) fn write_to_selected_tape_checkpointed(
     parity_journal_path: &Path,
     resources: &PoolWriteResources,
 ) -> Result<PoolWriteResult, PoolWriteError> {
+    let fence_cfg = &super::test_fence_config(state.path().parent().expect("catalog parent"));
     let preflight =
         prepare_checkpointed_write(state, pool_cfg, &request, &selected, checkpoint_journal_dir)?;
     let (checkpoint_lease, prior_records) = match preflight {
@@ -890,6 +910,7 @@ pub(super) fn write_to_selected_tape_checkpointed(
     };
     let appended = write_to_selected_tape_checkpointed_after_preflight(
         state,
+        fence_cfg,
         sink,
         pool_cfg,
         request,
@@ -902,6 +923,7 @@ pub(super) fn write_to_selected_tape_checkpointed(
     )?;
     finish_checkpointed_append(
         state,
+        fence_cfg,
         sink,
         pool_cfg,
         &selected,
@@ -913,6 +935,7 @@ pub(super) fn write_to_selected_tape_checkpointed(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn write_to_selected_tape_checkpointed_after_preflight(
     state: &mut CatalogIndex,
+    fence_cfg: &crate::write_owner::TerminalWriteConfig,
     sink: &mut dyn BlockSink,
     pool_cfg: &TapePoolConfig,
     request: WriteObjectToPoolRequest,
@@ -960,6 +983,7 @@ pub(super) fn write_to_selected_tape_checkpointed_after_preflight(
                 let append = first_batched_append_context(state, &selected, &prior_records)?;
                 let result = write_batched_to_selected_tape_after_replay_check(
                     state,
+                    fence_cfg,
                     sink,
                     pool_cfg,
                     request,
@@ -1151,6 +1175,7 @@ pub(super) fn write_to_selected_tape_checkpointed_after_preflight(
                     Err(error) if raw_write_attempted => {
                         return Err(fence_after_terminal_motion(
                             state,
+                            fence_cfg,
                             &selected,
                             "parity_append",
                             error,
@@ -1278,6 +1303,7 @@ pub(super) struct CheckpointedAppend {
 }
 fn finish_checkpointed_append(
     state: &mut CatalogIndex,
+    fence_cfg: &crate::write_owner::TerminalWriteConfig,
     sink: &mut dyn BlockSink,
     pool_cfg: &TapePoolConfig,
     selected: &SelectedTape,
@@ -1300,6 +1326,7 @@ fn finish_checkpointed_append(
             ParityConfig::None => {
                 finalize_direct_checkpoint_prefix(
                     state,
+                    fence_cfg,
                     pool_cfg,
                     sink,
                     &mut checkpoint_lease,
@@ -1325,6 +1352,7 @@ fn finish_checkpointed_append(
                 .map_err(ParityError::from)?;
                 finalize_direct_checkpoint_prefix(
                     state,
+                    fence_cfg,
                     pool_cfg,
                     sink,
                     &mut checkpoint_lease,
@@ -1400,8 +1428,10 @@ pub(crate) fn write_to_selected_tape_with_live_counter(
     selected: SelectedTape,
     live_write_counter: Option<Arc<crate::DriveByteCounters>>,
 ) -> Result<PoolWriteResult, PoolWriteError> {
+    let fence_cfg = &super::test_fence_config(state.path().parent().expect("catalog parent"));
     write_to_selected_tape_with_live_counter_impl(
         state,
+        fence_cfg,
         sink,
         pool_cfg,
         request,
@@ -1413,8 +1443,10 @@ pub(crate) fn write_to_selected_tape_with_live_counter(
 }
 
 /// Write one parity-off object into a server-owned provisional batch.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_batched_to_selected_tape_after_replay_check(
     state: &mut CatalogIndex,
+    fence_cfg: &crate::write_owner::TerminalWriteConfig,
     sink: &mut dyn BlockSink,
     pool_cfg: &TapePoolConfig,
     request: WriteObjectToPoolRequest,
@@ -1429,6 +1461,7 @@ pub(crate) fn write_batched_to_selected_tape_after_replay_check(
     }
     write_to_selected_tape_with_live_counter_impl(
         state,
+        fence_cfg,
         sink,
         pool_cfg,
         request,
@@ -1641,6 +1674,7 @@ pub(crate) fn write_batched_parity_to_selected_tape_after_replay_check(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn write_to_selected_tape_with_live_counter_impl(
     state: &mut CatalogIndex,
+    fence_cfg: &crate::write_owner::TerminalWriteConfig,
     sink: &mut dyn BlockSink,
     pool_cfg: &TapePoolConfig,
     request: WriteObjectToPoolRequest,
@@ -1655,6 +1689,7 @@ pub(super) fn write_to_selected_tape_with_live_counter_impl(
                 LiveCounterBlockSink::new(sink, counter, selected.block_size);
             write_to_selected_tape_inner(
                 state,
+                fence_cfg,
                 &mut live_counted_sink,
                 pool_cfg,
                 request,
@@ -1665,6 +1700,7 @@ pub(super) fn write_to_selected_tape_with_live_counter_impl(
         }
         None => write_to_selected_tape_inner(
             state,
+            fence_cfg,
             sink,
             pool_cfg,
             request,
@@ -1675,8 +1711,10 @@ pub(super) fn write_to_selected_tape_with_live_counter_impl(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn write_to_selected_tape_inner<S: BlockSink + ?Sized>(
     state: &mut CatalogIndex,
+    fence_cfg: &crate::write_owner::TerminalWriteConfig,
     sink: &mut S,
     pool_cfg: &TapePoolConfig,
     request: WriteObjectToPoolRequest,
@@ -1786,6 +1824,7 @@ pub(super) fn write_to_selected_tape_inner<S: BlockSink + ?Sized>(
         }
         ParityConfig::None => write_no_parity_object_to_selected_tape(
             state,
+            fence_cfg,
             &mut counted_sink,
             pool_cfg,
             request,

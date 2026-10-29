@@ -372,6 +372,8 @@ fn uncertain_write_cut_is_durably_fenced_even_after_an_earlier_checkpoint() {
         .list_active_tape_io_fences()
         .unwrap()
         .is_empty());
+    let audit_dir = state.paths().audit_dir.clone();
+    crate::tests::assert_fences_survive_empty_rebuild(state.catalog_index(), &audit_dir);
     let records = remanence_state::FileAuditLog::replay(&state.paths().audit_dir).unwrap();
     let mut rebuilt = CatalogIndex::open(root.path().join("rebuilt.sqlite")).unwrap();
     rebuilt.replay_audit_records(&records).unwrap();
@@ -616,7 +618,7 @@ fn parity_import_rejects_a_missing_partner_and_validates_the_complete_pair() {
 }
 
 #[test]
-fn combined_transport_and_audit_failure_latches_and_persists_quarantine() {
+fn combined_transport_and_audit_failure_latches_until_recovery_persists_quarantine() {
     let root = tempfile::tempdir().unwrap();
     let mut state = state(root.path());
     let world = world();
@@ -646,7 +648,7 @@ fn combined_transport_and_audit_failure_latches_and_persists_quarantine() {
         .write_checkpointed(&mut mounted, request(root.path(), "cut"))
         .is_err());
     assert!(backend.unusable);
-    assert!(!backend
+    assert!(backend
         .state
         .catalog_index()
         .list_active_tape_io_fences()
@@ -663,6 +665,17 @@ fn combined_transport_and_audit_failure_latches_and_persists_quarantine() {
     }
     assert_eq!(mounted.drive.media_write_dispatch_count(), count);
     backend.release(mounted);
+    // The durable open session supplies recovery evidence once audit storage returns.
+    let recovered = self::backend(
+        &mut state,
+        &world,
+        &root.path().join("locks"),
+        self::fault(),
+    )
+    .unwrap();
+    drop(recovered);
+    let audit_dir = state.paths().audit_dir.clone();
+    crate::tests::assert_fences_survive_empty_rebuild(state.catalog_index(), &audit_dir);
 }
 
 #[test]
@@ -2008,6 +2021,8 @@ fn standalone_fence_release_rebuild_preserves_endpoint_and_ack() {
         .unwrap()
         .pop()
         .unwrap();
+    let audit_dir = state.paths().audit_dir.clone();
+    crate::tests::assert_fences_survive_empty_rebuild(state.catalog_index(), &audit_dir);
     assert!(standalone_fence_releasable(&fence));
     crate::startup_guard::reject_active_tape_io_fences_on_startup(state.catalog_index()).unwrap();
     state
@@ -2620,4 +2635,40 @@ async fn multi_tape_write_history_rebuild_preserves_safety_projections() {
         .await;
     }
     crate::write_owner::tests::assert_rebuild_safety_equivalent(&mut state);
+}
+
+/// An uncertain bootstrap rewrite leaves replayable supersede failure evidence.
+#[test]
+fn supersede_tail_failure_fence_survives_empty_catalog_rebuild() {
+    let root = tempfile::tempdir().unwrap();
+    let mut state = state(root.path());
+    let world = world();
+    world
+        .lock()
+        .unwrap()
+        .tapes
+        .get_mut("HAND")
+        .unwrap()
+        .records
+        .truncate(1);
+    let cut = fault();
+    let mut mount = backend(
+        &mut state,
+        &world,
+        &root.path().join("locks"),
+        Arc::clone(&cut),
+    )
+    .unwrap();
+    let mut mounted = mount.mount(target()).unwrap();
+    *cut.lock().unwrap() = Some(0x0a);
+    assert!(mount
+        .supersede_tail(&mut mounted, "HAND", |_, _| Ok(()))
+        .is_err());
+    assert!(cut.lock().unwrap().is_none(), "the write fault must fire");
+    mount.release(mounted);
+    let audit_dir = state.paths().audit_dir.clone();
+    let fences = state.catalog_index().list_active_tape_io_fences().unwrap();
+    assert_eq!(fences.len(), 1);
+    assert_eq!(fences[0].reason, "supersede_tail_failed");
+    crate::tests::assert_fences_survive_empty_rebuild(state.catalog_index(), &audit_dir);
 }

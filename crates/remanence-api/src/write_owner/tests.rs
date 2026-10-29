@@ -2536,6 +2536,7 @@ fn first_parity_raw_write_failure_persists_and_audits_partial_fence() {
 
     assert_eq!(status.code(), tonic::Code::Internal);
     assert!(audited, "the exact persisted fence must be audited");
+    crate::tests::assert_fences_survive_empty_rebuild(&index, &audit_dir);
     let active = index
         .tape_io_admission_conflicts(&tape_uuid, None)
         .expect("active tape-I/O fence");
@@ -13362,6 +13363,7 @@ fn admission_fence_evidence_omits_closed_and_unknown_ranges() {
         let fences = index.list_active_tape_io_fences().unwrap();
         assert_eq!(fences.len(), 1);
         assert_eq!(fences[0].reason, "admission_contradiction");
+        crate::tests::assert_fences_survive_empty_rebuild(&index, &cfg.audit_dir);
         let evidence: serde_json::Value =
             serde_json::from_str(fences[0].evidence_json.as_deref().unwrap()).unwrap();
         assert_eq!(evidence["phase"], "append_admission");
@@ -14339,6 +14341,7 @@ async fn check_epoch_removal(
         }
         if matches!(case, "open_admission_blank" | "open_admission_medium") {
             assert_eq!(fences[0].reason, "admission_contradiction");
+            crate::tests::assert_fences_survive_empty_rebuild(&index, &cfg.audit_dir);
             assert_eq!(evidence["phase"], "append_admission");
         }
         assert!(!evidence["error"].as_str().unwrap().is_empty());
@@ -15010,4 +15013,56 @@ fn catalog_lock_refusal_logs_write_session_context() {
     ] {
         assert!(log.contains(expected), "missing {expected}: {log}");
     }
+}
+
+/// A failed checkpoint batch retains its fence when the catalog disappears.
+#[test]
+fn checkpoint_batch_fence_survives_empty_catalog_rebuild() {
+    let temp = tempfile::tempdir().unwrap();
+    let index_path = temp.path().join("state.sqlite");
+    let mut index = CatalogIndex::open(&index_path).unwrap();
+    let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
+        "LIB-CHECKPOINT-FENCE",
+        0x0100,
+        "DRV-CHECKPOINT-FENCE",
+        0x0400,
+        1,
+    )));
+    let mut library = open_model_library(world);
+    let cfg = test_write_owner_config(
+        index_path,
+        temp.path().join("audit"),
+        &library,
+        library_snapshot_cell(library.library().clone()),
+    );
+    let selected = SelectedTape {
+        standalone_endpoint: Some(remanence_library::DriveKey::Standalone {
+            drive_serial: "CHECKPOINT-FENCE".into(),
+        }),
+        pool_id: "checkpoint-fence".into(),
+        tape_uuid: [0x46; 16],
+        block_size: 4096,
+        parity_config: ParityConfig::None,
+    };
+    let policy = remanence_library::StaticAllowlist::new(["LIB-CHECKPOINT-FENCE"]);
+    let mut drive = library.open_drive(0x0100, &policy).unwrap();
+    let journal =
+        FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, selected.tape_uuid).unwrap();
+    let lease = journal.acquire_exclusive().unwrap();
+    let batch = super::checkpoint::PendingCheckpointBatch::new(std::time::Duration::from_secs(1));
+    super::checkpoint::fence_failed_checkpoint_batch(
+        &mut drive,
+        &lease,
+        None,
+        &mut index,
+        &cfg,
+        &selected,
+        &batch,
+        Status::unavailable("checkpoint barrier fails"),
+    );
+    assert_eq!(
+        index.list_active_tape_io_fences().unwrap()[0].reason,
+        "checkpoint_barrier_failed"
+    );
+    crate::tests::assert_fences_survive_empty_rebuild(&index, &cfg.audit_dir);
 }

@@ -9967,3 +9967,53 @@ async fn catalog_caller_id_requires_pool_when_two_pools_hold_it() {
         }
     }
 }
+
+/// Compare every active fence field against a rebuild with no catalog fallback.
+pub(crate) fn assert_fences_survive_empty_rebuild(
+    index: &remanence_state::CatalogIndex,
+    audit_dir: &std::path::Path,
+) {
+    let records = remanence_state::FileAuditLog::replay(audit_dir).unwrap();
+    let expected = index.list_active_tape_io_fences().unwrap();
+    assert!(
+        !expected.is_empty(),
+        "the caller must exercise its fence path"
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let mut rebuilt =
+        remanence_state::CatalogIndex::open(temp.path().join("empty.sqlite")).unwrap();
+    rebuilt
+        .rebuild_from_authoritative_sources(&records, &[])
+        .unwrap();
+    assert_eq!(
+        rebuilt.list_active_tape_io_fences().unwrap().len(),
+        expected.len()
+    );
+    for fence in expected {
+        let mut actual = rebuilt
+            .tape_io_fence_by_quarantine_id(&fence.quarantine_id)
+            .unwrap()
+            .unwrap();
+        actual.fence_id = fence.fence_id;
+        assert_eq!(actual, fence);
+        assert_eq!(
+            records
+                .iter()
+                .filter(
+                    |record| record.event == remanence_state::AuditEvent::TapeIoFenceRaised
+                        && record.subject.id.as_deref() == Some(&fence.quarantine_id)
+                )
+                .count(),
+            1
+        );
+    }
+    let before = rebuilt.list_active_tape_io_fences().unwrap();
+    for _ in 0..2 {
+        remanence_state::fence::reconcile(&mut rebuilt, audit_dir).unwrap();
+        assert_eq!(rebuilt.list_active_tape_io_fences().unwrap(), before);
+    }
+    assert_eq!(
+        remanence_state::FileAuditLog::replay(audit_dir).unwrap(),
+        records
+    );
+}

@@ -1,13 +1,11 @@
 //! Write-session state, append handling, close, and media preparation.
 
-use std::collections::BTreeMap;
 use std::time::{Duration as StdDuration, Instant};
 
-use ciborium::value::Value as CborValue;
 use remanence_library::{DriveHandle, DriveHandleSink, DriveHandleSource, TapeConfig};
 use remanence_parity::DriveHandleRawSink;
 use remanence_state::{
-    AuditActor, AuditEvent, CatalogIndex, SourceLayer, TapeIoFenceRecord, TapePoolConfig,
+    AuditActor, AuditEvent, CatalogIndex, TapeIoFenceRecord, TapePoolConfig,
     TerminalFinalizationOutcome, TerminalFinalizationProjectionInput,
 };
 use tokio::sync::{mpsc, oneshot};
@@ -16,8 +14,8 @@ use uuid::Uuid;
 
 use super::actor_protocol::DriveCommand;
 use super::actor_runtime::{
-    insert_optional_audit_text, record_session_close_snapshot, record_session_event,
-    record_session_snapshot, OpenWriteActorRequest, SessionAuditInput, WriteOwnerConfig,
+    record_session_close_snapshot, record_session_event, record_session_snapshot,
+    OpenWriteActorRequest, SessionAuditInput, WriteOwnerConfig,
 };
 use super::checkpoint::{
     arm_checkpoint_idle_close, arm_checkpoint_timer, extend_durable_checkpoint_records,
@@ -40,9 +38,7 @@ use super::{
     AppendFinishOutcome, CheckpointTrigger, CloseWriteActorDiagnostics, CloseWriteActorReply,
     SelectedTape, SessionOpenReadinessContext, TapeUuid,
 };
-use crate::audit_projection::{
-    append_and_project_audit, ensure_tape_sealed_audit, ProjectedAuditInput,
-};
+use crate::audit_projection::ensure_tape_sealed_audit;
 use crate::{
     pb, status_from_state_error, verify_tape_identity, PoolWriteError, WriteObjectToPoolRequest,
 };
@@ -546,6 +542,7 @@ impl WriteSessionState<'_> {
                         self.next_batched_append = Some(append.clone());
                         crate::pool_write::write_batched_to_selected_tape_after_replay_check(
                             self.index,
+                            &super::terminal_types::TerminalConfig::terminal_config(cfg),
                             &mut sink,
                             &pool_cfg,
                             request,
@@ -892,7 +889,6 @@ impl WriteSessionState<'_> {
                 }
                 let original_error = err.to_string();
                 let mut status = status_from_pool_write_error(err);
-                let mut fence_audited_here = false;
                 if tape_started {
                     let failed_batch = self.pending_batch.take();
                     if let Some(batch) = failed_batch.as_ref() {
@@ -927,11 +923,6 @@ impl WriteSessionState<'_> {
                             status,
                         );
                         status = fenced.0;
-                        // The helper either audits the exact fence it just
-                        // persisted or returns an error describing why it
-                        // could not. Never fall back to auditing an unrelated
-                        // "latest" active fence for this write failure.
-                        fence_audited_here = true;
                     } else if let Some(batch) = failed_batch.as_ref() {
                         status = fence_failed_checkpoint_batch(
                             self.drive,
@@ -945,7 +936,6 @@ impl WriteSessionState<'_> {
                             batch,
                             status,
                         );
-                        fence_audited_here = true;
                     } else if let Err(error) = crate::append_admission::abandon_pending_append(
                         self.drive,
                         &self.checkpoint_lease,
@@ -964,7 +954,6 @@ impl WriteSessionState<'_> {
                             status,
                         )
                         .0;
-                        fence_audited_here = true;
                     }
                 }
                 tracing::info!(
@@ -987,15 +976,6 @@ impl WriteSessionState<'_> {
                     throughput_mib_s = crate::diagnostics::mib_per_s(source_size, append_elapsed),
                     "remanence_write_diag",
                 );
-                if !fence_audited_here {
-                    if let Err(audit_err) =
-                        append_latest_tape_io_fence_evidence(self.index, cfg, selected.tape_uuid)
-                    {
-                        tracing::warn!(
-                            "failed to append tape-I/O fence evidence after write error: {audit_err}"
-                        );
-                    }
-                }
                 record_session_snapshot(
                     self.index,
                     cfg,
@@ -2235,22 +2215,6 @@ pub(super) fn handle_drive_open_write(
     }
 }
 
-pub(super) fn append_latest_tape_io_fence_evidence(
-    index: &mut CatalogIndex,
-    cfg: &WriteOwnerConfig,
-    tape_uuid: [u8; 16],
-) -> Result<(), Status> {
-    let fence = index
-        .list_active_tape_io_fences()
-        .map_err(crate::status_from_state_error)?
-        .into_iter()
-        .find(|fence| fence.tape_uuid.as_slice() == tape_uuid);
-    let Some(fence) = fence else {
-        return Ok(());
-    };
-    append_tape_io_fence_evidence(index, cfg, &fence, AuditEvent::TapeIoFenceRaised)
-}
-
 pub(super) fn append_tape_sealed_evidence(
     index: &mut CatalogIndex,
     cfg: &WriteOwnerConfig,
@@ -2264,48 +2228,18 @@ pub(super) fn append_tape_sealed_evidence(
     )
 }
 
-pub(crate) fn append_tape_io_fence_evidence(
+/// Raise a fence under the same append lock as the other daemon audit writers.
+pub(crate) fn raise_tape_io_fence(
     index: &mut CatalogIndex,
     cfg: &impl super::terminal_types::TerminalConfig,
-    fence: &TapeIoFenceRecord,
-    event: AuditEvent,
-) -> Result<(), Status> {
-    let cfg = &cfg.terminal_config();
-    let mut detail = BTreeMap::from([
-        (
-            "tape_uuid".to_string(),
-            CborValue::Bytes(fence.tape_uuid.clone()),
-        ),
-        (
-            "quarantine_id".to_string(),
-            CborValue::Text(fence.quarantine_id.clone()),
-        ),
-        ("reason".to_string(), CborValue::Text(fence.reason.clone())),
-    ]);
-    insert_optional_audit_text(&mut detail, "barcode", fence.barcode.as_ref());
-    insert_optional_audit_text(&mut detail, "evidence_json", fence.evidence_json.as_ref());
-    insert_optional_audit_text(&mut detail, "release_ack", fence.release_ack.as_ref());
-    if let Some(endpoint) = &fence.endpoint {
-        detail.insert("endpoint_key".into(), CborValue::Text(endpoint.encode()));
-    }
-    append_and_project_audit(
-        index,
-        cfg.audit_dir.as_path(),
-        cfg.audit_fsync,
-        &cfg.audit_append_lock,
-        ProjectedAuditInput {
-            actor: AuditActor::System,
-            source_layer: SourceLayer::Layer4,
-            operation_id: None,
-            session_id: None,
-            idempotency_key: None,
-            event,
-            subject_kind: "tape_io_fence",
-            subject_id: Some(fence.quarantine_id.clone()),
-            detail,
-        },
-    )?;
-    Ok(())
+    input: remanence_state::TapeIoFenceInput,
+    endpoint: Option<&remanence_library::DriveKey>,
+) -> Result<TapeIoFenceRecord, remanence_state::StateError> {
+    let cfg = cfg.terminal_config();
+    let _guard = cfg.audit_append_lock.lock().map_err(|_| {
+        remanence_state::StateError::IndexCorrupt("audit append lock poisoned".into())
+    })?;
+    remanence_state::fence::raise(index, &cfg.audit_dir, input, endpoint, AuditActor::System)
 }
 
 /// Run the load-time wrap-map harvest for a freshly mounted cartridge
