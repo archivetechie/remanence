@@ -222,10 +222,18 @@ promise. `rem-daemon` serves seven services:
 | `Daemon` | health, version, operation lifecycle (get/list/cancel/watch) |
 | `LibraryService` | inventory, drive stewardship, alarms, live status (incl. an advisory `drive_assignments` projection of the per-bay reservation state, for an external arbitration client — read-only, cannot gate a mount), robotics (move/load/unload); `ImportElement`, `ExportElement` and `StreamLibraryEvents` are defined but return unimplemented |
 | `Catalog` | tapes, pools, tape files, object enumeration, catalog units, reconcile; `StartTapeVerification` starts a cancellable `tape_verification` operation, `GetTapeVerification` fetches its retained verdict, and `VerifyTapeIndex` starts and waits for the same operation; scoped and paginated enumeration is not implemented (only the unscoped, unpaginated case works) |
-| `WriteSessionService` | open (pool and pinned-tape targets — drive targets are unimplemented), client-streamed append, explicit checkpoint, close, abort; opt-in batched durability is parity-off only; write-session restart (`recover_session_id`) is not implemented, and the restart support described under [The read path](#the-read-path) covers reads only |
+| `WriteSessionService` | open (pool and pinned-tape targets — drive targets are unimplemented), client-streamed append, explicit checkpoint, close, abort; checkpoint-batched durability applies to parity and no-parity tapes; write-session restart (`recover_session_id`) is not implemented, and the restart support described under [The read path](#the-read-path) covers reads only |
 | `ReadSessionService` | open (tape targets only), server-streamed object/file/byte-range reads, close; `OpenReadSession` accepts an optional resume target, so a client that lost its session in a restart can reopen against durable coordinates (tape UUID, object/file id, file-boundary offset); see [The read path](#the-read-path) |
 | `ReadPlanService` | `PlanBatchRead` — an advisory read-ordering RPC for a batch of targets on one tape; it moves no tape, and no client in this repository calls it; see [Read-order planning](#read-order-planning) |
 | `Audit` | registered on both the Unix socket and mTLS TCP listeners; its one RPC, `QueryAudit`, streams the append-only audit log back incrementally paged |
+
+Checkpoint batching defaults to 32 GiB of pending logical bytes, 200 pending
+objects, or a 300 second batch age. The byte threshold counts logical object
+bytes, not physical tape bytes. The daemon starts the age timer when it opens
+a pending batch; the timer queues a checkpoint through the drive actor, so an
+in-flight object finishes before the barrier runs. Explicit checkpoint and
+close also commit the pending batch. See the
+[checkpoint settings](reference-configuration.md) for configuration.
 
 The daemon listens on a Unix socket and, optionally, on an mTLS TCP listener
 (TCP with mutual TLS certificate authentication). Both use 4 MiB HTTP/2

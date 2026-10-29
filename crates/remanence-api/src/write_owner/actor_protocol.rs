@@ -62,10 +62,6 @@ pub(crate) enum ChangerCommand {
         dst: u16,
         reply: oneshot::Sender<Result<(), Status>>,
     },
-    #[expect(dead_code, reason = "Phase 3a command shape includes explicit refresh")]
-    Refresh {
-        reply: oneshot::Sender<Result<(), Status>>,
-    },
     Reconcile {
         tape_uuid: [u8; 16],
         handle: crate::operations::OperationHandle,

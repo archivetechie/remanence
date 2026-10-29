@@ -64,6 +64,29 @@ def tearDownModule() -> None:
 
 
 class ArithmeticTests(unittest.TestCase):
+    def test_writer_check_value_vectors(self) -> None:
+        """Check the Guide's writer vectors and rederive each patterned block CRC."""
+        path = impl.REPO_ROOT / "fixtures" / "rem-writer-check-value" / "vectors.json"
+        cases = json.loads(path.read_text())["cases"]
+        self.assertEqual(len(cases), 4)
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                for value in [*case["block_crcs"], case["expected"]]:
+                    self.assertRegex(value, r"^[0-9a-f]{16}$")
+                crcs = [int(value, 16) for value in case["block_crcs"]]
+                if "block_pattern" in case:
+                    pattern = case["block_pattern"]
+                    self.assertEqual(pattern["block_count"], 4)
+                    self.assertEqual(pattern["block_size"], 256 * 1024)
+                    self.assertEqual(len(crcs), pattern["block_count"])
+                    for i, expected in enumerate(crcs):
+                        block = bytes(
+                            (i * pattern["block_multiplier"] + j) % pattern["modulus"]
+                            for j in range(pattern["block_size"])
+                        )
+                        self.assertEqual(impl.crc64_xz(block), expected)
+                self.assertEqual(impl.check_value(iter(crcs)), int(case["expected"], 16))
+
     def test_crc64_vectors_section_5_1(self) -> None:
         vectors = [
             (b"123456789", 0x995DC9BBDF1939FA),
