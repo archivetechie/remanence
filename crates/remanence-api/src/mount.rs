@@ -2561,6 +2561,34 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
                 .as_ref()
                 .and_then(|parked| parked.seated.prior_session_id),
         };
+        // A fenced cartridge is left alone: it stays seated, and the fence names it.
+        let fenced = state.index().and_then(|index| {
+            index
+                .tape_io_is_fenced(
+                    seated.tape_uuid.as_ref(),
+                    seated.barcode.as_deref(),
+                    Some(&drive_key),
+                )
+                .map_err(crate::status_from_state_error)
+        });
+        match fenced {
+            Ok(false) => {}
+            Ok(true) => {
+                tracing::warn!(
+                    library = %library_serial,
+                    bay = *bay,
+                    barcode = ?seated.barcode,
+                    "fenced cartridge stays seated at shutdown; release the fence to unload it"
+                );
+                drop(reservation);
+                continue;
+            }
+            Err(err) => {
+                failures.push(format!("{} bay 0x{:04x}: {err}", *library_serial, *bay));
+                drop(reservation);
+                continue;
+            }
+        }
         if let Err(err) =
             dismount_reserved_cartridge(state, pool, &seated, DismountReason::Shutdown, reservation)
                 .await
