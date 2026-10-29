@@ -633,6 +633,14 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
             },
         ),
         (
+            "remanence-api/src/write_owner/acceptance_finalization.rs",
+            DispatchPolicy::Exact {
+                execute_out: 1,
+                execute_none: 1,
+                why: "cfg(test) finalization crash and lost-response forwarder uses only in-memory ModelTransport",
+            },
+        ),
+        (
             "remanence-api/src/write_owner/durability_tests.rs",
             DispatchPolicy::Exact {
                 execute_out: 1,
