@@ -58,7 +58,12 @@ cargo test --workspace
 ```
 
 Hardware and large-memory tests are `#[ignore]`d by default and opt in
-through environment variables documented in their test modules.
+through environment variables documented in their test modules. The default
+suite includes the sampled durability property; the full durability matrix is
+also ignored by default. Run it with
+`cargo test -p remanence-api --lib durability -- --ignored` (about 12 minutes).
+See [durability crash suites](architecture-overview.md#durability-crash-suites)
+for coverage and known refusal defects.
 
 <!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/archive_ingest.rs @ 6ed03ef0 -->
 ## First archive, no tape required

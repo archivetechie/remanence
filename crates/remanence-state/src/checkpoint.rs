@@ -15,7 +15,8 @@ mod bot_recovery_authority;
 
 pub use bot_recovery_authority::CheckpointBotRecoveryAuthority;
 
-use std::fs::{self, File, OpenOptions};
+use remanence_library::durable_file::{File, OpenOptions};
+use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -2887,7 +2888,7 @@ fn write_terminal_finalization_intent(
                 error,
             )
         })?;
-    fs::rename(&temporary_path, &intent_path).map_err(|error| {
+    remanence_library::durable_file::rename(&temporary_path, &intent_path).map_err(|error| {
         StateError::io_at("publish terminal finalization intent", &intent_path, error)
     })?;
     sync_companion_parent(&intent_path, "fsync terminal finalization intent directory")
@@ -3126,7 +3127,7 @@ fn initialize_checkpoint_file(path: &Path, tape_uuid: [u8; 16]) -> Result<File, 
             path.display()
         )));
     }
-    fs::rename(&init_path, path)
+    remanence_library::durable_file::rename(&init_path, path)
         .map_err(|err| StateError::io_at("publish checkpoint journal header", path, err))?;
     let parent = path.parent().ok_or_else(|| {
         StateError::JournalReplayFailed(

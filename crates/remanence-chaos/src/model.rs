@@ -1,10 +1,75 @@
-//! Stateful virtual SSC tape and SMC changer transport for L1b chaos tests.
+//! Stateful virtual SSC tape and SMC changer transport for crash tests.
 //!
-//! `ModelTransport` is intentionally small: it implements only the SCSI
-//! commands Remanence's public drive/changer handles need for hermetic
-//! Phase C tests. It is a record-oriented model, so one WRITE(6) buffer
-//! becomes one tape record, filemarks are records of their own, and READ
-//! POSITION reports the current record index.
+//! `VirtualTape::durable_frontier` counts durable leading records. WRITE and
+//! immediate WRITE FILEMARKS buffer new records; fixed WRITE contributes one
+//! record per block. Overwrite retracts the frontier to the overwrite position.
+//! `VirtualWorld::power_cut(bay, keep)` retains any prefix from the frontier
+//! through EOD, then queues UNIT ATTENTION `06/29/00` and invalidates position.
+//! INQUIRY leaves that attention pending. READ POSITION sets LONU/MPU until
+//! successful LOAD, REWIND, or LOCATE; relative I/O refuses unknown position.
+//!
+//! Synchronization follows [SSC-3 revision 01c][ssc], section 4.2.8:
+//!
+//! | Modeled command | Clause | Synchronization |
+//! | --- | --- | --- |
+//! | WRITE FILEMARKS(6) | 6.9 | IMMED=0, including count zero, proves all records |
+//! | READ(6) | 6.4 | Flush before reading |
+//! | LOCATE(10), LOCATE(16) | 6.3, 7.3 | Flush before positioning |
+//! | REWIND | 7.8 | Flush before rewinding |
+//! | LOAD UNLOAD | 7.2 | Flush before loading or unloading |
+//! | SPACE(6), SPACE(16) | 6.6, 7.10 | Flush except zero count outside EOD mode |
+//!
+//! Positioning completes synchronously here, including IMMED requests. Queries
+//! (TUR, INQUIRY, MODE SENSE, READ POSITION, READ BLOCK LIMITS, LOG SENSE,
+//! MAINTENANCE IN) do not flush. MODE SELECT's supported block/compression fields
+//! do not guarantee synchronization; partition changes are not modeled. Changer
+//! MOVE MEDIUM and READ ELEMENT STATUS do not synchronize a drive.
+//!
+//! [ssc]: https://www.13thmonkey.org/documentation/SCSI/ssc3r01c.pdf
+//!
+//! `ChaosTransport` applies scenario fault `RSP-01` (or action
+//! `{"lost_response":true}`) after a successful underlying command. The existing
+//! matcher and transient/persistent scopes apply to every command. It returns
+//! Linux SG `TransportError` with DID_TIME_OUT, empty sense, and unknown host
+//! position; the command's media or changer effects remain intact.
+//!
+//! `crate::file_model::MemoryDirectory` separates written and durable inode bytes
+//! and directory entries. Crashes retain any byte prefix of an unsynced append;
+//! unsynced creates and renames may disappear. A failed sync discards dirty bytes
+//! and a later successful sync cannot restore them. The shared
+//! `remanence_library::durable_file` traits feed checkpoint, parity, and audit
+//! journals without changing their framing or synchronization order. Host files
+//! mirror visible bytes for existing replay and locking; crash snapshots replace
+//! them with surviving model bytes in a fresh state directory.
+//!
+//! The API write-owner durability tests checkpoint three objects on one tape.
+//! They capture every command completion, append, before/after sync, namespace
+//! operation, and client commit receipt. The default suite retains only the tape
+//! frontier and discards unsynced bytes and names at every cut: the maximum-loss
+//! choice exposes a missing barrier. It also samples failed syncs and one-byte /
+//! penultimate-byte tears at the first dirty header and last dirty frame sync
+//! of each file.
+//! Four independent recovery workers keep this suite near one minute. The
+//! missing-barrier control stays in the default suite and stops at its first loss.
+//!
+//! The ignored full suite explores all buffered record counts through eight
+//! records (otherwise first/middle/last), both namespace outcomes, and journal
+//! tails at zero, one, middle, penultimate, and final byte. Tail choices vary one
+//! journal at a time with minimum tape retention; this is a deterministic boundary
+//! matrix, not the Cartesian product of all failures. Every sync boundary also
+//! explores a failed sync followed by a successful retry. Run the full suite with
+//! `cargo test -p remanence-api --lib durability -- --ignored` (about 12 minutes).
+//! See `docs/architecture-overview.md` for suite commands and refusal references.
+//!
+//! Restart uses the daemon checkpoint replay and the in-process write/read
+//! session engines. It checks receipts, exact payloads, durable authority limits,
+//! and the next append position. Tail discard uses operator preview/confirmation.
+//! Durable commits whose reply is not yet delivered may also appear on restart.
+//!
+//! A test-only transport sets IMMED on every WRITE FILEMARKS. The same property
+//! must detect lost acknowledged bytes. Known recovery refusals without tape
+//! identity are counted and pinned explicitly; they remain recovery defects,
+//! not evidence that the full refusal-identity requirement passes.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -44,6 +109,8 @@ pub enum Record {
 pub struct VirtualTape {
     /// Tape records in physical order.
     pub records: Vec<Record>,
+    /// Number of leading records proved durable by a synchronizing command.
+    pub durable_frontier: usize,
     /// EOM early-warning threshold in bytes.
     pub capacity_bytes: u64,
     /// Total data bytes written through this model.
@@ -79,6 +146,7 @@ impl VirtualTape {
     pub fn empty(capacity_bytes: u64, block_size: u32) -> Self {
         Self {
             records: Vec::new(),
+            durable_frontier: 0,
             capacity_bytes,
             written_bytes: 0,
             write_protected: false,
@@ -305,6 +373,10 @@ pub struct VirtualDriveState {
     pub initializing_command_required: bool,
     /// Opt in to SSC UNLOAD leaving a seated cartridge unthreaded.
     pub unload_leaves_unthreaded: bool,
+    /// Reset unit attention remains pending until an eligible command consumes it.
+    pub reset_unit_attention: bool,
+    /// Reset destroys position knowledge until LOAD, REWIND, or LOCATE completes.
+    pub position_unknown: bool,
 }
 
 impl VirtualWorld {
@@ -357,6 +429,31 @@ impl VirtualWorld {
                 ie_count: 0,
             },
         }
+    }
+
+    /// Cut drive power, retaining exactly `keep` records, including every durable record.
+    /// Invalid bays or retention choices leave the world unchanged.
+    pub fn power_cut(&mut self, bay: u16, keep: usize) -> Result<(), ScsiError> {
+        let barcode = self
+            .loaded_barcode(bay)
+            .ok_or(ScsiError::InvalidInput("power cut requires loaded tape"))?
+            .to_owned();
+        let tape = self
+            .tapes
+            .get_mut(&barcode)
+            .ok_or(ScsiError::InvalidInput("missing virtual tape"))?;
+        if !(tape.durable_frontier..=tape.records.len()).contains(&keep) {
+            return Err(ScsiError::InvalidInput(
+                "power cut keep is outside buffered frontier",
+            ));
+        }
+        tape.records.truncate(keep);
+        tape.durable_frontier = keep;
+        recompute_written_bytes(tape);
+        let state = self.drive_states.entry(bay).or_default();
+        state.reset_unit_attention = true;
+        state.position_unknown = true;
+        Ok(())
     }
 
     /// Return the role to use for a transport factory path.
@@ -671,6 +768,49 @@ impl ModelTransport {
         }
     }
 
+    fn prepare_command(&self, cdb: &[u8]) -> Result<(), ScsiError> {
+        let DeviceRole::Drive { bay } = self.role else {
+            return Ok(());
+        };
+        let opcode = cdb.first().copied().unwrap_or(0);
+        let mut world = self.world.lock().expect("virtual world lock");
+        let state = world.drive_states.entry(bay).or_default();
+        // INQUIRY does not consume a pending unit attention.
+        if opcode != 0x12 && std::mem::take(&mut state.reset_unit_attention) {
+            return Err(check_condition(fixed_sense(0x06, 0x29, 0x00, None, 0), 0));
+        }
+        if state.position_unknown && matches!(opcode, 0x08 | 0x0a | 0x10 | 0x11 | 0x91) {
+            return Err(check_condition(fixed_sense(0x03, 0x15, 0x02, None, 0), 0));
+        }
+        // SSC synchronize-before-operation commands. Immediate positioning is
+        // completed synchronously by this model; WFM IMMED is buffered separately.
+        let space_sync = match opcode {
+            0x11 if cdb.len() >= 5 => cdb[1] & 7 == 3 || read_u24(cdb, 2) != Some(0),
+            0x91 if cdb.len() >= 12 => cdb[1] & 7 == 3 || cdb[4..12].iter().any(|byte| *byte != 0),
+            _ => false,
+        };
+        if space_sync || matches!(opcode, 0x01 | 0x08 | 0x1b | 0x2b | 0x92) {
+            if let Some(barcode) = world.loaded_barcode(bay).map(str::to_owned) {
+                if let Some(tape) = world.tapes.get_mut(&barcode) {
+                    tape.durable_frontier = tape.records.len();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn position_known(&self) {
+        if let DeviceRole::Drive { bay } = self.role {
+            self.world
+                .lock()
+                .expect("virtual world lock")
+                .drive_states
+                .entry(bay)
+                .or_default()
+                .position_unknown = false;
+        }
+    }
+
     fn drive_bay(&self) -> Result<u16, ScsiError> {
         match self.role {
             DeviceRole::Drive { bay } => Ok(bay),
@@ -819,6 +959,13 @@ impl ModelTransport {
         let flags = if self.position == 0 { 0x80 } else { 0x00 };
         let mut response = rp_long_response(flags, 0, self.position);
         let world = self.world.lock().expect("virtual world lock");
+        if world
+            .drive_states
+            .get(&bay)
+            .is_some_and(|state| state.position_unknown)
+        {
+            response[0] = 0x0c; // LONU and MPU: neither logical object nor file is known.
+        }
         // Position reporting also works without media or before initialization.
         let file = world
             .drive_bays
@@ -1036,8 +1183,26 @@ impl ModelTransport {
             if tape.write_protected {
                 return Err(ScsiError::InvalidInput("virtual tape is write protected"));
             }
+            let expected = if fixed {
+                fixed_transfer_bytes(
+                    transfer_len as usize,
+                    fixed_block_size(tape.block_size)?,
+                    "fixed WRITE",
+                )?
+            } else {
+                transfer_len as usize
+            };
+            if buf.len() != expected {
+                return Err(ScsiError::InvalidInput(
+                    "WRITE buffer length does not match transfer length",
+                ));
+            }
+            if transfer_len == 0 {
+                return Ok(());
+            }
             if position < tape.records.len() {
                 tape.records.truncate(position);
+                tape.durable_frontier = tape.durable_frontier.min(position);
                 recompute_written_bytes(tape);
             }
             if fixed {
@@ -1098,12 +1263,16 @@ impl ModelTransport {
         let position = usize::try_from(self.position)
             .map_err(|_| ScsiError::InvalidInput("model position exceeds usize"))?;
         self.with_loaded_tape(&mut world, |tape| {
-            if position < tape.records.len() {
+            if count > 0 && position < tape.records.len() {
                 tape.records.truncate(position);
+                tape.durable_frontier = tape.durable_frontier.min(position);
                 recompute_written_bytes(tape);
             }
             for _ in 0..count {
                 tape.records.push(Record::Filemark);
+            }
+            if cdb[1] & 1 == 0 {
+                tape.durable_frontier = tape.records.len();
             }
             Ok(())
         })?;
@@ -1363,6 +1532,7 @@ impl ModelTransport {
 impl SgTransport for ModelTransport {
     fn execute_in(&mut self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
         let _command = self.begin_command(cdb);
+        self.prepare_command(cdb)?;
         match cdb.first().copied() {
             Some(0x05) => self.read_block_limits(buf),
             Some(0x08) => self.read_6(cdb, buf),
@@ -1386,19 +1556,27 @@ impl SgTransport for ModelTransport {
 
     fn execute_none(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
         let _command = self.begin_command(cdb);
+        self.prepare_command(cdb)?;
         match cdb.first().copied() {
             Some(0x00) => self.test_unit_ready(),
             Some(0x01) => {
                 self.drive_bay()?;
                 self.rewind();
+                self.position_known();
                 Ok(())
             }
             Some(0x10) => self.write_filemarks(cdb),
             Some(0x11 | 0x91) => self.space(cdb),
-            Some(0x1b) => self.load_unload(cdb),
+            Some(0x1b) => {
+                self.load_unload(cdb)?;
+                self.position_known();
+                Ok(())
+            }
             Some(0x2b | 0x92) => {
                 self.drive_bay()?;
-                self.locate(cdb)
+                self.locate(cdb)?;
+                self.position_known();
+                Ok(())
             }
             Some(0xa5) => {
                 self.ensure_changer()?;
@@ -1410,6 +1588,7 @@ impl SgTransport for ModelTransport {
 
     fn execute_out(&mut self, cdb: &[u8], buf: &[u8]) -> Result<TransferOutcome, ScsiError> {
         let _command = self.begin_command(cdb);
+        self.prepare_command(cdb)?;
         match cdb.first().copied() {
             Some(0x0a) => self.write_6(cdb, buf),
             Some(0x15) => self.mode_select(buf),

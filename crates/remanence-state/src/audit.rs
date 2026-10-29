@@ -1,7 +1,8 @@
 //! Hash-chained append-only audit log.
 
+use remanence_library::durable_file::{File, OpenOptions};
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
