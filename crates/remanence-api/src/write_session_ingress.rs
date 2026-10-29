@@ -873,6 +873,7 @@ fn committed_overlap_record(
     let mut record = crate::catalog_conversion::find_object_for_key(
         state,
         Some(pb::get_object_request::Key::ObjectId(object_id)),
+        "",
     )?
     .ok_or_else(|| Status::internal("overlap checkpoint has no committed object record"))?;
     record.copies.retain(|copy| copy.status == "committed");

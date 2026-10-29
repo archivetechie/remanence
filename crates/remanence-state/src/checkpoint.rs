@@ -3096,6 +3096,10 @@ fn acquire_checkpoint_lock(
         .open(&lock_path)
         .map_err(|err| StateError::io_at("open checkpoint journal lock", &lock_path, err))?;
     Flock::lock(lock_file, operation).map_err(|(_file, errno)| {
+        if errno == nix::errno::Errno::EWOULDBLOCK {
+            tracing::warn!(operation = action, journal = %path.display(), error = %errno,
+                "checkpoint journal lock refusal");
+        }
         StateError::io_at(action, &lock_path, std::io::Error::from(errno))
     })
 }

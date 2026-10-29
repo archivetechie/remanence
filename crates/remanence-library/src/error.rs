@@ -289,6 +289,16 @@ pub enum OpenError {
 /// changer operations.
 #[derive(Debug, Error)]
 pub enum MoveError {
+    /// Live element status differs from the inventory used to plan the command.
+    #[error("element 0x{addr:04x} changes: expected {expected}, found {found}; command refused")]
+    InventoryChanged {
+        /// Element address.
+        addr: u16,
+        /// Previously observed occupancy and barcode.
+        expected: String,
+        /// Fresh occupancy and barcode.
+        found: String,
+    },
     /// The given element address isn't part of this library's snapshot.
     /// Typo, stale CLI input, or address from a different library.
     #[error("element address 0x{addr:04x} is not part of library {library:?}")]
@@ -371,6 +381,9 @@ pub enum MoveError {
 /// without conflation.
 #[derive(Debug, Error)]
 pub enum DriveOpError {
+    /// Changer inventory refuses the unload before the drive receives a command.
+    #[error("unload inventory refusal: {0}")]
+    Inventory(#[from] MoveError),
     /// The SCSI drive returned CHECK CONDITION or a transport error.
     #[error("SCSI error on drive: {0}")]
     ScsiError(#[from] remanence_scsi::ScsiError),
@@ -452,19 +465,11 @@ pub enum UnloadError {
     #[error("drive UNLOAD failed: {0}")]
     DriveUnload(DriveOpError),
 
-    /// Drive UNLOAD succeeded but the changer MOVE failed.
-    ///
-    /// - **CHECK CONDITION** (changer rejected MOVE): cartridge
-    ///   still in the bay (mechanically released but not physically
-    ///   moved). Snapshot's bay-loaded state matches reality;
-    ///   `is_dirty()` stays `false`. Operator can retry the MOVE
-    ///   phase via `move_medium(bay, dst)` directly.
-    /// - **Transport error / driver timeout** (cartridge may have
-    ///   moved partway, may be back in the bay, may be in flight):
-    ///   `is_dirty()` is `true` with cause
-    ///   `DirtyCause::CompletionUnknown`. Refresh / rescan before
-    ///   acting on either endpoint.
-    #[error("drive UNLOAD succeeded but changer MOVE failed: {0}")]
+    /// Inventory preflight or the changer MOVE refuses the unload sequence.
+    /// Fresh element status, when available, replaces the cached inventory.
+    /// The error alone does not establish whether UNLOAD ran or where the
+    /// cartridge remains. Transport failures retain the dirty marker.
+    #[error("unload inventory or changer MOVE failed: {0}")]
     Move(MoveError),
 }
 

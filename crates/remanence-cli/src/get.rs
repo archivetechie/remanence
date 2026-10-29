@@ -58,6 +58,10 @@ pub(crate) struct GetArgs {
     #[arg(long, conflicts_with = "sha256")]
     caller_id: bool,
 
+    /// Pool that scopes the caller object id.
+    #[arg(long, requires = "caller_id", value_name = "POOL")]
+    pool: Option<String>,
+
     /// Interpret OBJECT as the content sha256 (hex).
     #[arg(long)]
     sha256: bool,
@@ -153,7 +157,10 @@ async fn get(
     let mut catalog = pb::catalog_client::CatalogClient::new(channel.clone());
     let key = object_key(args)?;
     let record = catalog
-        .get_object(pb::GetObjectRequest { key: Some(key) })
+        .get_object(pb::GetObjectRequest {
+            key: Some(key),
+            pool_id: args.pool.clone().unwrap_or_default(),
+        })
         .await
         .map_err(|status| {
             DaemonClientError::client(format!(
@@ -1017,6 +1024,7 @@ mod tests {
             object,
             dest,
             caller_id: false,
+            pool: None,
             sha256: false,
             tape: None,
             member_path: None,

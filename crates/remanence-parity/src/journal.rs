@@ -1059,7 +1059,13 @@ impl FileTapeFileJournal {
             .truncate(false)
             .open(&path)?;
         let mut file = Flock::lock(file, FlockArg::LockExclusiveNonblock)
-            .map_err(|(_file, errno)| JournalError::Io(std::io::Error::from(errno)))?;
+            .map_err(|(_file, errno)| {
+                if errno == nix::errno::Errno::EWOULDBLOCK {
+                    tracing::warn!(operation = "lock parity journal", journal = %path.display(), error = %errno,
+                        "parity journal lock refusal");
+                }
+                JournalError::Io(std::io::Error::from(errno))
+            })?;
         let len = file.metadata()?.len();
         let mut last_highest_protected_ordinal = 0;
         let mut last_total_committed_ordinals = 0;
@@ -1386,7 +1392,13 @@ impl FileTapeFileJournalReader {
     fn open_existing_inner(path: PathBuf) -> Result<Self, JournalError> {
         let file = OpenOptions::new().read(true).open(&path)?;
         let mut file = Flock::lock(file, FlockArg::LockSharedNonblock)
-            .map_err(|(_file, errno)| JournalError::Io(std::io::Error::from(errno)))?;
+            .map_err(|(_file, errno)| {
+                if errno == nix::errno::Errno::EWOULDBLOCK {
+                    tracing::warn!(operation = "lock parity journal", journal = %path.display(), error = %errno,
+                        "parity journal lock refusal");
+                }
+                JournalError::Io(std::io::Error::from(errno))
+            })?;
         let header = read_header(&mut file)?;
         Ok(Self {
             file,
@@ -1406,7 +1418,13 @@ impl FileTapeFileJournalReader {
     ) -> Result<Self, JournalError> {
         let file = OpenOptions::new().read(true).open(&path)?;
         let mut file = Flock::lock(file, FlockArg::LockSharedNonblock)
-            .map_err(|(_file, errno)| JournalError::Io(std::io::Error::from(errno)))?;
+            .map_err(|(_file, errno)| {
+                if errno == nix::errno::Errno::EWOULDBLOCK {
+                    tracing::warn!(operation = "lock parity journal", journal = %path.display(), error = %errno,
+                        "parity journal lock refusal");
+                }
+                JournalError::Io(std::io::Error::from(errno))
+            })?;
         let header = read_header(&mut file)?;
         if header.tape_uuid != tape_uuid
             || header.block_size != block_size

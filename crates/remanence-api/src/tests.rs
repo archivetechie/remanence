@@ -4227,7 +4227,7 @@ fn assert_no_pool_write_catalog_reference(
 ) {
     assert!(
         index
-            .get_native_object_by_caller_object_id(caller_object_id)
+            .get_native_object_by_unique_caller_object_id(caller_object_id)
             .expect("query caller object id")
             .is_none(),
         "failed write must not leave an object row"
@@ -8397,6 +8397,7 @@ async fn catalog_enumerates_and_fetches_native_objects() {
     let fetched = pb::catalog_server::Catalog::get_object(
         &service,
         Request::new(pb::GetObjectRequest {
+            pool_id: String::new(),
             key: Some(pb::get_object_request::Key::CallerObjectId(
                 "caller-1".to_string(),
             )),
@@ -8410,6 +8411,7 @@ async fn catalog_enumerates_and_fetches_native_objects() {
     let fetched_by_id = pb::catalog_server::Catalog::get_object(
         &service,
         Request::new(pb::GetObjectRequest {
+            pool_id: String::new(),
             key: Some(pb::get_object_request::Key::ObjectId(
                 object_uuid().as_bytes().to_vec(),
             )),
@@ -8423,6 +8425,7 @@ async fn catalog_enumerates_and_fetches_native_objects() {
     let fetched_by_digest = pb::catalog_server::Catalog::get_object(
         &service,
         Request::new(pb::GetObjectRequest {
+            pool_id: String::new(),
             key: Some(pb::get_object_request::Key::ContentDigest(pb::Digest {
                 algorithm: "sha256".to_string(),
                 value: vec![7u8; 32],
@@ -8440,6 +8443,7 @@ async fn catalog_enumerates_and_fetches_native_objects() {
     let copies = pb::catalog_server::Catalog::find_object_copies(
         &service,
         Request::new(pb::FindObjectCopiesRequest {
+            pool_id: String::new(),
             key: Some(pb::find_object_copies_request::Key::ContentSha256(vec![
                 7u8;
                 32
@@ -8479,6 +8483,7 @@ fn content_digest_lookup_rejects_ambiguous_or_malformed_keys() {
     let ambiguous = find_object_for_key(
         &state,
         Some(pb::get_object_request::Key::ContentSha256(vec![7u8; 32])),
+        "",
     )
     .expect_err("ambiguous content identity must fail");
     assert_eq!(ambiguous.code(), tonic::Code::FailedPrecondition);
@@ -8487,6 +8492,7 @@ fn content_digest_lookup_rejects_ambiguous_or_malformed_keys() {
     let malformed = find_object_for_key(
         &state,
         Some(pb::get_object_request::Key::ContentSha256(vec![7u8; 31])),
+        "",
     )
     .expect_err("malformed SHA-256 key must fail");
     assert_eq!(malformed.code(), tonic::Code::InvalidArgument);
@@ -8497,6 +8503,7 @@ fn content_digest_lookup_rejects_ambiguous_or_malformed_keys() {
             algorithm: "sha512".to_string(),
             value: vec![7u8; 64],
         })),
+        "",
     )
     .expect_err("unsupported digest algorithm must fail");
     assert_eq!(unsupported.code(), tonic::Code::InvalidArgument);
@@ -9846,4 +9853,117 @@ fn startup_reports_each_fence_and_refuses_malformed_scope() {
     assert!(error
         .message()
         .contains("startup blocked by active tape-I/O fence"));
+}
+
+/// Caller ids resolve within a pool and never select the oldest cross-pool match.
+#[tokio::test]
+async fn catalog_caller_id_requires_pool_when_two_pools_hold_it() {
+    let state = populated_state();
+    let service = state.catalog_service();
+    let mut index = CatalogIndex::open(state.index_path.as_ref()).unwrap();
+    index
+        .upsert_tape_pool_projection(remanence_state::TapePoolProjectionInput {
+            pool_id: "copy-b".into(),
+            display_name: None,
+            copy_class: None,
+            content_class: None,
+            created_at_utc: None,
+        })
+        .unwrap();
+    let original = index
+        .get_native_object(&object_uuid().to_string())
+        .unwrap()
+        .unwrap();
+    index
+        .provision_tape(remanence_state::ProvisionTapeInput {
+            tape_uuid: [99; 16],
+            voltag: "COPYB".into(),
+            block_size: 4096,
+            parity: remanence_parity::ParityConfig::None,
+            force: false,
+        })
+        .unwrap();
+    index
+        .project_tape_pool_membership([99; 16], "copy-b")
+        .unwrap();
+    let other = Uuid::from_u128(99);
+    index
+        .upsert_native_object_projection(
+            remanence_state::NativeObjectProjectionInput {
+                object_id: other.to_string(),
+                caller_object_id: original.caller_object_id.clone(),
+                body_format: original.body_format.clone(),
+                logical_size_bytes: original.logical_size_bytes,
+                content_hash: original.content_hash.clone(),
+                metadata_hash: original.metadata_hash.clone(),
+                created_at_utc: None,
+            },
+            &[remanence_state::NativeObjectCopyProjectionInput {
+                object_id: other.to_string(),
+                tape_uuid: [99; 16],
+                tape_file_number: 1,
+                first_body_lba: 0,
+                first_parity_data_ordinal: None,
+                protected_until_ordinal: None,
+                status: "committed".into(),
+                representation: "plaintext".into(),
+                recipient_epoch_ids: None,
+                metadata_frame_len: None,
+                plaintext_digest: None,
+                stored_digest: None,
+            }],
+        )
+        .unwrap();
+    for (pool, expected) in [("camera.copy-a", object_uuid()), ("copy-b", other)] {
+        let record = pb::catalog_server::Catalog::get_object(
+            &service,
+            Request::new(pb::GetObjectRequest {
+                pool_id: pool.into(),
+                key: Some(pb::get_object_request::Key::CallerObjectId(
+                    "caller-1".into(),
+                )),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(record.object_id, expected.as_bytes());
+        let copies = pb::catalog_server::Catalog::find_object_copies(
+            &service,
+            Request::new(pb::FindObjectCopiesRequest {
+                pool_id: pool.into(),
+                key: Some(pb::find_object_copies_request::Key::CallerObjectId(
+                    "caller-1".into(),
+                )),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(copies.copies.iter().all(|copy| copy.pool_id == pool));
+    }
+    for pool in ["", "missing"] {
+        let error = pb::catalog_server::Catalog::get_object(
+            &service,
+            Request::new(pb::GetObjectRequest {
+                pool_id: pool.into(),
+                key: Some(pb::get_object_request::Key::CallerObjectId(
+                    "caller-1".into(),
+                )),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.code(),
+            if pool.is_empty() {
+                tonic::Code::FailedPrecondition
+            } else {
+                tonic::Code::NotFound
+            }
+        );
+        if pool.is_empty() {
+            assert!(error.message().contains("camera.copy-a, copy-b"));
+        }
+    }
 }

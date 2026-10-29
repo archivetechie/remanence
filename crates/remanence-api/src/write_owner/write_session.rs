@@ -1533,6 +1533,37 @@ impl WriteSessionState<'_> {
     }
 }
 
+/// Publish open refusals after later-declared journal leases leave scope.
+struct OpenWriteReply {
+    sender: Option<oneshot::Sender<Result<pb::WriteSession, Status>>>,
+    refusal: Option<Status>,
+}
+
+impl OpenWriteReply {
+    fn send(&mut self, result: Result<pb::WriteSession, Status>) -> Result<(), ()> {
+        match result {
+            Err(error) => {
+                self.refusal = Some(error);
+                Ok(())
+            }
+            Ok(session) => self
+                .sender
+                .take()
+                .expect("open reply sender")
+                .send(Ok(session))
+                .map_err(|_| ()),
+        }
+    }
+}
+
+impl Drop for OpenWriteReply {
+    fn drop(&mut self) {
+        if let (Some(sender), Some(error)) = (self.sender.take(), self.refusal.take()) {
+            let _ = sender.send(Err(error));
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_drive_open_write(
     bay: u16,
@@ -1558,6 +1589,11 @@ pub(super) fn handle_drive_open_write(
         drive_serial,
         reply,
     } = request;
+    // Declare before leases so refusal publication follows their release.
+    let mut reply = OpenWriteReply {
+        sender: Some(reply),
+        refusal: None,
+    };
     let actor_open_started = Instant::now();
     let session_id = Uuid::new_v4();
     if let Some(lifecycle) = &cfg.lifecycle {
@@ -1569,6 +1605,9 @@ pub(super) fn handle_drive_open_write(
         );
     }
     let tape_uuid = selected.tape_uuid;
+    let _session_span = tracing::warn_span!("write_session",
+        session_id = %session_id, tape_uuid = %Uuid::from_bytes(tape_uuid))
+    .entered();
     if let Err(status) = session_open_reject_tape_io_fences(
         index,
         &tape_uuid,
@@ -2458,4 +2497,38 @@ pub(super) fn prepare_drive_for_write_observing_identity(
         "remanence_write_diag",
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod reply_tests {
+    use super::*;
+
+    /// A failed open becomes observable only after its later-declared lease releases.
+    #[test]
+    fn write_open_refusal_waits_for_checkpoint_lease_release() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = remanence_state::FileCheckpointJournal::open(temp.path(), [94; 16]).unwrap();
+        let (sender, mut receiver) = oneshot::channel();
+        {
+            let mut reply = OpenWriteReply {
+                sender: Some(sender),
+                refusal: None,
+            };
+            let _lease = journal.acquire_exclusive().unwrap();
+            reply
+                .send(Err(Status::failed_precondition("open refused")))
+                .unwrap();
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+        }
+        assert_eq!(
+            receiver.try_recv().unwrap().unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+        journal
+            .acquire_exclusive()
+            .expect("refusal releases lease before caller resumes");
+    }
 }

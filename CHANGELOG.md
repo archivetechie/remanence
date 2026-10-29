@@ -7,6 +7,15 @@ per-release summaries.
 <!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_backend.rs crates/remanence-state/src/index.rs crates/remanence-library/src/discovery.rs @ 638210f7 -->
 ## Unreleased
 
+- Catalog caller ids resolve within a pool. Both object lookup requests accept
+  `pool_id`, and `rem get --caller-id` accepts `--pool`. Unscoped ambiguous
+  lookups refuse with the matching pool names.
+- Unload and move check live element occupancy and volume tags. Inventory
+  changes refuse motion and stop idle retries; failed moves refresh inventory.
+- Catalog writers reserve SQLite write transactions before reading projection
+  state. Rejected session opens release journal leases before replying. Catalog
+  and journal lock refusals log at WARN with session context.
+
 - The daemon starts with scoped tape-I/O fences and reports each fence in
   health, catalog tape lists, and live status. Recovery leaves fenced media
   untouched. `LibraryService.ReleaseTapeIoFence` and `rem tape quarantine release`

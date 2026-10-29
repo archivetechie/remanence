@@ -531,7 +531,7 @@ sha256.
 
 | Command | What it does |
 |---|---|
-| `rem get <OBJECT> --dest <DIR> [--overwrite]` | Restore all members of an object into a directory. OBJECT is an object UUID by default; `--caller-id` selects by the caller id recorded at put time, `--sha256` by content hash. The daemon mounts the copy's tape as needed, and a media-readiness fence is watched to completion (`--no-wait` fails fast). |
+| `rem get <OBJECT> --dest <DIR> [--overwrite]` | Restore all members of an object into a directory. OBJECT is an object UUID by default; `--caller-id --pool <POOL>` selects by the caller id recorded in that pool at put time, `--sha256` by content hash. The daemon mounts the copy's tape as needed, and a media-readiness fence is watched to completion (`--no-wait` fails fast). |
 | `rem get <OBJECT> --dest <DIR> --tape <UUID>` | Read from the copy on a specific tape instead of the first cataloged copy — for exercising a particular cartridge, or steering away from one. |
 | `rem get <OBJECT> --dest <DIR> --path <MEMBER>` | Restore only the named member. |
 | `rem get ... [--stream-chunk-bytes <BYTES>] [--no-wait]` | Suggested read-stream chunk size (default 1 MiB), and `--no-wait` to fail fast instead of watching a media-readiness load. |
@@ -808,3 +808,7 @@ Tape-I/O fences appear in `rem catalog tapes --json` and `rem top` as
 `active_tape_io_fence_count` and `active_tape_io_fences`. Each record identifies
 the quarantine, UUID, barcode, endpoint, reason, and state. The daemon's release
 RPC is described in [the API reference](reference-api.md).
+
+For library-mode `rem get --caller-id`, `--pool <POOL>` selects the caller id's
+pool. Without `--pool`, a caller id present in several pools returns a refusal
+that names the pools. A caller id present in only one pool still resolves.

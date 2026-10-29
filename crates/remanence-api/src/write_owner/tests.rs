@@ -24,8 +24,8 @@ use remanence_format::{
     RemTarFile, RemTarObjectLayout, RemTarObjectOptions,
 };
 use remanence_library::{
-    ChangerHandle, DiscoveryReport, DriveHandle, DriveOpError, LoadError, MediaFamily,
-    MediaReadiness, SpaceKind, TapeConfig, TapeIoError,
+    DiscoveryReport, DriveHandle, DriveOpError, LoadError, MediaFamily, MediaReadiness, SpaceKind,
+    TapeConfig, TapeIoError,
 };
 use remanence_library::{
     DriveBay, ElementLayout, FixtureTransport, IdentitySource, InstalledDrive, Library,
@@ -2286,7 +2286,15 @@ async fn daemon_checkpoint_lease_contention_precedes_conditional_load_for_no_par
     let drive = library
         .open_drive(0x0100, &policy)
         .expect("open model drive");
-    let drive_tx = spawn_drive_actor(0x0100, drive, cfg);
+    let log_path = temp.path().join("daemon.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || log.try_clone().unwrap())
+        .finish();
+    let drive_tx =
+        tracing::subscriber::with_default(subscriber, || spawn_drive_actor(0x0100, drive, cfg));
     let command_start = world.lock().expect("world lock").command_log.len();
     let (open_tx, open_rx) = oneshot::channel();
     drive_tx
@@ -2327,6 +2335,16 @@ async fn daemon_checkpoint_lease_contention_precedes_conditional_load_for_no_par
         .await
         .expect("no-parity open reply")
         .expect_err("competing checkpoint lease must reject session open");
+    let log = std::fs::read_to_string(log_path).unwrap();
+    for expected in [
+        "WARN",
+        "checkpoint journal lock refusal",
+        "session_id=",
+        "tape_uuid=",
+        "operation=",
+    ] {
+        assert!(log.contains(expected), "missing {expected}: {log}");
+    }
     assert!(
         world.lock().expect("world lock").command_log[command_start..].is_empty(),
         "checkpoint contention must reject before conditional LOAD or any drive command"
@@ -2790,6 +2808,26 @@ async fn partial_epoch_checkpoint_projects_replays_and_first_post_checkpoint_sho
         .expect("parity checkpoint succeeds");
     assert_eq!(checkpoint.committed_objects.len(), 1);
 
+    // A committed parity duplicate conflicts before any additional tape write.
+    let command_count = world.lock().unwrap().command_log.len();
+    let duplicate = append_actor_test_file_result(
+        &drive_tx,
+        session_id,
+        temp.path().join("parity-conflict.bin"),
+        "parity-first.bin",
+        "parity-actor-first",
+        b"different parity content",
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(duplicate.code(), tonic::Code::AlreadyExists);
+    assert!(
+        world.lock().unwrap().command_log[command_count..]
+            .iter()
+            .all(|command| !matches!(command.opcode, 0x0a | 0x10)),
+        "a conflicting caller id writes no tape records or filemarks"
+    );
+
     let (close_tx, close_rx) = oneshot::channel();
     drive_tx
         .send(DriveCommand::Close {
@@ -2896,7 +2934,7 @@ async fn partial_epoch_checkpoint_projects_replays_and_first_post_checkpoint_sho
         .is_some());
     assert!(
         read_only
-            .get_native_object_by_caller_object_id("parity-actor-second")
+            .get_native_object_by_unique_caller_object_id("parity-actor-second")
             .expect("query failed object")
             .is_none(),
         "the short post-checkpoint append must not reach catalog visibility"
@@ -3705,24 +3743,6 @@ fn test_changer_library(serial: &str) -> Library {
     }
 }
 
-fn open_test_changer(library: &Library) -> ChangerHandle {
-    let policy = remanence_library::StaticAllowlist::new([library.serial.as_str()]);
-    let serial = library.serial.clone();
-    let mut responses = Some(vec![changer_inquiry_response(), vpd80_response(&serial)]);
-    library
-        .open_with(&policy, move |_| {
-            let responses = responses
-                .take()
-                .expect("test changer transport opened once");
-            Ok::<_, remanence_library::IoErrorKind>(Box::new(
-                FixtureTransport::new().with_responses(responses),
-            )
-                as Box<dyn remanence_library::SgTransport>)
-        })
-        .expect("open test changer")
-        .into_changer()
-}
-
 #[cfg(target_os = "linux")]
 fn open_test_drive_with_tur_script(
     library_serial: &str,
@@ -3867,6 +3887,7 @@ fn test_write_owner_config(
     library_snapshot: Arc<RwLock<Arc<crate::LibrarySnapshot>>>,
 ) -> WriteOwnerConfig {
     let serial = library.library().serial.clone();
+    let checkpoint_journal_dir = index_path.parent().unwrap().join("checkpoints");
     WriteOwnerConfig {
         index_path,
         report: DiscoveryReport {
@@ -3894,7 +3915,7 @@ fn test_write_owner_config(
         )
         .expect("test I/O memory manager"),
         write_admissions: WriteAdmissionCoordinator::default(),
-        checkpoint_journal_dir: std::env::temp_dir().join("rem-checkpoint-tests"),
+        checkpoint_journal_dir,
         checkpoint_max_bytes: remanence_state::DEFAULT_CHECKPOINT_MAX_BYTES,
         checkpoint_max_objects: remanence_state::DEFAULT_CHECKPOINT_MAX_OBJECTS,
         checkpoint_max_age_seconds: remanence_state::DEFAULT_CHECKPOINT_MAX_AGE_SECONDS,
@@ -4785,7 +4806,7 @@ async fn daemon_watermark_terminalization_is_atomic_and_terminal_failure_stays_f
             );
             assert_eq!(tape.state, "recovery_required");
             assert!(read_only
-                .get_native_object_by_caller_object_id("terminal-caller")
+                .get_native_object_by_unique_caller_object_id("terminal-caller")
                 .expect("query committed object")
                 .is_some());
             let fences = read_only
@@ -4802,7 +4823,7 @@ async fn daemon_watermark_terminalization_is_atomic_and_terminal_failure_stays_f
             assert_eq!(tape.state, "sealed");
             assert_eq!(tape.written_extent_lba, Some(records[1].eod_lba));
             assert!(read_only
-                .get_native_object_by_caller_object_id("terminal-caller")
+                .get_native_object_by_unique_caller_object_id("terminal-caller")
                 .expect("query committed object")
                 .is_some());
             assert!(read_only
@@ -6044,9 +6065,12 @@ async fn changer_move_succeeds_and_publishes_snapshot_when_catalog_observation_f
         .expect("install observation failure trigger");
     drop(sqlite);
 
-    let library = test_changer_library("LIB_MOVE_OBS_FAIL");
+    let mut world = VirtualWorld::single_drive("LIB_MOVE_OBS_FAIL", 0x0100, "DRV_A", 0x0400, 1);
+    world.put_tape_in_slot(0x0400, "TAPE_MOVE", VirtualTape::default());
+    let handle = open_model_library(Arc::new(Mutex::new(world)));
+    let library = handle.library().clone();
     let snapshot_cell = library_snapshot_cell(library.clone());
-    let changer = open_test_changer(&library);
+    let changer = handle.into_changer();
     let policy = remanence_library::StaticAllowlist::new([library.serial.as_str()]);
     let cfg = WriteOwnerConfig {
         index_path: index_path.clone(),
@@ -14732,5 +14756,258 @@ fn robotics_fence_admission_reads_current_catalog() {
         )
         .unwrap();
         super::robotics::admit_fenced_elements(&index, &library, &[bay]).unwrap();
+    }
+}
+
+/// Separate tape leases and catalog writers allow simultaneous session checkpoints.
+#[tokio::test]
+async fn two_tape_sessions_checkpoint_concurrently() {
+    const BLOCK: u32 = 256 * 1024;
+    let temp = tempfile::tempdir().unwrap();
+    let index_path = temp.path().join("state.sqlite");
+    let mut index = CatalogIndex::open(&index_path).unwrap();
+    let audit_dir = temp.path().join("audit");
+    std::fs::create_dir_all(&audit_dir).unwrap();
+    let audit_lock = Arc::new(Mutex::new(()));
+    let admissions = WriteAdmissionCoordinator::default();
+    let mut actors = Vec::new();
+    for n in [1u8, 2] {
+        let pool_id = format!("copy-{n}");
+        let tape_uuid = [n; 16];
+        let barcode = format!("TP000{n}L9");
+        let serial = format!("LIB{n}");
+        let drive_serial = format!("DRV{n}");
+        index
+            .upsert_tape_pool_projection(TapePoolProjectionInput {
+                pool_id: pool_id.clone(),
+                display_name: None,
+                copy_class: None,
+                content_class: None,
+                created_at_utc: None,
+            })
+            .unwrap();
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: barcode.clone(),
+                block_size: BLOCK,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .unwrap();
+        index
+            .project_tape_pool_membership(tape_uuid, &pool_id)
+            .unwrap();
+        let drive_uuid = index
+            .observe_drive(DriveObservationInput {
+                serial: drive_serial.clone(),
+                identity_source: "DvcidAndInquiry".into(),
+                vendor: None,
+                product: None,
+                firmware_rev: None,
+                managed: "rem".into(),
+                library_serial: Some(serial.clone()),
+                element_address: Some(0x0100),
+                observed_at_utc: None,
+            })
+            .unwrap()
+            .drive_uuid;
+        let bootstrap = BootstrapPayload {
+            scheme: None,
+            no_parity_flag: true,
+            filemark_map_digest: None,
+            tape_uuid,
+            written_by_version: "test".into(),
+            written_at: "2026-10-29T00:00:00Z".into(),
+            sequence: 0,
+            block_size_bytes: BLOCK,
+            drive_compression: false,
+        };
+        let mut block = vec![0; BLOCK as usize];
+        write_bootstrap_block(&bootstrap, &mut block).unwrap();
+        let mut tape = VirtualTape::empty(64 * 1024 * 1024, BLOCK);
+        tape.records = vec![Record::Block(block), Record::Filemark];
+        tape.written_bytes = u64::from(BLOCK);
+        let mut world = VirtualWorld::single_drive(&serial, 0x0100, &drive_serial, 0x0400, 1);
+        world.put_tape_in_drive(0x0100, &barcode, Some(0x0400), tape);
+        let mut library = open_model_library(Arc::new(Mutex::new(world)));
+        let snapshot = library_snapshot_cell(library.library().clone());
+        let mut cfg =
+            test_write_owner_config(index_path.clone(), audit_dir.clone(), &library, snapshot);
+        cfg.audit_append_lock = audit_lock.clone();
+        cfg.write_admissions = admissions.clone();
+        cfg.checkpoint_max_objects = 1;
+        let drive = library.open_drive(0x0100, &cfg.policy).unwrap();
+        let tx = spawn_drive_actor(0x0100, drive, cfg);
+        let pool_cfg = TapePoolConfig {
+            id: pool_id,
+            scheme: None,
+            display_name: None,
+            copy_class: None,
+            content_class: None,
+            selection_policy: remanence_state::PoolSelectionPolicyName::CompleteOrFill,
+            watermark_low: 0.9,
+            watermark_high: 0.95,
+            capacity_cap_bytes: None,
+            block_size_bytes: u64::from(BLOCK),
+            min_object_size_bytes: 0,
+        };
+        let session = open_actor_test_write_session(
+            &tx,
+            &pool_cfg,
+            tape_uuid,
+            &serial,
+            &barcode,
+            &drive_uuid,
+            &drive_serial,
+        )
+        .await;
+        actors.push((tx, session));
+    }
+    let append = |i: usize| {
+        append_actor_test_file_result(
+            &actors[i].0,
+            actors[i].1,
+            temp.path().join(format!("source-{i}")),
+            "payload",
+            "shared-caller",
+            b"payload",
+        )
+    };
+    let (a, b) = tokio::join!(append(0), append(1));
+    for result in [a, b] {
+        assert_eq!(
+            result
+                .unwrap()
+                .record
+                .append_commit_info
+                .unwrap()
+                .durability,
+            pb::AppendDurability::Checkpointed as i32
+        );
+    }
+    for (tx, session_id) in actors {
+        let (reply, response) = oneshot::channel();
+        tx.send(DriveCommand::Close { session_id, reply })
+            .await
+            .unwrap();
+        response.await.unwrap().unwrap();
+    }
+    assert!(index
+        .get_native_object_by_pool_and_caller_object_id("copy-1", "shared-caller")
+        .unwrap()
+        .is_some());
+    assert!(index
+        .get_native_object_by_pool_and_caller_object_id("copy-2", "shared-caller")
+        .unwrap()
+        .is_some());
+}
+
+/// An out-of-band removal stops the real idle timer without an UNLOAD or MOVE.
+#[tokio::test]
+async fn idle_unload_stops_when_live_element_status_finds_empty_bay() {
+    let temp = tempfile::tempdir().unwrap();
+    let index_path = temp.path().join("state.sqlite");
+    let index = CatalogIndex::open(&index_path).unwrap();
+    let audit_dir = temp.path().join("audit");
+    std::fs::create_dir_all(&audit_dir).unwrap();
+    let mut world = VirtualWorld::single_drive("LIB-IDLE", 0x100, "DRV-IDLE", 0x400, 1);
+    world.put_tape_in_drive(0x100, "TAPE-IDLE", Some(0x400), VirtualTape::default());
+    let world = Arc::new(Mutex::new(world));
+    let mut library = open_model_library(world.clone());
+    let mut cfg = test_write_owner_config(
+        index_path,
+        audit_dir,
+        &library,
+        library_snapshot_cell(library.library().clone()),
+    );
+    let lifecycle = crate::drive_pool::DrivePoolLifecycle::default();
+    cfg.lifecycle = Some(lifecycle.clone());
+    let key = crate::drive_pool::DriveKey::new("LIB-IDLE", 0x100);
+    let drive = library.open_drive(0x100, &cfg.policy).unwrap();
+    let actor = spawn_drive_actor(0x100, drive, cfg.clone());
+    let changer = spawn_changer_actor(library.into_changer(), cfg.clone());
+    let pool = DrivePool::new_with_lifecycle(
+        HashMap::from([("LIB-IDLE".into(), changer)]),
+        HashMap::from([(key.clone(), actor)]),
+        Arc::new(HashMap::from([(key, AtomicBool::new(false))])),
+        lifecycle,
+    );
+    let seated = SeatedCartridge {
+        bay: 0x100,
+        library_serial: "LIB-IDLE".into(),
+        barcode: Some("TAPE-IDLE".into()),
+        home_slot: 0x400,
+        tape_uuid: None,
+        prior_session_id: None,
+    };
+    pool.park_cartridge(seated.clone());
+    let mut api = crate::ApiState::new(index);
+    api.library_snapshot = Some(cfg.library_snapshot.clone());
+    api.drive_pool = Some(pool);
+    api.drive_idle_unload_seconds = 1;
+    {
+        let mut world = world.lock().unwrap();
+        world.drive_bays.insert(0x100, None);
+        world.drive_source_slots.insert(0x100, None);
+        world.command_log.clear();
+    }
+    crate::mount::test_remove_seated_epoch(&api, "idle", seated).await;
+    assert!(!cfg.library_snapshot.read().unwrap().report.libraries[0].drive_bays[0].loaded);
+    let commands = world.lock().unwrap().command_log.len();
+    tokio::time::sleep(StdDuration::from_millis(1200)).await;
+    let world = world.lock().unwrap();
+    assert_eq!(
+        world.command_log.len(),
+        commands,
+        "timer stops for the empty bay"
+    );
+    assert!(world
+        .command_log
+        .iter()
+        .all(|c| !matches!(c.opcode, 0x1b | 0xa5)));
+}
+
+/// Exhausted SQLite waits retain WARN, operation, session and tape context.
+#[test]
+fn catalog_lock_refusal_logs_write_session_context() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("state.sqlite");
+    let mut index = CatalogIndex::open(&path).unwrap();
+    let holder = rusqlite::Connection::open(&path).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let log_path = temp.path().join("daemon.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || log.try_clone().unwrap())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        let _span = tracing::warn_span!(
+            "write_session",
+            session_id = "test-session",
+            tape_uuid = "test-tape"
+        )
+        .entered();
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: [91; 16],
+                voltag: "LOCK01L9".into(),
+                block_size: 4096,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .unwrap_err();
+    });
+    let log = std::fs::read_to_string(log_path).unwrap();
+    for expected in [
+        "WARN",
+        "catalog lock refusal",
+        "operation=",
+        "test-session",
+        "test-tape",
+    ] {
+        assert!(log.contains(expected), "missing {expected}: {log}");
     }
 }

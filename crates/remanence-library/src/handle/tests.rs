@@ -407,7 +407,9 @@ fn move_medium_happy_path() {
         include_bytes!("../../../../fixtures/inquiry/changer-msl-g3.bin").to_vec(),
         vpd80_response("LIB_MM01"),
     ]);
-    let mut handle = lib.open_with(&policy, factory).expect("open");
+    let mut handle = lib
+        .open_with(&policy, with_inventory(&lib, factory))
+        .expect("open");
     let (hook, audit) = capture_audit();
     handle.set_audit_hook(hook);
 
@@ -475,7 +477,9 @@ fn audit_hook_panic_does_not_permanently_poison_shared_state() {
         include_bytes!("../../../../fixtures/inquiry/changer-msl-g3.bin").to_vec(),
         vpd80_response("LIB_MM_POISON"),
     ]);
-    let mut handle = lib.open_with(&policy, factory).expect("open");
+    let mut handle = lib
+        .open_with(&policy, with_inventory(&lib, factory))
+        .expect("open");
 
     let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let fired_cl = fired.clone();
@@ -508,7 +512,9 @@ fn changer_handle_is_usable_standalone() {
         include_bytes!("../../../../fixtures/inquiry/changer-msl-g3.bin").to_vec(),
         vpd80_response("LIB_CH01"),
     ]);
-    let handle = lib.open_with(&policy, factory).expect("open");
+    let handle = lib
+        .open_with(&policy, with_inventory(&lib, factory))
+        .expect("open");
     let mut changer = handle.into_changer();
 
     changer
@@ -550,7 +556,9 @@ fn move_medium_preflight_refused_emits_refused_no_cdb() {
         include_bytes!("../../../../fixtures/inquiry/changer-msl-g3.bin").to_vec(),
         vpd80_response("LIB_MM02"),
     ]);
-    let mut handle = lib.open_with(&policy, factory).expect("open");
+    let mut handle = lib
+        .open_with(&policy, with_inventory(&lib, factory))
+        .expect("open");
     let (hook, audit) = capture_audit();
     handle.set_audit_hook(hook);
 
@@ -708,7 +716,9 @@ fn move_medium_succeeds_when_derived_is_explicitly_allowed() {
         include_bytes!("../../../../fixtures/inquiry/changer-msl-g3.bin").to_vec(),
         vpd80_response("LIB_MM04"),
     ]);
-    let mut handle = lib.open_with(&policy, factory).expect("open");
+    let mut handle = lib
+        .open_with(&policy, with_inventory(&lib, factory))
+        .expect("open");
     handle
         .move_medium(0x0400, 0x0100, &policy)
         .expect("derived + opt-in → move ok");
@@ -1490,7 +1500,8 @@ fn open_drive_refused_when_device_is_not_sequential_access() {
 
 #[test]
 fn drive_handle_unload_issues_correct_cdb_and_audits() {
-    let lib = open_drive_test_lib("LIB_OD07");
+    let mut lib = open_drive_test_lib("LIB_OD07");
+    crate::ops::apply_move(&mut lib, 0x0400, 0x0100).unwrap();
     let policy = StaticAllowlist::new(["LIB_OD07"]);
     let (factory, log) = multi_recording_factory(vec![
         (
@@ -1502,7 +1513,9 @@ fn drive_handle_unload_issues_correct_cdb_and_audits() {
             vec![lto9_inquiry(), vpd80_response("DRV_A")],
         ),
     ]);
-    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+    let mut handle = lib
+        .open_with(&policy, with_inventory(&lib, factory))
+        .expect("library opens");
     let (hook, audit) = capture_audit();
     handle.set_audit_hook(hook);
 
@@ -6400,7 +6413,9 @@ fn load_happy_path_audits_with_load_op_context() {
         (PathBuf::from("/dev/sg-mock"), open_script("LIB_LD01")),
         (PathBuf::from("/dev/sg-drive-mock"), drive_script()),
     ]);
-    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+    let mut handle = lib
+        .open_with(&policy, with_inventory(&lib, factory))
+        .expect("library opens");
     let (hook, audit) = capture_audit();
     handle.set_audit_hook(hook);
 
@@ -6455,7 +6470,9 @@ fn load_returns_move_phase_error_on_preflight_fail() {
         PathBuf::from("/dev/sg-mock"),
         open_script("LIB_LD02"),
     )]);
-    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+    let mut handle = lib
+        .open_with(&policy, with_inventory(&lib, factory))
+        .expect("library opens");
 
     // Source bay is empty (the bay starts unloaded in this lib).
     let err = handle
@@ -6490,7 +6507,9 @@ fn unload_happy_path_uses_source_slot_when_no_destination_given() {
         (PathBuf::from("/dev/sg-mock"), open_script("LIB_UL01")),
         (PathBuf::from("/dev/sg-drive-mock"), drive_script()),
     ]);
-    let handle = lib.open_with(&policy, factory).expect("library opens");
+    let handle = lib
+        .open_with(&policy, with_inventory(&lib, factory))
+        .expect("library opens");
     // To allow the second open_drive (for unload), we need to
     // build a fresh factory. Re-do the setup with both load and
     // unload scripted.
@@ -6527,7 +6546,9 @@ fn unload_happy_path_uses_source_slot_when_no_destination_given() {
     );
     // Re-open the library with the new factory.
     let lib = composed_test_lib("LIB_UL01");
-    let mut handle = lib.open_with(&policy, factory).expect("library reopens");
+    let mut handle = lib
+        .open_with(&policy, with_inventory(&lib, factory))
+        .expect("library reopens");
 
     // Now load + unload.
     handle.load(0x0400, 0x0100, &policy).expect("load ok");
@@ -6662,7 +6683,9 @@ fn load_returns_open_drive_error_after_move_marks_dirty() {
         PathBuf::from("/dev/sg-mock"),
         open_script("LIB_LD03"),
     )]);
-    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+    let mut handle = lib
+        .open_with(&policy, with_inventory(&lib, factory))
+        .expect("library opens");
 
     let err = handle.load(0x0400, 0x0100, &policy).unwrap_err();
     match err {
@@ -6847,7 +6870,9 @@ fn unload_returns_move_error_after_unload_keeps_snapshot() {
                 })
             }
         });
-    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+    let mut handle = lib
+        .open_with(&policy, with_inventory(&lib, factory))
+        .expect("library opens");
     let snapshot_before = handle.library().clone();
 
     let err = handle.unload(0x0100, None, &policy).unwrap_err();
@@ -6928,7 +6953,9 @@ fn ie_endpoint_move_marks_snapshot_dirty() {
         PathBuf::from("/dev/sg-mock"),
         open_script("LIB_IE_DIRTY"),
     )]);
-    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+    let mut handle = lib
+        .open_with(&policy, with_inventory(&lib, factory))
+        .expect("library opens");
     let (hook, audit) = capture_audit();
     handle.set_audit_hook(hook);
     assert!(!handle.is_dirty(), "starts clean");
@@ -6977,7 +7004,9 @@ fn ie_to_slot_move_also_marks_dirty() {
         PathBuf::from("/dev/sg-mock"),
         open_script("LIB_IE_DIRTY2"),
     )]);
-    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+    let mut handle = lib
+        .open_with(&policy, with_inventory(&lib, factory))
+        .expect("library opens");
     assert!(!handle.is_dirty());
 
     handle
@@ -7000,7 +7029,9 @@ fn slot_to_bay_move_does_not_mark_dirty() {
         PathBuf::from("/dev/sg-mock"),
         open_script("LIB_CLEAN"),
     )]);
-    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+    let mut handle = lib
+        .open_with(&policy, with_inventory(&lib, factory))
+        .expect("library opens");
     // slot 0x0400 (full) → bay 0x0100 (empty). Neither endpoint
     // is an IE port.
     handle
@@ -7024,7 +7055,9 @@ fn export_uses_first_available_ie_port() {
         PathBuf::from("/dev/sg-mock"),
         open_script("LIB_EX01"),
     )]);
-    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+    let mut handle = lib
+        .open_with(&policy, with_inventory(&lib, factory))
+        .expect("library opens");
     let (hook, audit) = capture_audit();
     handle.set_audit_hook(hook);
 
@@ -7105,7 +7138,9 @@ fn import_uses_first_occupied_ie_port() {
         PathBuf::from("/dev/sg-mock"),
         open_script("LIB_IM01"),
     )]);
-    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+    let mut handle = lib
+        .open_with(&policy, with_inventory(&lib, factory))
+        .expect("library opens");
     let (hook, audit) = capture_audit();
     handle.set_audit_hook(hook);
 
@@ -7342,7 +7377,9 @@ fn guard_supports_protected_move_via_deref_mut() {
         PathBuf::from("/dev/sg-mock"),
         open_script("LIB_LK05"),
     )]);
-    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+    let mut handle = lib
+        .open_with(&policy, with_inventory(&lib, factory))
+        .expect("library opens");
 
     {
         let mut guard = handle.lock_removal().expect("lock ok");
@@ -7502,7 +7539,9 @@ fn move_with_transport_error_marks_snapshot_dirty() {
             let faulted = FailFirstNoneWithTransportError::new(recorded);
             Ok(Box::new(faulted) as Box<dyn SgTransport>)
         });
-    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+    let mut handle = lib
+        .open_with(&policy, with_inventory(&lib, factory))
+        .expect("library opens");
     let snapshot_before = handle.library().clone();
     let (hook, audit) = capture_audit();
     handle.set_audit_hook(hook);
@@ -7646,7 +7685,9 @@ fn composed_unload_with_drive_transport_error_marks_dirty() {
                 })
             }
         });
-    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+    let mut handle = lib
+        .open_with(&policy, with_inventory(&lib, factory))
+        .expect("library opens");
 
     let err = handle.unload(0x0100, None, &policy).unwrap_err();
     match err {
@@ -7699,7 +7740,9 @@ fn move_transport_error_records_completion_unknown_cause() {
             let faulted = FailFirstNoneWithTransportError::new(recorded);
             Ok(Box::new(faulted) as Box<dyn SgTransport>)
         });
-    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+    let mut handle = lib
+        .open_with(&policy, with_inventory(&lib, factory))
+        .expect("library opens");
     let _ = handle
         .move_medium(0x0400, 0x0100, &policy)
         .expect_err("MOVE must fail");
@@ -7720,7 +7763,9 @@ fn ie_endpoint_move_records_vendor_semantics_cause() {
         PathBuf::from("/dev/sg-mock"),
         open_script("LIB_CAUSE02"),
     )]);
-    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+    let mut handle = lib
+        .open_with(&policy, with_inventory(&lib, factory))
+        .expect("library opens");
     handle
         .move_medium(0x0400, 0x0300, &policy)
         .expect("slot → IE move succeeds against fixture");
@@ -7745,7 +7790,9 @@ fn composed_load_partial_failure_records_partial_failure_cause() {
         PathBuf::from("/dev/sg-mock"),
         open_script("LIB_CAUSE03"),
     )]);
-    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+    let mut handle = lib
+        .open_with(&policy, with_inventory(&lib, factory))
+        .expect("library opens");
     let _ = handle
         .load(0x0400, 0x0100, &policy)
         .expect_err("load must fail at open_drive");
@@ -7804,7 +7851,9 @@ fn composed_load_drive_transport_error_records_completion_unknown() {
                 })
             }
         });
-    let mut handle = lib.open_with(&policy, factory).expect("library opens");
+    let mut handle = lib
+        .open_with(&policy, with_inventory(&lib, factory))
+        .expect("library opens");
 
     let err = handle
         .load(0x0400, 0x0100, &policy)
@@ -7933,4 +7982,139 @@ fn standalone_policy_denies_unlisted_devices_and_ephemeral_audit_authority() {
         drive.write_filemarks(1),
         Err(TapeIoError::EphemeralReadOnly)
     ));
+}
+
+/// Supply live RES responses for command fixtures, updating only on successful moves.
+fn with_inventory<F>(
+    library: &Library,
+    mut factory: F,
+) -> impl FnMut(&Path) -> Result<Box<dyn SgTransport>, IoErrorKind>
+where
+    F: FnMut(&Path) -> Result<Box<dyn SgTransport>, IoErrorKind> + 'static,
+{
+    let library = library.clone();
+    move |path| {
+        let inner = factory(path)?;
+        if path == library.changer_sg {
+            Ok(Box::new(InventoryFixture {
+                inner,
+                library: library.clone(),
+            }) as Box<dyn SgTransport>)
+        } else {
+            Ok(inner)
+        }
+    }
+}
+
+/// Independent fixture inventory answers the same wire command as a changer.
+struct InventoryFixture {
+    inner: Box<dyn SgTransport>,
+    library: Library,
+}
+impl SgTransport for InventoryFixture {
+    fn execute_in(&mut self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
+        if cdb[0] != 0xb8 {
+            return self.inner.execute_in(cdb, buf);
+        }
+        assert_ne!(cdb[1] & 0x10, 0, "RES requests volume tags");
+        let response = inventory_bytes(&self.library);
+        let len = buf.len().min(response.len());
+        buf[..len].copy_from_slice(&response[..len]);
+        Ok(TransferOutcome {
+            bytes_transferred: len as u32,
+            sense: None,
+        })
+    }
+    fn execute_none(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
+        self.inner.execute_none(cdb)?;
+        if cdb[0] == 0xa5 {
+            let src = u16::from_be_bytes([cdb[4], cdb[5]]);
+            let dst = u16::from_be_bytes([cdb[6], cdb[7]]);
+            crate::ops::apply_move(&mut self.library, src, dst).unwrap();
+        }
+        Ok(())
+    }
+    fn execute_out(&mut self, cdb: &[u8], buf: &[u8]) -> Result<TransferOutcome, ScsiError> {
+        self.inner.execute_out(cdb, buf)
+    }
+    fn set_timeout_for(&mut self, class: TimeoutClass) {
+        self.inner.set_timeout_for(class);
+    }
+}
+
+/// Encode occupancy, volume tags, source slots and drive identities in RES pages.
+fn inventory_bytes(library: &Library) -> Vec<u8> {
+    let mut out = vec![0; 8];
+    let mut count = 0u16;
+    let mut element = |kind: u8,
+                       addr: u16,
+                       full: bool,
+                       tag: Option<&str>,
+                       source: Option<u16>,
+                       serial: Option<&str>| {
+        let len = if serial.is_some() { 84u16 } else { 48u16 };
+        out.extend_from_slice(&[kind, 0x80, 0, len as u8, 0, 0, 0, len as u8]);
+        let mut desc = vec![0; usize::from(len)];
+        desc[..2].copy_from_slice(&addr.to_be_bytes());
+        desc[2] = 8 | u8::from(full);
+        if kind == 3 {
+            let port = library
+                .ie_ports
+                .iter()
+                .find(|p| p.element_address == addr)
+                .unwrap();
+            desc[2] |=
+                (u8::from(port.export_enabled) * 0x10) | (u8::from(port.import_enabled) * 0x20);
+        }
+        if let Some(source) = source {
+            desc[9] = 0x80;
+            desc[10..12].copy_from_slice(&source.to_be_bytes());
+        }
+        desc[12..48].fill(b' ');
+        if let Some(tag) = tag {
+            desc[12..12 + tag.len()].copy_from_slice(tag.as_bytes());
+        }
+        if let Some(serial) = serial {
+            desc[48..52].copy_from_slice(&[2, 0, 0, 32]);
+            desc[52..84].fill(b' ');
+            desc[52..52 + serial.len()].copy_from_slice(serial.as_bytes());
+        }
+        out.extend_from_slice(&desc);
+        count += 1;
+    };
+    element(1, library.layout.robot_address, false, None, None, None);
+    for slot in &library.slots {
+        element(
+            2,
+            slot.element_address,
+            slot.full,
+            slot.cartridge.as_deref(),
+            None,
+            None,
+        );
+    }
+    for port in &library.ie_ports {
+        element(
+            3,
+            port.element_address,
+            port.full,
+            port.cartridge.as_deref(),
+            None,
+            None,
+        );
+    }
+    for bay in &library.drive_bays {
+        element(
+            4,
+            bay.element_address,
+            bay.loaded,
+            bay.loaded_tape.as_deref(),
+            bay.source_slot,
+            bay.installed.as_ref().map(|d| d.serial.as_str()),
+        );
+    }
+    out[2..4].copy_from_slice(&count.to_be_bytes());
+    let bytes = ((out.len() - 8) as u32).to_be_bytes();
+    out[5..8].copy_from_slice(&bytes[1..]);
+    out
 }
