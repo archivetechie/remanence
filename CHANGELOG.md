@@ -17,6 +17,10 @@ per-release summaries.
   matrix runs as an ignored test. The tests record existing recovery refusals
   that omit the tape identity.
 
+- Review-vector generation and scratch-tape drills move to the development-only
+  `rem-dev` binary. `rem` and `rem-debug` report the replacement command;
+  release archives and the field kit exclude `rem-dev`.
+
 - Catalog caller ids resolve within a pool. Both object lookup requests accept
   `pool_id`, and `rem get --caller-id` accepts `--pool`. Unscoped ambiguous
   lookups refuse with the matching pool names.

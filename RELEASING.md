@@ -108,3 +108,11 @@ Zenodo can archive a repository's GitHub releases automatically. When it is enab
 repository, publishing a GitHub release creates a software record by itself, and that record cannot be
 removed with the project's token. Format deposits are made by the tool and never by a release, so the
 integration must be off for this repository when format records are deposited.
+
+## Development binary
+
+`rem-dev` is a workspace development target. Build it with
+`cargo build -p remanence-cli --bin rem-dev`. The release workflow selects
+`rem`, `rem-debug`, `rem-daemon` and `rem-recover` explicitly for its build
+and archive. The field-kit installer copies only `rem`, `rem-debug` and
+`rem-daemon`. Neither package includes `rem-dev`.

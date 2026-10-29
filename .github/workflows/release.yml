@@ -78,7 +78,8 @@ jobs:
       - name: Build static binaries
         run: |
           cargo build --release --locked --target "$TARGET" \
-            -p remanence-cli -p remanence-daemon -p rem-recover
+            -p remanence-cli -p remanence-daemon -p rem-recover \
+            --bin rem --bin rem-debug --bin rem-daemon --bin rem-recover
           for bin in rem rem-debug rem-daemon rem-recover; do
             file "target/$TARGET/release/$bin" | grep -E 'statically linked|static-pie linked'
           done

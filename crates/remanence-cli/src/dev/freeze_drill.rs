@@ -192,7 +192,7 @@ struct PhaseDurationsMs {
     total: u64,
 }
 
-/// Stable machine-readable result written by `rem-debug tape freeze-drill`.
+/// Stable machine-readable result written by `rem-dev tape freeze-drill`.
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct FreezeDrillReport {
     report_version: u32,
@@ -1532,41 +1532,6 @@ mod tests {
                 .gap_records,
             4096
         );
-    }
-
-    #[test]
-    fn rem_debug_parses_the_documented_freeze_drill_cli() {
-        let cli = <crate::DebugCli as clap::Parser>::try_parse_from([
-            "rem-debug",
-            "tape",
-            "freeze-drill",
-            "--device",
-            "/dev/sg7",
-            "--block-size",
-            "524288",
-            "--data-mib",
-            "32",
-            "--default-index-separation",
-            "--damage-plan",
-            "terminal-replica-c",
-            "--yes-i-know-scratch",
-            "--report",
-            "/tmp/freeze-report.json",
-        ])
-        .expect("documented freeze-drill CLI parses");
-        let crate::Command::Tape {
-            command: crate::TapeCommand::FreezeDrill(args),
-        } = cli.command
-        else {
-            panic!("expected tape freeze-drill command");
-        };
-        assert_eq!(args.device, Path::new("/dev/sg7"));
-        assert_eq!(args.block_size.bytes(), 524_288);
-        assert_eq!(args.data_mib, 32);
-        assert!(args.default_index_separation);
-        assert_eq!(args.damage_plan, DamagePlan::TerminalReplicaC);
-        assert!(args.yes_i_know_scratch);
-        assert_eq!(args.report, Path::new("/tmp/freeze-report.json"));
     }
 
     #[test]

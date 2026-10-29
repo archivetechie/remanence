@@ -17,6 +17,10 @@ path = "src/main.rs"
 name = "rem-debug"
 path = "src/rem_debug.rs"
 
+[[bin]]
+name = "rem-dev"
+path = "src/rem_dev.rs"
+
 [dependencies]
 toml_edit = "0.25"
 remanence-aead    = { path = "../remanence-aead" }

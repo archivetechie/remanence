@@ -25,8 +25,6 @@
 //! rem-debug lock    <serial>      # PREVENT MEDIUM REMOVAL
 //! rem-debug unlock  <serial>      # ALLOW MEDIUM REMOVAL
 //! rem-debug archive scan --format <adapter> --tape <serial> --bay 0x0100 --rewind
-//! rem-debug dev write-dump-to-tape --dump <path> --tape <serial> --bay 0x0100 \
-//!   --i-understand-this-overwrites-the-loaded-tape
 //! ```
 //!
 //! Direct hardware subcommands require an explicit `--allow <serial>`
@@ -95,8 +93,9 @@ mod archive_map;
 #[cfg(test)]
 mod capability_tests;
 #[cfg(test)]
+#[allow(dead_code)]
+#[path = "dev/damage_vectors.rs"]
 mod damage_vectors;
-mod freeze_drill;
 mod get;
 mod pool_ops;
 pub use pool_ops::{
@@ -106,24 +105,34 @@ mod media_readiness;
 mod put;
 mod recovery_report;
 mod tape_finalize;
-pub mod tape_image;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "dev/tape_image.rs"]
+mod tape_image;
 mod tape_supersede;
-// Review-only fixture code used by the example and the executor.
-#[doc(hidden)]
-pub mod negative_vectors;
-#[doc(hidden)]
-pub mod resume_vectors;
-#[doc(hidden)]
-pub mod tape_image_vectors;
+// Test-only fixtures exercise operator inventory and recovery projections.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "dev/negative_vectors.rs"]
+mod negative_vectors;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "dev/resume_vectors.rs"]
+mod resume_vectors;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "dev/tape_image_vectors.rs"]
+mod tape_image_vectors;
 mod tape_inventory;
 mod tape_read_rate;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "dev/terminal_index_drill.rs"]
 mod terminal_index_drill;
 #[cfg(feature = "tui")]
 mod top;
 
 const DEFAULT_DAEMON_ENDPOINT: &str = "unix:/var/lib/rem/rem.sock";
-const DEFAULT_DEV_TAPE_RECORD_BYTES: usize = 1024 * 1024;
-const MAX_SCSI_VARIABLE_WRITE_BYTES: usize = 0x00FF_FFFF;
 const MEDIA_CONDITIONING_TIMEOUT: StdDuration = StdDuration::from_secs(9_000);
 const MEDIA_CONDITIONING_STEADY_POLL: StdDuration = StdDuration::from_secs(60);
 #[cfg(test)]
@@ -304,13 +313,6 @@ fn rem_debug_only_reason(cmd: &Command) -> Option<&'static str> {
         | Command::Rescan { .. }
         | Command::Lock { .. }
         | Command::Unlock { .. } => Some("direct local SCSI mutation"),
-        Command::Dev { .. } => Some("development direct tape helper"),
-        Command::Tape {
-            command: TapeCommand::FreezeDrill(_),
-        } => Some("destructive direct tape freeze drill"),
-        Command::Tape {
-            command: TapeCommand::TerminalIndexDrill(_),
-        } => Some("direct terminal-index verification drill"),
         Command::Archive { command } if command.tape_target().is_some() => {
             Some("direct local tape archive access")
         }
@@ -370,8 +372,7 @@ fn rem_only_reason(cmd: &Command) -> Option<&'static str> {
         | Command::RebuildCatalogFromJournals { .. }
         | Command::Catalog { .. }
         | Command::Archive { .. }
-        | Command::Tape { .. }
-        | Command::Dev { .. } => None,
+        | Command::Tape { .. } => None,
     }
 }
 
@@ -651,14 +652,6 @@ enum RemCommand {
 
     /// Restore a native REM-OBJECT object into a directory.
     Restore(RemArchiveExtractArgs),
-
-    /// Development-only hardware helpers.
-    #[command(hide = true)]
-    Dev {
-        /// Development operation to run.
-        #[command(subcommand)]
-        command: DevCommand,
-    },
 }
 
 impl From<RemCommand> for Command {
@@ -771,7 +764,6 @@ impl From<RemCommand> for Command {
             RemCommand::Restore(args) => Self::Archive {
                 command: Box::new(ArchiveCommand::Extract(args.into())),
             },
-            RemCommand::Dev { command } => Self::Dev { command },
         }
     }
 }
@@ -792,7 +784,6 @@ fn state_changing_target(cmd: &Command) -> Option<&str> {
         | Command::Lock { serial }
         | Command::Unlock { serial } => Some(serial.as_str()),
         Command::Archive { command } => command.tape_target(),
-        Command::Dev { command } => Some(command.tape_target()),
         Command::Tape {
             command: TapeCommand::BotProbe(args),
         } => Some(args.library.as_str()),
@@ -832,7 +823,8 @@ fn state_changing_target(cmd: &Command) -> Option<&str> {
 
 /// Parse an SMC element address from a CLI argument. Accepts
 /// `0x0400`, `0X0400`, or `1024` — anything that fits in a `u16`.
-fn parse_element_addr(s: &str) -> Result<u16, String> {
+#[doc(hidden)]
+pub fn parse_element_addr(s: &str) -> Result<u16, String> {
     let trimmed = s.trim();
     if let Some(rest) = trimmed
         .strip_prefix("0x")
@@ -882,16 +874,6 @@ fn parse_tape_init_target(s: &str) -> Result<TapeInitTarget, String> {
     }
 }
 
-/// Parse a byte count for dev tape record sizing.
-/// Accepts plain bytes plus binary suffixes like `1024K` or `1MiB`.
-fn parse_record_size(s: &str) -> Result<usize, String> {
-    let bytes = parse_binary_byte_count(s, "record size")?;
-    if bytes == 0 {
-        return Err("record size must be greater than zero".to_string());
-    }
-    usize::try_from(bytes).map_err(|_| format!("record size {s:?} is too large for this host"))
-}
-
 /// Parse an REM-OBJECT archive build chunk size.
 fn parse_archive_chunk_size(s: &str) -> Result<usize, String> {
     let bytes = parse_binary_byte_count(s, "chunk size")?;
@@ -932,7 +914,8 @@ fn parse_tape_block_size(s: &str) -> Result<u64, String> {
     Ok(bytes)
 }
 
-fn parse_binary_byte_count(s: &str, label: &str) -> Result<u64, String> {
+#[doc(hidden)]
+pub fn parse_binary_byte_count(s: &str, label: &str) -> Result<u64, String> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         return Err(format!("{label} cannot be empty"));
@@ -1300,13 +1283,6 @@ enum Command {
         drive: u16,
         locator: String,
         expected_sha256: String,
-    },
-
-    /// Development-only hardware helpers.
-    Dev {
-        /// Development operation to run.
-        #[command(subcommand)]
-        command: DevCommand,
     },
 }
 
@@ -1716,13 +1692,6 @@ enum TapeCommand {
     /// Emit a catalog-less terminal-index object recovery report.
     RecoveryReport(TapeRecoveryReportArgs),
 
-    /// Run one destructive REM-PARITY freeze criterion 4 fault-injected scratch-tape round-trip.
-    FreezeDrill(TapeFreezeDrillArgs),
-
-    /// Run one read-only terminal triple-index verification/fallback leg.
-    #[command(name = "terminal-index-drill")]
-    TerminalIndexDrill(terminal_index_drill::TerminalIndexDrillArgs),
-
     /// Read the loaded drive's TapeAlert LOG SENSE page.
     Alerts(TapeAlertsArgs),
 
@@ -1750,8 +1719,6 @@ impl TapeCommand {
             Self::BotProbe(args) => args.validate_before_discovery(),
             Self::ReadRate(args) => args.validate_before_discovery(),
             Self::AdoptBootstrap(args) => args.validate_before_discovery(),
-            Self::FreezeDrill(args) => args.validate_before_discovery(),
-            Self::TerminalIndexDrill(args) => args.validate_before_discovery(),
             Self::Alerts(args) => args.validate_before_discovery(),
             Self::Init(args) => args.validate_before_discovery(),
             Self::WaitReady(args) => args.validate_before_discovery(),
@@ -2206,84 +2173,6 @@ fn run_bot_identity_hardware(
 }
 
 #[derive(Args, Debug)]
-struct TapeFreezeDrillArgs {
-    /// Explicit SG tape-drive device containing the mounted scratch tape.
-    #[arg(long, value_name = "/dev/sgN")]
-    device: PathBuf,
-
-    /// Fixed tape block size for this drill invocation.
-    #[arg(long, value_enum)]
-    block_size: freeze_drill::FreezeDrillBlockSize,
-
-    /// Deterministic payload volume in MiB across the drill objects.
-    #[arg(long, default_value_t = 512)]
-    data_mib: u64,
-
-    /// Use the production default one-GiB separation extent instead of the
-    /// compact three-record drill profile.
-    #[arg(long)]
-    default_index_separation: bool,
-
-    /// Read-side medium-error arrangement to inject.
-    #[arg(long, value_enum)]
-    damage_plan: freeze_drill::DamagePlan,
-
-    /// Permit a scratch-tape overwrite when BOT cannot be read.
-    #[arg(long)]
-    yes_i_know_scratch: bool,
-
-    /// Destination for the stable JSON drill report.
-    #[arg(long, value_name = "PATH.json")]
-    report: PathBuf,
-}
-
-impl TapeFreezeDrillArgs {
-    fn validate_before_discovery(&self) -> Result<(), String> {
-        fs::metadata(&self.device).map_err(|error| {
-            format!(
-                "inspect freeze-drill device {}: {error}",
-                self.device.display()
-            )
-        })?;
-        if self.data_mib == 0 {
-            return Err("tape freeze-drill --data-mib must be greater than zero".to_string());
-        }
-        if self.report == self.device {
-            return Err("tape freeze-drill --report must not name the tape device".to_string());
-        }
-        match fs::metadata(&self.report) {
-            Ok(metadata) if !metadata.is_file() => {
-                return Err(format!(
-                    "tape freeze-drill --report {} exists and is not a regular file",
-                    self.report.display()
-                ));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "inspect tape freeze-drill report {}: {error}",
-                    self.report.display()
-                ));
-            }
-        }
-        if let Some(parent) = self
-            .report
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            if !parent.is_dir() {
-                return Err(format!(
-                    "tape freeze-drill report parent {} is not a directory",
-                    parent.display()
-                ));
-            }
-        }
-        Ok(())
-    }
-}
-
-#[derive(Args, Debug)]
 struct TapeRecoveryReportArgs {
     /// Published-layout image directory or discovered `/dev/sgN` drive path.
     #[arg(value_name = "SOURCE")]
@@ -2698,63 +2587,6 @@ impl TapeRetireArgs {
             return Err("tape retire requires --i-understand-copies-become-unreadable".to_string());
         }
         Ok(())
-    }
-}
-
-#[derive(Subcommand, Debug)]
-enum DevCommand {
-    /// Destructively write a raw dump file to the loaded tape in a drive bay.
-    WriteDumpToTape {
-        /// Path to a raw dump file.
-        #[arg(long, value_name = "PATH")]
-        dump: PathBuf,
-
-        /// Library serial for the loaded tape.
-        #[arg(long, value_name = "SERIAL")]
-        tape: String,
-
-        /// Drive bay containing the loaded scratch tape.
-        #[arg(long, value_parser = parse_element_addr)]
-        bay: u16,
-
-        /// Variable tape record size to write.
-        #[arg(
-            long,
-            value_name = "BYTES",
-            value_parser = parse_record_size,
-            default_value_t = DEFAULT_DEV_TAPE_RECORD_BYTES
-        )]
-        record_size: usize,
-
-        /// Required acknowledgement that the loaded tape will be overwritten.
-        #[arg(long = "i-understand-this-overwrites-the-loaded-tape")]
-        overwrite_ack: bool,
-    },
-}
-
-impl DevCommand {
-    fn tape_target(&self) -> &str {
-        match self {
-            Self::WriteDumpToTape { tape, .. } => tape,
-        }
-    }
-
-    fn validate_before_discovery(&self) -> Result<(), String> {
-        match self {
-            Self::WriteDumpToTape {
-                record_size,
-                overwrite_ack,
-                ..
-            } => {
-                if !overwrite_ack {
-                    return Err(
-                        "dev write-dump-to-tape requires --i-understand-this-overwrites-the-loaded-tape"
-                            .to_string(),
-                    );
-                }
-                validate_dev_record_size(*record_size)
-            }
-        }
     }
 }
 
@@ -4137,6 +3969,45 @@ impl ArchiveFormat {
     }
 }
 
+/// Identify retired command paths without opening devices or parsing drill arguments.
+fn development_replacement(args: &[std::ffi::OsString]) -> Option<&'static str> {
+    let mut words = args.iter().skip(1);
+    let mut command = None;
+    while let Some(word) = words.next() {
+        let word = word.to_str()?;
+        if matches!(
+            word,
+            "--allow" | "--allow-derived" | "--config" | "--device" | "--allow-device"
+        ) {
+            words.next()?;
+            continue;
+        }
+        if word.starts_with("--allow=")
+            || word.starts_with("--allow-derived=")
+            || word.starts_with("--config=")
+            || word.starts_with("--device=")
+            || word.starts_with("--allow-device=")
+        {
+            continue;
+        }
+        if word.starts_with('-') {
+            return None;
+        }
+        match command {
+            None if matches!(word, "tape" | "dev") => command = Some(word),
+            Some("tape") if word == "freeze-drill" => return Some("rem-dev tape freeze-drill"),
+            Some("tape") if word == "terminal-index-drill" => {
+                return Some("rem-dev tape terminal-index-drill")
+            }
+            Some("dev") if word == "write-dump-to-tape" => {
+                return Some("rem-dev dev write-dump-to-tape")
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 pub fn main_entry() -> ExitCode {
     main_entry_with_registry(ForeignFormatRegistry::default())
 }
@@ -4148,6 +4019,10 @@ pub fn main_entry_with_registry(registry: ForeignFormatRegistry) -> ExitCode {
         let _ = writeln!(std::io::stderr().lock(), "warning: {message}");
     });
     let args: Vec<_> = std::env::args_os().collect();
+    if let Some(replacement) = development_replacement(&args) {
+        eprintln!("error: use `{replacement}`");
+        return ExitCode::from(1);
+    }
     if let Some(help) = standalone::shared_help(&args) {
         println!("{help}");
         return ExitCode::SUCCESS;
@@ -4169,12 +4044,35 @@ pub fn debug_main_entry_with_registry(registry: ForeignFormatRegistry) -> ExitCo
         use std::io::Write;
         let _ = writeln!(std::io::stderr().lock(), "warning: {message}");
     });
-    let cli = DebugCli::parse();
+    let args: Vec<_> = std::env::args_os().collect();
+    if let Some(replacement) = development_replacement(&args) {
+        eprintln!("error: use `{replacement}`");
+        return ExitCode::from(1);
+    }
+    let cli = DebugCli::parse_from(args);
     run_cli(cli.into(), CliMode::Debug, registry)
 }
 
+/// Print discovery errors and their existing warning and capability hints.
+#[doc(hidden)]
+pub fn print_discovery_error(e: &DiscoveryError, err: &mut dyn Write) {
+    let _ = writeln!(err, "error: {e}");
+    // Errors that carry warnings (NoLibraries when devices
+    // were seen but every probe failed) should surface those
+    // warnings so the operator can see the root cause —
+    // most notably EPERM from a missing CAP_SYS_RAWIO.
+    if let DiscoveryError::NoLibraries { warnings } = e {
+        if !warnings.is_empty() {
+            print_warning_list(warnings, err);
+            print_setcap_hint_if_needed(warnings, err);
+        }
+    }
+}
+
+/// Discover devices through the shared debug transport policy.
 #[cfg(target_os = "linux")]
-fn cli_discover() -> Result<DiscoveryReport, DiscoveryError> {
+#[doc(hidden)]
+pub fn cli_discover() -> Result<DiscoveryReport, DiscoveryError> {
     let factory = cli_transport_factory(CliTransportAccess::ReadOnly)
         .map_err(|cause| DiscoveryError::EnumerationDenied { cause })?;
     let devices = remanence_library::sysfs::enumerate_sg_devices()
@@ -4468,8 +4366,7 @@ where
         | Command::RebuildCatalogFromJournals { .. }
         | Command::Catalog { .. }
         | Command::Tape { .. }
-        | Command::Archive { .. }
-        | Command::Dev { .. } => {}
+        | Command::Archive { .. } => {}
     }
 
     // Pre-discovery allowlist gate. State-changing subcommands
@@ -4489,12 +4386,6 @@ where
                 err,
                 "       pass `--allow {target}` to permit this invocation"
             );
-            return ExitCode::from(1);
-        }
-    }
-    if let Command::Dev { command } = &cli.command {
-        if let Err(error) = command.validate_before_discovery() {
-            let _ = writeln!(err, "error: {error}");
             return ExitCode::from(1);
         }
     }
@@ -4529,24 +4420,6 @@ where
                 );
             }
             return run_direct_device_recovery_report(args, out, err);
-        }
-        if let TapeCommand::FreezeDrill(args) = command {
-            return freeze_drill::run_live(
-                freeze_drill::LiveDrillRequest {
-                    device: &args.device,
-                    block_size: args.block_size.bytes(),
-                    data_mib: args.data_mib,
-                    default_index_separation: args.default_index_separation,
-                    damage_plan: args.damage_plan,
-                    unreadable_bot_ack: args.yes_i_know_scratch,
-                    report_path: &args.report,
-                },
-                out,
-                err,
-            );
-        }
-        if let TapeCommand::TerminalIndexDrill(args) = command {
-            return terminal_index_drill::run_live(args, out, err);
         }
         // These tape subcommands are catalog + audit only — no SCSI, no
         // library allowlist — so they bypass discovery entirely (like the
@@ -4619,17 +4492,7 @@ where
     let report = match discover_fn() {
         Ok(r) => r,
         Err(e) => {
-            let _ = writeln!(err, "error: {e}");
-            // Errors that carry warnings (NoLibraries when devices
-            // were seen but every probe failed) should surface those
-            // warnings so the operator can see the root cause —
-            // most notably EPERM from a missing CAP_SYS_RAWIO.
-            if let DiscoveryError::NoLibraries { warnings } = &e {
-                if !warnings.is_empty() {
-                    print_warning_list(warnings, err);
-                    print_setcap_hint_if_needed(warnings, err);
-                }
-            }
+            print_discovery_error(&e, err);
             return ExitCode::from(1);
         }
     };
@@ -4934,9 +4797,6 @@ where
                 out,
                 err,
             );
-        }
-        Command::Dev { command } => {
-            return run_dev_command(&report, &command, &allow, &allow_derived, out, err);
         }
         Command::Top { .. } | Command::AuditClient { .. } | Command::ArchiveVerifyClient { .. } => {
             unreachable!("daemon client command returns before discovery")
@@ -9024,12 +8884,6 @@ fn run_tape_command(
         TapeCommand::RecoveryReport(_) => {
             unreachable!("tape recovery report dispatched pre-discovery")
         }
-        TapeCommand::FreezeDrill(_) => {
-            unreachable!("tape freeze-drill dispatched pre-discovery")
-        }
-        TapeCommand::TerminalIndexDrill(_) => {
-            unreachable!("tape terminal-index-drill dispatched pre-discovery")
-        }
         TapeCommand::Alerts(args) => run_tape_alerts(report, args, out, err),
         TapeCommand::Init(args) => run_tape_init(report, args, input, out, err),
         TapeCommand::WaitReady(args) => run_tape_wait_ready(report, args, out, err),
@@ -12367,162 +12221,6 @@ fn init_error_label(error: &remanence_api::TapeInitError) -> String {
     }
 }
 
-fn run_dev_command(
-    report: &DiscoveryReport,
-    command: &DevCommand,
-    allow: &[String],
-    allow_derived: &[String],
-    out: &mut dyn Write,
-    err: &mut dyn Write,
-) -> ExitCode {
-    match command {
-        DevCommand::WriteDumpToTape {
-            dump,
-            tape,
-            bay,
-            record_size,
-            ..
-        } => run_state_change(
-            report,
-            tape,
-            allow,
-            allow_derived,
-            out,
-            err,
-            |handle, policy| {
-                let mut drive = handle
-                    .open_drive(*bay, policy)
-                    .map_err(|error| error.to_string())?;
-                let report = write_dump_to_loaded_tape(&mut drive, dump, *record_size)?;
-                Ok(format!(
-                    "wrote {} bytes from {} to bay 0x{bay:04x} in {} records; \
-                     wrote 1 filemark and rewound",
-                    report.bytes_written,
-                    dump.display(),
-                    report.records_written
-                ))
-            },
-        ),
-    }
-}
-
-fn validate_dev_record_size(record_size: usize) -> Result<(), String> {
-    if record_size == 0 {
-        return Err("record size must be greater than zero".to_string());
-    }
-    if record_size > MAX_SCSI_VARIABLE_WRITE_BYTES {
-        return Err(format!(
-            "record size {record_size} exceeds WRITE(6) transfer limit {MAX_SCSI_VARIABLE_WRITE_BYTES}"
-        ));
-    }
-    Ok(())
-}
-
-struct DevWriteDumpReport {
-    bytes_written: u64,
-    records_written: u64,
-}
-
-fn write_dump_to_loaded_tape(
-    drive: &mut remanence_library::DriveHandle,
-    dump: &Path,
-    record_size: usize,
-) -> Result<DevWriteDumpReport, String> {
-    validate_dev_record_size(record_size)?;
-    let metadata = std::fs::metadata(dump)
-        .map_err(|error| format!("read dump metadata {}: {error}", dump.display()))?;
-    if !metadata.is_file() {
-        return Err(format!(
-            "dump path {} is not a regular file",
-            dump.display()
-        ));
-    }
-    let dump_len = metadata.len();
-    if dump_len == 0 {
-        return Err("dump file is empty".to_string());
-    }
-    let identity_generation = drive.identity_generation();
-    let current_config = drive.read_config().map_err(|error| error.to_string())?;
-    if record_size > current_config.max_block_size_bytes as usize {
-        return Err(format!(
-            "record size {record_size} exceeds drive-reported max block size {}",
-            current_config.max_block_size_bytes
-        ));
-    }
-
-    let mut reader = BufReader::new(
-        File::open(dump).map_err(|error| format!("open dump {}: {error}", dump.display()))?,
-    );
-    let mut buffer = vec![0; record_size];
-    let mut report = DevWriteDumpReport {
-        bytes_written: 0,
-        records_written: 0,
-    };
-
-    drive.rewind().map_err(|error| error.to_string())?;
-    drive
-        .write_config(TapeConfig {
-            density_code: None,
-            block_size: BlockSize::Variable,
-            compression: false,
-            max_block_size_bytes: current_config.max_block_size_bytes,
-            write_protected: current_config.write_protected,
-            worm: current_config.worm,
-        })
-        .map_err(|error| error.to_string())?;
-
-    drive
-        .bind_identity_generation(identity_generation)
-        .map_err(|error| error.to_string())?;
-    loop {
-        let mut filled = 0usize;
-        while filled < buffer.len() {
-            let read = reader
-                .read(&mut buffer[filled..])
-                .map_err(|error| format!("read dump {}: {error}", dump.display()))?;
-            if read == 0 {
-                break;
-            }
-            filled += read;
-        }
-        if filled == 0 {
-            break;
-        }
-        let outcome = drive
-            .write_block(&buffer[..filled])
-            .map_err(|error| error.to_string())?;
-        if outcome.bytes_written as usize != filled {
-            return Err(format!(
-                "short tape write: wrote {} bytes from {filled}-byte record",
-                outcome.bytes_written
-            ));
-        }
-        report.bytes_written += filled as u64;
-        report.records_written += 1;
-        if outcome.end_of_medium {
-            return Err("drive reported end-of-medium while writing dump".to_string());
-        }
-        if filled < buffer.len() {
-            break;
-        }
-    }
-
-    if report.bytes_written != dump_len {
-        return Err(format!(
-            "wrote {} bytes but dump length is {dump_len}",
-            report.bytes_written
-        ));
-    }
-    let filemark = drive
-        .write_filemarks(1)
-        .map_err(|error| error.to_string())?;
-    if filemark.end_of_medium {
-        return Err("drive reported end-of-medium while writing filemark".to_string());
-    }
-    drive.rewind().map_err(|error| error.to_string())?;
-    Ok(report)
-}
-
 fn run_archive_dump_command(
     command: &ArchiveCommand,
     registry: &ForeignFormatRegistry,
@@ -15739,7 +15437,8 @@ fn run_watch(_coalesce_window: &str, _out: &mut dyn Write, err: &mut dyn Write) 
 ///
 /// Warnings from the discovery pass always print to stderr at the
 /// end, matching the read-only subcommands' behaviour.
-fn run_state_change<F>(
+#[doc(hidden)]
+pub fn run_state_change<F>(
     report: &DiscoveryReport,
     serial: &str,
     allow: &[String],
@@ -17929,18 +17628,17 @@ mod tests {
         let help = command_help(DebugCli::command());
 
         for command in [
-            "move", "load", "unload", "export", "import", "rescan", "lock", "unlock", "dev",
-            "catalog",
+            "move", "load", "unload", "export", "import", "rescan", "lock", "unlock", "catalog",
         ] {
             assert!(
                 help.contains(&format!("\n  {command}")),
                 "rem-debug help should expose {command}:\n{help}"
             );
         }
-        for command in ["daemon", "op", "daemon-catalog"] {
+        for command in ["daemon", "op", "daemon-catalog", "dev"] {
             assert!(
                 !help.contains(&format!("\n  {command}")),
-                "rem-debug help should not expose daemon client command {command}:\n{help}"
+                "rem-debug help should not expose retired or daemon client command {command}:\n{help}"
             );
         }
     }
@@ -21199,38 +20897,6 @@ pool_id = "init-test"
     }
 
     #[test]
-    fn rem_dev_write_dump_points_to_rem_debug_before_discovery() {
-        let cli = Cli::parse_from([
-            "rem",
-            "dev",
-            "write-dump-to-tape",
-            "--dump",
-            "/tmp/fixture.bin",
-            "--tape",
-            "LIB_DEV_01",
-            "--bay",
-            "0x0100",
-            "--i-understand-this-overwrites-the-loaded-tape",
-        ]);
-        let mut out = Vec::<u8>::new();
-        let mut err = Vec::<u8>::new();
-        let code = run(
-            cli,
-            move || -> Result<DiscoveryReport, DiscoveryError> {
-                panic!("discover_fn must not be called when dev --allow gate fails")
-            },
-            &mut out,
-            &mut err,
-        );
-
-        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
-        let stderr = String::from_utf8(err).unwrap();
-        assert!(stderr.contains("available through `rem-debug`"));
-        assert!(stderr.contains("development direct tape helper"));
-        assert!(out.is_empty());
-    }
-
-    #[test]
     fn rem_debug_state_changing_op_without_allow_refuses_before_discovery() {
         let cli = DebugCli::parse_from([
             "rem-debug",
@@ -21256,47 +20922,6 @@ pool_id = "init-test"
         assert!(stderr.contains("not on the --allow list"));
         assert!(stderr.contains("--allow LIB_GATE_01"));
         assert!(out.is_empty());
-    }
-
-    #[test]
-    fn rem_debug_dev_write_dump_without_overwrite_ack_refuses_before_discovery() {
-        let cli = DebugCli::parse_from([
-            "rem-debug",
-            "--allow",
-            "LIB_DEV_01",
-            "dev",
-            "write-dump-to-tape",
-            "--dump",
-            "/tmp/fixture.bin",
-            "--tape",
-            "LIB_DEV_01",
-            "--bay",
-            "0x0100",
-        ]);
-        let mut out = Vec::<u8>::new();
-        let mut err = Vec::<u8>::new();
-        let code = run_debug(
-            cli,
-            move || -> Result<DiscoveryReport, DiscoveryError> {
-                panic!("discover_fn must not be called when destructive ack is missing")
-            },
-            &mut out,
-            &mut err,
-        );
-
-        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
-        let stderr = String::from_utf8(err).unwrap();
-        assert!(stderr.contains("--i-understand-this-overwrites-the-loaded-tape"));
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn dev_record_size_parser_accepts_binary_suffixes() {
-        assert_eq!(parse_record_size("1M").unwrap(), 1024 * 1024);
-        assert_eq!(parse_record_size("1MB").unwrap(), 1024 * 1024);
-        assert_eq!(parse_record_size("2KiB").unwrap(), 2048);
-        assert_eq!(parse_record_size("2KB").unwrap(), 2048);
-        assert_eq!(parse_record_size("4096").unwrap(), 4096);
     }
 
     #[test]

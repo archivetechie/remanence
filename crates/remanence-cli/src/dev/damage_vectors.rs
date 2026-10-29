@@ -1439,8 +1439,9 @@ fn compare_e2(id: &str, expected: &Value, actual: &Value) -> Vec<String> {
 }
 
 /// The E4 overlay: expectations of erratum set E4 for existing damage cases.
-const E4_OVERLAY: &str =
-    include_str!("../../../fixtures/rem-parity-terminal-index-draft/tape-images/expected-e4.json");
+const E4_OVERLAY: &str = include_str!(
+    "../../../../fixtures/rem-parity-terminal-index-draft/tape-images/expected-e4.json"
+);
 
 /// What a Verifier's full verification reported, projected onto the structure
 /// an E4 author's entry states: the failed data blocks by tape-file position
@@ -3651,8 +3652,10 @@ fn metadata_run_positioning_is_independent_of_block_count() {
     }
 }
 
+#[path = "damage_vectors/forward_counts.rs"]
 mod forward_counts;
 #[cfg(test)]
+#[path = "damage_vectors/one_pass_counts.rs"]
 mod one_pass_counts;
 
 /// Recovery never bypasses the sidecar CRC, including the batch retry path.

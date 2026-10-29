@@ -680,7 +680,7 @@ it never substitutes labels from the new retry request.
   `format_version: 2`; ranged mode reports the recipients parsed from the
   authenticated prefix and the authenticated-chunk/stored-range geometry.
 
-<!-- code-anchor: crates/remanence-cli/src/rem_debug.rs crates/remanence-cli/src/lib.rs crates/remanence-cli/src/freeze_drill.rs @ bc2f9f90 -->
+<!-- code-anchor: crates/remanence-cli/src/rem_debug.rs crates/remanence-cli/src/lib.rs @ bc2f9f90 -->
 ## rem-debug extras
 
 `rem-debug` has only part of the surface above. It shares discovery
@@ -706,11 +706,10 @@ archive verify` verifies through the daemon (see [Restoring from
 tape](#restoring-from-tape)); `rem-debug archive verify` reads the tape
 directly.
 
-In the other direction, `rem` refuses the robotics, `dev`, and the direct
+In the other direction, `rem` refuses the robotics and the direct
 tape-path `archive write`, `archive read` and `archive export-object` with an
 error saying they are available through `rem-debug`. It has no `tape
-bot-probe`, `tape adopt-bootstrap`, `tape recovery-report`, `tape
-freeze-drill`, `tape terminal-index-drill`, `catalog reset` or `catalog
+bot-probe`, `tape adopt-bootstrap`, `tape recovery-report`, `catalog reset` or `catalog
 reset-preflight`.
 
 What `rem-debug` adds:
@@ -737,7 +736,6 @@ journals):
 | `rem-debug archive verify --library <SERIAL> --locator <JSON> --expected-sha256 <HEX> [--private-key <REMP>]` | Stream and hash an object on tape against an expected digest, restoring nothing; encrypted copies require the matching private key. |
 | `rem-debug archive probe/scan/restore/recover --format <ID> --tape <SERIAL> --bay <BAY> [--rewind]` | Run a registered foreign-format adapter directly against a mounted tape instead of a dump file. `--tape` takes the serial of the library that holds the tape, and `--bay` the drive bay; that library must be on `--allow`. `restore` and `recover` also take `--dest <DIR>`, as with a dump file. |
 | `rem-debug tape alerts --bay <BAY> [--library <SERIAL>]` | Read the loaded drive's TapeAlert LOG SENSE page directly. `--library` selects a configured library when more than one is present. `rem tape alerts` has no `--bay`; it is the daemon alias that takes a drive serial or UUID. |
-| `rem-debug tape terminal-index-drill --device <SG> --tape-uuid <UUID> --block-size <BYTES> --report <PATH> [--damage-plan <PLAN>] [--reconcile-outcome <OUTCOME>] [--full-verify]` | Run one read-only live-SG terminal-index verification leg and write schema `rem.tape.terminal-index-drill.v1`. `--damage-plan` defaults to `none`. `--reconcile-outcome` forces one no-write reconciliation refusal: `torn-worm` makes the next component readable at its proved start only as a torn WORM tail, and `unproved-start` makes the next component's immutable start unprovable. Replica plans are `none`, `a`, `b`, `c`, `ab`, `ac`, `bc`, `abc`, and `disagreement`; the latter substitutes a locally valid conflicting A edition and requires the fail-closed typed `TerminalIndexReplicaConflict` refusal with no selected replica, while `abc` executes BOT structural recovery. Gap plans are `gap-ab-header`, `gap-ab-footer`, `gap-bc-header`, and `gap-bc-footer`; each replaces the named record with a fixed `0xd7` block above the transport, requires `--full-verify`, and reports typed degraded separation evidence. Reports name the mechanism and exact injected LBAs. All injection occurs in the reader above the transport and never rewrites media. Full verification otherwise requires `--damage-plan none`. In the report's `full_verify` object, `outcome` names what the terminal suffix did and `complete` names what the tape did: `outcome: "verified_complete"` with `complete: false` means that the terminal suffix validated and the protected content did not, and `complete` is `true` only when both hold. See [Full verification](guide-full-verification.md). |
 
 Destructive maintenance:
 
@@ -745,8 +743,6 @@ Destructive maintenance:
 |---|---|
 | `rem-debug catalog reset-preflight [--preserve-tape-voltag <VOLTAG>]... [--allow-erase-tape-voltag <VOLTAG>]...` | Read-only admission for a scoped catalog reset. It enumerates every data and cleaning tape, rejects any bound label outside the two exact selector sets, and returns a source-bound token plus `source_schema_version`. A catalog of schema 16 or 17 is inspectable only when the preservation set is empty and every bound tape is explicitly allowed to be erased; such a catalog is never migrated and never accepted for preservation. |
 | `rem-debug catalog reset --i-understand-this-erases-the-catalog [--expected-preflight-token <SHA256>] [--preserve-tape-voltag <VOLTAG>]... [--allow-erase-tape-voltag <VOLTAG>]...` | Destructively reset local catalog state from the configured paths. Any scoped reset requires the exact current preflight token and repeats selector and source-schema admission under the exclusive state lock before mutation. |
-| `rem-debug dev write-dump-to-tape --dump <PATH> --tape <SERIAL> --bay <BAY> --i-understand-this-overwrites-the-loaded-tape [--record-size <BYTES>]` | Overwrite the loaded scratch tape with raw dump bytes (test fixture setup). `--tape` takes the serial of the library that holds the tape. `--record-size` sets the variable record size (default 1048576). |
-| `rem-debug tape freeze-drill --device </dev/sgN> --block-size <BYTES> --damage-plan <PLAN> --report <PATH.json> [--data-mib <MIB>] [--default-index-separation] [--yes-i-know-scratch]` | Run one destructive REM-PARITY freeze criterion 4 fault-injected scratch-tape round-trip: write drill objects through a full terminal-index finalization, then inject a chosen read-side medium-error damage plan and verify recovery. `--damage-plan` is one of `bootstrap-copy0`, `sidecar-head`, `object-span`, `terminal-replica-c`, or `combined` (the maximal conforming set). `--yes-i-know-scratch` permits overwriting the tape when BOT cannot be read; `--default-index-separation` uses the production 1 GiB separation extent instead of the compact drill profile. `--block-size` is 262144, 524288 or 1048576; `--data-mib` defaults to 512. Writes a stable JSON report to `--report`. The drill does not consult `--allow`; the explicit `--device` is its only target selection. |
 
 The global `--allow-derived <SERIAL>` flag additionally permits operating
 drive bays whose identity was derived rather than read from the device, in
@@ -812,3 +808,11 @@ RPC is described in [the API reference](reference-api.md).
 For library-mode `rem get --caller-id`, `--pool <POOL>` selects the caller id's
 pool. Without `--pool`, a caller id present in several pools returns a refusal
 that names the pools. A caller id present in only one pool still resolves.
+
+## Development tools
+
+`rem-dev` holds the review-vector generator and scratch-tape drills. It is
+absent from release archives and the field kit. Build it with
+`cargo build -p remanence-cli --bin rem-dev`. See [Development tools](development-tools.md)
+for commands and arguments. Old development invocations through `rem` or
+`rem-debug` fail with a one-line replacement command.

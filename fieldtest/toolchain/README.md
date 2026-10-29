@@ -22,7 +22,7 @@ mkdir -p .cargo
 cp ../vendor-config.toml .cargo/config.toml   # [source.crates-io] replace-with vendored
 
 # 4. Build
-cargo build --release --offline
+cargo build --release --offline --bin rem --bin rem-debug --bin rem-daemon
 
 # 5. Install into the kit
 cp target/release/{rem,rem-daemon,rem-debug} ~/remfield/bin/

@@ -102,11 +102,11 @@ jobs:
           ) || true
 
       - name: Check full-tape parity image digests and damage descriptors
-        run: cargo run -p remanence-cli --example generate_tape_images -- --check
+        run: cargo run -p remanence-cli --bin rem-dev -- generate-tape-images --check
 
       - name: Export draft tape image streams
         timeout-minutes: 5
-        run: cargo run --offline -q -p remanence-cli --example generate_tape_images -- --export-images "$RUNNER_TEMP/w2-images"
+        run: cargo run --offline -q -p remanence-cli --bin rem-dev -- generate-tape-images --export-images "$RUNNER_TEMP/w2-images"
 
       - name: Build and verify the draft vector archive
         timeout-minutes: 20
