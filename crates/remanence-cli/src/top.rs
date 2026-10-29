@@ -185,7 +185,12 @@ fn render_top(frame: &mut Frame<'_>, state: &TopState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(
+                3 + state
+                    .live
+                    .as_ref()
+                    .map_or(0, |live| live.active_tape_io_fences.len().min(5) as u16),
+            ),
             Constraint::Length(7),
             Constraint::Min(7),
             Constraint::Length(if state.help { 4 } else { 2 }),
@@ -206,13 +211,11 @@ fn render_top(frame: &mut Frame<'_>, state: &TopState) {
 fn render_header(frame: &mut Frame<'_>, area: Rect, state: &TopState) {
     let title = match &state.live {
         Some(live) => format!(
-            "rem top  snapshot {}  daemon {}",
-            live.snapshot_at_utc, live.daemon_epoch
+            "rem top  fences={}  daemon {}  snapshot {}",
+            live.active_tape_io_fence_count, live.daemon_epoch, live.snapshot_at_utc,
         ),
         None => "rem top".to_string(),
     };
-    // One bordered row: borders consume 2 of the 3 header rows, so PAUSED
-    // must live on the title line or real ratatui clips it.
     let mut spans = vec![Span::styled(
         title,
         Style::default()
@@ -227,8 +230,32 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &TopState) {
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    let paragraph =
-        Paragraph::new(vec![Line::from(spans)]).block(Block::default().borders(Borders::ALL));
+    let mut lines = vec![Line::from(spans)];
+    if let Some(live) = &state.live {
+        let visible = if live.active_tape_io_fences.len() > 5 {
+            4
+        } else {
+            5
+        };
+        for fence in live.active_tape_io_fences.iter().take(visible) {
+            lines.push(Line::from(format!(
+                "FENCED {} {}  {}",
+                fence
+                    .barcode
+                    .as_deref()
+                    .unwrap_or(&bytes_to_uuid_text(&fence.tape_uuid)),
+                fence.endpoint_key.as_deref().unwrap_or(""),
+                fence.quarantine_id,
+            )));
+        }
+        if live.active_tape_io_fences.len() > 5 {
+            lines.push(Line::from(format!(
+                "{} more fences; full list: rem catalog tapes --json",
+                live.active_tape_io_fences.len() - visible,
+            )));
+        }
+    }
+    let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::ALL));
     frame.render_widget(paragraph, area);
 }
 
@@ -482,6 +509,8 @@ mod tests {
 
     fn sample_response() -> pb::GetLiveStatusResponse {
         pb::GetLiveStatusResponse {
+            active_tape_io_fence_count: 0,
+            active_tape_io_fences: Vec::new(),
             libraries: vec![pb::LibraryState {
                 library: Some(pb::Library {
                     library_serial: "MAINLIB".to_string(),
@@ -580,6 +609,47 @@ mod tests {
         assert!(text.contains("CLN001"));
         assert!(text.contains("1m23s"));
         assert!(text.contains("parity pending [128,131)"));
+    }
+
+    /// Fence identities remain visible on an ordinary terminal, below the status row.
+    #[test]
+    fn renders_fence_scopes_on_separate_rows() {
+        let mut response = sample_response();
+        response.active_tape_io_fence_count = 2;
+        response.active_tape_io_fences = vec![
+            pb::TapeIoFence {
+                barcode: Some("DATA001".into()),
+                quarantine_id: "tioq-tape".into(),
+                ..Default::default()
+            },
+            pb::TapeIoFence {
+                endpoint_key: Some("MAINLIB:256".into()),
+                quarantine_id: "tioq-drive".into(),
+                ..Default::default()
+            },
+        ];
+        let state = TopState {
+            live: Some(response),
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render_top(frame, &state)).unwrap();
+        let text = terminal
+            .backend_mut()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        for expected in [
+            "fences=2",
+            "DATA001",
+            "MAINLIB:256",
+            "tioq-tape",
+            "tioq-drive",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
     }
 
     #[test]

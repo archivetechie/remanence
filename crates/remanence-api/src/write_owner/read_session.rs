@@ -53,6 +53,18 @@ pub(super) fn handle_drive_open_read(
         );
     }
 
+    let endpoint = remanence_state::DriveKey::new(&library_serial, bay);
+    match index.tape_io_is_fenced(Some(&tape_uuid), barcode.as_deref(), Some(&endpoint)) {
+        Ok(false) => {}
+        result => {
+            let status = match result {
+                Err(error) => status_from_state_error(error),
+                _ => Status::failed_precondition("session blocked by active tape-I/O fence"),
+            };
+            let _ = reply.send(Err(status));
+            return;
+        }
+    }
     if let Err(status) = session_open_short_probe_or_load(
         index,
         drive,

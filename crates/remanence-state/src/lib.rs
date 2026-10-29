@@ -11,6 +11,7 @@ pub mod calibration;
 pub mod checkpoint;
 pub mod config;
 pub mod error;
+pub mod fence;
 pub mod index;
 pub mod lock;
 pub mod media;

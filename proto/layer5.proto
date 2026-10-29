@@ -115,6 +115,25 @@ service Daemon {
   rpc WatchOperation  (GetOperationRequest)    returns (stream OperationStatus);
 }
 
+message ReleaseTapeIoFenceRequest {
+  string quarantine_id = 1;
+  string acknowledgment = 2;
+}
+
+message TapeIoFence {
+  string quarantine_id = 1;
+  bytes tape_uuid = 2;
+  optional string barcode = 3;
+  optional string endpoint_key = 4;
+  string reason = 5;
+  string state = 6;
+  string created_at_utc = 7;
+  string updated_at_utc = 8;
+  optional string release_ack = 9;
+  optional string evidence_json = 10;
+  int64 fence_id = 11;
+}
+
 message HealthResponse {
   enum Status {
     STATUS_UNSPECIFIED   = 0;
@@ -132,6 +151,8 @@ message HealthResponse {
   repeated string supported_endpoint_kinds = 5;
   repeated string daemon_capabilities = 6;
   repeated ObservedEndpoint observed_endpoints = 7;
+  uint64 active_tape_io_fence_count = 8;
+  repeated TapeIoFence active_tape_io_fences = 9;
 }
 
 message ComponentHealth {
@@ -201,6 +222,9 @@ message CancelOperationResponse {
 // =============================================================================
 
 service LibraryService {
+  // Administrative release: durable evidence precedes clearing the fence.
+  rpc ReleaseTapeIoFence (ReleaseTapeIoFenceRequest) returns (TapeIoFence);
+
   rpc ListLibraries     (google.protobuf.Empty)       returns (ListLibrariesResponse);
   rpc GetLibrary        (GetLibraryRequest)           returns (LibraryState);
   rpc RefreshInventory  (RefreshInventoryRequest)     returns (OperationRef);
@@ -575,6 +599,8 @@ message GetLiveStatusResponse {
   uint64 daemon_epoch = 5;
   // Advisory only. The atomic per-bay reservation remains sole enforcement.
   repeated DriveAssignment drive_assignments = 6;
+  uint64 active_tape_io_fence_count = 7;
+  repeated TapeIoFence active_tape_io_fences = 8;
 }
 
 message Slot {
@@ -1386,7 +1412,12 @@ message ListTapesRequest {
   string pool_id       = 4; // empty = all pools and unassigned tapes
   string kind          = 5; // empty = all; explicit callers use "data" or "cleaning"
 }
-message ListTapesResponse { repeated Tape tapes = 1; PageToken next_page_token = 2; }
+message ListTapesResponse {
+  repeated Tape tapes = 1;
+  PageToken next_page_token = 2;
+  uint64 active_tape_io_fence_count = 3;
+  repeated TapeIoFence active_tape_io_fences = 4;
+}
 
 message GetTapeRequest      { bytes tape_uuid = 1; }
 message ListTapeFilesRequest {

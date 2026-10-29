@@ -6881,6 +6881,87 @@ async fn induced_append_and_read_failures_persist_session_snapshots() {
         block_size_bytes: 4096,
         min_object_size_bytes: 0,
     };
+    // A live actor observes the RPC release through its existing catalog connection.
+    for endpoint in [None, Some(remanence_state::DriveKey::new(&serial, 0x0100))] {
+        let fence = index
+            .record_tape_io_fence_at_endpoint(
+                remanence_state::TapeIoFenceInput {
+                    tape_uuid: if endpoint.is_some() {
+                        [0; 16]
+                    } else {
+                        tape_uuid
+                    },
+                    barcode: None,
+                    reason: "transfer_error".into(),
+                    evidence_json: None,
+                },
+                endpoint.as_ref(),
+            )
+            .unwrap();
+        let commands_before = world.lock().unwrap().command_log.len();
+        let (reply, received) = oneshot::channel();
+        drive_tx
+            .send(DriveCommand::OpenWrite {
+                actor: AuditActor::System,
+                pool_cfg: pool_cfg.clone(),
+                selected: SelectedTape {
+                    standalone_endpoint: None,
+                    pool_id: "failure-test".into(),
+                    tape_uuid,
+                    block_size: 4096,
+                    parity_config: ParityConfig::None,
+                },
+                target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
+                needs_drive_load: false,
+                library_serial: serial.clone(),
+                barcode: Some("FAIL002L9".into()),
+                source_slot: None,
+                drive_uuid: Some(drive_uuid.clone()),
+                drive_serial: Some("DRV-INDUCED-FAIL".into()),
+                reply,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            received.await.unwrap().unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+        let (reply, received) = oneshot::channel();
+        drive_tx
+            .send(DriveCommand::OpenRead {
+                tape_uuid,
+                needs_drive_load: false,
+                library_serial: serial.clone(),
+                barcode: Some("FAIL002L9".into()),
+                source_slot: None,
+                drive_uuid: Some(drive_uuid.clone()),
+                drive_serial: Some("DRV-INDUCED-FAIL".into()),
+                resume_target: None,
+                daemon_epoch: 1,
+                reply,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            received.await.unwrap().unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            world.lock().unwrap().command_log.len(),
+            commands_before,
+            "fenced opens issue no tape commands or append recovery"
+        );
+        let api = crate::ApiState::new(CatalogIndex::open(&index_path).unwrap());
+        <crate::LibraryServiceApi as pb::library_service_server::LibraryService>::release_tape_io_fence(
+            &api.library_service(),
+            tonic::Request::new(pb::ReleaseTapeIoFenceRequest {
+                quarantine_id: fence.quarantine_id,
+                acknowledgment: "verified tape and drive".into(),
+            }),
+        )
+        .await
+        .unwrap();
+    }
     let (open_write_tx, open_write_rx) = oneshot::channel();
     drive_tx
         .send(DriveCommand::OpenWrite {
@@ -12574,6 +12655,19 @@ pub(crate) async fn check_seated_parity_sessions(
     let (reply, received) = oneshot::channel();
     tx.send(DriveCommand::Unload { reply }).await.unwrap();
     let unloaded = received.await.unwrap();
+    if invalidation == RetentionInvalidation::Fenced {
+        assert_eq!(
+            unloaded.unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            world.lock().unwrap().command_log.len(),
+            before_unload,
+            "fenced retained epoch issues no tape commands"
+        );
+        assert_rebuild_safety_equivalent(state);
+        return;
+    }
     unloaded.unwrap();
     assert!(world.lock().unwrap().command_log[before_unload..]
         .iter()
@@ -12602,7 +12696,10 @@ pub(crate) async fn check_seated_parity_sessions(
         })
         .await
         .unwrap();
-        received.await.unwrap().unwrap();
+        assert_eq!(
+            received.await.unwrap().unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
         assert!(world.lock().unwrap().command_log[before..]
             .iter()
             .all(|c| !matches!(c.opcode, 0x0a | 0x10)));
@@ -13735,6 +13832,44 @@ async fn check_epoch_removal(
             );
         }
     }
+    if index
+        .tape_io_is_fenced(
+            Some(&selected.tape_uuid),
+            Some("HAND"),
+            Some(&remanence_state::DriveKey::new(
+                &cfg.actor_library_serial,
+                0x100,
+            )),
+        )
+        .unwrap()
+    {
+        let commands = world.lock().unwrap().command_log.len();
+        let (reply, received) = oneshot::channel();
+        tx.send(DriveCommand::PrepareRemoval {
+            reply,
+            progress: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            received.await.unwrap().unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            world.lock().unwrap().command_log.len(),
+            commands,
+            "{case} through {path}: fenced epoch stays untouched"
+        );
+        assert!(
+            index
+                .get_tape(&selected.tape_uuid)
+                .unwrap()
+                .unwrap()
+                .highest_protected_ordinal
+                < before.total_committed_ordinals
+        );
+        return;
+    }
     let mut api = crate::ApiState::new(index);
     api.audit_dir = Arc::new(cfg.audit_dir.clone());
     api.library_snapshot = Some(cfg.library_snapshot.clone());
@@ -13747,6 +13882,7 @@ async fn check_epoch_removal(
         let (sender, mut receiver) = mpsc::channel(4);
         let policy = cfg.policy.clone();
         let model_world = world.clone();
+        let admission_path = cfg.index_path.clone();
         drop(library);
         tokio::task::spawn_blocking(move || {
             let mut library = open_model_library(model_world);
@@ -13758,6 +13894,14 @@ async fn check_epoch_removal(
             else {
                 panic!("operator unload command")
             };
+            if let Err(error) = super::robotics::admit_fenced_elements(
+                &CatalogIndex::open(&admission_path).unwrap(),
+                library.library(),
+                &[bay],
+            ) {
+                handle.publish_failed(error.message(), &[]);
+                return;
+            }
             library.unload(bay, destination, &policy).unwrap();
             handle.publish_state(pb::OperationState::Succeeded, &[]);
         });
@@ -13785,7 +13929,17 @@ async fn check_epoch_removal(
     api.drive_pool = Some(pool);
     let command_start = world.lock().unwrap().command_log.len();
     match path {
-        "shutdown" => api.shutdown_drive_pool().await.unwrap(),
+        "shutdown" => {
+            if let Err(error) = api.shutdown_drive_pool().await {
+                assert!(
+                    api.index()
+                        .unwrap()
+                        .tape_io_is_fenced(Some(&selected.tape_uuid), Some("HAND"), None)
+                        .unwrap(),
+                    "{error}"
+                );
+            }
+        }
         "operator" => {
             let operation = api
                 .library_service()
@@ -13799,6 +13953,14 @@ async fn check_epoch_removal(
                 .unwrap();
             tokio::time::timeout(StdDuration::from_secs(10), async {
                 while world.lock().unwrap().drive_bays[&0x100].is_some() {
+                    if api
+                        .index()
+                        .unwrap()
+                        .tape_io_is_fenced(Some(&selected.tape_uuid), Some("HAND"), None)
+                        .unwrap()
+                    {
+                        break;
+                    }
                     tokio::time::sleep(StdDuration::from_millis(10)).await;
                 }
             })
@@ -13977,17 +14139,35 @@ async fn check_epoch_removal(
         }
     }
     let world = world.lock().unwrap();
-    assert!(world.drive_bays[&0x100].is_none(), "{case} through {path}");
-    assert_eq!(
-        world
-            .slots
-            .iter()
-            .find(|s| s.address == 0x400)
-            .unwrap()
-            .barcode
-            .as_deref(),
-        Some("HAND")
-    );
+    let fenced = api
+        .index()
+        .unwrap()
+        .tape_io_is_fenced(Some(&selected.tape_uuid), Some("HAND"), None)
+        .unwrap();
+    if fenced {
+        assert!(
+            world.drive_bays[&0x100].is_some(),
+            "{case} through {path}: a new fence keeps the cartridge seated"
+        );
+        assert!(
+            world.command_log[command_start..]
+                .iter()
+                .all(|command| command.opcode != 0xa5),
+            "no robot move after fencing"
+        );
+    } else {
+        assert!(world.drive_bays[&0x100].is_none(), "{case} through {path}");
+        assert_eq!(
+            world
+                .slots
+                .iter()
+                .find(|s| s.address == 0x400)
+                .unwrap()
+                .barcode
+                .as_deref(),
+            Some("HAND")
+        );
+    }
     assert!(
         matches!(
             case,
@@ -14511,4 +14691,46 @@ fn check_terminal_fence_precedes_recovery_failure(tail: bool) {
         .as_deref()
         .unwrap()
         .contains("terminal write fails"));
+}
+
+/// Tape and endpoint scopes both stop actual changer dispatch admission, then release in place.
+#[test]
+fn robotics_fence_admission_reads_current_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut index = CatalogIndex::open(dir.path().join("index.sqlite")).unwrap();
+    let mut library = test_changer_library("LIB");
+    let bay = library.drive_bays[0].element_address;
+    library.drive_bays[0].loaded_tape = Some("FENCED".into());
+    for endpoint in [None, Some(remanence_state::DriveKey::new("LIB", bay))] {
+        let fence = index
+            .record_tape_io_fence_at_endpoint(
+                remanence_state::TapeIoFenceInput {
+                    tape_uuid: [0; 16],
+                    barcode: if endpoint.is_none() {
+                        Some("FENCED".into())
+                    } else {
+                        None
+                    },
+                    reason: "transfer_error".into(),
+                    evidence_json: None,
+                },
+                endpoint.as_ref(),
+            )
+            .unwrap();
+        assert_eq!(
+            super::robotics::admit_fenced_elements(&index, &library, &[bay])
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        remanence_state::fence::release(
+            &mut index,
+            &dir.path().join("audit"),
+            &fence.quarantine_id,
+            "verified",
+            AuditActor::System,
+        )
+        .unwrap();
+        super::robotics::admit_fenced_elements(&index, &library, &[bay]).unwrap();
+    }
 }

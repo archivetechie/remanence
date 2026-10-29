@@ -126,6 +126,14 @@ impl ApiState {
             .media_readiness_operation(operation_id)
             .map_err(crate::startup_media_readiness::status_from_state_error)?
             .ok_or_else(|| Status::not_found("media-readiness operation not found"))?;
+        if index
+            .tape_io_is_fenced(None, record.barcode.as_deref(), Some(&record.endpoint))
+            .map_err(crate::startup_media_readiness::status_from_state_error)?
+        {
+            return Err(Status::failed_precondition(
+                "readiness blocked by active tape-I/O fence",
+            ));
+        }
         if started_by == "daemon" && record.cancel_source.as_deref() == Some("operator") {
             return Err(Status::failed_precondition(
                 "readiness wait is cancelled by an operator",
@@ -321,6 +329,16 @@ pub(crate) fn spawn_auto_resume(state: ApiState) {
                     Ok(records) => {
                         let mut eligible = std::collections::HashSet::new();
                         for record in records {
+                            if index
+                                .tape_io_is_fenced(
+                                    None,
+                                    record.barcode.as_deref(),
+                                    Some(&record.endpoint),
+                                )
+                                .unwrap_or(true)
+                            {
+                                continue;
+                            }
                             if !is_resumable(&record.state)
                                 || record.cancel_source.as_deref() == Some("operator")
                             {

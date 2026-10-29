@@ -514,6 +514,7 @@ impl StateHandle {
             )),
         )?;
         let mut index = CatalogIndex::open(&paths.sqlite_path)?;
+        crate::fence::reconcile(&mut index, &paths.audit_dir)?;
         let config_warnings = project_configured_tape_pools(&mut index, &config)?;
         index.reconcile_cleaning_prefixes(&config.cleaning.voltag_prefixes)?;
         let calibration = CalibrationControlStore::open(&paths.calibration_dir)?;
@@ -1322,47 +1323,21 @@ impl StateHandle {
         Ok(outcome)
     }
 
-    /// Release a tape-I/O fence and append its durable release evidence.
+    /// Sync release evidence before clearing a tape-I/O fence under the state lock.
     pub fn release_tape_io_fence(
         &mut self,
         quarantine_id: &str,
         ack: &str,
     ) -> Result<Option<TapeIoFenceRecord>, StateError> {
-        let released = self.index.release_tape_io_fence(quarantine_id, ack)?;
-        let Some(record) = released else {
-            return Ok(None);
-        };
-        let mut detail = BTreeMap::from([
-            (
-                "tape_uuid".to_string(),
-                CborValue::Bytes(record.tape_uuid.clone()),
-            ),
-            (
-                "quarantine_id".to_string(),
-                CborValue::Text(record.quarantine_id.clone()),
-            ),
-            ("release_ack".to_string(), CborValue::Text(ack.to_string())),
-        ]);
-        if let Some(barcode) = record.barcode.as_ref() {
-            detail.insert("barcode".to_string(), CborValue::Text(barcode.clone()));
-        }
-        if let Some(endpoint) = record.endpoint.as_ref() {
-            detail.insert("endpoint_key".into(), CborValue::Text(endpoint.encode()));
-        }
-        self.audit.append(AuditEventRecord {
-            actor: AuditActor::local_user(),
-            source_layer: SourceLayer::Layer4,
-            operation_id: None,
-            session_id: None,
-            idempotency_key: None,
-            event: AuditEvent::TapeIoFenceReleased,
-            subject: AuditSubject {
-                kind: "tape_io_fence".to_string(),
-                id: Some(record.quarantine_id.clone()),
-            },
-            detail,
-        })?;
-        Ok(Some(record))
+        let result = crate::fence::release(
+            &mut self.index,
+            &self.paths.audit_dir,
+            quarantine_id,
+            ack,
+            AuditActor::local_user(),
+        );
+        self.refresh_audit_append_cursor()?;
+        result
     }
 
     /// Return the Layer 3c journal path for a tape UUID.

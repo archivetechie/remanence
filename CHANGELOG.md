@@ -7,6 +7,12 @@ per-release summaries.
 <!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_backend.rs crates/remanence-state/src/index.rs crates/remanence-library/src/discovery.rs @ 638210f7 -->
 ## Unreleased
 
+- The daemon starts with scoped tape-I/O fences and reports each fence in
+  health, catalog tape lists, and live status. Recovery leaves fenced media
+  untouched. `LibraryService.ReleaseTapeIoFence` and `rem tape quarantine release`
+  sync release evidence before clearing the fence; retry and startup complete
+  an interrupted release without duplicating evidence.
+
 - Full verification offers `[verification] route = "one_pass"` in the daemon;
   the default remains `"walk"`. The one-pass route reads the terminal index
   first, then reads the protected prefix forward from BOT, measuring files at

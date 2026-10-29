@@ -5531,13 +5531,20 @@ fn run_catalog_client_command(
             let mut client = pb::catalog_client::CatalogClient::new(channel);
             match command {
                 CatalogClientCommand::Tapes { pool, kind } => {
-                    let tapes = client
+                    let response = client
                         .list_tapes(catalog_tapes_request(pool.as_deref(), *kind))
                         .await
                         .map_err(drive_status_error)?
-                        .into_inner()
-                        .tapes;
-                    print_tape_list(tapes, json_output, out).map_err(DaemonClientError::from)
+                        .into_inner();
+                    if json_output {
+                        print_json_envelope("rem.catalog.tape.list.v1", "list", json!({
+                            "tapes": response.tapes.iter().map(tape_json).collect::<Vec<_>>(),
+                            "active_tape_io_fence_count": response.active_tape_io_fence_count,
+                            "active_tape_io_fences": response.active_tape_io_fences.iter().map(proto_fence_json).collect::<Vec<_>>()
+                        }), out).map_err(DaemonClientError::from)
+                    } else {
+                        print_tape_list(response.tapes, false, out).map_err(DaemonClientError::from)
+                    }
                 }
                 CatalogClientCommand::Tape { tape_uuid } => {
                     let tape_uuid = resolve_tape_uuid_arg(&mut client, tape_uuid).await?;
@@ -7083,6 +7090,8 @@ fn endpoint_json(endpoints: &[pb::ObservedEndpoint]) -> Vec<Value> {
 
 fn health_json(health: &pb::HealthResponse) -> Value {
     json!({
+        "active_tape_io_fence_count": health.active_tape_io_fence_count,
+        "active_tape_io_fences": health.active_tape_io_fences.iter().map(proto_fence_json).collect::<Vec<_>>(),
         "supported_endpoint_kinds": health.supported_endpoint_kinds,
         "daemon_capabilities": health.daemon_capabilities,
         "observed_endpoints": endpoint_json(&health.observed_endpoints),
@@ -7345,6 +7354,8 @@ fn print_live_status_json(
     out: &mut dyn Write,
 ) -> Result<(), String> {
     let data = json!({
+        "active_tape_io_fence_count": response.active_tape_io_fence_count,
+        "active_tape_io_fences": response.active_tape_io_fences.iter().map(proto_fence_json).collect::<Vec<_>>(),
         "libraries": response.libraries.iter().map(library_state_json).collect::<Vec<_>>(),
         "operations": response.operations.iter().map(|operation| {
             json!({
@@ -7367,6 +7378,14 @@ fn print_live_status_text(
         "snapshot_at_utc: {}  daemon_epoch: {}",
         response.snapshot_at_utc, response.daemon_epoch
     );
+    let _ = writeln!(
+        out,
+        "active tape-I/O fences: {}",
+        response.active_tape_io_fence_count
+    );
+    for fence in &response.active_tape_io_fences {
+        let _ = writeln!(out, "{}", proto_fence_json(fence));
+    }
     for library in &response.libraries {
         let serial = library
             .library
@@ -8012,6 +8031,18 @@ fn run_tape_quarantine(
                 Ok(value) => value,
                 Err(code) => return code,
             };
+            if quarantine.starts_with("tioq-") {
+                match release_fence_via_daemon(&config, quarantine, ack) {
+                    Ok(Some(record)) => {
+                        return print_tape_io_quarantine_released(&record, *json, out, err)
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _ = writeln!(err, "error: {error}");
+                        return ExitCode::from(1);
+                    }
+                }
+            }
             let mut state = match remanence_state::StateHandle::open_with_config(paths, config) {
                 Ok(state) => state,
                 Err(error) => {
@@ -16889,6 +16920,65 @@ mod tests {
         String::from_utf8(out).expect("help is utf8")
     }
 
+    /// A missing configured daemon socket selects offline state ownership.
+    #[test]
+    fn fence_release_absent_daemon_selects_offline() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = tape_init_config_with_pool(4096);
+        config.daemon.socket_path = Some(dir.path().join("absent.sock"));
+        assert!(release_fence_via_daemon(&config, "tioq-missing", "checked")
+            .unwrap()
+            .is_none());
+        assert!(release_fence_via_daemon(&config, "tioq-missing", " ").is_err());
+    }
+
+    /// A connected CLI releases through gRPC while the daemon retains the state lock.
+    #[test]
+    fn fence_release_cli_rpc_works_with_daemon_state_lock() {
+        daemon_runtime().unwrap().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let _lock = remanence_state::StateLockGuard::acquire(dir.path()).unwrap();
+            let mut index =
+                remanence_state::CatalogIndex::open(dir.path().join("state.sqlite")).unwrap();
+            let fence = index
+                .record_tape_io_fence(remanence_state::TapeIoFenceInput {
+                    tape_uuid: [0x31; 16],
+                    barcode: None,
+                    reason: "transfer_error".into(),
+                    evidence_json: None,
+                })
+                .unwrap();
+            let state = remanence_api::ApiState::new(index);
+            let (client, server) = tokio::io::duplex(65536);
+            let task = tokio::spawn(
+                tonic::transport::Server::builder()
+                    .add_service(pb::library_service_server::LibraryServiceServer::new(
+                        state.library_service(),
+                    ))
+                    .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(server)])),
+            );
+            let client = std::sync::Arc::new(std::sync::Mutex::new(Some(client)));
+            let channel = tonic::transport::Endpoint::from_static("http://in-memory")
+                .connect_with_connector(tower::service_fn(move |_| {
+                    let client = client.lock().unwrap().take().unwrap();
+                    async { Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(client)) }
+                }))
+                .await
+                .unwrap();
+            let released =
+                release_fence_on_channel(channel.clone(), &fence.quarantine_id, "verified")
+                    .await
+                    .unwrap();
+            assert_eq!(released.state, "released");
+            assert_eq!(released.release_ack.as_deref(), Some("verified"));
+            assert!(release_fence_on_channel(channel, "missing", "checked")
+                .await
+                .is_err());
+            assert!(remanence_state::StateLockGuard::acquire(dir.path()).is_err());
+            task.abort();
+        });
+    }
+
     fn tape_init_config_with_pool(block_size_bytes: u64) -> remanence_state::RemConfig {
         let root = std::env::temp_dir().join("remanence-cli-tape-init-test");
         remanence_state::RemConfig {
@@ -19211,6 +19301,8 @@ mod tests {
 
         print_health(
             pb::HealthResponse {
+                active_tape_io_fence_count: 0,
+                active_tape_io_fences: Vec::new(),
                 supported_endpoint_kinds: vec![],
                 daemon_capabilities: vec![],
                 observed_endpoints: vec![],
@@ -19282,6 +19374,8 @@ mod tests {
 
     fn sample_live_status_response() -> pb::GetLiveStatusResponse {
         pb::GetLiveStatusResponse {
+            active_tape_io_fence_count: 0,
+            active_tape_io_fences: Vec::new(),
             libraries: vec![pb::LibraryState {
                 library: Some(pb::Library {
                     library_serial: "MAINLIB".to_string(),
@@ -25736,4 +25830,82 @@ mod clobber_confirmation_tests {
         .unwrap_err()
         .contains("non-interactive"));
     }
+}
+
+/// Try the configured local daemon; only an absent listener permits offline release.
+fn release_fence_via_daemon(
+    config: &remanence_state::RemConfig,
+    id: &str,
+    ack: &str,
+) -> Result<Option<remanence_state::TapeIoFenceRecord>, String> {
+    if ack.trim().is_empty() {
+        return Err("--ack must be non-empty".into());
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    runtime.block_on(async {
+        let socket = config.daemon.socket_path_or_default();
+        if !socket.try_exists().map_err(|error| error.to_string())? {
+            return Ok(None);
+        }
+        // Probe preserves the OS error kind; TLS/RPC/authentication failures never fall back.
+        match tokio::net::UnixStream::connect(&socket).await {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                return Ok(None)
+            }
+            Err(error) => return Err(format!("connect daemon: {error}")),
+            Ok(stream) => drop(stream),
+        }
+        let channel = remanence_api::connect_unix(socket)
+            .await
+            .map_err(|e| e.to_string())?;
+        release_fence_on_channel(channel, id, ack).await.map(Some)
+    })
+}
+
+/// Issue the release RPC on an established channel; RPC refusals never select offline mode.
+async fn release_fence_on_channel(
+    channel: Channel,
+    id: &str,
+    ack: &str,
+) -> Result<remanence_state::TapeIoFenceRecord, String> {
+    let record = pb::library_service_client::LibraryServiceClient::new(channel)
+        .release_tape_io_fence(pb::ReleaseTapeIoFenceRequest {
+            quarantine_id: id.into(),
+            acknowledgment: ack.into(),
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .into_inner();
+    Ok(remanence_state::TapeIoFenceRecord {
+        fence_id: record.fence_id,
+        quarantine_id: record.quarantine_id,
+        tape_uuid: record.tape_uuid,
+        barcode: record.barcode,
+        endpoint: record
+            .endpoint_key
+            .map(|key| remanence_state::DriveKey::decode(&key))
+            .transpose()
+            .map_err(|e| e.to_string())?,
+        state: record.state,
+        reason: record.reason,
+        evidence_json: record.evidence_json,
+        created_at_utc: record.created_at_utc,
+        updated_at_utc: record.updated_at_utc,
+        release_ack: record.release_ack,
+    })
+}
+
+/// Render the same scope and release evidence in catalog and live status output.
+fn proto_fence_json(record: &pb::TapeIoFence) -> serde_json::Value {
+    json!({"quarantine_id": record.quarantine_id, "tape_uuid": bytes_to_uuid_text(&record.tape_uuid),
+        "barcode": record.barcode, "endpoint_key": record.endpoint_key, "reason": record.reason,
+        "state": record.state, "release_ack": record.release_ack, "updated_at_utc": record.updated_at_utc})
 }

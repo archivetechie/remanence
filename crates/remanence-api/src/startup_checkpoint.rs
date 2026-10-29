@@ -88,6 +88,12 @@ pub(crate) fn replay_checkpoint_journal_projections_with_audit(
     {
         let tape_uuid = remanence_state::tape_uuid_from_checkpoint_path(path.as_path())
             .map_err(status_from_state_error)?;
+        if index
+            .tape_io_is_fenced(Some(&tape_uuid), None, None)
+            .map_err(status_from_state_error)?
+        {
+            continue;
+        }
         let journal = remanence_state::FileCheckpointJournal::open(checkpoint_dir, tape_uuid)
             .map_err(status_from_state_error)?;
         let pending_intent = journal

@@ -1579,6 +1579,18 @@ pub(super) fn handle_drive_open_write(
         return;
     }
 
+    let endpoint = remanence_state::DriveKey::new(&library_serial, bay);
+    match index.tape_io_is_fenced(Some(&tape_uuid), barcode.as_deref(), Some(&endpoint)) {
+        Ok(false) => {}
+        result => {
+            let status = match result {
+                Err(error) => status_from_state_error(error),
+                _ => Status::failed_precondition("session blocked by active tape-I/O fence"),
+            };
+            let _ = reply.send(Err(status));
+            return;
+        }
+    }
     // Recovery authority must be complete and mutually consistent before any
     // load, rewind, locate, drive-mode change, or write preparation. Keep both
     // journal leases across the later media work so another writer cannot

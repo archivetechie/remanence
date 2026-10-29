@@ -361,6 +361,16 @@ impl FileAuditLog {
         })
     }
 
+    /// Make every appended record durable, regardless of the configured append policy.
+    pub fn sync(&self) -> Result<(), StateError> {
+        self.file
+            .sync_all()
+            .map_err(|err| StateError::io_at("sync audit release", &self.dir, err))?;
+        File::open(&self.dir)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|err| StateError::io_at("sync audit directory", &self.dir, err))
+    }
+
     /// Replay all audit records in a directory into a collection.
     ///
     /// Call [`Self::replay_incremental`] when the caller does not inherently

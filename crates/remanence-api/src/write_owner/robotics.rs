@@ -118,6 +118,33 @@ pub(crate) fn handle_robotics(
             }
         }
     };
+    let elements = match &action {
+        RoboticsAction::Refresh => Vec::new(),
+        RoboticsAction::Move { src, dst } => vec![*src, *dst],
+        RoboticsAction::Load { slot, bay, .. } => vec![*slot, *bay],
+        RoboticsAction::Unload { bay, destination } => {
+            std::iter::once(*bay).chain(*destination).collect()
+        }
+        RoboticsAction::Clean { drive_uuid, .. } => match index.get_drive_by_uuid(drive_uuid) {
+            Ok(Some(drive)) => drive
+                .last_element_address
+                .and_then(|b| u16::try_from(b).ok())
+                .into_iter()
+                .collect(),
+            _ => {
+                return RoboticsOutcome::Failed {
+                    message: "cannot resolve cleaning drive".into(),
+                    phase: "admission",
+                }
+            }
+        },
+    };
+    if let Err(error) = admit_fenced_elements(index, lib, &elements) {
+        return RoboticsOutcome::Failed {
+            message: error.to_string(),
+            phase: "admission",
+        };
+    }
     let mut library = match lib.open(&cfg.policy) {
         Ok(handle) => handle,
         Err(err) => {
@@ -678,4 +705,44 @@ pub(crate) fn robotics_detail(action: &RoboticsAction) -> BTreeMap<String, CborV
         }
     }
     detail
+}
+
+/// Refuse motion involving a fenced cartridge or endpoint using current catalog state.
+pub(super) fn admit_fenced_elements(
+    index: &CatalogIndex,
+    library: &remanence_library::Library,
+    elements: &[u16],
+) -> Result<(), Status> {
+    for element in elements {
+        let bay = library
+            .drive_bays
+            .iter()
+            .find(|bay| bay.element_address == *element);
+        let barcode = bay
+            .and_then(|bay| bay.loaded_tape.as_deref())
+            .or_else(|| {
+                library
+                    .slots
+                    .iter()
+                    .find(|slot| slot.element_address == *element)
+                    .and_then(|slot| slot.cartridge.as_deref())
+            })
+            .or_else(|| {
+                library
+                    .ie_ports
+                    .iter()
+                    .find(|slot| slot.element_address == *element)
+                    .and_then(|slot| slot.cartridge.as_deref())
+            });
+        let endpoint = bay.map(|_| remanence_state::DriveKey::new(&library.serial, *element));
+        if index
+            .tape_io_is_fenced(None, barcode, endpoint.as_ref())
+            .map_err(crate::status_from_state_error)?
+        {
+            return Err(Status::failed_precondition(
+                "robotics blocked by active tape-I/O fence",
+            ));
+        }
+    }
+    Ok(())
 }

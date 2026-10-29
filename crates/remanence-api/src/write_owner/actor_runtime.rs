@@ -126,9 +126,13 @@ pub(super) fn changer_loop(
                 ownership,
                 reply,
             } => {
-                let result = changer
-                    .move_medium(src, dst, &cfg.policy)
-                    .map_err(|err| Status::internal(format!("move medium: {err}")));
+                let result =
+                    super::robotics::admit_fenced_elements(&index, changer.library(), &[src, dst])
+                        .and_then(|()| {
+                            changer
+                                .move_medium(src, dst, &cfg.policy)
+                                .map_err(|err| Status::internal(format!("move medium: {err}")))
+                        });
                 if result.is_ok() {
                     match observe_refreshed_library(&mut index, &cfg, changer.library()) {
                         Ok(()) => clear_library_snapshot_persist_alarm(
@@ -151,9 +155,13 @@ pub(super) fn changer_loop(
                 let _ = reply.send(ownership.complete(result));
             }
             ChangerCommand::Move { src, dst, reply } => {
-                let result = changer
-                    .move_medium(src, dst, &cfg.policy)
-                    .map_err(|err| Status::internal(format!("move medium: {err}")));
+                let result =
+                    super::robotics::admit_fenced_elements(&index, changer.library(), &[src, dst])
+                        .and_then(|()| {
+                            changer
+                                .move_medium(src, dst, &cfg.policy)
+                                .map_err(|err| Status::internal(format!("move medium: {err}")))
+                        });
                 if result.is_ok() {
                     match observe_refreshed_library(&mut index, &cfg, changer.library()) {
                         Ok(()) => clear_library_snapshot_persist_alarm(
@@ -631,7 +639,8 @@ pub(super) fn drive_loop(
                     &mut retained,
                     None,
                 ) {
-                    tracing::error!(%error, "epoch close fails; unloading cartridge");
+                    let _ = reply.send(Err(error));
+                    continue;
                 }
                 let started = Instant::now();
                 let result = drive
