@@ -2071,9 +2071,8 @@ impl DismountReason {
 ///   awaits the move before it moves on, and the daemon serves until that
 ///   pass returns, so a graceful stop never exits between the two commands.
 ///
-/// A hard kill between the commands or a failed changer move leaves the cartridge
-/// unthreaded; session open and media-readiness waits then send one SSC LOAD
-/// to thread it.
+/// A hard kill between commands can leave a cartridge unthreaded. After a failed
+/// move, fresh element status determines whether it remains in the drive.
 ///
 /// On success the reservation returns to the caller; on failure it is
 /// released once the task has finished with the drive.
@@ -2130,12 +2129,12 @@ async fn dismount_pair(
             barcode = seated.barcode.as_deref().unwrap_or("(unknown)"),
             unload = reason.as_str(),
             error = %err,
-            "drive unloaded but the move home failed; the cartridge stays unthreaded in the drive until a changer move or an SSC LOAD"
+            "drive unload succeeds but the move home fails; inspect refreshed inventory before recovery"
         );
         return Err(Status::new(
             err.code(),
             format!(
-                "drive bay 0x{:04x} unloaded but the move to slot 0x{:04x} failed; cartridge {} stays unthreaded in the drive: {}",
+                "drive bay 0x{:04x} unloaded but the move to slot 0x{:04x} failed; cartridge {} location requires refreshed inventory: {}",
                 seated.bay,
                 seated.home_slot,
                 seated.barcode.as_deref().unwrap_or("(unknown)"),
@@ -2301,6 +2300,12 @@ fn schedule_idle_dismount(state: ApiState, parked: crate::write_owner::ParkedCar
             {
                 Ok(_reservation) => return,
                 Err(_) if pool.is_shutting_down() => return,
+                Err(err) if err.code() == tonic::Code::FailedPrecondition => {
+                    tracing::warn!(bay = parked.seated.bay, error = %err,
+                        "idle unload stops after inventory refusal");
+                    pool.forget_parked(&parked);
+                    return;
+                }
                 Err(err) => tracing::warn!(
                     bay = parked.seated.bay,
                     error = %err,
@@ -4435,7 +4440,7 @@ mod tests {
         assert!(!harness.pool.parked_is_current(&parked));
     }
 
-    /// A refused changer move names the unthreaded tape and releases its bay.
+    /// A refused changer move names the tape without claiming its location.
     #[tokio::test]
     async fn failed_move_after_unload_names_cartridge_and_releases_reservation() {
         let mut harness = dismount_harness(0);
@@ -4488,7 +4493,7 @@ mod tests {
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         for text in [
             "OLD001L9",
-            "unthreaded",
+            "location requires refreshed inventory",
             "0x0101",
             "0x0401",
             "destination slot unavailable",

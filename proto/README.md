@@ -112,3 +112,13 @@ stays FINALIZING with that summary in `detail`. FAILED persists until a same-key
 retry or startup recovery relaunches the worker. A retry publishes RUNNING before
 `FinalizeTape` returns. After a restart, recovery relaunches the worker under the
 same operation id and it reports RUNNING.
+
+## Caller object identity
+
+A `caller_object_id` names an object within one pool.
+`GetObjectRequest.pool_id` and `FindObjectCopiesRequest.pool_id` select that
+pool's committed object and copies. An absent or empty pool selector succeeds
+only when one pool contains the caller id; several pools return
+`FAILED_PRECONDITION` naming those pools. No match returns `NOT_FOUND`.
+Repeated writes with the same pool, caller id and content replay the committed
+receipt; conflicting content is refused.

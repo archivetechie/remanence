@@ -28,6 +28,7 @@ const CATALOG_STREAM_BUFFER: usize = 32;
 pub(crate) fn find_object_for_key(
     state: &ApiState,
     key: Option<pb::get_object_request::Key>,
+    pool_id: &str,
 ) -> Result<Option<NativeObjectRecord>, Status> {
     match key.ok_or_else(|| Status::invalid_argument("missing object lookup key"))? {
         pb::get_object_request::Key::ObjectId(value) => {
@@ -48,10 +49,18 @@ pub(crate) fn find_object_for_key(
             }
             find_object_by_content_sha256(state, digest.value.as_slice())
         }
-        pb::get_object_request::Key::CallerObjectId(caller_id) => state
-            .index()?
-            .get_native_object_by_caller_object_id(caller_id.as_str())
-            .map_err(|err| Status::internal(err.to_string())),
+        pb::get_object_request::Key::CallerObjectId(caller_id) => {
+            let index = state.index()?;
+            let result = if pool_id.is_empty() {
+                index.get_native_object_by_unique_caller_object_id(&caller_id)
+            } else {
+                index.get_native_object_by_pool_and_caller_object_id(pool_id, &caller_id)
+            };
+            result.map_err(|err| match err {
+                StateError::AmbiguousCatalogLookup(message) => Status::failed_precondition(message),
+                other => Status::internal(other.to_string()),
+            })
+        }
     }
 }
 
@@ -76,6 +85,7 @@ pub(crate) fn find_object_by_content_sha256(
 pub(crate) fn find_copy_object_for_key(
     state: &ApiState,
     key: Option<pb::find_object_copies_request::Key>,
+    pool_id: &str,
 ) -> Result<Option<NativeObjectRecord>, Status> {
     let get_key = match key.ok_or_else(|| Status::invalid_argument("missing object lookup key"))? {
         pb::find_object_copies_request::Key::ObjectId(value) => {
@@ -91,7 +101,7 @@ pub(crate) fn find_copy_object_for_key(
             pb::get_object_request::Key::ContentDigest(value)
         }
     };
-    find_object_for_key(state, Some(get_key))
+    find_object_for_key(state, Some(get_key), pool_id)
 }
 
 pub(crate) fn catalog_unit_filter(value: i32) -> CatalogUnitFilter {

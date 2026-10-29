@@ -2988,6 +2988,78 @@ mod l1b_tests {
         captured
     }
 
+    /// Out-of-band library changes refuse commands and replace the cached view.
+    #[test]
+    fn element_preflight_refuses_changed_source_and_full_destination() {
+        for destination_changes in [false, true] {
+            let world = slotted_world(64 * 1024 * 1024);
+            let mut handle = open_handle(Arc::clone(&world), None);
+            {
+                let mut world = world.lock().unwrap();
+                if destination_changes {
+                    world.put_tape_in_drive(BAY, "OTHER", None, VirtualTape::default());
+                } else {
+                    world.put_tape_in_slot(SLOT, "OTHER", VirtualTape::default());
+                }
+                world.command_log.clear();
+            }
+            assert!(matches!(
+                handle.move_medium(SLOT, BAY, &policy()),
+                Err(MoveError::InventoryChanged { .. })
+            ));
+            assert_eq!(handle.library(), &world.lock().unwrap().library_snapshot());
+            assert!(world
+                .lock()
+                .unwrap()
+                .command_log
+                .iter()
+                .all(|c| c.opcode != 0xa5));
+        }
+    }
+
+    /// A drive emptied by another initiator receives no SSC UNLOAD.
+    #[test]
+    fn unload_preflight_refuses_empty_drive_and_normal_commands_dispatch_once() {
+        let world = slotted_world(64 * 1024 * 1024);
+        let mut handle = open_handle(Arc::clone(&world), None);
+        handle.move_medium(SLOT, BAY, &policy()).unwrap();
+        let mut drive = handle.open_drive(BAY, &policy()).unwrap();
+        drive.unload().unwrap();
+        {
+            let mut world = world.lock().unwrap();
+            assert_eq!(
+                world
+                    .command_log
+                    .iter()
+                    .filter(|c| c.opcode == 0xa5)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                world
+                    .command_log
+                    .iter()
+                    .filter(|c| c.opcode == 0x1b)
+                    .count(),
+                1
+            );
+            world.drive_bays.insert(BAY, None);
+            world.drive_source_slots.insert(BAY, None);
+            world.command_log.clear();
+        }
+        assert!(matches!(
+            drive.unload(),
+            Err(remanence_library::DriveOpError::Inventory(_))
+        ));
+        assert!(!drive.observed_library().unwrap().drive_bays[0].loaded);
+        assert!(world
+            .lock()
+            .unwrap()
+            .command_log
+            .iter()
+            .all(|c| c.opcode != 0x1b));
+    }
+
     #[test]
     fn changer_honest_refresh_and_move_succeed() {
         let world = slotted_world(64 * 1024 * 1024);
@@ -3040,8 +3112,8 @@ mod l1b_tests {
             .expect_err("LIB-01 fails move");
 
         match err {
-            MoveError::ScsiError(err) => assert_eq!(scsi_error_tuple(&err), (0x05, 0x3b, 0x0e)),
-            other => panic!("expected ScsiError, got {other:?}"),
+            MoveError::DestinationFull { addr } => assert_eq!(addr, BAY),
+            other => panic!("expected DestinationFull, got {other:?}"),
         }
         assert!(!handle.is_dirty());
         assert_eq!(
@@ -3174,16 +3246,21 @@ mod l1b_tests {
             .move_medium(SLOT, BAY, &policy())
             .expect("move succeeds before UA");
 
-        let err = handle
-            .move_medium(BAY, SLOT, &policy())
-            .expect_err("next changer command gets UA");
-        match err {
-            MoveError::ScsiError(err) => assert_eq!(scsi_error_tuple(&err), (0x06, 0x28, 0x00)),
-            other => panic!("expected ScsiError, got {other:?}"),
-        }
+        // The next command is now the RES header probe. Its one-shot UA
+        // triggers the existing full-read fallback before any second MOVE.
         handle
             .move_medium(BAY, SLOT, &policy())
-            .expect("UA is one-shot");
+            .expect("fresh RES absorbs one-shot UA");
+        assert_eq!(
+            world
+                .lock()
+                .unwrap()
+                .command_log
+                .iter()
+                .filter(|c| c.opcode == 0xa5)
+                .count(),
+            2
+        );
     }
 
     #[test]

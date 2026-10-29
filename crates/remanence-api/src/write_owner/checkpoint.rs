@@ -1433,6 +1433,22 @@ pub(super) fn close_retained_before_removal(
     retained: &mut Option<RetainedParityEpoch>,
     progress: Option<&crate::operations::OperationHandle>,
 ) -> Result<(), Status> {
+    let prior_session = cfg.lifecycle.as_ref().and_then(|lifecycle| {
+        lifecycle
+            .parked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .by_drive
+            .get(&crate::drive_pool::DriveKey::new(
+                &cfg.actor_library_serial,
+                bay,
+            ))
+            .and_then(|parked| parked.seated.prior_session_id)
+    });
+    let removal_span = tracing::warn_span!("remove_cartridge",
+        session_id = %prior_session.map_or_else(|| "none".to_string(), |id| id.to_string()),
+        tape_uuid = tracing::field::Empty, bay);
+    let _removal_span = removal_span.enter();
     let endpoint = remanence_state::DriveKey::new(&cfg.actor_library_serial, bay);
     let barcode = cfg
         .library_snapshot
@@ -1505,6 +1521,10 @@ pub(super) fn close_retained_before_removal(
         };
         let tape_uuid = crate::catalog_conversion::decode_uuid_bytes(&tape.tape_uuid, "tape_uuid")?;
         closing_tape = Some(tape_uuid);
+        removal_span.record(
+            "tape_uuid",
+            tracing::field::display(Uuid::from_bytes(tape_uuid)),
+        );
         if !remanence_state::FileCheckpointJournal::exists(&cfg.checkpoint_journal_dir, tape_uuid)
             .map_err(crate::status_from_state_error)?
         {

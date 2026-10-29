@@ -1454,6 +1454,8 @@ message EnumerateObjectsRequest {
 }
 
 message GetObjectRequest {
+  // Caller ids are scoped by pool; omission requires exactly one matching pool.
+  string pool_id = 5;
   oneof key {
     bytes  object_id        = 1; // Remanence daemon-local primary-key UUID
     // Canonical logical-asset identity lookup, not proof that a particular
@@ -1468,6 +1470,8 @@ message GetObjectRequest {
 }
 
 message FindObjectCopiesRequest {
+  // Caller ids are scoped by pool; omission requires exactly one matching pool.
+  string pool_id = 5;
   oneof key {
     bytes  object_id        = 1;
     bytes  content_sha256   = 2;

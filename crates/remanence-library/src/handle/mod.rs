@@ -239,7 +239,7 @@ pub struct ChangerHandle {
     /// handle type doesn't carry a transport type parameter; the cost
     /// is one dyn dispatch per CDB, which is dwarfed by the SG_IO
     /// kernel round-trip.
-    transport: Box<dyn SgTransport>,
+    transport: Arc<Mutex<Box<dyn SgTransport>>>,
     /// Shared audit hook + dirty state cloned into drive handles.
     /// This lifts the old borrowed `DriveHandle` shape while preserving
     /// one unified audit stream and dirty bit for library + drive ops.
@@ -322,6 +322,8 @@ impl DirtyState {
 pub(crate) struct DriveShared {
     pub(crate) audit_hook: Option<AuditHook>,
     pub(crate) dirty: DirtyState,
+    inventory: Option<Library>,
+    changer_transport: Option<Arc<Mutex<Box<dyn SgTransport>>>>,
 }
 
 pub(crate) fn lock_drive_shared(shared: &Arc<Mutex<DriveShared>>) -> MutexGuard<'_, DriveShared> {
@@ -384,6 +386,20 @@ impl std::fmt::Debug for ChangerHandle {
 }
 
 impl ChangerHandle {
+    /// Adopt element observations made by a drive handle sharing this changer.
+    fn adopt_observed_inventory(&mut self) {
+        if let Some(library) = &lock_drive_shared(&self.shared).inventory {
+            self.library = library.clone();
+        }
+    }
+
+    /// Read volume tags and refuse changes to the elements involved in a command.
+    pub fn check_elements(&mut self, addresses: &[u16]) -> Result<(), MoveError> {
+        let result = check_shared_elements(&self.shared, addresses);
+        self.adopt_observed_inventory();
+        result
+    }
+
     /// Read-only access to the snapshot the handle was opened against.
     pub fn library(&self) -> &Library {
         &self.library
@@ -458,7 +474,10 @@ impl ChangerHandle {
     /// Bubbles `ScsiError` if the RES CDB itself fails.
     pub fn refresh(&mut self) -> Result<(), ScsiError> {
         let new_es = crate::discovery::issue_res(
-            self.transport.as_mut(),
+            self.transport
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_mut(),
             /* element_type */ 0,
             /* dvcid */ true,
             /* curdata */ true,
@@ -466,6 +485,7 @@ impl ChangerHandle {
         match ops::reconcile(&self.library, new_es) {
             Ok((new_lib, warnings)) => {
                 self.library = new_lib;
+                lock_drive_shared(&self.shared).inventory = Some(self.library.clone());
                 self.clear_dirty();
                 // Per §5.2: reconciliation warnings flow to the audit
                 // log. Even though refresh() itself is read-only and
@@ -541,9 +561,13 @@ impl ChangerHandle {
 
         let started = Instant::now();
         // INIT walks the whole library — minutes on big chassis.
-        self.transport
-            .set_timeout_for(TimeoutClass::InitElementStatus);
-        if let Err(e) = self.transport.execute_none(&cdb) {
+
+        let result = {
+            let mut transport = self.transport.lock().unwrap_or_else(|e| e.into_inner());
+            transport.set_timeout_for(TimeoutClass::InitElementStatus);
+            transport.execute_none(&cdb)
+        };
+        if let Err(e) = result {
             // INIT failure with ambiguous completion: the changer
             // may have partially re-derived its element-state cache
             // before we lost the connection. Mark dirty so callers
@@ -573,12 +597,16 @@ impl ChangerHandle {
         // (`issue_res` sets `TimeoutClass::ReadElementStatus` on the
         // transport for us — its window covers both the probe and
         // the full read.)
-        let new_es = match crate::discovery::issue_res(
-            self.transport.as_mut(),
+        let result = crate::discovery::issue_res(
+            self.transport
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_mut(),
             /* element_type */ 0,
             /* dvcid */ true,
             /* curdata */ true,
-        ) {
+        );
+        let new_es = match result {
             Ok(es) => es,
             Err(e) => {
                 self.mark_dirty(DirtyCause::CompletionUnknown);
@@ -600,6 +628,7 @@ impl ChangerHandle {
             Ok((new_lib, warnings)) => {
                 let duration = started.elapsed();
                 self.library = new_lib;
+                lock_drive_shared(&self.shared).inventory = Some(self.library.clone());
                 self.clear_dirty();
                 // Fire one Warning event per reconciliation
                 // observation, before the Finished event closes out
@@ -652,31 +681,10 @@ impl ChangerHandle {
         }
     }
 
-    /// Issue a MOVE MEDIUM CDB to the changer, moving the cartridge
-    /// at element `src` to element `dst`. Robot address is taken from
-    /// `library.layout.robot_address`; INVERT is always 0.
-    ///
-    /// **Validation order**:
-    /// snapshot-level preflight (via the `ops::plan_move` helper) →
-    /// derived-identity policy check → CDB. On preflight failure no
-    /// CDB is issued, an [`AuditEvent::Refused`] event is fired, and
-    /// the snapshot is unchanged.
-    ///
-    /// On successful CDB completion, the snapshot is patched per
-    /// §5.1 (cartridge moves from `src` to `dst`, `source_slot` set
-    /// only when `src` was a Storage slot). [`AuditEvent::Started`]
-    /// fires before the CDB and [`AuditEvent::Finished`] after.
-    ///
-    /// **Dirty-state on failure:** a CHECK CONDITION leaves the
-    /// snapshot clean ([`is_dirty()`] stays `false`); a transport
-    /// error / driver timeout sets `is_dirty()` with cause
-    /// [`DirtyCause::CompletionUnknown`] because the cartridge may
-    /// have moved partway. **Dirty-state on success:** when either
-    /// endpoint is an IE port, `is_dirty()` is `true` with cause
-    /// [`DirtyCause::VendorSemantics`] (HPE parks visibly,
-    /// Quadstor vaults — the snapshot patch may not match reality).
-    ///
-    /// [`is_dirty()`]: Self::is_dirty
+    /// Read element status with volume tags for both endpoints, then move.
+    /// Occupancy or barcode changes update inventory and return a typed refusal
+    /// before motion. Failed commands refresh inventory without automatic retry.
+    /// Transport failures retain the completion-unknown dirty marker.
     pub fn move_medium(
         &mut self,
         src: u16,
@@ -737,6 +745,18 @@ impl ChangerHandle {
             }
         }
 
+        // Read both endpoints with volume tags before any motion. Re-plan
+        // after observation, including identity changes found by reconciliation.
+        if let Err(error) = self.check_elements(&[src, dst]) {
+            fire_refused(
+                &mut lock_drive_shared(&self.shared).audit_hook,
+                &self.library.serial,
+                op,
+                &error,
+            );
+            return Err(error);
+        }
+        let plan = ops::plan_move(&self.library, src, dst)?;
         // Build CDB + Started event.
         let cdb = move_medium_cdb::build_cdb(
             self.library.layout.robot_address,
@@ -758,13 +778,18 @@ impl ChangerHandle {
         // the long window so a healthy operation doesn't get torn
         // down by the SG_IO timeout (which would then look like an
         // unknown-completion transport failure to us).
-        self.transport.set_timeout_for(TimeoutClass::Move);
+
         let started = Instant::now();
-        let result = self.transport.execute_none(&cdb);
+        let result = {
+            let mut transport = self.transport.lock().unwrap_or_else(|e| e.into_inner());
+            transport.set_timeout_for(TimeoutClass::Move);
+            transport.execute_none(&cdb)
+        };
         match result {
             Ok(()) => {
                 let duration = started.elapsed();
                 ops::apply_planned_move(&mut self.library, &plan);
+                lock_drive_shared(&self.shared).inventory = Some(self.library.clone());
                 // IE-port endpoints make the patch vendor-specific:
                 // HPE physical libraries park the cartridge in the IE
                 // port (snapshot is correct), Quadstor's VTL vaults
@@ -818,6 +843,17 @@ impl ChangerHandle {
                         at: SystemTime::now(),
                     },
                 );
+                // Refresh after every failed move, including destination-full and
+                // not-ready sense. No automatic retry uses the old inventory.
+                let refresh = self.check_elements(&[src, dst]);
+                if let ScsiError::CheckCondition { sense, .. } = &e {
+                    if let Some(sense) = remanence_scsi::decode_sense(sense) {
+                        if sense.key == 0x05 && sense.asc == 0x3b && sense.ascq == 0x0e {
+                            return Err(MoveError::DestinationFull { addr: dst });
+                        }
+                    }
+                }
+                refresh?;
                 Err(MoveError::ScsiError(e))
             }
         }
@@ -1177,21 +1213,9 @@ impl LibraryHandle {
     /// (and fires a `Refused` audit event with `op = Unload { bay,
     /// dst: None }`).
     ///
-    /// Phase-aware errors:
-    /// - [`UnloadError::OpenDrive`] — drive open failed; no CDB
-    ///   went out; `is_dirty()` stays `false`.
-    /// - [`UnloadError::DriveUnload`] — drive UNLOAD CDB failed; no
-    ///   MOVE attempted. A CHECK CONDITION leaves the snapshot
-    ///   clean (cartridge still held by the drive); a transport
-    ///   error / driver timeout sets `is_dirty()` with cause
-    ///   `DirtyCause::CompletionUnknown` because the drive may
-    ///   have actually ejected the cartridge mechanically.
-    /// - [`UnloadError::Move`] — drive UNLOAD succeeded, MOVE
-    ///   failed. A CHECK CONDITION leaves the snapshot clean
-    ///   (cartridge still in the bay, matching the snapshot);
-    ///   a transport error / driver timeout sets `is_dirty()` with
-    ///   cause `DirtyCause::CompletionUnknown` because the
-    ///   cartridge may have moved partway.
+    /// Reads the bay before UNLOAD and both endpoints before MOVE.
+    /// Inventory refusal updates the cached view. A failed move refreshes that
+    /// view; the error alone does not establish the cartridge's location.
     pub fn unload(
         &mut self,
         bay: u16,
@@ -1238,6 +1262,17 @@ impl LibraryHandle {
                 }
             }
         };
+        // Read the bay and the destination before SSC UNLOAD: a cartridge is never
+        // unthreaded for a move that its destination would refuse.
+        self.changer
+            .check_elements(&[bay, dst])
+            .map_err(UnloadError::Move)?;
+        if element_state(self.changer.library(), dst)
+            .map_err(UnloadError::Move)?
+            .0
+        {
+            return Err(UnloadError::Move(MoveError::DestinationFull { addr: dst }));
+        }
         let op = AuditOp::Unload {
             bay,
             dst: Some(dst),
@@ -1259,13 +1294,11 @@ impl LibraryHandle {
                 self.changer.mark_dirty(DirtyCause::CompletionUnknown);
             }
         }
+        self.changer.adopt_observed_inventory();
         drive_result?;
 
-        // Phase 2: changer MOVE bay → dst. Per §5.1, a failure here
-        // leaves the snapshot unchanged (the bay still holds the
-        // cartridge per the snapshot, and per reality too — the
-        // drive's UNLOAD just released the cartridge mechanically;
-        // it didn't move it).
+        // Phase 2 reads source and destination again before the changer move.
+        // A failure refreshes inventory; it does not imply a cartridge location.
         self.changer
             .move_medium_as(bay, dst, policy, op)
             .map_err(UnloadError::Move)
@@ -1405,9 +1438,13 @@ impl ChangerHandle {
         // immediately; 5 s is generous. We don't mark the snapshot
         // dirty on transport failure because the snapshot doesn't
         // track lock state — operator can re-issue idempotently.
-        self.transport.set_timeout_for(TimeoutClass::PreventAllow);
         let started = Instant::now();
-        match self.transport.execute_none(&cdb) {
+        let result = {
+            let mut transport = self.transport.lock().unwrap_or_else(|e| e.into_inner());
+            transport.set_timeout_for(TimeoutClass::PreventAllow);
+            transport.execute_none(&cdb)
+        };
+        match result {
             Ok(()) => {
                 let duration = started.elapsed();
                 fire_audit(
@@ -1982,6 +2019,24 @@ impl DriveHandle {
         op: AuditOp,
     ) -> Result<(), DriveOpError> {
         use remanence_scsi::load_unload as lu;
+        if !load {
+            if let MountEndpoint::Durable(DriveKey::Bay { bay, .. }) = &self.endpoint {
+                check_shared_elements(&self.shared, &[*bay]).map_err(DriveOpError::Inventory)?;
+                if !element_state(
+                    &lock_drive_shared(&self.shared)
+                        .inventory
+                        .clone()
+                        .expect("bay inventory"),
+                    *bay,
+                )?
+                .0
+                {
+                    return Err(DriveOpError::Inventory(MoveError::SourceEmpty {
+                        addr: *bay,
+                    }));
+                }
+            }
+        }
         let cdb = lu::build_cdb_with_immed(load, immed);
 
         // Invalidate before dispatch: even a failed LOAD/UNLOAD may have
@@ -2165,6 +2220,7 @@ fn fire_refused(hook: &mut Option<AuditHook>, library_serial: &str, op: AuditOp,
         MoveError::DriveBayMissingDevice { .. } => "DriveBayMissingDevice",
         MoveError::DerivedDriveBay { .. } => "DerivedDriveBay",
         MoveError::ScsiError(_) => "ScsiError",
+        MoveError::InventoryChanged { .. } => "InventoryChanged",
     };
     fire_audit(
         hook,
@@ -2277,7 +2333,12 @@ impl Library {
             });
         }
 
-        let shared = Arc::new(Mutex::new(DriveShared::default()));
+        let transport = Arc::new(Mutex::new(transport));
+        let shared = Arc::new(Mutex::new(DriveShared {
+            inventory: Some(self.clone()),
+            changer_transport: Some(transport.clone()),
+            ..DriveShared::default()
+        }));
         let changer = ChangerHandle {
             library: self.clone(),
             transport,
@@ -2322,6 +2383,11 @@ fn revalidate_serial(transport: &mut dyn SgTransport) -> Result<Option<String>, 
 mod tests;
 
 impl DriveHandle {
+    /// Latest changer inventory, including observations from a refused unload.
+    pub fn observed_library(&self) -> Option<Library> {
+        lock_drive_shared(&self.shared).inventory.clone()
+    }
+
     /// Passive verification context shared by every raw adapter on this drive.
     pub fn verification_context(&self) -> crate::verification_io::VerificationContext {
         self.transport.verification.clone()
@@ -2330,4 +2396,94 @@ impl DriveHandle {
     pub fn begin_verification_io(&self) -> crate::verification_io::VerificationIoSession {
         self.verification_context().begin()
     }
+}
+
+/// Compare occupancy and volume tags, retaining the fresh inventory on refusal.
+fn check_shared_elements(
+    shared: &Arc<Mutex<DriveShared>>,
+    addresses: &[u16],
+) -> Result<(), MoveError> {
+    if addresses.is_empty() {
+        return Ok(());
+    }
+    let (transport, expected) = {
+        let state = lock_drive_shared(shared);
+        match (state.changer_transport.clone(), state.inventory.clone()) {
+            (Some(transport), Some(inventory)) => (transport, inventory),
+            _ => {
+                return Err(MoveError::InventoryChanged {
+                    addr: addresses[0],
+                    expected: "a changer inventory for this handle".into(),
+                    found: "no changer transport shared with this handle".into(),
+                })
+            }
+        }
+    };
+    let data = crate::discovery::issue_res(
+        transport.lock().unwrap_or_else(|e| e.into_inner()).as_mut(),
+        0,
+        true,
+        true,
+    )
+    .inspect_err(|_| {
+        lock_drive_shared(shared)
+            .dirty
+            .mark(DirtyCause::CompletionUnknown)
+    })?;
+    let (found, _) = ops::reconcile(&expected, data).map_err(|err| {
+        lock_drive_shared(shared)
+            .dirty
+            .mark(DirtyCause::CompletionUnknown);
+        MoveError::InventoryChanged {
+            addr: addresses[0],
+            expected: "known element layout".into(),
+            found: err.to_string(),
+        }
+    })?;
+    lock_drive_shared(shared).inventory = Some(found.clone());
+    let mut refusal = None;
+    for &addr in addresses {
+        let old = element_state(&expected, addr)?;
+        let new = element_state(&found, addr)?;
+        if old != new {
+            tracing::warn!(element = addr, expected = ?old, found = ?new, "element inventory changes; command refused");
+            if refusal.is_none() {
+                refusal = Some(MoveError::InventoryChanged {
+                    addr,
+                    expected: format!("{old:?}"),
+                    found: format!("{new:?}"),
+                });
+            }
+        }
+    }
+    refusal.map_or(Ok(()), Err)
+}
+
+/// Read occupancy separately from a possibly unreadable barcode.
+fn element_state(library: &Library, addr: u16) -> Result<(bool, Option<String>), MoveError> {
+    if let Some(bay) = library
+        .drive_bays
+        .iter()
+        .find(|bay| bay.element_address == addr)
+    {
+        return Ok((bay.loaded, bay.loaded_tape.clone()));
+    }
+    if let Some(slot) = library
+        .slots
+        .iter()
+        .find(|slot| slot.element_address == addr)
+    {
+        return Ok((slot.full, slot.cartridge.clone()));
+    }
+    if let Some(port) = library
+        .ie_ports
+        .iter()
+        .find(|port| port.element_address == addr)
+    {
+        return Ok((port.full, port.cartridge.clone()));
+    }
+    Err(MoveError::AddressUnknown {
+        library: library.serial.clone(),
+        addr,
+    })
 }

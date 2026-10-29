@@ -1254,7 +1254,9 @@ impl super::DriveHandle {
                 // threaded, which is not a repeat within this epoch.
                 unit_attention_seen.clear();
                 if let Err(error) = self.load_immediate() {
-                    let DriveOpError::ScsiError(scsi) = &error;
+                    let DriveOpError::ScsiError(scsi) = &error else {
+                        return Err(error.to_string());
+                    };
                     let failure = classify_media_readiness_error_ref(scsi, family);
                     let detail = error.to_string();
                     event(MediaReadinessWaitEvent::InitializingLoadFailed {

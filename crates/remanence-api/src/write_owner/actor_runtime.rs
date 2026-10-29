@@ -90,10 +90,15 @@ pub(crate) fn spawn_drive_actor(
 ) -> mpsc::Sender<DriveCommand> {
     let (tx, rx) = mpsc::channel::<DriveCommand>(16);
     let actor_tx = tx.clone();
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let actor_name = format!("rem-drive-actor-{}-{bay:04x}", cfg.actor_library_serial);
     std::thread::Builder::new()
         .name(actor_name)
-        .spawn(move || drive_loop(bay, &mut drive, cfg, actor_tx, rx))
+        .spawn(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                drive_loop(bay, &mut drive, cfg, actor_tx, rx)
+            })
+        })
         .expect("spawn drive actor thread");
     tx
 }
@@ -129,11 +134,11 @@ pub(super) fn changer_loop(
                 let result =
                     super::robotics::admit_fenced_elements(&index, changer.library(), &[src, dst])
                         .and_then(|()| {
-                            changer
-                                .move_medium(src, dst, &cfg.policy)
-                                .map_err(|err| Status::internal(format!("move medium: {err}")))
+                            changer.move_medium(src, dst, &cfg.policy).map_err(|err| {
+                                Status::failed_precondition(format!("move medium: {err}"))
+                            })
                         });
-                if result.is_ok() {
+                {
                     match observe_refreshed_library(&mut index, &cfg, changer.library()) {
                         Ok(()) => clear_library_snapshot_persist_alarm(
                             &mut index,
@@ -158,11 +163,11 @@ pub(super) fn changer_loop(
                 let result =
                     super::robotics::admit_fenced_elements(&index, changer.library(), &[src, dst])
                         .and_then(|()| {
-                            changer
-                                .move_medium(src, dst, &cfg.policy)
-                                .map_err(|err| Status::internal(format!("move medium: {err}")))
+                            changer.move_medium(src, dst, &cfg.policy).map_err(|err| {
+                                Status::failed_precondition(format!("move medium: {err}"))
+                            })
                         });
-                if result.is_ok() {
+                {
                     match observe_refreshed_library(&mut index, &cfg, changer.library()) {
                         Ok(()) => clear_library_snapshot_persist_alarm(
                             &mut index,
@@ -646,7 +651,16 @@ pub(super) fn drive_loop(
                 let result = drive
                     .unload()
                     .map(|()| started.elapsed())
-                    .map_err(|err| Status::internal(format!("unload drive: {err}")));
+                    .map_err(|err| match err {
+                        remanence_library::DriveOpError::Inventory(_) => {
+                            Status::failed_precondition(format!("unload drive: {err}"))
+                        }
+                        _ => Status::internal(format!("unload drive: {err}")),
+                    });
+                if let Some(library) = drive.observed_library() {
+                    let _ = observe_refreshed_library(&mut index, &cfg, &library);
+                    publish_library_snapshot(&cfg.library_snapshot, library);
+                }
                 let _ = reply.send(result);
             }
             DriveCommand::PollHealth {

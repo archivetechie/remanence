@@ -206,3 +206,7 @@ VerificationIoCounts.command_ms     zero is honest when a phase never runs or it
 VerificationIoCounts.max_command_ms zero is honest when a phase never runs or no command lasts one millisecond
 
 StartTapeVerificationRequest.tape_uuid  required exact 16-byte tape identity; an empty value is refused
+
+# Caller-id lookup scope. Empty explicitly selects an unscoped, exactly-one-pool lookup.
+GetObjectRequest.pool_id empty selects unscoped caller-id resolution; it never selects an arbitrary pool
+FindObjectCopiesRequest.pool_id empty selects unscoped caller-id resolution; it never selects an arbitrary pool

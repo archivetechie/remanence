@@ -397,6 +397,7 @@ async fn put(
             Some(object) => object,
             None => match catalog
                 .get_object(pb::GetObjectRequest {
+                    pool_id: String::new(),
                     key: Some(pb::get_object_request::Key::ObjectId(
                         record.object_id.clone(),
                     )),

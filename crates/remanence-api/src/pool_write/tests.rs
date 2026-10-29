@@ -439,6 +439,39 @@ fn selected_drive_writer_binds_media_check_and_write_to_one_drive() {
         command_start,
         "an exact replay must return before drive preparation"
     );
+    let conflict_source = temp.path().join("conflicting.bin");
+    std::fs::write(&conflict_source, b"different caller content").unwrap();
+    let conflict = write_to_selected_drive_checkpointed_with_catalog(
+        &mut state,
+        &mut drive,
+        &pool_cfg,
+        WriteObjectToPoolRequest {
+            pool_id: pool_cfg.id.clone(),
+            source: WriteObjectSource::Path(conflict_source),
+            archive_path: "rewritable.bin".into(),
+            caller_object_id: "direct-rewritable-check".into(),
+            expected_content_sha256: None,
+            expected_object_id: None,
+            input_kind: WriteObjectInputKind::LogicalFile,
+            representation: PoolWriteRepresentation::Plaintext,
+        },
+        SelectedTape {
+            standalone_endpoint: None,
+            pool_id: pool_cfg.id.clone(),
+            tape_uuid: TAPE_UUID,
+            block_size: BLOCK_SIZE,
+            parity_config: ParityConfig::None,
+        },
+        &temp.path().join("checkpoints"),
+        &temp.path().join("parity.cbor"),
+        &resources,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        conflict,
+        PoolWriteError::CallerObjectIdConflict { .. }
+    ));
+    assert_eq!(world.lock().unwrap().command_log.len(), command_start);
 }
 
 fn test_pool_write_resources() -> PoolWriteResources {
@@ -2450,7 +2483,7 @@ fn direct_encrypted_parity_write_uses_configured_spool_ceiling_before_object_mot
     assert_eq!(sink.filemarks, vec![1]);
     assert!(
         state
-            .get_native_object_by_caller_object_id("direct-encrypted-capacity-caller")
+            .get_native_object_by_unique_caller_object_id("direct-encrypted-capacity-caller")
             .expect("query caller object")
             .is_none(),
         "capacity rejection must not publish the Object"
@@ -4516,7 +4549,7 @@ fn direct_terminal_failure_preserves_object_checkpoint_and_structured_intent() {
     assert_eq!(fences[0].reason, "terminal_finalization");
     assert!(
         index
-            .get_native_object_by_caller_object_id("terminal-authority-caller")
+            .get_native_object_by_unique_caller_object_id("terminal-authority-caller")
             .expect("query caller object")
             .is_some(),
         "ordinary Object authority must precede structured terminal intent"

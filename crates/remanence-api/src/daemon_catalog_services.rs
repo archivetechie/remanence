@@ -433,7 +433,7 @@ impl pb::catalog_server::Catalog for CatalogService {
     ) -> Result<Response<pb::ObjectRecord>, Status> {
         authorize_request(&request, AuthPermission::Read)?;
         let request = request.into_inner();
-        let object = find_object_for_key(&self.state, request.key)?
+        let object = find_object_for_key(&self.state, request.key, &request.pool_id)?
             .ok_or_else(|| Status::not_found("object not found"))?;
         Ok(Response::new(object_record_to_proto(object)?))
     }
@@ -444,7 +444,7 @@ impl pb::catalog_server::Catalog for CatalogService {
     ) -> Result<Response<pb::FindObjectCopiesResponse>, Status> {
         authorize_request(&request, AuthPermission::Read)?;
         let request = request.into_inner();
-        let object = find_copy_object_for_key(&self.state, request.key)?
+        let object = find_copy_object_for_key(&self.state, request.key, &request.pool_id)?
             .ok_or_else(|| Status::not_found("object not found"))?;
         let copies = object
             .copies

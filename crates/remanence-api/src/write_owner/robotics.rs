@@ -109,7 +109,12 @@ pub(crate) fn handle_robotics(
         };
     }
 
-    let lib = match cfg.report.library(library_serial) {
+    let snapshot = cfg
+        .library_snapshot
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let lib = match snapshot.report.library(library_serial) {
         Some(lib) => lib,
         None => {
             return RoboticsOutcome::Failed {
@@ -155,17 +160,9 @@ pub(crate) fn handle_robotics(
         }
     };
 
-    publish_running(handle, &[("phase", "refresh")]);
-    if let Err(err) = library.refresh() {
-        return RoboticsOutcome::Failed {
-            message: format!("refresh inventory: {err}"),
-            phase: "refresh",
-        };
-    }
-
     publish_running(handle, &[("phase", "execute")]);
     let action = match &action {
-        RoboticsAction::Refresh => Ok(()),
+        RoboticsAction::Refresh => library.refresh().map_err(|err| err.to_string()),
         RoboticsAction::Move { src, dst } => library
             .move_medium(*src, *dst, &cfg.policy)
             .map_err(|err| err.to_string()),

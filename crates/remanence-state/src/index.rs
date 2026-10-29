@@ -2158,7 +2158,7 @@ impl CatalogIndex {
         let updated_at = now_utc()?;
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| sqlite_error("begin journal ingestion transaction", err))?;
         let report = index_committed_tape_journal_tx(&tx, &input, state, &updated_at)?;
         tx.commit()
@@ -2180,7 +2180,7 @@ impl CatalogIndex {
         let updated_at = now_utc()?;
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| sqlite_error("begin tape-file bundle projection", err))?;
         let report = project_committed_tape_file_bundle_tx(&tx, &input, bundle, &updated_at)?;
         tx.commit()
@@ -2207,7 +2207,7 @@ impl CatalogIndex {
         let last_committed_tape_file = last_committed_tape_file.map(SqliteU64::new);
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| sqlite_error("begin tape-files reconciliation", err))?;
         let changed = tx
             .execute(
@@ -2313,7 +2313,7 @@ impl CatalogIndex {
         let updated_at = now_utc()?;
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| sqlite_error("begin tape provisioning transaction", err))?;
         let previous: Option<(Vec<u8>, Option<String>)> = tx
             .query_row(
@@ -2397,7 +2397,7 @@ impl CatalogIndex {
         let updated_at = now_utc()?;
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| sqlite_error("begin bootstrap identity adoption", err))?;
         let outcome = adopt_bootstrap_identity_tx(
             &tx,
@@ -2712,7 +2712,7 @@ impl CatalogIndex {
         let updated_at = now_utc()?;
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| sqlite_error("begin catalog reset tape restore", err))?;
         for tape in tapes {
             let geometry = tape.geometry.as_ref();
@@ -2923,7 +2923,7 @@ impl CatalogIndex {
     ) -> Result<DriveObservationOutcome, StateError> {
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| sqlite_error("begin drive observation transaction", err))?;
         let observed = observe_drive_tx(&tx, input, false)?;
         let serial_collision =
@@ -2960,7 +2960,7 @@ impl CatalogIndex {
 
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| sqlite_error("begin drive inventory transaction", err))?;
         let mut observed_rows = Vec::new();
         let mut touched_serials = std::collections::BTreeMap::<String, String>::new();
@@ -3285,7 +3285,7 @@ impl CatalogIndex {
         let now = now_utc()?;
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| sqlite_error("begin verified clean run transaction", err))?;
         if let Some(cart_tape_uuid) = cart_tape_uuid {
             tx.execute(
@@ -4044,7 +4044,7 @@ impl CatalogIndex {
         );
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| sqlite_error("begin reinstate drive", err))?;
         tx.execute(
             "update drives
@@ -4097,7 +4097,7 @@ impl CatalogIndex {
         let updated_at = now_utc()?;
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| sqlite_error("begin tape retire transaction", err))?;
         let existing: Option<(Option<String>, String)> = tx
             .query_row(
@@ -4197,9 +4197,12 @@ impl CatalogIndex {
             None => now_utc()?,
         };
         let updated_at = now_utc()?;
-        let tx = self.conn.transaction().map_err(|err| {
-            sqlite_error("begin native object and tape-file bundle projection", err)
-        })?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|err| {
+                sqlite_error("begin native object and tape-file bundle projection", err)
+            })?;
         upsert_native_object_projection_tx(
             &tx,
             &object,
@@ -4237,7 +4240,7 @@ impl CatalogIndex {
         let updated_at = now_utc()?;
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| sqlite_error("begin native object append projection", err))?;
         validate_append_bundle_extension_tx(&tx, &tape_input, bundle)?;
         validate_append_object_conflicts_tx(&tx, &tape_input, bundle, &object, copies)?;
@@ -4323,7 +4326,7 @@ impl CatalogIndex {
         let updated_at = now_utc()?;
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| sqlite_error("begin checkpoint batch projection", err))?;
         let replay_plan =
             inspect_checkpoint_projection_tx(&tx, record, &object_bundles, barrier_bundle)?;
@@ -4552,7 +4555,7 @@ impl CatalogIndex {
         let updated_at = now_utc()?;
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| sqlite_error("begin structured terminal projection", error))?;
         project_tape_written_extent_tx(&tx, record.tape_uuid, record.eod_lba)?;
         // The terminal checkpoint proves the final partial epoch as well as C.
@@ -4687,7 +4690,7 @@ impl CatalogIndex {
     ) -> Result<AuditReplayReport, StateError> {
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| sqlite_error("begin audit replay transaction", err))?;
         tx.execute("delete from idempotency_keys", [])
             .map_err(|err| sqlite_error("clear idempotency projection", err))?;
@@ -4730,7 +4733,7 @@ impl CatalogIndex {
         let updated_at = now_utc()?;
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| sqlite_error("begin full index rebuild transaction", err))?;
         let preserved_tapes = query_preserved_tape_rows_tx(&tx)?;
         let preserved_evidence = query_preserved_evidence_keys_tx(&tx)?;
@@ -4808,7 +4811,7 @@ impl CatalogIndex {
     pub fn project_audit_record(&mut self, record: &AuditRecord) -> Result<(), StateError> {
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| sqlite_error("begin incremental audit projection", err))?;
         project_session_record(&tx, record)?;
         project_operation_record(&tx, record)?;
@@ -4832,7 +4835,7 @@ impl CatalogIndex {
         let created_at_utc = input.created_at_utc.unwrap_or(now_utc()?);
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| sqlite_error("begin tape pool projection", err))?;
         upsert_tape_pool_projection_tx(
             &tx,
@@ -4876,7 +4879,7 @@ impl CatalogIndex {
 
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| sqlite_error("begin tape pool rule reconciliation", err))?;
 
         let normalized_memberships = query_tapes_for_pool_derivation_tx(&tx)?
@@ -5086,7 +5089,7 @@ impl CatalogIndex {
         let updated_at_utc = now_utc()?;
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| sqlite_error("begin conditional tape pool assignment", err))?;
         set_tape_pool_membership_tx(
             &tx,
@@ -5179,7 +5182,7 @@ impl CatalogIndex {
         let updated_at_utc = input.updated_at_utc.clone().unwrap_or(now_utc()?);
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| sqlite_error("begin terminal finalization projection", err))?;
         project_terminal_finalization_tx(&tx, &input, updated_at_utc.as_str())?;
         tx.commit()
@@ -5299,7 +5302,7 @@ impl CatalogIndex {
         };
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| sqlite_error("begin native object projection", err))?;
         upsert_native_object_projection_tx(&tx, &object, None, copies, created_at_utc.as_str())?;
         tx.commit()
@@ -6144,37 +6147,32 @@ impl CatalogIndex {
         Ok(Some(object))
     }
 
-    /// Fetch a native object and its copies by caller-supplied object id.
-    pub fn get_native_object_by_caller_object_id(
+    /// Resolve an unscoped caller id only when one committed pool contains it.
+    pub fn get_native_object_by_unique_caller_object_id(
         &self,
         caller_object_id: &str,
     ) -> Result<Option<NativeObjectRecord>, StateError> {
         let mut stmt = self
             .conn
             .prepare(
-                "select object_id, caller_object_id, body_format, logical_size_bytes,
-                        content_hash, content_hash_algorithm,
-                        metadata_hash, metadata_hash_algorithm, created_at_utc
-                 from objects
-                 where caller_object_id = ?1
-                 order by created_at_utc, object_id
-                 limit 1",
+                "select distinct c.pool_id from objects o join object_copies c
+             on c.object_id = o.object_id where o.caller_object_id = ?1
+             and c.status = 'committed' and c.pool_id is not null order by c.pool_id",
             )
-            .map_err(|err| sqlite_error("prepare native object caller-id lookup", err))?;
-        let mut rows = stmt
-            .query(params![caller_object_id])
-            .map_err(|err| sqlite_error("query native object caller-id lookup", err))?;
-        let Some(row) = rows
-            .next()
-            .map_err(|err| sqlite_error("iterate native object caller-id lookup", err))?
-        else {
-            return Ok(None);
-        };
-        let mut object = native_object_from_row(row)?;
-        drop(rows);
-        drop(stmt);
-        object = self.attach_native_object_copies(object)?;
-        Ok(Some(object))
+            .map_err(|err| sqlite_error("prepare caller-id pools", err))?;
+        let pools = stmt
+            .query_map(params![caller_object_id], |row| row.get::<_, String>(0))
+            .map_err(|err| sqlite_error("query caller-id pools", err))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| sqlite_error("read caller-id pools", err))?;
+        match pools.as_slice() {
+            [] => Ok(None),
+            [pool] => self.get_native_object_by_pool_and_caller_object_id(pool, caller_object_id),
+            _ => Err(StateError::AmbiguousCatalogLookup(format!(
+                "caller object id {caller_object_id:?} occurs in pools: {}; specify pool_id",
+                pools.join(", ")
+            ))),
+        }
     }
 
     /// Fetch a native object by caller id only when it has a committed copy in
@@ -6200,7 +6198,7 @@ impl CatalogIndex {
                        and object_copies.status = 'committed'
                    )
                  order by created_at_utc, object_id
-                 limit 1",
+                 limit 2",
             )
             .map_err(|err| sqlite_error("prepare native object pool/caller-id lookup", err))?;
         let mut rows = stmt
@@ -6213,6 +6211,15 @@ impl CatalogIndex {
             return Ok(None);
         };
         let mut object = native_object_from_row(row)?;
+        if rows
+            .next()
+            .map_err(|err| sqlite_error("check pool/caller-id uniqueness", err))?
+            .is_some()
+        {
+            return Err(StateError::AmbiguousCatalogLookup(format!(
+                "caller object id {caller_object_id:?} matches multiple objects in pool {pool_id:?}"
+            )));
+        }
         drop(rows);
         drop(stmt);
         object = self.attach_native_object_copies(object)?;
@@ -6546,7 +6553,7 @@ impl CatalogIndex {
         };
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| sqlite_error("begin idempotency registration", err))?;
         let registration = upsert_idempotency_request(
             &tx,
@@ -13951,10 +13958,10 @@ fn json_escape_text(value: &str) -> String {
 }
 
 fn configure_sqlite(conn: &Connection) -> Result<(), StateError> {
-    conn.pragma_update(None, "journal_mode", "WAL")
-        .map_err(|err| sqlite_error("set sqlite journal_mode", err))?;
     conn.pragma_update(None, "busy_timeout", 5000)
         .map_err(|err| sqlite_error("set sqlite busy_timeout", err))?;
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .map_err(|err| sqlite_error("set sqlite journal_mode", err))?;
     conn.pragma_update(None, "synchronous", "FULL")
         .map_err(|err| sqlite_error("set sqlite synchronous", err))?;
     conn.pragma_update(None, "foreign_keys", "ON")
@@ -15358,6 +15365,12 @@ fn sqlite_open_error(path: &Path, err: rusqlite::Error) -> StateError {
 }
 
 fn sqlite_error(context: &str, err: rusqlite::Error) -> StateError {
+    if matches!(
+        err.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    ) {
+        tracing::warn!(operation = context, error = %err, "catalog lock refusal");
+    }
     StateError::Index {
         context: context.to_string(),
         source: err,
@@ -15380,6 +15393,34 @@ mod tests {
     };
 
     use super::*;
+
+    /// A competing writer is awaited before a transaction reads its update inputs.
+    #[test]
+    fn catalog_write_transaction_waits_for_competing_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.sqlite");
+        let mut index = CatalogIndex::open(&path).unwrap();
+        let holder = Connection::open(&path).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (started, waiting) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            index.provision_tape(ProvisionTapeInput {
+                tape_uuid: [93; 16],
+                voltag: "WAIT01L9".into(),
+                block_size: 4096,
+                parity: ParityConfig::None,
+                force: false,
+            })
+        });
+        waiting.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        holder.execute_batch("COMMIT").unwrap();
+        writer
+            .join()
+            .unwrap()
+            .expect("writer waits rather than refusing a read-to-write upgrade");
+    }
 
     /// Verification columns migrate while exact erase accepts the prior schema.
     #[test]
@@ -21904,13 +21945,10 @@ mod tests {
                 .expect("native object exists by hash"),
             objects[0]
         );
-        assert_eq!(
-            index
-                .get_native_object_by_caller_object_id("caller-1")
-                .expect("get native object by caller id")
-                .expect("native object exists by caller id"),
-            objects[0]
-        );
+        assert!(index
+            .get_native_object_by_unique_caller_object_id("caller-1")
+            .unwrap()
+            .is_none());
         assert_eq!(
             index
                 .find_native_object_copies("object-1")
@@ -22048,6 +22086,11 @@ mod tests {
                 .expect("project native object");
         }
 
+        let ambiguous = index
+            .get_native_object_by_unique_caller_object_id("shared-caller")
+            .unwrap_err();
+        assert!(matches!(ambiguous, StateError::AmbiguousCatalogLookup(_)));
+        assert!(ambiguous.to_string().contains("pool-a, pool-b"));
         let pool_a = index
             .get_native_object_by_pool_and_caller_object_id("pool-a", "shared-caller")
             .expect("query pool-a caller")
@@ -22071,6 +22114,20 @@ mod tests {
             .get_native_object_by_pool_and_caller_object_id("pool-missing", "shared-caller")
             .expect("query missing-only pool")
             .is_none());
+        index
+            .conn
+            .execute(
+                "update object_copies set status = 'missing' where pool_id = 'pool-b'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            index
+                .get_native_object_by_unique_caller_object_id("shared-caller")
+                .unwrap()
+                .unwrap(),
+            pool_a
+        );
     }
 
     #[test]

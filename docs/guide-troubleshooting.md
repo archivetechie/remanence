@@ -548,3 +548,31 @@ Tape recycling outside Remanence (for example re-creating a virtual
 cartridge with the same barcode) can leave the catalog's tape identity
 out of step with the UUID written at the beginning of tape. The retire and rebind machinery exists (`rem tape retire`); Remanence does
 not yet reconcile this automatically.
+
+## Element inventory changes before unload or move
+
+The daemon reads element status with volume tags before SSC UNLOAD and MOVE
+MEDIUM. If occupancy or the barcode changes, it refreshes its view, logs the
+expected and found state, and refuses the command. An idle unload stops after
+an inventory refusal. Check the refreshed inventory and other initiators before
+requesting another move. A full home slot requires an explicit empty destination;
+the daemon does not select a replacement automatically.
+
+A failed move also refreshes inventory. Sense `05/3B/0E` reports a full
+destination. An unload followed by a failed move does not prove that the
+cartridge remains in the drive; use the fresh element status for recovery.
+
+## Catalog and checkpoint lock refusals
+
+Catalog writers use immediate transactions and a five-second busy timeout.
+They reserve the SQLite writer before reading the rows they update, so
+concurrent checkpoints wait instead of failing on a deferred read-to-write
+upgrade. Each drive actor has its own connection to the same catalog.
+
+A checkpoint journal lease is exclusive per tape and lasts through the write
+session. A competing lease for that tape returns a refusal; it does not block
+indefinitely. Separate tapes use separate lock files. A rejected session open releases its
+journal leases before publishing the refusal, so an immediate retry or replay
+does not race that cleanup. Lock refusals log at WARN
+with the operation and write-session context. Check the session and tape ids
+and allow the holder to close before retrying. Do not delete a held lock file.
