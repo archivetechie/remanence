@@ -94,3 +94,6 @@ pub fn drive_mapping_message(warning: &DiscoveryWarning) -> Option<String> {
 
 /// Operation progress keys for the raw readiness sense and its readable name.
 pub const MEDIA_READINESS_SENSE_PROGRESS_KEYS: (&str, &str) = ("sense", "sense_name");
+
+/// Shared append and directory durability seam.
+pub mod durable_file;

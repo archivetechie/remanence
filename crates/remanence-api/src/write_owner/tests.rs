@@ -1,3 +1,6 @@
+#[path = "durability_tests.rs"]
+mod durability_tests;
+
 use super::*;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

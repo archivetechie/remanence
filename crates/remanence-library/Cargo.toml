@@ -10,6 +10,7 @@ publish.workspace = true
 repository  .workspace = true
 
 [dependencies]
+nix.workspace = true
 tracing.workspace = true
 libc.workspace = true
 serde.workspace = true
@@ -26,6 +27,8 @@ futures-util = { version = "0.3", optional = true }
 # Default: no native deps. The cross-platform layer-2c scaffolding
 # (event types, trait, coalescer, mock) builds and tests everywhere.
 default = []
+# Path-scoped file durability substitution for hermetic tests.
+test-support = []
 
 # `linux-udev` pulls in tokio-udev + futures-util and enables the
 # LinuxUdevSource backend. Requires `pkg-config` and `libudev-dev`

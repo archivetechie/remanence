@@ -27,6 +27,9 @@ use time::OffsetDateTime;
 /// Stateful virtual tape/changer transport for Phase C L1b tests.
 pub mod model;
 
+/// In-memory file and directory durability for crash tests.
+pub mod file_model;
+
 /// Environment variable that enables chaos wrapping when set to a truthy value.
 pub const ENV_CHAOS_ENABLED: &str = "REM_CHAOS_ENABLED";
 
@@ -263,6 +266,7 @@ impl FaultEngine {
             .filter(|fault| {
                 !inner.fired_once.contains(&fault.id)
                     && fault_matches(fault, ctx, command)
+                    && !is_lost_response_fault(fault)
                     && !is_mutation_fault(fault)
                     && !is_tape_alert_fault(fault)
             })
@@ -282,6 +286,24 @@ impl FaultEngine {
             fault,
             sense,
         })
+    }
+
+    fn lost_response(&self, ctx: &DeviceCtx, command: &CommandInfo) -> Option<(Scenario, Fault)> {
+        let mut inner = self.inner.lock().expect("chaos engine lock");
+        let scenario = inner.scenario.clone()?;
+        let fault = scenario
+            .faults
+            .iter()
+            .find(|fault| {
+                !inner.fired_once.contains(&fault.id)
+                    && fault_matches(fault, ctx, command)
+                    && is_lost_response_fault(fault)
+            })?
+            .clone();
+        if is_one_shot_fault(&fault) {
+            inner.fired_once.insert(fault.id);
+        }
+        Some((scenario, fault))
     }
 
     fn take_pending_ua(
@@ -632,6 +654,46 @@ impl<T> ChaosTransport<T> {
     }
 }
 
+impl<T: SgTransport> ChaosTransport<T> {
+    fn lose_response(&mut self, command: &CommandInfo) -> Result<(), ScsiError> {
+        let Some(engine) = &self.engine else {
+            return Ok(());
+        };
+        let Some((scenario, fault)) = engine.lost_response(&self.ctx, command) else {
+            return Ok(());
+        };
+        self.current_lba = None;
+        engine.log_event(command_event(CommandEvent {
+            scenario: Some(&scenario),
+            fault: Some(&fault),
+            ctx: &self.ctx,
+            command,
+            inner_called: true,
+            status: "lost_response",
+            returned_bytes: 0,
+            sense: None,
+            mutation: None,
+            tape_alert: None,
+            element_status: None,
+            state_delta: json!({"completion": "unknown"}),
+        }));
+        Err(ScsiError::TransportError {
+            status: 0,
+            host_status: 0x03,
+            driver_status: 0,
+            info: 1,
+            sense: Vec::new(),
+        })
+    }
+}
+
+/// RSP-01 loses a completed command's response with Linux DID_TIME_OUT.
+/// The action form also works with existing scenario catalogue entries.
+fn is_lost_response_fault(fault: &Fault) -> bool {
+    fault.catalogue_id == "RSP-01"
+        || fault.action.get("lost_response").and_then(Value::as_bool) == Some(true)
+}
+
 impl<T: SgTransport> SgTransport for ChaosTransport<T> {
     fn execute_in(&mut self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
         let command = self.command_info(cdb, DataDirection::In, buf.len() as u64);
@@ -682,6 +744,9 @@ impl<T: SgTransport> SgTransport for ChaosTransport<T> {
         }
 
         let result = self.inner.execute_in(cdb, buf);
+        if result.is_ok() {
+            self.lose_response(&command)?;
+        }
         match result {
             Ok(mut outcome) => {
                 let mut returned_bytes = outcome.bytes_transferred as usize;
@@ -840,6 +905,9 @@ impl<T: SgTransport> SgTransport for ChaosTransport<T> {
         }
 
         let result = self.inner.execute_none(cdb);
+        if result.is_ok() {
+            self.lose_response(&command)?;
+        }
         match result {
             Ok(()) => {
                 self.update_position_after_success(&command);
@@ -915,6 +983,9 @@ impl<T: SgTransport> SgTransport for ChaosTransport<T> {
         }
 
         let result = self.inner.execute_out(cdb, buf);
+        if result.is_ok() {
+            self.lose_response(&command)?;
+        }
         match result {
             Ok(outcome) => {
                 self.update_position_after_success(&command);
@@ -2942,6 +3013,107 @@ mod tests {
         assert!(mark_error
             .pre_call_decision(&DeviceCtx::new(), &command, 2048)
             .is_some());
+    }
+
+    #[test]
+    fn lost_responses_preserve_effects_and_use_transport_timeout() {
+        use crate::model::{DeviceRole, ModelTransport, VirtualTape, VirtualWorld};
+        for operation in [
+            "write",
+            "write_filemarks",
+            "locate",
+            "move_medium",
+            "load_unload",
+            "inquiry",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("faults.sqlite");
+            let conn = create_state(&path, "lost-response", "fixed");
+            insert_fault(
+                &conn,
+                "lost-response",
+                "RSP-01",
+                json!({}),
+                json!({"op": operation}),
+                json!({}),
+                "transient",
+            );
+            let mut world = VirtualWorld::single_drive("LIB", 1, "DRIVE", 100, 1);
+            world.put_tape_in_drive(1, "TAPE", Some(100), VirtualTape::empty(1024, 4));
+            if operation == "locate" {
+                world.drive_states.get_mut(&1).unwrap().position_unknown = true;
+            }
+            if operation == "load_unload" {
+                world.leave_cartridge_unthreaded(1);
+            }
+            let world = Arc::new(Mutex::new(world));
+            let role = if operation == "move_medium" {
+                DeviceRole::Changer
+            } else {
+                DeviceRole::Drive { bay: 1 }
+            };
+            let mut transport = ChaosTransport::from_state_path(
+                ModelTransport::new(world.clone(), role),
+                &path,
+                DeviceCtx::new(),
+            )
+            .unwrap();
+            let error = match operation {
+                "write" => transport.execute_out(&write6(4), b"data").unwrap_err(),
+                "write_filemarks" => transport.execute_none(&[0x10, 0, 0, 0, 1, 0]).unwrap_err(),
+                "locate" => transport.execute_none(&locate16(0)).unwrap_err(),
+                "move_medium" => transport
+                    .execute_none(&[0xa5, 0, 0, 0, 0, 1, 0, 100, 0, 0, 0, 0])
+                    .unwrap_err(),
+                "load_unload" => transport.execute_none(&[0x1b, 0, 0, 0, 1, 0]).unwrap_err(),
+                "inquiry" => transport
+                    .execute_in(&[0x12, 0, 0, 0, 36, 0], &mut [0; 36])
+                    .unwrap_err(),
+                _ => unreachable!(),
+            };
+            assert!(
+                matches!(error, ScsiError::TransportError { host_status: 3, sense, .. } if sense.is_empty())
+            );
+            assert_eq!(transport.current_lba, None);
+            let world = world.lock().unwrap();
+            assert_eq!(
+                world.command_log.len(),
+                1,
+                "exactly one command takes effect"
+            );
+            match operation {
+                "write" => {
+                    assert_eq!(world.tapes["TAPE"].records.len(), 1);
+                    assert_eq!(world.tapes["TAPE"].durable_frontier, 0);
+                }
+                "write_filemarks" => {
+                    assert_eq!(world.tapes["TAPE"].records.len(), 1);
+                    assert_eq!(world.tapes["TAPE"].durable_frontier, 1);
+                }
+                "locate" => assert!(!world.drive_states[&1].position_unknown),
+                "move_medium" => assert_eq!(world.slots[0].barcode.as_deref(), Some("TAPE")),
+                "load_unload" => assert!(!world.drive_states[&1].initializing_command_required),
+                _ => {}
+            }
+            drop(world);
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE event_json LIKE '%lost_response%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+            assert!(transport
+                .engine
+                .as_ref()
+                .unwrap()
+                .inner
+                .lock()
+                .unwrap()
+                .fired_once
+                .contains(&1));
+        }
     }
 
     fn chaos_fixture(state_path: &Path, ctx: DeviceCtx) -> ChaosTransport<FixtureTransport> {

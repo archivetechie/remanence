@@ -2707,6 +2707,7 @@ version = "0.2.0"
 dependencies = [
  "futures-util",
  "libc",
+ "nix 0.31.3",
  "remanence-scsi",
  "serde",
  "serde_json",

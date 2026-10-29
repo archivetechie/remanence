@@ -615,3 +615,55 @@ variables. Formal verification of the parity, format, and manifest cores (with
 Lean and Aeneas, tools for machine-checked proofs about Rust code) is under
 `verif/` and is inventoried in
 [formal-verification-status.md](formal-verification-status.md).
+
+### Durability crash suites
+
+The write-owner durability tests checkpoint three objects on the in-memory tape
+and restart from cuts at command completions, file appends and syncs, namespace
+operations, and client receipts, including session close. Both suites check
+acknowledged bytes through the read engine, durable catalog authority, operator
+tail confirmation, and the next append position.
+
+The default suite visits every cut once with maximum loss: it retains exactly
+the durable tape frontier, drops all unsynced file bytes, and drops unsynced
+directory entries. This choice gives a missing barrier no accidental partial
+flush to hide behind. It also samples failed syncs and torn tails at the first
+dirty header and last dirty frame sync of each journal file. Torn tails retain
+one byte or all but the last byte. Four independent recovery workers keep the
+suite near one minute. The missing-barrier control remains a default test and
+must detect lost acknowledged bytes.
+
+```sh
+cargo test -p remanence-api --lib durability -- --nocapture
+```
+
+The full matrix is ignored by default and takes about 12 minutes. It retains the
+same restart checks and explores the original tape-count, namespace, byte-tail,
+and failed-sync choices. It varies journal tails one file at a time, rather than
+exploring the Cartesian product of all failures.
+
+```sh
+cargo test -p remanence-api --lib durability -- --ignored
+```
+
+Both suites report deterministic cut numbers and crash choices. The five refusal
+categories that omit tape identity remain explicit recovery defects; passing
+byte-survival checks does not establish the full refusal-identity requirement.
+
+The following references identify current findings in the three-object fixture.
+Cut numbers count capture events from one; `keep` counts retained tape records,
+`receipts` counts client commit receipts, and a tail length counts retained
+unsynced bytes. All unlisted unsynced tails are discarded. These examples use the
+default suite; they remain defects rather than accepted production guarantees.
+
+| Reference | Refusal without tape identity | Example cut and crash choice |
+| --- | --- | --- |
+| CHAOS-REFUSAL-01 | Missing bootstrap | C066, after READ POSITION; `keep=0`, lose unsynced names and bytes, `receipts=0`. |
+| CHAOS-REFUSAL-02 | Orphan parity bundle | C122, after READ POSITION; `keep=15`, lose unsynced names and bytes, `receipts=2`. |
+| CHAOS-REFUSAL-03 | Short audit header | C041, before audit sync; `keep=2`, retain names and one unsynced audit byte, `receipts=0`. The status is `Internal`. |
+| CHAOS-REFUSAL-04 | Short parity header | C036, before parity-journal sync; `keep=2`, retain names and one unsynced parity-journal byte, `receipts=0`. |
+| CHAOS-REFUSAL-05 | Torn parity frame | C128, before parity-journal sync; `keep=24`, retain names and one unsynced parity-journal byte, `receipts=2`. |
+
+The fixed tape identity is `d0d0d0d0-d0d0-d0d0-d0d0-d0d0d0d0d0d0`, barcode
+`DUR001L9`. The audit filename follows the execution date. Each run prints its
+full cut descriptions so later changes to the trace are visible.

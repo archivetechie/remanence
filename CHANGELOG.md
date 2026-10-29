@@ -7,6 +7,16 @@ per-release summaries.
 <!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_backend.rs crates/remanence-state/src/index.rs crates/remanence-library/src/discovery.rs @ 638210f7 -->
 ## Unreleased
 
+- Test infrastructure: the chaos model separates buffered tape records from
+  durable records, models power cuts and lost command responses, and supplies
+  an in-memory file/directory model with torn writes and failed syncs. Checkpoint,
+  parity, and audit journals use a shared durability seam with unchanged framing
+  and sync order. Write-session crash tests check acknowledged bytes and append
+  placement, exercise operator tail confirmation, and detect skipped barriers.
+  The default durability suite samples crash choices at every cut; the full
+  matrix runs as an ignored test. The tests record existing recovery refusals
+  that omit the tape identity.
+
 - Catalog caller ids resolve within a pool. Both object lookup requests accept
   `pool_id`, and `rem get --caller-id` accepts `--pool`. Unscoped ambiguous
   lookups refuse with the matching pool names.

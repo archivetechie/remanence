@@ -618,11 +618,26 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
         (
             "remanence-chaos/src/lib.rs",
             DispatchPolicy::Exact {
-                execute_out: 4,
-                execute_none: 13,
-                why: "fault-injection SgTransport wrapper and its tests; it \
-                      wraps a transport owned by the handles and initiates \
-                      nothing",
+                execute_out: 5,
+                execute_none: 17,
+                why: "fault-injection wrapper forwards to a transport owned by handles; \
+                      lost-response tests dispatch only to in-memory ModelTransport",
+            },
+        ),
+        (
+            "remanence-chaos/tests/durability.rs",
+            DispatchPolicy::Exact {
+                execute_out: 9,
+                execute_none: 9,
+                why: "durability tests dispatch only to in-memory ModelTransport",
+            },
+        ),
+        (
+            "remanence-api/src/write_owner/durability_tests.rs",
+            DispatchPolicy::Exact {
+                execute_out: 1,
+                execute_none: 1,
+                why: "cfg(test) crash-cut forwarder and missing-barrier control use only in-memory ModelTransport",
             },
         ),
         (

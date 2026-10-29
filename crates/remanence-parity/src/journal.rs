@@ -10,7 +10,8 @@
 //! bundles are surfaced as orphans because their tape writes were not included
 //! in a daemon checkpoint projection.
 
-use std::fs::{self, File, OpenOptions};
+use remanence_library::durable_file::{File, OpenOptions};
+use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
