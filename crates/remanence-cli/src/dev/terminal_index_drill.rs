@@ -180,7 +180,7 @@ impl TerminalIndexDamagePlan {
     }
 }
 
-/// Arguments for `rem-debug tape terminal-index-drill`.
+/// Arguments for `rem-dev tape terminal-index-drill`.
 #[derive(Args, Debug)]
 pub(crate) struct TerminalIndexDrillArgs {
     /// Explicit SG tape-drive device containing the already-finalized tape.
@@ -1461,6 +1461,19 @@ pub(crate) fn run_live(
     }
 }
 
+/// Check the parsed development command without exposing drill fields.
+#[cfg(test)]
+pub(crate) fn assert_documented_args(args: &TerminalIndexDrillArgs) {
+    assert_eq!(args.device, Path::new("/dev/sg7"));
+    assert_eq!(args.block_size, 262144);
+    assert_eq!(args.damage_plan, TerminalIndexDamagePlan::None);
+    assert_eq!(
+        args.reconcile_outcome,
+        Some(TerminalReconcileDrill::TornWorm)
+    );
+    assert!(args.full_verify);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1756,43 +1769,6 @@ mod tests {
             assert!(report.expectations_met);
             assert!(report.expectation_failures.is_empty());
         }
-    }
-
-    #[test]
-    fn documented_cli_parses() {
-        let cli = <crate::DebugCli as clap::Parser>::try_parse_from([
-            "rem-debug",
-            "tape",
-            "terminal-index-drill",
-            "--device",
-            "/dev/sg7",
-            "--tape-uuid",
-            "71717171-7171-7171-7171-717171717171",
-            "--block-size",
-            "262144",
-            "--damage-plan",
-            "none",
-            "--reconcile-outcome",
-            "torn-worm",
-            "--full-verify",
-            "--report",
-            "/tmp/tix.json",
-        ])
-        .expect("documented terminal-index drill parses");
-        let crate::Command::Tape {
-            command: crate::TapeCommand::TerminalIndexDrill(args),
-        } = cli.command
-        else {
-            panic!("expected terminal-index drill")
-        };
-        assert_eq!(args.device, Path::new("/dev/sg7"));
-        assert_eq!(args.block_size, BLOCK_SIZE);
-        assert_eq!(args.damage_plan, TerminalIndexDamagePlan::None);
-        assert_eq!(
-            args.reconcile_outcome,
-            Some(TerminalReconcileDrill::TornWorm)
-        );
-        assert!(args.full_verify);
     }
 
     #[test]

@@ -126,7 +126,7 @@ cargo build --release --locked --target x86_64-unknown-linux-musl \
 
 The binaries are then in `target/x86_64-unknown-linux-musl/release/`.
 
-`cargo install --locked --path crates/remanence-cli` installs `rem` and
+`cargo install --locked --path crates/remanence-cli --bin rem --bin rem-debug` installs `rem` and
 `rem-debug` into `~/.cargo/bin` (repeat with `crates/remanence-daemon` and
 `crates/rem-recover` for the others). That is convenient for the archive
 commands, which need no hardware. For tape hardware, prefer the root-owned

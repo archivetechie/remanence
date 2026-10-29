@@ -187,15 +187,15 @@ mod tests;
 // is test-only: Layer-5 resume entry points remain private to write_owner.
 #[cfg(test)]
 #[allow(dead_code)]
-#[path = "../../remanence-cli/src/resume_vectors.rs"]
+#[path = "../../remanence-cli/src/dev/resume_vectors.rs"]
 mod resume_vectors;
 #[cfg(test)]
 #[allow(dead_code)]
-#[path = "../../remanence-cli/src/tape_image.rs"]
+#[path = "../../remanence-cli/src/dev/tape_image.rs"]
 mod tape_image;
 #[cfg(test)]
 #[allow(dead_code)]
-#[path = "../../remanence-cli/src/tape_image_vectors.rs"]
+#[path = "../../remanence-cli/src/dev/tape_image_vectors.rs"]
 mod tape_image_vectors;
 
 /// Discovery facts for CLI envelopes, independent of binary or daemon capabilities.

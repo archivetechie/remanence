@@ -167,8 +167,8 @@ def build_repository(root: Path, images: Path | None, output: Path, replace: boo
     with tempfile.TemporaryDirectory(prefix="draft-images-") as tmp:
         if images is None:
             images = Path(tmp) / "streams"
-            subprocess.run(["cargo", "run", "--offline", "-q", "-p", "remanence-cli", "--example",
-                            "generate_tape_images", "--", "--export-images", str(images)], cwd=root, check=True)
+            subprocess.run(["cargo", "run", "--offline", "-q", "-p", "remanence-cli", "--bin",
+                            "rem-dev", "--", "generate-tape-images", "--export-images", str(images)], cwd=root, check=True)
         payload = source_members(root, images)
         check_specification_exclusion(payload, specification_sources(root))
         # Check pins, including ALL concatenations, before installing the archive.
@@ -187,7 +187,7 @@ def build_repository(root: Path, images: Path | None, output: Path, replace: boo
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--images", type=Path, help="streams from generate_tape_images --export-images (otherwise generate offline)")
+    parser.add_argument("--images", type=Path, help="streams from rem-dev generate-tape-images --export-images (otherwise generate offline)")
     parser.add_argument("--output", type=Path, default=ROOT / "dist" / ARCHIVE_NAME)
     parser.add_argument("--replace", action="store_true")
     parser.add_argument("--allow-dirty", action="store_true", help="allow uncommitted source changes for tests and development")

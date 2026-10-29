@@ -651,7 +651,7 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
             },
         ),
         (
-            "remanence-cli/src/damage_vectors.rs",
+            "remanence-cli/src/dev/damage_vectors.rs",
             DispatchPolicy::Exact {
                 execute_out: 2,
                 execute_none: 2,

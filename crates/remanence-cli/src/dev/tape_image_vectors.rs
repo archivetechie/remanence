@@ -20,7 +20,7 @@ use crate::tape_image::{
 
 pub const BLOCK: u32 = 262144;
 pub const EXPECTATIONS: &str = include_str!(
-    "../../../fixtures/rem-parity-terminal-index-draft/tape-images/expected-cases.json"
+    "../../../../fixtures/rem-parity-terminal-index-draft/tape-images/expected-cases.json"
 );
 const TIMESTAMP: &str = "2026-08-09T00:00:00Z";
 const VERSION: &str = "remanence-terminal-vector-generator/1";

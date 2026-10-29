@@ -23,7 +23,7 @@ rem-dev-setcap:
 		echo "error: rem-dev-setcap requires Linux file capabilities"; \
 		exit 1; \
 	fi
-	$(CARGO) build -p remanence-cli
+	$(CARGO) build -p remanence-cli --bin rem --bin rem-debug
 	$(SUDO) $(SETCAP) cap_sys_rawio+ep $(REM_BIN)
 	$(GETCAP) $(REM_BIN)
 

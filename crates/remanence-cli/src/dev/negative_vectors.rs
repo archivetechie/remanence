@@ -13,11 +13,16 @@ use std::{
     fs,
     path::PathBuf,
 };
+#[path = "negative_vectors/erratum.rs"]
 pub mod erratum;
 #[cfg(test)]
+#[path = "negative_vectors/mutations.rs"]
 mod mutations;
+#[path = "negative_vectors/overflow.rs"]
 mod overflow;
+#[path = "negative_vectors/profiles.rs"]
 mod profiles;
+#[path = "negative_vectors/supplement.rs"]
 pub mod supplement;
 const B: usize = BLOCK as usize;
 

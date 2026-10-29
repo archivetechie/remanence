@@ -18,7 +18,7 @@ use std::{
 };
 
 pub const EXPECTATIONS: &str = include_str!(
-    "../../../fixtures/rem-parity-terminal-index-draft/tape-images/resume/expected-cases.json"
+    "../../../../fixtures/rem-parity-terminal-index-draft/tape-images/resume/expected-cases.json"
 );
 
 /// Preserve each complete JSON case's literal spelling, including multiline cases.
