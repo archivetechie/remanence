@@ -1,6 +1,9 @@
 //! Crash exploration through the same in-process write-session engine as the daemon.
 //! Each command, file append, sync, and client receipt captures a restartable cut.
 
+#[path = "acceptance_finalization.rs"]
+mod acceptance_finalization;
+
 use super::*;
 use remanence_chaos::file_model::{FileEvent, FileSnapshot, MemoryDirectory};
 use remanence_library::durable_file::test_support::register;
