@@ -226,6 +226,26 @@ pub(crate) fn ensure_media_readiness_admitted(
             "{action} blocked by active tape-I/O fence; inspect rem tape quarantine list"
         )));
     }
+    ensure_media_readiness_unconflicted(
+        index,
+        action,
+        library_serial,
+        drive_element,
+        barcode,
+        library_robotics,
+    )
+}
+
+/// The readiness half of [`ensure_media_readiness_admitted`], without the tape-I/O fence check. Ending a session
+/// uses it: a session on a tape fenced since it opened still closes and releases its drive.
+pub(crate) fn ensure_media_readiness_unconflicted(
+    index: &CatalogIndex,
+    action: &str,
+    library_serial: &str,
+    drive_element: Option<u16>,
+    barcode: Option<&str>,
+    library_robotics: bool,
+) -> Result<(), Status> {
     let conflicts = index
         .media_readiness_admission_conflicts(
             library_serial,
