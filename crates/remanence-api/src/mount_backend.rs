@@ -1498,7 +1498,7 @@ fn same_authority(a: &Path, b: &Path) -> Result<bool, MountError> {
     Ok(digest(a)? == digest(b)?)
 }
 
-/// Persist uncertainty in both the index and its existing audit replay funnel.
+/// Sync uncertainty evidence before projecting its tape and endpoint fence.
 fn raise_standalone_fence(
     state: &mut StateHandle,
     tape_uuid: TapeUuid,
@@ -1511,29 +1511,18 @@ fn raise_standalone_fence(
         .get_tape(&tape_uuid)
         .map_err(refusal)?
         .and_then(|t| t.voltag);
-    let fence = state
-        .catalog_index()
-        .record_tape_io_fence_at_endpoint(
-            remanence_state::TapeIoFenceInput {
-                tape_uuid,
-                barcode,
-                reason: reason.into(),
-                evidence_json: Some(serde_json::json!({"error": detail}).to_string()),
-            },
-            endpoint,
-        )
-        .map_err(refusal)?;
-    let cfg = crate::write_owner::TerminalWriteConfig {
-        checkpoint_journal_dir: state.paths().journal_dir.join("checkpoints"),
-        audit_dir: state.paths().audit_dir.clone(),
-        audit_fsync: state.config().audit.fsync,
-        audit_append_lock: Arc::new(Mutex::new(())),
-    };
-    crate::write_owner::append_tape_io_fence_evidence(
+    let audit_dir = state.paths().audit_dir.clone();
+    let fence = remanence_state::fence::raise(
         state.catalog_index(),
-        &cfg,
-        &fence,
-        AuditEvent::TapeIoFenceRaised,
+        &audit_dir,
+        remanence_state::TapeIoFenceInput {
+            tape_uuid,
+            barcode,
+            reason: reason.into(),
+            evidence_json: Some(serde_json::json!({"error": detail}).to_string()),
+        },
+        endpoint,
+        remanence_state::AuditActor::System,
     )
     .map_err(refusal)?;
     let release_options = fence_release_options(&fence);
@@ -1805,26 +1794,21 @@ pub(crate) fn supersede_mounted_tail(
     })();
     drive.clear_append_admission();
     if let Err(error) = result {
-        let fence = index
-            .record_tape_io_fence_at_endpoint(
-                remanence_state::TapeIoFenceInput {
-                    tape_uuid,
-                    barcode: tape.voltag,
-                    reason: "supersede_tail_failed".into(),
-                    evidence_json: Some(serde_json::json!({"error":error}).to_string()),
-                },
-                drive
-                    .endpoint()
-                    .durable_key()
-                    .filter(|key| matches!(key, remanence_library::DriveKey::Standalone { .. })),
-            )
-            .map_err(crate::status_from_state_error)?;
-        crate::write_owner::append_tape_io_fence_evidence(
+        crate::write_owner::raise_tape_io_fence(
             index,
             cfg,
-            &fence,
-            AuditEvent::TapeIoFenceRaised,
-        )?;
+            remanence_state::TapeIoFenceInput {
+                tape_uuid,
+                barcode: tape.voltag,
+                reason: "supersede_tail_failed".into(),
+                evidence_json: Some(serde_json::json!({"error":error}).to_string()),
+            },
+            drive
+                .endpoint()
+                .durable_key()
+                .filter(|key| matches!(key, remanence_library::DriveKey::Standalone { .. })),
+        )
+        .map_err(crate::status_from_state_error)?;
         return Err(Status::unavailable(error));
     }
     index

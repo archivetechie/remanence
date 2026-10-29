@@ -800,10 +800,12 @@ where
     S: BlockSink + ?Sized,
     R: Send,
 {
+    let fence_cfg = &super::test_fence_config(state.path().parent().expect("catalog parent"));
     run_ring_staged_transfer(inner, block_size, producer, None, |error| {
         let error = error.to_string();
         record_tape_io_fence_for_transfer_error(
             state,
+            fence_cfg,
             selected,
             tape_io_fence_reason_for_transfer_error(&error),
             &error,
@@ -825,6 +827,7 @@ where
     S: BlockSink + ?Sized,
     R: Send,
 {
+    let fence_cfg = &super::test_fence_config(state.path().parent().expect("catalog parent"));
     let tape_write_control = overlap_control.as_ref().map(Arc::clone);
     let outcome =
         run_ring_staged_transfer(inner, block_size, producer, tape_write_control, |error| {
@@ -837,6 +840,7 @@ where
             let error = error.to_string();
             record_tape_io_fence_for_transfer_error(
                 state,
+                fence_cfg,
                 selected,
                 tape_io_fence_reason_for_transfer_error(&error),
                 &error,
@@ -846,8 +850,10 @@ where
     outcome.result
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_faulted_counted_fenced_staged_transfer<S, R>(
     state: &mut CatalogIndex,
+    fence_cfg: &crate::write_owner::TerminalWriteConfig,
     selected: &SelectedTape,
     inner: &mut CountingBlockSink<'_, S>,
     block_size: usize,
@@ -877,6 +883,7 @@ where
                 let error = error.to_string();
                 record_tape_io_fence_for_transfer_error(
                     state,
+                    fence_cfg,
                     selected,
                     tape_io_fence_reason_for_transfer_error(&error),
                     &error,

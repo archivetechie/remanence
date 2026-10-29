@@ -23,7 +23,7 @@ use super::terminal_finalize::{
     finalize_terminal_no_parity, finalize_terminal_with_parity_journal,
 };
 use super::terminal_types::TerminalFinalizeSpec;
-use super::write_session::{append_tape_io_fence_evidence, append_tape_sealed_evidence};
+use super::write_session::{append_tape_sealed_evidence, raise_tape_io_fence};
 use super::{CheckpointTrigger, ParkedCartridge, SeatedCartridge, WriteAdmissionReservation};
 use crate::catalog_conversion::object_record_to_proto;
 use crate::{pb, SelectedTape, TapeUuid};
@@ -1123,7 +1123,9 @@ pub(super) fn fence_failed_checkpoint_batch(
         "error": status.message(),
     })
     .to_string();
-    match index.record_tape_io_fence_at_endpoint(
+    match raise_tape_io_fence(
+        index,
+        cfg,
         remanence_state::TapeIoFenceInput {
             tape_uuid: selected.tape_uuid,
             barcode,
@@ -1132,16 +1134,7 @@ pub(super) fn fence_failed_checkpoint_batch(
         },
         selected.standalone_endpoint.as_ref(),
     ) {
-        Ok(fence) => {
-            match append_tape_io_fence_evidence(index, cfg, &fence, AuditEvent::TapeIoFenceRaised) {
-                Ok(()) => status,
-                Err(err) => Status::internal(format!(
-                    "{}; tape fence {} persisted but its audit evidence failed: {err}",
-                    status.message(),
-                    fence.quarantine_id
-                )),
-            }
-        }
+        Ok(_) => status,
         Err(err) => {
             tracing::error!(
                 tape_uuid = %Uuid::from_bytes(selected.tape_uuid),
@@ -1206,7 +1199,9 @@ pub(super) fn fence_failed_parity_raw_write(
         "error": error,
     })
     .to_string();
-    let fence = match index.record_tape_io_fence_at_endpoint(
+    match raise_tape_io_fence(
+        index,
+        cfg,
         remanence_state::TapeIoFenceInput {
             tape_uuid: selected.tape_uuid,
             barcode,
@@ -1215,7 +1210,7 @@ pub(super) fn fence_failed_parity_raw_write(
         },
         selected.standalone_endpoint.as_ref(),
     ) {
-        Ok(fence) => fence,
+        Ok(_) => (status, true),
         Err(err) => {
             tracing::error!(
                 tape_uuid = %Uuid::from_bytes(selected.tape_uuid),
@@ -1223,30 +1218,10 @@ pub(super) fn fence_failed_parity_raw_write(
                 error = %err,
                 "failed to persist parity raw-write tape-I/O fence"
             );
-            return (
+            (
                 Status::internal(format!(
                     "{}; additionally failed to persist the required tape fence: {err}",
                     status.message()
-                )),
-                false,
-            );
-        }
-    };
-    match append_tape_io_fence_evidence(index, cfg, &fence, AuditEvent::TapeIoFenceRaised) {
-        Ok(()) => (status, true),
-        Err(err) => {
-            tracing::error!(
-                tape_uuid = %Uuid::from_bytes(selected.tape_uuid),
-                quarantine_id = fence.quarantine_id.as_str(),
-                phase,
-                error = %err,
-                "persisted parity raw-write fence but failed to append audit evidence"
-            );
-            (
-                Status::internal(format!(
-                    "{}; tape fence {} persisted but its audit evidence failed: {err}",
-                    status.message(),
-                    fence.quarantine_id
                 )),
                 false,
             )
@@ -1973,20 +1948,18 @@ fn record_epoch_fence(
     {
         return;
     }
-    match index.record_tape_io_fence(remanence_state::TapeIoFenceInput {
-        tape_uuid,
-        barcode: tape.voltag,
-        reason: reason.into(),
-        evidence_json: Some(evidence),
-    }) {
-        Ok(fence) => {
-            if let Err(error) =
-                append_tape_io_fence_evidence(index, cfg, &fence, AuditEvent::TapeIoFenceRaised)
-            {
-                tracing::error!(%error, "open epoch fence audit fails");
-            }
-        }
-        Err(error) => tracing::error!(%error, "open epoch fence persistence fails"),
+    if let Err(error) = raise_tape_io_fence(
+        index,
+        cfg,
+        remanence_state::TapeIoFenceInput {
+            tape_uuid,
+            barcode: tape.voltag,
+            reason: reason.into(),
+            evidence_json: Some(evidence),
+        },
+        None,
+    ) {
+        tracing::error!(%error, "open epoch fence persistence fails");
     }
 }
 

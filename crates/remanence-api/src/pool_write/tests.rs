@@ -219,6 +219,7 @@ fn selected_drive_writer_binds_media_check_and_write_to_one_drive() {
     let command_start = world.lock().expect("world lock").command_log.len();
     let cross_pool = write_to_selected_drive_checkpointed_with_catalog(
         &mut state,
+        &super::test_fence_config(temp.path()),
         &mut drive,
         &cross_pool_cfg,
         cross_pool_request,
@@ -251,6 +252,7 @@ fn selected_drive_writer_binds_media_check_and_write_to_one_drive() {
     let command_start = world.lock().expect("world lock").command_log.len();
     let wrong_parity = write_to_selected_drive_checkpointed_with_catalog(
         &mut state,
+        &super::test_fence_config(temp.path()),
         &mut drive,
         &pool_cfg,
         wrong_parity_request,
@@ -283,6 +285,7 @@ fn selected_drive_writer_binds_media_check_and_write_to_one_drive() {
     let command_start = world.lock().expect("world lock").command_log.len();
     let invalid = write_to_selected_drive_checkpointed_with_catalog(
         &mut state,
+        &super::test_fence_config(temp.path()),
         &mut drive,
         &pool_cfg,
         invalid_request,
@@ -303,6 +306,7 @@ fn selected_drive_writer_binds_media_check_and_write_to_one_drive() {
 
     let error = write_to_selected_drive_checkpointed_with_catalog(
         &mut state,
+        &super::test_fence_config(temp.path()),
         &mut drive,
         &pool_cfg,
         request,
@@ -362,6 +366,7 @@ fn selected_drive_writer_binds_media_check_and_write_to_one_drive() {
 
     let result = write_to_selected_drive_checkpointed_with_catalog(
         &mut state,
+        &super::test_fence_config(temp.path()),
         &mut drive,
         &pool_cfg,
         request,
@@ -418,6 +423,7 @@ fn selected_drive_writer_binds_media_check_and_write_to_one_drive() {
     let command_start = world.lock().expect("world lock").command_log.len();
     let replay = write_to_selected_drive_checkpointed_with_catalog(
         &mut state,
+        &super::test_fence_config(temp.path()),
         &mut drive,
         &pool_cfg,
         replay_request,
@@ -443,6 +449,7 @@ fn selected_drive_writer_binds_media_check_and_write_to_one_drive() {
     std::fs::write(&conflict_source, b"different caller content").unwrap();
     let conflict = write_to_selected_drive_checkpointed_with_catalog(
         &mut state,
+        &super::test_fence_config(temp.path()),
         &mut drive,
         &pool_cfg,
         WriteObjectToPoolRequest {
@@ -2598,6 +2605,7 @@ fn direct_checkpointed_parity_raw_write_failure_persists_fence_and_blocks_retry(
         .expect("query persisted fence");
     assert_eq!(fences.len(), 1);
     assert_eq!(fences[0].reason, "parity_append");
+    crate::tests::assert_fences_survive_empty_rebuild(&state, &temp.path().join("audit"));
     let retry_error = ensure_selected_tape_accepts_session_write(&state, &pool_cfg, &selected)
         .expect_err("persisted fence blocks retry before tape motion");
     assert!(matches!(retry_error, PoolWriteError::InvalidInput(_)));
@@ -3292,6 +3300,10 @@ fn fence_test_fixture() -> (tempfile::TempDir, CatalogIndex, SelectedTape) {
 }
 
 fn assert_one_transfer_fence(state: &CatalogIndex, expected_error: &str) {
+    crate::tests::assert_fences_survive_empty_rebuild(
+        state,
+        &state.path().parent().unwrap().join("audit"),
+    );
     let fences = state
         .list_active_tape_io_fences()
         .expect("list active tape-I/O fences");
@@ -4505,6 +4517,7 @@ fn direct_terminal_failure_preserves_object_checkpoint_and_structured_intent() {
         .to_string()
         .contains("injected terminal replica failure"));
     assert_eq!(sink.terminal_replica_attempts, 1);
+    crate::tests::assert_fences_survive_empty_rebuild(&index, &temp.path().join("audit"));
 
     let journal = remanence_state::FileCheckpointJournal::open(&checkpoint_dir, tape_uuid)
         .expect("reopen checkpoint authority");

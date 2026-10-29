@@ -997,16 +997,6 @@ pub(super) fn append_drive_health_evidence(
     Ok(())
 }
 
-pub(super) fn insert_optional_audit_text(
-    detail: &mut BTreeMap<String, CborValue>,
-    key: &str,
-    value: Option<&String>,
-) {
-    if let Some(value) = value {
-        detail.insert(key.to_string(), CborValue::Text(value.clone()));
-    }
-}
-
 pub(super) fn raise_alarm_with_evidence(
     index: &mut CatalogIndex,
     cfg: &WriteOwnerConfig,

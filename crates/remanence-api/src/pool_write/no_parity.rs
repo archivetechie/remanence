@@ -48,8 +48,10 @@ use remanence_parity::ParityScheme;
 #[cfg(test)]
 use remanence_state::TapeJournalIndexInput;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
     state: &mut CatalogIndex,
+    fence_cfg: &crate::write_owner::TerminalWriteConfig,
     sink: &mut CountingBlockSink<'_, S>,
     _pool_cfg: &TapePoolConfig,
     request: WriteObjectToPoolRequest,
@@ -81,6 +83,7 @@ pub(super) fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
     let write_report: Result<StreamingObjectWriteReport, PoolWriteError> =
         run_faulted_counted_fenced_staged_transfer(
             state,
+            fence_cfg,
             &selected,
             sink,
             selected.block_size as usize,
@@ -329,6 +332,7 @@ pub(super) fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
 
 pub(super) fn record_tape_io_fence_for_transfer_error(
     state: &mut CatalogIndex,
+    fence_cfg: &crate::write_owner::TerminalWriteConfig,
     selected: &SelectedTape,
     reason: &str,
     error: &str,
@@ -342,7 +346,9 @@ pub(super) fn record_tape_io_fence_for_transfer_error(
         uuid_text(selected.tape_uuid),
         json_escape(error),
     );
-    state.record_tape_io_fence_at_endpoint(
+    crate::write_owner::raise_tape_io_fence(
+        state,
+        fence_cfg,
         remanence_state::TapeIoFenceInput {
             tape_uuid: selected.tape_uuid,
             barcode,
@@ -356,12 +362,19 @@ pub(super) fn record_tape_io_fence_for_transfer_error(
 
 pub(super) fn fence_after_terminal_motion(
     state: &mut CatalogIndex,
+    fence_cfg: &crate::write_owner::TerminalWriteConfig,
     selected: &SelectedTape,
     reason: &str,
     error: PoolWriteError,
 ) -> PoolWriteError {
     let detail = error.to_string();
-    match record_tape_io_fence_for_transfer_error(state, selected, reason, detail.as_str()) {
+    match record_tape_io_fence_for_transfer_error(
+        state,
+        fence_cfg,
+        selected,
+        reason,
+        detail.as_str(),
+    ) {
         Ok(()) => error,
         Err(fence_error) => PoolWriteError::InvalidInput(format!(
             "{detail}; failed to persist required terminal tape-I/O fence: {fence_error}"
