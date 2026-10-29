@@ -1944,13 +1944,8 @@ fn standalone_fences_match_only_recorded_tape_or_endpoint() {
             )
             .unwrap();
         assert_eq!(standalone_fence_releasable(&fence), endpoint.is_some());
-        let startup =
-            crate::startup_guard::reject_active_tape_io_fences_on_startup(state.catalog_index())
-                .unwrap_err();
-        assert_eq!(
-            startup.message().contains("--after-settled-inventory"),
-            endpoint.is_none()
-        );
+        crate::startup_guard::reject_active_tape_io_fences_on_startup(state.catalog_index())
+            .unwrap();
         if blocks {
             let refusal =
                 standalone_fence_policy(state.catalog_index(), Some(UUID), Some(&here), true)
@@ -2014,10 +2009,7 @@ fn standalone_fence_release_rebuild_preserves_endpoint_and_ack() {
         .pop()
         .unwrap();
     assert!(standalone_fence_releasable(&fence));
-    let startup =
-        crate::startup_guard::reject_active_tape_io_fences_on_startup(state.catalog_index())
-            .unwrap_err();
-    assert!(!startup.message().contains("--after-settled-inventory"));
+    crate::startup_guard::reject_active_tape_io_fences_on_startup(state.catalog_index()).unwrap();
     state
         .release_tape_io_fence(&fence.quarantine_id, "rescued files")
         .unwrap()
@@ -2182,7 +2174,7 @@ async fn seated_parity_sessions_close_before_unload_and_shutdown() {
     }
 }
 
-/// Every removal entry point releases cartridges after skipped or failed epoch closes.
+/// Removal keeps newly fenced cartridges seated and releases unfenced cartridges.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn epoch_removal_admission_failure_matrix() {
     const CHILD: &str = "REMOVAL_MATRIX_CHILD";

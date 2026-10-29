@@ -84,6 +84,33 @@ The full setup and first-tape sequence is in [Using a standalone LTO
 drive](guide-standalone-drive.md).
 
 <!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs crates/remanence-cli/src/lib.rs @ 6ed03ef0 -->
+## Tape-I/O fences
+
+The daemon starts with tape-scoped and drive-scoped tape-I/O fences. Each fence
+produces a startup WARN with its quarantine id, UUID, barcode or endpoint,
+reason, and release command. `rem top`, `rem catalog tapes --json`, and
+`Daemon.Health` list active fences and their count. A fence with missing or
+unparseable scope still refuses startup.
+
+Checkpoint replay and projection, append recovery, manual-finalize relaunch,
+terminal recovery, readiness reconciliation and automatic waits, retained-epoch
+handling, and idle dismount leave fenced tapes and drives untouched. Other
+media remain available. Investigate the recorded evidence and verify the medium
+and drive before release:
+
+```sh
+rem tape quarantine release <ID> --after-settled-inventory --ack "what was checked"
+```
+
+Standalone endpoint fences need only `--ack`. The command uses the configured
+daemon socket when it is listening. An absent listener permits offline release,
+which still requires the exclusive state lock. RPC and authentication failures
+do not fall back offline. Release syncs the actor, scope, acknowledgment and
+release time to the audit log before clearing the row. A crash between these
+steps leaves the fence active; retry or startup completes the release from the
+same evidence. The tape or drive becomes admissible without restarting, subject
+to the normal identity, readiness and append checks.
+
 ## Media-readiness fences and quarantine
 
 Remanence classifies TEST UNIT READY results into an explicit readiness
@@ -120,7 +147,7 @@ until the fence is cleared. You will see messages like:
 run `rem tape quarantine show <id>` or wait-ready/resume before retrying
 ```
 
-The daemon resumes load-transient fences itself with a 9000 s timeout and
+Unless a tape-I/O fence blocks the same tape or drive, the daemon resumes load-transient fences itself with a 9000 s timeout and
 30 s steady polls, including after startup reconciliation. Calls to
 `ResumeMediaReadiness` attach to a running readiness wait or LoadDrive for the
 same operation. `rem tape wait-ready --resume <UUID> --endpoint <URI>` watches
@@ -273,7 +300,7 @@ layers — seeing one does not imply the others tripped too.
 | `untrusted state volume ...` | State, journal, audit, index, cache, or socket path sits on tmpfs/NFS/SMB/overlayfs and `journal.require_trusted_volume` is `true` (the default). Move the state or consciously disable the check. |
 | `error: configure spool dir ...` | The spool resolved to tmpfs and `spool_tmpfs_ram_budget` is not set. Spooling to RAM needs an explicit budget acknowledgement. |
 | `TLS private key ... has insecure permissions` | The key file is group- or world-accessible. `chmod 600` it. |
-| `startup blocked by active tape-I/O fence <id> ...` | A write was interrupted in a completion-unknown state before shutdown. `rem tape quarantine release <id>` after verifying the tape, as the message says. |
+| `startup blocked by active tape-I/O fence <id> ...` | The fence has missing or unparseable scope. Inspect its evidence and repair its attribution before restart, or release it after verification. Scoped fences produce WARNs and allow startup. |
 | `error: discover libraries: ...` | Same permission gates as the CLI (tape group + `CAP_SYS_RAWIO`, via systemd `AmbientCapabilities` for a service). |
 | `error: acquire daemon state ownership ...` | Another daemon or offline state-mutating command holds `<state_dir>/state.lock`. Stop the other owner; do not delete the lock file or point a second daemon at the same state directory. The kernel releases the lock when its owner exits. |
 
@@ -494,7 +521,7 @@ Strings worth grepping for, mapped to the sections above:
 | `every SCSI probe returned EPERM` | missing CAP_SYS_RAWIO |
 | `was removed; the pipelined fixed-block path is now the only tape I/O path` | stale `tape_io.legacy_single_block`/`pipelined_submission` key in config |
 | `blocked by active media-readiness fence` | quarantined media |
-| `startup blocked by active tape-I/O fence` | interrupted write before restart |
+| `startup blocked by active tape-I/O fence` | missing or unparseable fence scope |
 | `transport error (completion unknown)` | dirty snapshot; rescan |
 | `write session poisoned by a failed append` | session-level write poison; open a new session |
 | `sealed at the checkpoint boundary` | tape sealed at a checkpoint barrier; open a new session against the pool |

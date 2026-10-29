@@ -563,6 +563,42 @@ fn cbor_u16(value: u16) -> CborValue {
 
 #[tonic::async_trait]
 impl pb::library_service_server::LibraryService for LibraryServiceApi {
+    async fn release_tape_io_fence(
+        &self,
+        request: Request<pb::ReleaseTapeIoFenceRequest>,
+    ) -> Result<Response<pb::TapeIoFence>, Status> {
+        crate::auth::authorize_request(&request, crate::auth::AuthPermission::OperationControl)?;
+        let actor = crate::auth::actor_from_request(&request);
+        let request = request.into_inner();
+        if request.acknowledgment.trim().is_empty() {
+            return Err(Status::invalid_argument("acknowledgment must not be empty"));
+        }
+        let state = self.state.clone();
+        let record = tokio::task::spawn_blocking(move || {
+            let _guard = state
+                .audit_append_lock
+                .lock()
+                .map_err(|_| Status::internal("audit append lock poisoned"))?;
+            remanence_state::fence::release(
+                &mut state.index_write()?,
+                &state.audit_dir,
+                &request.quarantine_id,
+                &request.acknowledgment,
+                actor,
+            )
+            .map_err(crate::startup_media_readiness::status_from_state_error)?
+            .ok_or_else(|| Status::not_found("tape-I/O fence not found"))
+        })
+        .await
+        .map_err(|error| Status::internal(error.to_string()))??;
+        if let Some(pool) = &self.state.drive_pool {
+            pool.readiness_wake.notify.notify_one();
+        }
+        Ok(Response::new(
+            crate::daemon_catalog_services::tape_io_fence_to_proto(record),
+        ))
+    }
+
     async fn list_libraries(
         &self,
         request: Request<()>,
@@ -2697,6 +2733,53 @@ mod tests {
         state
             .readiness_shutdown
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Tape-I/O fencing suppresses automatic readiness until the daemon releases it.
+    #[tokio::test]
+    async fn auto_resume_skips_tape_io_fence_until_rpc_release() {
+        let (state, id, mut rx) = auto_resume_fixture("becoming_ready");
+        let record = state
+            .index()
+            .unwrap()
+            .media_readiness_operation(id)
+            .unwrap()
+            .unwrap();
+        let fence = state
+            .index_write()
+            .unwrap()
+            .record_tape_io_fence_at_endpoint(
+                remanence_state::TapeIoFenceInput {
+                    tape_uuid: [0; 16],
+                    barcode: record.barcode,
+                    reason: "transfer_error".into(),
+                    evidence_json: None,
+                },
+                Some(&record.endpoint),
+            )
+            .unwrap();
+        crate::readiness_wait::spawn_auto_resume(state.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(rx.try_recv().is_err());
+        assert!(state.operations.latest(&id).is_none());
+        <crate::LibraryServiceApi as pb::library_service_server::LibraryService>::release_tape_io_fence(
+            &state.library_service(),
+            Request::new(pb::ReleaseTapeIoFenceRequest {
+                quarantine_id: fence.quarantine_id,
+                acknowledgment: "drive verified".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let command = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            command,
+            crate::write_owner::DriveCommand::WaitReady { .. }
+        ));
+        state.begin_shutdown();
     }
 
     /// Release-only states and durable operator cancellation never dispatch automatically.

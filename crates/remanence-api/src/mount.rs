@@ -1209,6 +1209,17 @@ pub(crate) fn spawn_startup_terminal_recoveries(state: ApiState) {
                     continue;
                 }
             };
+            if state
+                .index()
+                .and_then(|index| {
+                    index
+                        .tape_io_is_fenced(Some(&tape_uuid), None, None)
+                        .map_err(status_from_state_error)
+                })
+                .unwrap_or(true)
+            {
+                continue;
+            }
             let journal = match remanence_state::FileCheckpointJournal::open(
                 state.checkpoint_journal_dir.as_path(),
                 tape_uuid,
@@ -1342,6 +1353,14 @@ async fn recover_automatic_terminal_tape(
     let _tape_reservation = pool.reserve_tape(tape_uuid)?;
     let index = CatalogIndex::open_read_only(state.index_path.as_ref())
         .map_err(|error| Status::internal(error.to_string()))?;
+    if index
+        .tape_io_is_fenced(Some(&tape_uuid), None, None)
+        .map_err(status_from_state_error)?
+    {
+        return Err(Status::failed_precondition(
+            "terminal recovery blocked by active tape-I/O fence",
+        ));
+    }
     let tape = index
         .get_tape(&tape_uuid)
         .map_err(crate::startup_media_readiness::status_from_state_error)?
@@ -2233,6 +2252,22 @@ fn schedule_idle_dismount(state: ApiState, parked: crate::write_owner::ParkedCar
             if pool.is_shutting_down() || !pool.parked_is_current(&parked) {
                 return;
             }
+            if state
+                .index()
+                .and_then(|index| {
+                    index
+                        .tape_io_is_fenced(
+                            parked.seated.tape_uuid.as_ref(),
+                            parked.seated.barcode.as_deref(),
+                            Some(&parked.seated.drive_key()),
+                        )
+                        .map_err(status_from_state_error)
+                })
+                .unwrap_or(true)
+            {
+                tokio::time::sleep(Duration::from_secs(timeout_seconds)).await;
+                continue;
+            }
             let reservation = match pool.reserve_drive(&parked.seated.drive_key()) {
                 Ok(reservation) => reservation,
                 Err(_) => {
@@ -2326,6 +2361,21 @@ pub(crate) fn register_startup_seated_cartridges(
                 .as_ref()
                 .and_then(|barcode| voltags.get(barcode))
                 .and_then(|bytes| <[u8; 16]>::try_from(bytes.as_slice()).ok());
+            if state
+                .index()
+                .and_then(|index| {
+                    index
+                        .tape_io_is_fenced(
+                            tape_uuid.as_ref(),
+                            bay.loaded_tape.as_deref(),
+                            Some(&drive_key),
+                        )
+                        .map_err(status_from_state_error)
+                })
+                .unwrap_or(true)
+            {
+                continue;
+            }
             // Design §6.5, startup/orphan-recovery row: a cartridge
             // already seated when the daemon starts is a load this
             // process never harvested — sessions can open on it with
@@ -3317,6 +3367,21 @@ pub(crate) async fn test_remove_seated_epoch(
         schedule_idle_dismount(state.clone(), parked.clone());
         tokio::time::timeout(Duration::from_secs(10), async {
             while pool.parked_is_current(&parked) {
+                if state
+                    .index()
+                    .unwrap()
+                    .tape_io_is_fenced(
+                        seated.tape_uuid.as_ref(),
+                        seated.barcode.as_deref(),
+                        Some(&seated.drive_key()),
+                    )
+                    .unwrap()
+                {
+                    if let Ok(reservation) = pool.reserve_drive(&seated.drive_key()) {
+                        drop(reservation);
+                        return;
+                    }
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -3324,9 +3389,23 @@ pub(crate) async fn test_remove_seated_epoch(
         .expect("idle removal finishes");
     } else {
         let reservation = pool.reserve_drive(&seated.drive_key()).unwrap();
-        dismount_reserved_cartridge(state, pool, &seated, DismountReason::Evicted, reservation)
-            .await
-            .unwrap();
+        if let Err(error) =
+            dismount_reserved_cartridge(state, pool, &seated, DismountReason::Evicted, reservation)
+                .await
+        {
+            assert!(
+                state
+                    .index()
+                    .unwrap()
+                    .tape_io_is_fenced(
+                        seated.tape_uuid.as_ref(),
+                        seated.barcode.as_deref(),
+                        Some(&seated.drive_key())
+                    )
+                    .unwrap(),
+                "{error}"
+            );
+        }
     }
 }
 
@@ -5329,6 +5408,42 @@ mod tests {
         let lowered_index = CatalogIndex::open(&index_path).expect("open lowered-cap catalog");
         let mut lowered_state = ApiState::new_with_pool_configs(lowered_index, [lowered]);
         lowered_state.drive_pool = Some(pool);
+        let fence = lowered_state
+            .index_write()
+            .unwrap()
+            .record_tape_io_fence(remanence_state::TapeIoFenceInput {
+                tape_uuid: STARTUP_TAPE,
+                barcode: None,
+                reason: "terminal_finalization".into(),
+                evidence_json: None,
+            })
+            .unwrap();
+        let before = lowered_state
+            .index()
+            .unwrap()
+            .terminal_finalization(&STARTUP_TAPE)
+            .unwrap();
+        spawn_startup_terminal_recoveries(lowered_state.clone());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            lowered_state
+                .index()
+                .unwrap()
+                .terminal_finalization(&STARTUP_TAPE)
+                .unwrap(),
+            before
+        );
+        assert!(drive_rx.try_recv().is_err());
+        assert!(changer_rx.try_recv().is_err());
+        <crate::LibraryServiceApi as pb::library_service_server::LibraryService>::release_tape_io_fence(
+            &lowered_state.library_service(),
+            tonic::Request::new(pb::ReleaseTapeIoFenceRequest {
+                quarantine_id: fence.quarantine_id,
+                acknowledgment: "checked terminal state".into(),
+            }),
+        )
+        .await
+        .unwrap();
         recover_automatic_terminal_tape(&lowered_state, STARTUP_TAPE)
             .await
             .expect("automatic route seals after C despite a newly lowered capacity cap");
@@ -5852,6 +5967,48 @@ mod tests {
         })
         .await
         .expect("retry worker releases exact-tape ownership");
+        let fence = state
+            .index_write()
+            .unwrap()
+            .record_tape_io_fence(remanence_state::TapeIoFenceInput {
+                tape_uuid,
+                barcode: None,
+                reason: "checkpoint_barrier_failed".into(),
+                evidence_json: None,
+            })
+            .unwrap();
+        let before = std::fs::read(
+            remanence_state::list_checkpoint_journals(&checkpoint_dir)
+                .unwrap()
+                .pop()
+                .unwrap(),
+        )
+        .unwrap();
+        spawn_startup_terminal_recoveries(state.clone());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            drive_rx.try_recv().is_err(),
+            "fenced manual intent never relaunches"
+        );
+        assert_eq!(
+            std::fs::read(
+                remanence_state::list_checkpoint_journals(&checkpoint_dir)
+                    .unwrap()
+                    .pop()
+                    .unwrap()
+            )
+            .unwrap(),
+            before
+        );
+        <crate::LibraryServiceApi as pb::library_service_server::LibraryService>::release_tape_io_fence(
+            &state.library_service(),
+            tonic::Request::new(pb::ReleaseTapeIoFenceRequest {
+                quarantine_id: fence.quarantine_id,
+                acknowledgment: "checked terminal intent".into(),
+            }),
+        )
+        .await
+        .unwrap();
         spawn_startup_terminal_recoveries(state.clone());
         let resumed = tokio::time::timeout(Duration::from_secs(1), drive_rx.recv())
             .await
@@ -6112,6 +6269,50 @@ mod tests {
             drive_rx,
             changer_rx,
         }
+    }
+
+    /// Startup registration and already-armed idle timers leave fenced cartridges alone.
+    #[tokio::test]
+    async fn fenced_startup_and_idle_timer_do_not_dispatch() {
+        let mut harness = dismount_harness(1);
+        let fence = harness
+            .state
+            .index_write()
+            .unwrap()
+            .record_tape_io_fence_at_endpoint(
+                remanence_state::TapeIoFenceInput {
+                    tape_uuid: [0; 16],
+                    barcode: harness.seated.barcode.clone(),
+                    reason: "transfer_error".into(),
+                    evidence_json: None,
+                },
+                Some(&harness.seated.drive_key()),
+            )
+            .unwrap();
+        register_startup_seated_cartridges(
+            &harness.state,
+            &harness.state.current_library_snapshot().unwrap().report,
+        );
+        assert!(harness
+            .pool
+            .parked_at(&harness.seated.drive_key())
+            .is_none());
+        let parked = harness.pool.park_cartridge(harness.seated.clone());
+        schedule_idle_dismount(harness.state.clone(), parked);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(harness.drive_rx.try_recv().is_err());
+        assert!(harness.changer_rx.try_recv().is_err());
+        assert_eq!(
+            harness
+                .state
+                .index()
+                .unwrap()
+                .list_active_tape_io_fences()
+                .unwrap()[0]
+                .quarantine_id,
+            fence.quarantine_id
+        );
+        harness.state.begin_shutdown();
     }
 
     async fn reply_to_dismount_commands(

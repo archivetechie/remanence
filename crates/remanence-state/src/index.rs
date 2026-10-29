@@ -2018,6 +2018,54 @@ impl CatalogIndex {
             .collect())
     }
 
+    /// Check current tape identity, barcode, and endpoint fences without a cached view.
+    pub fn tape_io_is_fenced(
+        &self,
+        tape_uuid: Option<&[u8; 16]>,
+        barcode: Option<&str>,
+        endpoint: Option<&DriveKey>,
+    ) -> Result<bool, StateError> {
+        let fences = self.list_active_tape_io_fences()?;
+        if fences.is_empty() {
+            return Ok(false);
+        }
+        if fences.iter().any(|fence| {
+            tape_uuid.is_some_and(|uuid| fence.tape_uuid.as_slice() == uuid)
+                || endpoint.is_some_and(|key| fence.endpoint.as_ref() == Some(key))
+                || barcode.is_some_and(|barcode| {
+                    !barcode.trim().is_empty()
+                        && fence
+                            .barcode
+                            .as_deref()
+                            .is_some_and(|b| b.trim().eq_ignore_ascii_case(barcode.trim()))
+                })
+        }) {
+            return Ok(true);
+        }
+        let tape = if let Some(uuid) = tape_uuid {
+            self.get_tape(uuid)?
+        } else if let Some(barcode) = barcode {
+            self.get_tape_by_voltag(barcode)?
+        } else {
+            None
+        };
+        let resolved_uuid = tape
+            .as_ref()
+            .and_then(|t| <[u8; 16]>::try_from(t.tape_uuid.as_slice()).ok());
+        let tape_uuid = tape_uuid.or(resolved_uuid.as_ref());
+        let barcode = barcode.or_else(|| tape.as_ref().and_then(|tape| tape.voltag.as_deref()));
+        Ok(fences.iter().any(|fence| {
+            tape_uuid.is_some_and(|uuid| fence.tape_uuid.as_slice() == uuid)
+                || barcode.filter(|b| !b.trim().is_empty()).is_some_and(|b| {
+                    fence
+                        .barcode
+                        .as_deref()
+                        .is_some_and(|f| f.trim().eq_ignore_ascii_case(b.trim()))
+                })
+                || endpoint.is_some_and(|key| fence.endpoint.as_ref() == Some(key))
+        }))
+    }
+
     /// Release an active tape-I/O fence by quarantine id.
     pub fn release_tape_io_fence(
         &mut self,
@@ -2025,20 +2073,26 @@ impl CatalogIndex {
         ack: &str,
     ) -> Result<Option<TapeIoFenceRecord>, StateError> {
         let now = now_utc()?;
-        let changed = self
-            .conn
+        self.complete_tape_io_fence_release(quarantine_id, ack, &now)
+    }
+
+    /// Project durable release evidence without changing its original time or acknowledgment.
+    pub fn complete_tape_io_fence_release(
+        &mut self,
+        quarantine_id: &str,
+        ack: &str,
+        released_at: &str,
+    ) -> Result<Option<TapeIoFenceRecord>, StateError> {
+        self.conn
             .execute(
                 "update tape_io_fences
                  set state = 'released',
                      updated_at_utc = ?2,
                      release_ack = ?3
                  where quarantine_id = ?1 and state = 'active'",
-                params![quarantine_id, now.as_str(), ack],
+                params![quarantine_id, released_at, ack],
             )
             .map_err(|err| sqlite_error("release tape io fence", err))?;
-        if changed == 0 {
-            return Ok(None);
-        }
         self.tape_io_fence_by_quarantine_id(quarantine_id)
     }
 

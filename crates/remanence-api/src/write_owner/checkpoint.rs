@@ -1433,6 +1433,31 @@ pub(super) fn close_retained_before_removal(
     retained: &mut Option<RetainedParityEpoch>,
     progress: Option<&crate::operations::OperationHandle>,
 ) -> Result<(), Status> {
+    let endpoint = remanence_state::DriveKey::new(&cfg.actor_library_serial, bay);
+    let barcode = cfg
+        .library_snapshot
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .report
+        .library(&cfg.actor_library_serial)
+        .and_then(|library| library.drive_bays.iter().find(|d| d.element_address == bay))
+        .and_then(|drive| drive.loaded_tape.clone());
+    if index
+        .tape_io_is_fenced(
+            retained.as_ref().map(|e| &e.selected.tape_uuid),
+            barcode.as_deref(),
+            Some(&endpoint),
+        )
+        .map_err(crate::status_from_state_error)?
+    {
+        tracing::info!(
+            bay,
+            "fenced removal leaves the epoch open until append recovery"
+        );
+        return Err(Status::failed_precondition(
+            "retained epoch blocked by active tape-I/O fence",
+        ));
+    }
     let mut epoch = retained.take();
     let mut closing_tape = epoch.as_ref().map(|e| e.selected.tape_uuid);
     let mut open_range = None;

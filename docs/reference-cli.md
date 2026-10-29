@@ -192,7 +192,7 @@ The table omits the device/authorization flags, which all media verbs accept.
 | `rem tape import-journals --from <DIR>` | Validate and import matching checkpoint/parity journal authority for append recovery. |
 | `rem tape supersede-tail --acknowledge-tape <LABEL\|UUID> [--confirm-supersede "SUPERSEDE <LABEL>"]` | List and explicitly discard the suffix beyond local authority, with typed confirmation and audit. Rescue files first. |
 | `rem tape quarantine list` | List local active tape-I/O fences. |
-| `rem tape quarantine release <ID> --ack <TEXT>` | Release a fence with an operator acknowledgement. This does not bypass append admission. |
+| `rem tape quarantine release <ID> --ack <TEXT>` | Release through the configured daemon socket when it is listening; otherwise use the exclusive offline state lock. The acknowledgment is durable before the fence clears. This does not bypass append admission. |
 | `rem tape release` | Clear medium-removal guard only; quarantine remains. |
 | `rem diagnostics capture --out <FILE.tar> [--device <SG> --allow-device <SERIAL>]` | Capture diagnostics without reading tape data or positioning media. |
 
@@ -281,7 +281,7 @@ derived rather than read from the device.
 <!-- code-anchor: crates/remanence-cli/src/lib.rs @ 4dc2a3c6 -->
 ## Tape lifecycle
 
-Initialization, readiness, quarantine, and retirement run against local
+Initialization, readiness, and retirement run against local
 config/state and real hardware; they are gated by what the code calls the
 destructive-safety gauntlet — a chain of identity, ownership, and
 data-presence checks that each initialization must pass. In library mode,
@@ -297,7 +297,7 @@ and fencing checks. The CLI performs no local SCSI discovery for these verbs.
 | `rem tape wait-ready [--barcode <BARCODE> \| --drive-element <ADDR>] [--already-loaded] [--wait] [--timeout <DURATION>] [--poll <DURATION>] [--resume <UUID>] [--endpoint <URI>] [--library <SERIAL>]` | Poll TEST UNIT READY until already-loaded media is usable. LTO-9 first loads can take hours (media optimization); the default timeout of 2.5h exists for that, and the default poll interval is 30s. With `--wait`, a drive that asks for an initializing command (`02/04/02`) for a cartridge the changer places in it gets one SSC LOAD per operation; polling then continues. `--resume` continues a durable readiness operation without moving media. With `--endpoint`, it calls the daemon and attaches to its running wait, prints each readiness state change to stderr, and leaves the daemon waiting if the local `--timeout` ends. `--endpoint` requires `--resume`. Without it the command uses direct SCSI and requires the daemon to be stopped. `--library` selects a configured library. |
 | `rem tape quarantine list [--library <SERIAL>]` | List active media-readiness fences, each with its last sense and the sense name when known, for example `sense=02/04/02 (initializing command required)`. |
 | `rem tape quarantine show <ID>` | One fence, by quarantine id or operation UUID, with its phase and last sense. JSON carries `last_sense` (`KK/AA/QQ`) and `last_sense_name` beside the raw sense fields. |
-| `rem tape quarantine release <ID> --ack <TEXT> [--after-settled-inventory]` | Release a fence after operator root-cause acknowledgement. |
+| `rem tape quarantine release <ID> --ack <TEXT> [--after-settled-inventory]` | Release a tape-I/O fence through the configured daemon socket after operator acknowledgment. Only an absent listener permits offline fallback, which requires the state lock. Repeating a release returns its original evidence. Media-readiness release keeps its existing offline behavior. |
 | `rem tape retire <TARGET> --reason <TEXT> --i-understand-copies-become-unreadable [--dry-run]` | Permanently retire a tape identity in the local catalog. Every copy on that tape becomes unreadable through the catalog. |
 | `rem tape finalize --tape-uuid <UUID> [--expected-pool <ID>] --reason <EXACT> --idempotency-key <UUID> --ack-tape-uuid <UUID> [--wait] [--json] [--endpoint <URI>]` | Irreversibly finalize one exact reconciled tape, including below the automatic low watermark. Voltags are not accepted, the acknowledgement must name the same UUID, and a pooled tape requires its canonical current pool id. The reason is sent exactly as supplied. Without `--wait`, the command submits once and prints the current status; with it, the command polls the read-only status RPC across daemon reconnects until a terminal outcome and never resubmits finalization. While the projection is FINALIZING it also checks the operation and exits non-zero with its summary on FAILED, CANCELLED or COMPLETION_UNKNOWN. Reuse the same idempotency key to resume durable intent under the same operation id. JSON uses schema `rem.tape.finalization.v2`; `replica_progress` is historical barrier evidence, not a current media-health observation. A value the daemon does not have is `null`, never `0`: `operation_id` is `null` for a finalization an automatic trigger started, and a BUSY response has `null` `operation_id`, `completed_replicas` and digests. `completed_replicas` `0` is a real value (before replica A). |
 | `rem tape supersede-tail --tape-uuid <UUID> --ack-tape-uuid <UUID> [--confirm-supersede <TEXT>]` | Through the daemon, list and explicitly discard a suffix beyond checkpoint authority using the same append checks. Rescue first; confirm the exact text requested. |
@@ -752,8 +752,9 @@ The global `--allow-derived <SERIAL>` flag additionally permits operating
 drive bays whose identity was derived rather than read from the device, in
 the commands that `--allow` gates; it must be a subset of `--allow`. `tape
 init` is not gated by `--allow`: it operates only on the libraries in the
-configuration. `tape retire`, `tape quarantine release` and `catalog reset`
-change only local state and carry their own confirmations.
+configuration. `tape retire` and `catalog reset` change local state and carry
+their own confirmations. `tape quarantine release` uses the daemon for tape-I/O
+fences when it runs; offline release requires exclusive state ownership.
 
 <!-- code-anchor: crates/remanence-cli/src/lib.rs @ 6ed03ef0 -->
 ## Catalog rebuild
@@ -802,3 +803,8 @@ can distinguish failures:
 | 3 | malformed REMP key file or recipient epoch not present in the object |
 | 4 | corrupt/nonconforming envelope or inner REM-OBJECT; also a matching-epoch authenticated unwrap failure, which cannot distinguish a damaged recipient slot from an incorrect REMP seed |
 | 5 | host filesystem, staging, input, or output I/O failure |
+
+Tape-I/O fences appear in `rem catalog tapes --json` and `rem top` as
+`active_tape_io_fence_count` and `active_tape_io_fences`. Each record identifies
+the quarantine, UUID, barcode, endpoint, reason, and state. The daemon's release
+RPC is described in [the API reference](reference-api.md).

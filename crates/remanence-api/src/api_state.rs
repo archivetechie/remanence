@@ -134,6 +134,9 @@ impl ApiState {
     /// Build service state with operator-resolved tape-pool selection config.
     pub fn new_with_config(mut index: CatalogIndex, config: &RemConfig) -> Result<Self, Status> {
         let audit_append_lock = Arc::new(std::sync::Mutex::new(()));
+        remanence_state::fence::reconcile(&mut index, &config.audit.dir)
+            .map_err(status_from_state_error)?;
+        reject_active_tape_io_fences_on_startup(&index)?;
         replay_checkpoint_journal_projections_with_audit(
             &mut index,
             config.journal.dir.join("checkpoints").as_path(),
@@ -309,6 +312,9 @@ impl ApiState {
             _ => None,
         };
         let audit_append_lock = Arc::new(std::sync::Mutex::new(()));
+        remanence_state::fence::reconcile(&mut index, &config.audit.dir)
+            .map_err(status_from_state_error)?;
+        reject_active_tape_io_fences_on_startup(&index)?;
         let library_snapshot = Arc::new(RwLock::new(Arc::new(LibrarySnapshot {
             report: report.clone(),
             captured_at: OffsetDateTime::now_utc(),
@@ -368,7 +374,6 @@ impl ApiState {
             config.audit.dir.as_path(),
             &audit_append_lock,
         )?;
-        reject_active_tape_io_fences_on_startup(&index)?;
         let reservations = Arc::new(
             opened_libraries
                 .iter()
@@ -699,6 +704,15 @@ impl ApiState {
                 if snapshot_at - cached.0 < self.live_status.min_poll_interval {
                     let mut response = cached.1;
                     self.refresh_live_observations(&mut response);
+                    response.active_tape_io_fences = self
+                        .index()?
+                        .list_active_tape_io_fences()
+                        .map_err(status_from_state_error)?
+                        .into_iter()
+                        .map(crate::daemon_catalog_services::tape_io_fence_to_proto)
+                        .collect();
+                    response.active_tape_io_fence_count =
+                        response.active_tape_io_fences.len() as u64;
                     response.drive_assignments = self.drive_assignments(&response.libraries)?;
                     return Ok(response);
                 }
@@ -832,7 +846,15 @@ impl ApiState {
             .format(&Rfc3339)
             .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
         let drive_assignments = self.drive_assignments(&libraries)?;
+        let fences = index
+            .list_active_tape_io_fences()
+            .map_err(status_from_state_error)?;
         let response = pb::GetLiveStatusResponse {
+            active_tape_io_fence_count: fences.len() as u64,
+            active_tape_io_fences: fences
+                .into_iter()
+                .map(crate::daemon_catalog_services::tape_io_fence_to_proto)
+                .collect(),
             libraries,
             operations,
             alarms,

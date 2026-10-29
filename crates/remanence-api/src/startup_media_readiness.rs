@@ -217,6 +217,15 @@ pub(crate) fn ensure_media_readiness_admitted(
     barcode: Option<&str>,
     library_robotics: bool,
 ) -> Result<(), Status> {
+    let endpoint = drive_element.map(|bay| remanence_state::DriveKey::new(library_serial, bay));
+    if index
+        .tape_io_is_fenced(None, barcode, endpoint.as_ref())
+        .map_err(status_from_state_error)?
+    {
+        return Err(Status::failed_precondition(format!(
+            "{action} blocked by active tape-I/O fence; inspect rem tape quarantine list"
+        )));
+    }
     let conflicts = index
         .media_readiness_admission_conflicts(
             library_serial,
@@ -338,6 +347,12 @@ pub(crate) fn reconcile_library_media_readiness_records_on_startup(
 ) -> Result<usize, Status> {
     let mut reconciled = 0usize;
     for record in records {
+        if index
+            .tape_io_is_fenced(None, record.barcode.as_deref(), Some(&record.endpoint))
+            .map_err(status_from_state_error)?
+        {
+            continue;
+        }
         let operation_id = parse_media_readiness_operation_id(&record)?;
         match startup_media_readiness_probe_plan(&record, library, operation_id) {
             StartupReadinessPlan::Probe {

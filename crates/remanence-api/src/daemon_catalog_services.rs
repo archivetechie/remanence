@@ -62,7 +62,14 @@ impl pb::daemon_server::Daemon for DaemonService {
                 String::new()
             },
         }];
+        let fences = self
+            .state
+            .index()?
+            .list_active_tape_io_fences()
+            .map_err(status_from_state_error)?;
         Ok(Response::new(pb::HealthResponse {
+            active_tape_io_fence_count: fences.len() as u64,
+            active_tape_io_fences: fences.into_iter().map(tape_io_fence_to_proto).collect(),
             status: status as i32,
             components,
             detail: format!("sqlite quick_check={quick_check}"),
@@ -250,7 +257,14 @@ impl pb::catalog_server::Catalog for CatalogService {
             .into_iter()
             .map(tape_to_proto)
             .collect::<Vec<_>>();
+        let fences = self
+            .state
+            .index()?
+            .list_active_tape_io_fences()
+            .map_err(status_from_state_error)?;
         Ok(Response::new(pb::ListTapesResponse {
+            active_tape_io_fence_count: fences.len() as u64,
+            active_tape_io_fences: fences.into_iter().map(tape_io_fence_to_proto).collect(),
             tapes,
             next_page_token: None,
         }))
@@ -765,4 +779,23 @@ fn overlay_operation(state: &ApiState, mut stored: pb::OperationStatus) -> pb::O
         }
     }
     stored
+}
+
+/// Convert durable quarantine evidence for status and release responses.
+pub(crate) fn tape_io_fence_to_proto(
+    record: remanence_state::TapeIoFenceRecord,
+) -> pb::TapeIoFence {
+    pb::TapeIoFence {
+        quarantine_id: record.quarantine_id,
+        tape_uuid: record.tape_uuid,
+        barcode: record.barcode,
+        endpoint_key: record.endpoint.map(|key| key.encode()),
+        reason: record.reason,
+        state: record.state,
+        created_at_utc: record.created_at_utc,
+        updated_at_utc: record.updated_at_utc,
+        release_ack: record.release_ack,
+        evidence_json: record.evidence_json,
+        fence_id: record.fence_id,
+    }
 }

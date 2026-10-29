@@ -1026,6 +1026,16 @@ where
             setup,
         )?
     };
+    if let Command::Tape {
+        command: Tape::Quarantine {
+            command: Quarantine::Release { id, ack },
+        },
+    } = &cli.command
+    {
+        if let Some(record) = crate::release_fence_via_daemon(&config, id, ack)? {
+            return Ok(crate::tape_io_fence_json(&record));
+        }
+    }
     if let Command::Pool {
         command: Pool::New {
             name,

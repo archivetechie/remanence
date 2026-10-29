@@ -4325,7 +4325,7 @@ fn tape_io_fence_refuses_pool_selection_until_operator_release() {
 }
 
 #[test]
-fn startup_refuses_active_tape_io_fence_until_operator_release() {
+fn startup_accepts_scoped_tape_io_fence_until_operator_release() {
     let mut index = test_index();
     let fence = index
         .record_tape_io_fence(remanence_state::TapeIoFenceInput {
@@ -4336,11 +4336,7 @@ fn startup_refuses_active_tape_io_fence_until_operator_release() {
         })
         .expect("record startup fence");
 
-    let status = reject_active_tape_io_fences_on_startup(&index)
-        .expect_err("active tape-I/O fence must block startup");
-    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-    assert!(status.message().contains(&fence.quarantine_id));
-    assert!(status.message().contains("position_drift"));
+    reject_active_tape_io_fences_on_startup(&index).expect("scoped fence permits startup");
 
     index
         .release_tape_io_fence(&fence.quarantine_id, "operator released")
@@ -9605,4 +9601,249 @@ async fn overlap_checkpoint_interleaving_uses_committed_records_and_preserves_er
         }
         actor.await.unwrap();
     }
+}
+
+/// Scoped startup preserves fencing; absent scope retains the original refusal.
+#[test]
+fn startup_fence_scope_and_readiness_recovery() {
+    let mut index = test_index();
+    let endpoint = remanence_state::DriveKey::new("LIB-A", 1);
+    let fence = index
+        .record_tape_io_fence_at_endpoint(
+            remanence_state::TapeIoFenceInput {
+                tape_uuid: [0; 16],
+                barcode: None,
+                reason: "transfer_error".into(),
+                evidence_json: None,
+            },
+            Some(&endpoint),
+        )
+        .unwrap();
+    reject_active_tape_io_fences_on_startup(&index).unwrap();
+    let record = media_readiness_record(Uuid::new_v4(), "LIB-A", 1, "drive", "tape");
+    let before = index.list_active_media_readiness_operations(None).unwrap();
+    // No drive handle exists: reaching the old recovery branch writes an unresolved transition.
+    let count = reconcile_library_media_readiness_records_on_startup(
+        &mut index,
+        &test_library("LIB-A"),
+        &mut [],
+        vec![record],
+    )
+    .unwrap();
+    assert_eq!(count, 0);
+    assert_eq!(
+        index
+            .list_active_media_readiness_operations(None)
+            .unwrap()
+            .len(),
+        before.len()
+    );
+    assert!(
+        ensure_media_readiness_admitted(&index, "open", "LIB-A", Some(1), None, false).is_err()
+    );
+    index
+        .release_tape_io_fence(&fence.quarantine_id, "checked")
+        .unwrap();
+    ensure_media_readiness_admitted(&index, "open", "LIB-A", Some(1), None, false).unwrap();
+    let unscoped = index
+        .record_tape_io_fence(remanence_state::TapeIoFenceInput {
+            tape_uuid: [0; 16],
+            barcode: None,
+            reason: "unknown".into(),
+            evidence_json: None,
+        })
+        .unwrap();
+    let error = reject_active_tape_io_fences_on_startup(&index).unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(error
+        .message()
+        .starts_with("startup blocked by active tape-I/O fence"));
+    assert!(error.message().contains(&unscoped.quarantine_id));
+}
+
+/// Fenced checkpoint recovery does not open or repair a damaged journal.
+#[test]
+fn startup_checkpoint_replay_leaves_fenced_journal_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let checkpoints = dir.path().join("checkpoints");
+    let mut index = CatalogIndex::open(dir.path().join("index.sqlite")).unwrap();
+    let tape = [0x52; 16];
+    std::fs::create_dir_all(&checkpoints).unwrap();
+    let path = checkpoints.join(format!("{}.remcheckpoint", Uuid::from_bytes(tape)));
+    std::fs::write(&path, b"damaged journal remains evidence").unwrap();
+    let paths = remanence_state::list_checkpoint_journals(&checkpoints).unwrap();
+    assert_eq!(paths.len(), 1);
+    std::fs::write(&paths[0], b"damaged journal remains evidence").unwrap();
+    index
+        .record_tape_io_fence(remanence_state::TapeIoFenceInput {
+            tape_uuid: tape,
+            barcode: None,
+            reason: "checkpoint_barrier_failed".into(),
+            evidence_json: None,
+        })
+        .unwrap();
+    replay_checkpoint_journal_projections(&mut index, &checkpoints).unwrap();
+    assert_eq!(
+        std::fs::read(&paths[0]).unwrap(),
+        b"damaged journal remains evidence"
+    );
+}
+
+/// Release RPC validates requests, preserves evidence, and refreshes admission without restart.
+#[tokio::test]
+async fn release_fence_rpc_and_live_admission() {
+    use pb::{daemon_server::Daemon, library_service_server::LibraryService};
+    let mut index = test_index();
+    project_pool(&mut index, "camera.copy-a");
+    project_no_parity_tape(&mut index, "camera.copy-a", POOL_WRITE_TAPE_UUID);
+    let fence = index
+        .record_tape_io_fence(remanence_state::TapeIoFenceInput {
+            tape_uuid: POOL_WRITE_TAPE_UUID,
+            barcode: None,
+            reason: "position_drift".into(),
+            evidence_json: None,
+        })
+        .unwrap();
+    let state = ApiState::new(index);
+    let daemon = state.daemon_service();
+    let library = state.library_service();
+    let request = |id: &str, ack: &str| {
+        tonic::Request::new(pb::ReleaseTapeIoFenceRequest {
+            quarantine_id: id.into(),
+            acknowledgment: ack.into(),
+        })
+    };
+    assert_eq!(
+        library
+            .release_tape_io_fence(request("missing", "checked"))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::NotFound
+    );
+    assert_eq!(
+        library
+            .release_tape_io_fence(request(&fence.quarantine_id, " "))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    let mut denied = request(&fence.quarantine_id, "checked");
+    denied
+        .metadata_mut()
+        .insert("x-remanence-role", "readonly".parse().unwrap());
+    assert_eq!(
+        library
+            .release_tape_io_fence(denied)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    assert!(state
+        .index()
+        .unwrap()
+        .tape_io_is_fenced(Some(&POOL_WRITE_TAPE_UUID), None, None)
+        .unwrap());
+    assert_eq!(
+        daemon
+            .health(tonic::Request::new(()))
+            .await
+            .unwrap()
+            .into_inner()
+            .active_tape_io_fence_count,
+        1
+    );
+    let first = library
+        .release_tape_io_fence(request(&fence.quarantine_id, "verified"))
+        .await
+        .unwrap()
+        .into_inner();
+    let second = library
+        .release_tape_io_fence(request(&fence.quarantine_id, "changed"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first, second);
+    assert!(!state
+        .index()
+        .unwrap()
+        .tape_io_is_fenced(Some(&POOL_WRITE_TAPE_UUID), None, None)
+        .unwrap());
+    assert_eq!(
+        daemon
+            .health(tonic::Request::new(()))
+            .await
+            .unwrap()
+            .into_inner()
+            .active_tape_io_fence_count,
+        0
+    );
+    let endpoint = remanence_state::DriveKey::new("LIB", 1);
+    let fence = state
+        .index_write()
+        .unwrap()
+        .record_tape_io_fence_at_endpoint(
+            remanence_state::TapeIoFenceInput {
+                tape_uuid: [0; 16],
+                barcode: None,
+                reason: "drive uncertainty".into(),
+                evidence_json: None,
+            },
+            Some(&endpoint),
+        )
+        .unwrap();
+    assert!(state
+        .index()
+        .unwrap()
+        .tape_io_is_fenced(None, None, Some(&endpoint))
+        .unwrap());
+    let released = library
+        .release_tape_io_fence(request(&fence.quarantine_id, "drive checked"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(released.endpoint_key, Some(endpoint.encode()));
+    assert!(!state
+        .index()
+        .unwrap()
+        .tape_io_is_fenced(None, None, Some(&endpoint))
+        .unwrap());
+}
+
+/// Startup logs one warning per scoped fence and rejects malformed endpoint evidence.
+#[test]
+fn startup_reports_each_fence_and_refuses_malformed_scope() {
+    let mut index = test_index();
+    for (tape, barcode, endpoint) in [
+        ([1; 16], None, None),
+        ([0; 16], Some("LABEL".to_string()), None),
+        (
+            [0; 16],
+            None,
+            Some(remanence_state::DriveKey::new("LIB", 1)),
+        ),
+    ] {
+        index
+            .record_tape_io_fence_at_endpoint(
+                remanence_state::TapeIoFenceInput {
+                    tape_uuid: tape,
+                    barcode,
+                    reason: "transfer_error".into(),
+                    evidence_json: None,
+                },
+                endpoint.as_ref(),
+            )
+            .unwrap();
+    }
+    let warnings = capture_warnings(|| reject_active_tape_io_fences_on_startup(&index).unwrap());
+    assert_eq!(warnings.len(), 3);
+    rusqlite::Connection::open(index.path()).unwrap().execute(
+        "update tape_io_fences set endpoint_key = 'unparseable-endpoint' where endpoint_key is not null", [],
+    ).unwrap();
+    let error = reject_active_tape_io_fences_on_startup(&index).unwrap_err();
+    assert!(error
+        .message()
+        .contains("startup blocked by active tape-I/O fence"));
 }

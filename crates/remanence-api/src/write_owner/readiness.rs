@@ -380,6 +380,15 @@ pub(crate) fn session_open_reject_admission_conflicts(
     index: &mut CatalogIndex,
     ctx: &SessionOpenReadinessContext<'_>,
 ) -> Result<(), Status> {
+    let endpoint = remanence_state::DriveKey::new(ctx.library_serial, ctx.bay);
+    if index
+        .tape_io_is_fenced(None, ctx.barcode, Some(&endpoint))
+        .map_err(status_from_state_error)?
+    {
+        return Err(Status::failed_precondition(
+            "readiness blocked by active tape-I/O fence",
+        ));
+    }
     let conflicts = index
         .media_readiness_admission_conflicts(ctx.library_serial, Some(ctx.bay), ctx.barcode, false)
         .map_err(status_from_state_error)?;
