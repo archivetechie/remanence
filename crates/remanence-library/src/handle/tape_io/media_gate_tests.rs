@@ -654,6 +654,14 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
                 why: "append-admission exact-sense fixture forwards only to in-memory ModelTransport; no real device",
             },
         ),
+        (
+            "remanence-api/tests/acceptance.rs",
+            DispatchPolicy::Exact {
+                execute_out: 1,
+                execute_none: 1,
+                why: "acceptance scheduling and fault transport forwards only to in-memory ModelTransport; no hardware transport",
+            },
+        ),
         // P4 model-only failure and mounted-reader forwarders.
         (
             "remanence-api/src/mount_backend/tests.rs",
