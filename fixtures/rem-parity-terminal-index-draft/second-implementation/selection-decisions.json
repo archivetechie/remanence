@@ -366,7 +366,7 @@
             "quote": "On a tape presented without host state, a validating C/B/A survivor attests the complete terminal inventory carried in that replica."
           },
           {
-            "section": "C",
+            "section": "specs/in-progress/records/rem-parity-1-revision-history.md",
             "quote": "the selection order among agreeing replicas"
           }
         ],
@@ -498,7 +498,7 @@
             "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
           },
           {
-            "section": "C",
+            "section": "specs/in-progress/records/rem-parity-1-revision-history.md",
             "quote": "the selection order among agreeing replicas"
           }
         ],
@@ -756,7 +756,7 @@
             "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
           },
           {
-            "section": "C",
+            "section": "specs/in-progress/records/rem-parity-1-revision-history.md",
             "quote": "the selection order among agreeing replicas"
           }
         ],
@@ -1171,7 +1171,7 @@
             "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
           },
           {
-            "section": "C",
+            "section": "specs/in-progress/records/rem-parity-1-revision-history.md",
             "quote": "the selection order among agreeing replicas"
           }
         ],

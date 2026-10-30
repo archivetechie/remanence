@@ -1359,20 +1359,31 @@ pub(crate) fn second_edition_replica_a(
 }
 
 /// Whether an expectation's quote occurs verbatim in the in-progress
-/// REM-PARITY text, whitespace aside. A leading bracketed locator, such as
-/// `[Section 5.2, excerpt]`, names the excerpt's place and is not quoted text.
+/// REM-PARITY text or its informative records, whitespace aside. A leading
+/// bracketed locator, such as `[Section 5.2, excerpt]`, names the excerpt's
+/// place and is not quoted text.
 #[cfg(test)]
 pub(crate) fn specification_quote_holds(quote: &str) -> bool {
-    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    static TEXTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     let normalise = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let text = TEXT.get_or_init(|| {
-        normalise(
-            &std::fs::read_to_string(
-                Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../specs/in-progress/rem-parity-1-specification.md"),
+    let texts = TEXTS.get_or_init(|| {
+        [
+            "rem-parity-1-specification.md",
+            "records/rem-parity-1-revision-history.md",
+            "records/rem-parity-1-open-items.md",
+        ]
+        .iter()
+        .map(|name| {
+            normalise(
+                &std::fs::read_to_string(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../../specs/in-progress")
+                        .join(name),
+                )
+                .expect("REM-PARITY text or record"),
             )
-            .expect("REM-PARITY text"),
-        )
+        })
+        .collect()
     });
     let quote = match quote
         .strip_prefix('[')
@@ -1381,7 +1392,7 @@ pub(crate) fn specification_quote_holds(quote: &str) -> bool {
         Some((_, quoted)) => quoted,
         None => quote,
     };
-    !quote.trim().is_empty() && text.contains(&normalise(quote))
+    !quote.trim().is_empty() && texts.iter().any(|text| text.contains(&normalise(quote)))
 }
 
 /// Apply resolved record edits to one record, checking every old byte. The

@@ -1622,7 +1622,7 @@ This document has four independent version axes:
 | Manifest schema version | `1` | The manifest's `schema_version` key |
 
 The four axes MUST NOT be used as proxies for one another. REM-ENCRYPT §10 and
-the REM-PARITY Status section state those documents' own axes.
+the REM-PARITY [Versioning and Change Policy](rem-parity-1-specification.md#versioning-and-change-policy) section state those documents' own axes.
 
 `REMANENCE.schema_version` is `1.0` when no xattr is preserved and `1.1`
 when any xattr is preserved. Both values are defined by document 1.0. The

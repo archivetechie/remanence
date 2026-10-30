@@ -320,14 +320,15 @@ documents and published artifacts themselves.
   reachable only by unpacking the source archive; these are the first
   revisions published as documents.
 - **How they change.** The three-question policy in each document's Status
-  section — the subject of [versioning-explained.md](versioning-explained.md).
+  section (under [Versioning and Change Policy](../specs/in-progress/rem-parity-1-specification.md#versioning-and-change-policy)
+  in the REM-PARITY preparing copy) — the subject of [versioning-explained.md](versioning-explained.md).
   Titles and filenames carry the major line only; each revision is
   archived under the document's own concept DOI with a per-revision DOI;
   a new major version, being a separate document, opens a new concept DOI
   series and cites its predecessor, so "latest revision" never crosses a
   compatibility break;
-  each document's Revision History appendix records every change and its
-  kind.
+  each document's Revision History appendix (the [revision-history record](../specs/in-progress/records/rem-parity-1-revision-history.md)
+  for the REM-PARITY preparing copy) records every change and its kind.
 
 ### 19. The conformance vector archives
 

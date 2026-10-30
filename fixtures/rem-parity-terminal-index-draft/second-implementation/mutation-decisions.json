@@ -1480,7 +1480,7 @@
               "quote": "A Scanner need not read every replica's payload (Section 8.4 step 2), so a replica whose payload it did not read is not found invalid for that reason; a Verifier's full check reports every replica."
             },
             {
-              "section": "C",
+              "section": "specs/in-progress/records/rem-parity-1-revision-history.md",
               "quote": "the selection order among agreeing replicas"
             }
           ],
@@ -3691,7 +3691,7 @@
               "quote": "A Scanner need not read every replica's payload (Section 8.4 step 2), so a replica whose payload it did not read is not found invalid for that reason; a Verifier's full check reports every replica."
             },
             {
-              "section": "C",
+              "section": "specs/in-progress/records/rem-parity-1-revision-history.md",
               "quote": "the selection order among agreeing replicas"
             }
           ],
@@ -5029,7 +5029,7 @@
               "quote": "A Scanner need not read every replica's payload (Section 8.4 step 2), so a replica whose payload it did not read is not found invalid for that reason; a Verifier's full check reports every replica."
             },
             {
-              "section": "C",
+              "section": "specs/in-progress/records/rem-parity-1-revision-history.md",
               "quote": "the selection order among agreeing replicas"
             }
           ],
@@ -5736,7 +5736,7 @@
               "quote": "A Scanner need not read every replica's payload (Section 8.4 step 2), so a replica whose payload it did not read is not found invalid for that reason; a Verifier's full check reports every replica."
             },
             {
-              "section": "C",
+              "section": "specs/in-progress/records/rem-parity-1-revision-history.md",
               "quote": "the selection order among agreeing replicas"
             }
           ],
@@ -6035,7 +6035,7 @@
               "quote": "A Scanner need not read every replica's payload (Section 8.4 step 2), so a replica whose payload it did not read is not found invalid for that reason; a Verifier's full check reports every replica."
             },
             {
-              "section": "C",
+              "section": "specs/in-progress/records/rem-parity-1-revision-history.md",
               "quote": "the selection order among agreeing replicas"
             }
           ],

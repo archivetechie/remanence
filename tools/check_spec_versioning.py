@@ -629,6 +629,26 @@ def preparing_copy_rule_findings(name: str, text: str, current: str | None) -> l
     return errors
 
 
+def record_findings(root: pathlib.Path) -> list[str]:
+    """Check the preparing REM-PARITY records without treating them as versions."""
+    if not (root / "specs/in-progress/rem-parity-1-specification.md").is_file():
+        return []
+    errors = []
+    for name in ("revision-history", "open-items"):
+        path = root / "specs/in-progress/records" / f"rem-parity-1-{name}.md"
+        if not path.is_file():
+            errors.append(f"{path.relative_to(root)}: missing companion record")
+            continue
+        text = path.read_text()
+        errors.extend(f"{path.relative_to(root)}:{line}: heading needs preceding blank line"
+                      for line in heading_spacing(text))
+        if name == "revision-history":
+            dates = re.findall(r"^- \*\*(\d{4}-\d{2}-\d{2})", text, re.M)
+            if dates != sorted(dates, reverse=True):
+                errors.append(f"{path.relative_to(root)}: revision history not newest-first: {dates}")
+    return errors
+
+
 def structural_findings(root: pathlib.Path = ROOT) -> list[str]:
     documents = discovered_documents(root)
     refs, anchors, errors = Counter(), Counter(), []
@@ -792,6 +812,7 @@ def main(argv: list[str] | None = None) -> int:
     for ref in sorted(unresolved_section_references(texts["rem-parity-1-specification.md"])):
         fail(f"rem-parity-1-specification.md: unresolved top-level Section {ref}")
     findings.extend(structural_findings(ROOT))
+    findings.extend(record_findings(ROOT))
 
     # 7. A version string is never reused for different bytes.
     #

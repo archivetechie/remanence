@@ -38,7 +38,7 @@ No change to the builder may follow a failed comparison without a row here.
 | e2-08 and e2-12, record edits of tape file 4 (F3, first run) | Not a comparison of bytes: the fault reader refused the construction "the ParityMap re-encoded with the edited directory entry" as one it does not know | None; the file states each byte edit, each old byte and the result's SHA-256 | Fixed: the construction is read as "the record keeps its length, and the listed edits are the whole change", checked by the old bytes, the SHA-256 and, for the edits that say they recompute, my own CRC and payload SHA-256 (all agree). GAPS M-1. |
 | e3-02 to e3-06, the `foreign` appended record (SHA-256 2c6afa39...) | My first reading, every byte the stated first byte (0x58), gives ce025caf... A further reading, the first byte then 0xFF, and a ramp from 1, also differ. The first byte then zeros reproduces the stated digest | None: the text does not say what a foreign Object's bytes are | The file states only `first_byte`, `length` and the digest. Zero fill is taken as the reading, checked by the digest but not derived. Four fills were tried, and the one that matches was kept. No decision depends on the bytes after the first (the ladder never reads Object content, and 0x58 begins none of the tape's role magics). GAPS M-3. |
 | The quote `terminal_u64`, checked by the test that every quoted sentence occurs in the text | The quote read "checked in u64"; the text has "checked in `u64`" | 8.3 | A fix that reads the text correctly: the sentence is "Arithmetic on these fields is checked in `u64` (Section 2.4)." Only `negative-supplement-decisions.json` cites this quote, and it was regenerated. |
-| The quote `resume_step1`, checked by the test that every quoted sentence occurs in the text (found in run 13; it failed on the tool as it was before this change too) | The quote read "dropping any torn tail"; the text now reads "dropping the tape's torn tail, if any" | 14 | A fix that reads the current text: the sentence is "Derive the committed prefix from the off-tape commit records (Section 3.4), dropping the tape's torn tail, if any, and compute `W` and `T` from it." The text was reworded after the resume and negative decisions were written (Appendix C records the wording follow-up). In run 14, `resume-decisions.json`, `resume-decisions-real-ids.json` and `negative-decisions.json` were regenerated; each differs from its predecessor only in this string (9, 9 and 1 occurrences). DECISION-LOG.md has the row. |
+| The quote `resume_step1`, checked by the test that every quoted sentence occurs in the text (found in run 13; it failed on the tool as it was before this change too) | The quote read "dropping any torn tail"; the text now reads "dropping the tape's torn tail, if any" | 14 | A fix that reads the current text: the sentence is "Derive the committed prefix from the off-tape commit records (Section 3.4), dropping the tape's torn tail, if any, and compute `W` and `T` from it." The text was reworded after the resume and negative decisions were written ([revision-history record](../../../specs/in-progress/records/rem-parity-1-revision-history.md) records the wording follow-up). In run 14, `resume-decisions.json`, `resume-decisions-real-ids.json` and `negative-decisions.json` were regenerated; each differs from its predecessor only in this string (9, 9 and 1 occurrences). DECISION-LOG.md has the row. |
 | Run 11, mut-06, mut-14, mut-23, mut-25 and mut-39: the retained-value checks of 32-byte digest fields | My applier compared 8 bytes, because it took a default width instead of the width of the stated value (for example "0x94 repeated 32 times") | None; an applier defect, not a reading of the text | Fixed: the width now comes from the stated value. The rows had not yet been decided. |
 | Run 11, mut-15: the footer header-record SHA-256 and the footer CRC | My applier treated the edited header-record hash as a repair output, because the row recomputes a checksum, and so never applied the edit | The row's repairs | A fix that reads the row correctly: its only recomputed entry is "Footer CRC-64/XZ at 0x3F8, over footer bytes [0x000, 0x3F8).", so the header-record hash is the mutation itself. An edit is now a repair output only when its own checksum or hash is listed as recomputed. |
 | overflow-7.2-T/isolated (sup-15), terminal profile multi-256k, tape file 6 block 0 | Not locatable: the manifest pins only the size and SHA-256, and no candidate reproduces it | 10.2–10.5; the variant | No fix. The variant leaves these bytes to the generator, and no rule of the text could fix them (GAPS H-2). |
@@ -184,7 +184,7 @@ regenerated, and each change to a decision has a row in `DECISION-LOG.md`.
 - Sections 2.2 and 9.1: the Verifier reads every sidecar's footer, primary
   copy and tail copy. It reports a divergence as `SidecarParse`, and reports
   each finding before the terminal suffix with the error a Reader reports.
-  Findings on data blocks and parity shards stay undecided (Appendix D).
+  Findings on data blocks and parity shards stay undecided ([open-items record](../../../specs/in-progress/records/rem-parity-1-open-items.md)).
   With no planned layout, a separation extent that the walk finds damaged is
   reported invalid.
 - Section 12.6: an inventory's degraded flag follows the Scanner's reads
@@ -240,10 +240,10 @@ file, and run 16 confirms that.
 These changes follow two rulings the text now states. No byte-producing code
 changed.
 
-- Quotes. The Appendix D sentence "Whether a full verification checks every
+- Quotes. The [open-items record](../../../specs/in-progress/records/rem-parity-1-open-items.md) sentence "Whether a full verification checks every
   data block and parity shard, or only structure and metadata, is to be
   decided…" no longer occurs. It is replaced by Section 2.2's two sentences
-  (`full_verification`, `structure_not_full`) and the revised Appendix D
+  (`full_verification`, `structure_not_full`) and the revised [open-items record](../../../specs/in-progress/records/rem-parity-1-open-items.md)
   sentence (`full_verification_d`). The unused quote `tail_route_open`,
   whose sentence also no longer occurs, is removed. Section 13.3's new
   sentences are added (`map_rescue`, `map_rescue_position`,
@@ -369,7 +369,7 @@ confirms that.
 
 ## Changes for the text after T2 (F4)
 
-- Quotes: `no_parity_may_omit` (Section 8.2) and `full_verification_d` (Appendix D TT-2)
+- Quotes: `no_parity_may_omit` (Section 8.2) and `full_verification_d` ([open-items record](../../../specs/in-progress/records/rem-parity-1-open-items.md) TT-2)
   follow the new text; three sentences are added (`artifact_scope`, `torn_file`,
   `tape_complete`). The parser refuses a no-parity bootstrap that carries a scheme.
 - The walk (Sections 12.2, 12.3): items 2 and 3 compare only the count with the plan; a

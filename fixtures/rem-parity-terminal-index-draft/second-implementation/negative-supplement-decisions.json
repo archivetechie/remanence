@@ -5140,7 +5140,7 @@
             "quote": "The acquired index MUST then be pinned against the bootstrap's scheme record (`k`, `m`, `S`, block size), or against the supplied scheme and block size when the bootstrap is unreadable, and against the map entry's ordinal range; disagreement is `SchemeMismatch`."
           },
           {
-            "section": "C",
+            "section": "specs/in-progress/records/rem-parity-1-revision-history.md",
             "quote": "Geometry and ordinal-range disagreements raise `SchemeMismatch`, as this document specifies, rather than a generic parse error."
           },
           {
@@ -5151,7 +5151,7 @@
         "order": "The named rule is a Section 9.2 copy rule; it fails in both copies, so neither validates. The Section 13.3 pin is not reached.",
         "reader_must_reject": true,
         "formula": null,
-        "note": "Both copies fail, so a Recoverer has no header/index copy for epoch 0: SidecarMetadataUnavailable{0} (Section 13.3 step 4). Appendix C would call the geometry disagreement SchemeMismatch (GAPS F-2), but no copy is acquired, so the pin is not reached."
+        "note": "Both copies fail, so a Recoverer has no header/index copy for epoch 0: SidecarMetadataUnavailable{0} (Section 13.3 step 4). specs/in-progress/records/rem-parity-1-revision-history.md would call the geometry disagreement SchemeMismatch (GAPS F-2), but no copy is acquired, so the pin is not reached."
       },
       "implementation": [
         {
