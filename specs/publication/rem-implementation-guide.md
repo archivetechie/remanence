@@ -523,14 +523,16 @@ commits fewer bytes than the full block or reports hard end-of-medium."
 
 Serves REM-OBJECT §4.9, Builder, Planner, and Reader Obligations.
 
-### 5.3. Re-read each copy before recording it durable
+### 5.3. Re-read each copy after commit
 
 The checks in section 5.1 prove that the writer archived what it was given.
 They do not prove that the medium or the network kept it. A copy can be
 damaged in transmission, or by a drive that reports success on a bad write.
 
-After each copy is written, and before it is recorded as durable, we recommend
-re-reading it through the object read path and re-verifying it. A full
+After each copy is committed, we recommend re-reading it through the object
+read path and recording its verification result separately. On tape, the
+barrier and the durable commit record establish commitment (REM-PARITY §11.2);
+read-back verification is not a condition of durability. A full
 verification checks every regular member's `file_sha256` together with the
 correspondence and hardlink checks of the Verifier profile (REM-OBJECT §7.4).
 At a minimum, the copy's `stored_digest` should be compared. This is the one
@@ -538,7 +540,8 @@ deliberate extra read in the pipeline, and a conformant Verifier is the
 natural tool for it. REM-ENCRYPT §7.3 describes the corresponding check for
 an encrypted copy.
 
-Serves REM-OBJECT §7.3, Post-Write Re-Verification.
+Serves REM-OBJECT §7.3, Post-Write Re-Verification, and REM-PARITY §11.2,
+Commit (W2).
 
 ### 5.4. Stage and publish a file-bound copy durably
 
@@ -557,7 +560,7 @@ Serves REM-OBJECT §8.3, File Binding.
 ### In plain terms
 
 Write in an order that finds problems before they cost anything, watch every
-block go down, read the copy back before believing in it, and never let a
+block go down, verify the committed copy, and never let a
 half-written file wear the name of a finished one.
 
 ## 6. Catalogs and indexes
@@ -1066,9 +1069,11 @@ out and keep it staged until the whole recovery has succeeded.
 
 REM-PARITY fixes what a committed tape file is, what the bytes of a tape must
 be, and where a resumed session appends. It does not say how a writer should
-keep its commit records, batch its synchronization, react to a failed write or
-seed a resumed session. Those choices decide whether a writer that crashes
-leaves a tape that can be continued safely. This chapter collects the practice.
+keep its commit records, batch its synchronization or choose between ending
+and continuing a resumed epoch. It fixes the refusal after a failed write;
+this chapter recommends how to stop and restart the session. Those choices
+decide whether a writer that crashes leaves a tape that can be continued
+safely. This chapter collects the practice.
 
 ### 9.1. Put enough in each commit record to resume
 
@@ -1081,9 +1086,12 @@ We recommend that each commit record hold the tape file's filemark-map entry
 (REM-PARITY §7.1), enough state to seed a resumed writer (section 9.9), and the
 evidence required by REM-PARITY §11.5 (W5): each block's `data_shard_crc64` or
 one check value over them in ascending ordinal order. For the check value, we
-recommend CRC-64/XZ over the whole-block CRCs, each encoded as eight
-little-endian bytes in ascending ordinal order, as pinned by
-[`fixtures/rem-writer-check-value/`](../../fixtures/rem-writer-check-value/).
+recommend recording the value for the open range `[W, T)`: CRC-64/XZ over
+its whole-block CRCs, each encoded as eight little-endian bytes in ascending
+ordinal order. The empty range has check value 0. Record the evidence no later
+than the blocks' commit, as W5 requires; the fixture set
+[`fixtures/rem-writer-check-value/`](../../fixtures/rem-writer-check-value/)
+pins both the block CRCs and their check value.
 The record that commits the Object completing a full epoch also commits that
 epoch's sidecar (REM-PARITY §11.4). How the record is stored is the
 implementation's own choice: "The commit record's format is
@@ -1130,14 +1138,57 @@ Consecutive tape files can share one synchronizing barrier, and one commit
 record, or one durable transaction, can cover the whole batch. A writer usually
 keeps, in memory, a projection of the filemark map and a record of its durable
 boundary. We recommend adding a tape file's entry to that projection, and
-advancing the boundary past the file, only once the file's synchronization is
-proved: at its own synchronous filemark, or, under deferral, at the barrier,
-for every file the barrier covers. The specification fixes when the batch counts as committed:
+advancing the durable boundary past the file, only after its barrier succeeds
+and the commit record is durable. A synchronous filemark can provide the
+barrier; under deferral, one barrier covers the batch. The specification fixes
+when the batch counts as committed:
 "A tape file is committed when a synchronizing barrier (Section 3.5) has proved
 its blocks and filemark on the medium and a durable off-tape commit record,
 written after that barrier, names it." (REM-PARITY §11.2).
 
-Serves REM-PARITY §11.2, Commit (W2).
+We recommend taking a barrier at a client checkpoint, at close, or when a
+pending-data limit is reached; 32 GiB, 200 Objects or 300 seconds are useful
+starting limits. A checkpoint proves durability and records the committed
+files. It need not end the open epoch (REM-PARITY §11.4).
+
+After the final Object commit at close, we recommend ending the session's
+remaining short epoch and writing and committing its sidecar. The client can
+receive its committed receipts before this closeout finishes. If closeout is
+interrupted, finish it before admitting new data, using the read-back proof in
+section 9.9. Session
+boundaries and this closeout policy are practice; REM-PARITY leaves them to the
+Writer.
+
+Every sidecar has a full `S × m` parity region, even for a short epoch
+(REM-PARITY §6.6 and §11.4). At the default geometry, a full epoch holds
+16 GiB of Object blocks and each sidecar has 512 MiB of parity shards. Ending
+the remaining epoch at every session close costs at most one short epoch's
+full sidecar per session, in addition to the sidecars for full epochs:
+
+| Object data per session | Sidecars | Parity shard bytes | Parity / Object data |
+| --- | ---: | ---: | ---: |
+| 5 GiB | 1 | 0.5 GiB | 10% |
+| 10 GiB | 1 | 0.5 GiB | 5% |
+| 50 GiB | 4 | 2 GiB | 4% |
+| 500 GiB | 32 | 16 GiB | 3.2% |
+| 1 TiB | 64 | 32 GiB | 3.125% |
+| Full epochs only | 1 per 16 GiB | 0.5 GiB per epoch | 3.125% |
+
+These are binary units and Object data means stored blocks, including padding.
+The table assumes no early epoch endings within a session, and excludes sidecar
+metadata, filemarks, the bootstrap, the final ParityMap and terminal replicas.
+For nonempty sessions the parity charge is
+`ceil(session_data_bytes / (16 GiB)) × 512 MiB`. An exact multiple of a full
+epoch needs no extra short sidecar. Reserve the complete layout when admitting
+writes (chapter 13).
+
+We recommend accumulating ready Objects in the orchestrator before opening a
+session, then streaming the batch in one session. Choose batch size and age
+limits from the available spool and acceptable waiting time. Object size
+controls per-Object costs; session size controls the extra short-epoch cost.
+
+Serves REM-PARITY §11.2, Commit (W2), and REM-PARITY §11.4, Epochs and sidecars
+(W4).
 
 ### 9.4. Treat staged records as uncommitted until their barrier
 
@@ -1215,38 +1266,87 @@ unclassified error, and verifying the append point by a positional query before
 the first block a resumed session writes. The specification fixes the outcome:
 "A Writer starts writing only immediately after the committed prefix, at a
 position it has proved, and then writes contiguously." (REM-PARITY §11.3).
-Remanence, for example, locates to the append point on resume, reads the
-position back with READ POSITION, and refuses to write if the two differ.
+We recommend proving the tape's identity, checking the recorded append position
+with READ POSITION, and reading the preceding record as a filemark. A position
+query alone does not prove that an older copy of the records still describes
+the tape's end.
+
+Before superseding an uncommitted suffix, we recommend matching it to the
+state in the durable records:
+
+| Recorded state | Expected suffix after the committed prefix |
+| --- | --- |
+| Sealed, or a session ended with `W = T` and no outstanding tail | End of data only; a sealed tape accepts no write. |
+| A live process ended the session and named its uncommitted files | Exactly those files, in order and within their recorded bounds. |
+| Finalization is planned but incomplete | The next planned component, torn or complete. |
+| An open session has no end record after a crash | End of data or one torn file; complete Objects need recorded operator acknowledgment before superseding them. |
+
+A finalization decision without a durable plan still uses the session's suffix
+rule. Except in the first row, the tape's own interrupted closeout sidecar for
+`[W, T)` can replace the rest of the expected suffix, followed by end of data.
+
+The proof consumes the whole expected suffix and then proves end of data.
+For each expected file, check its header identity (the Object id or the
+sidecar's canonical metadata hash) and the spacing to its filemark. A session
+end record should name each file's kind, identity, known block count, writes
+whose completion is unknown, and whether the filemark is present, absent or
+unknown. Accept only the bounded alternatives that record describes. A last
+named file with no known blocks can be absent, with end of data in its place.
+
+An extra file, a mismatched identity, a length outside the recorded bounds or
+missing end of data is a reason to refuse writing. Checking only the first
+expected file misses later committed files when the host records are stale.
+After the suffix proof, return to the committed append point and prove the
+position again before writing. Repeat that position proof after a read-back
+of committed data; that read leaves the head inside the committed prefix.
+These suffix rules are recommended practice for satisfying W3, not a change
+to the on-tape format.
 
 Serves REM-PARITY §3.5, Requirements on the Tape I/O Layer, and REM-PARITY §14,
 Resumer Obligations.
 
 ### 9.9. Resume a tape from its commit records
 
-A resumed session has to continue the parity of the epoch that was open when
-the last session ended, and finalization has to describe the whole tape later.
-A writer that seeds itself from anything less than the committed prefix
-produces a sidecar or a terminal inventory that disagrees with the tape.
+A resumed writer can end the open epoch before new data or continue it with
+new Objects. Both choices conform to REM-PARITY §11. A writer that seeds
+itself from less than the committed prefix can produce a sidecar or terminal
+inventory that disagrees with the tape.
 
-We recommend seeding a resumed writer with the complete replayable prefix map,
-the Object recovery rows, one full directory entry for every committed sidecar,
-the durable boundary, `W`, the next epoch id, and the open epoch `[W, T)`
-rebuilt from committed ordinals `[W, T)` under REM-PARITY §11.5 (W5). That source should stay
-replayable, so that finalization can later emit the final ParityMap and stream
-the same snapshot into replicas A, B and C. A generation-2 tape carries at most
-one ParityMap, so its `sequence` counter has no consequence for a reader.
+We recommend seeding the writer with the complete replayable prefix map, the
+Object recovery rows, one full directory entry for every committed sidecar,
+the durable boundary, `W`, `T` and the next epoch id. Keep this source replayable
+so that finalization can emit the final ParityMap and stream the same snapshot
+into replicas A, B and C (REM-PARITY §10.3 and §14). A generation-2 tape carries
+at most one ParityMap, so its `sequence` counter has no consequence for a reader.
 
-At resume time the writer should not close `[W, T)` or emit a sidecar for it;
-the epoch closes later, through the ordinary cycle. When a sidecar is emitted,
-we recommend re-parsing its encoded bytes and comparing them with the planned
-header, index and shard bytes before committing it. A correct encoder never
-fails this check, and a defective one is caught before its bytes are committed.
-Remanence, for example, does not close `[W, T)` at resume, and re-parses a
-rebuilt sidecar before it writes it. The pinned vector `resume-round-trip`
-records the bytes of a writer that does not close `[W, T)` at resume.
+When `[W, T)` is nonempty, rebuild the accumulator by reading its committed
+file extents, not by treating a data ordinal as a physical tape position.
+Compute each block's `data_shard_crc64` and reproduce the evidence recorded
+at commit, as REM-PARITY §11.5 (W5) requires. For the check-value form in
+section 9.1, compare CRC-64/XZ over the little-endian block CRCs of `[W, T)`
+with the recorded value. On a mismatch, we recommend rereading the range once.
+A second mismatch refuses the parity write and Object appends; do not replace
+the recorded evidence with a value derived from the failed read-back.
+W5 names a proof mismatch `ResumeAppend` and a medium or transport failure
+`TapeIo`; section 10.9 describes its finalization exception.
 
-Serves REM-PARITY §10.3, Object Recovery Rows, and REM-PARITY §14, Resumer
-Obligations.
+We recommend ending a rebuilt open epoch and committing its sidecar before
+admitting new Objects. This finishes an interrupted closeout and starts new
+data with a fresh epoch. Alternatively, retain the verified accumulator and
+continue the open epoch until it fills or ends at a later Object boundary.
+Both paths keep the W4 commit bound and write every ended epoch's sidecar
+before the next Object. An empty `[W, T)` needs no sidecar. The pinned
+`resume-round-trip` vector illustrates continuation; it does not make that
+choice mandatory for every writer.
+
+After read-back, prove the append position again as section 9.8 describes.
+When a sidecar is ready, we recommend re-parsing its encoded bytes and comparing
+them with the planned header, index and shard bytes before committing it.
+A correct encoder passes this check; a defective one is caught before its
+bytes are committed.
+
+Serves REM-PARITY §10.3, Object Recovery Rows; REM-PARITY §11.5, Parity from
+read-back (W5); and REM-PARITY §14, Resumer Obligations.
 
 ### In plain terms
 
@@ -1392,6 +1492,31 @@ replicas should carry the same snapshot, fixed before replica A (REM-PARITY
 §8.3).
 
 Serves REM-PARITY §10.3, Object Recovery Rows.
+
+### 10.9. Record acceptance of an uncovered range before planning finalization
+
+If W5 cannot prove `[W, T)` from read-back, because of `ResumeAppend` or
+`TapeIo`, W6 permits finalization only after the operator's recorded acceptance
+(REM-PARITY §11.6). The range gets no sidecar. Object appends and parity over
+those bytes remain refused; finalization writes the remaining sequence at
+proved positions. Losing the commit records does not qualify for this
+exception (REM-PARITY §3.4).
+
+We recommend recording the acceptance with the tape incarnation, the
+finalization operation, the tape-log sequence the operator saw, and `W` and
+`T`. Record the decision in the operator audit log and a reference to it in
+the tape log before recording the immutable finalization plan. Replay should
+require both records to agree. This binds acceptance to the particular tape
+and range the operator reviewed, and lets the plan describe the actual
+protection state.
+
+Keep the true `W` in the final directory and report `[W, T)` as unprotected.
+A Verifier reports this range even on a finalized tape; the absence of parity
+alone is not damage or a verification failure (REM-PARITY §2.2). This decision
+does not accept fewer terminal replicas: W6 still requires three complete
+replicas before the tape is reported finalized.
+
+Serves REM-PARITY §11.6, Finalization (W6).
 
 ### In plain terms
 

@@ -326,8 +326,11 @@ rests on a search of every mention of the Resumer and of resuming: in
 Sections 1.3, 2.2, 3.4, 11.1 and 14, and in Appendix B.10. None gives a
 source. This Resumer reads the bootstrap at LBA 0. A Resumer whose own
 off-tape state carries the scheme refuses resume-03 before any tape read.
-*Undecided:* `decision.before_any_tape_read` for resume-03. The other
-step-2 refusals are decided from the prefix alone, before any read.
+**Resolved by the revised text:** Section 14, step 2 says, "A Resumer may
+take `S` and `k` from its commit records or from the bootstrap." Both sources
+are permitted. `decision.before_any_tape_read` for resume-03 depends on the
+chosen source; it is not a required common outcome. The other step-2 refusals
+are decided from the prefix alone, before any read.
 
 **E-3. Section 14 does not check the prefix against the tape outside
 `[W, T)`.** Step 3 re-reads only the open epoch, and step 4 computes the
@@ -703,7 +706,8 @@ revised text (Sections 2.2, 2.4, 3.3, 3.5, 7.2, 8.4, 9.1, 9.6, 10.1.3,
 10.1.4, 10.6, 12.3, 12.6, 13.3–13.5, 14, 15 and 16.3, and Appendix D). Each
 decision the revision changed has a row in `DECISION-LOG.md`. The entries
 above that the revision decides end in a line beginning **Decided by the
-revised text**. B-4, B-5, B-7 (decided in F-T1b), B-11, E-2, E-3, E-5 to E-7, F-1, F-2, F-7,
+revised text** (E-2 is marked **Resolved by the revised text**). B-4, B-5,
+B-7 (decided in F-T1b), B-11, E-3, E-5 to E-7, F-1, F-2, F-7,
 G-1, G-4, G-6 and H-8 to H-10 stay as they were.
 
 **I-1. sup-15 is not isolated under Section 7.2.** `overflow-7.2-T/isolated`
