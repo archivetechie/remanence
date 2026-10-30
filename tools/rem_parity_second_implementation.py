@@ -1655,8 +1655,8 @@ def writer_check_prefix(structural: list[MapEntry], rows: list[dict[int, Any]], 
     has_parity_map = any(e.kind == KIND_PARITY_MAP for e in structural)
     if has_sidecar != has_parity_map:
         raise BuildRefusal("structural_entries", "a final ParityMap is present if and only if a sidecar is")
-    if has_sidecar and chain != ordinal:
-        raise BuildRefusal("structural_entries", "finalization must leave no Object ordinal unprotected")
+    if has_sidecar and chain > ordinal:
+        raise BuildRefusal("structural_entries", "protected ordinals exceed total Object ordinals")
     objects = [e for e in structural if e.kind == KIND_OBJECT]
     if len(objects) != len(rows):
         raise BuildRefusal("object_rows", "one Object row per kind-0 structural row")
@@ -2127,7 +2127,7 @@ QUOTES: dict[str, tuple[str, str]] = {
     "walk_no_map": ("13.1", "A walked map whose projection does not hash to a validated final ParityMap's `canonical_map_digest`, or whose prefix disagrees with those scope fields, is not validated and gives the Recoverer no map, with no fallback to the bootstrap's scope."),
     "reconstruct_error": ("15", "FilemarkMapReconstruct          BOT recovery walk could not produce a valid map"),
     "recoverer_inputs": ("13.1", "A validated, scoped map (Section 12); the bootstrap's scheme record, or the scheme supplied out of band when the bootstrap is unreadable (Section 8.4.1); and the failed addresses — `(tape_file_number, object_block_index)` pairs or ordinals."),
-    "refusals": ("13.2", "The Recoverer MUST reject, as typed refusals distinct from recovery failures: ordinals outside the validated scope (`OutsideValidatedMapPrefix`); ordinals ≥ `W` — the pending epoch, whose parity does not exist yet (`UnrecoverablePendingEpoch`); and failed blocks or sidecars in tape files outside the durable boundary."),
+    "refusals": ("13.2", "The Recoverer MUST reject, as typed refusals distinct from recovery failures: ordinals outside the validated scope (`OutsideValidatedMapPrefix`); ordinals ≥ `W` — the unprotected range, whose parity does not exist (`UnrecoverablePendingEpoch`); and failed blocks or sidecars in tape files outside the durable boundary."),
     "stripe_map": ("3.3", "For scheme `(k, m, S)` (Section 6.6), locate the unique sidecar descriptor whose explicit range `[start, end)`, of at most `S × k` data ordinals, contains ordinal `o`."),
     "footer_first": ("13.3", "If it parses as the epoch's footer and its total matches the map entry: read and verify **both** header copies against the footer locator, including the `canonical_metadata_hash`; use the primary if valid, else the tail; record copy health (both-usable / tail-lost / primary-lost)."),
     "primary_fallback": ("13.3", "If the footer is unreadable, unparseable, **or inconsistent with the map entry** — a footer that parses but contradicts the map is treated as an invalid footer, not as a hard stop — fall back to the primary header at block 0 (copy-kind and map-entry block-count cross-checks apply)."),
@@ -2730,10 +2730,10 @@ def validate_structural_rows(rows: list[Any], frame: dict[str, Any], replica_a_t
         problems.append("the ParityMap row is not the single final row")
     if bool(parity_maps) != bool(sidecars):
         problems.append("a ParityMap is present if and only if a sidecar is")
-    if sidecars and frame["watermark"] != frame["total"]:
+    if sidecars and frame["watermark"] > frame["total"]:
         # Section 10.6: both are the recorded fields; Section 7.4's
         # cross-check against the recomputed values is the rule above.
-        problems.append("recorded highest protected ordinal differs from recorded total data ordinals")
+        problems.append("recorded highest protected ordinal exceeds recorded total data ordinals")
     if not (frame["covered"] == len(entries) == replica_a_tape_file):
         problems.append("covered count, structural_row_count and A's tape-file number differ")
     # Section 7.2: every record and trailing-filemark position the map
@@ -4029,7 +4029,7 @@ QUOTES.update({
     "epoch_ids": ("9.2", "Epoch ids MUST increase by one but carry no range arithmetic."),
     'epoch_close': ('11.4', 'Each epoch is the next contiguous run of at most `S × k` ordinals, with the next epoch id.'),
     'pending_emit': ('11.4', "An ended epoch's sidecar (Section 9; always `S × m` parity shards) is its own tape file, written before the next Object begins."),
-    'barrier_short': ('10.1.5', 'A Writer MUST set `FINAL_PARTIAL_EPOCH` on the short epoch that the finalization sequence ends, and only there (Section 11.6); it MUST leave it clear on every short epoch ended before finalization.'),
+    'barrier_short': ('10.1.5', 'A Writer MUST set `FINAL_PARTIAL_EPOCH` on the short epoch that the finalization sequence ends, if it ends one, and on no other epoch (Section 11.6); it MUST leave it clear on every short epoch ended before finalization.'),
     "boundary_outcomes": ("3.5", "Fixed-block reads and writes only; a read returning other than exactly one block is an error, with two classified boundary outcomes: **Filemark** and **EndOfData**."),
     'err_resume': ('15', 'ResumeAppend                    Section 11.5 or Section 14 invariant violation'),
     "torn_superseded": ("3.4", "There is no on-tape commit marker and no on-tape \"unclean\" marker: an interrupted tail simply lies beyond the last committed file and is physically superseded on resume (Section 14)."),
@@ -4428,7 +4428,7 @@ QUOTES.update({
     "layout_valid": ("10.6", "The planned layout of the terminal suffix validates against Section 8.3, and its layout digest recomputes to the recorded value."),
     "conjunction": ("10.6", "The conditions are a conjunction, and this document does not fix the order in which a Reader checks them, except that a matching role magic commits the tape file to its control type, so malformed control never falls through to Object (Section 12.3)."),
     "covered_equal": ("10.6", "`covered_prefix_tape_file_count`, `structural_row_count`, and replica A's planned tape-file number are equal."),
-    "w_equals_t": ("10.6", "when sidecars are present, `highest_protected_ordinal` equals `total_data_ordinals`, so finalization left no Object ordinal unprotected;"),
+    "terminal_coverage": ("10.6", "when sidecars are present, `highest_protected_ordinal` is at most `total_data_ordinals`; the range between them is unprotected and may be nonempty on a finalized tape; both are the recorded fields, and Section 7.4 separately requires each to equal the value recomputed from the map;"),
     "sep_arith": ("10.6", "The footer arithmetic of Section 10.4 applies to its footer fields (`0x1A8`, `0x1B0`, `0x1B8`, `0x1C0`)."),
     "sep_valid": ("10.6", "A separation extent is valid when its header and footer satisfy the conditions in the first list above, read against the fields of Section 10.5 in place of those of Section 10.4, with two exceptions:"),
     "sep_records": ("10.5", "total_records    = ceil(E / B), required ≥ 2"),
@@ -4848,6 +4848,9 @@ def role_terminal(ws: Workspace) -> dict[str, Any]:
         out["selection"] = "TerminalIndexReplicaConflict"
     else:
         out["selection"] = f"Inventory from {'/'.join(valid)}" + (" (degraded)" if len(valid) < 3 else "")
+        selected = checks[valid[0]].header
+        if selected["watermark"] < selected["total"]:
+            out["unprotected_range"] = [selected["watermark"], selected["total"]]
     out["separations"] = {}
     for ordinal, name in ((1, "A-B"), (2, "B-C")):
         status, reason, _ = check_separation(tape, layout, ordinal, ws.tape_uuid, ws.block_size)
@@ -5457,8 +5460,8 @@ def negatives_table() -> dict[str, dict[str, Any]]:
 
     for variant, profile, offset, frm, to, rules in (
             ("a-covered-prefix", "multi-256k", 0x048, 6, 7, ["covered_equal", "digest_scope"]),
-            ("b-total-data-ordinals", "multi-256k", 0x050, 5, 6, ["digest_scope", "w_equals_t"]),
-            ("c-highest-protected", "multi-256k", 0x058, 5, 4, ["digest_scope", "w_equals_t"]),
+            ("b-total-data-ordinals", "multi-256k", 0x050, 5, 6, ["digest_scope", "terminal_coverage"]),
+            ("c-highest-protected", "multi-256k", 0x058, 5, 4, ["digest_scope", "terminal_coverage"]),
             ("d-total-isolated", "minimal-256k", 0x050, 0, 1, ["digest_scope"])):
         def apply47(ws, res, offset=offset, frm=frm, to=to):
             for key in ((0, 0), (0, 2)):
@@ -5652,7 +5655,7 @@ def run_negative(entry_id: str, spec: dict[str, Any], case: dict[str, Any]) -> d
     return out
 
 
-def self_check(expect: dict[str, str], results: list[dict[str, Any]]) -> dict[str, Any]:
+def self_check(expect: dict[str, Any], results: list[dict[str, Any]]) -> dict[str, Any]:
     details = []
     agrees = True
     for key, wanted in expect.items():
@@ -5680,6 +5683,9 @@ def self_check(expect: dict[str, str], results: list[dict[str, Any]]) -> dict[st
         elif key.startswith("separation "):
             match = next((r for r in results if "separations" in r), None)
             found = match and match["separations"].get(key.split()[1], {}).get("status")
+        elif key == "unprotected_range":
+            match = next((r for r in results if "selection" in r), None)
+            found = match and match.get("unprotected_range")
         elif key == "selection":
             match = next((r for r in results if "selection" in r), None)
             found = match and match["selection"]
@@ -6650,10 +6656,6 @@ def supplement_table() -> dict[str, dict[str, Any]]:
                    "multi-256k, the Object ids 'huge-object-profile-row-1/2', manifest_sha256 = 0x31 x 32, and A "
                    "placed at LBA 6 over one placeholder block per prefix file (no rule compares the rows with the "
                    "physical prefix)."),
-        "sup-21": ("neg-47", lambda: ws_unprotected(2), None, "§10.6 W = T", ["w_equals_t", "err_replica"],
-                   "Sidecars are present, and W (2) ≠ T (5).",
-                   "All three replicas carry it: BotStructuralRecoveryRequired at the tape level.",
-                   {"selection": "BotStructuralRecoveryRequired"}, ""),
         "sup-32": ("neg-47", lambda: ws_unprotected(5), None, "§7.4 W cross-check", ["digest_scope", "scope_in_list", "err_replica"],
                    "The recorded W (5) differs from its recompute (2). Section 15's TerminalIndexReplicaParse cites "
                    "Section 10.6, whose list includes 'scope', so the failure has that name.",
@@ -6667,6 +6669,15 @@ def supplement_table() -> dict[str, dict[str, Any]]:
         t[sup] = {"parent": parent, "terminal": builder, "roles": ["terminal"], "named": named,
                   "decide": decision("rejected", "TerminalIndexReplicaParse", rules, what, note=note), "expect": expect,
                   "resolution_note": resolution_note}
+
+    t["sup-21"] = {"parent": "neg-47", "terminal": lambda: ws_unprotected(2),
+                   "roles": ["terminal"], "named": "§10.6 uncovered finalization",
+                   "decide": decision("accepted", None, ["terminal_coverage", "digest_scope"],
+                                      "W = 2 and T = 5 equal their recomputes. All three replicas validate; "
+                                      "the inventory is accepted and [2, 5) is reported as unprotected.",
+                                      must_reject=False),
+                   "expect": {"selection": "Inventory from A/B/C", "unprotected_range": [2, 5]},
+                   "resolution_note": "The former equality-only negative is a positive case; its bytes are unchanged."}
 
     def apply34(ws, res):
         edit_slot(ws, res, 0, 384, 256, set_element(10, 0, (1 << 64) - 1), "Object-row slot 0 key 10")
@@ -9277,9 +9288,9 @@ def mutations_table() -> dict[str, dict[str, Any]]:
                "The last 100 bytes of the footer record (zero padding) are removed, so the footer record is 262 044 bytes, "
                "not a full record: invalid content of the extent (Section 3.5), and the record-length condition fails. "
                "The record count is unchanged, so nothing after the extent moves.")
-    replica("mut-19", ["digest_scope", "w_equals_t", "digests_recompute", "scope_in_list"],
-            "The recorded total data ordinals (6) differs from T recomputed over the structural rows (5), W (5) no "
-            "longer equals it although sidecars are present, and the edition digest (left stale) does not recompute."
+    replica("mut-19", ["digest_scope", "terminal_coverage", "digests_recompute", "scope_in_list"],
+            "The recorded total data ordinals (6) differs from T recomputed over the structural rows (5), "
+            "and the edition digest (left stale) does not recompute. W < T alone is permitted."
             + SEP_ORDER)
     replica("mut-20", ["kind_local", "device_agree"],
             "The frames' planned local start LBA (26) differs from the local tuple's start (25) and from the device's "

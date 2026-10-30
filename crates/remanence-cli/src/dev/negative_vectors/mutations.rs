@@ -92,7 +92,7 @@ fn terminal_mutation_section15() {
     let bytes = fs::read(root.join("mutation-section15.json")).expect("authored mutation names");
     assert_eq!(
         hex(&Sha256::digest(&bytes)),
-        "cfee8f27baaec890162a12ab6df450c53c01764f1b492e8ee390bb9bd7875313"
+        "8301a570c54ee75ad3f86eb25e183876c6266dc619178eac673f0c886f850091"
     );
     let names: Value = serde_json::from_slice(&bytes).unwrap();
     let entries = names["entries"].as_object().unwrap();

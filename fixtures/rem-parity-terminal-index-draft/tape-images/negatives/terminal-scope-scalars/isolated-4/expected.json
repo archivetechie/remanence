@@ -2,7 +2,7 @@
   "base": {
     "artifact": "new terminal profile 'multi-unprotected-256k' as in isolated-3"
   },
-  "every_other_rule_holds": "W = T (5 = 5), so the Section 10.6 rule holds. T equals its recompute and W ≤ T. The rest is as in isolated-3.",
+  "every_other_rule_holds": "Recorded W = T = 5 satisfies W ≤ T, and T equals its recompute. The rest is as in isolated-3; only the W recomputation fails.",
   "expected": {
     "error": "TerminalIndexReplicaParse",
     "tape_level": "BotStructuralRecoveryRequired"

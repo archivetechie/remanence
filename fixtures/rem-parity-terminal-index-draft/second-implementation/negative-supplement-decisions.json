@@ -1950,7 +1950,7 @@
         ]
       },
       "isolation": {
-        "claim": "The first ordinals are dense: file 2's first ordinal 1 equals the running total after file 1. There are no sidecar rows, so the W = T rule and the ParityMap-iff-sidecar rule hold vacuously. W = 0 matches its recompute. The Object rows are in bijection with the kind-0 rows and match their block counts, and the manifest ranges fit. covered = rows = A's planned tape-file number, and the layout and digests are consistent.",
+        "claim": "The first ordinals are dense: file 2's first ordinal 1 equals the running total after file 1. There are no sidecar or ParityMap rows, so the ParityMap-iff-sidecar rule holds. W = 0 matches its recompute. The Object rows are in bijection with the kind-0 rows and match their block counts, and the manifest ranges fit. covered = rows = A's planned tape-file number, and the layout and digests are consistent.",
         "disputed_by_implementation": true,
         "disputes": [
           "replica A: this implementation finds 3 failing rules: T or W differs from the frame; row 2: its records and trailing filemark reach position 18446744073709551619, which does not fit in u64 (Section 7.2); replica A's planned start LBA differs from the end of the covered prefix (Section 10.6)"
@@ -2486,8 +2486,8 @@
       "id": "sup-21",
       "parent": "neg-47",
       "group": "7b",
-      "target": "replica pre-A relationship 'when sidecars are present, highest_protected_ordinal equals total_data_ordinals' (Section 10.6)",
-      "violates_only": "Section 10.6 W = T when sidecars are present (2 ≠ 5)",
+      "target": "valid terminal inventory with recomputed W = 2 and T = 5; [2, 5) reported as unprotected (Sections 7.4, 10.6)",
+      "violates_only": "none; the former W = T requirement is retired",
       "apply": {
         "resolved": true,
         "vector": "bytes",
@@ -2525,34 +2525,35 @@
                 "sha256": "6c50fb4100856f2eb618eeb083b797b374779b13a1b9daada0f7540310a66e8c"
               }
             ]
-          }
+          },
+          "The former equality-only negative is a positive case; its bytes are unchanged."
         ]
       },
       "isolation": {
         "claim": "T = 5 and W = 2 equal their recomputes (Section 7.4), and W ≤ T. The rows are dense and the first ordinals contiguous. The ParityMap row is last and present because a sidecar row is present. The bijection holds, covered = rows = A's planned tape-file number = 5, and the layout, digests and footers are consistent.",
         "disputed_by_implementation": false,
         "disputes": [],
-        "replica_A_rules_failing": "payload: TerminalIndexReplicaParse: recorded highest protected ordinal differs from recorded total data ordinals"
+        "replica_A_rules_failing": "locally eligible under Section 10.6"
       },
       "decision": {
-        "outcome": "rejected",
-        "error": "TerminalIndexReplicaParse",
+        "outcome": "accepted",
+        "error": null,
         "error_set": null,
         "readings": null,
         "rules": [
           {
             "section": "10.6",
-            "quote": "when sidecars are present, `highest_protected_ordinal` equals `total_data_ordinals`, so finalization left no Object ordinal unprotected;"
+            "quote": "when sidecars are present, `highest_protected_ordinal` is at most `total_data_ordinals`; the range between them is unprotected and may be nonempty on a finalized tape; both are the recorded fields, and Section 7.4 separately requires each to equal the value recomputed from the map;"
           },
           {
-            "section": "15",
-            "quote": "TerminalIndexReplicaParse replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6"
+            "section": "7.4",
+            "quote": "When a Reader validates a terminal digest, it MUST recompute the digest over exactly the leading `tape_file_count` entries and cross-check all three scalars."
           }
         ],
-        "order": "Sidecars are present, and W (2) ≠ T (5).",
-        "reader_must_reject": true,
+        "order": "W = 2 and T = 5 equal their recomputes. All three replicas validate; the inventory is accepted and [2, 5) is reported as unprotected.",
+        "reader_must_reject": false,
         "formula": null,
-        "note": "All three replicas carry it: BotStructuralRecoveryRequired at the tape level."
+        "note": ""
       },
       "implementation": [
         {
@@ -2560,19 +2561,23 @@
           "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
           "replicas": {
             "A": {
-              "valid": false,
-              "reason": "payload: TerminalIndexReplicaParse: recorded highest protected ordinal differs from recorded total data ordinals"
+              "valid": true,
+              "reason": "locally eligible under Section 10.6"
             },
             "B": {
-              "valid": false,
-              "reason": "payload: TerminalIndexReplicaParse: recorded highest protected ordinal differs from recorded total data ordinals"
+              "valid": true,
+              "reason": "locally eligible under Section 10.6"
             },
             "C": {
-              "valid": false,
-              "reason": "payload: TerminalIndexReplicaParse: recorded highest protected ordinal differs from recorded total data ordinals"
+              "valid": true,
+              "reason": "locally eligible under Section 10.6"
             }
           },
-          "selection": "BotStructuralRecoveryRequired",
+          "selection": "Inventory from A/B/C",
+          "unprotected_range": [
+            2,
+            5
+          ],
           "separations": {
             "A-B": {
               "status": "valid",
@@ -2587,7 +2592,7 @@
       ],
       "self_check": {
         "agrees": true,
-        "detail": "selection: expected BotStructuralRecoveryRequired, implementation BotStructuralRecoveryRequired"
+        "detail": "selection: expected Inventory from A/B/C, implementation Inventory from A/B/C; unprotected_range: expected [2, 5], implementation [2, 5]"
       }
     },
     "sup-22": {
@@ -2802,7 +2807,7 @@
           },
           {
             "section": "14",
-            "quote": "Enforce the version-1 bound: `T − W < S × k` (at most one open epoch)."
+            "quote": "Validate the commit records: `T − W < S × k` (the bound Section 11.4 (W4) maintains);"
           }
         ],
         "order": "Unit level: only the named computation is evaluated.",
@@ -3640,7 +3645,7 @@
         ]
       },
       "isolation": {
-        "claim": "W = T (5 = 5), so the Section 10.6 rule holds. T equals its recompute and W ≤ T. The rest is as in isolated-3.",
+        "claim": "Recorded W = T = 5 satisfies W ≤ T, and T equals its recompute. The rest is as in sup-21; only the W recomputation fails.",
         "disputed_by_implementation": false,
         "disputes": [],
         "replica_A_rules_failing": "payload: TerminalIndexReplicaParse: T or W differs from the frame"
@@ -4706,7 +4711,7 @@
           },
           {
             "section": "14",
-            "quote": "**Position to the append point (`Σ(block_count + 1)` over the prefix) before writing anything.**"
+            "quote": "Apply Section 11.3 (W3) before appending."
           },
           {
             "section": "3.4",
@@ -4718,7 +4723,7 @@
           },
           {
             "section": "15",
-            "quote": "ResumeAppend Section 14 invariant violation"
+            "quote": "ResumeAppend Section 11.5 or Section 14 invariant violation"
           }
         ],
         "order": "T and W are unaffected and step 2 holds. The append point overflows, so the records do not determine one committed prefix and its append point, which Section 3.4 requires before the Resumer positions or writes: ResumeAppend.",
@@ -4942,7 +4947,7 @@
         "notes": []
       },
       "isolation": {
-        "claim": "There are no sidecar rows, so the W = T rule of Section 10.6 does not apply. W = 0 ≤ T = 1 (Section 2.3). covered = rows = A's planned file = 1. The digests recompute over the unchanged payload, and the frames agree.",
+        "claim": "There are no sidecar rows; Section 10.6 permits an unprotected tail. W = 0 ≤ T = 1 (Section 2.3). covered = rows = A's planned file = 1. The digests recompute over the unchanged payload, and the frames agree.",
         "disputed_by_implementation": false,
         "disputes": [],
         "replica_A_rules_failing": "payload: TerminalIndexReplicaParse: T or W differs from the frame"

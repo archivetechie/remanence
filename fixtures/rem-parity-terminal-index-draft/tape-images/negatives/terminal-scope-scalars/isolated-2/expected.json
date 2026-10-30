@@ -4,7 +4,7 @@
     "component": "replica-a.bin header and footer"
   },
   "caveat": "Section 15 gives this failure no name of its own; see NOTES.md gap 15 (FilemarkMapDigestMismatch reading).",
-  "every_other_rule_holds": "There are no sidecar rows, so the W = T rule of Section 10.6 does not apply. W = 0 ≤ T = 1 (Section 2.3). covered = rows = A's planned file = 1. The digests recompute over the unchanged payload, and the frames agree.",
+  "every_other_rule_holds": "There are no sidecar rows; Section 10.6 permits an unprotected tail. W = 0 ≤ T = 1 (Section 2.3). covered = rows = A's planned file = 1. The digests recompute over the unchanged payload, and the frames agree.",
   "expected": {
     "error": "TerminalIndexReplicaParse"
   },

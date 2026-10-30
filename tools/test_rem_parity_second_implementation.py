@@ -652,6 +652,26 @@ SYNTHETIC_SUPPLEMENT = {"description": "synthetic subset for the tests", "conven
 
 
 class SupplementTests(unittest.TestCase):
+    def test_uncovered_finalization_accepts_only_matching_scope(self) -> None:
+        """Accept the unchanged equality-only case and retain scalar refusals."""
+        table = impl.supplement_table()
+        cases = {case["id"]: case for case in impl.load_json(
+            impl.BLIND_INPUTS / "supplement-blind.json")["variants"]}
+        accepted = impl.run_supplement_entry("sup-21", table["sup-21"], cases["sup-21"])
+        expected = impl.load_json(impl.NEGATIVES_ROOT / "terminal-scope-scalars/isolated-3/expected.json")["expected"]
+        self.assertEqual(expected["outcome"], "ACCEPTED")
+        self.assertEqual(accepted["decision"]["outcome"], "accepted")
+        self.assertFalse(accepted["decision"]["reader_must_reject"])
+        result = accepted["implementation"][0]
+        self.assertEqual(result["selection"], expected["tape_level"])
+        self.assertEqual(result["unprotected_range"], expected["unprotected_range"])
+        self.assertTrue(all(replica["valid"] for replica in result["replicas"].values()))
+        self.assertTrue(accepted["self_check"]["agrees"])
+        rejected = impl.run_supplement_entry("sup-32", table["sup-32"], cases["sup-32"])
+        self.assertTrue(rejected["self_check"]["agrees"])
+        self.assertEqual(rejected["implementation"][0]["selection"], "BotStructuralRecoveryRequired")
+        self.assertNotIn("unprotected_range", rejected["implementation"][0])
+
     @classmethod
     def setUpClass(cls) -> None:
         if SUPPLEMENT_CASES:

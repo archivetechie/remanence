@@ -1151,13 +1151,13 @@
       ],
       "quotes": [
         "When a Reader validates a terminal digest, it MUST recompute the digest over exactly the leading `tape_file_count` entries and cross-check all three scalars.",
-        "when sidecars are present, `highest_protected_ordinal` equals `total_data_ordinals`, so finalization left no Object ordinal unprotected;",
+        "when sidecars are present, `highest_protected_ordinal` is at most `total_data_ordinals`; the range between them is unprotected and may be nonempty on a finalized tape; both are the recorded fields, and Section 7.4 separately requires each to equal the value recomputed from the map;",
         "The edition digest and the local descriptor digest recompute to the recorded values.",
         "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
         "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
       ],
       "pinned": true,
-      "notes": "Three rules fail at once: T ≠ recomputed T (Section 7.4); W (5) ≠ T (6) with sidecars present (Section 10.6); and the stale edition digest. FilemarkMapDigestMismatch is not the name: the canonical-map digest itself still recomputes (see NOTES gap 15 of the earlier set)."
+      "notes": "Two rules fail: T differs from its recomputation (Section 7.4), and the edition digest is stale. W < T alone is permitted by Section 10.6. FilemarkMapDigestMismatch is not the name: the canonical-map digest itself still recomputes (see NOTES gap 15 of the earlier set)."
     },
     "replica-wrong-scope": {
       "component": "replica-a.bin header and footer, covered-prefix count 6 -> 7",

@@ -322,7 +322,7 @@
    ],
    "target": "replica scope validation, T = max(first + block_count) (Sections 7.2, 7.4, 10.6)",
    "violates_only": "Checked evaluation of T: 1 + (2^64 \u2212 1) overflows u64",
-   "every_other_rule_holds": "The first ordinals are dense: file 2's first ordinal 1 equals the running total after file 1. There are no sidecar rows, so the W = T rule and the ParityMap-iff-sidecar rule hold vacuously. W = 0 matches its recompute. The Object rows are in bijection with the kind-0 rows and match their block counts, and the manifest ranges fit. covered = rows = A's planned tape-file number, and the layout and digests are consistent.",
+   "every_other_rule_holds": "The first ordinals are dense: file 2's first ordinal 1 equals the running total after file 1. There are no sidecar or ParityMap rows, so the ParityMap-iff-sidecar rule holds. W = 0 matches its recompute. The Object rows are in bijection with the kind-0 rows and match their block counts, and the manifest ranges fit. covered = rows = A's planned tape-file number, and the layout and digests are consistent.",
    "caveat": "No replica rule compares the rows' block counts with the physical prefix (NOTES.md gap 10), so the profile may present A at any LBA the harness chooses. A full Verifier that measures the prefix would also find a count mismatch.",
    "parent_blind_id": "neg-03"
   },
@@ -434,8 +434,8 @@
    "integrity_repair": [
     "the profile is generated consistently: payload, canonical-map, edition, layout and descriptor digests, CRCs and header hashes in all five components"
    ],
-   "target": "replica pre-A relationship 'when sidecars are present, highest_protected_ordinal equals total_data_ordinals' (Section 10.6)",
-   "violates_only": "Section 10.6 W = T when sidecars are present (2 \u2260 5)",
+   "target": "valid terminal inventory with recomputed W = 2 and T = 5; [2, 5) reported as unprotected (Sections 7.4, 10.6)",
+   "violates_only": "none; the former W = T requirement is retired",
    "every_other_rule_holds": "T = 5 and W = 2 equal their recomputes (Section 7.4), and W \u2264 T. The rows are dense and the first ordinals contiguous. The ParityMap row is last and present because a sidecar row is present. The bijection holds, covered = rows = A's planned tape-file number = 5, and the layout, digests and footers are consistent.",
    "parent_blind_id": "neg-47"
   },
@@ -650,7 +650,7 @@
    ],
    "target": "the Section 7.4 W cross-check",
    "violates_only": "Section 7.4 cross-check of highest_protected_ordinal against W recomputed over the prefix (5 \u2260 2)",
-   "every_other_rule_holds": "W = T (5 = 5), so the Section 10.6 rule holds. T equals its recompute and W \u2264 T. The rest is as in isolated-3.",
+   "every_other_rule_holds": "Recorded W = T = 5 satisfies W \u2264 T, and T equals its recompute. The rest is as in sup-21; only the W recomputation fails.",
    "parent_blind_id": "neg-47"
   },
   {
@@ -847,7 +847,7 @@
    ],
    "target": "the Section 7.4 T cross-check",
    "violates_only": "Section 7.4 'cross-check all three scalars': T recomputed over the prefix is 0 (no Object rows), but 1 is recorded",
-   "every_other_rule_holds": "There are no sidecar rows, so the W = T rule of Section 10.6 does not apply. W = 0 \u2264 T = 1 (Section 2.3). covered = rows = A's planned file = 1. The digests recompute over the unchanged payload, and the frames agree.",
+   "every_other_rule_holds": "There are no sidecar rows; Section 10.6 permits an unprotected tail. W = 0 \u2264 T = 1 (Section 2.3). covered = rows = A's planned file = 1. The digests recompute over the unchanged payload, and the frames agree.",
    "caveat": "Section 15 gives this failure no name of its own; see NOTES.[outcome withheld]",
    "parent_blind_id": "neg-47"
   },

@@ -4684,7 +4684,7 @@
         "rules": [
           {
             "section": "14",
-            "quote": "Enforce the version-1 bound: `T − W < S × k` (at most one open epoch)."
+            "quote": "Validate the commit records: `T − W < S × k` (the bound Section 11.4 (W4) maintains);"
           },
           {
             "section": "14",
@@ -4700,7 +4700,7 @@
           },
           {
             "section": "15",
-            "quote": "ResumeAppend Section 14 invariant violation"
+            "quote": "ResumeAppend Section 11.5 or Section 14 invariant violation"
           }
         ],
         "order": "W ≤ T fails (8 > 6), a step-2 violation, which is ResumeAppend. The bound compares T − W = −2 exactly (Section 2.4) and holds, so it is not the rule that refuses.",
@@ -6200,7 +6200,7 @@
           },
           {
             "section": "10.6",
-            "quote": "when sidecars are present, `highest_protected_ordinal` equals `total_data_ordinals`, so finalization left no Object ordinal unprotected;"
+            "quote": "when sidecars are present, `highest_protected_ordinal` is at most `total_data_ordinals`; the range between them is unprotected and may be nonempty on a finalized tape; both are the recorded fields, and Section 7.4 separately requires each to equal the value recomputed from the map;"
           },
           {
             "section": "15",
@@ -6219,7 +6219,7 @@
           "replicas": {
             "A": {
               "valid": false,
-              "reason": "payload: TerminalIndexReplicaParse: T or W differs from the frame; recorded highest protected ordinal differs from recorded total data ordinals"
+              "reason": "payload: TerminalIndexReplicaParse: T or W differs from the frame"
             },
             "B": {
               "valid": true,
@@ -6304,7 +6304,7 @@
           },
           {
             "section": "10.6",
-            "quote": "when sidecars are present, `highest_protected_ordinal` equals `total_data_ordinals`, so finalization left no Object ordinal unprotected;"
+            "quote": "when sidecars are present, `highest_protected_ordinal` is at most `total_data_ordinals`; the range between them is unprotected and may be nonempty on a finalized tape; both are the recorded fields, and Section 7.4 separately requires each to equal the value recomputed from the map;"
           },
           {
             "section": "15",
@@ -6323,7 +6323,7 @@
           "replicas": {
             "A": {
               "valid": false,
-              "reason": "payload: TerminalIndexReplicaParse: T or W differs from the frame; recorded highest protected ordinal differs from recorded total data ordinals"
+              "reason": "payload: TerminalIndexReplicaParse: T or W differs from the frame"
             },
             "B": {
               "valid": true,
@@ -7883,7 +7883,7 @@
           },
           {
             "section": "15",
-            "quote": "ResumeAppend Section 14 invariant violation"
+            "quote": "ResumeAppend Section 11.5 or Section 14 invariant violation"
           }
         ],
         "order": "T and the append point overflow in step 1. Checked arithmetic rejects them, so the records do not determine one committed prefix and append point (Section 3.4), which is ResumeAppend.",

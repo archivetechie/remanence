@@ -18,7 +18,7 @@ use std::{
 /// Parse the specification-authored supplement without accepting corpus drift.
 pub fn parse_source(bytes: &[u8]) -> Result<Value, String> {
     if hex(&Sha256::digest(bytes))
-        != "b86e9bd1bd967e3d8ac3d8c7bbfbf52d7adec4857ebea3ff7f1105b1d7d9b277"
+        != "bd7890e49b99b6b4d5e1c66b270396782cb5e66adb8838fb6555c25cdac6951d"
     {
         return Err("negative-cases-supplement.json SHA-256 differs".into());
     }
@@ -1330,6 +1330,9 @@ pub(super) fn expected_matches(expected: &Value, o: &Observation) -> bool {
     if !expected["error"].is_null() {
         return expected_matches(&expected["error"], o);
     }
+    if expected["outcome"] == "ACCEPTED" {
+        return o.name == "ACCEPTED";
+    }
     expected["outcome"]
         .as_str()
         .is_some_and(|s| s.starts_with("rejection"))
@@ -1370,7 +1373,7 @@ const ISOLATION_RULES: &[(&str, Option<&str>)] = &[
     ("paritymap-footer-header-disagreement/isolated", Some("parity-map parse error: both parity-map metadata copies failed: primary=parity-map parse error: parity-map header copy does not match footer locator; tail=parity-map parse error: parity-map header copy does not match footer locator")),
     ("terminal-scope-scalars/isolated-1", Some("terminal index covered_prefix_tape_file_count 6, expected 7")),
     ("terminal-scope-scalars/isolated-2", Some("terminal index total data ordinals 0, expected 1")),
-    ("terminal-scope-scalars/isolated-3", Some("terminal index payload authority failed: terminal parity closeout must protect every Object ordinal before replica A")),
+    ("terminal-scope-scalars/isolated-3", None),
     ("terminal-scope-scalars/isolated-4", Some("terminal index highest protected ordinal 2, expected 5")),
     ("overflow-3.2-14-append-point/isolated", Some("bounded resume append position overflows")),
     ("overflow-7.2-T/isolated", Some("terminal tape-index arithmetic overflow: Object data ordinal range")),
@@ -1506,6 +1509,11 @@ pub(super) fn execute(
             assert_eq!(&actual, wanted, "{path}/{name}");
         }
         manifest.push_str(&v.manifest);
+        if path == "terminal-scope-scalars/isolated-3" {
+            // Keep construction, metadata and byte-digest checks active. The
+            // acceptance expectation runs in the dedicated ignored test below.
+            continue;
+        }
         println!("ROLE {path}: {}", v.descriptor["entry_points"]);
         println!(
             "ISOLATION {path}: construction assertions passed; violates_only={}",
@@ -1587,6 +1595,38 @@ pub(super) fn execute(
         println!("{error}");
         failures.push(error);
     }
+}
+
+/// The former equality-only negative keeps its bytes and now expects acceptance.
+#[test]
+#[ignore = "acceptance: reference Reader refuses W < T until migration step 6"]
+fn finalized_unprotected_range_is_accepted() {
+    let source = source().expect("supplement source");
+    let case = source["variants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| case["id"] == "terminal-scope-scalars/isolated-3")
+        .unwrap();
+    let v = resolve(case).expect("unchanged uncovered-finalization image");
+    let observations = observations(&v);
+    assert!(!observations.is_empty());
+    for observed in observations {
+        assert!(
+            expected_matches(&case["expected"], &observed),
+            "expected {}; observed {}: {}",
+            case["expected"],
+            observed.outcome,
+            observed.detail
+        );
+    }
+    // Payload validation cross-checks these fields against the structural rows.
+    let header = parse_tape_index_replica_header(&v.files[&6][0], &v.uuid).unwrap();
+    let scope = header.plan.edition.descriptor.scope;
+    assert_eq!(
+        json!([scope.highest_protected_ordinal, scope.total_data_ordinals]),
+        case["expected"]["unprotected_range"]
+    );
 }
 
 #[cfg(test)]

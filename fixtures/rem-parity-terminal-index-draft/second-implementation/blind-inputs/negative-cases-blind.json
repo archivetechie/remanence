@@ -1320,7 +1320,7 @@
      "offset": "0x050",
      "from": 0,
      "to": 1,
-     "must_match": "T recomputed = 0 (no Object rows). No sidecars, so the W = T rule does not apply and only the Section 7.4 cross-check fails; W (0) <= T (1) still holds"
+     "must_match": "T recomputed = 0 (no Object rows). Only the Section 7.4 cross-check fails; W (0) <= T (1) still holds"
     }
    ],
    "base": {
