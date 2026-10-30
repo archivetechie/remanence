@@ -17,6 +17,7 @@ const DEVICE: &str = "/dev/sg-cli-read-model";
 struct Transport {
     inner: ModelTransport,
     commands: Option<Arc<Mutex<Vec<Vec<u8>>>>>,
+    fail_allow: bool,
 }
 impl Transport {
     fn record(&self, cdb: &[u8]) {
@@ -37,6 +38,16 @@ impl SgTransport for Transport {
     fn execute_none(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
         self.record(cdb);
         if cdb[0] == 0x1e {
+            if cdb[4] == 0 && self.fail_allow {
+                self.fail_allow = false;
+                return Err(ScsiError::TransportError {
+                    status: 0,
+                    host_status: 3,
+                    driver_status: 0,
+                    info: 1,
+                    sense: vec![],
+                });
+            }
             return Ok(());
         }
         self.inner.execute_none(cdb)
@@ -45,6 +56,22 @@ impl SgTransport for Transport {
         self.inner.set_timeout_for(class);
     }
 }
+/// Share the sanctioned model-only removal-guard transport with library write tests.
+pub(super) fn library_transport(inner: ModelTransport) -> Box<dyn SgTransport> {
+    library_transport_with_allow_failure(inner, false)
+}
+/// Fail cleanup once, after the object's durable checkpoint, on the real CLI route.
+pub(super) fn library_transport_with_allow_failure(
+    inner: ModelTransport,
+    fail_allow: bool,
+) -> Box<dyn SgTransport> {
+    Box::new(Transport {
+        inner,
+        commands: None,
+        fail_allow,
+    })
+}
+
 fn mount<'a>(
     state: &'a mut StateHandle,
     world: &SharedVirtualWorld,
@@ -56,6 +83,7 @@ fn mount<'a>(
         Box::new(Transport {
             inner: ModelTransport::new(Arc::clone(world), DeviceRole::Drive { bay: BAY }),
             commands: None,
+            fail_allow: false,
         }),
         state,
         &root.join("locks"),
@@ -200,6 +228,7 @@ tape_catalog_dir = "{0}/cache"
                         let role = shared.lock().unwrap().role_for_path(path).unwrap();
                         Ok(Box::new(Transport {
                             inner: ModelTransport::new(Arc::clone(&shared), role),
+                            fail_allow: false,
                             commands: Some(Arc::clone(&trace)),
                         }))
                     })

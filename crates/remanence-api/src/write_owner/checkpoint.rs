@@ -938,6 +938,17 @@ fn perform_checkpoint_barrier_mode(
             )))
         });
     }
+    // WOR's adapter-only crash cut: journal append has fsynced, SQLite has not projected.
+    if let Some(fault) = cfg.mounted().and_then(|m| m.direct_replay_fault.as_ref()) {
+        fault
+            .abort_after_checkpoint_append(&record)
+            .map_err(|error| {
+                CheckpointBarrierFailure::after_journal(status_from_selected_write_error(
+                    selected,
+                    crate::PoolWriteError::InvalidInput(error),
+                ))
+            })?;
+    }
     *checkpoint_ordinal = next_ordinal;
     *tape_committed_object_count = next_committed_count;
     // Hold a competing SQLite writer only across projection, after journal sync.

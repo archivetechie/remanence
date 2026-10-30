@@ -1,7 +1,7 @@
 //! Explicitly gated checkpoint crash cut for the live direct-replay scenario.
 //!
 //! This private hook is inert unless both exact environment variables are set.
-//! It publishes durable evidence only after the direct writer's checkpoint
+//! It publishes durable evidence only after the mounted actor's checkpoint
 //! append has fsynced, then aborts before the corresponding SQLite projection.
 
 use std::ffi::OsStr;
@@ -63,12 +63,7 @@ impl DirectReplayFaultPlan {
             )
         })?;
         let plan = Self::parse(&value)?;
-        if plan.tape_uuid != tape_uuid || plan.caller_object_id != caller_object_id {
-            return Err(
-                "direct-replay fault plan does not match the exact tape and caller object id"
-                    .to_string(),
-            );
-        }
+        plan.require_object(tape_uuid, caller_object_id)?;
         require_future_confined(&plan.evidence_path, "evidence")?;
         if plan.evidence_path.exists() {
             return Err(format!(
@@ -77,6 +72,21 @@ impl DirectReplayFaultPlan {
             ));
         }
         Ok(Some(plan))
+    }
+
+    /// Reject another object before media dispatch, including through the raw adapter API.
+    pub(crate) fn require_object(
+        &self,
+        tape_uuid: [u8; 16],
+        caller_object_id: &str,
+    ) -> Result<(), String> {
+        if self.tape_uuid != tape_uuid || self.caller_object_id != caller_object_id {
+            return Err(
+                "direct-replay fault plan does not match the exact tape and caller object id"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 
     fn parse(value: &Value) -> Result<Self, String> {
@@ -379,6 +389,23 @@ mod tests {
             seal_due: None,
         };
 
+        let mut invalid = record.clone();
+        invalid.tape_uuid = [0x99; 16];
+        assert!(plan.publish(&invalid).is_err());
+        invalid = record.clone();
+        invalid.objects.push(record.objects[0].clone());
+        assert!(
+            plan.publish(&invalid).is_err(),
+            "the cut requires exactly one object"
+        );
+        invalid = record.clone();
+        invalid.objects[0].object.caller_object_id = Some("other-caller".into());
+        assert!(plan.publish(&invalid).is_err());
+        assert!(
+            !plan.evidence_path.exists(),
+            "mismatches publish no evidence"
+        );
+        assert!(plan.require_object(tape_uuid, "other-caller").is_err());
         plan.publish(&record).expect("publish evidence");
         let evidence: Value =
             serde_json::from_slice(&fs::read(&plan.evidence_path).expect("read evidence"))

@@ -52,6 +52,8 @@ struct Owner {
     // Step-1 temporary deviation (Q1): retain StateHandle's state.lock AND the
     // owned device lock in the actor's MountedTape. Device-lock-only is step 5.
     state: StateHandle,
+    // Retain the caller's actual changer guard until the mounted actor has joined.
+    _library_guard: Option<remanence_library::ChangerHandle>,
 }
 impl Owner {
     fn finish(mut self, propagate_panic: bool) -> Result<()> {
@@ -151,6 +153,95 @@ impl MountedDrive {
         mount.finish().map_err(mount_error)?;
         Self::start(state, mounted, policy.clone(), audit)
     }
+    /// Own an already placed library drive, its real bay key, state and library guard.
+    /// The serial device lock coordinates with standalone use of the same drive;
+    /// bay sessions and calibration remain the daemon's responsibility.
+    /// No load or changer command is issued here. The optional WOR plan is bound
+    /// to this one caller before any actor write; daemon construction never reads it.
+    pub fn from_placed_library(
+        mut state: StateHandle,
+        library: remanence_library::LibraryHandle,
+        drive: remanence_library::DriveHandle,
+        policy: StaticAllowlist,
+        tape_uuid: crate::TapeUuid,
+        caller_object_id: &str,
+        lock_root: &Path,
+    ) -> Result<Self> {
+        let key = drive.endpoint().durable_key().ok_or_else(|| {
+            ActorFailure::from(Status::failed_precondition(
+                "library drive requires a durable bay",
+            ))
+        })?;
+        let remanence_library::DriveKey::Bay {
+            library_serial,
+            bay,
+        } = key
+        else {
+            return Err(
+                Status::failed_precondition("placed library drive requires a library bay").into(),
+            );
+        };
+        if library_serial != &library.library().serial {
+            return Err(Status::failed_precondition(
+                "drive does not belong to the retained library",
+            )
+            .into());
+        }
+        let serial = library
+            .library()
+            .drive_bays
+            .iter()
+            .find(|b| b.element_address == *bay)
+            .and_then(|b| b.installed.as_ref())
+            .map(|d| d.serial.clone())
+            .ok_or_else(|| {
+                ActorFailure::from(Status::failed_precondition(
+                    "placed bay has no installed drive",
+                ))
+            })?;
+        let fault = write_owner::direct_replay_fault::DirectReplayFaultPlan::from_env_for_object(
+            tape_uuid,
+            caller_object_id,
+        )
+        .map_err(|e| {
+            let error = crate::PoolWriteError::InvalidInput(e);
+            ActorFailure::from(ActorFailure::attach(
+                Status::invalid_argument(error.to_string()),
+                error,
+            ))
+        })?;
+        let path = Path::new("library drive");
+        let mut mount =
+            OperatorMount::from_placed_library(path, drive, &mut state, &serial, lock_root)
+                .map_err(mount_error)?;
+        let mounted = mount
+            .mount(MountTarget::Device {
+                path: path.into(),
+                expected_uuid: Some(tape_uuid),
+            })
+            .map_err(mount_error)?;
+        let audit = mount.context.audit_error.clone();
+        mount.finish().map_err(mount_error)?;
+        let mut cfg = mounted_config(&state, &mounted, policy, audit)?;
+        if let write_owner::ActorPlacement::Mounted(context) = &mut cfg.placement {
+            context.direct_replay_fault = fault;
+        }
+        Self::start_configured(state, mounted, cfg, Some(library.into_changer()))
+    }
+    /// Write one object through the actor without standalone version policy.
+    pub fn write_checkpointed(
+        &mut self,
+        request: crate::WriteObjectToPoolRequest,
+    ) -> std::result::Result<crate::MountedWriteResult, crate::MountError> {
+        let owner = self
+            .owner
+            .as_mut()
+            .ok_or_else(|| crate::mount_support::refusal("mounted drive finished"))?;
+        self.client
+            .reconcile_checkpoints(&mut owner.state)
+            .map_err(crate::MountError::Actor)?;
+        write_checkpointed(&mut self.client, &mut owner.state, request)
+    }
     fn start(
         state: StateHandle,
         mounted: crate::MountedTape,
@@ -158,6 +249,14 @@ impl MountedDrive {
         audit_error: Arc<Mutex<Option<String>>>,
     ) -> Result<Self> {
         let cfg = mounted_config(&state, &mounted, policy, audit_error)?;
+        Self::start_configured(state, mounted, cfg, None)
+    }
+    fn start_configured(
+        state: StateHandle,
+        mounted: crate::MountedTape,
+        cfg: write_owner::WriteOwnerConfig,
+        library_guard: Option<remanence_library::ChangerHandle>,
+    ) -> Result<Self> {
         let tape_uuid = mounted.tape_uuid;
         let endpoint = cfg.mounted().expect("mounted config").endpoint.clone();
         let (tx, thread) = write_owner::spawn_mounted_actor(mounted, cfg)
@@ -167,6 +266,7 @@ impl MountedDrive {
                 tx: tx.clone(),
                 thread,
                 state,
+                _library_guard: library_guard,
             }),
             client: MountedCommands::new(tx, tape_uuid, endpoint),
         })
@@ -676,6 +776,7 @@ pub(crate) fn mounted_config(
             actor: AuditActor::local_user(),
             audit_error,
             audit_session: Arc::new(Mutex::new(None)),
+            direct_replay_fault: None,
         }),
         snapshot_miss_alarm: c.drives.snapshot_miss_alarm,
         managed_library_serials: Arc::new(Default::default()),
@@ -728,6 +829,13 @@ pub(crate) fn put_version(
             let previously_claimed = client.receipts.len();
             match write_checkpointed(client, state, request) {
                 Ok(receipt) => Ok(Ok((receipt, reason))),
+                Err(crate::MountError::Committed {
+                    receipt, failure, ..
+                }) => Err(crate::MountError::Committed {
+                    receipt,
+                    reason,
+                    failure,
+                }),
                 Err(failure) => {
                     if let Some(record) = client.receipts[previously_claimed..]
                         .iter()
@@ -817,8 +925,19 @@ pub(crate) fn write_checkpointed(
                             .iter()
                             .any(|old| old.object_id == record.object_id)
                         {
-                            client.receipts.push(record);
+                            client.receipts.push(record.clone());
                         }
+                        let receipt = crate::standalone_write::receipt(
+                            state.catalog_index(),
+                            record,
+                            &pool,
+                            false,
+                        )?;
+                        return Err(MountError::Committed {
+                            receipt: Box::new(receipt),
+                            reason: "new",
+                            failure: Box::new(MountError::Actor(error)),
+                        });
                     }
                 }
             }

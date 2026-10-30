@@ -1,4 +1,4 @@
-//! Pool-targeted direct archive tape helpers.
+//! Pool-targeted archive tape helpers using the mounted write actor.
 //!
 //! This module implements:
 //! - `rem-debug archive write` — write one file to a pool-selected tape
@@ -19,9 +19,9 @@ use remanence_api::{
     load_tape_by_uuid, position_to_object,
     read_core::{read_object_payload, CapturePayloadSink},
     replay_committed_pool_write_from_state, select_tape_in_pool_for_write_session,
-    write_to_selected_drive_checkpointed, BotRelativeTapeFile, ChangerMount, MountBackend,
-    MountTarget, MountedTape, PoolWriteObjectRecord, PoolWriteRepresentation, PoolWriteResult,
-    TapeUuid, WriteObjectToPoolRequest,
+    BotRelativeTapeFile, ChangerMount, MountBackend, MountTarget, MountedTape,
+    PoolWriteObjectRecord, PoolWriteRepresentation, PoolWriteResult, TapeUuid,
+    WriteObjectToPoolRequest,
 };
 use remanence_format::{
     read_encrypted_rem_object_with_manifest_anchor, RemTarReadObject, MANIFEST_PATH,
@@ -67,6 +67,27 @@ pub fn run_archive_write(
     allow_derived: &[String],
     out: &mut dyn Write,
     err: &mut dyn Write,
+) -> ExitCode {
+    run_archive_write_with_lock_root(
+        report,
+        args,
+        allow,
+        allow_derived,
+        out,
+        err,
+        Path::new("/run/lock/rem"),
+    )
+}
+
+/// Inject only the lock namespace; selection, loading, actor and rendering stay production.
+fn run_archive_write_with_lock_root(
+    report: &remanence_library::DiscoveryReport,
+    args: &ArchiveWriteArgs,
+    allow: &[String],
+    allow_derived: &[String],
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    lock_root: &Path,
 ) -> ExitCode {
     // -- Validate inputs before any I/O ----------------------------------
     if !args.file.exists() {
@@ -212,7 +233,7 @@ pub fn run_archive_write(
     };
 
     // -- Load tape by UUID ------------------------------------------------
-    let mut drive = {
+    let drive = {
         let index = state_handle.catalog_index();
         match load_tape_by_uuid(index, &mut library_handle, &policy, &tape_uuid) {
             Ok(d) => d,
@@ -223,22 +244,79 @@ pub fn run_archive_write(
         }
     };
 
-    let result =
-        write_to_selected_drive_checkpointed(&mut state_handle, &mut drive, request, selected);
-
-    match result {
-        Ok(PoolWriteResult { object, .. }) => print_archive_write_success(
-            &object,
-            &pool_id,
-            representation.recipient_epochs.as_deref(),
-            args,
-            out,
-        ),
-        Err(e) => {
-            let _ = writeln!(err, "error: write object: {e}");
-            ExitCode::from(1)
+    let mut actor = match remanence_api::engine::drive_adapter::MountedDrive::from_placed_library(
+        state_handle,
+        library_handle,
+        drive,
+        policy,
+        tape_uuid,
+        &request.caller_object_id,
+        lock_root,
+    ) {
+        Ok(actor) => actor,
+        Err(error) => {
+            let _ = writeln!(err, "error: write object: {}", local_write_error(error));
+            return ExitCode::from(1);
         }
+    };
+    let result = actor.write_checkpointed(request);
+    let finished = actor.finish();
+    print_archive_write_outcome(
+        result,
+        finished,
+        &pool_id,
+        representation.recipient_epochs.as_deref(),
+        args,
+        out,
+        err,
+    )
+}
+
+/// A durable object keeps its locator even when subsequent actor work or cleanup fails.
+fn print_archive_write_outcome(
+    result: Result<remanence_api::MountedWriteResult, remanence_api::MountError>,
+    finished: Result<(), remanence_api::engine::drive_adapter::ActorFailure>,
+    pool_id: &str,
+    recipients: Option<&[serde_json::Value]>,
+    args: &ArchiveWriteArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let (receipt, failure) = match result {
+        Ok(receipt) => (Some(receipt), None),
+        Err(remanence_api::MountError::Committed {
+            receipt, failure, ..
+        }) => (Some(*receipt), Some(*failure)),
+        Err(error) => (None, Some(error)),
+    };
+    // Publish the committed locator before reporting either later failure.
+    let code = receipt.map_or(ExitCode::SUCCESS, |receipt| {
+        print_archive_write_success(&receipt.object, pool_id, recipients, args, out)
+    });
+    let failed = failure.is_some() || finished.is_err();
+    if let Some(error) = failure {
+        let message = match error {
+            remanence_api::MountError::Actor(error) => local_write_error(error),
+            error => error.to_string(),
+        };
+        let _ = writeln!(err, "error: write object: {message}");
     }
+    if let Err(error) = finished {
+        let _ = writeln!(err, "error: write object: {}", local_write_error(error));
+    }
+    if failed {
+        ExitCode::from(1)
+    } else {
+        code
+    }
+}
+
+/// Preserve the direct writer's PoolWriteError text across the local actor envelope.
+fn local_write_error(error: remanence_api::engine::drive_adapter::ActorFailure) -> String {
+    error.pool_write_error.as_ref().map_or_else(
+        || error.status.message().to_string(),
+        |cause| cause.to_string(),
+    )
 }
 
 fn committed_recipient_epochs(object: &PoolWriteObjectRecord) -> Option<Vec<serde_json::Value>> {
@@ -2136,3 +2214,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod write_tests;

@@ -64,6 +64,8 @@ pub(crate) enum ManualFinalizeTapeResult {
 /// preflight. Keeping this smaller than `WriteOwnerConfig` makes it explicit
 /// that admission has no drive or changer capability.
 pub(crate) struct ManualFinalizePreflightConfig<'a> {
+    /// Preserve local causes through host-only mounted recovery as well as media work.
+    pub(crate) mounted_endpoint: Option<&'a remanence_library::DriveKey>,
     pub(crate) checkpoint_journal_dir: &'a Path,
     pub(crate) audit_dir: &'a Path,
     pub(crate) audit_fsync: bool,
@@ -88,9 +90,11 @@ impl<'a> From<&'a WriteOwnerConfig> for TerminalFinalizeAuditConfig<'a> {
 }
 
 /// Persistence-only context shared by actor and standalone terminal writers.
-/// It carries no changer, bay, reservation pool, or discovery authority.
+/// It carries only persistence settings and optional local error identity, with no motion capability.
 #[derive(Clone)]
 pub(crate) struct TerminalWriteConfig {
+    /// Local mounted ownership carries typed causes even for an actual library bay.
+    pub mounted_endpoint: Option<remanence_library::DriveKey>,
     pub checkpoint_journal_dir: std::path::PathBuf,
     pub audit_dir: std::path::PathBuf,
     pub audit_fsync: bool,
@@ -107,6 +111,7 @@ impl TerminalConfig for TerminalWriteConfig {
 impl TerminalConfig for WriteOwnerConfig {
     fn terminal_config(&self) -> TerminalWriteConfig {
         TerminalWriteConfig {
+            mounted_endpoint: self.mounted().map(|m| m.endpoint.clone()),
             checkpoint_journal_dir: self.checkpoint_journal_dir.clone(),
             audit_dir: self.audit_dir.clone(),
             audit_fsync: self.audit_fsync,

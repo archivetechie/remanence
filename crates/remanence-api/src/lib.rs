@@ -96,7 +96,6 @@ pub use catalogless_restore::{
 mod catalog_request;
 mod daemon_catalog_services;
 mod diagnostics;
-mod direct_replay_fault;
 mod drive_collection;
 mod drive_mode;
 mod drive_pool;

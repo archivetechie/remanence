@@ -23,6 +23,7 @@ pub(crate) struct MountedDriveContext {
     pub actor: AuditActor,
     pub audit_error: Arc<Mutex<Option<String>>>,
     pub audit_session: Arc<Mutex<Option<Uuid>>>,
+    pub direct_replay_fault: Option<super::direct_replay_fault::DirectReplayFaultPlan>,
 }
 
 #[derive(Clone)]
