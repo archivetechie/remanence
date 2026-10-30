@@ -1,7 +1,9 @@
 //! Production standalone dispatch. Dependencies are filesystem roots, enumeration
 //! and transport only; the public integration seam runs this same parser and path.
 use clap::{Parser, Subcommand};
-use remanence_api::{MountBackend, MountTarget, OperatorMount};
+use remanence_api::mount_support::{MountBackend, MountTarget, OperatorMount};
+#[path = "standalone_writing.rs"]
+mod writing;
 use remanence_library::{
     BlockSize, DeviceAttachment, DiscoveryReport, DriveHandle, DriveHandleSource, IoErrorKind,
     SgTransport, StaticAllowlist,
@@ -19,7 +21,7 @@ use std::{
 };
 use uuid::Uuid;
 
-// One-cartridge invocations close a parity epoch at each checkpoint. Keep the
+// One-cartridge invocations close a partial parity epoch when the owner finishes. Keep the
 // same RS(128,4) code with one stripe so a small home write does not emit the
 // library default's 512 MiB sidecar. Operators can select --scheme default.
 const HOME_PARITY_HELP: &str = "New home-mode CLI pools default to custom:128,4,1. At 256 KiB blocks, contiguous-loss tolerance is 1 MiB versus 512 MiB for the library geometry, reducing parity overhead for small writes. Use rem pool new NAME --scheme default to select the block-size-aware library geometry, then rem tape init --pool NAME.";
@@ -1502,6 +1504,54 @@ where
             .map_err(err)?;
         return Ok(json!({"released":device}));
     }
+    if matches!(
+        cli.command,
+        Command::Put { .. }
+            | Command::Tape {
+                command: Tape::Finalize { .. } | Tape::SupersedeTail { .. }
+            }
+    ) {
+        let expected = match &cli.command {
+            Command::Tape {
+                command: Tape::Finalize { tape, .. },
+            } => tape.map(|t| *t.as_bytes()),
+            _ => None,
+        };
+        let mut actor =
+            remanence_api::engine::drive_adapter::MountedDrive::with_transport_and_reservation(
+                state,
+                device,
+                &policy,
+                transport,
+                &env.locks,
+                expected,
+                cli.reserve,
+            )
+            .map_err(err)?;
+        let result = (|| {
+            let previous_fence_count = output.active_fences.len();
+            output.active_fences = remanence_api::mount_support::standalone_fence_policy(
+                actor.catalog_index(),
+                None,
+                None,
+                false,
+            )
+            .map_err(err)?
+            .iter()
+            .map(crate::tape_io_fence_json)
+            .collect();
+            if previous_fence_count != output.active_fences.len()
+                && !output.active_fences.is_empty()
+            {
+                writeln!(errors, "warning: active tape-I/O fences ({}); reads remain available; inspect rem tape quarantine list", output.active_fences.len()).map_err(err)?;
+            }
+            writing::dispatch(cli, &mut actor, output)
+        })();
+        let finished = actor.finish().map_err(err);
+        let value = result?;
+        finished?;
+        return Ok(value);
+    }
     let mut backend =
         OperatorMount::with_transport(device, &policy, transport, &mut state, &env.locks)
             .map_err(err)?;
@@ -1570,124 +1620,7 @@ where
     }
     let uuid = mounted.tape_uuid;
     let result = match &cli.command {
-        Command::Put {
-            paths,
-            pool,
-            recipient,
-            allow_plaintext_copy,
-            tape: guard,
-        } => {
-            backend.reconcile_checkpoints().map_err(err)?;
-            let tape = backend
-                .catalog_index()
-                .get_tape(&uuid)
-                .map_err(err)?
-                .ok_or("loaded tape is not catalogued; use tape adopt")?;
-            if let Some(guard) = guard {
-                if !Uuid::parse_str(guard)
-                    .map(|u| *u.as_bytes() == uuid)
-                    .unwrap_or(false)
-                    && tape.voltag.as_deref() != Some(guard.as_str())
-                {
-                    return Err(format!(
-                        "requested tape {guard} differs from loaded tape {} ({})",
-                        tape.voltag.as_deref().unwrap_or("unlabelled"),
-                        Uuid::from_bytes(uuid)
-                    ));
-                }
-            }
-            let loaded = tape
-                .pool_id
-                .ok_or("loaded tape has no pool; use tape assign-pool")?;
-            if let Some(p) = pool {
-                if p != &loaded {
-                    return Err(format!(
-                        "requested pool {p} differs from loaded tape pool {loaded}"
-                    ));
-                }
-            }
-            let representation = if recipient.is_empty() {
-                remanence_api::PoolWriteRepresentation::Plaintext
-            } else {
-                remanence_api::PoolWriteRepresentation::Encrypted {
-                    recipients: crate::pool_ops::read_recipient_files(recipient)?,
-                }
-            };
-            let mut objects = Vec::new();
-            let mut failed = None;
-            for p in paths {
-                let archive = p
-                    .file_name()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| p.clone());
-                let result = collect_files(p, archive, &mut |source, archive_path, kind| {
-                    if let Some(kind) = kind {
-                        return output.receipt(
-                            json!({"event":"skipped_unsupported","path":archive_path.to_string_lossy(),"kind":kind}),
-                        );
-                    }
-                    let request = remanence_api::WriteObjectToPoolRequest {
-                        pool_id: loaded.clone(),
-                        caller_object_id: format!("put:{}", Uuid::new_v4()),
-                        archive_path: archive_path.clone(),
-                        source: remanence_api::WriteObjectSource::Path(source.into()),
-                        expected_content_sha256: None,
-                        expected_object_id: None,
-                        representation: representation.clone(),
-                        input_kind: remanence_api::WriteObjectInputKind::LogicalFile,
-                    };
-                    let outcome = backend.put_path_version_with_policy(
-                        &mut mounted,
-                        request,
-                        *allow_plaintext_copy,
-                    );
-                    if let Err(remanence_api::MountError::PlaintextCopy { newest_version }) =
-                        &outcome
-                    {
-                        return output.receipt(json!({"event":"refused","reason":"would_store_plaintext_copy_of_encrypted","path":archive_path.to_string_lossy(),"newest_version":newest_version}));
-                    }
-                    match outcome.map_err(|error| {
-                        output.tape_continuation = tape_continuation(&error);
-                        format!("{}: {error}", source.display())
-                    })? {
-                        Ok((result, reason)) => {
-                            let mut locator = Vec::new();
-                            crate::pool_ops::print_locator_json_with_recipients(
-                                &result.object,
-                                &loaded,
-                                None,
-                                &mut locator,
-                            );
-                            let locator: Value = serde_json::from_slice(&locator).map_err(err)?;
-                            output.receipt(json!({"event":"written","reason":reason,"path":archive_path.to_string_lossy(),"object_id":Uuid::from_bytes(result.object.object_id),"tape_uuid":Uuid::from_bytes(uuid),"label":tape.voltag,"bytes":result.object.logical_size_bytes}))?;
-                            objects.push(locator);
-                        }
-                        Err(version) => {
-                            let (copy, label) = version
-                                .copies
-                                .first()
-                                .ok_or("committed version has no copy")?;
-                            output.receipt(json!({"event":"already_stored","path":archive_path.to_string_lossy(),"object_id":version.object_id,"tape_uuid":Uuid::from_slice(copy).map_err(err)?,"label":label}))?;
-                        }
-                    }
-                    Ok(())
-                });
-                if let Err(failure) = result {
-                    failed = Some(failure);
-                    break;
-                }
-            }
-            output.finish(failed.as_ref(), &loaded)?;
-            match failed {
-                Some((path, error)) => Err(format!("{}: {error}", path.display())),
-                None if output.receipts.iter().any(|r| r["event"] == "refused") => {
-                    Err("one or more files refused".into())
-                }
-                None => Ok(
-                    json!({"tape":Uuid::from_bytes(uuid),"pool":loaded,"objects":objects,"receipts":output.receipts,"summary":output.summary}),
-                ),
-            }
-        }
+        Command::Put { .. } => unreachable!("actor dispatch"),
         Command::Get {
             object,
             version,
@@ -1965,74 +1898,12 @@ where
                         Ok(json!({"generation":generation}))
                     })
                     .map_err(err),
-                Tape::SupersedeTail {
-                    acknowledge_tape,
-                    confirm_supersede,
-                } => {
-                    let discarded = backend.supersede_tail(&mut mounted, acknowledge_tape, |expected, found| {
-                        eprintln!("Tail to discard: {}", found.join(", "));
-                        let confirmation = match confirm_supersede {
-                            Some(value) => value.clone(),
-                            None => {
-                                use std::io::IsTerminal;
-                                if !std::io::stdin().is_terminal() {
-                                    return Err(format!("non-interactive supersede requires --confirm-supersede {expected:?}"));
-                                }
-                                eprint!("Type {expected:?} to discard this tail: ");
-                                std::io::stderr().flush().map_err(err)?;
-                                let mut line = String::new();
-                                std::io::stdin().read_line(&mut line).map_err(err)?;
-                                line.trim_end_matches(['\r', '\n']).to_owned()
-                            }
-                        };
-                        if confirmation != expected { return Err("supersede confirmation did not match".into()); }
-                        Ok(())
-                    }).map_err(err)?;
-                    Ok(json!({"discarded_object_ids": discarded}))
-                }
+                Tape::SupersedeTail { .. } => unreachable!("actor dispatch"),
                 Tape::ImportJournals { from } => {
                     backend.import_journals(&mut mounted, from).map_err(err)?;
                     Ok(json!({"imported_from":from}))
                 }
-                Tape::Finalize {
-                    tape,
-                    acknowledge_tape,
-                    reason,
-                    idempotency_key,
-                    expected_pool,
-                } => {
-                    let row = backend
-                        .catalog_index()
-                        .get_tape(&uuid)
-                        .map_err(err)?
-                        .ok_or("loaded tape is not catalogued")?;
-                    if Uuid::parse_str(acknowledge_tape)
-                        .ok()
-                        .map(|u| *u.as_bytes())
-                        != Some(uuid)
-                        && row.voltag.as_deref() != Some(acknowledge_tape.as_str())
-                    {
-                        return Err("--acknowledge-tape does not match the loaded tape".into());
-                    }
-                    let result = backend
-                        .finalize(
-                            &mut mounted,
-                            remanence_api::StandaloneFinalizeRequest {
-                                tape_uuid: *tape.unwrap_or(Uuid::from_bytes(uuid)).as_bytes(),
-                                acknowledge_tape: uuid,
-                                reason: reason
-                                    .clone()
-                                    .unwrap_or_else(|| DEFAULT_FINALIZE_REASON.into()),
-                                idempotency_key: idempotency_key
-                                    .unwrap_or_else(|| default_finalize_key(uuid)),
-                                expected_pool_id: expected_pool.clone().or(row.pool_id),
-                            },
-                        )
-                        .map_err(err)?;
-                    Ok(
-                        json!({"finalized": matches!(result.outcome, remanence_state::TerminalFinalizationOutcome::Finalized | remanence_state::TerminalFinalizationOutcome::FinalizedDegraded), "outcome": result.outcome.as_str(), "operation_id": result.operation_id, "completed_replicas": result.completed_replicas, "edition_digest": crate::bytes_to_hex(&result.edition_digest), "layout_digest": crate::bytes_to_hex(&result.layout_digest)}),
-                    )
-                }
+                Tape::Finalize { .. } => unreachable!("actor dispatch"),
                 _ => unreachable!("pre-mount command"),
             }
         }
@@ -2047,12 +1918,27 @@ fn tape_continuation(error: &remanence_api::MountError) -> bool {
     if matches!(error, remanence_api::MountError::EarlyWarning) {
         return true;
     }
-    matches!(error, remanence_api::MountError::PoolWrite(cause) if matches!(cause.as_ref(),
-    remanence_api::PoolWriteError::SelectedTapeInsufficientCapacity { .. }
-    | remanence_api::PoolWriteError::TerminalCloseRequired { .. }
-    | remanence_api::PoolWriteError::Parity(remanence_parity::ParityError::CapacityReserveExceeded {
-        cause: remanence_parity::CapacityReserveCause::TapeCapacity, ..
-    })))
+    if let remanence_api::MountError::Committed { failure, .. } = error {
+        return tape_continuation(failure);
+    }
+    let cause = match error {
+        remanence_api::MountError::PoolWrite(cause) => Some(cause.as_ref()),
+        remanence_api::MountError::Actor(error) => error.pool_write_error.as_deref(),
+        _ => None,
+    };
+    matches!(
+        cause,
+        Some(
+            remanence_api::PoolWriteError::SelectedTapeInsufficientCapacity { .. }
+                | remanence_api::PoolWriteError::TerminalCloseRequired { .. }
+                | remanence_api::PoolWriteError::Parity(
+                    remanence_parity::ParityError::CapacityReserveExceeded {
+                        cause: remanence_parity::CapacityReserveCause::TapeCapacity,
+                        ..
+                    }
+                )
+        )
+    )
 }
 
 /// Stream receipts before proceeding to another file, retaining them for the envelope.

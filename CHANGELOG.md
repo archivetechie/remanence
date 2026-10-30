@@ -7,6 +7,15 @@ per-release summaries.
 <!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_backend.rs crates/remanence-state/src/index.rs crates/remanence-library/src/discovery.rs @ 638210f7 -->
 ## Unreleased
 
+- Standalone `rem put`, `rem tape finalize` and `rem tape supersede-tail` now
+  run the daemon's write actor in process on the operator-mounted drive. Version
+  skips, durable receipts and explicit recovery remain available. Init retains
+  its existing path. Temporary step-1 deviation: the adapter holds both the
+  owned device lock and `state.lock`; device-lock-only coordination lands in
+  architecture step 5. A failed ALLOW or RELEASE at the end of a standalone
+  write, finalize or supersede is now reported as a failure; previously it was
+  only logged.
+
 - Test infrastructure: the chaos model separates buffered tape records from
   durable records, models power cuts and lost command responses, and supplies
   an in-memory file/directory model with torn writes and failed syncs. Checkpoint,

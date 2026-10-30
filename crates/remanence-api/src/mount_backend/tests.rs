@@ -1,7 +1,7 @@
 //! Model coverage for invocation boundaries, durable crash cuts, and the shared
 //! finalization/import funnels. Transport injection never substitutes a writer.
 use super::*;
-use crate::{mount_backend::StandaloneFinalizeRequest, WriteObjectToPoolRequest};
+use crate::{StandaloneFinalizeRequest, WriteObjectToPoolRequest};
 use remanence_chaos::model::{
     DeviceRole, ModelTransport, Record, SharedVirtualWorld, VirtualTape, VirtualWorld,
 };
@@ -1359,7 +1359,7 @@ fn append_for_rollback(
     world: &SharedVirtualWorld,
     root: &Path,
     name: &str,
-) -> Result<crate::PoolWriteResult, MountError> {
+) -> Result<crate::MountedWriteResult, MountError> {
     let mut mount = backend(state, world, &root.join("locks"), fault()).unwrap();
     let mut mounted = mount.mount(target()).unwrap();
     let result = mount.write_checkpointed(&mut mounted, request(root, name));

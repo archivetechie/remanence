@@ -137,6 +137,15 @@ pub enum MountError {
     /// Preserve typed tape failures until the command chooses continuation advice.
     #[error("{0}")]
     PoolWrite(Box<crate::PoolWriteError>),
+    #[error("{0}")]
+    Actor(crate::engine::drive_adapter::ActorFailure),
+    /// The object checkpoint committed before later automatic work failed.
+    #[error("{failure}")]
+    Committed {
+        receipt: Box<crate::MountedWriteResult>,
+        reason: &'static str,
+        failure: Box<MountError>,
+    },
     /// A durable terminal projection records hardware early warning.
     #[error("tape closed after hardware early warning; continue on the next tape")]
     EarlyWarning,
@@ -974,3 +983,14 @@ pub(crate) fn raise_standalone_fence(
 #[cfg(test)]
 #[path = "mount_backend/tests.rs"]
 mod tests;
+
+impl OperatorMount<'_> {
+    /// Reconcile durable checkpoint authority before any standalone catalog decision.
+    pub fn reconcile_checkpoints(&mut self) -> Result<(), MountError> {
+        if !self.checkpoints_reconciled {
+            crate::reconcile_checkpoint_journal_projections(self.state).map_err(refusal)?;
+            self.checkpoints_reconciled = true;
+        }
+        Ok(())
+    }
+}

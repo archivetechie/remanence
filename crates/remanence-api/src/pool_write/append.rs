@@ -6,6 +6,7 @@ use super::capacity::{
     ensure_selected_tape_has_capacity, parity_capacity_basis_blocks,
     reserve_parity_object_capacity, uuid_text,
 };
+use super::model::require_rewritable_object_media;
 use super::model::{
     parity_post_write_projection_gate, AppendCommitDiagnostics, BatchedNoParityAppendContext,
     CapacityTrackingRawTapeSink, PoolWriteDurability, PoolWriteError, PoolWriteResult,
@@ -24,7 +25,8 @@ use super::prepare::{
 };
 use super::staging::{CountingBlockSink, LiveCounterBlockSink};
 use crate::bytes_to_hex;
-use remanence_library::BlockSink;
+use crate::verify_tape_identity;
+use remanence_library::{BlockSink, DriveHandle, DriveHandleSource};
 use remanence_parity::{
     CommittedBundle, CommittedBundleKind, ParityConfig, ParityScheme, ParitySink,
     ParitySinkSessionState, RawTapeSink, TapeFileEntry, TapeFileJournal, TapeFileKind,
@@ -463,4 +465,33 @@ pub(super) fn write_to_selected_tape_inner<S: BlockSink + ?Sized>(
             durability,
         ),
     }
+}
+
+/// Re-establish readiness, removal lock, BOT identity, mode, and the exact
+/// durable append cursor before any post-checkpoint terminal modification.
+pub(crate) fn reprove_checkpoint_boundary(
+    drive: &mut DriveHandle,
+    record: &remanence_state::CheckpointJournalRecord,
+) -> Result<(), PoolWriteError> {
+    drive.clear_append_admission();
+    drive
+        .test_unit_ready()
+        .map_err(|e| PoolWriteError::InvalidInput(e.to_string()))?;
+    drive
+        .prevent_medium_removal()
+        .map_err(|e| PoolWriteError::InvalidInput(e.to_string()))?;
+    drive.rewind()?;
+    let generation = drive.identity_generation();
+    verify_tape_identity(&mut DriveHandleSource(drive), &record.tape_uuid)?;
+    let config = drive.read_config()?;
+    require_rewritable_object_media(config)?;
+    crate::drive_mode::configure_fixed_uncompressed_write(drive, config, record.block_size)?;
+    drive.bind_identity_generation(generation)?;
+    let position = drive.locate(record.eod_lba)?;
+    if position.partition != record.eod_partition || position.lba != record.eod_lba {
+        return Err(PoolWriteError::InvalidInput(
+            "checkpoint append position mismatch".into(),
+        ));
+    }
+    Ok(())
 }

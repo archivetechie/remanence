@@ -108,11 +108,13 @@ mod library;
 mod live_status;
 mod mount;
 mod mount_backend;
-mod mount_support;
-pub use mount_backend::{
+pub mod mount_support;
+mod standalone_init;
+mod standalone_write;
+pub use mount_support::{
     ChangerMount, MountBackend, MountEndpoint, MountError, MountTarget, MountedTape, OperatorMount,
-    StandaloneFinalizeRequest,
 };
+pub use standalone_write::{MountedWriteResult, StandaloneFinalizeRequest};
 mod object_fault;
 mod object_position;
 pub use object_position::{position_to_object, BotRelativeTapeFile, ObjectPositionOrigin};
@@ -239,7 +241,7 @@ pub fn validate_spooled_object(
 }
 
 /// Standalone fence admission and reporting.
-pub use mount_backend::{standalone_fence_policy, standalone_fence_releasable};
+pub use mount_support::{standalone_fence_policy, standalone_fence_releasable};
 
 /// In-process ownership of today's session engine.
 pub mod engine;

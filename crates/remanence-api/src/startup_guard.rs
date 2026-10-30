@@ -36,11 +36,11 @@ pub(crate) fn reject_active_tape_io_fences_on_startup(index: &CatalogIndex) -> R
             tracing::warn!(quarantine_id = %first.quarantine_id,
                 tape_uuid = %bytes_to_hex(&first.tape_uuid), barcode = ?first.barcode,
                 endpoint = ?first.endpoint, reason = %first.reason,
-                release_command = %format!("rem tape quarantine release {} {}", first.quarantine_id, crate::mount_backend::fence_release_options(first)),
+                release_command = %format!("rem tape quarantine release {} {}", first.quarantine_id, crate::mount_support::fence_release_options(first)),
                 "active tape-I/O fence; scoped tape and drive remain refused");
             continue;
         }
-        let release_options = crate::mount_backend::fence_release_options(first);
+        let release_options = crate::mount_support::fence_release_options(first);
         return Err(Status::failed_precondition(format!(
             "startup blocked by active tape-I/O fence {} tape_uuid={} barcode={} reason={}; {} active fence(s); release via `rem tape quarantine release {} {release_options}` before retrying",
             first.quarantine_id,

@@ -686,7 +686,7 @@ pub(super) fn drive_loop(
                     )?;
                     let generation = drive.identity_generation();
                     let mut preview = None;
-                    let result = crate::mount_backend::supersede_mounted_tail(
+                    let result = crate::write_owner::supersede_mounted_tail(
                         &mut index,
                         &super::terminal_types::TerminalConfig::terminal_config(&cfg),
                         drive,
@@ -1403,4 +1403,16 @@ pub(super) fn tape_alert_flags_json(flags: &std::collections::BTreeSet<u8>) -> S
 
 pub(super) fn u64_to_i64(value: u64) -> Option<i64> {
     i64::try_from(value).ok()
+}
+
+/// Transitional borrowed-mount forward; the outer scope owns and releases the mount.
+pub(crate) fn run_borrowed_mounted_actor(
+    drive: &mut DriveHandle,
+    cfg: WriteOwnerConfig,
+    tx: mpsc::Sender<DriveCommand>,
+    rx: mpsc::Receiver<DriveCommand>,
+) {
+    if let Some(finish) = drive_loop(0, drive, cfg, tx, rx) {
+        let _ = finish.reply.send(finish.result);
+    }
 }
