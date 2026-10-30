@@ -8,6 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use remanence_api::engine::drive_adapter::MountedDrive;
 use remanence_api::{
     build_tape_bootstrap, check_writability_preconditions, lto_generation_from_density,
     scan_and_restore, verify_tape_identity, LtoGen, MountBackend, MountError, MountTarget,
@@ -508,15 +509,15 @@ fn c4_operator_mount_identity_blank_release_and_swap_before_write() {
     let armed = Arc::new(Mutex::new(None));
     let mut injected = self::transport(&world);
     injected.armed = Arc::clone(&armed);
-    let mut backend = OperatorMount::with_transport_for_test(
+    let mut actor = MountedDrive::with_transport(
+        state,
         Path::new(DEVICE),
         &policy(),
         Box::new(injected),
-        &mut state,
         &lock_root,
+        Some(UUID),
     )
     .unwrap();
-    let mut mounted = backend.mount(target(Some(UUID))).unwrap();
     let old_tape = world.lock().unwrap().tapes["ORACLEL9"].records.clone();
     world
         .lock()
@@ -532,9 +533,7 @@ fn c4_operator_mount_identity_blank_release_and_swap_before_write() {
         ascq: 0,
         completion_unknown: false,
     });
-    assert!(backend
-        .write_checkpointed(&mut mounted, request(temp.path()))
-        .is_err());
+    assert!(actor.write_checkpointed(request(temp.path())).is_err());
     assert!(
         armed.lock().unwrap().is_none(),
         "the medium-change UA was delivered"
@@ -544,7 +543,7 @@ fn c4_operator_mount_identity_blank_release_and_swap_before_write() {
     assert_eq!(w.tapes["SWAPPEDL9"].records, other_before);
     assert_eq!(w.tapes["SWAPPEDL9"].written_bytes, u64::from(BLOCK));
     drop(w);
-    backend.release(mounted);
+    let _ = actor.finish();
 }
 
 #[test]
@@ -709,22 +708,33 @@ fn c4_ephemeral_mount_is_read_only_and_mints_no_write_authority() {
         &temp.path().join("locks"),
     )
     .unwrap();
-    let mut mounted = backend
+    let mounted = backend
         .mount(target(Some(UUID)))
         .expect("otherwise valid read-only mount");
     assert!(matches!(mounted.endpoint, MountEndpoint::Ephemeral { .. }));
     assert!(!mounted.writable());
-    let error = backend
-        .write_checkpointed(&mut mounted, request(temp.path()))
-        .unwrap_err()
-        .to_string();
+    backend.release(mounted);
+    let mut injected = transport(&world);
+    injected.hide_serial = true;
+    let (injected, write_log) = RecordingTransport::new(injected);
+    let error = MountedDrive::with_transport(
+        state,
+        Path::new(DEVICE),
+        &policy,
+        Box::new(injected),
+        &temp.path().join("locks"),
+        Some(UUID),
+    )
+    .err()
+    .expect("ephemeral endpoint cannot own a writer")
+    .to_string();
+    assert_no_media_dispatch(&write_log);
     assert!(
         ["ephemeral", "read-only", "serial"]
             .iter()
             .any(|word| error.to_lowercase().contains(word)),
         "{error}"
     );
-    backend.release(mounted);
     assert_no_media_dispatch(&log);
     assert_eq!(world.lock().unwrap().tapes["ORACLEL9"].records, before);
     assert_eq!(
@@ -768,16 +778,16 @@ fn c5_calibration_fence_failure_prevents_media_dispatch() {
     let epoch = control.row(UUID).write_epoch;
     let world = world(tape(UUID));
     let before = world.lock().unwrap().tapes["ORACLEL9"].records.clone();
-    let (transport, log) = RecordingTransport::new(transport(&world));
+    let (injected, log) = RecordingTransport::new(transport(&world));
     let mut backend = OperatorMount::with_transport_for_test(
         Path::new(DEVICE),
         &policy(),
-        Box::new(transport),
+        Box::new(injected),
         &mut state,
         &temp.path().join("locks"),
     )
     .unwrap();
-    let mut mounted = backend.mount(target(Some(UUID))).unwrap();
+    let mounted = backend.mount(target(Some(UUID))).unwrap();
     // EISDIR on journal append is deterministic even under root. Inject after
     // successful mount so readiness/identity cannot mask the fence refusal.
     let journal = dir.join(remanence_state::calibration::CALIBRATION_CONTROL_FILENAME);
@@ -785,15 +795,24 @@ fn c5_calibration_fence_failure_prevents_media_dispatch() {
         fs::rename(&journal, dir.join("before-fault")).unwrap();
     }
     fs::create_dir(&journal).unwrap();
-    let error = backend
-        .write_checkpointed(&mut mounted, request(temp.path()))
-        .unwrap_err()
-        .to_string();
+    backend.release(mounted);
+    let (injected, write_log) = RecordingTransport::new(transport(&world));
+    let error = MountedDrive::with_transport(
+        state,
+        Path::new(DEVICE),
+        &policy(),
+        Box::new(injected),
+        &temp.path().join("locks"),
+        Some(UUID),
+    )
+    .err()
+    .expect("failed calibration fence refuses actor construction")
+    .to_string();
+    assert_no_media_dispatch(&write_log);
     assert!(
         error.contains("calibration") || error.contains("fence"),
         "{error}"
     );
-    backend.release(mounted);
     assert_no_media_dispatch(&log);
     assert_eq!(control.row(UUID).write_epoch, epoch);
     assert_eq!(world.lock().unwrap().tapes["ORACLEL9"].records, before);
@@ -801,6 +820,49 @@ fn c5_calibration_fence_failure_prevents_media_dispatch() {
         world.lock().unwrap().tapes["ORACLEL9"].written_bytes,
         u64::from(BLOCK)
     );
+}
+
+/// The installed fence must still refuse a write when its durable store fails
+/// after the owned adapter has mounted successfully in the same invocation.
+#[test]
+fn c5_calibration_fence_failure_after_mount_prevents_media_dispatch() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = state(&temp.path().join("state"));
+    let dir = state.paths().calibration_dir.clone();
+    let control = state.calibration_control().clone();
+    let epoch = control.row(UUID).write_epoch;
+    let world = world(tape(UUID));
+    let before = world.lock().unwrap().tapes["ORACLEL9"].records.clone();
+    let (injected, log) = RecordingTransport::new(transport(&world));
+    let mut actor = MountedDrive::with_transport(
+        state,
+        Path::new(DEVICE),
+        &policy(),
+        Box::new(injected),
+        &temp.path().join("locks"),
+        Some(UUID),
+    )
+    .expect("mount and install the calibration fence before injecting the fault");
+    let journal = dir.join(remanence_state::calibration::CALIBRATION_CONTROL_FILENAME);
+    fs::rename(&journal, dir.join("before-fault")).unwrap();
+    fs::create_dir(&journal).unwrap();
+    let error = actor
+        .write_checkpointed(request(temp.path()))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("calibration") || error.contains("fence"),
+        "{error}"
+    );
+    assert_no_media_dispatch(&log);
+    assert_eq!(control.row(UUID).write_epoch, epoch);
+    assert_eq!(world.lock().unwrap().tapes["ORACLEL9"].records, before);
+    assert_eq!(
+        world.lock().unwrap().tapes["ORACLEL9"].written_bytes,
+        u64::from(BLOCK)
+    );
+    let _ = actor.finish();
+    assert_no_media_dispatch(&log);
 }
 
 #[test]
@@ -821,7 +883,7 @@ fn c2_null_generation_refuses_writability_even_with_lto_label() {
 #[test]
 fn c5_write_adapter_sessions_fence_audit_and_stale_fence_refusal() {
     let temp = tempfile::tempdir().unwrap();
-    let mut state = state(&temp.path().join("state"));
+    let state = state(&temp.path().join("state"));
     let db_path = state.paths().sqlite_path.clone();
     let audit_dir = state.paths().audit_dir.clone();
     let world = world(tape(UUID));
@@ -834,19 +896,20 @@ fn c5_write_adapter_sessions_fence_audit_and_stale_fence_refusal() {
         before,
         Arc::clone(&observed),
     ));
-    let mut backend = OperatorMount::with_transport_for_test(
+    let config_before = state.config().clone();
+    let paths_before = state.paths().clone();
+    let mut actor = MountedDrive::with_transport(
+        state,
         Path::new(DEVICE),
         &policy(),
         Box::new(observed_transport),
-        &mut state,
         &temp.path().join("locks"),
+        Some(UUID),
     )
     .unwrap();
-    let mut mounted = backend.mount(target(Some(UUID))).unwrap();
-    backend
-        .write_checkpointed(&mut mounted, request(temp.path()))
-        .unwrap();
-    backend.release(mounted);
+    actor.write_checkpointed(request(temp.path())).unwrap();
+    actor.finish().unwrap();
+    let mut state = StateHandle::open_with_config(paths_before, config_before).unwrap();
     assert!(*observed.lock().unwrap() > 0, "observer saw media dispatch");
     assert!(world.lock().unwrap().tapes["ORACLEL9"].written_bytes > u64::from(BLOCK));
     assert!(
@@ -901,15 +964,31 @@ fn c5_write_adapter_sessions_fence_audit_and_stale_fence_refusal() {
             // active fence so the operator can rescue data; writes to the fenced
             // tape are refused before any media dispatch.
             let mut backend = attempt.expect("a stale fence must not refuse the read-capable open");
-            let mut mounted = backend
+            let mounted = backend
                 .mount(target(Some(UUID)))
                 .expect("a stale fence must not refuse a mount for reading");
-            let error = match backend.write_checkpointed(&mut mounted, request(temp.path())) {
-                Ok(_) => panic!("stale active fence must refuse writes"),
+            backend.release(mounted);
+            let paths = reopened.paths().clone();
+            let config = reopened.config().clone();
+            let error = match MountedDrive::with_transport(
+                reopened,
+                Path::new(DEVICE),
+                &policy(),
+                Box::new(transport(&world)),
+                &temp.path().join("locks"),
+                Some(UUID),
+            ) {
                 Err(error) => error.to_string(),
+                Ok(mut actor) => {
+                    let error = actor
+                        .put_path_version_with_policy(request(temp.path()), false)
+                        .unwrap_err()
+                        .to_string();
+                    let _ = actor.finish();
+                    error
+                }
             };
-            drop(mounted);
-            drop(backend);
+            let mut reopened = StateHandle::open_with_config(paths, config).unwrap();
             assert!(
                 !reopened
                     .catalog_index()

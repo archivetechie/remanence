@@ -178,7 +178,7 @@ pub(crate) fn supersede_mounted_tail(
     let result = (|| {
         let mut sink = remanence_library::DriveHandleSink(drive);
         if last.is_none() {
-            let bootstrap = crate::pool_write::build_tape_bootstrap(
+            let bootstrap = crate::tape_init::build_tape_bootstrap(
                 tape_uuid,
                 size,
                 parity.clone(),
@@ -187,7 +187,7 @@ pub(crate) fn supersede_mounted_tail(
                     .map_err(|e| e.to_string())?,
                 env!("CARGO_PKG_VERSION"),
             );
-            crate::pool_write::write_tape_bootstrap(&mut sink, &bootstrap)
+            crate::tape_init::write_tape_bootstrap(&mut sink, &bootstrap)
                 .map_err(|e| e.to_string())?;
         } else {
             remanence_library::BlockSink::write_filemarks(&mut sink, 1)

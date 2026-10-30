@@ -390,8 +390,10 @@ between sessions. `reserved_bytes` gives the requested accumulator reservation;
 The reservation covers the parity shards, CRC capacity, vector headers, codec
 matrix, and inline detached state. The reservation releases when the epoch
 closes or the actor discards it. Ordinary checkpoints keep their barrier cadence.
-Daemon sidecars normally appear when an epoch fills, at finalization, or before
-removal. Standalone writes close at every barrier. A fenced removal leaves the
+Sidecars normally appear when an epoch fills, at finalization, or before
+removal. Standalone commands use the same actor policy: ordinary checkpoints
+retain partial epochs, and explicit owner finish closes the remaining epoch
+without unloading. A fenced removal leaves the
 epoch open until append recovery clears the fence. Removal does not seal the tape.
 
 A committed tail without a sidecar appears as `[open_epoch_start, open_epoch_end)`

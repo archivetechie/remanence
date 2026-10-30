@@ -4,8 +4,14 @@ Notable changes to Remanence and its published formats. The format
 specifications carry their own revision histories; entries here are
 per-release summaries.
 
-<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_backend.rs crates/remanence-state/src/index.rs crates/remanence-library/src/discovery.rs @ 638210f7 -->
+<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/index.rs crates/remanence-library/src/discovery.rs @ 638210f7 -->
 ## Unreleased
+
+- Removed the duplicate direct session writer and mount-session forwarding.
+  Standalone and pool-selected writes share the actor; ordinary checkpoints
+  retain partial parity epochs and owner finish closes them without unloading.
+  Archive-write errors keep the typed cause first and include the actor's
+  additional recovery, fence-persistence, and checkpoint retry advice.
 
 - Pool-selected `rem-debug archive write` now uses the same in-process write
   actor on its actual library bay. Committed replay still avoids loading tape;
@@ -131,9 +137,10 @@ per-release summaries.
   emit sidecars for full epochs. A seated cartridge retains its accumulator
   between sessions when identity and committed coordinates match; otherwise
   rebuilding reads each extent forward in batches. Finalization and cartridge
-  removal close the open epoch. Standalone checkpoints still close it at every
-  barrier. Readers treat the open range as unprotected, and `rem catalog tapes
-  --json` and `rem top` show its committed ordinals. Catalog schema 22 records
+  removal close the open epoch. Standalone checkpoints now retain it too; owner
+  finish closes the remaining epoch without unloading. Readers treat the open
+  range as unprotected, and `rem catalog tapes --json` and `rem top` show its
+  committed ordinals. Catalog schema 22 records
   deferred sealing obligations for the next session or finalization.
 
 - Epoch-close fixes: removal projects the checkpoint journal before deciding

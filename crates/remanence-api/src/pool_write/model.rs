@@ -5,15 +5,14 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Read};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use remanence_aead::RecipientPublicKey;
 use remanence_library::{TapeConfig, TapeIoError, WormMediaState};
 use remanence_parity::{
-    FileTapeFileJournal, ParityConfig, ParityError, PhysicalPositionHint, RawTapeSink,
-    RawWriteOutcome, TapeFileJournal, TerminalComponentCommit, TerminalComponentReconcileEvidence,
-    TerminalTailAuthority, TerminalTailProgress, TerminalTripleObjectReservation,
+    ParityConfig, ParityError, PhysicalPositionHint, RawTapeSink, RawWriteOutcome,
+    TerminalTripleObjectReservation,
 };
 use remanence_state::StateError;
 use remanence_stream::{StreamingError, StreamingObjectWriteReport};
@@ -43,67 +42,6 @@ impl ParityCapacityReservation {
         crate::io_memory::IoMemoryPermit,
     ) {
         (self.reservation, self._spool_permit)
-    }
-}
-
-/// Process-local resources shared by direct checkpointed pool writes.
-///
-/// Callers construct one handle from the configured I/O-memory ceiling and
-/// reuse it across concurrent direct writes. Daemon-owned writes use the same
-/// reservation primitive through their long-lived owner configuration.
-#[derive(Clone, Debug)]
-pub struct PoolWriteResources {
-    pub(super) io_memory: Arc<crate::io_memory::IoMemoryReservation>,
-    pub(super) write_admissions: crate::write_admission::WriteAdmissionCoordinator,
-}
-
-pub(super) fn direct_write_admissions() -> crate::write_admission::WriteAdmissionCoordinator {
-    static COORDINATOR: OnceLock<crate::write_admission::WriteAdmissionCoordinator> =
-        OnceLock::new();
-    COORDINATOR.get_or_init(Default::default).clone()
-}
-
-impl PoolWriteResources {
-    /// Create a shared resource handle using the configured byte ceiling.
-    pub fn new(io_memory_ceiling_bytes: u64) -> Result<Self, String> {
-        Ok(Self {
-            io_memory: crate::io_memory::IoMemoryReservation::new(io_memory_ceiling_bytes)?,
-            write_admissions: direct_write_admissions(),
-        })
-    }
-
-    /// Admission identities are scoped to one state store, just like SQLite
-    /// replay keys. Independent installations in one process must not collide.
-    pub(super) fn for_state(
-        io_memory_ceiling_bytes: u64,
-        state_dir: &std::path::Path,
-    ) -> Result<Self, String> {
-        static STORES: OnceLock<
-            std::sync::Mutex<
-                std::collections::HashMap<
-                    std::path::PathBuf,
-                    crate::write_admission::WriteAdmissionCoordinator,
-                >,
-            >,
-        > = OnceLock::new();
-        let path = state_dir
-            .canonicalize()
-            .map_err(|error| error.to_string())?;
-        let coordinator = STORES
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(path)
-            .or_default()
-            .clone();
-        Ok(Self {
-            io_memory: crate::io_memory::IoMemoryReservation::new(io_memory_ceiling_bytes)?,
-            write_admissions: coordinator,
-        })
-    }
-
-    pub(super) fn io_memory(&self) -> &Arc<crate::io_memory::IoMemoryReservation> {
-        &self.io_memory
     }
 }
 
@@ -160,95 +98,6 @@ impl RawTapeSink for CapacityTrackingRawTapeSink<'_> {
         let position = self.inner.position()?;
         self.position_ready = true;
         Ok(position)
-    }
-}
-
-/// Durable authority for the direct writer's uninterrupted terminal tail.
-///
-/// The direct sink has no raw read side, so this authority can only attest the
-/// next component as absent while continuing from the cursor proved by the
-/// immediately preceding checkpoint/prefix/component barrier. A pending
-/// intent encountered by a later invocation is rejected by ordinary
-/// checkpoint replay and must be reconciled by a source-capable owner.
-/// Terminal admission is irreversible: recovery may complete missing tail
-/// components, but it must never resume Object writes on this tape.
-pub(super) struct DirectSequentialTerminalAuthority<'a> {
-    pub(super) checkpoint: &'a mut remanence_state::FileCheckpointJournalLease,
-    pub(super) parity_journal: Option<&'a mut FileTapeFileJournal>,
-    pub(super) intent: remanence_state::TerminalFinalizationIntent,
-    pub(super) cursor_proved_for: TerminalTailProgress,
-}
-
-impl TerminalTailAuthority for DirectSequentialTerminalAuthority<'_> {
-    fn load_progress(&mut self) -> Result<TerminalTailProgress, String> {
-        Ok(parity_progress_from_state(self.intent.progress))
-    }
-
-    fn reconcile_next(
-        &mut self,
-        progress: TerminalTailProgress,
-        _component: remanence_parity::TerminalTailComponentPlan,
-    ) -> Result<TerminalComponentReconcileEvidence, String> {
-        if progress != self.cursor_proved_for || progress != self.load_progress()? {
-            return Err(
-                "direct terminal writer lost its uninterrupted barrier-proved cursor authority"
-                    .to_string(),
-            );
-        }
-        Ok(TerminalComponentReconcileEvidence::Absent)
-    }
-
-    fn commit_after_barrier(&mut self, commit: &TerminalComponentCommit) -> Result<(), String> {
-        if commit.previous_progress != self.cursor_proved_for {
-            return Err(
-                "direct terminal component did not continue from the proved cursor".to_string(),
-            );
-        }
-        if let Some(journal) = self.parity_journal.as_deref_mut() {
-            journal
-                .commit_terminal_component_transition(
-                    &commit.journal_bundle,
-                    &commit.checkpoint_bundle,
-                )
-                .map_err(|error| format!("commit terminal component journal: {error}"))?;
-        }
-        self.intent = self
-            .checkpoint
-            .advance_terminal_finalization(
-                state_progress_from_parity(commit.previous_progress),
-                state_progress_from_parity(commit.next_progress),
-            )
-            .map_err(|error| format!("advance terminal checkpoint progress: {error}"))?;
-        self.cursor_proved_for = commit.next_progress;
-        Ok(())
-    }
-}
-
-const fn parity_progress_from_state(
-    progress: remanence_state::TerminalFinalizationProgress,
-) -> TerminalTailProgress {
-    use remanence_state::TerminalFinalizationProgress as State;
-    match progress {
-        State::BeforeReplicaA => TerminalTailProgress::BeforeReplicaA,
-        State::AfterReplicaA => TerminalTailProgress::AfterReplicaA,
-        State::AfterSeparationAb => TerminalTailProgress::AfterSeparationAb,
-        State::AfterReplicaB => TerminalTailProgress::AfterReplicaB,
-        State::AfterSeparationBc => TerminalTailProgress::AfterSeparationBc,
-        State::AfterReplicaC => TerminalTailProgress::AfterReplicaC,
-    }
-}
-
-const fn state_progress_from_parity(
-    progress: TerminalTailProgress,
-) -> remanence_state::TerminalFinalizationProgress {
-    use remanence_state::TerminalFinalizationProgress as State;
-    match progress {
-        TerminalTailProgress::BeforeReplicaA => State::BeforeReplicaA,
-        TerminalTailProgress::AfterReplicaA => State::AfterReplicaA,
-        TerminalTailProgress::AfterSeparationAb => State::AfterSeparationAb,
-        TerminalTailProgress::AfterReplicaB => State::AfterReplicaB,
-        TerminalTailProgress::AfterSeparationBc => State::AfterSeparationBc,
-        TerminalTailProgress::AfterReplicaC => State::AfterReplicaC,
     }
 }
 

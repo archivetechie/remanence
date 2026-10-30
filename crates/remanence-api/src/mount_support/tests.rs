@@ -251,6 +251,25 @@ fn backend<'a>(
         root,
     )
 }
+/// Transfer the original state and proven mount into the production owned actor.
+macro_rules! own_mount {
+    ($backend:ident, $mounted:ident, $state:ident) => {{
+        let paths = $backend.state.paths().clone();
+        let config = $backend.state.config().clone();
+        let audit = $backend.context.audit_error.clone();
+        $backend.finish().unwrap();
+        let owner = crate::engine::drive_adapter::MountedDrive::start(
+            $state,
+            $mounted,
+            StaticAllowlist::new([SERIAL]),
+            audit,
+        )
+        .unwrap();
+        (owner, move || {
+            StateHandle::open_with_config(paths.clone(), config.clone()).unwrap()
+        })
+    }};
+}
 fn target() -> MountTarget {
     MountTarget::Device {
         path: DEVICE.into(),
@@ -289,16 +308,18 @@ fn insertion_removal_and_swap_require_a_new_proof() {
         .unwrap()
         .put_tape_in_drive(BAY, "HAND", None, media(UUID));
     let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
-    let mut mounted = mount.mount(target()).unwrap();
+    let mounted = mount.mount(target()).unwrap();
+    let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
     world.lock().unwrap().drive_bays.insert(BAY, None);
-    assert!(mount
-        .write_checkpointed(&mut mounted, request(root.path(), "removed"))
+    assert!(actor
+        .write_checkpointed(request(root.path(), "removed"))
         .is_err());
     assert_eq!(
         world.lock().unwrap().tapes["HAND"].written_bytes,
         u64::from(BLOCK)
     );
-    mount.release(mounted);
+    let _ = actor.finish();
+    let mut state = reopen_state();
     assert!(
         state
             .catalog_index()
@@ -360,16 +381,18 @@ fn uncertain_write_cut_is_durably_fenced_even_after_an_earlier_checkpoint() {
     let lock = root.path().join("locks");
     let fault = fault();
     let mut mount = backend(&mut state, &world, &lock, Arc::clone(&fault)).unwrap();
-    let mut mounted = mount.mount(target()).unwrap();
-    mount
-        .write_checkpointed(&mut mounted, request(root.path(), "first"))
+    let mounted = mount.mount(target()).unwrap();
+    let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
+    actor
+        .write_checkpointed(request(root.path(), "first"))
         .unwrap();
     *fault.lock().unwrap() = Some(0x0a);
-    assert!(mount
-        .write_checkpointed(&mut mounted, request(root.path(), "second"))
+    assert!(actor
+        .write_checkpointed(request(root.path(), "second"))
         .is_err());
     assert!(fault.lock().unwrap().is_none(), "the write cut was reached");
-    mount.release(mounted);
+    let _ = actor.finish();
+    let mut state = reopen_state();
     assert!(!state
         .catalog_index()
         .list_active_tape_io_fences()
@@ -389,10 +412,19 @@ fn uncertain_write_cut_is_durably_fenced_even_after_an_earlier_checkpoint() {
         "audit replay must preserve the standalone fence identity"
     );
     let mut reopened = backend(&mut state, &world, &lock, self::fault()).unwrap();
-    let mut mounted = reopened.mount(target()).unwrap();
+    let mounted = reopened.mount(target()).unwrap();
+    let (mut actor, reopen_state) = own_mount!(reopened, mounted, state);
+    let error = actor
+        .write_checkpointed(request(root.path(), "third"))
+        .unwrap_err();
     assert!(
-        matches!(reopened.write_checkpointed(&mut mounted, request(root.path(), "third")), Err(MountError::Refused(ref message)) if message.contains("fence"))
+        matches!(error, MountError::Actor(ref failure) if failure.status.code() == tonic::Code::FailedPrecondition && failure.status.message().contains("fence")),
+        "{error}"
     );
+    let finish_error = actor.finish().unwrap_err();
+    assert_eq!(finish_error.status.code(), tonic::Code::FailedPrecondition);
+    assert!(finish_error.status.message().contains("fence"));
+    drop(reopen_state());
 }
 #[test]
 fn checkpoint_finalize_and_terminal_restore_share_the_production_funnels() {
@@ -401,12 +433,13 @@ fn checkpoint_finalize_and_terminal_restore_share_the_production_funnels() {
     let world = world();
     let lock = root.path().join("locks");
     let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
-    let mut mounted = mount.mount(target()).unwrap();
-    mount
-        .write_checkpointed(&mut mounted, request(root.path(), "first"))
+    let mounted = mount.mount(target()).unwrap();
+    let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
+    actor
+        .write_checkpointed(request(root.path(), "first"))
         .unwrap();
-    mount
-        .write_checkpointed(&mut mounted, request(root.path(), "second"))
+    actor
+        .write_checkpointed(request(root.path(), "second"))
         .unwrap();
     let id = uuid::Uuid::new_v4();
     let finalize = || StandaloneFinalizeRequest {
@@ -416,15 +449,20 @@ fn checkpoint_finalize_and_terminal_restore_share_the_production_funnels() {
         reason: "operator finished".into(),
         idempotency_key: id,
     };
-    mount.finalize(&mut mounted, finalize()).unwrap();
-    mount.finalize(&mut mounted, finalize()).unwrap();
-    let before_replay = mounted.drive.media_write_dispatch_count();
-    assert!(mount
-        .write_checkpointed(&mut mounted, request(root.path(), "first"))
+    actor.close_session().unwrap();
+    actor.finalize_standalone(finalize()).unwrap();
+    actor.finalize_standalone(finalize()).unwrap();
+    let before_replay = dispatched_writes(&world);
+    assert!(actor
+        .write_checkpointed(request(root.path(), "first"))
         .unwrap()
         .is_replay());
-    assert_eq!(mounted.drive.media_write_dispatch_count(), before_replay);
+    assert_eq!(dispatched_writes(&world), before_replay);
     let output = root.path().join("restored");
+    actor.finish().unwrap();
+    let mut state = reopen_state();
+    let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
+    let mut mounted = mount.mount(target()).unwrap();
     let report = crate::restore_catalogless(&mut mounted.drive, &output, None).unwrap();
     assert_eq!(report["terminal_index"], true, "{report}");
     assert_eq!(
@@ -446,11 +484,13 @@ async fn adopted_idle_unload_preserves_journal_import() {
     let lock = root.path().join("locks");
     let from = original.paths().journal_dir.clone();
     let mut mount = backend(&mut original, &world, &lock, fault()).unwrap();
-    let mut mounted = mount.mount(target()).unwrap();
-    mount
-        .write_checkpointed(&mut mounted, request(root.path(), "first"))
+    let mounted = mount.mount(target()).unwrap();
+    let (mut actor, reopen_state) = own_mount!(mount, mounted, original);
+    actor
+        .write_checkpointed(request(root.path(), "first"))
         .unwrap();
-    mount.release(mounted);
+    let _ = actor.finish();
+    drop(reopen_state());
     let mut adopted = adopted_state(&root.path().join("new-host"), crate::ParityConfig::None);
     crate::write_owner::tests::unload_adopted_cartridge(&adopted, world.clone(), UUID).await;
     {
@@ -473,11 +513,13 @@ fn imported_checkpoint_authorizes_append_and_conflicting_import_is_refused() {
     let lock = root.path().join("locks");
     let from = state.paths().journal_dir.clone();
     let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
-    let mut mounted = mount.mount(target()).unwrap();
-    mount
-        .write_checkpointed(&mut mounted, request(root.path(), "first"))
+    let mounted = mount.mount(target()).unwrap();
+    let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
+    actor
+        .write_checkpointed(request(root.path(), "first"))
         .unwrap();
-    mount.release(mounted);
+    let _ = actor.finish();
+    let state = reopen_state();
     drop(state);
     let mut state = adopted_state(&root.path().join("new-host"), crate::ParityConfig::None);
     let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
@@ -490,10 +532,21 @@ fn imported_checkpoint_authorizes_append_and_conflicting_import_is_refused() {
     drop(state);
     let mut state = StateHandle::open_with_config(paths, config).unwrap();
     let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
-    let mut mounted = mount.mount(target()).unwrap();
-    mount
-        .write_checkpointed(&mut mounted, request(root.path(), "second"))
+    let mounted = mount.mount(target()).unwrap();
+    let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
+    actor
+        .write_checkpointed(request(root.path(), "second"))
         .unwrap();
+    let _ = actor.finish();
+    let mut state = reopen_state();
+    let mut mount = self::backend(
+        &mut state,
+        &world,
+        &root.path().join("locks"),
+        self::fault(),
+    )
+    .unwrap();
+    let mut mounted = mount.mount(target()).unwrap();
     assert!(mount.import_journals(&mut mounted, &from).is_err());
     let output = root.path().join("restored");
     let report = crate::scan_and_restore(&mut mounted.drive, &output, None).unwrap();
@@ -515,7 +568,8 @@ fn encrypted_scan_uses_the_same_contained_restore_sink() {
     let mut state = state(root.path());
     let world = world();
     let mut mount = backend(&mut state, &world, &root.path().join("locks"), fault()).unwrap();
-    let mut mounted = mount.mount(target()).unwrap();
+    let mounted = mount.mount(target()).unwrap();
+    let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
     let key = remanence_aead::RecipientPrivateKey::new([9; 16], "model", [7; 32]).unwrap();
     let mut input = request(root.path(), "secret");
     input.representation = crate::PoolWriteRepresentation::Encrypted {
@@ -527,7 +581,17 @@ fn encrypted_scan_uses_the_same_contained_restore_sink() {
                 .unwrap(),
         ],
     };
-    mount.write_checkpointed(&mut mounted, input).unwrap();
+    actor.write_checkpointed(input).unwrap();
+    let _ = actor.finish();
+    let mut state = reopen_state();
+    let mut mount = self::backend(
+        &mut state,
+        &world,
+        &root.path().join("locks"),
+        self::fault(),
+    )
+    .unwrap();
+    let mut mounted = mount.mount(target()).unwrap();
     let refused =
         crate::scan_and_restore(&mut mounted.drive, &root.path().join("no-key"), None).unwrap();
     assert!(refused.to_string().contains("--private-key"));
@@ -589,11 +653,13 @@ fn parity_import_rejects_a_missing_partner_and_validates_the_complete_pair() {
     let from = state.paths().journal_dir.clone();
     let partner = state.journal_path(UUID);
     let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
-    let mut mounted = mount.mount(target()).unwrap();
-    mount
-        .write_checkpointed(&mut mounted, request(root.path(), "first"))
+    let mounted = mount.mount(target()).unwrap();
+    let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
+    actor
+        .write_checkpointed(request(root.path(), "first"))
         .unwrap();
-    mount.release(mounted);
+    let _ = actor.finish();
+    let state = reopen_state();
     drop(state);
     let mut state = adopted_state(&root.path().join("new-host"), parity);
     let destination = state.paths().journal_dir.join("checkpoints");
@@ -613,11 +679,13 @@ fn parity_import_rejects_a_missing_partner_and_validates_the_complete_pair() {
     drop(state);
     let mut state = StateHandle::open_with_config(paths, config).unwrap();
     let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
-    let mut mounted = mount.mount(target()).unwrap();
-    mount
-        .write_checkpointed(&mut mounted, request(root.path(), "second"))
+    let mounted = mount.mount(target()).unwrap();
+    let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
+    actor
+        .write_checkpointed(request(root.path(), "second"))
         .unwrap();
-    mount.release(mounted);
+    let _ = actor.finish();
+    drop(reopen_state());
 }
 
 #[test]
@@ -645,29 +713,32 @@ fn combined_transport_and_audit_failure_latches_until_recovery_persists_quaranti
         &root.path().join("locks"),
     )
     .unwrap();
-    let mut mounted = backend.mount(target()).unwrap();
+    let mounted = backend.mount(target()).unwrap();
+    let (mut actor, reopen_state) = own_mount!(backend, mounted, state);
     *fault.lock().unwrap() = Some(0x0a);
-    assert!(backend
-        .write_checkpointed(&mut mounted, request(root.path(), "cut"))
+    assert!(actor
+        .write_checkpointed(request(root.path(), "cut"))
         .is_err());
-    assert!(backend.unusable);
-    assert!(backend
-        .state
+    assert!(actor
+        .write_checkpointed(request(root.path(), "latched"))
+        .is_err());
+    assert!(actor
         .catalog_index()
         .list_active_tape_io_fences()
         .unwrap()
         .is_empty());
     std::fs::remove_dir(&audit_path).unwrap();
     std::fs::rename(audit_path.with_extension("saved"), &audit_path).unwrap();
-    let count = mounted.drive.media_write_dispatch_count();
+    let count = dispatched_writes(&world);
     for _ in 0..2 {
-        let error = backend
-            .write_checkpointed(&mut mounted, request(root.path(), "retry"))
+        let error = actor
+            .write_checkpointed(request(root.path(), "retry"))
             .unwrap_err();
-        assert!(error.to_string().contains("unusable"), "{error}");
+        assert!(error.to_string().contains("drive audit failed"), "{error}");
     }
-    assert_eq!(mounted.drive.media_write_dispatch_count(), count);
-    backend.release(mounted);
+    assert_eq!(dispatched_writes(&world), count);
+    let _ = actor.finish();
+    let mut state = reopen_state();
     // The durable open session supplies recovery evidence once audit storage returns.
     let recovered = self::backend(
         &mut state,
@@ -721,11 +792,13 @@ fn automatic_terminal_close_reproves_after_checkpoint_publication() {
             &root.path().join("locks"),
         )
         .unwrap();
-        let mut mounted = backend.mount(target()).unwrap();
-        let error = backend
-            .write_checkpointed(&mut mounted, request(root.path(), "boundary"))
+        let mounted = backend.mount(target()).unwrap();
+        let (mut actor, reopen_state) = own_mount!(backend, mounted, state);
+        let error = actor
+            .write_checkpointed(request(root.path(), "boundary"))
             .unwrap_err();
         assert!(*seen.lock().unwrap(), "boundary not exercised: {error}");
+        let _ = actor.finish();
         assert!(checkpoint
             .acquire_exclusive()
             .unwrap()
@@ -743,7 +816,8 @@ fn automatic_terminal_close_reproves_after_checkpoint_publication() {
             world.lock().unwrap().tapes["HAND"].written_bytes < 16 * 1024 * 1024,
             "no terminal extent written"
         );
-        backend.release(mounted);
+        let _ = actor.finish();
+        drop(reopen_state());
     }
 }
 
@@ -1066,11 +1140,13 @@ fn imported_authority_preserves_quarantine_and_terminal_restrictions() {
     let world = world();
     let from = state.paths().journal_dir.clone();
     let mut mount = backend(&mut state, &world, &root.path().join("locks"), fault()).unwrap();
-    let mut mounted = mount.mount(target()).unwrap();
-    mount
-        .write_checkpointed(&mut mounted, request(root.path(), "first"))
+    let mounted = mount.mount(target()).unwrap();
+    let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
+    actor
+        .write_checkpointed(request(root.path(), "first"))
         .unwrap();
-    mount.release(mounted);
+    let _ = actor.finish();
+    let state = reopen_state();
     drop(state);
     for restricted in ["fence", "sealed"] {
         let mut state = adopted_state(&root.path().join(restricted), crate::ParityConfig::None);
@@ -1143,46 +1219,67 @@ fn library_automatic_sealing_releases_owned_removal_guard() {
                 }))
             })
             .unwrap();
-        let mut drive =
+        let drive =
             crate::load_tape_by_uuid(state.catalog_index(), &mut library, &policy, &UUID).unwrap();
-        let result = crate::write_to_selected_drive_checkpointed(
-            &mut state,
-            &mut drive,
-            request(root.path(), "seal"),
-            crate::pool_write::SelectedTape {
-                standalone_endpoint: None,
-                pool_id: "default".into(),
-                tape_uuid: UUID,
-                block_size: BLOCK,
-                parity_config: crate::ParityConfig::None,
-            },
+        let mut owner = crate::engine::drive_adapter::MountedDrive::from_placed_library(
+            state,
+            library,
+            drive,
+            policy,
+            UUID,
+            "seal",
+            &root.path().join("locks"),
         );
-        if cut {
-            assert!(result.is_err());
-        } else {
-            assert!(result.unwrap().sealed_after_write());
-        }
-        assert_eq!(
-            commands
+        if let Ok(actor) = &mut owner {
+            let result = actor.write_checkpointed(request(root.path(), "seal"));
+            if cut {
+                assert!(result.is_err());
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    actor
+                        .catalog_index()
+                        .get_tape(&UUID)
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    "sealed"
+                );
+            }
+            let prevents: Vec<_> = commands
                 .lock()
                 .unwrap()
                 .iter()
                 .filter(|c| c[0] == 0x1e)
                 .map(|c| c[4])
-                .collect::<Vec<_>>(),
-            [1]
-        );
-        drop(drive);
+                .collect();
+            assert!(!prevents.is_empty());
+            assert!(
+                prevents.iter().all(|value| *value == 1),
+                "no premature ALLOW"
+            );
+            let _ = actor.finish();
+        } else {
+            assert!(cut);
+        }
         let commands = commands.lock().unwrap();
+        let removal: Vec<_> = commands
+            .iter()
+            .filter(|c| c[0] == 0x1e)
+            .map(|c| c[4])
+            .collect();
+        assert_eq!(removal.iter().filter(|v| **v == 0).count(), 1);
+        assert_eq!(removal.last(), Some(&0));
+        assert!(removal[..removal.len() - 1].iter().all(|v| *v == 1));
         assert_eq!(
             commands
                 .iter()
-                .filter(|c| c[0] == 0x1e)
-                .map(|c| c[4])
-                .collect::<Vec<_>>(),
-            [1, 0]
+                .rev()
+                .find(|c| c[0] == 0x1e)
+                .unwrap()
+                .as_slice(),
+            &[0x1e, 0, 0, 0, 0, 0]
         );
-        assert_eq!(commands.last().unwrap().as_slice(), &[0x1e, 0, 0, 0, 0, 0]);
     }
 }
 
@@ -1354,17 +1451,19 @@ fn copy_closed_state(from: &Path, to: &Path) {
         }
     }
 }
-fn append_for_rollback(
-    state: &mut StateHandle,
-    world: &SharedVirtualWorld,
-    root: &Path,
-    name: &str,
-) -> Result<crate::MountedWriteResult, MountError> {
-    let mut mount = backend(state, world, &root.join("locks"), fault()).unwrap();
-    let mut mounted = mount.mount(target()).unwrap();
-    let result = mount.write_checkpointed(&mut mounted, request(root, name));
-    mount.release(mounted);
-    result
+macro_rules! append_for_rollback {
+    (&mut $state:ident, $world:expr, $root:expr, $name:expr) => {{
+        let world = $world;
+        let root = $root;
+        let mut mount = backend(&mut $state, world, &root.join("locks"), fault()).unwrap();
+        let mounted = mount.mount(target()).unwrap();
+        let (mut actor, reopen_state) = own_mount!(mount, mounted, $state);
+        let result = actor.write_checkpointed(request(root, $name));
+        let _ = actor.finish();
+        $state = reopen_state();
+        let _ = &$state; // The caller regains state ownership even on refusal.
+        result
+    }};
 }
 fn dispatched_writes(world: &SharedVirtualWorld) -> usize {
     world
@@ -1409,12 +1508,12 @@ async fn standalone_and_daemon_state_rollback_refuses_checkpoint_and_fresh_with_
                 set_rollback_bootstrap(&world, parity.clone());
                 let mut state = state_with_parity(&state_dir, true, parity.clone());
                 if !fresh {
-                    append_for_rollback(&mut state, &world, root.path(), "A").unwrap();
+                    append_for_rollback!(&mut state, &world, root.path(), "A").unwrap();
                 }
                 drop(state);
                 copy_closed_state(&state_dir, &backup);
                 let mut state = configured_state(&state_dir, true);
-                let b = append_for_rollback(&mut state, &world, root.path(), "B").unwrap();
+                let b = append_for_rollback!(&mut state, &world, root.path(), "B").unwrap();
                 drop(state);
                 let intact = world.lock().unwrap().tapes["HAND"].records.clone();
                 std::fs::remove_dir_all(&state_dir).unwrap();
@@ -1448,7 +1547,7 @@ async fn standalone_and_daemon_state_rollback_refuses_checkpoint_and_fresh_with_
                     )
                     .await
                 } else {
-                    append_for_rollback(&mut state, &world, root.path(), "C")
+                    append_for_rollback!(&mut state, &world, root.path(), "C")
                         .unwrap_err()
                         .to_string()
                 };
@@ -1479,11 +1578,11 @@ fn complete_uncheckpointed_tail_requires_confirmation_and_records_discarded_ids(
             let world = world();
             set_rollback_bootstrap(&world, parity.clone());
             let mut state = state_with_parity(&dir, false, parity);
-            append_for_rollback(&mut state, &world, root.path(), "A").unwrap();
+            append_for_rollback!(&mut state, &world, root.path(), "A").unwrap();
             drop(state);
             copy_closed_state(&dir, &backup);
             let mut state = configured_state(&dir, false);
-            let b = append_for_rollback(&mut state, &world, root.path(), "B").unwrap();
+            let b = append_for_rollback!(&mut state, &world, root.path(), "B").unwrap();
             drop(state);
             // Crash after the complete object and closing delimiter, before checkpoint.
             let b_id = uuid::Uuid::from_bytes(b.object.object_id).to_string();
@@ -1510,20 +1609,21 @@ fn complete_uncheckpointed_tail_requires_confirmation_and_records_discarded_ids(
             copy_closed_state(&backup, &dir);
             let mut state = configured_state(&dir, false);
             let before = dispatched_writes(&world);
-            assert!(append_for_rollback(&mut state, &world, root.path(), "C")
+            assert!(append_for_rollback!(&mut state, &world, root.path(), "C")
                 .unwrap_err()
                 .to_string()
                 .contains(&b_id));
             assert_eq!(dispatched_writes(&world), before);
             let mut mount =
                 backend(&mut state, &world, &root.path().join("locks"), fault()).unwrap();
-            let mut mounted = mount.mount(target()).unwrap();
-            assert!(mount
-                .supersede_tail(&mut mounted, "HAND", |_, _| Err("no confirmation".into()))
+            let mounted = mount.mount(target()).unwrap();
+            let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
+            assert!(actor
+                .supersede_tail_confirmed("HAND", |_, _| Err("no confirmation".into()))
                 .is_err());
             assert_eq!(dispatched_writes(&world), before);
-            let discarded = mount
-                .supersede_tail(&mut mounted, "HAND", |expected, found| {
+            let discarded = actor
+                .supersede_tail_confirmed("HAND", |expected, found| {
                     assert_eq!(expected, "SUPERSEDE HAND");
                     assert_eq!(found, std::slice::from_ref(&b_id));
                     Ok(())
@@ -1531,22 +1631,20 @@ fn complete_uncheckpointed_tail_requires_confirmation_and_records_discarded_ids(
                 .unwrap();
             assert_eq!(discarded, std::slice::from_ref(&b_id));
             if finalize_after {
-                mount
-                    .finalize(
-                        &mut mounted,
-                        StandaloneFinalizeRequest {
-                            tape_uuid: UUID,
-                            acknowledge_tape: UUID,
-                            expected_pool_id: Some("default".into()),
-                            reason: "close recovered tape".into(),
-                            idempotency_key: uuid::Uuid::new_v4(),
-                        },
-                    )
+                actor
+                    .finalize_standalone(StandaloneFinalizeRequest {
+                        tape_uuid: UUID,
+                        acknowledge_tape: UUID,
+                        expected_pool_id: Some("default".into()),
+                        reason: "close recovered tape".into(),
+                        idempotency_key: uuid::Uuid::new_v4(),
+                    })
                     .unwrap();
             }
-            mount.release(mounted);
+            let _ = actor.finish();
+            let mut state = reopen_state();
             if !finalize_after {
-                append_for_rollback(&mut state, &world, root.path(), "C").unwrap();
+                append_for_rollback!(&mut state, &world, root.path(), "C").unwrap();
             }
             let audit = remanence_state::FileAuditLog::replay(&state.paths().audit_dir).unwrap();
             assert!(audit.iter().any(|r| r.event == AuditEvent::RecoveryEvent
@@ -1568,11 +1666,11 @@ fn stale_import_publishes_nothing_and_terminal_finalize_preserves_foreign_object
         let world = world();
         set_rollback_bootstrap(&world, parity.clone());
         let mut state = state_with_parity(&dir, true, parity.clone());
-        append_for_rollback(&mut state, &world, root.path(), "A").unwrap();
+        append_for_rollback!(&mut state, &world, root.path(), "A").unwrap();
         drop(state);
         copy_closed_state(&dir, &backup);
         let mut state = configured_state(&dir, true);
-        let b = append_for_rollback(&mut state, &world, root.path(), "B").unwrap();
+        let b = append_for_rollback!(&mut state, &world, root.path(), "B").unwrap();
         let id = uuid::Uuid::from_bytes(b.object.object_id).to_string();
         drop(state);
         let intact = world.lock().unwrap().tapes["HAND"].records.clone();
@@ -1598,23 +1696,21 @@ fn stale_import_publishes_nothing_and_terminal_finalize_preserves_foreign_object
         copy_closed_state(&backup, &dir);
         let mut state = configured_state(&dir, true);
         let mut mount = backend(&mut state, &world, &root.path().join("locks"), fault()).unwrap();
-        let mut mounted = mount.mount(target()).unwrap();
-        let error = mount
-            .finalize(
-                &mut mounted,
-                StandaloneFinalizeRequest {
-                    tape_uuid: UUID,
-                    acknowledge_tape: UUID,
-                    expected_pool_id: Some("default".into()),
-                    reason: "close tape".into(),
-                    idempotency_key: uuid::Uuid::new_v4(),
-                },
-            )
+        let mounted = mount.mount(target()).unwrap();
+        let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
+        let error = actor
+            .finalize_standalone(StandaloneFinalizeRequest {
+                tape_uuid: UUID,
+                acknowledge_tape: UUID,
+                expected_pool_id: Some("default".into()),
+                reason: "close tape".into(),
+                idempotency_key: uuid::Uuid::new_v4(),
+            })
             .unwrap_err()
             .to_string();
         assert!(error.contains(&id), "{error}");
-        let refusal = mount
-            .supersede_tail(&mut mounted, "HAND", |_, _| Ok(()))
+        let refusal = actor
+            .supersede_tail_confirmed("HAND", |_, _| Ok(()))
             .unwrap_err()
             .to_string();
         assert!(
@@ -1627,7 +1723,8 @@ fn stale_import_publishes_nothing_and_terminal_finalize_preserves_foreign_object
         );
         assert_eq!(dispatched_writes(&world), before);
         assert_eq!(world.lock().unwrap().tapes["HAND"].records, intact);
-        mount.release(mounted);
+        let _ = actor.finish();
+        drop(reopen_state());
     }
 }
 
@@ -1641,11 +1738,11 @@ fn torn_object_after_rollback_is_superseded_with_both_parity_modes() {
         let world = world();
         set_rollback_bootstrap(&world, parity.clone());
         let mut state = state_with_parity(&dir, true, parity);
-        append_for_rollback(&mut state, &world, root.path(), "A").unwrap();
+        append_for_rollback!(&mut state, &world, root.path(), "A").unwrap();
         drop(state);
         copy_closed_state(&dir, &backup);
         let mut state = configured_state(&dir, true);
-        let b = append_for_rollback(&mut state, &world, root.path(), "B").unwrap();
+        let b = append_for_rollback!(&mut state, &world, root.path(), "B").unwrap();
         drop(state);
         {
             let mut locked = world.lock().unwrap();
@@ -1663,7 +1760,7 @@ fn torn_object_after_rollback_is_superseded_with_both_parity_modes() {
         std::fs::remove_dir_all(&dir).unwrap();
         copy_closed_state(&backup, &dir);
         let mut state = configured_state(&dir, true);
-        append_for_rollback(&mut state, &world, root.path(), "C").unwrap();
+        append_for_rollback!(&mut state, &world, root.path(), "C").unwrap();
     }
 }
 
@@ -1674,13 +1771,14 @@ fn encrypted_complete_tail_is_preserved_without_a_private_key_and_past_empty_fil
     let backup = root.path().join("backup");
     let world = world();
     let mut state = state(&dir);
-    append_for_rollback(&mut state, &world, root.path(), "A").unwrap();
+    append_for_rollback!(&mut state, &world, root.path(), "A").unwrap();
     let boundary = world.lock().unwrap().tapes["HAND"].records.len();
     drop(state);
     copy_closed_state(&dir, &backup);
     let mut state = configured_state(&dir, true);
     let mut mount = backend(&mut state, &world, &root.path().join("locks"), fault()).unwrap();
-    let mut mounted = mount.mount(target()).unwrap();
+    let mounted = mount.mount(target()).unwrap();
+    let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
     let mut input = request(root.path(), "encrypted-B");
     input.representation = crate::PoolWriteRepresentation::Encrypted {
         recipients: vec![
@@ -1694,8 +1792,9 @@ fn encrypted_complete_tail_is_preserved_without_a_private_key_and_past_empty_fil
                 .unwrap(),
         ],
     };
-    let b = mount.write_checkpointed(&mut mounted, input).unwrap();
-    mount.release(mounted);
+    let b = actor.write_checkpointed(input).unwrap();
+    let _ = actor.finish();
+    let state = reopen_state();
     drop(state);
     // A delimiter cannot hide later complete evidence from the suffix scan.
     world
@@ -1711,7 +1810,7 @@ fn encrypted_complete_tail_is_preserved_without_a_private_key_and_past_empty_fil
     copy_closed_state(&backup, &dir);
     let mut state = configured_state(&dir, true);
     let before = dispatched_writes(&world);
-    let error = append_for_rollback(&mut state, &world, root.path(), "C")
+    let error = append_for_rollback!(&mut state, &world, root.path(), "C")
         .unwrap_err()
         .to_string();
     assert!(
@@ -1760,22 +1859,21 @@ fn bootstrap_without_filemark_can_be_explicitly_superseded() {
         .records
         .truncate(1);
     let mut mount = backend(&mut state, &world, &root.path().join("locks"), fault()).unwrap();
-    let mut mounted = mount.mount(target()).unwrap();
-    assert!(mount
-        .supersede_tail(&mut mounted, "HAND", |expected, found| {
+    let mounted = mount.mount(target()).unwrap();
+    let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
+    assert!(actor
+        .supersede_tail_confirmed("HAND", |expected, found| {
             assert_eq!(expected, "SUPERSEDE HAND");
             assert!(found.is_empty());
             Ok(())
         })
         .unwrap()
         .is_empty());
-    mount
-        .write_checkpointed(
-            &mut mounted,
-            request(root.path(), "after-bootstrap-recovery"),
-        )
+    actor
+        .write_checkpointed(request(root.path(), "after-bootstrap-recovery"))
         .unwrap();
-    mount.release(mounted);
+    let _ = actor.finish();
+    drop(reopen_state());
 }
 
 #[test]
@@ -1894,40 +1992,6 @@ fn clearing_append_recovery_on_sealed_tape_is_a_precise_precondition() {
             .state,
         "sealed"
     );
-}
-
-/// A source returning to the newest bytes during preparation must never reach media.
-#[test]
-fn prepared_skip_and_command_reconciliation_are_independent_of_file_count() {
-    let root = tempfile::tempdir().unwrap();
-    let mut state = state(root.path());
-    let world = world();
-    let lock = root.path().join("locks");
-    let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
-    let mut mounted = mount.mount(target()).unwrap();
-    crate::startup_checkpoint::RECONCILIATION_COUNT.with(|count| count.set(0));
-    for name in ["first", "second", "third"] {
-        let input = request(root.path(), name);
-        assert!(mount.put_path_version(&mut mounted, input).unwrap().is_ok());
-    }
-    let before = mounted.drive.media_write_dispatch_count();
-    for name in ["first", "second", "third"] {
-        let input = request(root.path(), name);
-        let crate::WriteObjectSource::Path(path) = &input.source else {
-            panic!("path source")
-        };
-        let path = path.clone();
-        std::fs::write(&path, b"changed before preparation").unwrap();
-        let decision = mount
-            .put_path_version_with_preparation(&mut mounted, input, false, || {
-                std::fs::write(path, name.as_bytes()).unwrap();
-            })
-            .unwrap();
-        assert!(decision.is_err(), "prepared digest must skip");
-    }
-    assert_eq!(mounted.drive.media_write_dispatch_count(), before);
-    crate::startup_checkpoint::RECONCILIATION_COUNT.with(|count| assert_eq!(count.get(), 1));
-    mount.release(mounted);
 }
 
 /// A historical tape identity never acquires today's endpoint; both explicit
@@ -2664,13 +2728,15 @@ fn supersede_tail_failure_fence_survives_empty_catalog_rebuild() {
         Arc::clone(&cut),
     )
     .unwrap();
-    let mut mounted = mount.mount(target()).unwrap();
+    let mounted = mount.mount(target()).unwrap();
+    let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
     *cut.lock().unwrap() = Some(0x0a);
-    assert!(mount
-        .supersede_tail(&mut mounted, "HAND", |_, _| Ok(()))
+    assert!(actor
+        .supersede_tail_confirmed("HAND", |_, _| Ok(()))
         .is_err());
     assert!(cut.lock().unwrap().is_none(), "the write fault must fire");
-    mount.release(mounted);
+    let _ = actor.finish();
+    let mut state = reopen_state();
     let audit_dir = state.paths().audit_dir.clone();
     let fences = state.catalog_index().list_active_tape_io_fences().unwrap();
     assert_eq!(fences.len(), 1);

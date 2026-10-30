@@ -1046,7 +1046,6 @@ pub(crate) fn raise_standalone_fence(
 }
 
 #[cfg(test)]
-#[path = "mount_backend/tests.rs"]
 mod tests;
 
 impl OperatorMount<'_> {

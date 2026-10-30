@@ -1,4 +1,4 @@
-//! Shared object-append primitives used by the drive actor and direct compatibility path.
+//! Shared object-append primitives used by the drive actor.
 
 use super::capacity::{
     ensure_no_parity_terminal_close_capacity, ensure_request_pool_matches_config,

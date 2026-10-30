@@ -7,7 +7,7 @@ const ENABLE: &str = "REM_WOR_DIRECT_REPLAY_FAULT_ENABLE";
 const PLAN: &str = "REM_WOR_DIRECT_REPLAY_FAULT_PLAN";
 const ENABLE_VALUE: &str = "direct-replay-after-checkpoint-v1-abort";
 
-fn library_parts(
+pub(super) fn library_parts(
     fixture: &Fixture,
 ) -> (
     remanence_library::LibraryHandle,
@@ -38,7 +38,11 @@ fn library_parts(
     let drive = library.open_drive(BAY, &policy).unwrap();
     (library, drive, policy)
 }
-fn library_owner(fixture: &Fixture, state: StateHandle, caller: &str) -> Result<MountedDrive> {
+pub(super) fn library_owner(
+    fixture: &Fixture,
+    state: StateHandle,
+    caller: &str,
+) -> Result<MountedDrive> {
     let (library, drive, policy) = library_parts(fixture);
     MountedDrive::from_placed_library(
         state,

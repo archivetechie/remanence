@@ -164,7 +164,7 @@ mod read_session;
 #[cfg(test)]
 pub(crate) mod tests;
 
-pub(crate) use actor_runtime::{run_borrowed_mounted_actor, spawn_mounted_actor};
+pub(crate) use actor_runtime::spawn_mounted_actor;
 
 mod tail_recovery;
 pub(crate) use tail_recovery::supersede_mounted_tail;

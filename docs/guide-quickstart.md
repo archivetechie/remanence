@@ -397,8 +397,10 @@ are refused before MODE SELECT or any tape write. These `rem-debug` commands
 also take the daemon's exclusive state lock, so stop the daemon before running
 them.
 
-Daemon write sessions keep a short epoch across barriers. Standalone writes
-(`rem-debug` and `OperatorMount`) close the epoch at every barrier.
+Daemon and in-process write sessions keep a short epoch across ordinary
+checkpoint barriers. Standalone `rem put` and pool-selected `rem-debug archive
+write` use that same actor policy; finishing the command closes any remaining
+short epoch without unloading the cartridge.
 
 A checkpoint drains the drive, proves the end position, and commits the journals
 and catalog. A CHECKPOINTED receipt keeps this meaning on a parity pool even

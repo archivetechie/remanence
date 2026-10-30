@@ -470,7 +470,8 @@ fn archive_write_prints_committed_locator_before_post_checkpoint_error() {
         .unwrap();
     let object_id = Uuid::from_bytes(receipt.object.object_id).to_string();
     let cause = remanence_api::PoolWriteError::InvalidInput("post-checkpoint failure".into());
-    let expected = format!("error: write object: {cause}\n");
+    let expected =
+        format!("error: write object: {cause}; actor context differs from original error\n");
     let error = remanence_api::MountError::Committed {
         receipt: Box::new(receipt),
         reason: "new",
@@ -538,6 +539,45 @@ fn archive_write_prints_committed_locator_before_post_checkpoint_error() {
     assert_eq!(
         String::from_utf8(errors).unwrap(),
         expected,
-        "original PoolWriteError text, not Status context"
+        "legacy PoolWriteError leading text followed by actor context"
+    );
+}
+
+/// Local diagnostics retain both the legacy cause and the actor's recovery advice.
+#[test]
+fn typed_write_error_keeps_appended_fence_abandonment_and_checkpoint_context() {
+    use remanence_api::engine::drive_adapter::ActorFailure;
+    let cause = Arc::new(remanence_api::PoolWriteError::InvalidInput(
+        "write failed".into(),
+    ));
+    let leading = cause.to_string();
+    for suffix in [
+        "additionally failed to persist standalone fence: disk full",
+        "abandonment marker failed: disk full",
+    ] {
+        let message = format!("{leading}; {suffix}");
+        assert_eq!(
+            local_write_error(ActorFailure {
+                status: tonic::Status::internal(message.clone()),
+                pool_write_error: Some(cause.clone())
+            }),
+            message
+        );
+    }
+    let retry =
+        format!("checkpoint batch batch-one failed; re-send all 2 WRITTEN objects: {leading}");
+    assert_eq!(
+        local_write_error(ActorFailure {
+            status: tonic::Status::internal(retry.clone()),
+            pool_write_error: Some(cause.clone())
+        }),
+        format!("{leading}; {retry}")
+    );
+    assert_eq!(
+        local_write_error(ActorFailure {
+            status: tonic::Status::internal(leading.clone()),
+            pool_write_error: Some(cause)
+        }),
+        leading
     );
 }

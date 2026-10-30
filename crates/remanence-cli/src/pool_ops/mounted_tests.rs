@@ -179,32 +179,41 @@ tape_catalog_dir = "{0}/cache"
         let name = if encrypted { "encrypted" } else { "plaintext" };
         let input = root.path().join(name);
         std::fs::write(&input, name).unwrap();
-        let (mut backend, mut mounted) = mount(&mut state, &world, root.path());
-        let result = backend
-            .write_checkpointed(
-                &mut mounted,
-                WriteObjectToPoolRequest {
-                    pool_id: "default".into(),
-                    source: WriteObjectSource::Path(input),
-                    archive_path: name.into(),
-                    caller_object_id: name.into(),
-                    expected_content_sha256: None,
-                    expected_object_id: None,
-                    input_kind: WriteObjectInputKind::LogicalFile,
-                    representation: if encrypted {
-                        PoolWriteRepresentation::Encrypted {
-                            recipients: vec![
-                                key.public_key(0).unwrap(),
-                                backup.public_key(1).unwrap(),
-                            ],
-                        }
-                    } else {
-                        PoolWriteRepresentation::Plaintext
-                    },
+        let paths = state.paths().clone();
+        let config = state.config().clone();
+        let mut actor = remanence_api::engine::drive_adapter::MountedDrive::with_transport(
+            state,
+            Path::new(DEVICE),
+            &StaticAllowlist::new([SERIAL]),
+            Box::new(Transport {
+                inner: ModelTransport::new(Arc::clone(&world), DeviceRole::Drive { bay: BAY }),
+                commands: None,
+                fail_allow: false,
+            }),
+            &root.path().join("locks"),
+            Some(UUID),
+        )
+        .unwrap();
+        let result = actor
+            .write_checkpointed(WriteObjectToPoolRequest {
+                pool_id: "default".into(),
+                source: WriteObjectSource::Path(input),
+                archive_path: name.into(),
+                caller_object_id: name.into(),
+                expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: WriteObjectInputKind::LogicalFile,
+                representation: if encrypted {
+                    PoolWriteRepresentation::Encrypted {
+                        recipients: vec![key.public_key(0).unwrap(), backup.public_key(1).unwrap()],
+                    }
+                } else {
+                    PoolWriteRepresentation::Plaintext
                 },
-            )
+            })
             .unwrap();
-        backend.release(mounted);
+        actor.finish().unwrap();
+        state = StateHandle::open_with_config(paths, config).unwrap();
         let mut locator = Vec::new();
         print_locator_json(&result.object, "default", &mut locator);
         let locator = String::from_utf8(locator).unwrap();
