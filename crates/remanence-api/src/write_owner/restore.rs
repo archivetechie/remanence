@@ -917,7 +917,7 @@ pub(crate) struct WriteSessionProtoInput<'a> {
     pub(crate) bytes_committed: u64,
     pub(crate) opened_at_utc: &'a str,
     pub(crate) last_checkpoint_at_utc: Option<&'a str>,
-    pub(crate) drive_element_address: u16,
+    pub(crate) drive_element_address: Option<u16>,
     pub(crate) pending_batch: Option<&'a PendingCheckpointBatch>,
 }
 
@@ -932,7 +932,7 @@ pub(crate) fn session_proto(input: WriteSessionProtoInput<'_>) -> pb::WriteSessi
     pb::WriteSession {
         session_id: input.session_id.as_bytes().to_vec(),
         tape_uuid: Some(input.tape_uuid.to_vec()),
-        drive_element_address: Some(u32::from(input.drive_element_address)),
+        drive_element_address: input.drive_element_address.map(u32::from),
         body_format: "rem-object-v1".to_string(),
         state: input.state as i32,
         objects_committed: input.objects_committed,
@@ -962,7 +962,10 @@ pub(crate) fn session_proto(input: WriteSessionProtoInput<'_>) -> pb::WriteSessi
     }
 }
 
-pub(crate) fn status_from_pool_write_error(err: PoolWriteError) -> Status {
+pub(crate) fn status_from_pool_write_error(
+    err: impl std::borrow::Borrow<PoolWriteError>,
+) -> Status {
+    let err = err.borrow();
     let message = err.to_string();
     match err {
         PoolWriteError::Select(select) => status_from_select_tape_error(select),
@@ -986,17 +989,31 @@ pub(crate) fn status_from_pool_write_error(err: PoolWriteError) -> Status {
             Status::already_exists(message)
         }
         PoolWriteError::ReplayObjectInvalid { .. } => Status::internal(message),
-        PoolWriteError::Streaming(streaming) => status_from_streaming_error(&streaming, message),
+        PoolWriteError::Streaming(streaming) => status_from_streaming_error(streaming, message),
         PoolWriteError::ParitySpoolRefused { cause, .. } => {
-            status_from_parity_error(&cause, message)
+            status_from_parity_error(cause, message)
         }
-        PoolWriteError::Parity(parity) => status_from_parity_error(&parity, message),
+        PoolWriteError::Parity(parity) => status_from_parity_error(parity, message),
         PoolWriteError::PhysicalUsedBytesOverflow { .. }
         | PoolWriteError::CheckpointReconciliation(_)
         | PoolWriteError::Io { .. }
         | PoolWriteError::TapeIo(_)
         | PoolWriteError::TransferWithSecondary { .. }
         | PoolWriteError::TimeFormat(_) => Status::internal(message),
+    }
+}
+
+/// Only a mounted endpoint transports an owned local cause; daemon Status text
+/// (including all downstream audit/log formatting) remains byte-for-byte legacy.
+pub(super) fn status_from_selected_write_error(
+    selected: &crate::pool_write::SelectedTape,
+    err: PoolWriteError,
+) -> Status {
+    let status = status_from_pool_write_error(&err);
+    if selected.standalone_endpoint.is_some() {
+        super::ActorFailure::attach(status, err)
+    } else {
+        status
     }
 }
 
@@ -1043,7 +1060,10 @@ pub(crate) fn status_from_pinned_tape_error(err: crate::pool_write::PinnedTapeEr
     }
 }
 
-pub(crate) fn status_from_select_tape_error(err: SelectTapeError) -> Status {
+pub(crate) fn status_from_select_tape_error(
+    err: impl std::borrow::Borrow<SelectTapeError>,
+) -> Status {
+    let err = err.borrow();
     let message = err.to_string();
     match err {
         SelectTapeError::UnknownPool { .. } => Status::invalid_argument(message),

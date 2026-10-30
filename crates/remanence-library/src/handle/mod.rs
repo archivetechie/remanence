@@ -1880,6 +1880,16 @@ impl DriveHandle {
         Ok(())
     }
 
+    /// Consume an owner's removal obligation exactly once at explicit finish.
+    /// A failed ALLOW is reported to that owner for operator recovery; Drop
+    /// must not silently retry it after the owner has published its result.
+    pub fn finish_medium_removal_guard(&mut self) -> Result<(), DriveOpError> {
+        if self.removal_guard.take().is_some() {
+            self.issue_removal(false)?;
+        }
+        Ok(())
+    }
+
     /// Opt-in SCSI RESERVE(6); the invocation owns the matching RELEASE(6).
     pub fn reserve(&mut self) -> Result<(), DriveOpError> {
         self.issue_drive_control(

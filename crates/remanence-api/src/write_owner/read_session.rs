@@ -163,7 +163,7 @@ pub(super) fn handle_drive_open_read(
             let _ = drive.unload();
             if let Some(library) = drive.observed_library() {
                 let _ = super::robotics::observe_refreshed_library(index, cfg, &library);
-                super::robotics::publish_library_snapshot(&cfg.library_snapshot, library);
+                super::robotics::publish_library_snapshot(&cfg.library().snapshot, library);
             }
         }
         return;
@@ -338,6 +338,26 @@ pub(super) fn handle_drive_open_read(
                     Err(Status::not_found("read session not found"))
                 };
                 let _ = reply.send(status);
+            }
+            DriveCommand::OpenMountedWrite { reply, .. } => {
+                let _ = reply.send(Err(Status::failed_precondition(
+                    "read session already active",
+                )));
+            }
+            DriveCommand::FinishMountedInvocation { reply } => {
+                let _ = reply.send(Err(Status::failed_precondition(
+                    "read session already active",
+                )));
+            }
+            DriveCommand::FinalizeMounted { reply, .. } => {
+                let _ = reply.send(Err(Status::failed_precondition(
+                    "read session already active",
+                )));
+            }
+            DriveCommand::SupersedeMounted { reply, .. } => {
+                let _ = reply.send(Err(Status::failed_precondition(
+                    "read session already active",
+                )));
             }
             DriveCommand::OpenWrite { reply, .. } => {
                 let _ = reply.send(Err(Status::failed_precondition(

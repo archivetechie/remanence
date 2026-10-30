@@ -240,3 +240,6 @@ pub fn validate_spooled_object(
 
 /// Standalone fence admission and reporting.
 pub use mount_backend::{standalone_fence_policy, standalone_fence_releasable};
+
+/// In-process ownership of today's session engine.
+pub mod engine;

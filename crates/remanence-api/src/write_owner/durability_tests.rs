@@ -283,7 +283,7 @@ async fn open_writer(
         selected: selected(),
         target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
         needs_drive_load: false,
-        library_serial: LIBRARY.into(),
+        library_serial: Some(LIBRARY.into()),
         barcode: Some(BARCODE.into()),
         source_slot: None,
         drive_uuid: None,

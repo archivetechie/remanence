@@ -40,7 +40,13 @@ const LOAD_READY_TIMEOUT: StdDuration =
 const LOAD_READY_POLL_INTERVAL: StdDuration =
     StdDuration::from_secs(crate::readiness_wait::DEFAULT_READY_POLL_SECONDS as u64);
 
+mod mounted_commands;
+mod placement;
+pub(crate) use placement::{ActorPlacement, LibraryActorContext, MountedDriveContext};
+mod local_failure;
+pub use local_failure::ActorFailure;
 mod actor_protocol;
+mod timers;
 pub(crate) use actor_protocol::*;
 
 mod terminal_types;
@@ -156,3 +162,5 @@ mod read_session;
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+pub(crate) use actor_runtime::spawn_mounted_actor;

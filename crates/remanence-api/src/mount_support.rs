@@ -108,6 +108,17 @@ impl Drop for MountedTape {
     }
 }
 impl MountedTape {
+    /// Finish an actor-owned mount, reporting ALLOW/RELEASE failures before reply.
+    pub(crate) fn finish(mut self) -> Result<(), MountError> {
+        let removal = self.drive.finish_medium_removal_guard().map_err(refusal);
+        let reservation = if std::mem::take(&mut self.reserved) {
+            self.drive.release_reservation().map_err(refusal)
+        } else {
+            Ok(())
+        };
+        removal.and(reservation)
+    }
+
     /// Ephemeral identities never authorize persistent mutations.
     pub fn writable(&self) -> bool {
         matches!(self.endpoint, MountEndpoint::Durable(_))
@@ -233,7 +244,7 @@ fn lock_device(io: &mut LockIo, serial: &str) -> Result<DeviceLock, MountError> 
 pub(crate) struct LockedAuditedDevice {
     pub(crate) drive: Option<DriveHandle>,
     lock: Option<Arc<DeviceLock>>,
-    audit_error: Arc<Mutex<Option<String>>>,
+    pub(crate) audit_error: Arc<Mutex<Option<String>>>,
     pub(crate) endpoint: MountEndpoint,
 }
 impl LockedAuditedDevice {

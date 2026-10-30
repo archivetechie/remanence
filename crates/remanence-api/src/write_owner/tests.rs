@@ -3906,8 +3906,12 @@ fn test_write_owner_config(
         audit_fsync: false,
         audit_append_lock: Arc::new(std::sync::Mutex::new(())),
         reservations: Arc::new(HashMap::new()),
-        actor_library_serial: serial.clone(),
-        library_snapshot,
+        placement: crate::write_owner::ActorPlacement::Library(
+            crate::write_owner::LibraryActorContext {
+                serial: serial.clone(),
+                snapshot: library_snapshot,
+            },
+        ),
         snapshot_miss_alarm: 1,
         managed_library_serials: Arc::new(HashSet::from([serial])),
         cleaning: remanence_state::CleaningConfig::default(),
@@ -3988,6 +3992,7 @@ async fn append_actor_test_file_result(
             caller_object_id: caller_object_id.to_string(),
             expected_content_sha256: None,
             expected_object_id: None,
+            representation: crate::PoolWriteRepresentation::Plaintext,
             input_kind: crate::WriteObjectInputKind::LogicalFile,
             live_write_counter: None,
             reply: append_tx,
@@ -4047,8 +4052,15 @@ fn checkpoint_timer_request_queues_behind_existing_drive_actor_work() {
     tx.blocking_send(DriveCommand::Get { session_id, reply })
         .expect("queue in-flight actor command");
 
-    arm_checkpoint_timer(tx, session_id, batch_id, StdDuration::from_millis(0))
-        .expect("spawn checkpoint timer");
+    let mut timers = super::timers::SessionTimers::default();
+    arm_checkpoint_timer(
+        &mut timers,
+        tx,
+        session_id,
+        batch_id,
+        StdDuration::from_millis(0),
+    )
+    .expect("spawn checkpoint timer");
 
     assert!(matches!(
         rx.blocking_recv().expect("first queued command"),
@@ -6090,8 +6102,12 @@ async fn changer_move_succeeds_and_publishes_snapshot_when_catalog_observation_f
         audit_fsync: false,
         audit_append_lock: Arc::new(std::sync::Mutex::new(())),
         reservations: Arc::new(HashMap::new()),
-        actor_library_serial: library.serial.clone(),
-        library_snapshot: Arc::clone(&snapshot_cell),
+        placement: crate::write_owner::ActorPlacement::Library(
+            crate::write_owner::LibraryActorContext {
+                serial: library.serial.clone(),
+                snapshot: Arc::clone(&snapshot_cell),
+            },
+        ),
         snapshot_miss_alarm: 1,
         managed_library_serials: Arc::new(HashSet::from([library.serial.clone()])),
         cleaning: remanence_state::CleaningConfig::default(),
@@ -6226,7 +6242,7 @@ fn session_protos_include_drive_element_address() {
         bytes_committed: 0,
         opened_at_utc: opened_at,
         last_checkpoint_at_utc: None,
-        drive_element_address: 0x0100,
+        drive_element_address: Some(0x0100),
         pending_batch: None,
     });
     let read = read_session_proto(
@@ -7029,6 +7045,7 @@ async fn induced_append_and_read_failures_persist_session_snapshots() {
             caller_object_id: "failure-test-object".to_string(),
             expected_content_sha256: None,
             expected_object_id: None,
+            representation: crate::PoolWriteRepresentation::Plaintext,
             input_kind: crate::WriteObjectInputKind::LogicalFile,
             live_write_counter: None,
             reply: append_tx,
@@ -9104,7 +9121,7 @@ fn resume_vectors_layer5_authorities(refusal: Option<&str>) {
             "does not match sink journal block size"
         };
         assert!(detail.contains(expected_detail), "{detail}");
-        let pool_status = super::restore::status_from_pool_write_error(error.into());
+        let pool_status = super::restore::status_from_pool_write_error(PoolWriteError::from(error));
         assert_eq!(pool_status.code(), tonic::Code::FailedPrecondition);
         assert!(pool_status.message().contains(expected_detail));
         drop(journal);
@@ -11845,7 +11862,7 @@ pub(crate) async fn check_context_failure_receipts(
         selected: selected.clone(),
         target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
         needs_drive_load: false,
-        library_serial: serial,
+        library_serial: Some(serial),
         barcode: Some("HAND".into()),
         source_slot: None,
         drive_uuid: None,
@@ -13021,7 +13038,7 @@ async fn check_session_projection_busy(
     let drive = library
         .open_drive(
             0x100,
-            &remanence_library::StaticAllowlist::new([cfg.actor_library_serial.as_str()]),
+            &remanence_library::StaticAllowlist::new([cfg.library().serial.as_str()]),
         )
         .unwrap();
     let tx = spawn_drive_actor(0x100, drive, cfg.clone());
@@ -13032,7 +13049,7 @@ async fn check_session_projection_busy(
         selected: selected.clone(),
         target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
         needs_drive_load: false,
-        library_serial: cfg.actor_library_serial.clone(),
+        library_serial: cfg.library().serial.clone(),
         barcode: Some("HAND".into()),
         source_slot: None,
         drive_uuid: None,
@@ -13148,7 +13165,7 @@ async fn check_open_checkpoint_projection_busy(
             selected: selected.clone(),
             target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
             needs_drive_load: false,
-            library_serial: cfg.actor_library_serial.clone(),
+            library_serial: cfg.library().serial.clone(),
             barcode: Some("HAND".into()),
             source_slot: Some(0x400),
             drive_uuid: None,
@@ -13212,7 +13229,7 @@ async fn check_open_checkpoint_projection_busy(
         tx.send(DriveCommand::OpenRead {
             tape_uuid: selected.tape_uuid,
             needs_drive_load: false,
-            library_serial: cfg.actor_library_serial.clone(),
+            library_serial: cfg.library().serial.clone(),
             barcode: Some("HAND".into()),
             source_slot: Some(0x400),
             drive_uuid: None,
@@ -13297,19 +13314,19 @@ pub(crate) async fn unload_adopted_cartridge(
     cfg.tape_pools = state.config().tape_pools.clone();
     let lifecycle = crate::drive_pool::DrivePoolLifecycle::default();
     cfg.lifecycle = Some(lifecycle.clone());
-    let key = crate::drive_pool::DriveKey::new(&cfg.actor_library_serial, 0x100);
+    let key = crate::drive_pool::DriveKey::new(&cfg.library().serial, 0x100);
     let drive = library.open_drive(0x100, &cfg.policy).unwrap();
     let actor = spawn_drive_actor(0x100, drive, cfg.clone());
     let changer = spawn_changer_actor(library.into_changer(), cfg.clone());
     let pool = DrivePool::new_with_lifecycle(
-        HashMap::from([(cfg.actor_library_serial.clone(), changer)]),
+        HashMap::from([(cfg.library().serial.clone(), changer)]),
         HashMap::from([(key.clone(), actor)]),
         Arc::new(HashMap::from([(key, AtomicBool::new(false))])),
         lifecycle,
     );
     let seated = SeatedCartridge {
         bay: 0x100,
-        library_serial: cfg.actor_library_serial.clone(),
+        library_serial: cfg.library().serial.clone(),
         barcode: Some("HAND".into()),
         home_slot: 0x400,
         tape_uuid: Some(tape_uuid),
@@ -13318,7 +13335,7 @@ pub(crate) async fn unload_adopted_cartridge(
     pool.park_cartridge(seated.clone());
     let mut api = crate::ApiState::new(CatalogIndex::open(&state.paths().sqlite_path).unwrap());
     api.audit_dir = Arc::new(cfg.audit_dir.clone());
-    api.library_snapshot = Some(cfg.library_snapshot.clone());
+    api.library_snapshot = Some(cfg.library().snapshot.clone());
     api.drive_pool = Some(pool);
     api.drive_idle_unload_seconds = 1;
     crate::mount::test_remove_seated_epoch(&api, "idle", seated).await;
@@ -13791,7 +13808,7 @@ async fn check_epoch_removal(
                 selected: selected.clone(),
                 target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
                 needs_drive_load: false,
-                library_serial: cfg.actor_library_serial.clone(),
+                library_serial: cfg.library().serial.clone(),
                 barcode: Some("HAND".into()),
                 source_slot: Some(0x400),
                 drive_uuid: None,
@@ -13866,7 +13883,7 @@ async fn check_epoch_removal(
             Some(&selected.tape_uuid),
             Some("HAND"),
             Some(&remanence_state::DriveKey::new(
-                &cfg.actor_library_serial,
+                &cfg.library().serial,
                 0x100,
             )),
         )
@@ -13901,10 +13918,10 @@ async fn check_epoch_removal(
     }
     let mut api = crate::ApiState::new(index);
     api.audit_dir = Arc::new(cfg.audit_dir.clone());
-    api.library_snapshot = Some(cfg.library_snapshot.clone());
-    api.default_library_serial = Some(Arc::new(cfg.actor_library_serial.clone()));
+    api.library_snapshot = Some(cfg.library().snapshot.clone());
+    api.default_library_serial = Some(Arc::new(cfg.library().serial.clone()));
     api.drive_idle_unload_seconds = 1;
-    let key = crate::drive_pool::DriveKey::new(&cfg.actor_library_serial, 0x100);
+    let key = crate::drive_pool::DriveKey::new(&cfg.library().serial, 0x100);
     let changer = if path == "operator" {
         // Inject the model library at the robotics execution boundary; the API still
         // dispatches PrepareRemoval to the real drive actor before this command.
@@ -13939,14 +13956,14 @@ async fn check_epoch_removal(
         spawn_changer_actor(library.into_changer(), cfg.clone())
     };
     let pool = DrivePool::new_with_lifecycle(
-        HashMap::from([(cfg.actor_library_serial.clone(), changer)]),
+        HashMap::from([(cfg.library().serial.clone(), changer)]),
         HashMap::from([(key.clone(), tx)]),
         Arc::new(HashMap::from([(key, AtomicBool::new(false))])),
         lifecycle,
     );
     let seated = SeatedCartridge {
         bay: 0x100,
-        library_serial: cfg.actor_library_serial.clone(),
+        library_serial: cfg.library().serial.clone(),
         barcode: Some("HAND".into()),
         home_slot: 0x400,
         tape_uuid: Some(selected.tape_uuid),
@@ -13973,7 +13990,7 @@ async fn check_epoch_removal(
             let operation = api
                 .library_service()
                 .unload_drive(tonic::Request::new(pb::UnloadDriveRequest {
-                    library_uuid: crate::library::library_uuid(&cfg.actor_library_serial).to_vec(),
+                    library_uuid: crate::library::library_uuid(&cfg.library().serial).to_vec(),
                     drive_element_address: 0x100,
                     destination_slot_address: 0x400,
                     idempotency_key: None,
@@ -14539,17 +14556,17 @@ async fn check_api_epoch_fills(
             .map(|p| (p.id.clone(), p.clone()))
             .collect(),
     );
-    api.library_snapshot = Some(cfg.library_snapshot.clone());
-    api.default_library_serial = Some(Arc::new(cfg.actor_library_serial.clone()));
+    api.library_snapshot = Some(cfg.library().snapshot.clone());
+    api.default_library_serial = Some(Arc::new(cfg.library().serial.clone()));
     api.checkpoint_journal_dir = Arc::new(cfg.checkpoint_journal_dir.clone());
     api.audit_dir = Arc::new(cfg.audit_dir.clone());
     api.audit_append_lock = cfg.audit_append_lock.clone();
     api.drive_idle_unload_seconds = 0;
     api.io_memory = cfg.io_memory.clone();
-    let key = crate::drive_pool::DriveKey::new(&cfg.actor_library_serial, 0x100);
+    let key = crate::drive_pool::DriveKey::new(&cfg.library().serial, 0x100);
     let changer = spawn_changer_actor(library.into_changer(), cfg.clone());
     api.drive_pool = Some(DrivePool::new_with_lifecycle(
-        HashMap::from([(cfg.actor_library_serial.clone(), changer)]),
+        HashMap::from([(cfg.library().serial.clone(), changer)]),
         HashMap::from([(key.clone(), tx.clone())]),
         Arc::new(HashMap::from([(key, AtomicBool::new(false))])),
         lifecycle,
@@ -14949,7 +14966,7 @@ async fn idle_unload_stops_when_live_element_status_finds_empty_bay() {
     };
     pool.park_cartridge(seated.clone());
     let mut api = crate::ApiState::new(index);
-    api.library_snapshot = Some(cfg.library_snapshot.clone());
+    api.library_snapshot = Some(cfg.library().snapshot.clone());
     api.drive_pool = Some(pool);
     api.drive_idle_unload_seconds = 1;
     {
@@ -14959,7 +14976,7 @@ async fn idle_unload_stops_when_live_element_status_finds_empty_bay() {
         world.command_log.clear();
     }
     crate::mount::test_remove_seated_epoch(&api, "idle", seated).await;
-    assert!(!cfg.library_snapshot.read().unwrap().report.libraries[0].drive_bays[0].loaded);
+    assert!(!cfg.library().snapshot.read().unwrap().report.libraries[0].drive_bays[0].loaded);
     let commands = world.lock().unwrap().command_log.len();
     tokio::time::sleep(StdDuration::from_millis(1200)).await;
     let world = world.lock().unwrap();
@@ -15068,4 +15085,70 @@ fn checkpoint_batch_fence_survives_empty_catalog_rebuild() {
         "checkpoint_barrier_failed"
     );
     crate::tests::assert_fences_survive_empty_rebuild(&index, &cfg.audit_dir);
+}
+
+/// The mounted local failure envelope must not change daemon durable diagnostics.
+#[test]
+fn daemon_epoch_failure_audit_keeps_legacy_status_text() {
+    use std::error::Error as _;
+    let temp = tempfile::tempdir().unwrap();
+    let mut index = CatalogIndex::open(temp.path().join("state.sqlite")).unwrap();
+    let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
+        "audit-library",
+        0x100,
+        "audit-drive",
+        0x400,
+        1,
+    )));
+    let library = open_model_library(world);
+    let cfg = test_write_owner_config(
+        temp.path().join("state.sqlite"),
+        temp.path().join("audit"),
+        &library,
+        library_snapshot_cell(library.library().clone()),
+    );
+    let selected = crate::pool_write::SelectedTape {
+        standalone_endpoint: None,
+        tape_uuid: [0x42; 16],
+        block_size: 262144,
+        parity_config: ParityConfig::None,
+        pool_id: "default".into(),
+    };
+    let status = status_from_selected_write_error(
+        &selected,
+        PoolWriteError::SelectedTapeInsufficientCapacity {
+            object_size: 31,
+            raw_capacity: 17,
+            used: 9,
+        },
+    );
+    assert!(
+        status.source().is_none(),
+        "daemon conversion has no local WriteCause at any sink"
+    );
+    let expected = "code: 'The system is not in a state required for the operation's execution', message: \"selected tape has insufficient capacity: object_size=31, raw_capacity=17, used=9\"";
+    assert_eq!(status.to_string(), expected, "legacy log Display text");
+    audit_removal_epoch(
+        &mut index,
+        &cfg,
+        0x100,
+        Some(selected.tape_uuid),
+        "epoch_left_open",
+        status.to_string(),
+        Some((0, 1)),
+    );
+    let audit = FileAuditLog::replay(&cfg.audit_dir).unwrap();
+    let record = audit
+        .iter()
+        .find(|r| r.detail.get("session_kind") == Some(&CborValue::Text("epoch_left_open".into())))
+        .unwrap();
+    assert_eq!(
+        record.detail.get("abort_reason"),
+        Some(&CborValue::Text(expected.into()))
+    );
+    let wrapped = super::ActorFailure::preserve(&status, Status::internal("secondary failure"));
+    assert!(
+        wrapped.source().is_none(),
+        "fence wrapping cannot introduce a local cause on the daemon path"
+    );
 }

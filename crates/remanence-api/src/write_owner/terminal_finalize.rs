@@ -27,7 +27,7 @@ use super::checkpoint::{
 };
 use super::read_session::session_open_reject_tape_io_fences;
 use super::readiness::session_open_short_probe_or_load;
-use super::restore::{status_from_parity_error, status_from_pool_write_error};
+use super::restore::{status_from_parity_error, status_from_selected_write_error};
 use super::terminal_types::TerminalConfig;
 use super::terminal_types::{
     parity_progress_from_state, persist_terminal_recovery_required,
@@ -352,7 +352,7 @@ pub(super) fn authorize_terminal_intent_capacity(
         counts,
         intent.layout.expected_eod_lba,
     )
-    .map_err(status_from_pool_write_error)?;
+    .map_err(|err| status_from_selected_write_error(selected, err))?;
     Ok(())
 }
 
@@ -511,7 +511,7 @@ pub(super) fn build_new_terminal_plan(
         summary.counts,
         layout.expected_eod_lba,
     )
-    .map_err(status_from_pool_write_error)?;
+    .map_err(|err| status_from_selected_write_error(selected, err))?;
     let edition_sequence = previous
         .ordinal
         .checked_add(1)
@@ -2756,7 +2756,7 @@ pub(super) fn plan_mounted_epoch_finalization(
                     .unwrap_or_else(|e| e.into_inner())
                     .by_drive
                     .get(&crate::drive_pool::DriveKey::new(
-                        &cfg.actor_library_serial,
+                        &cfg.library().serial,
                         bay,
                     ))
                     .map_or(e.parked_generation == 0, |p| {
@@ -2790,7 +2790,7 @@ pub(super) fn plan_mounted_epoch_finalization(
                     .unwrap_or_else(|e| e.into_inner())
                     .by_drive
                     .get(&crate::drive_pool::DriveKey::new(
-                        &cfg.actor_library_serial,
+                        &cfg.library().serial,
                         bay,
                     ))
                     .map(|p| p.generation)

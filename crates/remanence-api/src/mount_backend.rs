@@ -584,7 +584,13 @@ impl OperatorMount<'_> {
                 AuditEvent::SessionOrphaned
             },
         )?;
-        result.map(|reply| reply.projection).map_err(refusal)
+        result.map(|reply| reply.projection).map_err(|status| {
+            // The shared finalizer may carry a mounted local cause. Preserve the
+            // legacy standalone refusal text at this Display-based boundary.
+            refusal(crate::write_owner::ActorFailure::without_local_cause(
+                status,
+            ))
+        })
     }
 }
 

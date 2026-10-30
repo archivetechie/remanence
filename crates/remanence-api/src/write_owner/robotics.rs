@@ -82,11 +82,11 @@ pub(crate) fn handle_robotics(
     action: RoboticsAction,
     handle: &crate::operations::OperationHandle,
 ) -> RoboticsOutcome {
-    if library_serial != cfg.actor_library_serial {
+    if library_serial != cfg.library().serial {
         return RoboticsOutcome::Failed {
             message: format!(
                 "robotics request for library {library_serial} reached actor for {}",
-                cfg.actor_library_serial
+                cfg.library().serial
             ),
             phase: "routing",
         };
@@ -110,7 +110,8 @@ pub(crate) fn handle_robotics(
     }
 
     let snapshot = cfg
-        .library_snapshot
+        .library()
+        .snapshot
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
@@ -190,7 +191,7 @@ pub(crate) fn handle_robotics(
 
     let observation = observe_refreshed_library(index, cfg, library.library())
         .map_err(|err| err.message().to_string());
-    publish_library_snapshot(&cfg.library_snapshot, library.library().clone());
+    publish_library_snapshot(&cfg.library().snapshot, library.library().clone());
     RoboticsOutcome::Completed {
         action,
         observation,

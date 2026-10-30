@@ -26,7 +26,7 @@ use super::checkpoint::{
 use super::read_session::session_open_reject_tape_io_fences;
 use super::readiness::session_open_short_probe_or_load;
 use super::restore::{
-    now_rfc3339, session_proto, status_from_pool_write_error, WriteSessionProtoInput,
+    now_rfc3339, session_proto, status_from_selected_write_error, WriteSessionProtoInput,
 };
 use super::terminal_finalize::{
     finalize_terminal_no_parity, finalize_terminal_with_parity,
@@ -53,7 +53,7 @@ pub(super) struct CloseWriteActorInput<'a> {
     session_id: Uuid,
     tape_uuid: TapeUuid,
     target_kind: pb::write_session::TargetKind,
-    library_serial: &'a str,
+    library_serial: Option<&'a str>,
     bay: u16,
     objects_committed: u64,
     bytes_committed: u64,
@@ -97,7 +97,7 @@ pub(super) fn close_write_actor(
         bytes_committed: input.bytes_committed,
         opened_at_utc: input.opened_at_utc,
         last_checkpoint_at_utc: input.last_checkpoint_at_utc,
-        drive_element_address: input.bay,
+        drive_element_address: input.cfg.wire_bay(input.bay),
         pending_batch: None,
     });
     session.checkpointed_objects = input.checkpointed_objects.to_vec();
@@ -115,7 +115,7 @@ pub(super) fn close_write_actor(
             session_kind: "write",
             event: AuditEvent::SessionClosed,
             tape_uuid: Some(input.tape_uuid),
-            library_serial: Some(input.library_serial.to_string()),
+            library_serial: input.library_serial.map(str::to_owned),
             drive_bay: Some(input.bay),
             drive_uuid: input.drive_uuid.clone(),
             drive_serial: input.drive_serial.clone(),
@@ -138,7 +138,14 @@ type DeferredWriteCloseReply = (
     CloseWriteActorReply,
 );
 
+type FinishRequest = (
+    oneshot::Sender<Result<(), Status>>,
+    oneshot::Receiver<Result<CloseWriteActorReply, Status>>,
+);
+
 pub(super) struct WriteSessionState<'a> {
+    timers: super::timers::SessionTimers,
+    finish_request: Option<FinishRequest>,
     bay: u16,
     index: &'a mut CatalogIndex,
     cfg: &'a WriteOwnerConfig,
@@ -148,7 +155,7 @@ pub(super) struct WriteSessionState<'a> {
     pool_cfg: TapePoolConfig,
     selected: SelectedTape,
     target_kind: pb::write_session::TargetKind,
-    library_serial: String,
+    library_serial: Option<String>,
     drive_uuid: Option<Vec<u8>>,
     drive_serial: Option<String>,
     session_id: Uuid,
@@ -245,6 +252,36 @@ impl WriteSessionState<'_> {
     fn run(&mut self, rx: &mut mpsc::Receiver<DriveCommand>) -> Option<DeferredWriteCloseReply> {
         while let Some(command) = rx.blocking_recv() {
             match command {
+                DriveCommand::FinishMountedInvocation { reply } => {
+                    if self.cfg.mounted().is_none() {
+                        let _ = reply.send(Err(Status::failed_precondition(
+                            "mounted command on library actor",
+                        )));
+                        continue;
+                    }
+                    let (close_tx, close_rx) = oneshot::channel();
+                    self.handle_close(DriveCommand::Close {
+                        session_id: self.session_id,
+                        reply: close_tx,
+                    });
+                    self.finish_request = Some((reply, close_rx));
+                    break;
+                }
+                DriveCommand::OpenMountedWrite { reply, .. } => {
+                    let _ = reply.send(Err(Status::failed_precondition(
+                        "write session already active",
+                    )));
+                }
+                DriveCommand::FinalizeMounted { reply, .. } => {
+                    let _ = reply.send(Err(Status::failed_precondition(
+                        "write session already active",
+                    )));
+                }
+                DriveCommand::SupersedeMounted { reply, .. } => {
+                    let _ = reply.send(Err(Status::failed_precondition(
+                        "write session already active",
+                    )));
+                }
                 command @ DriveCommand::AppendFinish { .. } => {
                     self.handle_append_finish(command);
                 }
@@ -384,12 +421,18 @@ impl WriteSessionState<'_> {
             expected_content_sha256,
             expected_object_id,
             input_kind,
+            representation,
             live_write_counter,
             reply,
         } = command
         else {
             unreachable!("append handler received another drive command");
         };
+        if let Err(error) = self.cfg.mounted_audit_ready() {
+            source.remove_completed_path();
+            let _ = reply.send(Err(error));
+            return;
+        }
         let cfg = self.cfg;
         let pool_cfg = self.pool_cfg.clone();
         let selected = self.selected.clone();
@@ -434,6 +477,32 @@ impl WriteSessionState<'_> {
                 .map(|(index, pending)| (index, (batch.batch_id, pending)))
         }) {
             let (batch_id, pending) = pending;
+            let (label, recipients) = crate::pool_write::requested_copy_identity(&representation);
+            if pending.checkpoint_projection().is_none_or(|p| {
+                p.copy.representation != label || p.copy.recipient_epoch_ids != recipients
+            }) {
+                source.remove_completed_path();
+                let _ = reply.send(Err(status_from_selected_write_error(
+                    &selected,
+                    crate::PoolWriteError::CallerObjectIdRepresentationConflict {
+                        pool_id: pool_cfg.id.clone(),
+                        caller_object_id,
+                        existing_representations: pending
+                            .checkpoint_projection()
+                            .map(|p| {
+                                vec![format!(
+                                    "{} {:?}",
+                                    p.copy.representation, p.copy.recipient_epoch_ids
+                                )]
+                            })
+                            .unwrap_or_default(),
+                        requested_representation: label,
+                        requested_recipient_epoch_ids: recipients,
+                    },
+                )));
+                return;
+            }
+
             let pending_archive_path =
                 if pending.input_kind() == crate::WriteObjectInputKind::LogicalFile {
                     match pending
@@ -482,7 +551,7 @@ impl WriteSessionState<'_> {
                     }
                 },
                 Err(err) => {
-                    let _ = reply.send(Err(status_from_pool_write_error(err)));
+                    let _ = reply.send(Err(status_from_selected_write_error(&selected, err)));
                 }
             }
             return;
@@ -494,7 +563,7 @@ impl WriteSessionState<'_> {
             caller_object_id,
             expected_content_sha256,
             expected_object_id,
-            representation: crate::PoolWriteRepresentation::Plaintext,
+            representation,
             input_kind,
         };
         let mut write_admission = match cfg.write_admissions.reserve(
@@ -580,7 +649,9 @@ impl WriteSessionState<'_> {
                                 Ok(context) => context,
                                 Err(err) => {
                                     self.append_gate.record_failure();
-                                    let _ = reply.send(Err(status_from_pool_write_error(err)));
+                                    let _ = reply.send(Err(status_from_selected_write_error(
+                                        &selected, err,
+                                    )));
                                     return;
                                 }
                             };
@@ -607,6 +678,7 @@ impl WriteSessionState<'_> {
                     );
                     let timer_arm_failed = if new_batch {
                         match arm_checkpoint_timer(
+                            &mut self.timers,
                             self.actor_tx.clone(),
                             session_id,
                             batch_id,
@@ -652,7 +724,7 @@ impl WriteSessionState<'_> {
                                         Err(err) => {
                                             self.append_gate.record_failure();
                                             self.pending_batch = None;
-                                            let _ = reply.send(Err(status_from_pool_write_error(err)));
+                                            let _ = reply.send(Err(status_from_selected_write_error(&selected, err)));
                                             return;
                                         }
                                     };
@@ -888,7 +960,8 @@ impl WriteSessionState<'_> {
                     self.append_gate.record_failure();
                 }
                 let original_error = err.to_string();
-                let mut status = status_from_pool_write_error(err);
+                let mut status = status_from_selected_write_error(&selected, err);
+                let typed_status = status.clone();
                 if tape_started {
                     let failed_batch = self.pending_batch.take();
                     if let Some(batch) = failed_batch.as_ref() {
@@ -986,7 +1059,7 @@ impl WriteSessionState<'_> {
                     "append-failure",
                     self.snapshot_misses,
                 );
-                let _ = reply.send(Err(status));
+                let _ = reply.send(Err(super::ActorFailure::preserve(&typed_status, status)));
             }
         }
     }
@@ -1027,13 +1100,21 @@ impl WriteSessionState<'_> {
                     bytes_committed: self.bytes_committed,
                     opened_at_utc: opened_at_utc.as_str(),
                     last_checkpoint_at_utc: self.last_checkpoint_at_utc.as_deref(),
-                    drive_element_address: bay,
+                    drive_element_address: cfg.wire_bay(bay),
                     pending_batch: None,
                 });
                 send_checkpoint_actor_reply(reply, session, &mut self.committed_receipts, trigger);
             }
             return;
         };
+        // A failed audit blocks another durability barrier, but already-committed
+        // receipts above remain claimable without any device or journal writes.
+        if let Err(error) = self.cfg.mounted_audit_ready() {
+            if let Some(reply) = reply {
+                let _ = reply.send(Err(error));
+            }
+            return;
+        }
         if expected_batch_id.is_some_and(|expected| expected != batch.batch_id) {
             return;
         }
@@ -1082,7 +1163,7 @@ impl WriteSessionState<'_> {
                             Err(err) => {
                                 self.append_gate.record_failure();
                                 self.pending_batch = None;
-                                let status = status_from_pool_write_error(err);
+                                let status = status_from_selected_write_error(&selected, err);
                                 if let Some(reply) = reply {
                                     let _ = reply.send(Err(status));
                                 } else {
@@ -1099,6 +1180,7 @@ impl WriteSessionState<'_> {
                 if trigger == CheckpointTrigger::Timer {
                     self.timer_checkpoint_waiting = Some(timer_batch_id);
                     if let Err(err) = arm_checkpoint_idle_close(
+                        &mut self.timers,
                         self.actor_tx.clone(),
                         session_id,
                         timer_batch_id,
@@ -1134,7 +1216,7 @@ impl WriteSessionState<'_> {
                     bytes_committed: self.bytes_committed,
                     opened_at_utc: opened_at_utc.as_str(),
                     last_checkpoint_at_utc: self.last_checkpoint_at_utc.as_deref(),
-                    drive_element_address: bay,
+                    drive_element_address: cfg.wire_bay(bay),
                     pending_batch: None,
                 });
                 if let Some(reply) = reply {
@@ -1231,7 +1313,7 @@ impl WriteSessionState<'_> {
             session_id,
             tape_uuid,
             target_kind,
-            library_serial: library_serial.as_str(),
+            library_serial: library_serial.as_deref(),
             bay,
             objects_committed: self.objects_committed,
             bytes_committed: self.bytes_committed,
@@ -1261,6 +1343,10 @@ impl WriteSessionState<'_> {
         else {
             unreachable!("close handler received another drive command");
         };
+        if let Err(error) = self.cfg.mounted_audit_ready() {
+            let _ = reply.send(Err(error));
+            return false;
+        }
         let bay = self.bay;
         let cfg = self.cfg;
         let pool_cfg = self.pool_cfg.clone();
@@ -1306,7 +1392,9 @@ impl WriteSessionState<'_> {
                                 Err(err) => {
                                     self.append_gate.record_failure();
                                     self.pending_batch = None;
-                                    let _ = reply.send(Err(status_from_pool_write_error(err)));
+                                    let _ = reply.send(Err(status_from_selected_write_error(
+                                        &selected, err,
+                                    )));
                                     return false;
                                 }
                             };
@@ -1366,7 +1454,7 @@ impl WriteSessionState<'_> {
             session_id,
             tape_uuid,
             target_kind,
-            library_serial: library_serial.as_str(),
+            library_serial: library_serial.as_deref(),
             bay,
             objects_committed: self.objects_committed,
             bytes_committed: self.bytes_committed,
@@ -1452,7 +1540,7 @@ impl WriteSessionState<'_> {
             session_id,
             tape_uuid,
             target_kind,
-            library_serial: library_serial.as_str(),
+            library_serial: library_serial.as_deref(),
             bay,
             objects_committed: self.objects_committed,
             bytes_committed: self.bytes_committed,
@@ -1503,7 +1591,7 @@ impl WriteSessionState<'_> {
                 bytes_committed: self.bytes_committed,
                 opened_at_utc: opened_at_utc.as_str(),
                 last_checkpoint_at_utc: self.last_checkpoint_at_utc.as_deref(),
-                drive_element_address: bay,
+                drive_element_address: self.cfg.wire_bay(bay),
                 pending_batch: self.pending_batch.as_ref(),
             }))
         } else {
@@ -1555,7 +1643,7 @@ pub(super) fn handle_drive_open_write(
     snapshot_misses: &mut u32,
     request: OpenWriteActorRequest,
     retained: &mut Option<super::checkpoint::RetainedParityEpoch>,
-) {
+) -> Option<super::actor_runtime::MountedFinish> {
     let OpenWriteActorRequest {
         actor,
         pool_cfg,
@@ -1578,7 +1666,10 @@ pub(super) fn handle_drive_open_write(
     let session_id = Uuid::new_v4();
     if let Some(lifecycle) = &cfg.lifecycle {
         lifecycle.set_holder(
-            &crate::drive_pool::DriveKey::new(&library_serial, bay),
+            &crate::drive_pool::DriveKey::new(
+                library_serial.as_deref().expect("library session"),
+                bay,
+            ),
             drive_serial.as_deref(),
             "write session",
             session_id,
@@ -1595,10 +1686,10 @@ pub(super) fn handle_drive_open_write(
         "open write session",
     ) {
         let _ = reply.send(Err(status));
-        return;
+        return None;
     }
 
-    let endpoint = remanence_state::DriveKey::new(&library_serial, bay);
+    let endpoint = cfg.endpoint(bay);
     match index.tape_io_is_fenced(Some(&tape_uuid), barcode.as_deref(), Some(&endpoint)) {
         Ok(false) => {}
         result => {
@@ -1607,7 +1698,7 @@ pub(super) fn handle_drive_open_write(
                 _ => Status::failed_precondition("session blocked by active tape-I/O fence"),
             };
             let _ = reply.send(Err(status));
-            return;
+            return None;
         }
     }
     // Recovery authority must be complete and mutually consistent before any
@@ -1621,14 +1712,14 @@ pub(super) fn handle_drive_open_write(
         Ok(journal) => journal,
         Err(err) => {
             let _ = reply.send(Err(status_from_state_error(err)));
-            return;
+            return None;
         }
     };
     let pending_terminal_intent = match checkpoint_journal.terminal_finalization_intent() {
         Ok(intent) => intent,
         Err(err) => {
             let _ = reply.send(Err(status_from_state_error(err)));
-            return;
+            return None;
         }
     };
     if pending_terminal_intent
@@ -1639,21 +1730,21 @@ pub(super) fn handle_drive_open_write(
             "tape {} has an operator-owned terminal finalization in progress; retry FinalizeTape with its original idempotency key",
             Uuid::from_bytes(tape_uuid)
         ))));
-        return;
+        return None;
     }
     let (mut checkpoint_lease, pending_terminal_intent) = if pending_terminal_intent.is_some() {
         let lease = match checkpoint_journal.acquire_exclusive_for_terminal_recovery() {
             Ok(lease) => lease,
             Err(err) => {
                 let _ = reply.send(Err(status_from_state_error(err)));
-                return;
+                return None;
             }
         };
         let intent = match lease.terminal_finalization_intent() {
             Ok(intent) => intent,
             Err(err) => {
                 let _ = reply.send(Err(status_from_state_error(err)));
-                return;
+                return None;
             }
         };
         (lease, intent)
@@ -1662,7 +1753,7 @@ pub(super) fn handle_drive_open_write(
             Ok(lease) => lease,
             Err(err) => {
                 let _ = reply.send(Err(status_from_state_error(err)));
-                return;
+                return None;
             }
         };
         (lease, None)
@@ -1672,7 +1763,7 @@ pub(super) fn handle_drive_open_write(
             Ok(records) => records,
             Err(err) => {
                 let _ = reply.send(Err(status_from_state_error(err)));
-                return;
+                return None;
             }
         };
     if durable_checkpoint_records
@@ -1683,7 +1774,7 @@ pub(super) fn handle_drive_open_write(
             "checkpoint authority records tape {} as terminal and sealed",
             Uuid::from_bytes(tape_uuid)
         ))));
-        return;
+        return None;
     }
     if pending_terminal_intent.is_none() {
         if let Err(err) = crate::pool_write::ensure_empty_checkpoint_matches_catalog_freshness(
@@ -1691,34 +1782,44 @@ pub(super) fn handle_drive_open_write(
             &selected,
             &durable_checkpoint_records,
         ) {
-            let _ = reply.send(Err(status_from_pool_write_error(err)));
-            return;
+            let _ = reply.send(Err(status_from_selected_write_error(&selected, err)));
+            return None;
         }
         if let Err(err) = crate::pool_write::ensure_selected_tape_accepts_session_write(
             index, &pool_cfg, &selected,
         ) {
-            let _ = reply.send(Err(status_from_pool_write_error(err)));
-            return;
+            let _ = reply.send(Err(status_from_selected_write_error(&selected, err)));
+            return None;
         }
     }
 
-    if let Err(status) = session_open_short_probe_or_load(
-        index,
-        drive,
-        SessionOpenReadinessContext {
-            action: "open write session",
-            bay,
-            library_serial: library_serial.as_str(),
-            barcode: barcode.as_deref(),
-            source_slot,
-            drive_serial: drive_serial.as_deref(),
-            needs_drive_load,
-        },
-    ) {
+    if let Err(status) = if cfg.mounted().is_some() {
+        cfg.mounted_ready(index, drive)
+    } else {
+        session_open_short_probe_or_load(
+            index,
+            drive,
+            SessionOpenReadinessContext {
+                action: "open write session",
+                bay,
+                library_serial: library_serial.as_deref().expect("library session"),
+                barcode: barcode.as_deref(),
+                source_slot,
+                drive_serial: drive_serial.as_deref(),
+                needs_drive_load,
+            },
+        )
+    } {
         let _ = reply.send(Err(status));
-        return;
+        return None;
     }
 
+    if cfg.mounted().is_some() {
+        if let Err(error) = super::mounted_commands::open_audit(index, cfg, session_id) {
+            let _ = reply.send(Err(error));
+            return None;
+        }
+    }
     let media_policy = if pending_terminal_intent.is_some() {
         WriteMediaPolicy::TerminalAppend
     } else {
@@ -1732,7 +1833,7 @@ pub(super) fn handle_drive_open_write(
         media_policy,
     ) {
         let _ = reply.send(Err(status));
-        return;
+        return None;
     }
     // Load-time wrap-map harvest + fence install, one act (design
     // §6.5): only when this open freshly mounted the cartridge — a
@@ -1748,7 +1849,7 @@ pub(super) fn handle_drive_open_write(
         Ok(tape) => tape.and_then(|tape| tape.seal_due),
         Err(error) => {
             let _ = reply.send(Err(status_from_state_error(error)));
-            return;
+            return None;
         }
     };
     if pending_terminal_intent.is_some() || seal_due.is_some() {
@@ -1760,7 +1861,7 @@ pub(super) fn handle_drive_open_write(
                 "tape {} has an operator-owned terminal finalization in progress; retry FinalizeTape with its original idempotency key",
                 Uuid::from_bytes(tape_uuid)
             ))));
-            return;
+            return None;
         }
         let drive_config = match drive.read_config() {
             Ok(config) => config,
@@ -1768,14 +1869,14 @@ pub(super) fn handle_drive_open_write(
                 let _ = reply.send(Err(Status::unavailable(format!(
                     "read automatic terminal-recovery drive config: {error}"
                 ))));
-                return;
+                return None;
             }
         };
         if drive_config.write_protected {
             let _ = reply.send(Err(Status::failed_precondition(
                 "tape is write-protected and automatic terminal recovery cannot continue",
             )));
-            return;
+            return None;
         }
         let rewritable = matches!(
             drive_config.worm,
@@ -1810,14 +1911,14 @@ pub(super) fn handle_drive_open_write(
                 })
             {
                 let _ = reply.send(Err(status_from_state_error(error)));
-                return;
+                return None;
             }
         }
         let Some(previous) = durable_checkpoint_records.last() else {
             let _ = reply.send(Err(Status::failed_precondition(
                 "seal due has no checkpoint authority",
             )));
-            return;
+            return None;
         };
         let result = match &selected.parity_config {
             remanence_parity::ParityConfig::None => finalize_terminal_no_parity(
@@ -1851,6 +1952,13 @@ pub(super) fn handle_drive_open_write(
                 if let Err(error) = append_tape_sealed_evidence(index, cfg, tape_uuid) {
                     tracing::warn!(error = %error, "failed to append recovered tape sealing evidence");
                 }
+                if cfg.mounted().is_some() {
+                    if let Err(error) = super::mounted_commands::close_audit(index, cfg, session_id)
+                    {
+                        let _ = reply.send(Err(error));
+                        return None;
+                    }
+                }
                 let _ = reply.send(Err(Status::failed_precondition(format!(
                     "tape {} completes terminal finalization (the due automatic seal) during open recovery; retry OpenWriteSession against the pool to select another tape",
                     Uuid::from_bytes(tape_uuid)
@@ -1866,7 +1974,7 @@ pub(super) fn handle_drive_open_write(
                 let _ = reply.send(Err(error));
             }
         }
-        return;
+        return None;
     }
     tracing::info!(
         target: "remanence_write_diag",
@@ -1908,7 +2016,7 @@ pub(super) fn handle_drive_open_write(
                     &error,
                 ) {
                     let _ = reply.send(Err(Status::failed_precondition(error.to_string())));
-                    return;
+                    return None;
                 }
             }
             let status = crate::append_admission::daemon_admission_error(
@@ -1919,7 +2027,7 @@ pub(super) fn handle_drive_open_write(
                 error,
             );
             let _ = reply.send(Err(status));
-            return;
+            return None;
         }
     };
     let parity_authority = if pending_terminal_intent.is_none()
@@ -1936,7 +2044,7 @@ pub(super) fn handle_drive_open_write(
             Ok(authority) => Some(authority),
             Err(status) => {
                 let _ = reply.send(Err(status));
-                return;
+                return None;
             }
         }
     } else {
@@ -1948,39 +2056,45 @@ pub(super) fn handle_drive_open_write(
     let bytes_committed = 0u64;
     let last_checkpoint_at_utc = None;
     let last_durable_checkpoint = durable_checkpoint_records.last().cloned();
-    if let Err(status) = record_session_event(
-        index,
-        cfg,
-        SessionAuditInput {
-            session_id,
-            session_kind: "write",
-            event: AuditEvent::SessionOpened,
-            tape_uuid: Some(tape_uuid),
-            library_serial: Some(library_serial.clone()),
-            drive_bay: Some(bay),
-            drive_uuid: drive_uuid.clone(),
-            drive_serial: drive_serial.clone(),
-            abort_reason: None,
-        },
-    ) {
-        let _ = reply.send(Err(status));
-        return;
+    if cfg.mounted().is_none() {
+        if let Err(status) = record_session_event(
+            index,
+            cfg,
+            SessionAuditInput {
+                session_id,
+                session_kind: "write",
+                event: AuditEvent::SessionOpened,
+                tape_uuid: Some(tape_uuid),
+                library_serial: library_serial.clone(),
+                drive_bay: Some(bay),
+                drive_uuid: drive_uuid.clone(),
+                drive_serial: drive_serial.clone(),
+                abort_reason: None,
+            },
+        ) {
+            let _ = reply.send(Err(status));
+            return None;
+        }
     }
     let had_retained_epoch = retained.is_some();
     let carried = retained.take().filter(|epoch| {
-        let key = crate::drive_pool::DriveKey::new(&library_serial, bay);
-        let parked_matches = cfg.lifecycle.as_ref().is_some_and(|lifecycle| {
-            lifecycle
-                .parked
-                .lock()
-                .unwrap_or_else(|err| err.into_inner())
-                .by_drive
-                .get(&key)
-                .map_or(epoch.parked_generation == 0, |parked| {
-                    parked.generation == epoch.parked_generation
-                        && parked.seated.tape_uuid == Some(tape_uuid)
-                })
-        });
+        let parked_matches = cfg.mounted().is_some()
+            || cfg.lifecycle.as_ref().is_some_and(|lifecycle| {
+                let key = crate::drive_pool::DriveKey::new(
+                    library_serial.as_deref().expect("library session"),
+                    bay,
+                );
+                lifecycle
+                    .parked
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .by_drive
+                    .get(&key)
+                    .map_or(epoch.parked_generation == 0, |parked| {
+                        parked.generation == epoch.parked_generation
+                            && parked.seated.tape_uuid == Some(tape_uuid)
+                    })
+            });
         !needs_drive_load
             && parked_matches
             && epoch.selected.tape_uuid == tape_uuid
@@ -2032,7 +2146,7 @@ pub(super) fn handle_drive_open_write(
                         );
                     }
                     let _ = reply.send(Err(status));
-                    return;
+                    return None;
                 }
             }
         }
@@ -2047,8 +2161,8 @@ pub(super) fn handle_drive_open_write(
         ) {
             Ok(context) => Some(context),
             Err(err) => {
-                let _ = reply.send(Err(status_from_pool_write_error(err)));
-                return;
+                let _ = reply.send(Err(status_from_selected_write_error(&selected, err)));
+                return None;
             }
         }
     } else {
@@ -2072,7 +2186,7 @@ pub(super) fn handle_drive_open_write(
         bytes_committed,
         opened_at_utc: opened_at_utc.as_str(),
         last_checkpoint_at_utc: last_checkpoint_at_utc.as_deref(),
-        drive_element_address: bay,
+        drive_element_address: cfg.wire_bay(bay),
         pending_batch: None,
     });
     if reply.send(Ok(open_reply)).is_err() {
@@ -2088,7 +2202,10 @@ pub(super) fn handle_drive_open_write(
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .by_drive
-                            .get(&crate::drive_pool::DriveKey::new(&library_serial, bay))
+                            .get(&crate::drive_pool::DriveKey::new(
+                                library_serial.as_deref().expect("library session"),
+                                bay,
+                            ))
                             .map(|parked| parked.generation)
                     })
                     .unwrap_or(0);
@@ -2104,10 +2221,12 @@ pub(super) fn handle_drive_open_write(
                 });
             }
         }
-        return;
+        return None;
     }
 
     let mut session_state = WriteSessionState {
+        timers: super::timers::SessionTimers::default(),
+        finish_request: None,
         bay,
         index,
         cfg,
@@ -2155,7 +2274,23 @@ pub(super) fn handle_drive_open_write(
             })
     {
         if let Some(mut parity) = session_state.parity_session.take() {
-            if let (Some(state), Some(permit), Some(lifecycle)) = (
+            if cfg.mounted().is_some() {
+                if let (Some(state), Some(permit)) =
+                    (parity.sink_state.take(), parity.retention.take())
+                {
+                    *retained = Some(super::checkpoint::RetainedParityEpoch {
+                        head_at_eod: session_state
+                            .drive
+                            .known_position()
+                            .is_some_and(|p| p.partition == 0 && p.lba == state.used_tape_blocks()),
+                        state,
+                        permit,
+                        selected: session_state.selected.clone(),
+                        parked_generation: 0,
+                        identity_generation: session_state.drive.identity_generation(),
+                    });
+                }
+            } else if let (Some(state), Some(permit), Some(lifecycle)) = (
                 parity.sink_state.take(),
                 parity.retention.take(),
                 cfg.lifecycle.as_ref(),
@@ -2166,7 +2301,13 @@ pub(super) fn handle_drive_open_write(
                     .unwrap_or_else(|err| err.into_inner())
                     .get(&session_id)
                     .cloned();
-                let key = crate::drive_pool::DriveKey::new(&session_state.library_serial, bay);
+                let key = crate::drive_pool::DriveKey::new(
+                    session_state
+                        .library_serial
+                        .as_deref()
+                        .expect("library session"),
+                    bay,
+                );
                 let mut parked = lifecycle
                     .parked
                     .lock()
@@ -2209,10 +2350,18 @@ pub(super) fn handle_drive_open_write(
             }
         }
     }
+    let finish_request = session_state.finish_request.take();
     drop(session_state);
     if let Some((reply, result)) = deferred_close_reply {
         let _ = reply.send(Ok(result));
     }
+    finish_request.map(|(reply, mut closed)| super::actor_runtime::MountedFinish {
+        reply,
+        result: closed
+            .try_recv()
+            .map_err(|_| Status::internal("session close reply lost"))
+            .and_then(|result| result.map(|_| ())),
+    })
 }
 
 pub(super) fn append_tape_sealed_evidence(

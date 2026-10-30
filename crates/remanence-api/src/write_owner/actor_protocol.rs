@@ -74,6 +74,23 @@ pub(crate) enum ChangerCommand {
 }
 
 pub(crate) enum DriveCommand {
+    OpenMountedWrite {
+        host_only_recovery: bool,
+        pool_cfg: TapePoolConfig,
+        selected: SelectedTape,
+        reply: oneshot::Sender<Result<pb::WriteSession, Status>>,
+    },
+    FinishMountedInvocation {
+        reply: oneshot::Sender<Result<(), Status>>,
+    },
+    FinalizeMounted {
+        request: crate::StandaloneFinalizeRequest,
+        reply: oneshot::Sender<Result<remanence_state::TerminalFinalizationProjection, Status>>,
+    },
+    SupersedeMounted {
+        request: pb::SupersedeTailRequest,
+        reply: oneshot::Sender<Result<pb::SupersedeTailResponse, Status>>,
+    },
     WaitReady {
         operation_id: Uuid,
         family: MediaFamily,
@@ -185,6 +202,7 @@ pub(crate) enum DriveCommand {
         expected_content_sha256: Option<[u8; 32]>,
         expected_object_id: Option<[u8; 16]>,
         input_kind: crate::WriteObjectInputKind,
+        representation: crate::PoolWriteRepresentation,
         live_write_counter: Option<Arc<crate::DriveByteCounters>>,
         reply: oneshot::Sender<Result<AppendFinishOutcome, Status>>,
     },
