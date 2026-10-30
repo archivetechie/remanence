@@ -1525,74 +1525,157 @@ impl StateHandle {
             .collect::<Vec<_>>();
         let count = sessions.len() as u64;
         for session in sessions {
-            // A write session that was non-terminal when the process
-            // died may have dispatched a media-modifying CDB whose
-            // fence state is now uncertain. The design's §6.5 startup
-            // row resolves that uncertainty as false invalidation:
-            // durably advance the epoch and leave the volume
-            // uncalibrated until a fresh load harvest. Read sessions
-            // dispatch nothing media-modifying and are left alone.
-            if session.session_kind == "write" {
-                if let Some(tape_uuid) = session
-                    .tape_uuid
-                    .as_deref()
-                    .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
-                {
-                    self.calibration.record_possible_write_recovery(tape_uuid)?;
-                }
-            }
+            invalidate_restart_session_volume(&self.calibration, &session)?;
             quarantine(self, &session)?;
             self.refresh_audit_append_cursor()?;
-            let mut detail = BTreeMap::new();
-            if let Some(key) = &session.drive_key {
-                detail.insert("endpoint_key".into(), CborValue::Text(key.encode()));
-            }
-            detail.insert(
-                "session_kind".to_string(),
-                CborValue::Text(session.session_kind.clone()),
-            );
-            detail.insert(
-                "restart_reason".to_string(),
-                CborValue::Text("daemon_restart".to_string()),
-            );
-            if let Some(tape_uuid) = session.tape_uuid.as_ref() {
-                detail.insert("tape_uuid".to_string(), CborValue::Bytes(tape_uuid.clone()));
-            }
-            if let Some(library_serial) = session.library_serial.as_ref() {
-                detail.insert(
-                    "library_serial".to_string(),
-                    CborValue::Text(library_serial.clone()),
-                );
-            }
-            if let Some(drive_bay) = session.drive_bay {
-                detail.insert(
-                    "drive_bay".to_string(),
-                    CborValue::Integer(drive_bay.into()),
-                );
-            }
-            if let Some(drive_uuid) = session.drive_uuid.as_ref() {
-                detail.insert(
-                    "drive_uuid".to_string(),
-                    CborValue::Bytes(drive_uuid.clone()),
-                );
-            }
-            let (_, record) = self.audit.append_and_return_record(AuditEventRecord {
-                actor: AuditActor::System,
-                source_layer: SourceLayer::Layer4,
-                operation_id: None,
-                session_id: Some(session.session_id),
-                idempotency_key: None,
-                event: AuditEvent::SessionLostByRestart,
-                subject: AuditSubject {
-                    kind: session.session_kind,
-                    id: Some(session.session_id.to_string()),
-                },
-                detail,
-            })?;
-            self.index.project_audit_record(&record)?;
+            mark_restart_session_lost(&mut self.index, &mut self.audit, &session)?;
         }
         Ok(count)
     }
+}
+
+/// Replay audit projections, then mark prior sessions lost on configured library bays.
+///
+/// Call before actors or requests. The caller's state-directory lock is the only
+/// protection against sweeping a live process's session. Step 5 (device-lock-only
+/// CLI writers) must replace it with a recorded owner identity or a lock proof.
+/// Standalone endpoints, other libraries, and sessions without an endpoint are
+/// not marked lost. This performs no device I/O, fencing, or checkpoint recovery.
+pub fn recover_library_sessions_after_restart(
+    index: &mut CatalogIndex,
+    config: &RemConfig,
+) -> Result<u64, StateError> {
+    index.replay_audit_records(&FileAuditLog::replay(&config.audit.dir)?)?;
+    let libraries: HashSet<_> = config
+        .libraries
+        .iter()
+        .map(|library| library.serial.trim())
+        .collect();
+    let sessions: Vec<_> = index
+        .non_terminal_sessions()?
+        .into_iter()
+        .filter(|session| {
+            matches!(&session.drive_key, Some(crate::DriveKey::Bay { library_serial, .. })
+            if libraries.contains(library_serial.as_str()))
+        })
+        .collect();
+    let count = sessions.len() as u64;
+    if !sessions.is_empty() {
+        let calibration = CalibrationControlStore::open(
+            StatePaths::from_config(Path::new(""), config).calibration_dir,
+        )?;
+        let mut audit = FileAuditLog::open_with_clock_forward_tolerance(
+            &config.audit.dir,
+            config.audit.fsync,
+            Some(Duration::seconds(
+                config.audit.clock_forward_tolerance_seconds as i64,
+            )),
+        )?;
+        for session in sessions {
+            invalidate_restart_session_volume(&calibration, &session)?;
+            mark_restart_session_lost(index, &mut audit, &session)?;
+            if let Some(
+                endpoint @ crate::DriveKey::Bay {
+                    library_serial,
+                    bay,
+                },
+            ) = &session.drive_key
+            {
+                tracing::info!(
+                    session_id = %session.session_id,
+                    endpoint = %endpoint.encode(),
+                    library_serial = %library_serial,
+                    bay = *bay,
+                    "daemon marks prior library session lost"
+                );
+            }
+        }
+    }
+    tracing::info!(
+        lost_sessions_marked = count,
+        "daemon startup session recovery completes"
+    );
+    Ok(count)
+}
+
+/// Preserve the existing conservative invalidation for possibly written volumes.
+fn invalidate_restart_session_volume(
+    calibration: &CalibrationControlStore,
+    session: &crate::RestartSession,
+) -> Result<(), StateError> {
+    // A write session that was non-terminal when the process
+    // died may have dispatched a media-modifying CDB whose
+    // fence state is now uncertain. The design's §6.5 startup
+    // row resolves that uncertainty as false invalidation:
+    // durably advance the epoch and leave the volume
+    // uncalibrated until a fresh load harvest. Read sessions
+    // dispatch nothing media-modifying and are left alone.
+    if session.session_kind == "write" {
+        if let Some(tape_uuid) = session
+            .tape_uuid
+            .as_deref()
+            .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
+        {
+            calibration.record_possible_write_recovery(tape_uuid)?;
+        }
+    }
+    Ok(())
+}
+
+/// Persist and project the same terminal session transition for every recovery scope.
+fn mark_restart_session_lost(
+    index: &mut CatalogIndex,
+    audit: &mut FileAuditLog,
+    session: &crate::RestartSession,
+) -> Result<(), StateError> {
+    let mut detail = BTreeMap::new();
+    if let Some(key) = &session.drive_key {
+        detail.insert("endpoint_key".into(), CborValue::Text(key.encode()));
+    }
+    detail.insert(
+        "session_kind".to_string(),
+        CborValue::Text(session.session_kind.clone()),
+    );
+    detail.insert(
+        "restart_reason".to_string(),
+        CborValue::Text("daemon_restart".to_string()),
+    );
+    if let Some(tape_uuid) = session.tape_uuid.as_ref() {
+        detail.insert("tape_uuid".to_string(), CborValue::Bytes(tape_uuid.clone()));
+    }
+    if let Some(library_serial) = session.library_serial.as_ref() {
+        detail.insert(
+            "library_serial".to_string(),
+            CborValue::Text(library_serial.clone()),
+        );
+    }
+    if let Some(drive_bay) = session.drive_bay {
+        detail.insert(
+            "drive_bay".to_string(),
+            CborValue::Integer(drive_bay.into()),
+        );
+    }
+    if let Some(drive_uuid) = session.drive_uuid.as_ref() {
+        detail.insert(
+            "drive_uuid".to_string(),
+            CborValue::Bytes(drive_uuid.clone()),
+        );
+    }
+    let (_, record) = audit.append_and_return_record(AuditEventRecord {
+        actor: AuditActor::System,
+        source_layer: SourceLayer::Layer4,
+        operation_id: None,
+        session_id: Some(session.session_id),
+        idempotency_key: None,
+        event: AuditEvent::SessionLostByRestart,
+        subject: AuditSubject {
+            kind: session.session_kind.clone(),
+            id: Some(session.session_id.to_string()),
+        },
+        detail,
+    })?;
+    index.project_audit_record(&record)?;
+    Ok(())
 }
 
 fn tape_record_matches_provision_geometry(tape: &TapeRecord, input: &ProvisionTapeInput) -> bool {
@@ -5466,6 +5549,257 @@ pool_id = "camera.copy-a"
                 .expect("session state")
                 .as_deref(),
             Some("closed")
+        );
+    }
+
+    /// Build ordinary bay-session audit evidence for startup projection gaps.
+    fn library_restart_event(
+        session_id: Uuid,
+        tape_uuid: [u8; 16],
+        event: AuditEvent,
+    ) -> AuditEventRecord {
+        AuditEventRecord {
+            actor: AuditActor::System,
+            source_layer: SourceLayer::Layer5,
+            operation_id: None,
+            session_id: Some(session_id),
+            idempotency_key: None,
+            event,
+            subject: AuditSubject {
+                kind: "write".into(),
+                id: Some(session_id.to_string()),
+            },
+            detail: BTreeMap::from([
+                ("session_kind".into(), CborValue::Text("write".into())),
+                ("tape_uuid".into(), CborValue::Bytes(tape_uuid.to_vec())),
+                ("library_serial".into(), CborValue::Text("LIB001".into())),
+                ("drive_bay".into(), CborValue::Integer(256.into())),
+            ]),
+        }
+    }
+
+    /// A durable close wins over stale open projection without invalidating its tape.
+    #[test]
+    fn library_startup_replays_unprojected_session_close() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = parse_config_toml(&config_text(temp.path())).unwrap();
+        let paths = StatePaths::from_config(temp.path().join("config.toml"), &config);
+        let session_id = Uuid::new_v4();
+        let tape_uuid = [0x71; 16];
+        {
+            let mut state = StateHandle::open_with_config(paths.clone(), config.clone()).unwrap();
+            let (_, opened) = state
+                .audit
+                .append_and_return_record(library_restart_event(
+                    session_id,
+                    tape_uuid,
+                    AuditEvent::SessionOpened,
+                ))
+                .unwrap();
+            state.index.project_audit_record(&opened).unwrap();
+            state
+                .calibration_control()
+                .record_harvest_success(tape_uuid, 0)
+                .unwrap();
+            state
+                .audit()
+                .append(library_restart_event(
+                    session_id,
+                    tape_uuid,
+                    AuditEvent::SessionClosed,
+                ))
+                .unwrap();
+        }
+        let _lock = StateLockGuard::acquire(&paths.state_dir).unwrap();
+        let mut index = CatalogIndex::open(&paths.sqlite_path).unwrap();
+        assert_eq!(
+            index.session_state(session_id).unwrap().as_deref(),
+            Some("open")
+        );
+        let calibration_path = paths
+            .calibration_dir
+            .join(crate::CALIBRATION_CONTROL_FILENAME);
+        let calibration_before = fs::read(&calibration_path).unwrap();
+
+        let lost = recover_library_sessions_after_restart(&mut index, &config).unwrap();
+
+        assert_eq!(
+            index.session_state(session_id).unwrap().as_deref(),
+            Some("closed")
+        );
+        assert_eq!(lost, 0);
+        assert_eq!(fs::read(calibration_path).unwrap(), calibration_before);
+        assert!(!FileAuditLog::replay(&paths.audit_dir)
+            .unwrap()
+            .iter()
+            .any(|record| record.event == AuditEvent::SessionLostByRestart));
+    }
+
+    /// A durable open missing from SQLite still belongs to startup recovery.
+    #[test]
+    fn library_startup_replays_unprojected_session_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = parse_config_toml(&config_text(temp.path())).unwrap();
+        let paths = StatePaths::from_config(temp.path().join("config.toml"), &config);
+        let session_id = Uuid::new_v4();
+        {
+            let mut state = StateHandle::open_with_config(paths.clone(), config.clone()).unwrap();
+            state
+                .audit()
+                .append(library_restart_event(
+                    session_id,
+                    [0x72; 16],
+                    AuditEvent::SessionOpened,
+                ))
+                .unwrap();
+        }
+        let _lock = StateLockGuard::acquire(&paths.state_dir).unwrap();
+        let mut index = CatalogIndex::open(&paths.sqlite_path).unwrap();
+        assert_eq!(index.session_state(session_id).unwrap(), None);
+
+        let lost = recover_library_sessions_after_restart(&mut index, &config).unwrap();
+
+        assert_eq!(
+            index.session_state(session_id).unwrap().as_deref(),
+            Some("lost_by_restart")
+        );
+        assert_eq!(lost, 1);
+    }
+
+    /// Daemon recovery scopes loss and existing volume invalidation to its library bays.
+    #[test]
+    fn library_startup_recovery_is_scoped_and_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = parse_config_toml(&config_text(temp.path())).unwrap();
+        let mut second_library = config.libraries[0].clone();
+        second_library.serial = "LIB002".into();
+        config.libraries.push(second_library);
+        let paths = StatePaths::from_config(temp.path().join("config.toml"), &config);
+        let sessions = [
+            (
+                Some(crate::DriveKey::new("LIB001", 256)),
+                "write",
+                "lost_by_restart",
+            ),
+            (
+                Some(crate::DriveKey::new("LIB001", 0)),
+                "read",
+                "lost_by_restart",
+            ),
+            (Some(crate::DriveKey::new("OTHER", 256)), "write", "open"),
+            (
+                Some(crate::DriveKey::Standalone {
+                    drive_serial: "DIRECT".into(),
+                }),
+                "write",
+                "open",
+            ),
+            (Some(crate::DriveKey::new("LIB001", 257)), "write", "closed"),
+            (None, "write", "open"),
+            (
+                Some(crate::DriveKey::new("LIB002", 256)),
+                "write",
+                "lost_by_restart",
+            ),
+        ];
+        {
+            let mut state = StateHandle::open_with_config(paths.clone(), config.clone()).unwrap();
+            for (n, (endpoint, kind, expected)) in sessions.iter().enumerate() {
+                let id = Uuid::from_u128(n as u128 + 1);
+                let tape = [n as u8 + 1; 16];
+                let mut detail = BTreeMap::from([
+                    ("session_kind".into(), CborValue::Text((*kind).into())),
+                    ("tape_uuid".into(), CborValue::Bytes(tape.to_vec())),
+                ]);
+                if let Some(endpoint) = endpoint {
+                    // The read fixture exercises legacy bay-coordinate evidence.
+                    if *kind != "read" {
+                        detail.insert("endpoint_key".into(), CborValue::Text(endpoint.encode()));
+                    }
+                    // Explicit standalone identity wins over stale bay coordinates.
+                    detail.insert(
+                        "library_serial".into(),
+                        CborValue::Text(endpoint.library_serial().unwrap_or("LIB001").into()),
+                    );
+                    detail.insert(
+                        "drive_bay".into(),
+                        CborValue::Integer(endpoint.bay().unwrap_or(256).into()),
+                    );
+                }
+                let mut event = AuditEventRecord {
+                    actor: AuditActor::System,
+                    source_layer: SourceLayer::Layer5,
+                    operation_id: None,
+                    session_id: Some(id),
+                    idempotency_key: None,
+                    event: AuditEvent::SessionOpened,
+                    subject: AuditSubject {
+                        kind: (*kind).into(),
+                        id: Some(id.to_string()),
+                    },
+                    detail,
+                };
+                state.audit().append(event.clone()).unwrap();
+                if *expected == "closed" {
+                    event.event = AuditEvent::SessionClosed;
+                    state.audit().append(event).unwrap();
+                }
+                state
+                    .calibration_control()
+                    .record_harvest_success(tape, 0)
+                    .unwrap();
+            }
+            state.replay_audit_projection().unwrap();
+        }
+        let _lock = StateLockGuard::acquire(&paths.state_dir).unwrap();
+        let mut index = CatalogIndex::open(&paths.sqlite_path).unwrap();
+        assert_eq!(
+            recover_library_sessions_after_restart(&mut index, &config).unwrap(),
+            3
+        );
+        let calibration = CalibrationControlStore::open(&paths.calibration_dir).unwrap();
+        for (n, (_, kind, expected)) in sessions.iter().enumerate() {
+            assert_eq!(
+                index
+                    .session_state(Uuid::from_u128(n as u128 + 1))
+                    .unwrap()
+                    .as_deref(),
+                Some(*expected)
+            );
+            let row = calibration.row([n as u8 + 1; 16]);
+            let invalidated = *kind == "write" && *expected == "lost_by_restart";
+            assert_eq!(row.write_epoch, u64::from(invalidated));
+            assert_eq!(
+                row.state == crate::VolumeCalibrationState::Uncalibrated,
+                invalidated
+            );
+            assert!(!index
+                .tape_io_is_fenced(Some(&[n as u8 + 1; 16]), None, None)
+                .unwrap());
+        }
+        let before = FileAuditLog::replay(&paths.audit_dir).unwrap().len();
+        let calibration_bytes = fs::read(
+            paths
+                .calibration_dir
+                .join(crate::CALIBRATION_CONTROL_FILENAME),
+        )
+        .unwrap();
+        assert_eq!(
+            recover_library_sessions_after_restart(&mut index, &config).unwrap(),
+            0
+        );
+        assert_eq!(
+            FileAuditLog::replay(&paths.audit_dir).unwrap().len(),
+            before
+        );
+        assert_eq!(
+            fs::read(
+                paths
+                    .calibration_dir
+                    .join(crate::CALIBRATION_CONTROL_FILENAME)
+            )
+            .unwrap(),
+            calibration_bytes
         );
     }
 

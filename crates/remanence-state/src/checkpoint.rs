@@ -19,6 +19,7 @@ use remanence_library::durable_file::{File, OpenOptions};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
@@ -39,11 +40,14 @@ const CHECKPOINT_FINALIZATION_INTENT_VERSION: u16 = 3;
 const CHECKPOINT_RECORD_PREFIX_LEN: u64 = 2 + 4;
 const MAX_CHECKPOINT_RECORD_LEN: u64 = 64 * 1024 * 1024;
 const MAX_FINALIZATION_INTENT_LEN: u64 = MAX_CHECKPOINT_RECORD_LEN;
+const CHECKPOINT_READER_WAIT: Duration = Duration::from_millis(250);
+const CHECKPOINT_READER_RETRY_INTERVAL: Duration = Duration::from_millis(5);
 
 #[cfg(test)]
 thread_local! {
     static FAIL_NEXT_CHECKPOINT_FRAME_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_NEXT_CHECKPOINT_FRAME_ROLLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static ON_CHECKPOINT_READER_CONTENTION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 fn write_checkpoint_frame(file: &mut File, frame: &[u8]) -> io::Result<()> {
@@ -2159,6 +2163,8 @@ impl FileCheckpointJournal {
 
     /// Acquire the exclusive lease that write paths retain from authority
     /// replay through media work and checkpoint append.
+    /// Brief reader contention retries for up to 250 ms; a writer conflict
+    /// retains the nonblocking lock error.
     pub fn acquire_exclusive(&self) -> Result<FileCheckpointJournalLease, StateError> {
         self.acquire_exclusive_inner(false)
     }
@@ -3083,6 +3089,40 @@ fn finalization_base_record(
     }
 }
 
+/// Acquire a journal lock, allowing a short bounded wait for readers only.
+/// The shared probe never grants write authority and releases before retrying
+/// the exclusive lock, so another writer or recovery can still win admission.
+fn lock_checkpoint_file(mut file: File, operation: FlockArg) -> nix::Result<Flock<File>> {
+    let deadline = Instant::now() + CHECKPOINT_READER_WAIT;
+    loop {
+        let error;
+        (file, error) = match Flock::lock(file, operation) {
+            Ok(lock) => return Ok(lock),
+            Err(failure) => failure,
+        };
+        if operation != FlockArg::LockExclusiveNonblock
+            || error != nix::errno::Errno::EWOULDBLOCK
+            || Instant::now() >= deadline
+        {
+            return Err(error);
+        }
+        // A retained writer also refuses a shared lock. Preserve the original
+        // exclusive-lock error, without sleeping, when the probe fails.
+        let reader = Flock::lock(file, FlockArg::LockSharedNonblock).map_err(|_| error)?;
+        file = reader.unlock().map_err(|(_, errno)| errno)?;
+        #[cfg(test)]
+        ON_CHECKPOINT_READER_CONTENTION.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        std::thread::sleep(
+            CHECKPOINT_READER_RETRY_INTERVAL
+                .min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
 fn acquire_checkpoint_lock(
     path: &Path,
     operation: FlockArg,
@@ -3096,7 +3136,7 @@ fn acquire_checkpoint_lock(
         .write(true)
         .open(&lock_path)
         .map_err(|err| StateError::io_at("open checkpoint journal lock", &lock_path, err))?;
-    Flock::lock(lock_file, operation).map_err(|(_file, errno)| {
+    lock_checkpoint_file(lock_file, operation).map_err(|errno| {
         if errno == nix::errno::Errno::EWOULDBLOCK {
             tracing::warn!(operation = action, journal = %path.display(), error = %errno,
                 "checkpoint journal lock refusal");
@@ -5330,6 +5370,151 @@ mod tests {
 
         assert!(error.is_checkpoint_append_authority_uncertain(), "{error}");
         assert!(error.to_string().contains("rollback"), "{error}");
+    }
+
+    /// Session admission retries the shared lock used by startup intent inspection.
+    #[test]
+    fn exclusive_checkpoint_lease_waits_for_startup_reader() {
+        let dir = tempfile::tempdir().expect("temporary checkpoint directory");
+        let tape_uuid = [0x24; 16];
+        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).unwrap();
+        drop(journal.acquire_exclusive().unwrap());
+        let reader = acquire_checkpoint_lock(
+            journal.path(),
+            FlockArg::LockSharedNonblock,
+            "hold startup finalization-intent reader",
+        )
+        .unwrap();
+        // Release only after admission encounters the reader. No scheduling or
+        // sleep determines whether the exclusive request actually contends.
+        ON_CHECKPOINT_READER_CONTENTION.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || drop(reader)));
+        });
+
+        let mut lease = journal
+            .acquire_exclusive()
+            .expect("wait for startup reader");
+        ON_CHECKPOINT_READER_CONTENTION.with(|hook| assert!(hook.borrow().is_none()));
+        journal
+            .replay()
+            .expect_err("exclusive lease excludes readers");
+        journal
+            .acquire_exclusive()
+            .expect_err("exclusive lease excludes other writers");
+        lease.append(&record(tape_uuid)).unwrap();
+        drop(lease);
+        assert_eq!(journal.replay().unwrap(), vec![record(tape_uuid)]);
+    }
+
+    /// Persistent readers exhaust the retry budget with the original lock error.
+    #[test]
+    fn exclusive_checkpoint_lease_bounds_reader_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = FileCheckpointJournal::open(dir.path(), [0x24; 16]).unwrap();
+        let reader = acquire_checkpoint_lock(
+            journal.path(),
+            FlockArg::LockSharedNonblock,
+            "hold persistent reader",
+        )
+        .unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        let worker = std::thread::spawn(move || {
+            send.send(journal.acquire_exclusive()).unwrap();
+        });
+        let error = receive
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reader wait is bounded")
+            .expect_err("persistent reader refuses exclusive admission");
+        worker.join().unwrap();
+        assert!(started.elapsed() >= CHECKPOINT_READER_WAIT);
+        assert_checkpoint_write_lock_conflict(&error);
+        drop(reader);
+    }
+
+    /// Both ordinary writers and mutating recovery refuse admission without retry.
+    #[test]
+    fn exclusive_checkpoint_lease_keeps_writer_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let tape_uuid = [0x24; 16];
+        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).unwrap();
+        for recovery in [false, true] {
+            let mut lease = journal.acquire_exclusive().unwrap();
+            if recovery {
+                lease.append(&record(tape_uuid)).unwrap();
+                lease
+                    .begin_terminal_finalization(&finalization_intent(tape_uuid))
+                    .unwrap();
+                drop(lease);
+                lease = journal.acquire_exclusive_for_terminal_recovery().unwrap();
+            }
+            ON_CHECKPOINT_READER_CONTENTION.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(|| panic!("writer conflict must not retry")));
+            });
+            let error = journal.acquire_exclusive().unwrap_err();
+            assert_checkpoint_write_lock_conflict(&error);
+            ON_CHECKPOINT_READER_CONTENTION.with(|hook| {
+                assert!(hook.borrow_mut().take().is_some());
+            });
+            drop(lease);
+        }
+    }
+
+    /// A writer that wins after the shared probe still excludes the waiting opener.
+    #[test]
+    fn exclusive_checkpoint_lease_refuses_writer_after_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = FileCheckpointJournal::open(dir.path(), [0x24; 16]).unwrap();
+        let reader = acquire_checkpoint_lock(
+            journal.path(),
+            FlockArg::LockSharedNonblock,
+            "hold startup reader",
+        )
+        .unwrap();
+        let writer = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let retained_writer = writer.clone();
+        let path = journal.path().to_path_buf();
+        ON_CHECKPOINT_READER_CONTENTION.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                drop(reader);
+                *retained_writer.borrow_mut() = Some(
+                    acquire_checkpoint_lock(
+                        &path,
+                        FlockArg::LockExclusiveNonblock,
+                        "hold competing writer",
+                    )
+                    .unwrap(),
+                );
+            }));
+        });
+        let error = journal.acquire_exclusive().unwrap_err();
+        assert_checkpoint_write_lock_conflict(&error);
+        assert!(writer.borrow().is_some());
+        assert!(
+            !journal.path().exists(),
+            "refused admission creates no journal"
+        );
+        drop(writer);
+        journal.acquire_exclusive().unwrap();
+    }
+
+    /// Lock conflicts retain their context, companion path, and OS error code.
+    fn assert_checkpoint_write_lock_conflict(error: &StateError) {
+        match error {
+            StateError::Io {
+                context,
+                path,
+                source,
+            } => {
+                assert_eq!(context, "lock checkpoint journal for write session");
+                assert!(path.as_ref().unwrap().to_str().unwrap().ends_with(".lock"));
+                assert_eq!(
+                    source.raw_os_error(),
+                    Some(nix::errno::Errno::EWOULDBLOCK as i32)
+                );
+            }
+            other => panic!("expected checkpoint lock conflict, got {other}"),
+        }
     }
 
     #[test]

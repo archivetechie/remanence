@@ -132,7 +132,11 @@ impl ApiState {
     }
 
     /// Build service state with operator-resolved tape-pool selection config.
+    /// Call once at daemon startup under state ownership, before admitting any
+    /// sessions: prior sessions on configured library bays are marked lost.
     pub fn new_with_config(mut index: CatalogIndex, config: &RemConfig) -> Result<Self, Status> {
+        remanence_state::state::recover_library_sessions_after_restart(&mut index, config)
+            .map_err(status_from_state_error)?;
         let audit_append_lock = Arc::new(std::sync::Mutex::new(()));
         remanence_state::fence::reconcile(&mut index, &config.audit.dir)
             .map_err(status_from_state_error)?;
@@ -267,6 +271,7 @@ impl ApiState {
     }
 
     /// Build service state with a live changer/drive actor pool.
+    /// The caller retains state ownership from startup through service shutdown.
     pub fn with_drive_pool(
         index: CatalogIndex,
         config: &RemConfig,
@@ -288,6 +293,7 @@ impl ApiState {
 
     /// Construct the same daemon runtime with an injected library transport opener.
     /// All discovery, admission, reconciliation, and actor setup remain shared.
+    /// The caller holds state ownership and admits no sessions before construction.
     pub fn with_drive_pool_opener(
         mut index: CatalogIndex,
         config: &RemConfig,
@@ -302,6 +308,10 @@ impl ApiState {
             -> Result<remanence_library::LibraryHandle, remanence_library::OpenError>,
     ) -> Result<Self, Status> {
         let index_path = index.path().to_path_buf();
+        // The daemon retains state ownership across this constructor and serve.
+        // Recover its predecessor before actors or startup tasks can admit work.
+        remanence_state::state::recover_library_sessions_after_restart(&mut index, config)
+            .map_err(status_from_state_error)?;
         let pool_configs: HashMap<String, TapePoolConfig> = config
             .tape_pools
             .iter()
