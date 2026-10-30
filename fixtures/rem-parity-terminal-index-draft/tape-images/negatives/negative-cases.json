@@ -486,7 +486,7 @@
       "shadowed": false,
       "expected": {"one_of": ["BootstrapParse", "BootstrapPayloadTooLarge"], "permitting_text": "Section 8.1 names the step ('payload bounds (checked against the block)') but not its error; Section 15 offers BootstrapParse ('bootstrap frame or payload violates Section 8') and BootstrapPayloadTooLarge ('framed BOT payload cannot fit the block'), both of which describe a declared length past the block."},
       "tape_level": "Unpinned. At discovery the only bootstrap candidate is invalid, which Section 15 calls NoBootstrapFound ('bootstrap is absent or invalid'); whether a checksum-valid frame with bad bounds counts as 'unreadable' (so that supplied values may be used) is open item TT-7.",
-      "sections": ["8.1", "8.4", "2.4", "15", "Appendix D TT-7"],
+      "sections": ["8.1", "8.4", "2.4", "15", "specs/in-progress/records/rem-parity-1-open-items.md TT-7"],
       "quotes": ["Parse order: block length ≥ 0x40 → magic → header CRC → schema_major → payload bounds (checked against the block) → payload CRC → CBOR.", "BootstrapParse                  bootstrap frame or payload violates Section 8", "BootstrapPayloadTooLarge        framed BOT payload cannot fit the block", "NoBootstrapFound                bootstrap is absent or invalid"],
       "pinned": false,
       "pin_reason": "Two Section 15 names fit the parser outcome, and a third (NoBootstrapFound) fits the discovery outcome; TT-7 is open."
@@ -661,7 +661,7 @@
       "shadowed": false,
       "expected": {"error": "BootstrapParse"},
       "tape_level": "Unpinned at discovery level: whether such a checksum-valid bootstrap counts as unreadable (so supplied values may be used) or yields NoBootstrapFound is open item TT-7.",
-      "sections": ["6.6", "8.2", "2.4", "15", "Appendix D TT-7"],
+      "sections": ["6.6", "8.2", "2.4", "15", "specs/in-progress/records/rem-parity-1-open-items.md TT-7"],
       "quotes": ["k ≥ 2      1 ≤ m ≤ k      S ≥ 1      k + m ≤ 255      S × (k + m) ≤ 2³² − 1", "For a parity bootstrap the scheme record's `scheme_id` MUST be `rs-cauchy-gf256-v1` and `(k, m, S)` MUST satisfy Section 6.6 validity."],
       "pinned": true,
       "pin_note": "Pinned at the bootstrap parser. Whether the inequality is evaluated with overflow detection or found false, the result is the same.",

@@ -41,7 +41,7 @@
     "8.2",
     "2.4",
     "15",
-    "Appendix D TT-7"
+    "specs/in-progress/records/rem-parity-1-open-items.md TT-7"
   ],
   "shadowed": false,
   "tape_level": "Unpinned at discovery level: whether such a checksum-valid bootstrap counts as unreadable (so supplied values may be used) or yields NoBootstrapFound is open item TT-7.",

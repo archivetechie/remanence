@@ -199,7 +199,7 @@ It writes `negative-supplement-decisions.json`, whose entries add an
 `cross_structure_failing`, `disputed_by_implementation`, `disputes`) to the
 keys of the negatives schema below.
 
-`negative-blocks` closes the first criterion-2 gap that Appendix D item TT-2
+`negative-blocks` closes the first criterion-2 gap that [open-items record](../../../specs/in-progress/records/rem-parity-1-open-items.md) item TT-2
 lists for the negative vectors. It re-runs only the apply step of every
 negative case and supplement variant in `blind-inputs/`, on my own builds,
 and emits every block whose bytes the mutation and its repairs change, with

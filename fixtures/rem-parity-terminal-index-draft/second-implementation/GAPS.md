@@ -166,7 +166,7 @@ readable replica frame carries.
 
 **B-6. Section 8.4: whether an unread payload counts as degraded evidence
 is not settled (case 06).** A replica's payload "need be validated only for
-the replica to be accepted", and Appendix C records that the selection order
+the replica to be accepted", and [revision-history record](../../../specs/in-progress/records/rem-parity-1-revision-history.md) records that the selection order
 among agreeing replicas moved to the Guide. When C's envelope validates but
 its payload is unreadable, a Scanner that accepts A or B without reading C's
 payload reports no degraded evidence; one that reads it reports the result
@@ -244,7 +244,7 @@ take the same reading: every erasure in the stripe, the failed block
 included, and no implicit zero.
 **Decided by the revised text.** Section 13.5 now says: "`lost_count` is the number of erasures in the stripe, including the failed block, and `limit` is `m`." That is this Reader's reading; no decision changed.
 
-**B-13. Appendix D TT-7: which bootstraps count as unreadable is open.** No
+**B-13. [open-items record](../../../specs/in-progress/records/rem-parity-1-open-items.md) TT-7: which bootstraps count as unreadable is open.** No
 case depends on it: every unreadable bootstrap in these cases is a medium
 error on the block itself.
 **Decided by the revised text.** Section 8.4's two tables for the first record with supplied values, and Section 15's bootstrap names by level, now decide it (TT-7 is closed).
@@ -382,8 +382,8 @@ opposite hash results for neg-06's two variants. The outcome does not
 depend on the reading, because the rule "`primary_header_start_block` MUST
 = 0" fails in both.
 
-**F-2. Appendix C's statement about geometry disagreements (neg-08, 19, 20,
-23, 34).** Appendix C (informative) says "Geometry and ordinal-range
+**F-2. [revision-history record](../../../specs/in-progress/records/rem-parity-1-revision-history.md)'s statement about geometry disagreements (neg-08, 19, 20,
+23, 34).** [revision-history record](../../../specs/in-progress/records/rem-parity-1-revision-history.md) (informative) says "Geometry and ordinal-range
 disagreements raise `SchemeMismatch`". The normative text makes `k`, `m`
 and `S` ≠ 0, and the block size equal to the actual one, copy-validity
 rules of Section 9.2 (`SidecarParse`). It pins only an acquired index
@@ -424,7 +424,7 @@ accepted. Which role rejects, and with which name, is undecided.
 57).** `NoBootstrapFound` is "absent or invalid" and `BootstrapParse` is
 "violates Section 8". For a declared length beyond the block,
 `BootstrapPayloadTooLarge` ("cannot fit the block") also fits. No rule
-picks one, and Appendix D TT-7 records that which bootstraps count as
+picks one, and [open-items record](../../../specs/in-progress/records/rem-parity-1-open-items.md) TT-7 records that which bootstraps count as
 unreadable is open. *Undecided:* the error name; rejection itself is
 decided.
 **Decided by the revised text.** Section 15 now says: "The bootstrap names depend on the level at which a Reader meets the block." A parser reports `BootstrapParse`, and discovery without supplied values reports `NoBootstrapFound`. With supplied values, Section 8.4's tables decide. The decisions now give the name for each level (`by_level`), and name the level each case's target names (DECISION-LOG).
@@ -703,7 +703,7 @@ component is rejected, and the name is the set
 
 These were found while bringing this implementation into line with the
 revised text (Sections 2.2, 2.4, 3.3, 3.5, 7.2, 8.4, 9.1, 9.6, 10.1.3,
-10.1.4, 10.6, 12.3, 12.6, 13.3–13.5, 14, 15 and 16.3, and Appendix D). Each
+10.1.4, 10.6, 12.3, 12.6, 13.3–13.5, 14, 15 and 16.3, and [open-items record](../../../specs/in-progress/records/rem-parity-1-open-items.md)). Each
 decision the revision changed has a row in `DECISION-LOG.md`. The entries
 above that the revision decides end in a line beginning **Decided by the
 revised text** (E-2 is marked **Resolved by the revised text**). B-4, B-5,
@@ -837,7 +837,7 @@ only the keys it uses.
 The text now states two further rulings. Section 2.2 defines a full
 verification. Section 13.3 step 3 ends with the tail rescue from the terminal
 index, which was narrowed after a review (F-T1c). They decide B-3's
-remaining part and B-7 (above), and Appendix D TT-2 records both as decided.
+remaining part and B-7 (above), and [open-items record](../../../specs/in-progress/records/rem-parity-1-open-items.md) TT-2 records both as decided.
 Every decision they change has a row in `DECISION-LOG.md`.
 
 **K-1. The Verifier's name for a data-block CRC mismatch.** A full
@@ -1189,7 +1189,7 @@ reads no payload. *Decided:* (a) "agrees with the footer" is read as Section 10.
 agreement (every shared field except `copy_kind` and the CRC); (b) a tail header whose position lies outside
 the file does not parse; (c) the route is tried after the header magics of items 2 and 3, which commit a file as
 they state, and before the footer sentences of items 2 and 3; (d) the header route accepts either copy kind.
-The Appendix D TT-2 note that the reference "does not yet follow the footer route" concerns the reference
+The [open-items record](../../../specs/in-progress/records/rem-parity-1-open-items.md) TT-2 note that the reference "does not yet follow the footer route" concerns the reference
 implementation, not this Reader. No damage case has a ParityMap that only the tail route recognises, so no decision
 changed; the unit tests cover the route, its count mismatch with a damaged and an intact tail header, its
 disagreement, an unreadable first block, and its exclusion at tape file 0.

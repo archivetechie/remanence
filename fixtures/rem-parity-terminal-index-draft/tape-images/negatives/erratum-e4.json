@@ -83,7 +83,7 @@
               "2.4",
               "12.5",
               "15",
-              "Appendix D TT-2"
+              "specs/in-progress/records/rem-parity-1-open-items.md TT-2"
             ],
             "quotes": [
               "The rescue also requires the entry's `sidecar_total_block_count` to equal `2H + P + 1`, with `H > 0`. An entry that fails either precondition is not available.",
@@ -286,7 +286,7 @@
               "13.3",
               "2.4",
               "12.5",
-              "Appendix D TT-2"
+              "specs/in-progress/records/rem-parity-1-open-items.md TT-2"
             ],
             "quotes": [
               "A Recoverer MUST NOT place a read from a directory entry unless the entry agrees with the sidecar's map entry in tape file, epoch, protected range and block count.",

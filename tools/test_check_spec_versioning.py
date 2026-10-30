@@ -137,12 +137,30 @@ class StructuralRulesTests(unittest.TestCase):
             path.unlink()
             self.assertTrue(lint.readme_state_findings(root, docs))
 
+    def test_companion_records(self):
+        self.assertFalse(lint.record_findings(lint.ROOT))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            self.assertFalse(lint.record_findings(root))
+            preparing = root / "specs/in-progress"
+            preparing.mkdir(parents=True)
+            (preparing / "rem-parity-1-specification.md").write_text("Review draft.\n")
+            self.assertEqual(len(lint.record_findings(root)), 2)
+            records = root / "specs/in-progress/records"
+            records.mkdir(parents=True)
+            (records / "rem-parity-1-open-items.md").write_text("Informative.\n")
+            history = records / "rem-parity-1-revision-history.md"
+            history.write_text("- **2026-10-30** current\n- **2026-10-29** earlier\n")
+            self.assertFalse(lint.record_findings(root))
+            history.write_text("- **2026-10-29** earlier\n- **2026-10-30** current\n")
+            self.assertIn("not newest-first", lint.record_findings(root)[0])
+
     def test_corpus_floor_and_mutation(self):
         expected = {
             "publication/rem-object-core-1-specification.md": (21, 52, 120),
             "publication/rem-encrypt-1-specification.md": (0, 40, 37),
             "publication/formats-explained.md": (0, 7, 1),
-            "in-progress/rem-parity-1-specification.md": (25, 59, 94),
+            "in-progress/rem-parity-1-specification.md": (25, 128, 444),
             "in-progress/rem-object-core-1-specification.md": (22, 52, 120),
             "in-progress/rem-encrypt-1-specification.md": (21, 40, 37),
             "publication/rem-parity-1-specification.md": (26, 61, 0),

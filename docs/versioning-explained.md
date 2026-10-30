@@ -3,7 +3,9 @@
 
 *A plain-language companion to the versioning and revision policy of the
 Remanence format specifications. This document is informative. The policy
-itself lives in each specification's "Status of This Document" section and
+itself lives in each specification's "Status of This Document" section
+(or ["Versioning and Change Policy"](../specs/in-progress/rem-parity-1-specification.md#versioning-and-change-policy)
+in the REM-PARITY preparing copy) and
 its Section 10 (or 8.1.1) versioning machinery; where this text and a
 specification disagree, the specification wins.*
 

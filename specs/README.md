@@ -59,6 +59,13 @@ string appears there and its bytes have since changed. So if a copy anywhere
 claims a deposited version X, it is byte-identical to that deposit or it is
 defective.
 
+A specification's deposit contains the specification and its companion records.
+At cut, the records move with it to `publication/records/`, preserving their
+relative links. Each record gets its own digest line in `DEPOSITED.sha256`,
+and the deposit description lists the records. The open-items record of a
+deposited revision is the snapshot taken at that revision's freeze; records
+of a preparing copy keep changing.
+
 A copy found inside a Remanence source release is a convenience copy under the
 same rule. It is deliberately shipped rather than replaced with a pointer,
 because a reader unpacking an archive offline needs the text itself.
@@ -69,9 +76,11 @@ A revision of a specification is prepared in [in-progress/](in-progress/),
 under the rules in [in-progress/README.md](in-progress/README.md#the-rules).
 It is then published for review in [publication/](publication/), with a
 version that carries a `-draft.N` suffix. On the freeze date named in its
-Status section, the finality promise in that section takes effect, and from
-then on the change policy in that section governs every revision. The
-conformance vectors that anchor a revision are pinned, and are never changed
+Status section, the finality promise takes effect, and from then on the change
+policy governs every revision. REM-OBJECT and REM-ENCRYPT keep that promise and
+policy in Status; the REM-PARITY preparing revision keeps them in
+[Versioning and Change Policy](in-progress/rem-parity-1-specification.md#versioning-and-change-policy).
+The conformance vectors that anchor a revision are pinned, and are never changed
 or replaced;
 [versioning-explained.md](../docs/versioning-explained.md#the-test-vectors--evidence-that-never-moves)
 explains why. Entries
@@ -133,7 +142,7 @@ observation mismatch; nonzero gap interior; missing filemark; A/B/C survivor
 conflict; all three replicas invalid with explicit BOT fallback; and arithmetic
 overflow in every size/location formula.
 
-Item TT-2 of REM-PARITY's Appendix D records how far the review-only set has
+Item TT-2 of REM-PARITY's [open-items record](in-progress/records/rem-parity-1-open-items.md) records how far the review-only set has
 got.
 
 ### REM-PARITY's freeze criteria
@@ -147,7 +156,7 @@ implementation must do. Candidate-vector, proof, hermetic, VTL and incremental
 review results are evidence gathered before the freeze, not a declaration that
 the specification is frozen. REM-PARITY's Section 18 says that its criteria are
 kept here, and its
-[Appendix D](in-progress/rem-parity-1-specification.md#appendix-d-open-items-informative)
+[open-items record](in-progress/records/rem-parity-1-open-items.md)
 lists the items that remain open.
 
 The criteria below were carried word for word, under the same numbers, from
@@ -207,9 +216,9 @@ tools kept in its repository.
 
 | Criterion | Evidence in the reference implementation | Remarks |
 | --- | --- | --- |
-| 2 | `tools/verify_terminal_index_vectors.py` re-derives the candidate terminal bytes without calling the Rust codec. `tools/rem_parity_second_implementation.py`, written from REM-PARITY without reading the reference, re-derives the pinned bytes REM-PARITY §17 lists, decides the damage, portable resume and negative cases §17 describes, compares the negatives' mutated-block digests, and decides the outcomes `MUTATIONS.tsv` and `SELECTION.tsv` pin; Appendix D, TT-2, says what it re-derives, which pinned values are excluded and why, and what remains open. The generators are `crates/remanence-parity/examples/generate_terminal_index_vectors.rs` and `crates/remanence-cli/examples/generate_tape_images.rs` | REM-PARITY §17 describes the candidate set; Appendix D, TT-2, lists what remains open before the criterion is met |
-| 3 | Five coverage-guided targets in `fuzz/fuzz_targets/`: `rem_parity_bootstrap_parse`, `rem_parity_bootstrap_structured`, `rem_parity_map_parse`, `rem_parity_scan_walk` and `rem_parity_sidecar_parse`, run by `tools/run_rem_parity_fuzz_campaign.sh` and `tools/run_rem_parity_fuzz_overnight.sh` | No target yet covers the terminal-replica or separation parsers, so the criterion is open (Appendix D, TT-6) |
-| 4 | `rem-debug tape freeze-drill` ([reference-cli.md](../docs/reference-cli.md)) writes drill objects through a full finalization on a scratch tape, injects a chosen read-side medium-error damage plan, and verifies recovery | One run covers one block size, and the criterion asks for two. The supervised physical-tape runs are open (Appendix D, TT-3) |
+| 2 | `tools/verify_terminal_index_vectors.py` re-derives the candidate terminal bytes without calling the Rust codec. `tools/rem_parity_second_implementation.py`, written from REM-PARITY without reading the reference, re-derives the pinned bytes REM-PARITY §17 lists, decides the damage, portable resume and negative cases §17 describes, compares the negatives' mutated-block digests, and decides the outcomes `MUTATIONS.tsv` and `SELECTION.tsv` pin; [open-items record](in-progress/records/rem-parity-1-open-items.md), TT-2, says what it re-derives, which pinned values are excluded and why, and what remains open. The generators are `crates/remanence-parity/examples/generate_terminal_index_vectors.rs` and `crates/remanence-cli/examples/generate_tape_images.rs` | REM-PARITY §17 describes the candidate set; [open-items record](in-progress/records/rem-parity-1-open-items.md), TT-2, lists what remains open before the criterion is met |
+| 3 | Five coverage-guided targets in `fuzz/fuzz_targets/`: `rem_parity_bootstrap_parse`, `rem_parity_bootstrap_structured`, `rem_parity_map_parse`, `rem_parity_scan_walk` and `rem_parity_sidecar_parse`, run by `tools/run_rem_parity_fuzz_campaign.sh` and `tools/run_rem_parity_fuzz_overnight.sh` | No target yet covers the terminal-replica or separation parsers, so the criterion is open ([open-items record](in-progress/records/rem-parity-1-open-items.md), TT-6) |
+| 4 | `rem-debug tape freeze-drill` ([reference-cli.md](../docs/reference-cli.md)) writes drill objects through a full finalization on a scratch tape, injects a chosen read-side medium-error damage plan, and verifies recovery | One run covers one block size, and the criterion asks for two. The supervised physical-tape runs are open ([open-items record](in-progress/records/rem-parity-1-open-items.md), TT-3) |
 | 5 | A clean-room exercise by an AI system, given the specification and generic libraries but no implementation source | Technical independence only, as the note above says; RP-4 remains open |
 
 Criterion 1 is judged against the whole implementation, and criterion 6 names

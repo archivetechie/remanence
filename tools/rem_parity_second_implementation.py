@@ -2161,8 +2161,8 @@ QUOTES: dict[str, tuple[str, str]] = {
     "parity_locator": ("9.1", "A Reader MUST locate a parity shard by computing `block(stripe, parity_index)` from its explicit fields, never by the position of its index entry."),
     "pm_copies": ("10.1.3", "When one header copy is invalid and the other is valid, the valid copy is used; when both are valid they MUST agree (Section 10.1.4)."),
     "pm_crc": ("10.1.3", "A Reader MUST verify the CRC-64/XZ at 0xC0 of each header copy and of the footer, and MUST NOT rely on a block whose CRC does not verify."),
-    "tt2_walk_pm": ("D", "Section 12.3 (item 4) finds a ParityMap whose block 0 is unreadable, or damaged so that no head rung takes it, through its footer and tail header copy, and the replica route survives that damage by locating it through structural rows."),
-    "selection_guide": ("C", "the selection order among agreeing replicas"),
+    "tt2_walk_pm": ("specs/in-progress/records/rem-parity-1-open-items.md", "Section 12.3 (item 4) finds a ParityMap whose block 0 is unreadable, or damaged so that no head rung takes it, through its footer and tail header copy, and the replica route survives that damage by locating it through structural rows."),
+    "selection_guide": ("specs/in-progress/records/rem-parity-1-revision-history.md", "the selection order among agreeing replicas"),
     "bootstrap_supplied_refused": ("8.4", "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."),
     "hint_walk_accept": ("8.4.1", "A Scanner MUST accept an expected tape UUID,"),
 }
@@ -2171,7 +2171,7 @@ QUOTES: dict[str, tuple[str, str]] = {
 
 # Sentences of the revised text that the decisions cite (the F0 revision:
 # Sections 2.2, 2.4, 3.3, 3.5, 7.2, 8.4, 9.1, 9.6, 10.1.3, 10.1.4, 10.6,
-# 12.3, 12.6, 13.3-13.5, 14, 15, 16.3 and Appendix D).
+# 12.3, 12.6, 13.3-13.5, 14, 15, 16.3 and specs/in-progress/records/rem-parity-1-open-items.md).
 QUOTES.update({
     'verifier_divergence': ('9.1', "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it."),
     'footer_decides': ('13.3', 'Such a footer is valid, and it decides, unless an available sidecar epoch directory entry (step 3) disagrees with it: a copy it contradicts is damaged, and the directory-assisted rescue of step 3 is not used.'),
@@ -2257,7 +2257,7 @@ QUOTES.update({
     'report_by_address': ('2.2', "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."),
     'opaque_bytes': ('2.2', 'It reads those blocks as opaque bytes and does not interpret Object content (Section 1.1, goal 2).'),
     'structure_not_full': ('2.2', 'A check of structure and metadata alone, which reads no data block or parity shard, is not a full verification.'),
-    'full_verification_d': ('D', "A full verification reads every data block and parity shard (Section 2.2), and the reference's verification does so."),
+    'full_verification_d': ('specs/in-progress/records/rem-parity-1-open-items.md', "A full verification reads every data block and parity shard (Section 2.2), and the reference's verification does so."),
     'tape_complete': ('2.2', 'It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix.'),
     'artifact_scope': ('12.6', 'A structural artifact is any tape file, complete or torn, that follows the last of the five files of the terminal suffix, whatever it contains. The suffix is exact when the walk recognises, in order, replica, separation extent, replica, separation extent and replica, none of them damaged. The rule is one of scope: an artifact is not an Object of any inventory. The walk may report it as it reports any file beyond the validated scope, as an Object candidate of unknown identity or, when torn, as an incomplete candidate (Section 8.4.1), so that an operator sees it.'),
     'torn_file': ('12.2', 'A file whose trailing filemark is missing before EOD is not a tape file of the map. The walk reports structural damage, classifies the file by its head, when the head can be read, as a torn candidate (an incomplete Object candidate when nothing else fits, Section 8.4.1), and ends there.'),
@@ -4413,7 +4413,7 @@ QUOTES.update({
     "ft_tail": ("9.6", "| 0x58 | 8 | tail_header_start_block u64 = H + P |"),
     "ft_fill": ("9.6", "| 0x88… | | zero fill, MUST be zero |"),
     "pin_then": ("13.3", "The acquired index MUST then be pinned against the bootstrap's scheme record (`k`, `m`, `S`, block size), or against the supplied scheme and block size when the bootstrap is unreadable, and against the map entry's ordinal range; disagreement is `SchemeMismatch`."),
-    "geometry_c": ("C", "Geometry and ordinal-range disagreements raise `SchemeMismatch`, as this document specifies, rather than a generic parse error."),
+    "geometry_c": ("specs/in-progress/records/rem-parity-1-revision-history.md", "Geometry and ordinal-range disagreements raise `SchemeMismatch`, as this document specifies, rather than a generic parse error."),
     "pm_M": ("10.1.2", "With payload length `L`, block size `B`, and `M = ceil((0xC8 + L) / B)` blocks per copy:"),
     "pm_min": ("10.1.2", "The minimum block size for ParityMap files is 0xC8."),
     "pm_locator": ("10.1.4", "Readers MUST validate the locator arithmetic (`M` from `payload_len` and `block_size`; total = 2M + 1; the three start indices) and reject disagreement between header, footer, and the measured tape file length."),
@@ -4906,7 +4906,7 @@ SIDECAR_ORDER = ("Section 9.2 gives its constraints as a table with no order amo
                  "this copy.")
 BOOT_NAME_READINGS = [
     "BootstrapParse: the frame or payload violates Section 8",
-    "NoBootstrapFound: Section 15 also names an invalid bootstrap 'absent or invalid', and Appendix D TT-7 records "
+    "NoBootstrapFound: Section 15 also names an invalid bootstrap 'absent or invalid', and specs/in-progress/records/rem-parity-1-open-items.md TT-7 records "
     "that which bootstraps count as unreadable is still open",
 ]
 
@@ -5217,7 +5217,7 @@ def negatives_table() -> dict[str, dict[str, Any]]:
     sc("neg-22", 0x58, 8, 4, 3, "data_crc_count", "hashed", ["sc_crc_count"])
     sc("neg-23", 0x28, 4, 262144, 524288, "block_size u32", "hashed", ["sc_block_size", "pin_then", "geometry_c"],
        order="The Section 9.2 block-size rule is a copy-validity rule, and Section 13.3 pins only an acquired index "
-             "('then pinned'), so SidecarParse fires first for this copy. Appendix C (informative) says geometry "
+             "('then pinned'), so SidecarParse fires first for this copy. specs/in-progress/records/rem-parity-1-revision-history.md (informative) says geometry "
              "disagreements raise SchemeMismatch; that applies when a copy that validates disagrees with the bootstrap "
              "(GAPS F-2).")
     for variant, to in (("a", 3), ("b", 0)):
@@ -5245,7 +5245,7 @@ def negatives_table() -> dict[str, dict[str, Any]]:
                    "decide": decision("no-vector", None, ["close_reserve"], "", must_reject=False,
                                       formula=formula("close reserve", {}, "evaluated only by a Writer", False),
                                       note="No Reader evaluates this formula. The Writer's capacity admission is practice in "
-                                           "the Guide; Appendix C records that this document no longer requires a tool to "
+                                           "the Guide; specs/in-progress/records/rem-parity-1-revision-history.md records that this document no longer requires a tool to "
                                            "refuse an Object that would leave too little room to finalize. Nothing for a "
                                            "Reader to reject.")}
 
@@ -6389,7 +6389,7 @@ def supplement_table() -> dict[str, dict[str, Any]]:
     sidecar_rule("sup-40", "neg-31", 0x92, 2, 0, 1, "reserved u16", False, False, False, False, ["sc_reserved92"], "§9.2 reserved 0x92")
     sidecar_rule("sup-42", "neg-23", 0x28, 4, 262144, 524288, "block_size", True, True, True, False,
                  ["sc_block_size", "pin_then", "geometry_c"], "§9.2 block_size",
-                 " Appendix C would call the geometry disagreement SchemeMismatch (GAPS F-2), but no copy is acquired, "
+                 " specs/in-progress/records/rem-parity-1-revision-history.md would call the geometry disagreement SchemeMismatch (GAPS F-2), but no copy is acquired, "
                  "so the pin is not reached.")
     sidecar_rule("sup-43", "neg-41", 0x88, 8, 6, 7, "footer_block_index", True, True, True, False, ["sc_footer_index"],
                  "§9.2 footer index")
@@ -7656,7 +7656,7 @@ def verifier_prefix_findings(tape: DamagedTape, entries: list[MapEntry], scope: 
     Every sidecar's primary copy, tail copy and footer are read (Section 9.1).
     Each finding says whether it is structure or metadata ("structure") or a
     data block or parity shard ("data"); whether a full verification checks
-    the latter is open (Appendix D TT-2).
+    the latter is open (specs/in-progress/records/rem-parity-1-open-items.md TT-2).
     """
     findings: list[dict[str, Any]] = []
     if stats is None:
@@ -8479,7 +8479,7 @@ def _json_default(value: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# The negatives' mutated-block digests (Appendix D TT-2, first open item).
+# The negatives' mutated-block digests (specs/in-progress/records/rem-parity-1-open-items.md TT-2, first open item).
 #
 # The `negatives` and `negatives-supplement` commands already apply each
 # mutation and its repairs to my own builds. This re-runs only that apply
@@ -8730,7 +8730,7 @@ def run_negative_blocks(negatives_path: pathlib.Path, supplement_path: pathlib.P
 
 
 # ---------------------------------------------------------------------------
-# The terminal-index mutations and survivor sets (Appendix D TT-2), decided
+# The terminal-index mutations and survivor sets (specs/in-progress/records/rem-parity-1-open-items.md TT-2), decided
 # blind. Each description is applied byte by byte to my own profile build,
 # the Reader runs on the resulting record stream, and the decision comes from
 # the text; the Reader's result is recorded beside it as a self-check.

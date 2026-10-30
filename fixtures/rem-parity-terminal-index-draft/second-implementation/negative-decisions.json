@@ -3033,7 +3033,7 @@
             "quote": "The acquired index MUST then be pinned against the bootstrap's scheme record (`k`, `m`, `S`, block size), or against the supplied scheme and block size when the bootstrap is unreadable, and against the map entry's ordinal range; disagreement is `SchemeMismatch`."
           },
           {
-            "section": "C",
+            "section": "specs/in-progress/records/rem-parity-1-revision-history.md",
             "quote": "Geometry and ordinal-range disagreements raise `SchemeMismatch`, as this document specifies, rather than a generic parse error."
           },
           {
@@ -3041,7 +3041,7 @@
             "quote": "SidecarParse sidecar structure violates Section 9"
           }
         ],
-        "order": "The Section 9.2 block-size rule is a copy-validity rule, and Section 13.3 pins only an acquired index ('then pinned'), so SidecarParse fires first for this copy. Appendix C (informative) says geometry disagreements raise SchemeMismatch; that applies when a copy that validates disagrees with the bootstrap (GAPS F-2).",
+        "order": "The Section 9.2 block-size rule is a copy-validity rule, and Section 13.3 pins only an acquired index ('then pinned'), so SidecarParse fires first for this copy. specs/in-progress/records/rem-parity-1-revision-history.md (informative) says geometry disagreements raise SchemeMismatch; that applies when a copy that validates disagrees with the bootstrap (GAPS F-2).",
         "reader_must_reject": true,
         "formula": null,
         "note": ""
@@ -3487,7 +3487,7 @@
           "type": "u64",
           "overflows": false
         },
-        "note": "No Reader evaluates this formula. The Writer's capacity admission is practice in the Guide; Appendix C records that this document no longer requires a tool to refuse an Object that would leave too little room to finalize. Nothing for a Reader to reject."
+        "note": "No Reader evaluates this formula. The Writer's capacity admission is practice in the Guide; specs/in-progress/records/rem-parity-1-revision-history.md records that this document no longer requires a tool to refuse an Object that would leave too little room to finalize. Nothing for a Reader to reject."
       },
       "implementation": [],
       "self_check": {

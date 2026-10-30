@@ -334,7 +334,7 @@ per-release summaries.
 
 - Wording pass over the REM-PARITY text that the recent clarifications touched.
   No requirement changes. Section 17 opens with the damage matrix as it now
-  stands and treats its first 25 cases as history, and Appendix D item TT-2
+  stands and treats its first 25 cases as history, and [open-items record](specs/in-progress/records/rem-parity-1-open-items.md) item TT-2
   drops the two reference gaps that are now closed.
 - Added the Implementation Guide checks to CI. `tools/check_guide.py` verifies
   that every quotation the Guide attributes to a specification section is
@@ -381,7 +381,7 @@ per-release summaries.
   pinned vectors already did: bootstrap discovery with supplied values, which
   footers supply a layout, the walk's measurements and classification ladder,
   the preconditions and order of the directory-assisted rescue, what makes a
-  final ParityMap valid, and what a full verification reports. Appendix D item
+  final ParityMap valid, and what a full verification reports. [open-items record](specs/in-progress/records/rem-parity-1-open-items.md) item
   TT-2 records the limits that follow. Three points were decided. A structural
   artifact after the exact terminal suffix is not an Object of any inventory
   (§12.6). A footer whose magic matches commits a tape file to its control type

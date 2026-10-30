@@ -914,7 +914,7 @@ This document has four independent version axes:
 | `wrap_suite` | `0x02` | Scalar-header offset `0x38` (Section 10.3) |
 
 These axes and the Core stream schema MUST NOT be used as proxies for one
-another. Core §10 and the REM-PARITY Status section state those documents' own
+another. Core §10 and the REM-PARITY [Versioning and Change Policy](rem-parity-1-specification.md#versioning-and-change-policy) section state those documents' own
 axes.
 
 Every value in the registries below was assigned by document 1.0; each future

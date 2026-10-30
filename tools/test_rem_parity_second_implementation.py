@@ -202,8 +202,9 @@ class ArithmeticTests(unittest.TestCase):
 
     @unittest.skipIf(impl.ARCHIVE_LAYOUT, "deposit excludes specification text; quotation provenance is checked in the repository")
     def test_decision_quotes_occur_in_the_text(self) -> None:
-        text = " ".join(impl.SPEC_PATH.read_text(encoding="utf-8").split())
         for key, (section, quote) in impl.QUOTES.items():
+            path = impl.REPO_ROOT / section if section.startswith("specs/") else impl.SPEC_PATH
+            text = " ".join(path.read_text(encoding="utf-8").split())
             self.assertIn(" ".join(quote.split()), text, f"{key} (Section {section})")
 
 
@@ -803,10 +804,12 @@ class MutationTests(unittest.TestCase):
 
     @unittest.skipIf(impl.ARCHIVE_LAYOUT, "deposit excludes specification text; quotation provenance is checked in the repository")
     def test_every_decision_cites_the_text(self) -> None:
-        text = " ".join(impl.SPEC_PATH.read_text(encoding="utf-8").split())
         for entry_id, entry in self.out["entries"].items():
             decision = entry["decision"]
             for citation in decision["component"]["rules"] + decision["tape"]["rules"]:
+                section = citation["section"]
+                path = impl.REPO_ROOT / section if section.startswith("specs/") else impl.SPEC_PATH
+                text = " ".join(path.read_text(encoding="utf-8").split())
                 self.assertIn(citation["quote"], text, entry_id)
 
     def test_a_stated_old_value_that_differs_is_reported_not_guessed(self) -> None:
