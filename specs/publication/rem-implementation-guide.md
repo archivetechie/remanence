@@ -529,9 +529,10 @@ The checks in section 5.1 prove that the writer archived what it was given.
 They do not prove that the medium or the network kept it. A copy can be
 damaged in transmission, or by a drive that reports success on a bad write.
 
-After each copy is committed, we recommend re-reading it through the object
-read path and recording its verification result separately. On tape, the
-barrier and the durable commit record establish commitment (REM-PARITY §11.2);
+After each copy is committed on tape or durably published elsewhere, we
+recommend re-reading it through the object read path and recording its
+verification result separately. On tape, the barrier and the durable commit
+record establish commitment (REM-PARITY §11.2);
 read-back verification is not a condition of durability. A full
 verification checks every regular member's `file_sha256` together with the
 correspondence and hardlink checks of the Verifier profile (REM-OBJECT §7.4).
@@ -1084,19 +1085,22 @@ at the wrong point overwrites committed data.
 
 We recommend that each commit record hold the tape file's filemark-map entry
 (REM-PARITY §7.1), enough state to seed a resumed writer (section 9.9), and the
-evidence required by REM-PARITY §11.5 (W5): each block's `data_shard_crc64` or
-one check value over them in ascending ordinal order. For the check value, we
-recommend recording the value for the open range `[W, T)`: CRC-64/XZ over
-its whole-block CRCs, each encoded as eight little-endian bytes in ascending
-ordinal order. The empty range has check value 0. Record the evidence no later
-than the blocks' commit, as W5 requires; the fixture set
+evidence that the specification defines: "Its commit records, written
+no later than each block's commit, bind every such block's `data_shard_crc64`
+(Section 6.7), either value by value or through one check value, the CRC-64/XZ
+(Section 5.1) of their little-endian encodings in ascending ordinal order,
+and the blocks read back reproduce that evidence." (REM-PARITY §11.5, Parity
+from read-back (W5)). For the check value, we recommend recording the value
+for the open range `[W, T)`: CRC-64/XZ over its whole-block CRCs, each encoded
+as eight little-endian bytes in ascending ordinal order. The empty range has
+check value 0. The fixture set
 [`fixtures/rem-writer-check-value/`](../../fixtures/rem-writer-check-value/)
 pins both the block CRCs and their check value.
 The record that commits the Object completing a full epoch also commits that
 epoch's sidecar (REM-PARITY §11.4). How the record is stored is the
 implementation's own choice: "The commit record's format is
 implementation-defined (a journal, a database row, a replicated log entry)."
-(REM-PARITY §3.4). That choice remains constrained by W5's required evidence.
+(REM-PARITY §3.4).
 
 An open tape whose commit records are lost can still be read, but cannot be
 resumed or finalized, so it never gains terminal replicas (REM-PARITY §3.4).
@@ -1307,10 +1311,12 @@ Resumer Obligations.
 
 ### 9.9. Resume a tape from its commit records
 
-A resumed writer can end the open epoch before new data or continue it with
-new Objects. Both choices conform to REM-PARITY §11. A writer that seeds
-itself from less than the committed prefix can produce a sidecar or terminal
-inventory that disagrees with the tape.
+The specification leaves the resume choice to the Writer: "When to take
+barriers, when to end a short epoch, whether a resumed Writer ends or
+continues its open epoch, and how commit records are stored are the Writer's
+choice; the Guide recommends practice." (REM-PARITY §11.6, Finalization (W6)).
+A writer that seeds itself from less than the committed prefix can produce a
+sidecar or terminal inventory that disagrees with the tape.
 
 We recommend seeding the writer with the complete replayable prefix map, the
 Object recovery rows, one full directory entry for every committed sidecar,
@@ -1321,14 +1327,22 @@ at most one ParityMap, so its `sequence` counter has no consequence for a reader
 
 When `[W, T)` is nonempty, rebuild the accumulator by reading its committed
 file extents, not by treating a data ordinal as a physical tape position.
-Compute each block's `data_shard_crc64` and reproduce the evidence recorded
-at commit, as REM-PARITY §11.5 (W5) requires. For the check-value form in
-section 9.1, compare CRC-64/XZ over the little-endian block CRCs of `[W, T)`
-with the recorded value. On a mismatch, we recommend rereading the range once.
-A second mismatch refuses the parity write and Object appends; do not replace
-the recorded evidence with a value derived from the failed read-back.
-W5 names a proof mismatch `ResumeAppend` and a medium or transport failure
-`TapeIo`; section 10.9 describes its finalization exception.
+The proof is defined by REM-PARITY: "Before computing parity from blocks read
+back from the committed prefix, a Writer proves that they are the committed
+bytes." (REM-PARITY §11.5, Parity from read-back (W5)). We recommend computing
+each block's `data_shard_crc64` and checking the evidence quoted in section
+9.1. For the check-value form, compare CRC-64/XZ over the little-endian block
+CRCs of `[W, T)` with the recorded value. On a mismatch, we recommend rereading
+the range once. After a second mismatch, stop the parity write and Object
+appends. Do not replace the recorded evidence with a value derived from the
+failed read-back. The specification names the failures: "A boundary
+or wrong-length read there, or a block that does not reproduce the evidence,
+is `ResumeAppend`; a medium or transport failure is `TapeIo`."
+(REM-PARITY §11.5, Parity from read-back (W5)). It also defines their scope:
+"These failures refuse Object appends and parity over those bytes;
+Section 11.6 permits finalization after recorded operator acceptance."
+(REM-PARITY §11.5, Parity from read-back (W5)). Section 10.9 gives the
+recommended practice for that finalization exception.
 
 We recommend ending a rebuilt open epoch and committing its sidecar before
 admitting new Objects. This finishes an interrupted closeout and starts new
@@ -1495,12 +1509,18 @@ Serves REM-PARITY §10.3, Object Recovery Rows.
 
 ### 10.9. Record acceptance of an uncovered range before planning finalization
 
-If W5 cannot prove `[W, T)` from read-back, because of `ResumeAppend` or
-`TapeIo`, W6 permits finalization only after the operator's recorded acceptance
-(REM-PARITY §11.6). The range gets no sidecar. Object appends and parity over
-those bytes remain refused; finalization writes the remaining sequence at
-proved positions. Losing the commit records does not qualify for this
-exception (REM-PARITY §3.4).
+Finalization after a failed read-back of `[W, T)` follows the specification:
+"After a failure a Writer only completes the remaining files of this sequence,
+at proved positions." (REM-PARITY §11.6, Finalization (W6)). The same section
+states the exception: "If W5 cannot prove the open epoch's blocks, because they
+do not reproduce the evidence (`ResumeAppend`) or cannot be read (`TapeIo`),
+finalization continues only on the operator's recorded acceptance: that epoch
+gets no sidecar, the range is recorded as `W < T`, and the rest of the sequence
+is written as above." (REM-PARITY §11.6, Finalization (W6)). The refusal of
+appends and parity still applies: "These failures refuse Object appends and
+parity over those bytes; Section 11.6 permits finalization after recorded
+operator acceptance." (REM-PARITY §11.5, Parity from read-back (W5)). Losing
+the commit records does not qualify for this exception (REM-PARITY §3.4).
 
 We recommend recording the acceptance with the tape incarnation, the
 finalization operation, the tape-log sequence the operator saw, and `W` and
@@ -1513,8 +1533,8 @@ protection state.
 Keep the true `W` in the final directory and report `[W, T)` as unprotected.
 A Verifier reports this range even on a finalized tape; the absence of parity
 alone is not damage or a verification failure (REM-PARITY §2.2). This decision
-does not accept fewer terminal replicas: W6 still requires three complete
-replicas before the tape is reported finalized.
+does not accept fewer terminal replicas: "A tape is reported finalized only
+with three complete replicas." (REM-PARITY §11.6, Finalization (W6)).
 
 Serves REM-PARITY §11.6, Finalization (W6).
 
@@ -2248,6 +2268,19 @@ identity at random.
   revision are now chapters 3 to 10, and chapters 10 to 14 are now chapters 12
   to 16. Earlier entries below keep the numbers of their time. Chapter titles
   are unchanged.
+
+  The specification pass then changed the text as follows.
+
+  Section 5.3 separates post-commit verification from tape commitment and
+  covers copies durably published elsewhere. Section 9.1 records the W5
+  evidence and recommends a check value for the open range. Section 9.3
+  describes batching, checkpoint and close barriers, session closeout and
+  their costs. Section 9.8 describes the proof of the append position and
+  the handling of an interrupted suffix. Section 9.9 describes both resume
+  choices, the read-back proof and the recommendation to reread once on a
+  mismatch. New section 10.9 records acceptance of an uncovered range before
+  planning finalization. Sections 9.1, 9.9 and 10.9 quote and cite W5 and W6
+  where they state those rules.
 
 - **30 September 2026.** Sixth revision. Section 7.3 gains the practice of a
   full verification: a check of structure alone is not one, and each failed

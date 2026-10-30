@@ -244,3 +244,38 @@ sizes. The 256 KiB
    states it, in two stages: the physical read, then the content of a record
    of the right length. Section 15 states the bootstrap error names by the
    level at which a Reader meets the block.
+8. **TT-8 — companion policy pointers at cut (open).** Owner: release
+   maintainer. Due: whenever REM-OBJECT or REM-ENCRYPT is cut alone. Their
+   preparing Section 10 pointers target
+   `rem-parity-1-specification.md#versioning-and-change-policy`, which the
+   published REM-PARITY draft does not have. Recheck each pointer against the
+   REM-PARITY copy that publication actually supplies and target its policy
+   section before cutting either companion alone.
+9. **TT-9 — deposit tooling for companion records (open).** Owner: release
+   tooling maintainer. Due: before the next cut. The records' deposit lifecycle
+   above is not yet implemented by the deposit tooling. The remaining work is:
+   - In `release/zenodo-records.json`, add the two records under
+     `specs/publication/records/` to `records.parity.files`, give each a
+     parent-revision-bound entry in `records.parity.deposit_lines`, and name
+     both in `records.parity.metadata.description`, identifying the open-items
+     record as the revision's freeze snapshot.
+   - In `tools/zenodo_deposit.py`, make `Deposit.plan()` distinguish companion
+     records from the primary specification and bind them to its revision
+     without requiring separate Version rows or version/concept DOIs. Keep
+     the file hash and upload checks.
+   - Define the mapping between flat upload filenames and repository paths
+     under `publication/records/` in `filename()`, configuration validation
+     and `record_locked()`. Keep local path validation and the specification's
+     relative links intact.
+   - In `tools/check_spec_versioning.py`, recognize companion record digest
+     names, resolve them under `specs/publication/records/`, and check each
+     record's digest against its parent revision's deposited entries.
+   - Update the explanatory comment in `specs/publication/DEPOSITED.sha256`
+     to cover REM-PARITY's “Versioning and Change Policy” section, and record
+     each real record digest at deposit.
+10. **TT-10 — fixture record citations at cut (open).** Owner: vector
+    maintainer. Due: when the records move at cut. Fixture citations now name
+    `specs/in-progress/records/`; retarget them to `specs/publication/records/`
+    when the records move there, and check that each citation resolves. The
+    second implementation's `DECISION-LOG.md` records that the preparing-path
+    citations are edits made after the decisions, with their outcomes intact.

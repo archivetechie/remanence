@@ -1667,7 +1667,14 @@ effect on conformance.
   Wording follow-ups then changed no requirement. Section 13.4 names the error
   of each metadata case it lists, groups the field cases under
   `InvalidMetadataField`, and lists the Sealer-input cases of the candidate
-  supplement in one order; a paragraph of Section 5.3 is rewrapped.
+  supplement in one order; a paragraph of Section 5.3 is
+  rewrapped.
+
+  The specification pass then changed the text as follows.
+
+  Section 10 points to REM-PARITY's “Versioning and Change Policy” section for
+  that document's version axes.
+
 - **2026-09-10 — 1.0.0-draft.3 — review-draft errata.** This revision makes
   three changes.
 
