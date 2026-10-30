@@ -239,11 +239,14 @@ fn lock_device(io: &mut LockIo, serial: &str) -> Result<DeviceLock, MountError> 
     })?;
     // SAFETY: flock borrows a live file descriptor; File owns its lifetime.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(refusal(format!(
-            "device lock {}: {}; stop the other process and retry",
-            path.display(),
-            std::io::Error::last_os_error()
-        )));
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Err(refusal(format!(
+                "drive {serial} is locked by a live writer or another process; not clearing its medium-removal lock (device lock {}: {error})",
+                path.display()
+            )));
+        }
+        return Err(refusal(format!("device lock {}: {error}", path.display())));
     }
     Ok(DeviceLock(file))
 }
@@ -329,6 +332,172 @@ impl LockedAuditedDevice {
         }
         Ok(())
     }
+}
+
+/// Drive device locks live here, one file per VPD serial.
+pub const DEVICE_LOCK_ROOT: &str = "/run/lock/rem";
+
+/// Exclusion acquired only after a drive refused UNLOAD with 05/53/02.
+/// The owner retains this value until any following changer MOVE has completed.
+pub(crate) struct UnloadRecoveryGuard {
+    _device: DeviceLock,
+    _state: Option<remanence_state::StateLockGuard>,
+    audit_error: Arc<Mutex<Option<String>>>,
+}
+impl std::fmt::Debug for UnloadRecoveryGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnloadRecoveryGuard")
+            .finish_non_exhaustive()
+    }
+}
+impl UnloadRecoveryGuard {
+    fn acquire(
+        drive: &mut DriveHandle,
+        config: Option<&Path>,
+        lock_root: &Path,
+    ) -> Result<Self, MountError> {
+        // This is the same VPD serial used by standalone and placed-library mounts.
+        let serial = &drive.drive().serial;
+        let root = lock_root.to_owned();
+        let device = lock_device(
+            &mut move |_, logical| {
+                Ok(root.join(
+                    logical
+                        .strip_prefix(DEVICE_LOCK_ROOT)
+                        .expect("device lock namespace"),
+                ))
+            },
+            serial,
+        )?;
+        let audit_error = Arc::new(Mutex::new(None));
+        let state = if let Some(path) = config {
+            let config = remanence_state::load_config(path).map_err(refusal)?;
+            // Recovery must work during a catalog reset: never open StateHandle/SQLite.
+            let state = remanence_state::StateLockGuard::acquire(&config.daemon.state_dir)
+                .map_err(refusal)?;
+            let mut audit =
+                remanence_state::FileAuditLog::open(&config.audit.dir, config.audit.fsync)
+                    .map_err(refusal)?;
+            let pending = audit_error.clone();
+            drive.set_audit_hook(move |event| {
+                use remanence_state::AuditSink;
+                if let Err(error) = audit.append(remanence_state::library_audit_event_record(event))
+                {
+                    *pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(error.to_string());
+                }
+            });
+            Some(state)
+        } else {
+            None
+        };
+        Ok(Self {
+            _device: device,
+            _state: state,
+            audit_error,
+        })
+    }
+
+    fn flush_audit(&self) -> Result<(), MountError> {
+        match self
+            .audit_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            Some(error) => Err(refusal(format!("drive audit failed: {error}"))),
+            None => Ok(()),
+        }
+    }
+
+    /// An audit error must never hide the original ALLOW/UNLOAD/MOVE failure.
+    fn finish(&self, result: Result<(), MountError>) -> Result<(), MountError> {
+        let audit = self.flush_audit();
+        if result.is_err() {
+            if let Err(error) = &audit {
+                tracing::error!(%error, "audit also failed during unload recovery");
+            }
+        }
+        result.and(audit)
+    }
+}
+
+/// Try the normal unload first. Only 05/53/02 permits locked removal recovery.
+/// No config is read and no new lock is taken unless that exact refusal occurs.
+/// Explicit config adds only the bare state lock and an audit sink, never a
+/// catalog open/migration or reset-fence reconciliation. Without config, the
+/// serial device lock excludes external writers and existing audit hooks apply.
+pub fn unload_library_bay(
+    library: &mut LibraryHandle,
+    bay: u16,
+    destination: Option<u16>,
+    policy: &dyn remanence_library::AccessPolicy,
+    config: Option<&Path>,
+    lock_root: &Path,
+) -> Result<UnloadOutcome, MountError> {
+    match library.unload(bay, destination, policy) {
+        Ok(()) => return Ok(UnloadOutcome::Unloaded),
+        Err(remanence_library::UnloadError::DriveUnload(ref error))
+            if error.is_medium_removal_prevented() => {}
+        Err(error) => return Err(refusal(error)),
+    }
+    let mut drive = library.open_drive(bay, policy).map_err(|error| {
+        refusal(format!(
+            "drive refused UNLOAD (medium removal prevented); opening it for recovery failed: {error}"
+        ))
+    })?;
+    let serial = drive.drive().serial.clone();
+    let guard = UnloadRecoveryGuard::acquire(&mut drive, config, lock_root)?;
+    let result = library
+        .unload_recovering_removal(bay, destination, policy)
+        .map_err(refusal);
+    guard.finish(result)?;
+    tracing::warn!(
+        bay = format_args!("0x{bay:04x}"),
+        %serial,
+        "cleared a stranded medium-removal lock under the device lock and unloaded"
+    );
+    Ok(UnloadOutcome::ClearedStrandedPrevent)
+}
+
+/// Whether an unload had to clear a medium-removal lock left by a writer that died holding it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnloadOutcome {
+    Unloaded,
+    ClearedStrandedPrevent,
+}
+
+/// A daemon drive unload failure: the plain UNLOAD's own error keeps its type so callers can
+/// tell an inventory refusal from a transport failure.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum DriveUnloadError {
+    #[error("drive UNLOAD failed: {0}")]
+    Drive(remanence_library::DriveOpError),
+    #[error("{0}")]
+    Recovery(MountError),
+}
+
+/// The daemon has already reserved this bay; the serial flock additionally
+/// excludes external processes. Return its guard for the caller's changer MOVE.
+pub(crate) fn unload_drive(
+    drive: &mut DriveHandle,
+    lock_root: &Path,
+) -> Result<Option<UnloadRecoveryGuard>, DriveUnloadError> {
+    match drive.unload() {
+        Ok(()) => return Ok(None),
+        Err(error) if error.is_medium_removal_prevented() => {}
+        Err(error) => return Err(DriveUnloadError::Drive(error)),
+    }
+    let serial = drive.drive().serial.clone();
+    let guard =
+        UnloadRecoveryGuard::acquire(drive, None, lock_root).map_err(DriveUnloadError::Recovery)?;
+    guard
+        .finish(drive.unload_recovering_removal().map_err(refusal))
+        .map_err(DriveUnloadError::Recovery)?;
+    tracing::warn!(
+        %serial,
+        "cleared a stranded medium-removal lock under the device lock and unloaded"
+    );
+    Ok(Some(guard))
 }
 
 /// Standalone invocation state. A second mount cannot consume another cartridge.
@@ -459,7 +628,7 @@ impl<'a> OperatorMount<'a> {
             &mut move |_, logical| {
                 Ok(root.join(
                     logical
-                        .strip_prefix("/run/lock/rem")
+                        .strip_prefix(DEVICE_LOCK_ROOT)
                         .expect("device lock namespace"),
                 ))
             },
@@ -1058,3 +1227,6 @@ impl OperatorMount<'_> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod unload_tests;

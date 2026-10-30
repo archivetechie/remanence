@@ -50,6 +50,21 @@ pub(crate) enum RoboticsAction {
     },
 }
 
+/// Carry recovery exclusion from the drive actor through the caller's changer MOVE.
+#[derive(Debug)]
+pub(crate) struct DriveUnloadOutcome {
+    pub(crate) elapsed: StdDuration,
+    pub(crate) recovery_guard: Option<crate::mount_support::UnloadRecoveryGuard>,
+}
+impl From<StdDuration> for DriveUnloadOutcome {
+    fn from(elapsed: StdDuration) -> Self {
+        Self {
+            elapsed,
+            recovery_guard: None,
+        }
+    }
+}
+
 pub(crate) enum ChangerCommand {
     PlanningMove {
         src: u16,
@@ -60,6 +75,8 @@ pub(crate) enum ChangerCommand {
     Move {
         src: u16,
         dst: u16,
+        // Owned by the queued command/actor even if the requester disappears.
+        recovery_guard: Option<crate::mount_support::UnloadRecoveryGuard>,
         reply: oneshot::Sender<Result<(), Status>>,
     },
     Reconcile {
@@ -181,7 +198,7 @@ pub(crate) enum DriveCommand {
         reply: oneshot::Sender<Result<(), Status>>,
     },
     Unload {
-        reply: oneshot::Sender<Result<StdDuration, Status>>,
+        reply: oneshot::Sender<Result<DriveUnloadOutcome, Status>>,
     },
     PollHealth {
         drive_uuid: Vec<u8>,

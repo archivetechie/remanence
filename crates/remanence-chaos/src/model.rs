@@ -355,9 +355,11 @@ pub struct VirtualWorld {
     pub element_layout: ElementLayout,
 }
 
-/// Per-drive cleaning simulation state.
+/// Per-drive mechanical, removal-lock and cleaning simulation state.
 #[derive(Clone, Debug, Default)]
 pub struct VirtualDriveState {
+    /// This model's single initiator PREVENT survives transport close/reopen.
+    pub removal_prevented: bool,
     /// After how many drive ops the drive becomes dirty.
     pub dirty_after_ops: Option<u64>,
     /// Number of drive ops since the last clean-cycle reset.
@@ -1362,6 +1364,9 @@ impl ModelTransport {
         } else {
             let mut world = self.world.lock().expect("virtual world lock");
             let bay = self.drive_bay()?;
+            if world.drive_states.entry(bay).or_default().removal_prevented {
+                return Err(check_condition(fixed_sense(0x05, 0x53, 0x02, None, 0), 0));
+            }
             if world.loaded_barcode(bay).is_some() {
                 let state = world.drive_states.entry(bay).or_default();
                 if state.unload_leaves_unthreaded {
@@ -1570,6 +1575,21 @@ impl SgTransport for ModelTransport {
             Some(0x1b) => {
                 self.load_unload(cdb)?;
                 self.position_known();
+                Ok(())
+            }
+            Some(0x1e) => {
+                let bay = self.drive_bay()?;
+                let prevent = cdb
+                    .get(4)
+                    .copied()
+                    .ok_or(ScsiError::InvalidInput("short PREVENT/ALLOW CDB"))?;
+                self.world
+                    .lock()
+                    .expect("virtual world lock")
+                    .drive_states
+                    .entry(bay)
+                    .or_default()
+                    .removal_prevented = prevent & 1 != 0;
                 Ok(())
             }
             Some(0x2b | 0x92) => {

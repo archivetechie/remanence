@@ -389,6 +389,21 @@ pub enum DriveOpError {
     ScsiError(#[from] remanence_scsi::ScsiError),
 }
 
+impl DriveOpError {
+    /// Only a current MEDIUM REMOVAL PREVENTED refusal authorizes recovery.
+    /// Other CHECK CONDITIONs, deferred sense and transport errors do not.
+    pub fn is_medium_removal_prevented(&self) -> bool {
+        match self {
+            Self::ScsiError(remanence_scsi::ScsiError::CheckCondition { sense, .. }) => {
+                remanence_scsi::sense::decode_sense(sense).is_some_and(|sense| {
+                    !sense.is_deferred() && (sense.key, sense.asc, sense.ascq) == (5, 0x53, 2)
+                })
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Errors from the composed `LibraryHandle::load`. Each variant names
 /// the phase that failed and (in the docstring) the resulting snapshot
 /// state.
@@ -443,6 +458,9 @@ pub enum LoadError {
 /// Errors from the composed `LibraryHandle::unload`.
 #[derive(Debug, Error)]
 pub enum UnloadError {
+    /// Recovery ALLOW failed; neither a retry UNLOAD nor MOVE was dispatched.
+    #[error("drive ALLOW MEDIUM REMOVAL failed: {0}")]
+    DriveAllow(DriveOpError),
     /// Opening the drive for UNLOAD failed. No MOVE attempted.
     /// **Snapshot unchanged**; `is_dirty()` stays `false` (no CDB
     /// reached the device).
@@ -913,6 +931,51 @@ impl<'a> AuditSubject<'a> {
         match self {
             Self::Library(id) | Self::Drive(id) => Some(id),
             Self::Ephemeral => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::DriveOpError;
+
+    /// Recovery must be exact, including current versus deferred sense format.
+    #[test]
+    fn medium_removal_recovery_requires_current_05_53_02() {
+        for response in [0x70, 0x71, 0x72, 0x73] {
+            for (key, asc, ascq) in [(5, 0x53, 2), (6, 0x53, 2), (5, 0x53, 0), (5, 0x20, 2)] {
+                let mut sense = vec![0; 18];
+                sense[0] = response;
+                if response < 0x72 {
+                    sense[2] = key;
+                    sense[12] = asc;
+                    sense[13] = ascq;
+                } else {
+                    sense[1..4].copy_from_slice(&[key, asc, ascq]);
+                }
+                let error = DriveOpError::ScsiError(remanence_scsi::ScsiError::CheckCondition {
+                    sense,
+                    bytes_transferred: 0,
+                });
+                assert_eq!(
+                    error.is_medium_removal_prevented(),
+                    matches!(response, 0x70 | 0x72) && (key, asc, ascq) == (5, 0x53, 2)
+                );
+            }
+        }
+        for sense in [
+            vec![],
+            vec![0x70, 0, 5],
+            vec![0x72, 5, 0x53],
+            vec![0x7f, 5, 0x53, 2],
+        ] {
+            assert!(
+                !DriveOpError::ScsiError(remanence_scsi::ScsiError::CheckCondition {
+                    sense,
+                    bytes_transferred: 0
+                })
+                .is_medium_removal_prevented()
+            );
         }
     }
 }

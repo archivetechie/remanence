@@ -404,9 +404,15 @@ pub(crate) fn run_cleaning_sequence(
         drive_uuid,
         "moving-back",
         || {
-            library
-                .unload(drive_bay, Some(slot_address), &cfg.policy)
-                .map_err(|err| format!("unload cleaning cartridge: {err}"))?;
+            crate::mount_support::unload_library_bay(
+                library,
+                drive_bay,
+                Some(slot_address),
+                &cfg.policy,
+                None,
+                std::path::Path::new(crate::mount_support::DEVICE_LOCK_ROOT),
+            )
+            .map_err(|err| format!("unload cleaning cartridge: {err}"))?;
             Ok(())
         },
     )?;

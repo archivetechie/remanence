@@ -172,9 +172,16 @@ pub(crate) fn handle_robotics(
             bay,
             wait_ready,
         } => run_load_sequence(index, cfg, handle, &mut library, *slot, *bay, *wait_ready),
-        RoboticsAction::Unload { bay, destination } => library
-            .unload(*bay, *destination, &cfg.policy)
-            .map_err(|err| err.to_string()),
+        RoboticsAction::Unload { bay, destination } => crate::mount_support::unload_library_bay(
+            &mut library,
+            *bay,
+            *destination,
+            &cfg.policy,
+            None,
+            std::path::Path::new(crate::mount_support::DEVICE_LOCK_ROOT),
+        )
+        .map(|_| ())
+        .map_err(|err| err.to_string()),
         RoboticsAction::Clean {
             drive_uuid,
             trigger,

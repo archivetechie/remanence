@@ -6142,6 +6142,7 @@ async fn changer_move_succeeds_and_publishes_snapshot_when_catalog_observation_f
         .send(ChangerCommand::Move {
             src: 0x0400,
             dst: 0x0100,
+            recovery_guard: None,
             reply: reply_tx,
         })
         .await

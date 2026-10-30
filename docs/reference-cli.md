@@ -720,10 +720,26 @@ Robotics (direct SCSI against the changer; all require `--allow <SERIAL>`):
 |---|---|
 | `rem-debug move --src <ADDR> --dst <ADDR> <SERIAL>` | MOVE MEDIUM between two element addresses. |
 | `rem-debug load --slot <SLOT> --bay <BAY> <SERIAL>` | Composed changer MOVE MEDIUM + drive SSC LOAD. |
-| `rem-debug unload --bay <BAY> [--dest <SLOT>] <SERIAL>` | Composed SSC UNLOAD + MOVE MEDIUM back to the recorded source slot (or `--dest`). |
+| `rem-debug unload --bay <BAY> [--dest <SLOT>] [--config <PATH>] <SERIAL>` | SSC UNLOAD + MOVE MEDIUM back to the recorded source slot (or `--dest`), with locked recovery for a stranded medium-removal prevent. |
 | `rem-debug export --slot <SLOT> <SERIAL>` / `import --slot <SLOT> <SERIAL>` | Move a cartridge to the first free IE port, or in from the first occupied one. |
 | `rem-debug rescan <SERIAL>` | INITIALIZE ELEMENT STATUS, then reconcile the snapshot. Shape mismatch is a hard error. |
 | `rem-debug lock <SERIAL>` / `unlock <SERIAL>` | PREVENT/ALLOW MEDIUM REMOVAL on the changer. The lock is held by the changer itself and survives process exit. |
+
+Unload first tries SSC UNLOAD without taking new locks or reading config. Only
+ILLEGAL REQUEST / 05/53/02 (MEDIUM REMOVAL PREVENTED) triggers recovery: take the
+VPD-serial device lock `/run/lock/rem/<drive-serial>.lock` without waiting, issue
+ALLOW MEDIUM REMOVAL (audited as `AllowRemoval`), retry UNLOAD, then MOVE. The lock
+stays held through MOVE. A busy lock refuses recovery without ALLOW; a failed
+ALLOW stops before the retry or MOVE. Other UNLOAD errors do not trigger recovery.
+
+Without `--config`, the device lock is the recovery exclusion; no config file,
+including `/etc/rem/config.toml`, is read. If `--config <PATH>` is explicitly
+supplied, recovery also acquires that config's state-directory lock without
+waiting and records recovery in its audit log. It takes only the bare state lock:
+it does not open/migrate the catalog or reconcile reset fences, so a catalog-reset
+fence does not block cartridge recovery. Normal unloads do not acquire this state
+lock even when `--config` is supplied. `rem-debug unlock` addresses the changer,
+so it does not clear a drive's PREVENT.
 
 Direct tape data path (bypasses the daemon; uses config for catalog and
 journals):

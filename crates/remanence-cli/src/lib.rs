@@ -437,6 +437,9 @@ enum RemCommand {
         /// Destination slot.
         #[arg(long, value_parser = parse_element_addr)]
         dest: Option<u16>,
+        /// Optionally require the state-directory lock when recovering a prevented unload.
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
     },
 
     /// Export a cartridge from a slot to the first available IE port.
@@ -669,7 +672,17 @@ impl From<RemCommand> for Command {
             },
             RemCommand::Move { serial, src, dst } => Self::Move { serial, src, dst },
             RemCommand::Load { serial, slot, bay } => Self::Load { serial, slot, bay },
-            RemCommand::Unload { serial, bay, dest } => Self::Unload { serial, bay, dest },
+            RemCommand::Unload {
+                serial,
+                bay,
+                dest,
+                config,
+            } => Self::Unload {
+                serial,
+                bay,
+                dest,
+                config,
+            },
             RemCommand::Export { serial, slot } => Self::Export { serial, slot },
             RemCommand::Import { serial, slot } => Self::Import { serial, slot },
             RemCommand::Rescan { serial } => Self::Rescan { serial },
@@ -1007,6 +1020,9 @@ enum Command {
         /// from) — pass this flag to override.
         #[arg(long, value_parser = parse_element_addr)]
         dest: Option<u16>,
+        /// Optionally require the state-directory lock when recovering a prevented unload.
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
     },
 
     /// Export a cartridge from a slot to the first available IE port.
@@ -4575,7 +4591,12 @@ where
                 },
             );
         }
-        Command::Unload { serial, bay, dest } => {
+        Command::Unload {
+            serial,
+            bay,
+            dest,
+            config,
+        } => {
             return run_state_change(
                 &report,
                 &serial,
@@ -4584,16 +4605,28 @@ where
                 out,
                 err,
                 |handle, policy| {
-                    handle
-                        .unload(bay, dest, policy)
-                        .map(|()| {
-                            let where_to = match dest {
-                                Some(d) => format!("→ slot 0x{d:04x}"),
-                                None => "→ recorded source slot".to_string(),
-                            };
-                            format!("unloaded bay 0x{bay:04x} {where_to}")
-                        })
-                        .map_err(|e| e.to_string())
+                    remanence_api::mount_support::unload_library_bay(
+                        handle,
+                        bay,
+                        dest,
+                        policy,
+                        config.as_deref(),
+                        Path::new(remanence_api::mount_support::DEVICE_LOCK_ROOT),
+                    )
+                    .map(|outcome| {
+                        let where_to = match dest {
+                            Some(d) => format!("→ slot 0x{d:04x}"),
+                            None => "→ recorded source slot".to_string(),
+                        };
+                        let recovered = match outcome {
+                            remanence_api::mount_support::UnloadOutcome::Unloaded => "",
+                            remanence_api::mount_support::UnloadOutcome::ClearedStrandedPrevent => {
+                                " (cleared a stranded medium-removal lock first)"
+                            }
+                        };
+                        format!("unloaded bay 0x{bay:04x} {where_to}{recovered}")
+                    })
+                    .map_err(|e| e.to_string())
                 },
             );
         }
@@ -21430,6 +21463,96 @@ tape_catalog_dir = "{0}/cache/tapes"
             timestamp: Some("2026-01-01T00:00:00Z".to_string()),
             chunk_size: 4096,
         }
+    }
+
+    /// Harness callers omit config; explicit config remains opt-in for recovery.
+    #[test]
+    fn unload_config_is_optional_and_explicit() {
+        for config in [None, Some("/missing/explicit-config.toml")] {
+            let mut args = vec![
+                "rem-debug",
+                "unload",
+                "--allow",
+                "UNLOAD-LIB",
+                "UNLOAD-LIB",
+                "--bay",
+                "256",
+            ];
+            if let Some(path) = config {
+                args.extend(["--config", path]);
+            }
+            let cli = DebugCli::try_parse_from(args).unwrap();
+            let Command::Unload { config: parsed, .. } = cli.command else {
+                panic!("unload command")
+            };
+            assert_eq!(parsed.as_deref(), config.map(Path::new));
+        }
+    }
+
+    /// Exercise the exact harness CLI route using only the injected model transport.
+    #[test]
+    fn plain_debug_unload_without_config_uses_no_allow() {
+        use remanence_chaos::model::{ModelTransport, VirtualTape, VirtualWorld};
+        use std::sync::Mutex;
+        let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
+            "UNLOAD-LIB",
+            256,
+            "UNLOAD-DRIVE",
+            1024,
+            1,
+        )));
+        let library = {
+            let mut world = world.lock().unwrap();
+            world.put_tape_in_drive(256, "TAPE", Some(1024), VirtualTape::default());
+            world.library_snapshot()
+        };
+        let factory_world = world.clone();
+        TEST_CLI_TRANSPORT_FACTORY.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(move |path| {
+                let role = factory_world.lock().unwrap().role_for_path(path).unwrap();
+                Ok(Box::new(ModelTransport::new(factory_world.clone(), role)))
+            }));
+        });
+        let cli = DebugCli::try_parse_from([
+            "rem-debug",
+            "unload",
+            "--allow",
+            "UNLOAD-LIB",
+            "--bay",
+            "256",
+            "--dest",
+            "1024",
+            "UNLOAD-LIB",
+        ])
+        .unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_debug(
+            cli,
+            || {
+                Ok(DiscoveryReport {
+                    libraries: vec![library],
+                    unattached_drives: vec![],
+                    complete: true,
+                    incomplete_evidence: vec![],
+                    warnings: vec![],
+                })
+            },
+            &mut out,
+            &mut err,
+        );
+        TEST_CLI_TRANSPORT_FACTORY.with(|slot| assert!(slot.borrow_mut().take().is_none()));
+        assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
+        let controls: Vec<_> = world
+            .lock()
+            .unwrap()
+            .command_log
+            .iter()
+            .map(|c| c.opcode)
+            .filter(|opcode| matches!(opcode, 0x1e | 0x1b | 0xa5))
+            .collect();
+        assert_eq!(controls, [0x1b, 0xa5]);
     }
 
     fn write_retire_test_config(root: &Path) -> PathBuf {
