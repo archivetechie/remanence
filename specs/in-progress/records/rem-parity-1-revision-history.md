@@ -57,6 +57,18 @@ the published revision 1.0.0-draft.2 (2026-09-06, SHA-256
 `1e4ad796bd77291f731d8d2611231984ba778f3650c1597f80eebdc7ba359fd2`), which is
 an errata revision of draft.1.
 
+- **2026-10-30 — 1.0.0-draft.5 — draft milestone (vectors).**
+  `resume-open` becomes informative and pins one conforming result; a resumed
+  Writer can end or continue the open epoch under Section 11.4 (W4) and the
+  last paragraph of Section 11.6. `resume-closed` stays pinned. The inputs and
+  expected results stay fixed. E9, `short-epoch-followed-by-another`, adds two
+  short epochs with separate sidecars and a finalized terminal suffix, and pins each sidecar's
+  coverage and recovery of both Objects. E9 is added after the blind comparison
+  and checked against the second implementation without a blind decision;
+  TT-2 records its evidence without changing freeze criterion 2. Both
+  implementations exercise the cases, and the draft vector archive is rebuilt.
+  No normative rule or existing vector outcome changes apart from `resume-open`'s classification.
+
 - **2026-10-30 — 1.0.0-draft.5 — draft milestone (companion records).**
   Appendices C and D move to informative companion records, with their headings
   kept as pointers. Most of the former Status section leaves that section:

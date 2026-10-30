@@ -70,6 +70,31 @@ class ArchiveTests(unittest.TestCase):
                 with self.subTest(source=source.name, member=name), self.assertRaises(ValueError):
                     builder.check_specification_exclusion({**members, name: data}, specifications)
 
+    def test_writer_check_value_inputs_are_packaged(self):
+        """The extracted regression suite can find its W5 fixture dependency."""
+        paths = {directory: [directory + "/example.json"] for directory in builder.FIXTURE_ROOTS}
+        paths[builder.FIXTURE_ROOTS[2]] = [builder.FIXTURE_ROOTS[2] + "/tape-images/MANIFEST.tsv"]
+        paths[builder.FIXTURE_ROOTS[3]] = [builder.FIXTURE_ROOTS[3] + "/vectors.json"]
+        sources = [path for values in paths.values() for path in values]
+        sources += ["crates/remanence-aead/testdata/" + name for name in ("xwing-draft10-kat.txt", "xwing-wrap-kat.txt")]
+        sources += ["tools/" + name for name in (*builder.TOOLS, "rem_parity_second_implementation.py",
+                    "test_rem_parity_second_implementation.py", "draft_vector_archive_README.md", "draft_vector_archive_verify.py")]
+        for name in sources:
+            path = self.source / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"fixture dependency")
+        (self.source / paths[builder.FIXTURE_ROOTS[2]][0]).write_text("image\ttape_file\n")
+        archive = self.source / "specs/publication/remanence-test-vectors.tar"
+        archive.parent.mkdir(parents=True)
+        with tarfile.open(archive, "w") as tar:
+            info = tarfile.TarInfo("rem-object/vectors.json")
+            info.size = 2
+            tar.addfile(info, io.BytesIO(b"{}"))
+        with mock.patch.object(builder, "tracked_files", side_effect=lambda root, directory: paths[directory]):
+            members = builder.source_members(self.source, self.root / "images")
+        self.assertEqual(members["fixtures/rem-writer-check-value/vectors.json"], b"fixture dependency")
+        self.assertIn("fixtures/rem-writer-check-value/*", members["CLAIMS_TO_ARTIFACTS.tsv"].decode())
+
     def test_unsafe_names(self):
         for name in ("/absolute", "../escape", "a/../b", "a//b", "./a", "C:/a", "a\\b"):
             with self.subTest(name=name), self.assertRaises(ValueError):

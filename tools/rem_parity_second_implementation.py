@@ -2015,7 +2015,7 @@ def compare_streaming(inputs: Mapping[str, Any], manifest_rows: list[dict[str, s
 # The build command.
 # ---------------------------------------------------------------------------
 
-IMAGE_NAMES = ["a4-minimal", "short-epoch", "two-epoch", "two-edition", "unfinalized-closed", "unfinalized-open"]
+IMAGE_NAMES = ["a4-minimal", "short-epoch", "two-short-epochs", "two-epoch", "two-edition", "unfinalized-closed", "unfinalized-open"]
 PROFILE_NAMES = ["minimal-256k", "minimal-512k", "minimal-1024k", "multi-256k", "multi-512k", "multi-1024k"]
 
 

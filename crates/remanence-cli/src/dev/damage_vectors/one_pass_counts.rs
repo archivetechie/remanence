@@ -449,7 +449,7 @@ fn one_pass_all_tape_images() {
             success += 1
         }
     }
-    assert_eq!((prefix, success, fallback, direct_walk), (3, 3, 3, 0));
+    assert_eq!((prefix, success, fallback, direct_walk), (4, 4, 3, 0));
     println!("tape images: prefix={prefix}, success={success}, rejected={fallback}, direct_walk={direct_walk}, reasons={reasons:?}");
 }
 

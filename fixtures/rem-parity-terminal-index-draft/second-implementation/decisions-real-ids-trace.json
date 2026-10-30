@@ -6195,6 +6195,142 @@
       }
     ]
   },
+  "short-epoch-followed-by-another": {
+    "fault_notes": [],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 46 (replica ordinal 3)",
+    "directory": "final ParityMap validates",
+    "recoveries": [
+      {
+        "address": [
+          1,
+          0
+        ],
+        "epoch": 0,
+        "result": "recovered",
+        "error": null,
+        "stripe": 0,
+        "lost": null,
+        "limit": null,
+        "bytes_match": null,
+        "index_acquisition": "footer valid; primary copy used",
+        "peers": [
+          "erasure (the failed block)",
+          "implicit",
+          "trusted",
+          "trusted"
+        ]
+      },
+      {
+        "address": [
+          1,
+          1
+        ],
+        "epoch": 0,
+        "result": "recovered",
+        "error": null,
+        "stripe": 1,
+        "lost": null,
+        "limit": null,
+        "bytes_match": null,
+        "index_acquisition": "footer valid; primary copy used",
+        "peers": [
+          "erasure (the failed block)",
+          "implicit",
+          "trusted",
+          "trusted"
+        ]
+      },
+      {
+        "address": [
+          3,
+          0
+        ],
+        "epoch": 1,
+        "result": "recovered",
+        "error": null,
+        "stripe": 0,
+        "lost": null,
+        "limit": null,
+        "bytes_match": null,
+        "index_acquisition": "footer valid; primary copy used",
+        "peers": [
+          "erasure (the failed block)",
+          "implicit",
+          "trusted",
+          "trusted"
+        ]
+      },
+      {
+        "address": [
+          3,
+          1
+        ],
+        "epoch": 1,
+        "result": "recovered",
+        "error": null,
+        "stripe": 1,
+        "lost": null,
+        "limit": null,
+        "bytes_match": null,
+        "index_acquisition": "footer valid; primary copy used",
+        "peers": [
+          "erasure (the failed block)",
+          "implicit",
+          "trusted",
+          "trusted"
+        ]
+      }
+    ],
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": [
+      {
+        "component": "Object tape file 1 block 0 (LBA 2)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data",
+        "address": {
+          "tape_file": 1,
+          "block": 0
+        }
+      },
+      {
+        "component": "Object tape file 1 block 1 (LBA 3)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data",
+        "address": {
+          "tape_file": 1,
+          "block": 1
+        }
+      },
+      {
+        "component": "Object tape file 3 block 0 (LBA 13)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data",
+        "address": {
+          "tape_file": 3,
+          "block": 0
+        }
+      },
+      {
+        "component": "Object tape file 3 block 1 (LBA 14)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data",
+        "address": {
+          "tape_file": 3,
+          "block": 1
+        }
+      }
+    ]
+  },
   "short-epoch-recoverable": {
     "fault_notes": [],
     "bootstrap_attempts": [

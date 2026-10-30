@@ -102,6 +102,66 @@
       "detail": "reproduced"
     },
     {
+      "artifact": "two-short-epochs tape file 0",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-short-epochs tape file 1",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-short-epochs tape file 2",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-short-epochs tape file 3",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-short-epochs tape file 4",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-short-epochs tape file 5",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-short-epochs tape file 6",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-short-epochs tape file 7",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-short-epochs tape file 8",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-short-epochs tape file 9",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-short-epochs tape file 10",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-short-epochs tape file ALL",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
       "artifact": "two-epoch tape file 0",
       "result": "reproduced",
       "detail": "reproduced"
@@ -732,6 +792,6 @@
       "detail": "reproduced"
     }
   ],
-  "reproduced": 146,
+  "reproduced": 158,
   "mismatched": 0
 }

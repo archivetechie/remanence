@@ -40,6 +40,14 @@ that step.
    Section 17 describes. Publication promotion remains gated by TT-5 and the
    other freeze criteria. The items below record what is decided and what
    remains open:
+   - The damage matrix has 72 cases: 71 have blind decisions, of which 69
+     are pinned. E9, `short-epoch-followed-by-another`, is also pinned; it is
+     added later and checked against the second implementation without a
+     blind decision. Its independent byte rederivation and Reader checks
+     supply no blind-decision evidence. Criterion 2 still requires every
+     pinned-at-generation value to be independently re-derived before freeze;
+     it does not require a blind decision for every case. Its wording and
+     the remaining items here stay unchanged.
    - The second implementation now compares the mutated-block digests of the
      negative vectors (`tape-images/negatives/MANIFEST.tsv`) and decides the
      outcomes that `MUTATIONS.tsv` and `SELECTION.tsv` pin. Of the 387 digest
