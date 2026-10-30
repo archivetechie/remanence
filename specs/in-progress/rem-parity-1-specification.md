@@ -37,6 +37,9 @@ records changes and review milestones. The
 [open-items record](records/rem-parity-1-open-items.md) records the remaining
 freeze work and implementation gaps.
 
+[Versioning and Change Policy](#versioning-and-change-policy) states the
+revision and freeze policy.
+
 ## Versioning and Change Policy
 
 **Comments close on 30 April 2027, and the documents freeze on 31 July 2027**,
@@ -183,6 +186,9 @@ recover up to *m* damaged blocks per stripe — including the case where the
 damaged block is the first block of the very file that describes it.
 
 ## Table of Contents
+
+- [Status of This Document](#status-of-this-document)
+- [Versioning and Change Policy](#versioning-and-change-policy)
 
 1. [Introduction](#1-introduction)
 2. [Conventions and Terminology](#2-conventions-and-terminology)
@@ -3300,8 +3306,9 @@ Objects, sidecars with their Reed–Solomon parity, and ParityMaps, and it
 re-derives the resumed tapes. It decided 71 damage cases (every case except
 E9), every portable resume case and every negative case and variant before
 seeing the expected outcome; one variant was corrected afterwards and not
-decided again. E9 is added later and checked against the second implementation
-without a blind decision. Of the 71 damage cases decided blind, 69 are pinned;
+decided again. E9 was added later and was checked against the second
+implementation without a blind decision. Of the 71 damage cases decided
+blind, 69 are pinned;
 E9 is also pinned. The implementation's records, under
 `second-implementation/`, show no disagreement with the
 expected outcomes except on questions this document leaves open, and list

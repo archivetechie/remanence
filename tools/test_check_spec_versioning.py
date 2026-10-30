@@ -160,7 +160,7 @@ class StructuralRulesTests(unittest.TestCase):
             "publication/rem-object-core-1-specification.md": (21, 52, 120),
             "publication/rem-encrypt-1-specification.md": (0, 40, 37),
             "publication/formats-explained.md": (0, 7, 1),
-            "in-progress/rem-parity-1-specification.md": (25, 128, 444),
+            "in-progress/rem-parity-1-specification.md": (28, 128, 444),
             "in-progress/rem-object-core-1-specification.md": (22, 52, 120),
             "in-progress/rem-encrypt-1-specification.md": (21, 40, 37),
             "publication/rem-parity-1-specification.md": (26, 61, 0),
