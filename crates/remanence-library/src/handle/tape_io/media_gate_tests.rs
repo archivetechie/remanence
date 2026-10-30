@@ -587,6 +587,16 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
             },
         ),
         (
+            "remanence-api/src/engine/drive_adapter/tests.rs",
+            DispatchPolicy::Exact {
+                execute_out: 1,
+                execute_none: 1,
+                why: "cfg(test) mounted actor transport forwarder only; observes audit evidence \
+                      before forwarding to in-memory ModelTransport; production adapter \
+                      dispatches through DriveHandle",
+            },
+        ),
+        (
             "remanence-cli/src/lib.rs",
             DispatchPolicy::Exact {
                 execute_out: 1,

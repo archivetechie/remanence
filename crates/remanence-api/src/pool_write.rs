@@ -71,3 +71,5 @@ fn test_fence_config(root: &std::path::Path) -> crate::write_owner::TerminalWrit
         audit_append_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
     }
 }
+
+pub(crate) use no_parity::requested_copy_identity;

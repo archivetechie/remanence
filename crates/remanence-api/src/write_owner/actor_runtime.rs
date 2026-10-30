@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Instant;
 
 use ciborium::value::Value as CborValue;
@@ -46,8 +46,7 @@ pub(crate) struct WriteOwnerConfig {
     pub audit_fsync: bool,
     pub audit_append_lock: Arc<std::sync::Mutex<()>>,
     pub reservations: Arc<HashMap<crate::drive_pool::DriveKey, AtomicBool>>,
-    pub actor_library_serial: String,
-    pub library_snapshot: Arc<RwLock<Arc<crate::LibrarySnapshot>>>,
+    pub placement: super::ActorPlacement,
     pub snapshot_miss_alarm: u32,
     pub managed_library_serials: Arc<HashSet<String>>,
     pub cleaning: CleaningConfig,
@@ -75,7 +74,7 @@ pub(crate) fn spawn_changer_actor(
     cfg: WriteOwnerConfig,
 ) -> mpsc::Sender<ChangerCommand> {
     let (tx, rx) = mpsc::channel::<ChangerCommand>(16);
-    let actor_name = format!("rem-changer-actor-{}", cfg.actor_library_serial);
+    let actor_name = format!("rem-changer-actor-{}", cfg.library().serial);
     std::thread::Builder::new()
         .name(actor_name)
         .spawn(move || changer_loop(&mut changer, cfg, rx))
@@ -91,7 +90,7 @@ pub(crate) fn spawn_drive_actor(
     let (tx, rx) = mpsc::channel::<DriveCommand>(16);
     let actor_tx = tx.clone();
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
-    let actor_name = format!("rem-drive-actor-{}-{bay:04x}", cfg.actor_library_serial);
+    let actor_name = format!("rem-drive-actor-{}-{bay:04x}", cfg.library().serial);
     std::thread::Builder::new()
         .name(actor_name)
         .spawn(move || {
@@ -101,6 +100,39 @@ pub(crate) fn spawn_drive_actor(
         })
         .expect("spawn drive actor thread");
     tx
+}
+
+/// Own the physical mount until all actor-local leases and accumulators are gone.
+pub(crate) fn spawn_mounted_actor(
+    mut mounted: crate::MountedTape,
+    cfg: WriteOwnerConfig,
+) -> std::io::Result<(mpsc::Sender<DriveCommand>, std::thread::JoinHandle<()>)> {
+    let (tx, rx) = mpsc::channel(16);
+    let actor_tx = tx.clone();
+    let audit_error = cfg.mounted().expect("mounted config").audit_error.clone();
+    let name = format!("rem-mounted-{}", cfg.endpoint(0).encode());
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
+    let thread = std::thread::Builder::new().name(name).spawn(move || {
+        // Zero is only a dispatch ordinal for the legacy loop. Physical coordinates
+        // always come from ActorPlacement; standalone sessions publish no bay.
+        let finish = tracing::dispatcher::with_default(&dispatch, || {
+            drive_loop(0, &mut mounted.drive, cfg, actor_tx, rx)
+        });
+        let cleanup = mounted
+            .finish()
+            .map_err(|e| Status::unavailable(e.to_string()));
+        if let Some(finish) = finish {
+            let audit = audit_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .map_or(Ok(()), |e| {
+                    Err(Status::internal(format!("drive audit failed: {e}")))
+                });
+            let _ = finish.reply.send(finish.result.and(cleanup).and(audit));
+        }
+    })?;
+    Ok((tx, thread))
 }
 
 pub(super) fn changer_loop(
@@ -115,7 +147,7 @@ pub(super) fn changer_loop(
                 rx,
                 format!("open catalog index: {err}"),
                 cfg.reservations.clone(),
-                cfg.actor_library_serial.clone(),
+                cfg.library().serial.clone(),
             );
             return;
         }
@@ -152,7 +184,7 @@ pub(super) fn changer_loop(
                             err.message(),
                         ),
                     }
-                    publish_library_snapshot(&cfg.library_snapshot, changer.library().clone());
+                    publish_library_snapshot(&cfg.library().snapshot, changer.library().clone());
                 }
                 if result.is_ok() {
                     ownership.moved();
@@ -181,14 +213,14 @@ pub(super) fn changer_loop(
                             err.message(),
                         ),
                     }
-                    publish_library_snapshot(&cfg.library_snapshot, changer.library().clone());
+                    publish_library_snapshot(&cfg.library().snapshot, changer.library().clone());
                 }
                 let _ = reply.send(result);
             }
             ChangerCommand::Reconcile { tape_uuid, handle } => {
                 let _exclusive_guard = ExclusiveGuard::from_reserved_library(
                     cfg.reservations.clone(),
-                    cfg.actor_library_serial.clone(),
+                    cfg.library().serial.clone(),
                 );
                 handle_reconcile(&mut index, &cfg, tape_uuid, handle);
                 refresh_actor_changer(changer, &cfg);
@@ -200,7 +232,7 @@ pub(super) fn changer_loop(
             } => {
                 let _exclusive_guard = ExclusiveGuard::from_reserved_library(
                     cfg.reservations.clone(),
-                    cfg.actor_library_serial.clone(),
+                    cfg.library().serial.clone(),
                 );
                 let outcome = handle_robotics(&mut index, &cfg, &library_serial, action, &handle);
                 finish_robotics_and_release(
@@ -243,7 +275,7 @@ pub(super) fn refresh_actor_changer(changer: &mut ChangerHandle, cfg: &WriteOwne
             }
             Err(err) => tracing::warn!("failed to open catalog for refreshed drive catalog: {err}"),
         }
-        publish_library_snapshot(&cfg.library_snapshot, changer.library().clone());
+        publish_library_snapshot(&cfg.library().snapshot, changer.library().clone());
     }
 }
 
@@ -274,18 +306,23 @@ pub(super) fn drain_failed_changer_commands(
     }
 }
 
+pub(crate) struct MountedFinish {
+    pub reply: oneshot::Sender<Result<(), Status>>,
+    pub result: Result<(), Status>,
+}
+
 pub(super) fn drive_loop(
     bay: u16,
     drive: &mut DriveHandle,
     cfg: WriteOwnerConfig,
     actor_tx: mpsc::Sender<DriveCommand>,
     mut rx: mpsc::Receiver<DriveCommand>,
-) {
+) -> Option<MountedFinish> {
     let mut index = match CatalogIndex::open(cfg.index_path.as_path()) {
         Ok(index) => index,
         Err(err) => {
             drain_failed_drive_commands(rx, format!("open catalog index: {err}"));
-            return;
+            return None;
         }
     };
     if let Some(lifecycle) = &cfg.lifecycle {
@@ -326,6 +363,139 @@ pub(super) fn drive_loop(
             }
         }
         match cmd {
+            DriveCommand::OpenMountedWrite {
+                host_only_recovery,
+                pool_cfg,
+                mut selected,
+                reply,
+            } => {
+                let Some(mounted) = cfg.mounted() else {
+                    let _ = reply.send(Err(Status::failed_precondition(
+                        "mounted command on library actor",
+                    )));
+                    continue;
+                };
+                if selected.tape_uuid != mounted.tape_uuid {
+                    let _ = reply.send(Err(Status::failed_precondition(
+                        "request differs from mounted tape",
+                    )));
+                    continue;
+                }
+                selected.standalone_endpoint = Some(mounted.endpoint.clone());
+                match super::preflight_automatic_terminal_completion(
+                    &mut index,
+                    super::ManualFinalizePreflightConfig {
+                        checkpoint_journal_dir: &cfg.checkpoint_journal_dir,
+                        audit_dir: &cfg.audit_dir,
+                        audit_fsync: cfg.audit_fsync,
+                        audit_append_lock: &cfg.audit_append_lock,
+                    },
+                    &selected,
+                    &pool_cfg,
+                ) {
+                    Ok(false) if !host_only_recovery => {}
+                    Ok(completed) => {
+                        let detail = if completed {
+                            "terminal finalization completed during host-only open recovery; tape cannot accept Objects"
+                        } else {
+                            "terminal recovery authority changed; refusing Object admission without media access"
+                        };
+                        let _ = reply.send(Err(super::ActorFailure::attach(
+                            Status::failed_precondition(detail),
+                            crate::PoolWriteError::TerminalCloseRequired {
+                                detail: detail.into(),
+                            },
+                        )));
+                        continue;
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                        continue;
+                    }
+                }
+                let before = drive.media_write_dispatch_count();
+                let finish = handle_drive_open_write(
+                    bay,
+                    &mut index,
+                    &cfg,
+                    actor_tx.clone(),
+                    &mut rx,
+                    drive,
+                    &mut snapshot_misses,
+                    OpenWriteActorRequest {
+                        actor: mounted.actor.clone(),
+                        pool_cfg,
+                        selected,
+                        target_kind:
+                            pb::write_session::TargetKind::WriteSessionTargetKindPinnedTape,
+                        needs_drive_load: false,
+                        library_serial: None,
+                        barcode: mounted.barcode.clone(),
+                        source_slot: None,
+                        drive_uuid: None,
+                        drive_serial: match &mounted.endpoint {
+                            remanence_library::DriveKey::Standalone { drive_serial } => {
+                                Some(drive_serial.clone())
+                            }
+                            _ => None,
+                        },
+                        reply,
+                    },
+                    &mut retained,
+                );
+                let audit = super::mounted_commands::settle_audit(&mut index, &cfg, drive, before);
+                if let Some(mut finish) = finish {
+                    let closed = super::mounted_commands::close_epoch(
+                        &mut index,
+                        &cfg,
+                        drive,
+                        bay,
+                        &mut retained,
+                    );
+                    finish.result = finish.result.and(audit).and(closed);
+                    rx.close();
+                    drain_failed_drive_commands(rx, "mounted actor finished".into());
+                    return Some(finish);
+                }
+                if let Err(error) = audit {
+                    *cfg.mounted()
+                        .expect("mounted session")
+                        .audit_error
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(error.to_string());
+                    tracing::error!(%error, "mounted session audit settlement failed");
+                }
+            }
+            DriveCommand::FinishMountedInvocation { reply } => {
+                if cfg.mounted().is_none() {
+                    let _ = reply.send(Err(Status::failed_precondition(
+                        "mounted command on library actor",
+                    )));
+                    continue;
+                }
+                let result = super::mounted_commands::close_epoch(
+                    &mut index,
+                    &cfg,
+                    drive,
+                    bay,
+                    &mut retained,
+                );
+                rx.close();
+                drain_failed_drive_commands(rx, "mounted actor finished".into());
+                return Some(MountedFinish { reply, result });
+            }
+            DriveCommand::FinalizeMounted { request, reply } => {
+                let result = super::mounted_commands::finalize(&mut index, &cfg, drive, request);
+                if result.is_ok() {
+                    retained = None;
+                }
+                let _ = reply.send(result);
+            }
+            DriveCommand::SupersedeMounted { request, reply } => {
+                let result = super::mounted_commands::supersede(&mut index, &cfg, drive, request);
+                retained = None;
+                let _ = reply.send(result);
+            }
             DriveCommand::WaitReady {
                 operation_id,
                 family,
@@ -359,29 +529,31 @@ pub(super) fn drive_loop(
                 drive_uuid,
                 drive_serial,
                 reply,
-            } => handle_drive_open_write(
-                bay,
-                &mut index,
-                &cfg,
-                actor_tx.clone(),
-                &mut rx,
-                drive,
-                &mut snapshot_misses,
-                OpenWriteActorRequest {
-                    actor,
-                    pool_cfg,
-                    selected,
-                    target_kind,
-                    needs_drive_load,
-                    library_serial,
-                    barcode,
-                    source_slot,
-                    drive_uuid,
-                    drive_serial,
-                    reply,
-                },
-                &mut retained,
-            ),
+            } => {
+                let _ = handle_drive_open_write(
+                    bay,
+                    &mut index,
+                    &cfg,
+                    actor_tx.clone(),
+                    &mut rx,
+                    drive,
+                    &mut snapshot_misses,
+                    OpenWriteActorRequest {
+                        actor,
+                        pool_cfg,
+                        selected,
+                        target_kind,
+                        needs_drive_load,
+                        library_serial: Some(library_serial),
+                        barcode,
+                        source_slot,
+                        drive_uuid,
+                        drive_serial,
+                        reply,
+                    },
+                    &mut retained,
+                );
+            }
             DriveCommand::OpenRead {
                 tape_uuid,
                 needs_drive_load,
@@ -603,7 +775,7 @@ pub(super) fn drive_loop(
                     super::SessionOpenReadinessContext {
                         action: "plan terminal finalization",
                         bay,
-                        library_serial: &cfg.actor_library_serial,
+                        library_serial: &cfg.library().serial,
                         barcode: barcode.as_deref(),
                         source_slot,
                         drive_serial: drive_serial.as_deref(),
@@ -659,7 +831,7 @@ pub(super) fn drive_loop(
                     });
                 if let Some(library) = drive.observed_library() {
                     let _ = observe_refreshed_library(&mut index, &cfg, &library);
-                    publish_library_snapshot(&cfg.library_snapshot, library);
+                    publish_library_snapshot(&cfg.library().snapshot, library);
                 }
                 let _ = reply.send(result);
             }
@@ -720,11 +892,25 @@ pub(super) fn drive_loop(
             }
         }
     }
+    None
 }
 
 pub(super) fn drain_failed_drive_commands(mut rx: mpsc::Receiver<DriveCommand>, message: String) {
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
+            DriveCommand::FinishMountedInvocation { reply } => {
+                let _ = reply.send(Err(Status::internal(message.clone())));
+                break;
+            }
+            DriveCommand::OpenMountedWrite { reply, .. } => {
+                let _ = reply.send(Err(Status::internal(message.clone())));
+            }
+            DriveCommand::FinalizeMounted { reply, .. } => {
+                let _ = reply.send(Err(Status::internal(message.clone())));
+            }
+            DriveCommand::SupersedeMounted { reply, .. } => {
+                let _ = reply.send(Err(Status::internal(message.clone())));
+            }
             DriveCommand::WaitReady {
                 handle,
                 reservation,
@@ -807,7 +993,7 @@ pub(super) struct OpenWriteActorRequest {
     pub(super) selected: SelectedTape,
     pub(super) target_kind: pb::write_session::TargetKind,
     pub(super) needs_drive_load: bool,
-    pub(super) library_serial: String,
+    pub(super) library_serial: Option<String>,
     pub(super) barcode: Option<String>,
     pub(super) source_slot: Option<u16>,
     pub(super) drive_uuid: Option<Vec<u8>>,
@@ -845,7 +1031,7 @@ pub(super) struct SessionAuditInput {
 pub(super) fn record_session_event(
     index: &mut CatalogIndex,
     cfg: &WriteOwnerConfig,
-    input: SessionAuditInput,
+    mut input: SessionAuditInput,
 ) -> Result<(), Status> {
     let _guard = cfg
         .audit_append_lock
@@ -858,6 +1044,23 @@ pub(super) fn record_session_event(
         ))
     })?;
     let mut detail = BTreeMap::new();
+    if let Some(mounted) = cfg.mounted() {
+        input.library_serial = None;
+        input.drive_bay = None;
+        input.drive_uuid = None;
+        if let remanence_library::DriveKey::Bay {
+            library_serial,
+            bay,
+        } = &mounted.endpoint
+        {
+            input.library_serial = Some(library_serial.clone());
+            input.drive_bay = Some(*bay);
+        }
+        detail.insert(
+            "endpoint_key".into(),
+            CborValue::Text(mounted.endpoint.encode()),
+        );
+    }
     detail.insert(
         "session_kind".to_string(),
         CborValue::Text(input.session_kind.to_string()),
@@ -889,11 +1092,16 @@ pub(super) fn record_session_event(
     if let Some(abort_reason) = input.abort_reason {
         detail.insert("abort_reason".to_string(), CborValue::Text(abort_reason));
     }
-    let mut audit = FileAuditLog::open(cfg.audit_dir.as_path(), cfg.audit_fsync)
-        .map_err(crate::status_from_state_error)?;
+    let mut audit = FileAuditLog::open(
+        cfg.audit_dir.as_path(),
+        cfg.audit_fsync || cfg.mounted().is_some(),
+    )
+    .map_err(crate::status_from_state_error)?;
     let (_, record) = audit
         .append_and_return_record(AuditEventRecord {
-            actor: AuditActor::System,
+            actor: cfg
+                .mounted()
+                .map_or(AuditActor::System, |m| m.actor.clone()),
             source_layer: SourceLayer::Layer5,
             operation_id: None,
             session_id: Some(input.session_id),
@@ -906,6 +1114,16 @@ pub(super) fn record_session_event(
             detail,
         })
         .map_err(crate::status_from_state_error)?;
+    if let Some(mounted) = cfg.mounted() {
+        *mounted
+            .audit_session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = if record.event == AuditEvent::SessionOpened {
+            Some(input.session_id)
+        } else {
+            None
+        };
+    }
     index
         .project_audit_record(&record)
         .map_err(crate::status_from_state_error)

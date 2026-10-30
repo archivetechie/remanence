@@ -25,7 +25,8 @@ const STARTUP_INITIALIZING_LOAD_TIMEOUT: Duration = Duration::from_secs(60);
 /// Steady poll interval of that startup poll, after the shared fast ramp.
 const STARTUP_INITIALIZING_LOAD_POLL: Duration = Duration::from_secs(5);
 
-pub(crate) fn status_from_state_error(err: StateError) -> Status {
+pub(crate) fn status_from_state_error(err: impl std::borrow::Borrow<StateError>) -> Status {
+    let err = err.borrow();
     match err {
         StateError::ConfigInvalid(_) => Status::invalid_argument(err.to_string()),
         StateError::IdempotencyConflict(_) => Status::already_exists(err.to_string()),

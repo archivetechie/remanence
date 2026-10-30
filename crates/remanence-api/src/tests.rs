@@ -6907,8 +6907,12 @@ async fn drive_target_read_open_uses_virtual_world_actor_and_proves_bot_identity
         audit_fsync: false,
         audit_append_lock: Arc::clone(&state.audit_append_lock),
         reservations: Arc::clone(&reservations),
-        actor_library_serial: LIBRARY_SERIAL.to_string(),
-        library_snapshot: Arc::clone(&library_snapshot),
+        placement: crate::write_owner::ActorPlacement::Library(
+            crate::write_owner::LibraryActorContext {
+                serial: LIBRARY_SERIAL.to_string(),
+                snapshot: Arc::clone(&library_snapshot),
+            },
+        ),
         snapshot_miss_alarm: 1,
         managed_library_serials: Arc::new(HashSet::from([LIBRARY_SERIAL.to_string()])),
         cleaning: remanence_state::CleaningConfig::default(),

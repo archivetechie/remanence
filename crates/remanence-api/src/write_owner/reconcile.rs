@@ -46,7 +46,7 @@ pub(crate) fn handle_reconcile(
         return;
     }
 
-    let library_serial = cfg.actor_library_serial.as_str();
+    let library_serial = cfg.library().serial.as_str();
     let lib = match cfg.report.library(library_serial) {
         Some(lib) => lib,
         None => {

@@ -402,8 +402,12 @@ impl ApiState {
             audit_fsync: config.audit.fsync,
             audit_append_lock: audit_append_lock.clone(),
             reservations: reservations.clone(),
-            actor_library_serial: String::new(),
-            library_snapshot: library_snapshot.clone(),
+            placement: crate::write_owner::ActorPlacement::Library(
+                crate::write_owner::LibraryActorContext {
+                    serial: String::new(),
+                    snapshot: library_snapshot.clone(),
+                },
+            ),
             snapshot_miss_alarm: config.drives.snapshot_miss_alarm,
             managed_library_serials: Arc::new(managed_library_serials),
             cleaning: config.cleaning.clone(),
@@ -424,7 +428,12 @@ impl ApiState {
         let mut changer_txs = HashMap::new();
         for (library_serial, library, opened_drives) in opened_libraries {
             let mut actor_cfg = base_cfg.clone();
-            actor_cfg.actor_library_serial = library_serial.clone();
+            actor_cfg.placement = crate::write_owner::ActorPlacement::Library(
+                crate::write_owner::LibraryActorContext {
+                    serial: library_serial.clone(),
+                    snapshot: library_snapshot.clone(),
+                },
+            );
             for (bay_addr, drive) in opened_drives {
                 let key = crate::drive_pool::DriveKey::new(library_serial.clone(), bay_addr);
                 let tx = crate::write_owner::spawn_drive_actor(bay_addr, drive, actor_cfg.clone());

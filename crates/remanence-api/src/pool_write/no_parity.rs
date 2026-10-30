@@ -824,7 +824,7 @@ pub(super) fn committed_native_object_input_kind(
     })
 }
 
-pub(super) fn requested_copy_identity(
+pub(crate) fn requested_copy_identity(
     representation: &PoolWriteRepresentation,
 ) -> (&'static str, Option<Vec<String>>) {
     match representation {
