@@ -3,8 +3,8 @@
 use crate::{LtoGen, TapeUuid};
 pub use remanence_library::MountEndpoint;
 use remanence_library::{
-    AccessPolicy, DriveHandle, DriveHandleSource, LibraryHandle, MediaFamily, MediaReadiness,
-    MediaReadinessWaitOptions, SgTransport, StaticAllowlist,
+    AccessPolicy, DriveHandle, DriveHandleSource, DriveKey, LibraryHandle, MediaFamily,
+    MediaReadiness, MediaReadinessWaitOptions, SgTransport, StaticAllowlist,
 };
 use remanence_state::{CatalogIndex, GenerationSource, LabelProvenance, StateHandle};
 use std::{
@@ -257,11 +257,7 @@ pub(crate) struct LockedAuditedDevice {
     pub(crate) endpoint: MountEndpoint,
 }
 impl LockedAuditedDevice {
-    fn open(
-        mut drive: DriveHandle,
-        state: &StateHandle,
-        io: &mut LockIo,
-    ) -> Result<Self, MountError> {
+    fn open(drive: DriveHandle, state: &StateHandle, io: &mut LockIo) -> Result<Self, MountError> {
         let lock = match drive.endpoint() {
             MountEndpoint::Durable(remanence_library::DriveKey::Standalone { drive_serial }) => {
                 Some(Arc::new(lock_device(io, drive_serial)?))
@@ -269,6 +265,13 @@ impl LockedAuditedDevice {
             MountEndpoint::Ephemeral { .. } => None,
             _ => return Err(refusal("operator mount requires a standalone endpoint")),
         };
+        Self::with_lock(drive, state, lock)
+    }
+    fn with_lock(
+        mut drive: DriveHandle,
+        state: &StateHandle,
+        lock: Option<Arc<DeviceLock>>,
+    ) -> Result<Self, MountError> {
         let audit_error = Arc::new(Mutex::new(None));
         if drive.endpoint().durable_key().is_some() {
             let pending = Arc::clone(&audit_error);
@@ -441,34 +444,80 @@ impl<'a> OperatorMount<'a> {
         io: &mut LockIo,
     ) -> Result<Self, MountError> {
         let context = LockedAuditedDevice::open(drive, state, io)?;
+        Self::from_context(path, context, state)
+    }
+    /// Adopt an already placed bay without reopening or relabelling the drive.
+    pub(crate) fn from_placed_library(
+        path: &Path,
+        drive: DriveHandle,
+        state: &'a mut StateHandle,
+        drive_serial: &str,
+        lock_root: &Path,
+    ) -> Result<Self, MountError> {
+        let root = lock_root.to_owned();
+        let lock = lock_device(
+            &mut move |_, logical| {
+                Ok(root.join(
+                    logical
+                        .strip_prefix("/run/lock/rem")
+                        .expect("device lock namespace"),
+                ))
+            },
+            drive_serial,
+        )?;
+        let context = LockedAuditedDevice::with_lock(drive, state, Some(Arc::new(lock)))?;
+        Self::from_context(path, context, state)
+    }
+    fn from_context(
+        path: &Path,
+        context: LockedAuditedDevice,
+        state: &'a mut StateHandle,
+    ) -> Result<Self, MountError> {
         if let Some(endpoint) = context.endpoint.durable_key() {
             state.replay_audit_projection().map_err(refusal)?;
-            standalone_fence_policy(state.catalog_index(), None, Some(endpoint), false)?;
-            state
-                .recover_sessions_after_restart(Some(endpoint), |state, session| {
-                    if session.session_kind == "write" {
-                        let tape_uuid = session
-                            .tape_uuid
-                            .as_deref()
-                            .and_then(|b| b.try_into().ok())
-                            .ok_or_else(|| {
-                                remanence_state::StateError::IndexCorrupt(
-                                    "unfinished write has no tape identity".into(),
-                                )
+            if matches!(endpoint, DriveKey::Standalone { .. }) {
+                standalone_fence_policy(state.catalog_index(), None, Some(endpoint), false)?;
+                state
+                    .recover_sessions_after_restart(Some(endpoint), |state, session| {
+                        if session.session_kind == "write" {
+                            let tape_uuid = session
+                                .tape_uuid
+                                .as_deref()
+                                .and_then(|b| b.try_into().ok())
+                                .ok_or_else(|| {
+                                    remanence_state::StateError::IndexCorrupt(
+                                        "unfinished write has no tape identity".into(),
+                                    )
+                                })?;
+                            raise_standalone_fence(
+                                state,
+                                tape_uuid,
+                                session.drive_key.as_ref(),
+                                "standalone_write_lost_by_restart",
+                                "unfinished durable write session requires recovery",
+                            )
+                            .map_err(|e| {
+                                remanence_state::StateError::IndexCorrupt(e.to_string())
                             })?;
-                        raise_standalone_fence(
-                            state,
-                            tape_uuid,
-                            session.drive_key.as_ref(),
-                            "standalone_write_lost_by_restart",
-                            "unfinished durable write session requires recovery",
-                        )
-                        .map_err(|e| remanence_state::StateError::IndexCorrupt(e.to_string()))?;
-                    }
-                    Ok(())
-                })
-                .map_err(refusal)?;
-            standalone_fence_policy(state.catalog_index(), None, Some(endpoint), false)?;
+                        }
+                        Ok(())
+                    })
+                    .map_err(refusal)?;
+                standalone_fence_policy(state.catalog_index(), None, Some(endpoint), false)?;
+            } else if let Some(session) = state
+                .catalog_index()
+                .non_terminal_sessions()
+                .map_err(refusal)?
+                .into_iter()
+                .find(|session| session.drive_key.as_ref() == Some(endpoint))
+            {
+                // Bay sessions belong to daemon recovery. Never orphan them or
+                // raise standalone restart fences from a placed-library caller.
+                return Err(refusal(format!(
+                    "library endpoint {} has open session {}; run daemon recovery before archive write",
+                    endpoint.encode(), session.session_id
+                )));
+            }
         }
         Ok(Self {
             state,
@@ -549,7 +598,10 @@ impl MountBackend for OperatorMount<'_> {
         match result {
             Ok((tape_uuid, label, generation)) => {
                 let proof_generation = drive.identity_generation();
-                if drive.endpoint().durable_key().is_some() {
+                if matches!(
+                    drive.endpoint().durable_key(),
+                    Some(DriveKey::Standalone { .. })
+                ) {
                     let control = self.state.calibration_control().clone();
                     if let Err(error) = crate::calibration::install_standalone_calibration_fence(
                         &mut drive, &control, tape_uuid,
@@ -625,17 +677,30 @@ fn prove_mount(
     drive.prevent_medium_removal().map_err(refusal)?;
     drive.rewind().map_err(refusal)?;
     let config = drive.read_config().map_err(refusal)?;
-    let classification = crate::classify_bot_from_source(&mut DriveHandleSource(drive));
-    let tape_uuid = match classification.classification {
-        crate::BotClassification::OursBootstrap { uuid, .. } => uuid,
-        crate::BotClassification::BlankCheckEod => {
-            return Err(MountError::Blank { path: path.into() })
+    let library_bay = matches!(drive.endpoint().durable_key(), Some(DriveKey::Bay { .. }));
+    let tape_uuid = if library_bay {
+        // The pool caller has already selected an exact UUID. Use the same
+        // identity verifier/error as the direct writer, not standalone BOT classification.
+        expected.ok_or_else(|| refusal("placed library mount requires a selected tape UUID"))?
+    } else {
+        let classification = crate::classify_bot_from_source(&mut DriveHandleSource(drive));
+        match classification.classification {
+            crate::BotClassification::OursBootstrap { uuid, .. } => uuid,
+            crate::BotClassification::BlankCheckEod => {
+                return Err(MountError::Blank { path: path.into() })
+            }
+            other => return Err(refusal(format!("BOT classification refused: {other:?}"))),
         }
-        other => return Err(refusal(format!("BOT classification refused: {other:?}"))),
     };
     if let Some(expected) = expected {
         drive.rewind().map_err(refusal)?;
-        crate::verify_tape_identity(&mut DriveHandleSource(drive), &expected).map_err(refusal)?;
+        crate::verify_tape_identity(&mut DriveHandleSource(drive), &expected).map_err(|error| {
+            if library_bay {
+                MountError::PoolWrite(Box::new(error.into()))
+            } else {
+                refusal(error)
+            }
+        })?;
     }
     let tape = index.get_tape(&tape_uuid).map_err(refusal)?;
     let generation = tape.as_ref().and_then(crate::tape_generation).or_else(|| {

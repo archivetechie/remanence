@@ -40,6 +40,7 @@ const LOAD_READY_TIMEOUT: StdDuration =
 const LOAD_READY_POLL_INTERVAL: StdDuration =
     StdDuration::from_secs(crate::readiness_wait::DEFAULT_READY_POLL_SECONDS as u64);
 
+pub(crate) mod direct_replay_fault;
 mod mounted_commands;
 mod placement;
 pub(crate) use placement::{ActorPlacement, LibraryActorContext, MountedDriveContext};

@@ -7,6 +7,48 @@ per-release summaries.
 <!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_backend.rs crates/remanence-state/src/index.rs crates/remanence-library/src/discovery.rs @ 638210f7 -->
 ## Unreleased
 
+- Pool-selected `rem-debug archive write` now uses the same in-process write
+  actor on its actual library bay. Committed replay still avoids loading tape;
+  locator output and the gated WOR checkpoint crash seam are preserved. The
+  caller also takes the host device lock to coordinate with standalone use of
+  the same drive. It leaves library calibration and restart recovery to the
+  daemon. An open bay session refuses with `library endpoint <key> has open
+  session <id>; run daemon recovery before archive write`, without raising a
+  standalone fence. If automatic work or cleanup fails after an object commits,
+  its locator is printed before the failure diagnostic and exit status 1.
+  Typed write failures retain the direct writer's `PoolWriteError` text,
+  including the `invalid pool write input:` prefix for WOR plan/hook failures.
+  New adapter-only errors use their local diagnostic: device-lock acquisition,
+  bay/retained-library identity, mount readiness, endpoint
+  audit/admission, actor startup/stoppage, and owner cleanup failures have no
+  direct-writer equivalent. In particular a failed ALLOW is now reported as
+  a write failure after the committed locator rather than only being logged.
+  Archive-write diagnostic differences where the actor has no retained typed
+  cause are:
+
+  - Drive preparation adds `reverify drive state:`, `rewind before write verify:`,
+    `tape identity:`, `rewind before write:`, `read drive config before write:`
+    or `verify fixed-block write config:` to the underlying error.
+  - Parity startup/resume adds `open parity tape journal:`, `freeze parity tape
+    journal:`, `locate fresh parity BOT:`, `project fresh parity bootstrap:`,
+    `locate parity checkpoint EOD:` or `restore parity append position:`.
+  - Checkpoint failures name the batch and distinguish barrier, READ POSITION,
+    position-proof mismatch, fsync with proven rollback, uncertain durable
+    authority, and a durable journal awaiting SQLite projection. The actor's
+    retry/reconciliation advice replaces the direct writer's lower-level error;
+    checkpoint ordinal/count/file-number overflow diagnostics also use actor
+    text without the old `invalid pool write input:` prefix.
+  - Automatic terminal recovery reports `read automatic terminal-recovery
+    drive config:`, an operator-owned finalization that must be retried with
+    its original key, a write-protected tape, missing seal authority, successful
+    terminal completion during open, or remaining terminal recovery. Terminal
+    work after a checkpoint uses `read terminal-finalization drive config:`
+    and reports a tape that became write-protected before finalization.
+  - Actor session/admission, retained-epoch close, audit and receipt-projection
+    failures keep their actor diagnostics and recovery evidence. These describe
+    the actor's state and cannot be faithfully converted to a direct-writer
+    error by stripping a prefix. Daemon diagnostics are unchanged.
+
 - Standalone `rem put`, `rem tape finalize` and `rem tape supersede-tail` now
   run the daemon's write actor in process on the operator-mounted drive. Version
   skips, durable receipts and explicit recovery remain available. Init retains

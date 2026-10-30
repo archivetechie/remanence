@@ -65,6 +65,7 @@ mod tests;
 #[cfg(test)]
 fn test_fence_config(root: &std::path::Path) -> crate::write_owner::TerminalWriteConfig {
     crate::write_owner::TerminalWriteConfig {
+        mounted_endpoint: None,
         checkpoint_journal_dir: root.join("checkpoints"),
         audit_dir: root.join("audit"),
         audit_fsync: true,

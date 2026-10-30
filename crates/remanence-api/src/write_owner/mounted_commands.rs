@@ -254,6 +254,7 @@ pub(super) fn finalize(
         if let Some(reply) = super::preflight_manual_finalize_with_prefix(
             index,
             super::ManualFinalizePreflightConfig {
+                mounted_endpoint: Some(&mounted.endpoint),
                 checkpoint_journal_dir: &terminal.checkpoint_journal_dir,
                 audit_dir: &terminal.audit_dir,
                 audit_fsync: terminal.audit_fsync,

@@ -385,6 +385,7 @@ pub(super) fn drive_loop(
                 match super::preflight_automatic_terminal_completion(
                     &mut index,
                     super::ManualFinalizePreflightConfig {
+                        mounted_endpoint: Some(&mounted.endpoint),
                         checkpoint_journal_dir: &cfg.checkpoint_journal_dir,
                         audit_dir: &cfg.audit_dir,
                         audit_fsync: cfg.audit_fsync,
@@ -429,7 +430,12 @@ pub(super) fn drive_loop(
                         target_kind:
                             pb::write_session::TargetKind::WriteSessionTargetKindPinnedTape,
                         needs_drive_load: false,
-                        library_serial: None,
+                        library_serial: match &mounted.endpoint {
+                            remanence_library::DriveKey::Bay { library_serial, .. } => {
+                                Some(library_serial.clone())
+                            }
+                            _ => None,
+                        },
                         barcode: mounted.barcode.clone(),
                         source_slot: None,
                         drive_uuid: None,

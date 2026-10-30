@@ -1324,6 +1324,7 @@ fn frontend_returns_committed_receipt_beside_post_projection_failure() {
             tx: tx.clone(),
             thread,
             state,
+            _library_guard: None,
         }),
         client: MountedCommands::new(tx, UUID, endpoint),
     };
@@ -1465,3 +1466,5 @@ fn standalone_terminal_fence_refusals_keep_quarantine_id_and_release_command() {
         assert!(fixture.reopen().is_ok());
     }
 }
+
+mod library;

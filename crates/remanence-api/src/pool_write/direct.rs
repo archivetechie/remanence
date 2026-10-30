@@ -458,6 +458,7 @@ pub(crate) fn write_to_selected_drive_checkpointed_reconciled(
     selected: SelectedTape,
 ) -> Result<PoolWriteResult, PoolWriteError> {
     let fence_cfg = &crate::write_owner::TerminalWriteConfig {
+        mounted_endpoint: None,
         checkpoint_journal_dir: state.paths().journal_dir.join("checkpoints"),
         audit_dir: state.paths().audit_dir.clone(),
         audit_fsync: true,
@@ -696,12 +697,6 @@ pub(super) fn write_to_selected_tape_checkpointed_after_preflight(
         .append_admission_drive()
         .map(|d| d.media_write_dispatch_count());
     let execution = (|| {
-        let direct_replay_fault =
-            crate::direct_replay_fault::DirectReplayFaultPlan::from_env_for_object(
-                selected.tape_uuid,
-                &request.caller_object_id,
-            )
-            .map_err(PoolWriteError::InvalidInput)?;
         let next_ordinal = prior_records.last().map_or(Ok(1), |record| {
             record.ordinal.checked_add(1).ok_or_else(|| {
                 PoolWriteError::InvalidInput("checkpoint ordinal overflows u64".to_string())
@@ -981,11 +976,6 @@ pub(super) fn write_to_selected_tape_checkpointed_after_preflight(
         if let Err(error) = checkpoint_lease.append(&record) {
             quarantine_direct_admission_on_uncertain_append(&error, write_admission);
             return Err(error.into());
-        }
-        if let Some(fault) = direct_replay_fault.as_ref() {
-            fault
-                .abort_after_checkpoint_append(&record)
-                .map_err(PoolWriteError::InvalidInput)?;
         }
         if let Err(error) = state.project_checkpoint_record(&record) {
             if let Some(admission) = write_admission {

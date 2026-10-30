@@ -312,6 +312,7 @@ async fn open_write_session_reserved(
     let host_completion = crate::write_owner::preflight_automatic_terminal_completion(
         &mut host_index,
         crate::write_owner::ManualFinalizePreflightConfig {
+            mounted_endpoint: None,
             checkpoint_journal_dir: state.checkpoint_journal_dir.as_path(),
             audit_dir: state.audit_dir.as_path(),
             audit_fsync: state.audit_fsync,
@@ -862,6 +863,7 @@ async fn manual_finalize_tape_critical(
     if let Some(reply) = crate::write_owner::preflight_manual_finalize_cancellable(
         &mut index,
         crate::write_owner::ManualFinalizePreflightConfig {
+            mounted_endpoint: None,
             checkpoint_journal_dir: state.checkpoint_journal_dir.as_path(),
             audit_dir: state.audit_dir.as_path(),
             audit_fsync: state.audit_fsync,
@@ -1125,6 +1127,7 @@ async fn manual_finalize_attempt(
     if crate::write_owner::preflight_manual_finalize_tape(
         &mut index,
         crate::write_owner::ManualFinalizePreflightConfig {
+            mounted_endpoint: None,
             checkpoint_journal_dir: state.checkpoint_journal_dir.as_path(),
             audit_dir: state.audit_dir.as_path(),
             audit_fsync: state.audit_fsync,
@@ -1386,6 +1389,7 @@ async fn recover_automatic_terminal_tape(
     if crate::write_owner::preflight_automatic_terminal_completion(
         &mut host_index,
         crate::write_owner::ManualFinalizePreflightConfig {
+            mounted_endpoint: None,
             checkpoint_journal_dir: state.checkpoint_journal_dir.as_path(),
             audit_dir: state.audit_dir.as_path(),
             audit_fsync: state.audit_fsync,
@@ -5270,6 +5274,7 @@ mod tests {
         crate::write_owner::preflight_automatic_terminal_completion(
             &mut projection_failure_index,
             crate::write_owner::ManualFinalizePreflightConfig {
+                mounted_endpoint: None,
                 checkpoint_journal_dir: state.checkpoint_journal_dir.as_path(),
                 audit_dir: state.audit_dir.as_path(),
                 audit_fsync: state.audit_fsync,

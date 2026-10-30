@@ -1783,6 +1783,7 @@ fn zero_dispatch_probe_failure_is_unavailable_and_not_durable() {
     let root = tempfile::tempdir().unwrap();
     let mut state = state(root.path());
     let cfg = crate::write_owner::TerminalWriteConfig {
+        mounted_endpoint: None,
         checkpoint_journal_dir: state.paths().journal_dir.join("checkpoints"),
         audit_dir: state.paths().audit_dir.clone(),
         audit_fsync: true,
@@ -1830,6 +1831,7 @@ fn structural_admission_refusals_project_recovery_with_authenticated_actor() {
         let root = tempfile::tempdir().unwrap();
         let mut state = state(root.path());
         let cfg = crate::write_owner::TerminalWriteConfig {
+            mounted_endpoint: None,
             checkpoint_journal_dir: state.paths().journal_dir.join("checkpoints"),
             audit_dir: state.paths().audit_dir.clone(),
             audit_fsync: true,

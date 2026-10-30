@@ -275,6 +275,7 @@ fn automatic_terminal_preflight_accepts_empty_fresh_authority() {
         !preflight_automatic_terminal_completion(
             &mut index,
             ManualFinalizePreflightConfig {
+                mounted_endpoint: None,
                 checkpoint_journal_dir: &checkpoint_dir,
                 audit_dir: temp.path(),
                 audit_fsync: false,
@@ -1006,6 +1007,7 @@ fn one_transition_ahead_sink_journal_reconciles_before_media_is_available() {
     assert!(preflight_automatic_terminal_completion(
         &mut index,
         ManualFinalizePreflightConfig {
+            mounted_endpoint: None,
             checkpoint_journal_dir: &temp.path().join("checkpoints"),
             audit_dir: temp.path(),
             audit_fsync: false,
@@ -5043,6 +5045,7 @@ async fn manual_finalize_closes_below_low_and_same_key_replay_moves_no_tape() {
     let rejected = preflight_manual_finalize_tape(
         &mut rejected_index,
         ManualFinalizePreflightConfig {
+            mounted_endpoint: None,
             checkpoint_journal_dir: &checkpoint_dir,
             audit_dir: &audit_dir,
             audit_fsync: false,
@@ -5087,6 +5090,7 @@ async fn manual_finalize_closes_below_low_and_same_key_replay_moves_no_tape() {
     let crash_error = preflight_manual_finalize_tape(
         &mut crash_index,
         ManualFinalizePreflightConfig {
+            mounted_endpoint: None,
             checkpoint_journal_dir: &checkpoint_dir,
             audit_dir: &audit_dir,
             audit_fsync: false,
@@ -5127,6 +5131,7 @@ async fn manual_finalize_closes_below_low_and_same_key_replay_moves_no_tape() {
     assert!(preflight_manual_finalize_tape(
         &mut retry_index,
         ManualFinalizePreflightConfig {
+            mounted_endpoint: None,
             checkpoint_journal_dir: &checkpoint_dir,
             audit_dir: &audit_dir,
             audit_fsync: false,
@@ -5216,6 +5221,7 @@ async fn manual_finalize_closes_below_low_and_same_key_replay_moves_no_tape() {
     assert!(preflight_manual_finalize_tape(
         &mut retry_index,
         ManualFinalizePreflightConfig {
+            mounted_endpoint: None,
             checkpoint_journal_dir: &checkpoint_dir,
             audit_dir: &audit_dir,
             audit_fsync: false,
@@ -5250,6 +5256,7 @@ async fn manual_finalize_closes_below_low_and_same_key_replay_moves_no_tape() {
     let changed = preflight_manual_finalize_tape(
         &mut retry_index,
         ManualFinalizePreflightConfig {
+            mounted_endpoint: None,
             checkpoint_journal_dir: &checkpoint_dir,
             audit_dir: &audit_dir,
             audit_fsync: false,
@@ -5407,6 +5414,7 @@ async fn manual_finalize_closes_below_low_and_same_key_replay_moves_no_tape() {
     let repaired = preflight_manual_finalize_tape(
         &mut host_index,
         ManualFinalizePreflightConfig {
+            mounted_endpoint: None,
             checkpoint_journal_dir: &checkpoint_dir,
             audit_dir: &audit_dir,
             audit_fsync: false,
@@ -12528,6 +12536,7 @@ pub(crate) async fn check_seated_parity_sessions(
         super::terminal_finalize::preflight_manual_finalize_with_prefix(
             &mut index,
             ManualFinalizePreflightConfig {
+                mounted_endpoint: None,
                 checkpoint_journal_dir: &cfg.checkpoint_journal_dir,
                 audit_dir: &cfg.audit_dir,
                 audit_fsync: cfg.audit_fsync,
@@ -13722,6 +13731,7 @@ async fn check_epoch_removal(
                     super::terminal_finalize::preflight_manual_finalize_with_prefix(
                         &mut index,
                         ManualFinalizePreflightConfig {
+                            mounted_endpoint: None,
                             checkpoint_journal_dir: &cfg.checkpoint_journal_dir,
                             audit_dir: &cfg.audit_dir,
                             audit_fsync: cfg.audit_fsync,
@@ -13741,6 +13751,7 @@ async fn check_epoch_removal(
                 super::terminal_finalize::preflight_manual_finalize_with_prefix(
                     &mut index,
                     ManualFinalizePreflightConfig {
+                        mounted_endpoint: None,
                         checkpoint_journal_dir: &cfg.checkpoint_journal_dir,
                         audit_dir: &cfg.audit_dir,
                         audit_fsync: cfg.audit_fsync,
@@ -14679,6 +14690,7 @@ fn check_terminal_fence_precedes_recovery_failure(tail: bool) {
         })
         .unwrap();
     let cfg = super::terminal_types::TerminalWriteConfig {
+        mounted_endpoint: None,
         checkpoint_journal_dir: root.path().join("checkpoints"),
         audit_dir: root.path().join("audit"),
         audit_fsync: true,

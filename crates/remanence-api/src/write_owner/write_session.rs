@@ -589,6 +589,16 @@ impl WriteSessionState<'_> {
             representation,
             input_kind,
         };
+        if let Some(fault) = cfg.mounted().and_then(|m| m.direct_replay_fault.as_ref()) {
+            if let Err(error) = fault.require_object(self.tape_uuid, &request.caller_object_id) {
+                request.source.remove_completed_path();
+                let _ = reply.send(Err(status_from_selected_write_error(
+                    &selected,
+                    PoolWriteError::InvalidInput(error),
+                )));
+                return;
+            }
+        }
         let mut write_admission = match cfg.write_admissions.reserve(
             pool_cfg.id.as_str(),
             request.caller_object_id.as_str(),
