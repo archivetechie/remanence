@@ -349,6 +349,42 @@ class ImageComparisonTests(unittest.TestCase):
                 self.assertIn("field sha256", failed[0])
 
 
+class ShortEpochSequenceTests(unittest.TestCase):
+    """Read E9 independently and reconstruct every block in both short epochs."""
+
+    def test_short_epoch_followed_by_another(self) -> None:
+        root = impl.FIXTURE_ROOT / "tape-images"
+        case_root = root / "cases" / "short-epoch-followed-by-another"
+        expected = impl.load_json(case_root / "expected.json")["expected"]
+        case = impl.load_fault_map(case_root / "fault-map.json")
+        image = impl.build_image(impl.load_image_inputs(case["image"]), case["image"])
+        self.assertTrue(all(r.reproduced for r in impl.compare_image(
+            image, impl.read_tsv(root / "MANIFEST.tsv"))))
+        trace = {}
+        decision = impl.decide_case(case, image, trace)
+        self.assertEqual(decision["scanner"]["result"], "Inventory")
+        entries, objects = trace["_inventory"]
+        self.assertEqual(len(objects), expected["inventory_object_rows"])
+        coverage = [[e.tape_file_number, e.epoch_id, e.protected_ordinal_start,
+                     e.protected_ordinal_end_exclusive] for e in entries if e.kind == impl.KIND_SIDECAR]
+        self.assertEqual(coverage, expected["sidecar_coverage"])
+        # These are reader results; the Writer's internal directory is not authority.
+        tape, _ = impl.damaged_tape_for(image, case)
+        directory, _ = impl.load_parity_map_directory(tape, entries, image.tape_uuid, image.block_size)
+        self.assertEqual([directory[n]["flags"] & impl.FLAG_FINAL_PARTIAL_EPOCH for n in (2, 4)], [0, 1])
+        recovered = {tuple(row["address"]): row["_block"] for row in decision["recoverer"]["addresses"]}
+        for number in (1, 3):
+            restored = b"".join(recovered[number, i] for i in range(len(image.files[number].blocks)))
+            self.assertEqual(hashlib.sha256(restored).digest(),
+                             hashlib.sha256(b"".join(image.files[number].blocks)).digest())
+        impl.reporting_only(decision, image, trace)
+        self.assertTrue(decision["scanner"]["inventory_equals_true_prefix"])
+        outcomes = decision["recoverer"]["addresses"]
+        self.assertEqual({tuple(row["address"]) for row in outcomes}, {(1, 0), (1, 1), (3, 0), (3, 1)})
+        self.assertTrue(all(row["result"] == "recovered" and row["bytes_match"] for row in outcomes))
+        self.assertEqual([row["epoch"] for row in outcomes], [0, 0, 1, 1])
+
+
 class UnfinalizedImageComparisonTests(ImageComparisonTests):
     """The smallest image by bytes. Its Writer never finalizes, so the inputs that
     only finalization reads (edition, extent size, ParityMap sequence) are recorded
@@ -581,6 +617,9 @@ class ResumeTests(unittest.TestCase):
                 self.assertEqual(len(case["data_shard_crc64"]), max(0, case["T"] - case["W"]))
                 image = impl.build_image(impl.load_image_inputs(case["image"]), case["image"])
                 result, _ = impl.resume_case(case, image, {})
+                if expected.get("pinned") is False:
+                    print(f"INFORMATIVE {expected['id']}: {result['decision']}")
+                    continue
                 wanted = expected["expected"]
                 if "accepted" in wanted:
                     self.assertEqual(result["decision"]["result"] == "accepted", wanted["accepted"])

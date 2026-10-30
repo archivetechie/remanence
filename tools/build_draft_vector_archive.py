@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build the generation-2 draft deposit from explicitly selected source roots.
 
-Only git-tracked files under the three fixture roots below are eligible. The
+Only git-tracked files under the four fixture roots below are eligible. The
 frozen archive supplies its published REM-OBJECT index; it is never rebuilt.
 Exported streams are selected by the pinned image manifest, never by a glob.
 """
@@ -22,7 +22,7 @@ ARCHIVE_NAME = "remanence-draft-test-vectors.tar"
 TOOLS = ("verify_terminal_index_vectors.py", "verify_rem_object_vectors_independent.py",
          "rem_parity_rederive.py", "requirements-rem-object-independent.txt")
 FIXTURE_ROOTS = ("fixtures/rem-object", "fixtures/rem-object-supplement-draft",
-                 "fixtures/rem-parity-terminal-index-draft")
+                 "fixtures/rem-parity-terminal-index-draft", "fixtures/rem-writer-check-value")
 SPEC_NAMES = ("rem-parity-1-specification.md", "rem-object-core-1-specification.md",
               "rem-encrypt-1-specification.md", "formats-explained.md")
 CLAIMS = [
@@ -33,7 +33,7 @@ CLAIMS = [
     ("REM-OBJECT supplement cases", "python3 verify.py --claim supplement", "rem-object-supplement/*"),
     ("Second implementation artifact rederivation", "python3 verify.py --claim second-build", "rem-parity-generation-2/*; rem-parity-second-implementation/build-report.json"),
     ("Second implementation damage, resume, negatives and terminal decisions", "python3 verify.py --claim second-decisions", "rem-parity-second-implementation/*; rem-parity-generation-2/tape-images/*"),
-    ("Second implementation regression tests", "python3 verify.py --claim second-tests", "rem-parity-second-implementation/test_rem_parity_second_implementation.py"),
+    ("Second implementation regression tests", "python3 verify.py --claim second-tests", "rem-parity-second-implementation/test_rem_parity_second_implementation.py; fixtures/rem-writer-check-value/*"),
 ]
 
 
@@ -61,6 +61,9 @@ def source_members(root: Path, images: Path) -> dict[str, bytes]:
                 destination = "rem-object/" + ("" if relative.startswith("objects/") else "manifests/") + relative
             elif directory == FIXTURE_ROOTS[1]:
                 destination = "rem-object-supplement/" + relative
+            elif directory == FIXTURE_ROOTS[3]:
+                # The second implementation tests read the shared W5 evidence vectors.
+                destination = directory + "/" + relative
             elif relative.startswith("second-implementation/"):
                 destination = "rem-parity-second-implementation/" + relative.removeprefix("second-implementation/")
             else:

@@ -3167,7 +3167,7 @@
               },
               {
                 "section": "8.4",
-                "quote": "`drive_compression = true` on a parity bootstrap still rejects the tape (Sections 11.4, 16.3)."
+                "quote": "`drive_compression = true` on a parity bootstrap still rejects the tape (Sections 11.1, 16.3)."
               }
             ]
           },
@@ -3198,7 +3198,7 @@
               },
               {
                 "section": "8.4",
-                "quote": "`drive_compression = true` on a parity bootstrap still rejects the tape (Sections 11.4, 16.3)."
+                "quote": "`drive_compression = true` on a parity bootstrap still rejects the tape (Sections 11.1, 16.3)."
               },
               {
                 "section": "15",
@@ -3237,7 +3237,7 @@
               },
               {
                 "section": "8.4",
-                "quote": "`drive_compression = true` on a parity bootstrap still rejects the tape (Sections 11.4, 16.3)."
+                "quote": "`drive_compression = true` on a parity bootstrap still rejects the tape (Sections 11.1, 16.3)."
               },
               {
                 "section": "15",
@@ -3279,7 +3279,7 @@
               },
               {
                 "section": "8.4",
-                "quote": "`drive_compression = true` on a parity bootstrap still rejects the tape (Sections 11.4, 16.3)."
+                "quote": "`drive_compression = true` on a parity bootstrap still rejects the tape (Sections 11.1, 16.3)."
               },
               {
                 "section": "15",
@@ -3338,7 +3338,7 @@
               },
               {
                 "section": "8.4",
-                "quote": "`drive_compression = true` on a parity bootstrap still rejects the tape (Sections 11.4, 16.3)."
+                "quote": "`drive_compression = true` on a parity bootstrap still rejects the tape (Sections 11.1, 16.3)."
               },
               {
                 "section": "15",
@@ -3377,7 +3377,7 @@
               },
               {
                 "section": "8.4",
-                "quote": "`drive_compression = true` on a parity bootstrap still rejects the tape (Sections 11.4, 16.3)."
+                "quote": "`drive_compression = true` on a parity bootstrap still rejects the tape (Sections 11.1, 16.3)."
               },
               {
                 "section": "15",
@@ -3419,7 +3419,7 @@
               },
               {
                 "section": "8.4",
-                "quote": "`drive_compression = true` on a parity bootstrap still rejects the tape (Sections 11.4, 16.3)."
+                "quote": "`drive_compression = true` on a parity bootstrap still rejects the tape (Sections 11.1, 16.3)."
               },
               {
                 "section": "15",
@@ -16861,6 +16861,509 @@
             "error": null
           }
         ],
+        "tape_complete": false,
+        "terminal_suffix": {
+          "complete": true,
+          "reasons": [
+            "three valid agreeing replicas, two valid separation extents, EOD after C"
+          ],
+          "replicas_valid": [
+            "A",
+            "B",
+            "C"
+          ]
+        }
+      }
+    },
+    "short-epoch-followed-by-another": {
+      "image": "two-short-epochs",
+      "image_unreproduced": [],
+      "discovery": {
+        "result": "found",
+        "block_size": 262144,
+        "used_hints": false,
+        "error": null,
+        "citations": [
+          {
+            "section": "8.4",
+            "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+          },
+          {
+            "section": "8.4",
+            "quote": "When the block size is unknown, a Scanner MUST apply each discovery candidate (256 KiB, 512 KiB, 1 MiB) as a real drive reconfiguration before reading."
+          },
+          {
+            "section": "8.4",
+            "quote": "It accepts a parsed bootstrap only if its `block_size_bytes` equals the configured read size."
+          }
+        ]
+      },
+      "scanner": {
+        "result": "Inventory",
+        "error": null,
+        "acceptable_selections": [
+          "A",
+          "B",
+          "C"
+        ],
+        "degraded": false,
+        "replicas": {
+          "A": {
+            "valid": true,
+            "reason": "locally eligible under Section 10.6"
+          },
+          "B": {
+            "valid": true,
+            "reason": "locally eligible under Section 10.6"
+          },
+          "C": {
+            "valid": true,
+            "reason": "locally eligible under Section 10.6"
+          }
+        },
+        "inventory_equals_true_prefix": true,
+        "citations": [
+          {
+            "section": "8.4",
+            "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+          },
+          {
+            "section": "8.4",
+            "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+          },
+          {
+            "section": "8.4",
+            "quote": "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple."
+          },
+          {
+            "section": "8.4",
+            "quote": "before accepting any replica, consider every replica that validates for conflict under Section 8.5;"
+          },
+          {
+            "section": "8.5",
+            "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+          },
+          {
+            "section": "12.6",
+            "quote": "On a tape presented without host state, a validating C/B/A survivor attests the complete terminal inventory carried in that replica."
+          }
+        ]
+      },
+      "walk": {
+        "result": "not_run",
+        "error": null,
+        "classes": {},
+        "object_identity": null,
+        "terminal_authority_recovered": null,
+        "citations": [
+          {
+            "section": "8.4",
+            "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
+          }
+        ]
+      },
+      "recoverer": {
+        "result": "run",
+        "addresses": [
+          {
+            "address": [
+              1,
+              0
+            ],
+            "epoch": 0,
+            "result": "recovered",
+            "error": null,
+            "stripe": 0,
+            "lost": null,
+            "limit": null,
+            "bytes_match": true,
+            "citations": [
+              {
+                "section": "13.1",
+                "quote": "A validated, scoped map (Section 12); the bootstrap's scheme record, or the scheme supplied out of band when the bootstrap is unreadable (Section 8.4.1); and the failed addresses — `(tape_file_number, object_block_index)` pairs or ordinals."
+              },
+              {
+                "section": "3.3",
+                "quote": "For scheme `(k, m, S)` (Section 6.6), locate the unique sidecar descriptor whose explicit range `[start, end)`, of at most `S × k` data ordinals, contains ordinal `o`."
+              },
+              {
+                "section": "13.3",
+                "quote": "If it parses as the epoch's footer and its total matches the map entry: read and verify **both** header copies against the footer locator, including the `canonical_metadata_hash`; use the primary if valid, else the tail; record copy health (both-usable / tail-lost / primary-lost)."
+              },
+              {
+                "section": "13.3",
+                "quote": "Such a footer is valid, and it decides, unless an available sidecar epoch directory entry (step 3) disagrees with it: a copy it contradicts is damaged, and the directory-assisted rescue of step 3 is not used."
+              },
+              {
+                "section": "9.1",
+                "quote": "When both copies are valid and their canonical metadata hashes (Section 9.5) differ, a Recoverer MUST use a copy that the footer or the sidecar epoch directory vouches for and neither contradicts, and MUST reject both when neither is available (Section 13.3)."
+              },
+              {
+                "section": "13.3",
+                "quote": "The acquired index MUST then be pinned against the bootstrap's scheme record (`k`, `m`, `S`, block size), or against the supplied scheme and block size when the bootstrap is unreadable, and against the map entry's ordinal range; disagreement is `SchemeMismatch`."
+              },
+              {
+                "section": "13.4",
+                "quote": "**Trusted shard**: the read succeeded, AND its CRC-64 matches the sidecar index (data CRC for data peers, parity CRC for parity peers), AND — for data peers — its object tape file is inside the durable boundary (in catalog-less recovery, inside the validated map scope; Section 13.2)."
+              },
+              {
+                "section": "13.4",
+                "quote": "**Erasure**: a read failure, a CRC mismatch, or a position outside the durable boundary."
+              },
+              {
+                "section": "13.4",
+                "quote": "**Implicit zero**: an ordinal ≥ `protected_ordinal_end_exclusive` — an all-zero shard supplied without tape I/O; not an erasure (Section 6.4)."
+              },
+              {
+                "section": "13.5",
+                "quote": "Reconstruct per Section 6.5 from the first `k` trusted or implicit shards (data shards first in index order, then parity)."
+              },
+              {
+                "section": "13.5",
+                "quote": "Every reconstructed data block MUST be verified against its sidecar data CRC before release."
+              }
+            ]
+          },
+          {
+            "address": [
+              1,
+              1
+            ],
+            "epoch": 0,
+            "result": "recovered",
+            "error": null,
+            "stripe": 1,
+            "lost": null,
+            "limit": null,
+            "bytes_match": true,
+            "citations": [
+              {
+                "section": "13.1",
+                "quote": "A validated, scoped map (Section 12); the bootstrap's scheme record, or the scheme supplied out of band when the bootstrap is unreadable (Section 8.4.1); and the failed addresses — `(tape_file_number, object_block_index)` pairs or ordinals."
+              },
+              {
+                "section": "3.3",
+                "quote": "For scheme `(k, m, S)` (Section 6.6), locate the unique sidecar descriptor whose explicit range `[start, end)`, of at most `S × k` data ordinals, contains ordinal `o`."
+              },
+              {
+                "section": "13.3",
+                "quote": "If it parses as the epoch's footer and its total matches the map entry: read and verify **both** header copies against the footer locator, including the `canonical_metadata_hash`; use the primary if valid, else the tail; record copy health (both-usable / tail-lost / primary-lost)."
+              },
+              {
+                "section": "13.3",
+                "quote": "Such a footer is valid, and it decides, unless an available sidecar epoch directory entry (step 3) disagrees with it: a copy it contradicts is damaged, and the directory-assisted rescue of step 3 is not used."
+              },
+              {
+                "section": "9.1",
+                "quote": "When both copies are valid and their canonical metadata hashes (Section 9.5) differ, a Recoverer MUST use a copy that the footer or the sidecar epoch directory vouches for and neither contradicts, and MUST reject both when neither is available (Section 13.3)."
+              },
+              {
+                "section": "13.3",
+                "quote": "The acquired index MUST then be pinned against the bootstrap's scheme record (`k`, `m`, `S`, block size), or against the supplied scheme and block size when the bootstrap is unreadable, and against the map entry's ordinal range; disagreement is `SchemeMismatch`."
+              },
+              {
+                "section": "13.4",
+                "quote": "**Trusted shard**: the read succeeded, AND its CRC-64 matches the sidecar index (data CRC for data peers, parity CRC for parity peers), AND — for data peers — its object tape file is inside the durable boundary (in catalog-less recovery, inside the validated map scope; Section 13.2)."
+              },
+              {
+                "section": "13.4",
+                "quote": "**Erasure**: a read failure, a CRC mismatch, or a position outside the durable boundary."
+              },
+              {
+                "section": "13.4",
+                "quote": "**Implicit zero**: an ordinal ≥ `protected_ordinal_end_exclusive` — an all-zero shard supplied without tape I/O; not an erasure (Section 6.4)."
+              },
+              {
+                "section": "13.5",
+                "quote": "Reconstruct per Section 6.5 from the first `k` trusted or implicit shards (data shards first in index order, then parity)."
+              },
+              {
+                "section": "13.5",
+                "quote": "Every reconstructed data block MUST be verified against its sidecar data CRC before release."
+              }
+            ]
+          },
+          {
+            "address": [
+              3,
+              0
+            ],
+            "epoch": 1,
+            "result": "recovered",
+            "error": null,
+            "stripe": 0,
+            "lost": null,
+            "limit": null,
+            "bytes_match": true,
+            "citations": [
+              {
+                "section": "13.1",
+                "quote": "A validated, scoped map (Section 12); the bootstrap's scheme record, or the scheme supplied out of band when the bootstrap is unreadable (Section 8.4.1); and the failed addresses — `(tape_file_number, object_block_index)` pairs or ordinals."
+              },
+              {
+                "section": "3.3",
+                "quote": "For scheme `(k, m, S)` (Section 6.6), locate the unique sidecar descriptor whose explicit range `[start, end)`, of at most `S × k` data ordinals, contains ordinal `o`."
+              },
+              {
+                "section": "13.3",
+                "quote": "If it parses as the epoch's footer and its total matches the map entry: read and verify **both** header copies against the footer locator, including the `canonical_metadata_hash`; use the primary if valid, else the tail; record copy health (both-usable / tail-lost / primary-lost)."
+              },
+              {
+                "section": "13.3",
+                "quote": "Such a footer is valid, and it decides, unless an available sidecar epoch directory entry (step 3) disagrees with it: a copy it contradicts is damaged, and the directory-assisted rescue of step 3 is not used."
+              },
+              {
+                "section": "9.1",
+                "quote": "When both copies are valid and their canonical metadata hashes (Section 9.5) differ, a Recoverer MUST use a copy that the footer or the sidecar epoch directory vouches for and neither contradicts, and MUST reject both when neither is available (Section 13.3)."
+              },
+              {
+                "section": "13.3",
+                "quote": "The acquired index MUST then be pinned against the bootstrap's scheme record (`k`, `m`, `S`, block size), or against the supplied scheme and block size when the bootstrap is unreadable, and against the map entry's ordinal range; disagreement is `SchemeMismatch`."
+              },
+              {
+                "section": "13.4",
+                "quote": "**Trusted shard**: the read succeeded, AND its CRC-64 matches the sidecar index (data CRC for data peers, parity CRC for parity peers), AND — for data peers — its object tape file is inside the durable boundary (in catalog-less recovery, inside the validated map scope; Section 13.2)."
+              },
+              {
+                "section": "13.4",
+                "quote": "**Erasure**: a read failure, a CRC mismatch, or a position outside the durable boundary."
+              },
+              {
+                "section": "13.4",
+                "quote": "**Implicit zero**: an ordinal ≥ `protected_ordinal_end_exclusive` — an all-zero shard supplied without tape I/O; not an erasure (Section 6.4)."
+              },
+              {
+                "section": "13.5",
+                "quote": "Reconstruct per Section 6.5 from the first `k` trusted or implicit shards (data shards first in index order, then parity)."
+              },
+              {
+                "section": "13.5",
+                "quote": "Every reconstructed data block MUST be verified against its sidecar data CRC before release."
+              }
+            ]
+          },
+          {
+            "address": [
+              3,
+              1
+            ],
+            "epoch": 1,
+            "result": "recovered",
+            "error": null,
+            "stripe": 1,
+            "lost": null,
+            "limit": null,
+            "bytes_match": true,
+            "citations": [
+              {
+                "section": "13.1",
+                "quote": "A validated, scoped map (Section 12); the bootstrap's scheme record, or the scheme supplied out of band when the bootstrap is unreadable (Section 8.4.1); and the failed addresses — `(tape_file_number, object_block_index)` pairs or ordinals."
+              },
+              {
+                "section": "3.3",
+                "quote": "For scheme `(k, m, S)` (Section 6.6), locate the unique sidecar descriptor whose explicit range `[start, end)`, of at most `S × k` data ordinals, contains ordinal `o`."
+              },
+              {
+                "section": "13.3",
+                "quote": "If it parses as the epoch's footer and its total matches the map entry: read and verify **both** header copies against the footer locator, including the `canonical_metadata_hash`; use the primary if valid, else the tail; record copy health (both-usable / tail-lost / primary-lost)."
+              },
+              {
+                "section": "13.3",
+                "quote": "Such a footer is valid, and it decides, unless an available sidecar epoch directory entry (step 3) disagrees with it: a copy it contradicts is damaged, and the directory-assisted rescue of step 3 is not used."
+              },
+              {
+                "section": "9.1",
+                "quote": "When both copies are valid and their canonical metadata hashes (Section 9.5) differ, a Recoverer MUST use a copy that the footer or the sidecar epoch directory vouches for and neither contradicts, and MUST reject both when neither is available (Section 13.3)."
+              },
+              {
+                "section": "13.3",
+                "quote": "The acquired index MUST then be pinned against the bootstrap's scheme record (`k`, `m`, `S`, block size), or against the supplied scheme and block size when the bootstrap is unreadable, and against the map entry's ordinal range; disagreement is `SchemeMismatch`."
+              },
+              {
+                "section": "13.4",
+                "quote": "**Trusted shard**: the read succeeded, AND its CRC-64 matches the sidecar index (data CRC for data peers, parity CRC for parity peers), AND — for data peers — its object tape file is inside the durable boundary (in catalog-less recovery, inside the validated map scope; Section 13.2)."
+              },
+              {
+                "section": "13.4",
+                "quote": "**Erasure**: a read failure, a CRC mismatch, or a position outside the durable boundary."
+              },
+              {
+                "section": "13.4",
+                "quote": "**Implicit zero**: an ordinal ≥ `protected_ordinal_end_exclusive` — an all-zero shard supplied without tape I/O; not an erasure (Section 6.4)."
+              },
+              {
+                "section": "13.5",
+                "quote": "Reconstruct per Section 6.5 from the first `k` trusted or implicit shards (data shards first in index order, then parity)."
+              },
+              {
+                "section": "13.5",
+                "quote": "Every reconstructed data block MUST be verified against its sidecar data CRC before release."
+              }
+            ]
+          }
+        ]
+      },
+      "verifier": {
+        "result": "complete",
+        "error": null,
+        "separations": {
+          "A-B": "valid",
+          "B-C": "valid"
+        },
+        "citations": [
+          {
+            "section": "2.2",
+            "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "8.5",
+            "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+          },
+          {
+            "section": "10.6",
+            "quote": "A Verifier performing full verification MUST check that every interior byte of both separation extents is zero."
+          },
+          {
+            "section": "10.6",
+            "quote": "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+          },
+          {
+            "section": "10.6",
+            "quote": "Its edition ID MUST equal the replicas'."
+          },
+          {
+            "section": "10.6",
+            "quote": "Its edition ID MUST equal the replicas'."
+          },
+          {
+            "section": "12.6",
+            "quote": "A normal finalized tape has the exact terminal suffix of Section 8.3 and EOD immediately after C's trailing filemark."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports damage it finds before the terminal suffix with the error a Reader reports for that component."
+          },
+          {
+            "section": "2.2",
+            "quote": "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "A check of structure and metadata alone, which reads no data block or parity shard, is not a full verification."
+          }
+        ],
+        "outside_terminal_suffix": [
+          {
+            "component": "Object tape file 1 block 0 (LBA 2)",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data",
+            "address": {
+              "tape_file": 1,
+              "block": 0
+            }
+          },
+          {
+            "component": "Object tape file 1 block 1 (LBA 3)",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data",
+            "address": {
+              "tape_file": 1,
+              "block": 1
+            }
+          },
+          {
+            "component": "Object tape file 3 block 0 (LBA 13)",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data",
+            "address": {
+              "tape_file": 3,
+              "block": 0
+            }
+          },
+          {
+            "component": "Object tape file 3 block 1 (LBA 14)",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data",
+            "address": {
+              "tape_file": 3,
+              "block": 1
+            }
+          }
+        ]
+      },
+      "undecided": [],
+      "verifier-full": {
+        "citations": [
+          {
+            "section": "2.2",
+            "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "2.2",
+            "quote": "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
+          }
+        ],
+        "data_blocks_failed": [
+          {
+            "address": {
+              "tape_file": 1,
+              "block": 0
+            },
+            "reason": "unreadable (medium error)",
+            "error": "TapeIo"
+          },
+          {
+            "address": {
+              "tape_file": 1,
+              "block": 1
+            },
+            "reason": "unreadable (medium error)",
+            "error": "TapeIo"
+          },
+          {
+            "address": {
+              "tape_file": 3,
+              "block": 0
+            },
+            "reason": "unreadable (medium error)",
+            "error": "TapeIo"
+          },
+          {
+            "address": {
+              "tape_file": 3,
+              "block": 1
+            },
+            "reason": "unreadable (medium error)",
+            "error": "TapeIo"
+          }
+        ],
+        "parity_shards_failed": [],
+        "coverage": {
+          "performed": true,
+          "data_blocks_read": 4,
+          "parity_shards_read": 8,
+          "epochs_without_index": [],
+          "data_blocks_read_but_not_checkable": 0,
+          "parity_shards_read_but_not_checkable": 0,
+          "parity_shards_not_locatable": 0
+        },
+        "other_findings": [],
         "tape_complete": false,
         "terminal_suffix": {
           "complete": true,

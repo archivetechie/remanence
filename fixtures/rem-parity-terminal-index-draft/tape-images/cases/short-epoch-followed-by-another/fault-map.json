@@ -1,0 +1,49 @@
+{
+  "failed_data_addresses": [
+    [
+      1,
+      0
+    ],
+    [
+      1,
+      1
+    ],
+    [
+      3,
+      0
+    ],
+    [
+      3,
+      1
+    ]
+  ],
+  "hints": null,
+  "image": "two-short-epochs",
+  "removed_filemark_after_tape_file": null,
+  "unreadable_records": [
+    {
+      "filemark": false,
+      "lba": 2,
+      "record_index": 0,
+      "tape_file": 1
+    },
+    {
+      "filemark": false,
+      "lba": 3,
+      "record_index": 1,
+      "tape_file": 1
+    },
+    {
+      "filemark": false,
+      "lba": 13,
+      "record_index": 0,
+      "tape_file": 3
+    },
+    {
+      "filemark": false,
+      "lba": 14,
+      "record_index": 1,
+      "tape_file": 3
+    }
+  ]
+}

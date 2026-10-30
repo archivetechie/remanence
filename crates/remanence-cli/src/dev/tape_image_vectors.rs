@@ -24,9 +24,10 @@ pub const EXPECTATIONS: &str = include_str!(
 );
 const TIMESTAMP: &str = "2026-08-09T00:00:00Z";
 const VERSION: &str = "remanence-terminal-vector-generator/1";
-pub const IMAGE_NAMES: [&str; 6] = [
+pub const IMAGE_NAMES: [&str; 7] = [
     "a4-minimal",
     "short-epoch",
+    "two-short-epochs",
     "two-epoch",
     "two-edition",
     "unfinalized-closed",
@@ -74,6 +75,7 @@ pub(crate) fn inputs(name: &str) -> TapeImageInputs {
     scheme.stripes_per_neighborhood = if name == "short-epoch" { 4 } else { 2 };
     let objects = match name {
         "short-epoch" => vec![object(2, 0)],
+        "two-short-epochs" => vec![object(2, 0), object(2, 1)],
         "two-epoch" => vec![object(8, 0)],
         "unfinalized-open" => vec![object(4, 0), object(2, 1)],
         _ => vec![object(4, 0)],

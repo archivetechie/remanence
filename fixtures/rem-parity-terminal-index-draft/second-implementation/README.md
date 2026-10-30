@@ -1,13 +1,35 @@
 # REM-PARITY generation 2: second implementation
 
+E9 (`short-epoch-followed-by-another`) adds the `two-short-epochs` image. The
+second implementation builds its bytes from the recorded inputs, reads the
+terminal inventory and each sidecar's coverage, and reconstructs all four
+Object blocks independently. Its regression test compares both complete
+Object digests. This addition uses the existing Reader and parity arithmetic;
+it is added after the original blind comparison and checked against the
+second implementation without a blind decision. The real-ID decision files
+and build report include it; the original blind records stay fixed.
+The recorded `e1-08` and negative E1 decisions refresh only their quoted compression pointers
+from Section 11.4 to Section 11.1 (W1), after the original run. Each outcome
+stays fixed; the updated quotation matches the current specification.
+The archive refresh also updates resume citations to the current Writer
+rules and records the already-existing `resume-evidence-mismatch` result.
+Every earlier resume decision retains its non-citation fields. The archive
+includes the existing W5 check-value fixture used by the regression suite.
+
+`resume-open` is informative and records one conforming continuation result.
+The expected input and result stay fixed. Its test executes the case without
+using that result to decide conformance; Section 11.4 (W4) and the last
+paragraph of Section 11.6 also permit ending the open epoch. Archive digest
+and decision comparisons check reproduction of this example.
+
 This directory holds the output of a second implementation of REM-PARITY
 generation 2, written from the specification text alone and without the
 reference implementation. It exists to supply the second, independent
 derivation that REM-PARITY freeze criterion 2 asks for:
 
 - every pinned candidate byte is re-derived from its recorded inputs; and
-- every damage case is decided from the text, before it is compared with an
-  expected outcome.
+- the 71 damage cases preceding E9 have blind decisions; E9 is checked against
+  the second implementation without a blind decision.
 
 The program is `tools/rem_parity_second_implementation.py`, and its tests are
 `tools/test_rem_parity_second_implementation.py`. Both use the Python 3
@@ -64,7 +86,7 @@ python3 -m unittest tools/test_rem_parity_second_implementation.py
 `build` re-derives these artifacts and compares each with its candidate
 bytes or pinned digests:
 
-- the six full tape images, compared per tape file, torn tail and `ALL` with
+- the seven full tape images, compared per tape file, torn tail and `ALL` with
   `tape-images/MANIFEST.tsv`;
 - the six terminal profiles, compared byte for byte and on every column of
   `MANIFEST.tsv`;
@@ -489,9 +511,9 @@ whether the filemark remains.
 | `BUILD-LOG.md` | Every failed comparison, what was consulted and how it was resolved |
 | `GAPS.md` | Text defects, silences and criterion-2 gaps, each with its section |
 | `build-report.json` | The last `build` run's result for every artifact |
-| `decisions.json` | The last `decide` run's decisions |
+| `decisions.json` | The original blind decisions |
 | `decisions-trace.json` | The reads and reasons behind each decision |
-| `decisions-real-ids.json` | The same decisions, from the repository's `fault-map.json` files and keyed by the real case ids |
+| `decisions-real-ids.json` | Decisions keyed by real case ids, including E9 checked without a blind decision |
 | `decisions-real-ids-trace.json` | Its trace |
 | `COMPARISON.md` | The comparison of the blind decisions with each case's `expected.json` |
 | `comparison.json` | The same comparison in machine-readable form, with the interpretation used for each expected key |

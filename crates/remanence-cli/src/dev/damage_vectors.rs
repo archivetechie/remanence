@@ -630,6 +630,17 @@ fn execute_reader(vector: &VectorImage, faults: &Value, hints: &Value) -> Value 
                 .filter(|entry| entry.kind == TapeFileKind::Object)
                 .count();
             out["replica_a_file_number"] = json!(replica_a_file);
+            out["sidecar_coverage"] = json!(map
+                .entries()
+                .iter()
+                .filter(|entry| entry.kind == TapeFileKind::ParitySidecar)
+                .map(|entry| json!([
+                    entry.tape_file_number,
+                    entry.epoch_id,
+                    entry.protected_ordinal_start,
+                    entry.protected_ordinal_end_exclusive
+                ]))
+                .collect::<Vec<_>>());
             out["inventory_structural_rows"] = json!(map.entries().len());
             out["inventory_object_rows"] = json!(objects.len());
             out["image_object_count"] = json!(image_object_count);
@@ -756,9 +767,29 @@ fn execute_reader(vector: &VectorImage, faults: &Value, hints: &Value) -> Value 
             matches!(raw.read_record(&mut vec![0; block_size as usize]), Err(ParityError::TapeIo(ref e)) if tape_error_is_current_medium_damage(e)),
             "failed-data subject must report a real medium error"
         );
-        let epoch = ordinal
-            / (u64::from(scheme.data_blocks_per_stripe)
-                * u64::from(scheme.stripes_per_neighborhood));
+        let epoch = scoped
+            .map
+            .entries()
+            .iter()
+            .find(|entry| {
+                entry.kind == TapeFileKind::ParitySidecar
+                    && entry
+                        .protected_ordinal_start
+                        .is_some_and(|start| start <= ordinal)
+                    && entry
+                        .protected_ordinal_end_exclusive
+                        .is_some_and(|end| ordinal < end)
+            })
+            .and_then(|entry| entry.epoch_id)
+            .unwrap_or_else(|| {
+                scoped
+                    .map
+                    .entries()
+                    .iter()
+                    .filter_map(|entry| entry.epoch_id)
+                    .max()
+                    .map_or(0, |epoch| epoch + 1)
+            });
         match recover_ordinal_from_sidecar(&mut raw, &scoped, &scheme, uuid, block_size, ordinal) {
             Ok(result) => {
                 out[format!("epoch_{epoch}")] = json!("recovered");
@@ -2253,6 +2284,7 @@ fn compare_s6(id: &str, expected: &Value, checks: &Value, actual: &Value) -> Vec
 
 macro_rules! cases { ($($name:ident => $id:literal),+ $(,)?) => { const CASE_IDS: &[&str] = &[$($id),+]; $(#[test] fn $name() { run($id); })+ }; }
 cases! {
+    short_epoch_followed_by_another => "short-epoch-followed-by-another",
     object_head => "object-head", burst_m => "burst-m", burst_m_plus_one => "burst-m-plus-one",
     short_epoch_burst => "short-epoch-burst", short_epoch_recoverable => "short-epoch-recoverable",
     parity_and_data => "parity-and-data", sidecar_primary => "sidecar-primary", sidecar_footer => "sidecar-footer",
@@ -3367,7 +3399,7 @@ fn one_pass_matches_walk_for_entire_damage_matrix() {
         distinct_schedules > 0,
         "the observation schedules must actually differ"
     );
-    assert_eq!((prefix, successes, fallbacks, direct_walk), (36, 3, 68, 0));
+    assert_eq!((prefix, successes, fallbacks, direct_walk), (37, 3, 69, 0));
     println!("one-pass routes: prefix={prefix}, success={successes}, rejected={fallbacks}, direct_walk={direct_walk}");
     println!("fallback reasons: {reasons:?}");
     println!("distinct transport schedules: {distinct_schedules}");
@@ -3661,8 +3693,7 @@ mod one_pass_counts;
 /// Recovery never bypasses the sidecar CRC, including the batch retry path.
 #[test]
 fn recovered_verification_reads_are_counted_and_crc_checked() {
-    let frozen: Value = serde_json::from_str(EXPECTATIONS).unwrap();
-    let vector = generate(frozen["cases"][0]["image"].as_str().unwrap()).unwrap();
+    let vector = generate("a4-minimal").unwrap();
     let object = vector
         .written
         .map

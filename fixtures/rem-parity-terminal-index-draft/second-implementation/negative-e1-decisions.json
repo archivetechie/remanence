@@ -66,11 +66,11 @@
         "rules": [
           {
             "section": "8.2",
-            "quote": "`true` on a parity bootstrap MUST be rejected (Sections 8.4, 11.4)"
+            "quote": "`true` on a parity bootstrap MUST be rejected (Sections 8.4, 11.1)"
           },
           {
             "section": "16.3",
-            "quote": "Both sentences concern a parity tape (Section 11.4): a no-parity bootstrap may record compression."
+            "quote": "Both sentences concern a parity tape (Section 11.1): a no-parity bootstrap may record compression."
           },
           {
             "section": "8.2",

@@ -3192,9 +3192,10 @@ implementation review are pre-freeze evidence rather than publication.
 
 The `minimal-*` profiles above are terminal suffixes of a tape that holds only
 the bootstrap. The set's `tape-images/` directory holds whole tapes. One
-tape-image builder makes six images from inputs recorded beside them:
+tape-image builder makes seven images from inputs recorded beside them:
 Appendix A.4's minimal tape, which also holds an Object, a sidecar and the
-ParityMap; a tape with a short epoch (`S = 4`); a tape with two epochs; the
+ParityMap; a tape with a short epoch (`S = 4`); a tape with two short epochs
+(`two-short-epochs`, `k = m = S = 2`); a tape with two epochs; the
 minimal tape with its replica B taken from a second edition, which differs
 only in edition id and edition sequence; and two unfinalized tapes that stop in
 a torn tail, one after a closed epoch and one with an epoch still open.
@@ -3202,11 +3203,15 @@ a torn tail, one after a closed epoch and one with an epoch still open.
 each torn tail and of the whole stream. The image bytes are regenerated from
 the inputs, not stored.
 
-The damage matrix, `tape-images/cases/`, holds 71 cases, and 69 of them are
+The damage matrix, `tape-images/cases/`, holds 72 cases, and 70 of them are
 pinned; `parity-map-and-sidecar` and `e1-07` are not. Each case gives the
 outcome it expects under this document: the inventory a Scanner reports, the
 result of the walk, each failed address's recovery or error, or what a
-Verifier reports. The matrix grew in five groups.
+Verifier reports. The matrix has the five groups below and E9,
+`short-epoch-followed-by-another`. E9 erases every block of two 2-block
+Objects in successive short epochs, each with its own sidecar, followed by
+a finalized terminal suffix. It pins the accepted inventory, the sidecars
+covering `[0, 2)` and `[2, 4)`, and recovery of both complete Objects.
 
 Of the first 25 cases, all but one make stated records of an image
 unreadable or remove a filemark; the other reads the second-edition image
@@ -3246,9 +3251,15 @@ image as Section 7.1 entries, with `W` and `T`. Their off-tape commit inputs
 also carry `data_shard_crc64`: the ordered whole-block CRC-64/XZ values for
 `[W, T)` as 16-digit hexadecimal strings, binding the read-back under
 Section 11.5 (W5). These are commit evidence, not additional Section 7.1
-fields. Two resumes of unfinalized images are accepted, one at `W = T` and
-one at `W < T`, and the resumed tapes are pinned; the second one's sidecar
-equals the one an uninterrupted session writes. Six prefixes, four over the
+fields. Two resumes of unfinalized images are accepted. The `W = T` resumed
+tape, `resume-closed`, stays pinned; only `resume-open`, at `W < T`, is
+informative. Its expectation pins one conforming result, not the only one.
+Its inputs and current result stay fixed; this Writer continues the open
+epoch, and its sidecar equals the one an uninterrupted session writes.
+Section 11.4 (W4) and the last paragraph of Section 11.6 also permit ending
+the open epoch before appending. The byte manifest pins this informative
+example for reproduction, not a unique Writer choice.
+Six prefixes, four over the
 unfinalized images and two over the two-epoch image, break a Section 14 rule
 and are refused. The negative case `resume-evidence-mismatch` uses the same
 `W < T` prefix and image with one recorded CRC changed; it is `ResumeAppend`.
@@ -3286,10 +3297,13 @@ written from REM-OBJECT. It re-derives the
 images, the terminal profiles, and the maximum, Object-row extension and
 streaming artifacts from their recorded inputs, among them the bootstraps,
 Objects, sidecars with their Reed–Solomon parity, and ParityMaps, and it
-re-derives the resumed tapes. It decided every damage case, every portable
-resume case and every negative case and variant before seeing the expected
-outcome; one variant was corrected afterwards and not decided again. Its
-records, under `second-implementation/`, show no disagreement with the
+re-derives the resumed tapes. It decided 71 damage cases (every case except
+E9), every portable resume case and every negative case and variant before
+seeing the expected outcome; one variant was corrected afterwards and not
+decided again. E9 is added later and checked against the second implementation
+without a blind decision. Of the 71 damage cases decided blind, 69 are pinned;
+E9 is also pinned. The implementation's records, under
+`second-implementation/`, show no disagreement with the
 expected outcomes except on questions this document leaves open, and list
 each place where it found this document silent or ambiguous. One expected
 negative outcome was corrected by citation after review, and its decision
