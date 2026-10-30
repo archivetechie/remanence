@@ -1,10 +1,13 @@
 //! Model coverage for invocation boundaries, durable crash cuts, and the shared
 //! finalization/import funnels. Transport injection never substitutes a writer.
 use super::*;
+use crate::{mount_backend::StandaloneFinalizeRequest, WriteObjectToPoolRequest};
 use remanence_chaos::model::{
     DeviceRole, ModelTransport, Record, SharedVirtualWorld, VirtualTape, VirtualWorld,
 };
 use remanence_library::{transport::TransferOutcome, ScsiError, TimeoutClass};
+use remanence_state::{AuditActor, AuditEvent, AuditEventRecord, AuditSubject, SourceLayer};
+use std::collections::BTreeMap;
 const UUID: TapeUuid = [
     0x73, 0x73, 0x73, 0x73, 0x73, 0x73, 0x43, 0x73, 0x83, 0x73, 0x73, 0x73, 0x73, 0x73, 0x73, 0x73,
 ];
@@ -2197,7 +2200,7 @@ async fn epoch_removal_admission_failure_matrix() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "mount_backend::tests::epoch_removal_admission_failure_matrix",
+                "mount_support::tests::epoch_removal_admission_failure_matrix",
                 "--nocapture",
             ])
             .env(CHILD, "1")

@@ -1,17 +1,76 @@
-//! Pure tape-init classification and decision helpers.
+//! Tape-init classification, decisions, and shared bootstrap primitives.
 //!
 //! The hardware orchestration that reads element status, loads drives, reads
-//! BOT, and writes the bootstrap stays outside this module. Callers project
+//! BOT, and provisions media stays outside this module. Callers project
 //! those facts into these value types so the destructive init decision can be
 //! unit-tested without a drive.
 
+use remanence_library::BlockSink;
 use remanence_parity::{
-    bootstrap::{has_bootstrap_magic, parse_bootstrap_block, BootstrapPayload},
-    default_scheme_for_block_size, ParityConfig, ParityScheme, SchemeId,
+    bootstrap::{
+        has_bootstrap_magic, parse_bootstrap_block, write_bootstrap_block, BootstrapPayload,
+    },
+    default_scheme_for_block_size, sole_bot_filemark_map_digest, ParityConfig, ParityScheme,
+    ParitySchemeRecord, SchemeId,
 };
 use remanence_state::{CatalogIndex, LabelProvenance, StateError, TapeRecord};
 
-use crate::pool_write::{build_tape_bootstrap, write_tape_bootstrap, PoolWriteError, TapeUuid};
+use crate::pool_write::{write_fixed_blocks, PoolWriteError, TapeUuid};
+
+/// Build the bootstrap payload for a newly provisioned tape.
+pub fn build_tape_bootstrap(
+    tape_uuid: TapeUuid,
+    block_size: u32,
+    parity: ParityConfig,
+    written_at: impl Into<String>,
+    written_by_version: impl Into<String>,
+) -> BootstrapPayload {
+    match parity {
+        ParityConfig::None => BootstrapPayload {
+            scheme: None,
+            no_parity_flag: true,
+            filemark_map_digest: None,
+            tape_uuid,
+            written_by_version: written_by_version.into(),
+            written_at: written_at.into(),
+            sequence: 0,
+            block_size_bytes: block_size,
+            drive_compression: false,
+        },
+        ParityConfig::Scheme(scheme) => BootstrapPayload {
+            scheme: Some(ParitySchemeRecord {
+                id: scheme.id.as_str().to_string(),
+                data_blocks_per_stripe: scheme.data_blocks_per_stripe,
+                parity_blocks_per_stripe: scheme.parity_blocks_per_stripe,
+                stripes_per_neighborhood: scheme.stripes_per_neighborhood,
+                no_parity_flag: false,
+            }),
+            no_parity_flag: false,
+            filemark_map_digest: Some(
+                sole_bot_filemark_map_digest()
+                    .expect("canonical sole-BOT filemark map is structurally valid"),
+            ),
+            tape_uuid,
+            written_by_version: written_by_version.into(),
+            written_at: written_at.into(),
+            sequence: 0,
+            block_size_bytes: block_size,
+            drive_compression: false,
+        },
+    }
+}
+
+/// Write one bootstrap tape file, requiring a complete block before its filemark.
+pub fn write_tape_bootstrap(
+    sink: &mut dyn BlockSink,
+    payload: &BootstrapPayload,
+) -> Result<(), PoolWriteError> {
+    let mut block = vec![0u8; payload.block_size_bytes as usize];
+    write_bootstrap_block(payload, &mut block)?;
+    write_fixed_blocks(sink, block.len(), &block)?;
+    sink.write_filemarks(1)?;
+    Ok(())
+}
 
 const BOT_CLASSIFY_READ_BYTES: usize = 1024 * 1024;
 
