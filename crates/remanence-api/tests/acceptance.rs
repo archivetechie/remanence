@@ -243,7 +243,10 @@ fn start(config: &RemConfig, worlds: &[SharedVirtualWorld], controls: &[Arc<Cont
 
 impl Rig {
     fn new(libraries: usize) -> Self {
-        let root = tempfile::tempdir().unwrap();
+        Self::with_root(tempfile::tempdir().unwrap(), libraries)
+    }
+
+    fn with_root(root: tempfile::TempDir, libraries: usize) -> Self {
         let config = config(root.path(), libraries);
         let paths = StatePaths::from_config(root.path().join("config.toml"), &config);
         let mut state = StateHandle::open_with_config(paths, config.clone()).unwrap();
@@ -804,6 +807,157 @@ async fn restart_with_seated_cartridge_does_not_repeat_load() {
     let session = rig.open(0).await;
     rig.close(&session).await;
     rig.finish().await;
+}
+
+/// Read-only daemon construction also leaves standalone ownership to its caller.
+#[test]
+fn daemon_startup_leaves_standalone_session_open() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = config(root.path(), 1);
+    config.daemon.read_only = true;
+    let paths = StatePaths::from_config(root.path().join("config.toml"), &config);
+    let id = uuid::Uuid::new_v4();
+    {
+        let mut state = StateHandle::open_with_config(paths, config.clone()).unwrap();
+        state
+            .audit()
+            .append(AuditEventRecord {
+                actor: AuditActor::System,
+                source_layer: SourceLayer::Layer5,
+                operation_id: None,
+                session_id: Some(id),
+                idempotency_key: None,
+                event: AuditEvent::SessionOpened,
+                subject: AuditSubject {
+                    kind: "write".into(),
+                    id: Some(id.to_string()),
+                },
+                detail: BTreeMap::from([
+                    ("session_kind".into(), Value::Text("write".into())),
+                    (
+                        "endpoint_key".into(),
+                        Value::Text(
+                            remanence_state::DriveKey::Standalone {
+                                drive_serial: "DIRECT".into(),
+                            }
+                            .encode(),
+                        ),
+                    ),
+                ]),
+            })
+            .unwrap();
+        state.replay_audit_projection().unwrap();
+    }
+    let _lock = remanence_state::StateLockGuard::acquire(&config.daemon.state_dir).unwrap();
+    let index = CatalogIndex::open(&config.index.sqlite_path).unwrap();
+    let _api = ApiState::new_with_config(
+        CatalogIndex::open(&config.index.sqlite_path).unwrap(),
+        &config,
+    )
+    .unwrap();
+    assert_eq!(index.session_state(id).unwrap().as_deref(), Some("open"));
+    assert!(!remanence_state::FileAuditLog::replay(&config.audit.dir)
+        .unwrap()
+        .iter()
+        .any(|record| record.event == AuditEvent::SessionLostByRestart));
+}
+
+/// A process exit drops the old actor's lease without closing its durable session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_marks_open_library_session_lost_before_admitting_writes() {
+    const CHILD_ROOT: &str = "REM_TEST_STARTUP_SESSION_ROOT";
+    if let Some(root) = std::env::var_os(CHILD_ROOT) {
+        let root = std::path::PathBuf::from(root);
+        let rig = Rig::with_root(tempfile::tempdir_in(&root).unwrap(), 1);
+        let session = rig.open(0).await;
+        let world = rig.worlds[0].lock().unwrap();
+        let tape = &world.tapes[&barcode(0)];
+        assert_eq!(tape.records.len(), 2, "open leaves the bootstrap unchanged");
+        let Record::Block(block) = &tape.records[0] else {
+            panic!("bootstrap is a data block");
+        };
+        std::fs::write(root.join("bootstrap"), block).unwrap();
+        std::fs::write(root.join("session"), &session.session_id).unwrap();
+        std::fs::write(
+            root.join("config-path"),
+            rig.root.path().join("config.toml").to_str().unwrap(),
+        )
+        .unwrap();
+        // Exit the test process without running session close or daemon shutdown.
+        // Every transport is virtual; no socket, signal, or real device is used.
+        std::process::exit(0);
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "restart_marks_open_library_session_lost_before_admitting_writes",
+            "--nocapture",
+        ])
+        .env(CHILD_ROOT, root.path())
+        .output()
+        .unwrap();
+    assert!(child.status.success(), "child startup: {child:?}");
+    let config_path = std::fs::read_to_string(root.path().join("config-path")).unwrap();
+    let config = remanence_state::load_config(Path::new(&config_path)).unwrap();
+    let previous =
+        uuid::Uuid::from_slice(&std::fs::read(root.path().join("session")).unwrap()).unwrap();
+    let _state_lock = remanence_state::StateLockGuard::acquire(&config.daemon.state_dir).unwrap();
+    let index = CatalogIndex::open(&config.index.sqlite_path).unwrap();
+    assert_eq!(
+        index.session_state(previous).unwrap().as_deref(),
+        Some("open")
+    );
+
+    let mut tape = VirtualTape::empty(8 * 1024 * 1024 * 1024, BLOCK);
+    tape.records = vec![
+        Record::Block(std::fs::read(root.path().join("bootstrap")).unwrap()),
+        Record::Filemark,
+    ];
+    tape.written_bytes = u64::from(BLOCK);
+    let mut world = VirtualWorld::single_drive(serial(0), BAY, "DRIVE-0", SLOT, 2);
+    world.put_tape_in_drive(BAY, barcode(0), Some(SLOT), tape);
+    let worlds = vec![Arc::new(Mutex::new(world))];
+    let controls = vec![Arc::new(Control::default())];
+    let api = start(&config, &worlds, &controls);
+    assert_eq!(
+        index.session_state(previous).unwrap().as_deref(),
+        Some("lost_by_restart")
+    );
+    assert!(!index.tape_io_is_fenced(Some(&uuid(0)), None, None).unwrap());
+    let session = tokio::time::timeout(BOUND, open(&api, 0))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.drive_element_address, Some(u32::from(BAY)));
+    assert_eq!(
+        index
+            .session_state(uuid::Uuid::from_slice(&session.session_id).unwrap())
+            .unwrap()
+            .as_deref(),
+        Some("open"),
+        "startup recovery leaves the new process's session open"
+    );
+    api.write_session_service()
+        .close_write_session(Request::new(pb::CloseWriteSessionRequest {
+            session_id: session.session_id,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    api.shutdown_drive_pool().await.unwrap();
+    let lost_count = || {
+        remanence_state::FileAuditLog::replay(&config.audit.dir)
+            .unwrap()
+            .iter()
+            .filter(|record| record.event == AuditEvent::SessionLostByRestart)
+            .count()
+    };
+    assert_eq!(lost_count(), 1);
+    let restarted = start(&config, &worlds, &controls);
+    assert_eq!(lost_count(), 1, "a second restart marks zero sessions");
+    restarted.shutdown_drive_pool().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
