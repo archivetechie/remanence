@@ -191,7 +191,12 @@ pub(super) fn changer_loop(
                 }
                 let _ = reply.send(ownership.complete(result));
             }
-            ChangerCommand::Move { src, dst, reply } => {
+            ChangerCommand::Move {
+                src,
+                dst,
+                reply,
+                recovery_guard,
+            } => {
                 let result =
                     super::robotics::admit_fenced_elements(&index, changer.library(), &[src, dst])
                         .and_then(|()| {
@@ -215,6 +220,7 @@ pub(super) fn changer_loop(
                     }
                     publish_library_snapshot(&cfg.library().snapshot, changer.library().clone());
                 }
+                drop(recovery_guard);
                 let _ = reply.send(result);
             }
             ChangerCommand::Reconcile { tape_uuid, handle } => {
@@ -825,16 +831,10 @@ pub(super) fn drive_loop(
                     let _ = reply.send(Err(error));
                     continue;
                 }
-                let started = Instant::now();
-                let result = drive
-                    .unload()
-                    .map(|()| started.elapsed())
-                    .map_err(|err| match err {
-                        remanence_library::DriveOpError::Inventory(_) => {
-                            Status::failed_precondition(format!("unload drive: {err}"))
-                        }
-                        _ => Status::internal(format!("unload drive: {err}")),
-                    });
+                let result = unload_actor_drive(
+                    drive,
+                    std::path::Path::new(crate::mount_support::DEVICE_LOCK_ROOT),
+                );
                 if let Some(library) = drive.observed_library() {
                     let _ = observe_refreshed_library(&mut index, &cfg, &library);
                     publish_library_snapshot(&cfg.library().snapshot, library);
@@ -1409,4 +1409,32 @@ pub(super) fn tape_alert_flags_json(flags: &std::collections::BTreeSet<u8>) -> S
 
 pub(super) fn u64_to_i64(value: u64) -> Option<i64> {
     i64::try_from(value).ok()
+}
+
+/// Actor unload after its retained-write epoch has closed. Keep recovery's
+/// device lock in the reply so a following changer MOVE remains protected.
+pub(crate) fn unload_actor_drive(
+    drive: &mut remanence_library::DriveHandle,
+    lock_root: &std::path::Path,
+) -> Result<super::DriveUnloadOutcome, Status> {
+    let started = Instant::now();
+    let bay = drive
+        .bay_address()
+        .map_or_else(|| "unplaced".to_string(), |bay| format!("0x{bay:04x}"));
+    let guard = crate::mount_support::unload_drive(drive, lock_root).map_err(|error| {
+        let message = format!("unload drive bay {bay}: {error}");
+        match error {
+            crate::mount_support::DriveUnloadError::Drive(
+                remanence_library::DriveOpError::Inventory(_),
+            )
+            | crate::mount_support::DriveUnloadError::Recovery(_) => {
+                Status::failed_precondition(message)
+            }
+            crate::mount_support::DriveUnloadError::Drive(_) => Status::internal(message),
+        }
+    })?;
+    Ok(super::DriveUnloadOutcome {
+        elapsed: started.elapsed(),
+        recovery_guard: guard,
+    })
 }

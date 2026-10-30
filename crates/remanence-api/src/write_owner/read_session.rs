@@ -160,7 +160,12 @@ pub(super) fn handle_drive_open_read(
     );
     if reply.send(Ok(open_reply)).is_err() {
         if needs_drive_load {
-            let _ = drive.unload();
+            if let Err(error) = crate::mount_support::unload_drive(
+                drive,
+                std::path::Path::new(crate::mount_support::DEVICE_LOCK_ROOT),
+            ) {
+                tracing::warn!(bay, %error, "cancelled read's compensating unload failed");
+            }
             if let Some(library) = drive.observed_library() {
                 let _ = super::robotics::observe_refreshed_library(index, cfg, &library);
                 super::robotics::publish_library_snapshot(&cfg.library().snapshot, library);

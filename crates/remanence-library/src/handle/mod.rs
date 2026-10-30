@@ -1222,6 +1222,30 @@ impl LibraryHandle {
         destination: Option<u16>,
         policy: &dyn AccessPolicy,
     ) -> Result<(), UnloadError> {
+        self.unload_inner(bay, destination, policy, false)
+    }
+
+    /// Recover a stranded drive PREVENT after UNLOAD refused with 05/53/02.
+    /// The caller must hold exclusive writer ownership throughout this call:
+    /// a library handle alone provides neither process nor session exclusion.
+    /// ALLOW is audited separately as [`AuditOp::AllowRemoval`]; failure stops
+    /// the operation before UNLOAD or MOVE.
+    pub fn unload_recovering_removal(
+        &mut self,
+        bay: u16,
+        destination: Option<u16>,
+        policy: &dyn AccessPolicy,
+    ) -> Result<(), UnloadError> {
+        self.unload_inner(bay, destination, policy, true)
+    }
+
+    fn unload_inner(
+        &mut self,
+        bay: u16,
+        destination: Option<u16>,
+        policy: &dyn AccessPolicy,
+        recover_removal: bool,
+    ) -> Result<(), UnloadError> {
         // Resolve destination: explicit override → caller-supplied;
         // otherwise the bay's source_slot. The lookup is *split* so
         // an unknown bay address (caller typo) surfaces distinctly
@@ -1281,7 +1305,14 @@ impl LibraryHandle {
         // Phase 1: drive open + SSC UNLOAD. Scope the DriveHandle so
         // it drops before phase 2 needs &mut self.
         let drive_result = match self.open_drive(bay, policy) {
-            Ok(mut drive) => drive.unload_as(op).map_err(UnloadError::DriveUnload),
+            Ok(mut drive) => {
+                if recover_removal {
+                    drive
+                        .allow_medium_removal()
+                        .map_err(UnloadError::DriveAllow)?;
+                }
+                drive.unload_as(op).map_err(UnloadError::DriveUnload)
+            }
             Err(e) => Err(UnloadError::OpenDrive(e)),
         };
         if let Err(UnloadError::DriveUnload(DriveOpError::ScsiError(ref e))) = drive_result {
@@ -1979,6 +2010,16 @@ impl DriveHandle {
                 bay: self.bay_address(),
             },
         )
+    }
+
+    /// Retry a 05/53/02 refusal by clearing a crashed owner's PREVENT, then unload.
+    /// The caller must exclude
+    /// live writers (including other processes) until this call completes.
+    /// ALLOW failure is audited and returned without attempting UNLOAD.
+    pub fn unload_recovering_removal(&mut self) -> Result<(), UnloadError> {
+        self.allow_medium_removal()
+            .map_err(UnloadError::DriveAllow)?;
+        self.unload().map_err(UnloadError::DriveUnload)
     }
 
     /// Issue SSC `LOAD` (`0x1B` with byte 4 = 1) to the drive. Modern

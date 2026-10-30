@@ -1994,12 +1994,35 @@ async fn changer_move(
     src: u16,
     dst: u16,
 ) -> Result<(), Status> {
+    changer_move_guarded(pool, library_serial, src, dst, None).await
+}
+
+/// Transfer removal recovery's flock into the queued MOVE, so cancellation of
+/// this future cannot release it while the changer still owns the operation.
+pub(crate) async fn changer_move_after_unload(
+    pool: &crate::write_owner::DrivePool,
+    library_serial: &str,
+    src: u16,
+    dst: u16,
+    unloaded: crate::write_owner::DriveUnloadOutcome,
+) -> Result<(), Status> {
+    changer_move_guarded(pool, library_serial, src, dst, unloaded.recovery_guard).await
+}
+
+async fn changer_move_guarded(
+    pool: &crate::write_owner::DrivePool,
+    library_serial: &str,
+    src: u16,
+    dst: u16,
+    recovery_guard: Option<crate::mount_support::UnloadRecoveryGuard>,
+) -> Result<(), Status> {
     let changer = pool.changer_tx(library_serial)?;
     let (reply_tx, reply_rx) = oneshot::channel();
     changer
         .send(crate::write_owner::ChangerCommand::Move {
             src,
             dst,
+            recovery_guard,
             reply: reply_tx,
         })
         .await
@@ -2011,8 +2034,11 @@ async fn changer_move(
 
 async fn compensate_open_mount(pool: &crate::write_owner::DrivePool, mount: &ActorMount) {
     if let Some(slot) = mount.source_slot {
-        let _ = drive_unload(pool, &mount.drive_key()).await;
-        let _ = changer_move(pool, &mount.library_serial, mount.bay, slot).await;
+        if let Ok(unloaded) = drive_unload(pool, &mount.drive_key()).await {
+            let _ =
+                changer_move_after_unload(pool, &mount.library_serial, mount.bay, slot, unloaded)
+                    .await;
+        }
     }
 }
 
@@ -2023,7 +2049,7 @@ fn should_compensate_open_mount(err: &Status) -> bool {
 async fn drive_unload(
     pool: &crate::write_owner::DrivePool,
     drive_key: &crate::drive_pool::DriveKey,
-) -> Result<Duration, Status> {
+) -> Result<crate::write_owner::DriveUnloadOutcome, Status> {
     let drive = pool.drive_tx(drive_key)?;
     let (reply_tx, reply_rx) = oneshot::channel();
     drive
@@ -2124,9 +2150,17 @@ async fn dismount_pair(
         )));
     }
     let started = Instant::now();
-    let ssc_unload = drive_unload(pool, &seated.drive_key()).await?;
+    let unloaded = drive_unload(pool, &seated.drive_key()).await?;
+    let ssc_unload = unloaded.elapsed;
     let move_started = Instant::now();
-    if let Err(err) = changer_move(pool, &seated.library_serial, seated.bay, seated.home_slot).await
+    if let Err(err) = changer_move_after_unload(
+        pool,
+        &seated.library_serial,
+        seated.bay,
+        seated.home_slot,
+        unloaded,
+    )
+    .await
     {
         tracing::error!(
             library_serial = %seated.library_serial,
@@ -3949,7 +3983,7 @@ mod tests {
         let crate::write_owner::DriveCommand::Unload { reply } = command else {
             panic!("unload")
         };
-        reply.send(Ok(Duration::ZERO)).unwrap();
+        reply.send(Ok(Duration::ZERO.into())).unwrap();
         let crate::write_owner::ChangerCommand::Move { reply, .. } =
             harness.changer_rx.recv().await.unwrap()
         else {
@@ -4212,7 +4246,9 @@ mod tests {
             let moves = moves.clone();
             async move {
                 while let Some(command) = changer_rx.recv().await {
-                    let crate::write_owner::ChangerCommand::Move { src, dst, reply } = command
+                    let crate::write_owner::ChangerCommand::Move {
+                        src, dst, reply, ..
+                    } = command
                     else {
                         panic!("pool opens only move media");
                     };
@@ -4503,12 +4539,13 @@ mod tests {
             panic!("unload command")
         };
         reply
-            .send(Ok(Duration::from_millis(7)))
+            .send(Ok(Duration::from_millis(7).into()))
             .expect("unload reply");
-        let Some(crate::write_owner::ChangerCommand::Move { src, dst, reply }) =
-            tokio::time::timeout(Duration::from_secs(1), harness.changer_rx.recv())
-                .await
-                .expect("move deadline")
+        let Some(crate::write_owner::ChangerCommand::Move {
+            src, dst, reply, ..
+        }) = tokio::time::timeout(Duration::from_secs(1), harness.changer_rx.recv())
+            .await
+            .expect("move deadline")
         else {
             panic!("move command")
         };
@@ -4631,13 +4668,14 @@ mod tests {
             "caller future was cancelled"
         );
         reply
-            .send(Ok(Duration::from_millis(7)))
+            .send(Ok(Duration::from_millis(7).into()))
             .expect("the detached dismount still awaits the unload");
 
-        let Some(crate::write_owner::ChangerCommand::Move { src, dst, reply }) =
-            tokio::time::timeout(Duration::from_secs(1), harness.changer_rx.recv())
-                .await
-                .expect("move arrives within the deadline")
+        let Some(crate::write_owner::ChangerCommand::Move {
+            src, dst, reply, ..
+        }) = tokio::time::timeout(Duration::from_secs(1), harness.changer_rx.recv())
+            .await
+            .expect("move arrives within the deadline")
         else {
             panic!("the move home must follow the unload");
         };
@@ -4700,10 +4738,11 @@ mod tests {
         );
 
         reply
-            .send(Ok(Duration::from_millis(7)))
+            .send(Ok(Duration::from_millis(7).into()))
             .expect("unload reply receiver");
-        let Some(crate::write_owner::ChangerCommand::Move { src, dst, reply }) =
-            harness.changer_rx.recv().await
+        let Some(crate::write_owner::ChangerCommand::Move {
+            src, dst, reply, ..
+        }) = harness.changer_rx.recv().await
         else {
             panic!("the move home must follow the unload");
         };
@@ -6365,10 +6404,11 @@ mod tests {
             panic!("dismount must issue drive unload first");
         };
         reply
-            .send(Ok(Duration::from_millis(7)))
+            .send(Ok(Duration::from_millis(7).into()))
             .expect("unload reply receiver");
-        let crate::write_owner::ChangerCommand::Move { src, dst, reply } =
-            changer_rx.recv().await.expect("move-home command")
+        let crate::write_owner::ChangerCommand::Move {
+            src, dst, reply, ..
+        } = changer_rx.recv().await.expect("move-home command")
         else {
             panic!("dismount must use the changer move command");
         };
@@ -6538,7 +6578,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let crate::write_owner::ChangerCommand::Move { src, dst, reply } = command else {
+        let crate::write_owner::ChangerCommand::Move {
+            src, dst, reply, ..
+        } = command
+        else {
             panic!("move")
         };
         assert_eq!((src, dst), (0x401, 0x101));
