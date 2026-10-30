@@ -1076,3 +1076,71 @@ pub(crate) fn now_rfc3339() -> Result<String, PoolWriteError> {
 pub(crate) fn uuid_text(value: [u8; 16]) -> String {
     Uuid::from_bytes(value).to_string()
 }
+
+/// Validate one already-planned close-only terminal tail through the shared
+/// exact capacity authority.
+///
+/// Parity finalization must emit its pending sidecar/ParityMap prefix before
+/// `first_start_lba`; the barrier-proved cursor therefore charges that prefix
+/// without modeling it a second time. The returned report covers exactly the
+/// remaining A/gap/B/gap/C tail plus the shared safety allowance under the
+/// selected pool/cartridge C/L/H basis.
+pub(crate) fn authorize_terminal_close_only_plan(
+    state: &CatalogIndex,
+    pool_cfg: Option<&TapePoolConfig>,
+    selected: &SelectedTape,
+    first_start_lba: u64,
+    counts: remanence_parity::TapeIndexReplicaCounts,
+    planned_eod_lba: u64,
+) -> Result<remanence_parity::TerminalTripleCloseReport, PoolWriteError> {
+    let capacity_blocks = terminal_capacity_basis_blocks(state, pool_cfg, selected)?;
+    let (low_watermark_blocks, high_watermark_blocks) =
+        terminal_watermark_blocks(capacity_blocks, pool_cfg)?;
+    let remaining_tape_blocks = capacity_blocks
+        .checked_sub(first_start_lba)
+        .ok_or_else(|| {
+            PoolWriteError::InvalidInput(format!(
+                "terminal cursor {first_start_lba} exceeds capacity basis {capacity_blocks}"
+            ))
+        })?;
+    let report = TerminalTripleCloseInput {
+        projected_object_present: false,
+        projected_object_blocks: 0,
+        block_size_bytes: selected.block_size,
+        current_epoch_fill_blocks: 0,
+        data_shards_per_epoch: 1,
+        parity_shards_per_epoch: 0,
+        pending_completed_sidecars: 0,
+        sidecar_entries_before_object: 0,
+        structural_entries_before_object: counts.structural_entry_count,
+        object_rows_before_object: counts.object_row_count,
+        object_filemark_blocks: 1,
+        sidecar_filemark_blocks: 1,
+        parity_map_filemark_blocks: 1,
+        replica_filemark_blocks: 1,
+        gap_filemark_blocks: 1,
+        gap_nominal_bytes: remanence_parity::DEFAULT_INDEX_SEPARATION_BYTES,
+        safety_margin_blocks: TERMINAL_CAPACITY_SAFETY_MARGIN_BLOCKS,
+        remaining_tape_blocks,
+        capacity_basis_blocks: capacity_blocks,
+        low_watermark_blocks,
+        high_watermark_blocks,
+        pending_completed_epoch_parity_bytes: 0,
+        remaining_spool_bytes: 0,
+    }
+    .evaluate()?;
+    let planned_tail_charge = planned_eod_lba
+        .checked_sub(first_start_lba)
+        .ok_or_else(|| {
+            PoolWriteError::InvalidInput(
+                "terminal layout ends before its starting cursor".to_string(),
+            )
+        })?;
+    if report.terminal_tail_charge_blocks != planned_tail_charge {
+        return Err(PoolWriteError::InvalidInput(format!(
+            "terminal close authority/layout mismatch: calculator={} planned={planned_tail_charge}",
+            report.terminal_tail_charge_blocks
+        )));
+    }
+    Ok(report)
+}

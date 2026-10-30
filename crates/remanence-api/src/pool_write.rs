@@ -9,7 +9,8 @@
 mod media;
 mod overlap;
 mod prepare;
-pub(crate) use prepare::ValidateCanonicalEntrySink;
+pub(crate) use capacity::uuid_text;
+pub(crate) use prepare::{write_fixed_blocks, ValidateCanonicalEntrySink};
 mod staging;
 #[cfg(test)]
 pub(crate) use prepare::canonical_admission_format_error;
@@ -27,7 +28,6 @@ pub use media::{
 };
 
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;
-const VERIFY_BOOTSTRAP_READ_BYTES: usize = 1024 * 1024;
 const NO_PARITY_BOOTSTRAP_BLOCKS: u64 = 1;
 /// Fresh media begins with the one-block identity bootstrap and its trailing
 /// filemark before any Object can be admitted.
@@ -45,6 +45,12 @@ pub use model::*;
 
 mod selection;
 pub use selection::*;
+
+mod append;
+mod replay;
+mod resume_authority;
+#[cfg(test)]
+mod test_support;
 
 mod direct;
 pub use direct::*;

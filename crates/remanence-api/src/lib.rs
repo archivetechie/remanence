@@ -108,6 +108,7 @@ mod library;
 mod live_status;
 mod mount;
 mod mount_backend;
+mod mount_support;
 pub use mount_backend::{
     ChangerMount, MountBackend, MountEndpoint, MountError, MountTarget, MountedTape, OperatorMount,
     StandaloneFinalizeRequest,
@@ -125,6 +126,7 @@ pub mod readiness_wait;
 mod startup_checkpoint;
 mod startup_guard;
 mod startup_media_readiness;
+mod tape_identity;
 mod tape_init;
 mod tape_verification;
 mod terminal_fault;
