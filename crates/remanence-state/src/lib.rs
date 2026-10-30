@@ -19,6 +19,7 @@ pub use media::{tape_generation, GenerationSource, LabelProvenance, LtoGen, Medi
 pub use remanence_library::DriveKey;
 pub mod paths;
 pub mod state;
+pub mod tape_log;
 
 pub use adapters::{
     append_library_audit_event, append_parity_recovery_event, append_sidecar_metadata_health_event,
