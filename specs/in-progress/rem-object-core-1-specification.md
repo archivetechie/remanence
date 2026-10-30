@@ -1599,10 +1599,12 @@ and what it adds to the terminal replicas' Object recovery rows, is:
    object's stored blocks are contiguous (stored `BodyLba` 0..N−1). Parity
    epochs span objects; sidecars land between tape files. None of this is
    visible in, or part of, the object's stored bytes.
-3. An object is *committed* when the parity layer's durable object-commit
-   operation completes ([REMPARITY]); neither representation defines an
-   in-band commit marker. REM-ENCRYPT completion framing is not a commit
-   barrier.
+3. An object is *committed* when a synchronizing barrier proves its blocks
+   and filemark on the medium and a durable off-tape commit record, written
+   after that barrier, names it ([REMPARITY] Section 11.2). Post-commit
+   verification and parity for an open epoch may follow; neither is a
+   condition of durability. Neither representation defines an in-band commit
+   marker. REM-ENCRYPT completion framing is not a commit barrier.
 4. **Informative:** REM-PARITY §10.3 defines the encrypted-object Object
    recovery row, while Section 8.2 states the obligation this document places
    on the REM-PARITY Writer. This relationship is additive and does not change

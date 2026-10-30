@@ -1,4 +1,18 @@
-# Tape-I/O fence API
+# API reference
+
+## Write sessions
+
+`CheckpointSession` costs a synchronizing barrier and a durable commit record;
+it need not end the open parity epoch.
+A session close costs the final barrier and commit record, followed by any
+remaining short epoch's full sidecar and its closeout barrier under the
+recommended session policy.
+`CHECKPOINTED` means the Object is durable; parity for its open epoch may follow.
+The scope of `caller_object_id` for retry identity is the pool.
+Session opens queue for a drive; clients accumulate ready Objects before
+opening and stream the batch when admitted.
+
+## Tape-I/O fences
 
 The `LibraryService` service owns readiness quarantine and administrative fence
 release. The `Daemon` service provides process health.

@@ -1,4 +1,4 @@
-# Object sizing for terminal-index tapes
+# Sizing objects and write sessions
 
 This page explains how the size of the Objects you write affects a tape, and how
 the writer decides that an Object still leaves room to close the tape. An
@@ -9,10 +9,10 @@ has no fixed ceiling. Block size and Object count still determine how much
 space the index occupies, and the writer's capacity check counts that space
 (see below).
 
-Object size still affects the tape in other ways. It controls tape-file and filemark
-overhead, the number of recovery rows in each terminal replica, how often
-parity is closed out, catalog scale, and the amount of work needed to retry a
-whole Object on another tape.
+Object size controls tape-file and filemark overhead, the number of recovery
+rows in each terminal replica, catalog scale, and the work needed to retry a
+whole Object on another tape. Session size controls how often a session ends
+a short parity epoch. Several Objects can share one session and one epoch.
 
 ## What admission reserves
 
@@ -62,8 +62,7 @@ Each stored Object consumes:
 - one tape file and trailing filemark;
 - one 64-byte structural slot in every terminal replica;
 - one 256-byte Object recovery slot in every terminal replica;
-- catalog, journal, audit, and verification work; and
-- parity closeout overhead when the workload forces a short epoch.
+- catalog, journal, audit, and verification work.
 
 Small files should therefore be bundled into one REM-OBJECT object. Each member
 remains individually named and checksummed in
@@ -92,6 +91,30 @@ ceiling. Larger bundles reduce filemark, row, and catalog overhead. Smaller
 bundles reduce retry cost, staging requirements, and the amount of unrelated
 data read for a whole-Object restore. A sensible target should also fit the
 available spool and memory budget with room for the configured write pipeline.
+
+## Write-session costs
+
+A checkpoint pays for a synchronizing barrier and a durable commit record; it
+need not end the open epoch. A close commits the last Objects, then the
+recommended session policy ends any remaining short epoch and commits its
+sidecar. The client can receive durable receipts before parity closeout
+finishes. These are separate costs from each Object's filemark and index rows.
+
+A sidecar always carries `S × m` parity shards, including for a short epoch.
+At the default geometry, 16 GiB of Object blocks fills an epoch and every
+sidecar has 512 MiB of parity shards. With no early endings inside a session,
+the parity charge for a nonempty session is
+`ceil(session_data_bytes / (16 GiB)) × 512 MiB`. A 5 GiB session pays 10% in
+parity shards, 50 GiB pays 4%, and 500 GiB pays 3.2%. These binary-unit figures
+exclude sidecar metadata, filemarks and terminal structures; an exact multiple
+of a full epoch needs no extra short sidecar.
+
+Accumulate ready Objects in the orchestrator and write them in one session.
+Batching Objects reduces short-epoch overhead without changing member layout
+or combining Objects. Choose the batch's size and age limits from spool space
+and acceptable waiting time. The
+[Implementation Guide, section 9.3](../specs/publication/rem-implementation-guide.md#93-batch-synchronization-behind-one-barrier)
+gives the cost table and the session-close recommendation.
 
 ## Block-size tradeoffs
 

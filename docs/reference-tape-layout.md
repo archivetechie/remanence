@@ -104,9 +104,13 @@ Parity-protected writes require LTO hardware compression disabled on the
 drive; compression would decouple logical block counts from physical
 media, and the stripe geometry is physical.
 
-Durability barriers may close the current epoch even when it is short. A
-batch-of-one workload therefore pays for more short-epoch sidecars than a
-well-batched workload. Before an Object moves, admission includes the complete
+A durability barrier proves files on the medium; the subsequent durable
+commit record commits them. It need not end the open epoch. Every sidecar
+carries the full `S × m` parity region, even for a short epoch. Under the
+recommended policy of ending the remaining epoch at session close, small
+sessions pay more short-epoch overhead. Object size and session size have
+separate costs; [Sizing objects and write sessions](guide-object-sizing.md)
+explains them. Before an Object moves, admission includes the complete
 Object commit and the exact terminal reserve: parity closeout, three replica
 charges, two separation extent charges, and safety allowance. Each header, footer, record,
 and filemark is charged once.
