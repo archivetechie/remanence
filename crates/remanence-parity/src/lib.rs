@@ -85,7 +85,7 @@ pub use capacity::{
     CapacityReserveCause, CapacityReserveRemedy, TerminalTripleCloseInput,
     TerminalTripleCloseReport, TerminalTripleObjectReservation,
 };
-pub use check_value::{check_value, CheckValue, CheckValueBuilder};
+pub use check_value::{check_value, CheckProvenance, CheckValue, CheckValueBuilder, CommitCursor};
 pub use diagnostic_text::escape_member_name;
 pub use error::{BootstrapRefusedField, ParityError};
 pub use filemark_map::{

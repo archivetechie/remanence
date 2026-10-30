@@ -57,3 +57,23 @@ pub fn check_value(block_crcs: impl IntoIterator<Item = u64>) -> CheckValue {
     }
     builder.value()
 }
+
+/// Source of the uncovered-range check; neither nonempty variant proves readback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckProvenance {
+    /// W=T and check zero.
+    Empty,
+    /// Computed from original write bytes.
+    OriginalWrite,
+    /// Includes reread bytes not compared to prior authority (until step 3).
+    UnverifiedRebuild,
+}
+
+/// Barrier-proved physical append coordinate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CommitCursor {
+    /// SCSI partition.
+    pub partition: u32,
+    /// Logical block/filemark coordinate.
+    pub lba: u64,
+}
