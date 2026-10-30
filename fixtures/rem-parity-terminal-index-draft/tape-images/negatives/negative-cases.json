@@ -516,18 +516,18 @@
         {"variant": "a-covered-prefix", "field": "covered-prefix tape-file count", "offset": "0x048", "from": 6, "to": 7, "must_match": "structural_row_count (6) and replica A's planned tape-file number (6) (Section 10.6); the digest scope of exactly the leading tape_file_count entries (Section 7.4)"},
         {"variant": "b-total-data-ordinals", "field": "total data ordinals", "offset": "0x050", "from": 5, "to": 6, "must_match": "T recomputed over the prefix (Sections 7.2, 7.4) = 5; and highest_protected_ordinal (5), because sidecars are present (Section 10.6)"},
         {"variant": "c-highest-protected", "field": "highest protected ordinal", "offset": "0x058", "from": 5, "to": 4, "must_match": "W recomputed over the prefix (Sections 7.2, 7.4) = 5; and total_data_ordinals (5) (Section 10.6)"},
-        {"variant": "d-total-isolated", "base_override": "terminal profile minimal-256k replica A", "field": "total data ordinals", "offset": "0x050", "from": 0, "to": 1, "must_match": "T recomputed = 0 (no Object rows). No sidecars, so the W = T rule does not apply and only the Section 7.4 cross-check fails; W (0) <= T (1) still holds"}
+        {"variant": "d-total-isolated", "base_override": "terminal profile minimal-256k replica A", "field": "total data ordinals", "offset": "0x050", "from": 0, "to": 1, "must_match": "T recomputed = 0 (no Object rows). Only the Section 7.4 cross-check fails; W (0) <= T (1) still holds"}
       ],
       "base": {"artifact": "terminal profile multi-256k", "component": "replica-a.bin", "location": "header record (file offset 0) and footer record (file offset 524288); the same value is written in both"},
       "target": "replica scope validation (Sections 7.4, 10.6)",
       "mutation": {"field": "see variants"},
       "integrity_repair": ["R-TR-COMMON: all three fields are in the edition digest preimage, so recompute the edition digest (0x0E8) and the descriptor digest (0x128) in both frames, the header CRC, the footer's header-record SHA-256 (0x2B8) and the footer CRC. Payload and canonical-map digests are unchanged and still verify."],
-      "concurrent_checks": ["variants b, c: the Section 10.6 W = T equality and the Section 7.4 recompute both fail"],
+      "concurrent_checks": ["variants b, c: the Section 7.4 scalar recompute fails; W < T alone is valid under Section 10.6"],
       "shadowed": false,
       "expected": {"error": "TerminalIndexReplicaParse"},
       "tape_level": "A is not locally eligible; B and C agree and are accepted as degraded evidence. Because A fails validation, its different edition-common values are not a TerminalIndexReplicaConflict (Section 8.5 compares only fully valid replicas).",
       "sections": ["7.2", "7.4", "10.6", "8.5", "15"],
-      "quotes": ["When a Reader validates a terminal digest, it MUST recompute the digest over exactly the leading `tape_file_count` entries and cross-check all three scalars.", "when sidecars are present, `highest_protected_ordinal` equals `total_data_ordinals`, so finalization left no Object ordinal unprotected;", "`covered_prefix_tape_file_count`, `structural_row_count`, and replica A's planned tape-file number are equal."],
+      "quotes": ["When a Reader validates a terminal digest, it MUST recompute the digest over exactly the leading `tape_file_count` entries and cross-check all three scalars.", "when sidecars are present, `highest_protected_ordinal` is at most `total_data_ordinals`; the range between them is unprotected and may be nonempty on a finalized tape; both are the recorded fields, and Section 7.4 separately requires each to equal the value recomputed from the map;", "`covered_prefix_tape_file_count`, `structural_row_count`, and replica A's planned tape-file number are equal."],
       "pinned": true,
       "pin_note": "FilemarkMapDigestMismatch is not the outcome: the canonical-map digest itself recomputes, and Section 15 gives that name to a 'replica structural projection digest mismatch'. Section 7.4 ties the scalar cross-check to digest validation, so a blind reading of variant d may differ; see NOTES.md."
     },

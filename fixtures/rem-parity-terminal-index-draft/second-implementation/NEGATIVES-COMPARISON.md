@@ -30,6 +30,8 @@ The full three-way table is kept with the review record.
 
 ## The single-violation supplement
 
+The former equality-only negative `sup-21` (`terminal-scope-scalars/isolated-3`) now expects an accepted terminal inventory with `[2, 5)` unprotected. Its image bytes stay unchanged. The second implementation follows that expectation; the reference acceptance test is ignored until migration step 6. No other case changes outcome.
+
 This implementation decided the 49 variants of the supplement's first version under opaque ids
 (`negative-supplement-decisions.json`; `blind-supplement-mapping.json` relates the ids to the variants). Compared with that
 version's expectations:

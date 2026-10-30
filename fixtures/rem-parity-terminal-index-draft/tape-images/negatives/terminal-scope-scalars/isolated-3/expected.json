@@ -5,8 +5,12 @@
   },
   "every_other_rule_holds": "T = 5 and W = 2 equal their recomputes (Section 7.4), and W ≤ T. The rows are dense and the first ordinals contiguous. The ParityMap row is last and present because a sidecar row is present. The bijection holds, covered = rows = A's planned tape-file number = 5, and the layout, digests and footers are consistent.",
   "expected": {
-    "error": "TerminalIndexReplicaParse",
-    "tape_level": "BotStructuralRecoveryRequired"
+    "outcome": "ACCEPTED",
+    "tape_level": "Inventory from A/B/C",
+    "unprotected_range": [
+      2,
+      5
+    ]
   },
   "group": "7b",
   "id": "terminal-scope-scalars/isolated-3",
@@ -16,16 +20,17 @@
   "mutation": {
     "fields": "total data ordinals = 5 and highest protected ordinal = 2, both equal to their recomputes"
   },
-  "parent": "terminal-scope-scalars (variants b, c: W = T rule)",
+  "parent": "terminal-scope-scalars (uncovered finalization)",
   "pinned": true,
   "quotes": [
-    "when sidecars are present, `highest_protected_ordinal` equals `total_data_ordinals`, so finalization left no Object ordinal unprotected;"
+    "when sidecars are present, `highest_protected_ordinal` is at most `total_data_ordinals`; the range between them is unprotected and may be nonempty on a finalized tape; both are the recorded fields, and Section 7.4 separately requires each to equal the value recomputed from the map;"
   ],
+  "reference_acceptance": "migration step 6; the reference Reader acceptance test is ignored until then",
   "sections": [
     "10.6",
     "7.2",
     "7.4"
   ],
-  "target": "replica pre-A relationship 'when sidecars are present, highest_protected_ordinal equals total_data_ordinals' (Section 10.6)",
-  "violates_only": "Section 10.6 W = T when sidecars are present (2 ≠ 5)"
+  "target": "valid terminal inventory with recomputed W = 2 and T = 5; [2, 5) reported as unprotected (Sections 7.4, 10.6)",
+  "violates_only": "none; the former W = T requirement is retired"
 }

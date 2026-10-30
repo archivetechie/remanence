@@ -545,7 +545,7 @@ recomputed values rather than on the recorded fields, so it also reports
 that rule. The text names the recorded fields
 (`highest_protected_ordinal`, `total_data_ordinals`). This is a known
 divergence in BUILD-LOG.
-**Decided by the revised text.** Section 10.6 now says of the `W = T` rule: "both are the recorded fields, and Section 7.4 separately requires each to equal the value recomputed from the map". This implementation now evaluates the recorded fields, so the divergence is gone and sup-32 breaks one rule.
+**Decided by the revised text.** Section 10.6 permits `W < T` on a finalized tape and keeps each recorded scalar equal to its recomputation. The second implementation accepts sup-21 and reports `[2, 5)` as unprotected; sup-32 still breaks only the W recomputation rule. The reference Reader retains its full-coverage check until migration step 6.
 
 **G-8. Fixture notes (no text defect).**
 - The variants name one another by labels `supplement.json` does not

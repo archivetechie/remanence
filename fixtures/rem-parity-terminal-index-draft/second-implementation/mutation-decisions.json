@@ -3143,7 +3143,7 @@
             },
             {
               "section": "10.6",
-              "quote": "when sidecars are present, `highest_protected_ordinal` equals `total_data_ordinals`, so finalization left no Object ordinal unprotected;"
+              "quote": "when sidecars are present, `highest_protected_ordinal` is at most `total_data_ordinals`; the range between them is unprotected and may be nonempty on a finalized tape; both are the recorded fields, and Section 7.4 separately requires each to equal the value recomputed from the map;"
             },
             {
               "section": "10.6",
@@ -3158,7 +3158,7 @@
               "quote": "TerminalIndexReplicaParse replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6"
             }
           ],
-          "why": "The recorded total data ordinals (6) differs from T recomputed over the structural rows (5), W (5) no longer equals it although sidecars are present, and the edition digest (left stale) does not recompute. Section 10.6 fixes no order among its conditions, and every failing one has the same name."
+          "why": "The recorded total data ordinals (6) differs from T recomputed over the structural rows (5), and the edition digest (left stale) does not recompute. W < T alone is permitted. Section 10.6 fixes no order among its conditions, and every failing one has the same name."
         },
         "tape": {
           "outcome": "inventory",

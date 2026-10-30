@@ -7,7 +7,7 @@
 | Status | Review draft |
 | Document version | 1.0 |
 | Version | 1.0.0-draft.5 |
-| Date | 2026-09-06 |
+| Date | 2026-10-29 |
 | License | CC-BY-4.0 |
 | Concept DOI (all revisions of this document) | [10.5281/zenodo.21719156](https://doi.org/10.5281/zenodo.21719156) |
 | Reference implementation (informative) | Zenodo concept DOI [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) — software deposit, Apache-2.0 |
@@ -43,6 +43,11 @@ contract. Barrier timing and short-epoch boundaries are Writer choices; this
 change alters no tape byte, valid tape or Reader rule. Resume-vector inputs
 add ordered block CRC evidence; existing outcomes stay unchanged, and one
 negative case rejects a changed recorded CRC.
+
+A finalized tape may carry an unprotected range `[W, T)`, which Verifiers
+report; no tape valid before becomes invalid. One draft vector (isolated-3),
+which tested only the retired equality, now expects a valid tape; no other
+vector outcome changes, and the reference Reader follows in migration step 6.
 
 **Comments close on 30 April 2027, and the documents freeze on 31 July 2027**,
 one year after publication. On that date the finality promise below takes
@@ -353,6 +358,9 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD",
 document are to be interpreted as described in BCP 14 [RFC2119] [RFC8174]
 when, and only when, they appear in all capitals, as shown here.
 
+Rules stated in the plain present tense in Sections 11 and 14 are
+requirements, as binding as the capitalised keywords.
+
 A paragraph that opens with *Rationale.* is informative and states no
 requirement.
 
@@ -381,6 +389,9 @@ A single implementation may fill several roles.
   ParityMap (`ParityMapParse`, Section 10.1.4), and the Verifier reports that
   error. A medium error on such a component is reported as
   an unreadable component. A non-medium fault of the transport stays `TapeIo`.
+  A Verifier reports `[W, T)` as unprotected when `W < T`, including on a
+  finalized tape; this report is not an error or a finding of damage about
+  the prefix and does not by itself prevent reporting the tape as complete.
   A Verifier's validation is
   a full verification: it reads every data block that a sidecar protects and
   every parity shard, and checks each against its sidecar's index
@@ -654,8 +665,10 @@ record the implementation does not treat as commit authority, such as a
 rebuildable catalog or cache, does not commit a tape file.
 
 An open tape whose commit records are lost can be read, but cannot be resumed
-or finalized, so it never gains terminal replicas. Recommended practice for
-commit records and this loss is described in the REM Implementation and
+or finalized, so it never gains terminal replicas. A tape refused for a
+Section 11.5 proof failure may still finalize under Section 11.6's exception;
+loss of commit records does not qualify. Recommended practice for commit
+records and this loss is described in the REM Implementation and
 Operations Guide, under “Writing tapes: sessions, commit and resume”.
 
 Finalization has a separate irreversible lifecycle:
@@ -742,8 +755,9 @@ protects the block with Reed–Solomon parity (Section 6) at the epoch's
 geometry. Between sidecar commits, fewer than one epoch's worth of
 committed data is pending (`W ≤ ordinal < T`, Section 11.4): durable, but
 not yet repairable, and recovery refuses it as such (Section 13.2).
-Finalization (Section 11.6) closes the final epoch, so on a finalized tape
-every object block is protected. The format provides:
+On a finalized tape every object block is protected unless the Writer
+finalized with an uncovered range (Section 11.6), in which case exactly
+`[W, T)` of the committed prefix is unprotected. The format provides:
 
 1. **Structural addressing.** `(tape_file_number, object_block_index)`
    resolves through the filemark map to a `ParityDataOrdinal` and back, so
@@ -1898,11 +1912,12 @@ tail-copy-known-good. Unknown flag bits MUST be rejected.
 **Writer rules.** In this revision a Writer MUST set the directory's
 `is_final_directory` (key 4) to `true` (CBOR 0xF5), and the ParityMap header
 and footer byte at 0x90 to 1. The directory's unprotected range
-`[scope_highest_protected_ordinal, scope_total_data_ordinals)` is empty,
-because finalization closes the partial epoch before it writes the ParityMap
-(Section 11.6). A Writer MUST set `FINAL_PARTIAL_EPOCH` on the short epoch
-that the finalization sequence ends, and only there (Section 11.6); it MUST
-leave it clear on every short epoch ended before finalization.
+`[scope_highest_protected_ordinal, scope_total_data_ordinals)` is empty unless
+the Writer finalized with an uncovered range, in which case it is exactly
+`[W, T)` of the committed prefix (Section 11.6). A Writer MUST set
+`FINAL_PARTIAL_EPOCH` on the short epoch that the finalization sequence ends,
+if it ends one, and on no other epoch (Section 11.6); it MUST leave it clear
+on every short epoch ended before finalization.
 
 **Reader rules.** Whenever a Reader decodes a sidecar epoch directory, it MUST
 validate all of the following invariants; a violation is `DirectoryInvalid`
@@ -1915,7 +1930,8 @@ time what Section 9.2 requires of the on-tape sidecar-header sequence:
   `parity_shard_block_count`;
 - `scope_highest_protected_ordinal ≤ scope_total_data_ordinals` (the range
   `[scope_highest_protected_ordinal, scope_total_data_ordinals)` is the tail of
-  committed-but-unprotected ordinals permitted by Section 11.4);
+  committed-but-unprotected ordinals permitted by Section 11.4 and, on a
+  finalized tape, Section 11.6);
 - the protected ranges **partition `[0, scope_highest_protected_ordinal)`**:
   taken in ascending `tape_file_number` order, the first
   `protected_ordinal_start` is `0`, each entry's `protected_ordinal_start` equals
@@ -2329,8 +2345,9 @@ additional relationships hold:
 - a `ParityMap` row, when present, is the final structural row;
 - a final `ParityMap` is present if and only if at least one
   `ParitySidecar` row is present;
-- when sidecars are present, `highest_protected_ordinal` equals
-  `total_data_ordinals`, so finalization left no Object ordinal unprotected;
+- when sidecars are present, `highest_protected_ordinal` is at most
+  `total_data_ordinals`; the range between them is unprotected and may be
+  nonempty on a finalized tape;
   both are the recorded fields, and Section 7.4 separately requires each to
   equal the value recomputed from the map;
 - replica A's planned start LBA equals the end of the covered prefix,
@@ -2413,9 +2430,13 @@ Writer proves that they are the committed bytes. Its commit records, written
 no later than each block's commit, bind every such block's `data_shard_crc64`
 (Section 6.7), either value by value or through one check value, the CRC-64/XZ
 (Section 5.1) of their little-endian encodings in ascending ordinal order,
-and the blocks read back reproduce that evidence. A boundary or wrong-length read there, or a block that does not
-reproduce the evidence, is `ResumeAppend`; a medium or transport failure is
+and the blocks read back reproduce that evidence. A boundary or wrong-length
+read there, or a block that does not reproduce the evidence, is `ResumeAppend`;
+a medium or transport failure is
 `TapeIo`. Bytes that fail the proof are never covered by a sidecar.
+
+These failures refuse Object appends and parity over those bytes;
+Section 11.6 permits finalization after recorded operator acceptance.
 
 ### 11.6. Finalization (W6)
 
@@ -2423,8 +2444,12 @@ Finalization begins between Objects, at a durable decision that ends Object
 admission for good. It ends any open epoch and writes its sidecar, writes the
 final ParityMap when any sidecar exists, then exactly A, AB, B, BC and C, each
 committed in turn. After a failure a Writer only completes the remaining
-files of this sequence, at proved positions. A tape is reported finalized
-only with three complete replicas.
+files of this sequence, at proved positions. If W5 cannot prove the open
+epoch's blocks, because they do not reproduce the evidence (`ResumeAppend`)
+or cannot be read (`TapeIo`), finalization continues only on the operator's
+recorded acceptance: that epoch gets no sidecar, the range is recorded as
+`W < T`, and the rest of the sequence is written as above. A tape is reported
+finalized only with three complete replicas.
 
 When to take barriers, when to end a short epoch, whether a resumed Writer
 ends or continues its open epoch, and how commit records are stored are the
@@ -2756,12 +2781,15 @@ walked map gives no validated scope beyond the bootstrap's. The sidecar epoch
 directory of the tape's final ParityMap is also an input whenever that
 ParityMap validates and is marked `is_final_directory`.
 
+On a finalized tape with `W < T`, the Recoverer recovers what the sidecars
+cover under this section's rules and reports `[W, T)` as unprotected.
+
 ### 13.2. Typed Refusals
 
 The Recoverer MUST reject, as typed refusals distinct
 from recovery failures: ordinals outside the validated scope
-(`OutsideValidatedMapPrefix`); ordinals ≥ `W` — the pending epoch, whose
-parity does not exist yet (`UnrecoverablePendingEpoch`); and failed blocks
+(`OutsideValidatedMapPrefix`); ordinals ≥ `W` — the unprotected range, whose
+parity does not exist (`UnrecoverablePendingEpoch`); and failed blocks
 or sidecars in tape files outside the durable boundary.
 
 ### 13.3. Acquiring the Sidecar Index
@@ -2981,6 +3009,7 @@ the last object, and not at the watermark.
    `ResumeAppend` too.
    A Resumer may take `S` and `k` from its commit records or from the bootstrap.
 3. Apply Section 11.5 (W5) to the blocks of `[W, T)`.
+   That section states the refusal scope and the finalization exception.
 4. Apply Section 11.3 (W3) before appending.
 
 Anything physically on tape beyond the committed prefix is superseded by
@@ -3011,7 +3040,7 @@ FilemarkMapDigestMismatch       replica structural projection digest mismatch, o
                                 projection or scope fields disagree with the final ParityMap
 FilemarkMapReconstruct          BOT recovery walk could not produce a valid map
 OutsideValidatedMapPrefix       refusal: address beyond the validated scope (Section 13.2)
-UnrecoverablePendingEpoch       refusal: ordinal ≥ W, parity not yet written
+UnrecoverablePendingEpoch       refusal: ordinal ≥ W, parity does not exist
 Unrecoverable{stripe, lost_count, limit}   more than m erasures in a stripe
 ReedSolomon                     matrix inversion or codec failure
 CapacityReserveExceeded         exact terminal/parity reserve is unavailable
@@ -3247,10 +3276,12 @@ location formula that a vector can reach. Each gives the mutation at the level
 of this document's tables and the checksums repaired so that the mutation
 reaches its rule, or the formula's inputs where only a test of the formula
 itself reaches it, or the reason no vector can exist. Many cases break more
-than one rule; each variant breaks one, and the supplement records 14 entries
-that cannot be isolated. Each gives the Section 15 error this document
-requires, the set of errors it permits, a required rejection with no named
-error, or an informative outcome. The `section15` column of `MUTATIONS.tsv`
+than one rule; each variant breaks one, except
+`terminal-scope-scalars/isolated-3`, which is now an accepted case. The
+supplement records 14 entries that cannot be isolated. Each gives the
+Section 15 error this document requires, the set of errors it permits, a
+required rejection with no named error, an accepted result, or an informative
+outcome. The `section15` column of `MUTATIONS.tsv`
 gives the same for the earlier terminal mutations.
 
 The second implementation, `tools/rem_parity_second_implementation.py`, was
@@ -3606,6 +3637,12 @@ the published revision 1.0.0-draft.2 (2026-09-06, SHA-256
 `1e4ad796bd77291f731d8d2611231984ba778f3650c1597f80eebdc7ba359fd2`), which is
 an errata revision of draft.1.
 
+- **2026-10-29 — 1.0.0-draft.5 — draft milestone (uncovered finalization).**
+  A finalized tape may carry an unprotected range `[W, T)`, which Verifiers
+  report; no tape valid before becomes invalid. One draft vector (isolated-3),
+  which tested only the retired equality, now expects a valid tape; no other
+  vector outcome changes, and the reference Reader follows in migration step 6.
+
 - **2026-10-29 — 1.0.0-draft.5 — draft milestone (Writer contract).**
   Section 11 states six Writer rules for tape files, commits, append positions,
   epochs, parity from read-back and finalization. Sections 3.4 and 14 use that
@@ -3913,7 +3950,7 @@ an errata revision of draft.1.
     Section 10.1.3 requires the ParityMap's `block_size` to equal the tape's,
     and Section 10.1.4 extends header–footer agreement to every field both
     carry.
-  - Section 10.6's `W = T` rule names the recorded fields; Section 12.6
+  - Section 10.6's now-retired `W = T` rule names the recorded fields; Section 12.6
     defines a degraded inventory; Section 13.5 defines `lost_count`.
   - Section 14 refuses a committed prefix that records a terminal component
     or a final ParityMap, and names the outcome of a failed re-read.
@@ -4306,6 +4343,12 @@ an errata revision of draft.1.
 ## Appendix D. Open Items (Informative)
 
 This is the live preparing-copy snapshot for generation 2.
+The reference Reader still refuses a finalized tape with `W < T`; migration
+step 6 relaxes it together with recovery and verification of such a tape,
+and adds the writer-side vector. The draft vector
+`terminal-scope-scalars/isolated-3` now expects a valid tape and reports
+`[2, 5)` as unprotected; its reference acceptance test remains ignored until
+that step.
 
 1. **TT-1 — byte derivation by the terminal verifier (candidate evidence
    passed).** The terminal verifier, a Python implementation, reproduces all
@@ -4399,7 +4442,7 @@ This is the live preparing-copy snapshot for generation 2.
      most `P` makes `total − 1 − P` negative, and the epoch is then
      metadata-unavailable (Section 13.3), not a rejection of the replica.
    - The three readings this item listed are now stated: exact integer values
-     (Section 2.4), the recorded fields in Section 10.6's `W = T` rule, and the
+     (Section 2.4), the recorded fields in Section 10.6's now-retired `W = T` rule, and the
      tail copy at `H + P`, with a directory entry's total equal to
      `2H + P + 1` (Section 13.3).
    - Section 2.2 includes in a Verifier's full check the Recoverer's index and

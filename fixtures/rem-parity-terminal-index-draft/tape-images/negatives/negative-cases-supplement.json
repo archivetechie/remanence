@@ -916,7 +916,7 @@
       ],
       "target": "the Section 7.4 T cross-check",
       "violates_only": "Section 7.4 'cross-check all three scalars': T recomputed over the prefix is 0 (no Object rows), but 1 is recorded",
-      "every_other_rule_holds": "There are no sidecar rows, so the W = T rule of Section 10.6 does not apply. W = 0 ≤ T = 1 (Section 2.3). covered = rows = A's planned file = 1. The digests recompute over the unchanged payload, and the frames agree.",
+      "every_other_rule_holds": "There are no sidecar rows; Section 10.6 permits an unprotected tail. W = 0 ≤ T = 1 (Section 2.3). covered = rows = A's planned file = 1. The digests recompute over the unchanged payload, and the frames agree.",
       "expected": {
         "error": "TerminalIndexReplicaParse"
       },
@@ -932,7 +932,7 @@
     },
     {
       "id": "terminal-scope-scalars/isolated-3",
-      "parent": "terminal-scope-scalars (variants b, c: W = T rule)",
+      "parent": "terminal-scope-scalars (uncovered finalization)",
       "group": "7b",
       "base": {
         "artifact": "new terminal profile 'multi-unprotected-256k', rebuilt from multi-256k's inputs without the second sidecar",
@@ -944,12 +944,16 @@
       "integrity_repair": [
         "the profile is generated consistently: payload, canonical-map, edition, layout and descriptor digests, CRCs and header hashes in all five components"
       ],
-      "target": "replica pre-A relationship 'when sidecars are present, highest_protected_ordinal equals total_data_ordinals' (Section 10.6)",
-      "violates_only": "Section 10.6 W = T when sidecars are present (2 ≠ 5)",
+      "target": "valid terminal inventory with recomputed W = 2 and T = 5; [2, 5) reported as unprotected (Sections 7.4, 10.6)",
+      "violates_only": "none; the former W = T requirement is retired",
       "every_other_rule_holds": "T = 5 and W = 2 equal their recomputes (Section 7.4), and W ≤ T. The rows are dense and the first ordinals contiguous. The ParityMap row is last and present because a sidecar row is present. The bijection holds, covered = rows = A's planned tape-file number = 5, and the layout, digests and footers are consistent.",
       "expected": {
-        "error": "TerminalIndexReplicaParse",
-        "tape_level": "BotStructuralRecoveryRequired"
+        "outcome": "ACCEPTED",
+        "tape_level": "Inventory from A/B/C",
+        "unprotected_range": [
+          2,
+          5
+        ]
       },
       "sections": [
         "10.6",
@@ -957,9 +961,10 @@
         "7.4"
       ],
       "quotes": [
-        "when sidecars are present, `highest_protected_ordinal` equals `total_data_ordinals`, so finalization left no Object ordinal unprotected;"
+        "when sidecars are present, `highest_protected_ordinal` is at most `total_data_ordinals`; the range between them is unprotected and may be nonempty on a finalized tape; both are the recorded fields, and Section 7.4 separately requires each to equal the value recomputed from the map;"
       ],
-      "pinned": true
+      "pinned": true,
+      "reference_acceptance": "migration step 6; the reference Reader acceptance test is ignored until then"
     },
     {
       "id": "terminal-scope-scalars/isolated-4",
@@ -976,7 +981,7 @@
       ],
       "target": "the Section 7.4 W cross-check",
       "violates_only": "Section 7.4 cross-check of highest_protected_ordinal against W recomputed over the prefix (5 ≠ 2)",
-      "every_other_rule_holds": "W = T (5 = 5), so the Section 10.6 rule holds. T equals its recompute and W ≤ T. The rest is as in isolated-3.",
+      "every_other_rule_holds": "Recorded W = T = 5 satisfies W ≤ T, and T equals its recompute. The rest is as in isolated-3; only the W recomputation fails.",
       "expected": {
         "error": "TerminalIndexReplicaParse",
         "tape_level": "BotStructuralRecoveryRequired"
@@ -1010,7 +1015,13 @@
       "expected": {
         "error": "ResumeAppend"
       },
-      "sections": ["3.2", "3.4", "14", "2.4", "11.3"],
+      "sections": [
+        "3.2",
+        "3.4",
+        "14",
+        "2.4",
+        "11.3"
+      ],
       "quotes": [
         "A Writer starts writing only immediately after the committed prefix, at a position it has proved, and then writes contiguously."
       ],
@@ -1019,7 +1030,7 @@
     },
     {
       "id": "overflow-7.2-T/isolated",
-      "parent": "overflow-7.2-T (added: the parent's forged count also broke the W = T rule, because sidecars were present)",
+      "parent": "overflow-7.2-T (isolated T overflow and scalar recomputation)",
       "group": "7c",
       "base": {
         "artifact": "new terminal profile 'huge-object-256k'",
@@ -1033,7 +1044,7 @@
       ],
       "target": "replica scope validation, T = max(first + block_count) (Sections 7.2, 7.4, 10.6)",
       "violates_only": "Checked evaluation of T: 1 + (2^64 − 1) overflows u64",
-      "every_other_rule_holds": "The first ordinals are dense: file 2's first ordinal 1 equals the running total after file 1. There are no sidecar rows, so the W = T rule and the ParityMap-iff-sidecar rule hold vacuously. W = 0 matches its recompute. The Object rows are in bijection with the kind-0 rows and match their block counts, and the manifest ranges fit. covered = rows = A's planned tape-file number, and the layout and digests are consistent.",
+      "every_other_rule_holds": "The first ordinals are dense: file 2's first ordinal 1 equals the running total after file 1. There are no sidecar or ParityMap rows, so the ParityMap-iff-sidecar rule holds. W = 0 matches its recompute. The Object rows are in bijection with the kind-0 rows and match their block counts, and the manifest ranges fit. covered = rows = A's planned tape-file number, and the layout and digests are consistent.",
       "expected": {
         "error": "TerminalIndexReplicaParse",
         "tape_level": "BotStructuralRecoveryRequired"
@@ -1777,7 +1788,7 @@
     {
       "case": "terminal-scope-scalars (variants b and c on multi-256k)",
       "group": "7b",
-      "reason": "On a prefix where sidecars are present and every Object ordinal is protected, the recomputed T equals the recomputed W. Changing either scalar alone breaks both its recompute and W = T, and changing both together breaks both recomputes. Each rule is isolated instead on another prefix: isolated-2 (T recompute, minimal profile), isolated-3 (W = T) and isolated-4 (W recompute), the last two on a rebuilt prefix whose last Object is unprotected.",
+      "reason": "The original variants change one recorded scalar and fail its Section 7.4 recomputation. Isolated-2 tests T recomputation and isolated-4 tests W recomputation. Isolated-3 retains matching recomputations and now expects an accepted inventory with [2, 5) unprotected.",
       "sections": [
         "7.4",
         "10.6"

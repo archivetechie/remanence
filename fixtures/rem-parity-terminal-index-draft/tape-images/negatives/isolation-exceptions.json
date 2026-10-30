@@ -20,9 +20,9 @@
     {
       "variant": "terminal-scope-scalars/isolated-4",
       "observation": "*",
-      "first_check": "the Section 10.6 W = T rule, evaluated on the recomputed W and T",
+      "first_check": "the reference Reader full-coverage check, retained until migration step 6",
       "target": "the §7.4 W cross-check",
-      "reason": "The variant keeps the recorded fields equal (5 = 5), so §10.6's rule as worded ('highest_protected_ordinal equals total_data_ordinals') holds and only the §7.4 cross-check should fail. The reference evaluates the W = T rule on the recomputed W (2) and T (5), and rejects there first; the second implementation reads it the same way (its BUILD-LOG, sup-32). Whether §10.6 names the recorded or the recomputed values is a text question for D9 (the GAPS G-1 class).",
+      "reason": "The recorded W (5) differs from its recomputation (2), so the Section 7.4 cross-check still rejects this case. The reference Reader rejects earlier because its full-coverage check still requires recomputed W = T; migration step 6 removes that obsolete check. The second implementation rejects only the scalar mismatch.",
       "tt2": null
     },
     {
