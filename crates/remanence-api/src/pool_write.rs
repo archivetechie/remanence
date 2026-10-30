@@ -73,3 +73,7 @@ fn test_fence_config(root: &std::path::Path) -> crate::write_owner::TerminalWrit
 }
 
 pub(crate) use no_parity::requested_copy_identity;
+
+pub(crate) use no_parity::pool_write_object_record_from_native;
+
+pub(crate) use append::reprove_checkpoint_boundary;

@@ -718,8 +718,9 @@ fn provisional_representation_guard_and_session_lease_release() {
         ));
         let (reply, rx) = oneshot::channel();
         owner
+            .client
             .send(DriveCommand::AppendFinish {
-                session_id: owner.session.as_ref().unwrap().0,
+                session_id: owner.client.session.as_ref().unwrap().0,
                 source,
                 archive_path: request.archive_path,
                 caller_object_id: request.caller_object_id,
@@ -805,8 +806,9 @@ fn transferred_reservation_and_audit_latch_survive_into_owner_and_finish() {
     .unwrap();
     let (reply, rx) = oneshot::channel();
     owner
+        .client
         .send(DriveCommand::AppendFinish {
-            session_id: owner.session.as_ref().unwrap().0,
+            session_id: owner.client.session.as_ref().unwrap().0,
             source: crate::WriteObjectSource::PreparedPath(crate::pool_write::PreparedPathSource(
                 prepared,
             )),
@@ -823,8 +825,9 @@ fn transferred_reservation_and_audit_latch_survive_into_owner_and_finish() {
     receive(rx).unwrap();
     let (reply, rx) = oneshot::channel();
     owner
+        .client
         .send(DriveCommand::Checkpoint {
-            session_id: owner.session.as_ref().unwrap().0,
+            session_id: owner.client.session.as_ref().unwrap().0,
             trigger: write_owner::CheckpointTrigger::Append,
             expected_batch_id: None,
             reply: Some(reply),
@@ -1111,8 +1114,9 @@ fn idle_close_allows_reopen_and_keeps_claimed_receipts() {
     .unwrap();
     let (reply, rx) = oneshot::channel();
     owner
+        .client
         .send(DriveCommand::AppendFinish {
-            session_id: owner.session.as_ref().unwrap().0,
+            session_id: owner.client.session.as_ref().unwrap().0,
             source: crate::WriteObjectSource::PreparedPath(crate::pool_write::PreparedPathSource(
                 prepared,
             )),
@@ -1131,8 +1135,9 @@ fn idle_close_allows_reopen_and_keeps_claimed_receipts() {
     loop {
         let (reply, rx) = oneshot::channel();
         owner
+            .client
             .send(DriveCommand::Get {
-                session_id: owner.session.as_ref().unwrap().0,
+                session_id: owner.client.session.as_ref().unwrap().0,
                 reply,
             })
             .unwrap();
@@ -1147,7 +1152,7 @@ fn idle_close_allows_reopen_and_keeps_claimed_receipts() {
     owner.checkpoint().unwrap();
     let receipts = owner.receipts().to_vec();
     assert_eq!(receipts.len(), 1);
-    let session_id = owner.session.as_ref().unwrap().0;
+    let session_id = owner.client.session.as_ref().unwrap().0;
     loop {
         if FileAuditLog::replay(&fixture.config.audit.dir)
             .unwrap()
@@ -1159,6 +1164,10 @@ fn idle_close_allows_reopen_and_keeps_claimed_receipts() {
         assert!(Instant::now() < deadline, "idle timer did not close");
         std::thread::sleep(Duration::from_millis(10));
     }
+    assert_eq!(
+        owner.close_session().unwrap().state,
+        pb::write_session::State::WriteSessionStateClosed as i32
+    );
     let next = owner.open_session("default").unwrap();
     assert_ne!(next.session_id, session_id.as_bytes());
     assert_eq!(owner.receipts(), receipts);
@@ -1166,4 +1175,293 @@ fn idle_close_allows_reopen_and_keeps_claimed_receipts() {
     assert_eq!(owner.receipts().len(), 2);
     owner.abort_session(None).unwrap();
     owner.finish().unwrap();
+}
+
+#[tokio::test]
+async fn cleanup_spawn_failure_finishes_in_place_and_releases_every_obligation() {
+    let (fixture, mut owner) = tokio::task::spawn_blocking(|| {
+        let (fixture, mut state) = Fixture::new(false);
+        let mut mount = OperatorMount::with_transport(
+            Path::new(DEVICE),
+            &StaticAllowlist::new([SERIAL]),
+            Box::new(Transport {
+                inner: ModelTransport::new(fixture.world.clone(), DeviceRole::Drive { bay: BAY }),
+                commands: fixture.commands.clone(),
+                fault: fixture.fault.clone(),
+                evidence: Some(fixture.config.audit.dir.clone()),
+                last_opcode: None,
+            }),
+            &mut state,
+            fixture.root.path(),
+        )
+        .unwrap();
+        let mut mounted = mount
+            .mount(MountTarget::Device {
+                path: DEVICE.into(),
+                expected_uuid: Some(UUID),
+            })
+            .unwrap();
+        mount.reserve(&mut mounted).unwrap();
+        let latch = mount.context.audit_error.clone();
+        mount.finish().unwrap();
+        let mut owner = MountedDrive::start(
+            state,
+            mounted,
+            StaticAllowlist::new([SERIAL]),
+            latch.clone(),
+        )
+        .unwrap();
+        owner.open_session("default").unwrap();
+        owner.append(fixture.request("spawn-failure")).unwrap();
+        (fixture, owner)
+    })
+    .await
+    .unwrap();
+    // Simulate EAGAIN on an async worker. The exceptional synchronous fallback
+    // must use the actor completion channel without Tokio blocking_recv panics.
+    defer_cleanup(owner.owner.take().unwrap(), |_| {
+        Err(std::io::Error::from_raw_os_error(11))
+    });
+    drop(owner);
+    assert!(fixture.reopen().is_ok());
+    let journal = remanence_state::FileCheckpointJournal::open(
+        fixture.config.journal.dir.join("checkpoints"),
+        UUID,
+    )
+    .unwrap();
+    drop(journal.acquire_exclusive().unwrap());
+    let commands = fixture.commands.lock().unwrap();
+    for opcode in [0x16, 0x17] {
+        assert_eq!(commands.iter().filter(|c| c[0] == opcode).count(), 1);
+    }
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|c| c[0] == 0x1e && c[4] == 0)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn frontend_batches_one_invocation_and_all_skips_open_no_session() {
+    let (fixture, state) = Fixture::new(true);
+    let mut owner = fixture.owner(state);
+    crate::startup_checkpoint::RECONCILIATION_COUNT.with(|count| count.set(0));
+    for name in ["first", "second"] {
+        assert!(owner
+            .put_path_version_with_policy(fixture.request(name), false)
+            .unwrap()
+            .is_ok());
+    }
+    let opened = || {
+        FileAuditLog::replay(&fixture.config.audit.dir)
+            .unwrap()
+            .iter()
+            .filter(|r| r.event == AuditEvent::SessionOpened)
+            .count()
+    };
+    assert_eq!(opened(), 1, "one session spans both object checkpoints");
+    assert_eq!(owner.receipts().len(), 2);
+    crate::startup_checkpoint::RECONCILIATION_COUNT.with(|count| assert_eq!(count.get(), 1));
+    owner.finish().unwrap();
+    let sessions = opened();
+    let modifying = || {
+        fixture
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| matches!(c[0], 0x0a | 0x10 | 0x19))
+            .count()
+    };
+    let before = modifying();
+    let mut owner = fixture.owner(fixture.reopen().unwrap());
+    for name in ["first", "second"] {
+        assert!(owner
+            .put_path_version_with_policy(fixture.request(name), false)
+            .unwrap()
+            .is_err());
+    }
+    owner.finish().unwrap();
+    assert_eq!(opened(), sessions);
+    assert_eq!(modifying(), before);
+}
+
+#[test]
+fn frontend_returns_committed_receipt_beside_post_projection_failure() {
+    let (fixture, mut state) = Fixture::new(false);
+    let mut mount = OperatorMount::with_transport(
+        Path::new(DEVICE),
+        &StaticAllowlist::new([SERIAL]),
+        Box::new(Transport {
+            inner: ModelTransport::new(fixture.world.clone(), DeviceRole::Drive { bay: BAY }),
+            commands: fixture.commands.clone(),
+            fault: fixture.fault.clone(),
+            evidence: Some(fixture.config.audit.dir.clone()),
+            last_opcode: None,
+        }),
+        &mut state,
+        fixture.root.path(),
+    )
+    .unwrap();
+    let mounted = mount
+        .mount(MountTarget::Device {
+            path: DEVICE.into(),
+            expected_uuid: Some(UUID),
+        })
+        .unwrap();
+    let audit = mount.context.audit_error.clone();
+    mount.finish().unwrap();
+    let cfg = mounted_config(&state, &mounted, StaticAllowlist::new([SERIAL]), audit).unwrap();
+    cfg.io_memory
+        .epoch_test_action
+        .store(9, std::sync::atomic::Ordering::Relaxed);
+    let endpoint = cfg.mounted().unwrap().endpoint.clone();
+    let (tx, thread) = write_owner::spawn_mounted_actor(mounted, cfg).unwrap();
+    let mut owner = MountedDrive {
+        owner: Some(Owner {
+            tx: tx.clone(),
+            thread,
+            state,
+        }),
+        client: MountedCommands::new(tx, UUID, endpoint),
+    };
+    let error = owner
+        .put_path_version_with_policy(fixture.request("committed-before-failure"), false)
+        .unwrap_err();
+    let crate::MountError::Committed {
+        receipt,
+        reason,
+        failure,
+    } = error
+    else {
+        panic!("missing durable receipt: {error}");
+    };
+    assert_eq!(reason, "new");
+    assert_eq!(receipt.object.caller_object_id, "committed-before-failure");
+    assert!(failure.to_string().contains("post-projection"), "{failure}");
+    assert_eq!(owner.receipts().len(), 1);
+    let _ = owner.finish();
+    assert!(fixture.reopen().is_ok());
+}
+
+/// A catalog generation cannot replace the generation proof captured by the mount.
+#[test]
+fn supersede_requires_mounted_generation_before_any_modifying_command() {
+    let (fixture, mut state) = Fixture::new(false);
+    let policy = StaticAllowlist::new([SERIAL]);
+    let mut mount = OperatorMount::with_transport(
+        Path::new(DEVICE),
+        &policy,
+        Box::new(Transport {
+            inner: ModelTransport::new(fixture.world.clone(), DeviceRole::Drive { bay: BAY }),
+            commands: fixture.commands.clone(),
+            fault: fixture.fault.clone(),
+            evidence: Some(fixture.config.audit.dir.clone()),
+            last_opcode: None,
+        }),
+        &mut state,
+        fixture.root.path(),
+    )
+    .unwrap();
+    let mut mounted = mount
+        .mount(MountTarget::Device {
+            path: DEVICE.into(),
+            expected_uuid: Some(UUID),
+        })
+        .unwrap();
+    // Reads permit an unknown mount generation even when the catalog has one.
+    // Exercise that exact handoff, independently of transport density inference.
+    mounted.generation = None;
+    let audit = mount.context.audit_error.clone();
+    mount.finish().unwrap();
+    assert!(state
+        .catalog_index()
+        .get_tape(&UUID)
+        .unwrap()
+        .unwrap()
+        .cartridge_generation
+        .is_some());
+    let mut owner = MountedDrive::start(state, mounted, policy, audit).unwrap();
+    let before = fixture.commands.lock().unwrap().len();
+    for confirmation in [None, Some("SUPERSEDE HAND".into())] {
+        let error = owner
+            .supersede_tail(pb::SupersedeTailRequest {
+                tape_uuid: UUID.to_vec(),
+                ack_tape_uuid: UUID.to_vec(),
+                confirm_supersede: confirmation,
+                expected_found: vec![],
+            })
+            .unwrap_err();
+        assert_eq!(error.status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            error.status.message(),
+            "tape generation is required before superseding a tail"
+        );
+    }
+    assert_eq!(fixture.commands.lock().unwrap().len(), before);
+    owner.finish().unwrap();
+    assert!(!fixture
+        .commands
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|cdb| matches!(cdb[0], 0x0a | 0x10 | 0x19)));
+}
+
+/// Terminal frontends retain the full standalone refusal, including release guidance.
+#[test]
+fn standalone_terminal_fence_refusals_keep_quarantine_id_and_release_command() {
+    let here = remanence_library::DriveKey::Standalone {
+        drive_serial: SERIAL.into(),
+    };
+    let elsewhere = remanence_library::DriveKey::Standalone {
+        drive_serial: "OTHER".into(),
+    };
+    for (tape_uuid, endpoint, release_options) in [
+        (UUID, Some(&elsewhere), "--ack TEXT"),
+        ([9; 16], Some(&here), "--ack TEXT"),
+        (UUID, None, "--after-settled-inventory --ack TEXT"),
+    ] {
+        let (fixture, state) = Fixture::new(false);
+        let mut owner = fixture.owner(state);
+        let fence = fixture
+            .index()
+            .record_tape_io_fence_at_endpoint(
+                remanence_state::TapeIoFenceInput {
+                    tape_uuid,
+                    barcode: None,
+                    reason: "review regression".into(),
+                    evidence_json: None,
+                },
+                endpoint,
+            )
+            .unwrap();
+        let expected = format!(
+            "write blocked by active tape-I/O fence {}: review regression; inspect `rem tape quarantine list`, then release with `rem tape quarantine release {} {release_options}`",
+            fence.quarantine_id, fence.quarantine_id
+        );
+        let before = fixture.commands.lock().unwrap().len();
+        let error = owner
+            .finalize_standalone(crate::StandaloneFinalizeRequest {
+                tape_uuid: UUID,
+                acknowledge_tape: UUID,
+                expected_pool_id: Some("default".into()),
+                reason: "operator requested".into(),
+                idempotency_key: Uuid::new_v4(),
+            })
+            .unwrap_err();
+        assert_eq!(error.to_string(), expected);
+        let error = owner
+            .supersede_tail_confirmed("HAND", |_, _| {
+                panic!("a fence must refuse before asking for confirmation")
+            })
+            .unwrap_err();
+        assert_eq!(error.to_string(), expected);
+        assert_eq!(fixture.commands.lock().unwrap().len(), before);
+        // Finish reports the existing fence but still joins and releases the locks.
+        assert!(owner.finish().is_err());
+        assert!(fixture.reopen().is_ok());
+    }
 }

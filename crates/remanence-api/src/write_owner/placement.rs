@@ -17,6 +17,8 @@ pub(crate) struct MountedDriveContext {
     pub endpoint: DriveKey,
     pub tape_uuid: crate::TapeUuid,
     pub barcode: Option<String>,
+    /// Cartridge generation established by the mount, independently of catalog admission.
+    pub cartridge_generation: Option<crate::LtoGen>,
     pub identity_generation: u64,
     pub actor: AuditActor,
     pub audit_error: Arc<Mutex<Option<String>>>,

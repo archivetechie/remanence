@@ -971,91 +971,99 @@ fn perform_checkpoint_barrier_mode(
         tracing::info!(tape_uuid = %Uuid::from_bytes(tape_uuid), ?seal_reason,
             "terminal seal is due; removal leaves finalization to the next write session or explicit finalize");
     }
-    let terminal_checkpoint_record =
-        if let Some(reason) = seal_reason.filter(|_| allow_finalization) {
-            let trigger = match reason {
-                crate::pool_write::TapeSealReason::ReachedLowWatermark => {
-                    remanence_state::TerminalFinalizationTrigger::ReachedLowWatermark
-                }
-                crate::pool_write::TapeSealReason::HardwareEarlyWarning => {
-                    remanence_state::TerminalFinalizationTrigger::HardwareEarlyWarning
-                }
-                crate::pool_write::TapeSealReason::OperatorCloseOut => {
-                    remanence_state::TerminalFinalizationTrigger::OperatorCloseOut
-                }
-                crate::pool_write::TapeSealReason::PoolCloseOut => {
-                    remanence_state::TerminalFinalizationTrigger::PoolCloseOut
-                }
-                crate::pool_write::TapeSealReason::NoPendingObjectFits => {
-                    remanence_state::TerminalFinalizationTrigger::NoPendingObjectFits
-                }
-            };
-            if trigger == remanence_state::TerminalFinalizationTrigger::OperatorCloseOut {
-                return Err(CheckpointBarrierFailure::after_projection(
-                    Status::internal(
-                        "automatic checkpoint seal unexpectedly carried an operator trigger",
-                    ),
-                ));
+    let terminal_checkpoint_record = if let Some(reason) =
+        seal_reason.filter(|_| allow_finalization)
+    {
+        let trigger = match reason {
+            crate::pool_write::TapeSealReason::ReachedLowWatermark => {
+                remanence_state::TerminalFinalizationTrigger::ReachedLowWatermark
             }
-            let drive_config = drive.read_config().map_err(|error| {
-                CheckpointBarrierFailure::after_projection(Status::unavailable(format!(
-                    "read terminal-finalization drive config: {error}"
-                )))
-            })?;
-            if drive_config.write_protected {
-                return Err(CheckpointBarrierFailure::after_projection(
-                    Status::failed_precondition(
-                        "tape became write-protected before terminal finalization",
-                    ),
-                ));
+            crate::pool_write::TapeSealReason::HardwareEarlyWarning => {
+                remanence_state::TerminalFinalizationTrigger::HardwareEarlyWarning
             }
-            let rewritable = matches!(
-                drive_config.worm,
-                remanence_library::WormMediaState::NotWorm
-            );
-            let spec = TerminalFinalizeSpec::automatic(selected, pool_cfg, trigger);
-            let result = match &selected.parity_config {
-                remanence_parity::ParityConfig::None => finalize_terminal_no_parity(
-                    index, cfg, drive, journal, &record, None, &spec, selected, None, rewritable,
-                ),
-                remanence_parity::ParityConfig::Scheme(_) => {
-                    let carried = parity_session
-                        .as_deref_mut()
-                        .and_then(|s| s.sink_state.take());
-                    let parity_journal = parity_session
-                        .and_then(|session| session.journal.take())
-                        .ok_or_else(|| {
-                            CheckpointBarrierFailure::after_projection(Status::internal(
-                                "automatic parity finalization has no session-owned append journal",
-                            ))
-                        })?;
-                    finalize_terminal_with_parity_journal(
-                        index,
-                        cfg,
-                        drive,
-                        journal,
-                        &record,
-                        None,
-                        &spec,
-                        selected,
-                        None,
-                        parity_journal,
-                        rewritable,
-                        carried,
-                    )
-                }
+            crate::pool_write::TapeSealReason::OperatorCloseOut => {
+                remanence_state::TerminalFinalizationTrigger::OperatorCloseOut
             }
-            .map_err(CheckpointBarrierFailure::after_projection)?;
-            let final_record = result.final_record.ok_or_else(|| {
-                CheckpointBarrierFailure::after_projection(Status::unavailable(
-                    "automatic terminal finalization requires recovery before sealing can complete",
-                ))
-            })?;
-            *checkpoint_ordinal = final_record.ordinal;
-            Some(final_record)
-        } else {
-            None
+            crate::pool_write::TapeSealReason::PoolCloseOut => {
+                remanence_state::TerminalFinalizationTrigger::PoolCloseOut
+            }
+            crate::pool_write::TapeSealReason::NoPendingObjectFits => {
+                remanence_state::TerminalFinalizationTrigger::NoPendingObjectFits
+            }
         };
+        if trigger == remanence_state::TerminalFinalizationTrigger::OperatorCloseOut {
+            return Err(CheckpointBarrierFailure::after_projection(
+                Status::internal(
+                    "automatic checkpoint seal unexpectedly carried an operator trigger",
+                ),
+            ));
+        }
+        if cfg.mounted().is_some() {
+            crate::pool_write::reprove_checkpoint_boundary(drive, &record).map_err(|error| {
+                CheckpointBarrierFailure::after_projection(
+                    super::restore::status_from_selected_write_error(selected, error),
+                )
+            })?;
+        }
+        let drive_config = drive.read_config().map_err(|error| {
+            CheckpointBarrierFailure::after_projection(Status::unavailable(format!(
+                "read terminal-finalization drive config: {error}"
+            )))
+        })?;
+        if drive_config.write_protected {
+            return Err(CheckpointBarrierFailure::after_projection(
+                Status::failed_precondition(
+                    "tape became write-protected before terminal finalization",
+                ),
+            ));
+        }
+        let rewritable = matches!(
+            drive_config.worm,
+            remanence_library::WormMediaState::NotWorm
+        );
+        let spec = TerminalFinalizeSpec::automatic(selected, pool_cfg, trigger);
+        let result = match &selected.parity_config {
+            remanence_parity::ParityConfig::None => finalize_terminal_no_parity(
+                index, cfg, drive, journal, &record, None, &spec, selected, None, rewritable,
+            ),
+            remanence_parity::ParityConfig::Scheme(_) => {
+                let carried = parity_session
+                    .as_deref_mut()
+                    .and_then(|s| s.sink_state.take());
+                let parity_journal = parity_session
+                    .and_then(|session| session.journal.take())
+                    .ok_or_else(|| {
+                        CheckpointBarrierFailure::after_projection(Status::internal(
+                            "automatic parity finalization has no session-owned append journal",
+                        ))
+                    })?;
+                finalize_terminal_with_parity_journal(
+                    index,
+                    cfg,
+                    drive,
+                    journal,
+                    &record,
+                    None,
+                    &spec,
+                    selected,
+                    None,
+                    parity_journal,
+                    rewritable,
+                    carried,
+                )
+            }
+        }
+        .map_err(CheckpointBarrierFailure::after_projection)?;
+        let final_record = result.final_record.ok_or_else(|| {
+            CheckpointBarrierFailure::after_projection(Status::unavailable(
+                "automatic terminal finalization requires recovery before sealing can complete",
+            ))
+        })?;
+        *checkpoint_ordinal = final_record.ordinal;
+        Some(final_record)
+    } else {
+        None
+    };
     let sealed_after_write = terminal_checkpoint_record.is_some();
     if sealed_after_write {
         if let Err(err) = append_tape_sealed_evidence(index, cfg, selected.tape_uuid) {

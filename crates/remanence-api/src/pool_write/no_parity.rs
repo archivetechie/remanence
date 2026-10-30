@@ -850,7 +850,7 @@ pub(super) fn committed_copy_identity_summary(copy: &NativeObjectCopyRecord) -> 
     }
 }
 
-pub(super) fn pool_write_object_record_from_native(
+pub(crate) fn pool_write_object_record_from_native(
     object: NativeObjectRecord,
     pool_id: &str,
 ) -> Result<PoolWriteObjectRecord, PoolWriteError> {

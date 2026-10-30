@@ -529,7 +529,7 @@ fn acknowledge_tail(root: &Path, world: Arc<Mutex<VirtualWorld>>) -> Result<(), 
     let generation = drive.identity_generation();
     let before = world.lock().unwrap().tapes[BARCODE].records.clone();
     let mut preview = None;
-    let refusal = crate::mount_backend::supersede_mounted_tail(
+    let refusal = crate::write_owner::supersede_mounted_tail(
         &mut index,
         &cfg.terminal_config(),
         &mut drive,
@@ -552,7 +552,7 @@ fn acknowledge_tail(root: &Path, world: Arc<Mutex<VirtualWorld>>) -> Result<(), 
     let Some((confirmation, found)) = preview else {
         return Err(refusal);
     };
-    crate::mount_backend::supersede_mounted_tail(
+    crate::write_owner::supersede_mounted_tail(
         &mut index,
         &cfg.terminal_config(),
         &mut drive,

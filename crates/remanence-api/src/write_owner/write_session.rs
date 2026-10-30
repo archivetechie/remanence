@@ -412,7 +412,30 @@ impl WriteSessionState<'_> {
     }
 
     /// Complete one accepted append and advance provisional checkpoint state.
-    fn handle_append_finish(&mut self, command: DriveCommand) {
+    fn handle_append_finish(&mut self, mut command: DriveCommand) {
+        if self.cfg.mounted().is_none() {
+            return self.handle_append_finish_inner(command);
+        }
+        let DriveCommand::AppendFinish { reply, .. } = &mut command else {
+            unreachable!("append handler received another drive command");
+        };
+        let (inner_reply, mut rx) = oneshot::channel();
+        let reply = std::mem::replace(reply, inner_reply);
+        let before = self.drive.media_write_dispatch_count();
+        self.handle_append_finish_inner(command);
+        let outcome = rx
+            .try_recv()
+            .unwrap_or_else(|_| Err(Status::internal("append omitted its reply")));
+        let outcome = match outcome {
+            Err(status) if self.drive.media_write_dispatch_count() != before => Err(
+                super::mounted_commands::fence_failed_write(self.index, self.cfg, status),
+            ),
+            result => result,
+        };
+        let _ = reply.send(outcome);
+    }
+
+    fn handle_append_finish_inner(&mut self, command: DriveCommand) {
         let DriveCommand::AppendFinish {
             session_id: requested,
             source,
@@ -580,6 +603,10 @@ impl WriteSessionState<'_> {
         };
         let append_started = Instant::now();
         let mut parity_raw_write_attempted = false;
+        let mounted_dispatches = self
+            .cfg
+            .mounted()
+            .map(|_| self.drive.media_write_dispatch_count());
         let result = match crate::pool_write::maybe_replay_pool_write(
             self.index, &pool_cfg, &request,
         ) {
@@ -948,7 +975,11 @@ impl WriteSessionState<'_> {
                     }
                     return;
                 }
-                let tape_started = if self.parity_session.is_some() {
+                let tape_started = if let Some(before) = mounted_dispatches {
+                    // Host-only mounted refusals must not create an abandonment
+                    // delimiter or fence. The direct path used this same boundary.
+                    self.drive.media_write_dispatch_count() != before
+                } else if self.parity_session.is_some() {
                     parity_raw_write_attempted
                 } else {
                     stream_control
@@ -1816,6 +1847,12 @@ pub(super) fn handle_drive_open_write(
 
     if cfg.mounted().is_some() {
         if let Err(error) = super::mounted_commands::open_audit(index, cfg, session_id) {
+            let _ = reply.send(Err(error));
+            return None;
+        }
+        // Preserve the mounted session's readiness boundary after durable open
+        // evidence, before consuming the caller's prepared source or writing media.
+        if let Err(error) = cfg.mounted_ready(index, drive) {
             let _ = reply.send(Err(error));
             return None;
         }

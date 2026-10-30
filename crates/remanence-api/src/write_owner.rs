@@ -152,15 +152,18 @@ pub(crate) struct SessionOpenReadinessContext<'a> {
 }
 
 mod write_session;
-pub(crate) use write_session::{prepare_drive_for_write, raise_tape_io_fence, WriteMediaPolicy};
+pub(crate) use write_session::raise_tape_io_fence;
 
 mod terminal_finalize;
+pub(crate) use terminal_finalize::preflight_manual_finalize_with_prefix;
 pub(crate) use terminal_finalize::*;
-pub(crate) use terminal_finalize::{finalize_mounted_tape, preflight_manual_finalize_with_prefix};
 
 mod read_session;
 
 #[cfg(test)]
 pub(crate) mod tests;
 
-pub(crate) use actor_runtime::spawn_mounted_actor;
+pub(crate) use actor_runtime::{run_borrowed_mounted_actor, spawn_mounted_actor};
+
+mod tail_recovery;
+pub(crate) use tail_recovery::supersede_mounted_tail;
