@@ -109,6 +109,19 @@ struct Fixture {
 }
 impl Fixture {
     fn new(parity: bool) -> (Self, StateHandle) {
+        let parity = if parity {
+            crate::ParityConfig::Scheme(remanence_parity::ParityScheme {
+                data_blocks_per_stripe: 4,
+                parity_blocks_per_stripe: 2,
+                stripes_per_neighborhood: 2,
+                id: remanence_parity::SchemeId::new_static("mounted"),
+            })
+        } else {
+            crate::ParityConfig::None
+        };
+        Self::with_parity(parity)
+    }
+    fn with_parity(parity: crate::ParityConfig) -> (Self, StateHandle) {
         let root = tempfile::tempdir().unwrap();
         let mut config = remanence_state::parse_config_toml(&format!(
             r#"
@@ -137,16 +150,6 @@ tape_catalog_dir = "{0}/cache"
         ))
         .unwrap();
         config.daemon.checkpoint_max_age_seconds = 1800;
-        let parity = if parity {
-            crate::ParityConfig::Scheme(remanence_parity::ParityScheme {
-                data_blocks_per_stripe: 4,
-                parity_blocks_per_stripe: 2,
-                stripes_per_neighborhood: 2,
-                id: remanence_parity::SchemeId::new_static("mounted"),
-            })
-        } else {
-            crate::ParityConfig::None
-        };
         let mut state = StateHandle::open_with_config(
             remanence_state::StatePaths::from_config(root.path().join("config.toml"), &config),
             config.clone(),
@@ -1468,3 +1471,42 @@ fn standalone_terminal_fence_refusals_keep_quarantine_id_and_release_command() {
 }
 
 mod library;
+
+/// A source returning to the newest bytes during preparation must never reach media.
+#[test]
+fn prepared_skip_and_command_reconciliation_are_independent_of_file_count() {
+    let (fixture, state) = Fixture::new(false);
+    let mut actor = fixture.owner(state);
+    crate::startup_checkpoint::RECONCILIATION_COUNT.with(|count| count.set(0));
+    for name in ["first", "second", "third"] {
+        assert!(actor
+            .put_path_version_with_policy(fixture.request(name), false)
+            .unwrap()
+            .is_ok());
+    }
+    let before = fixture.commands.lock().unwrap().len();
+    for name in ["first", "second", "third"] {
+        let input = fixture.request(name);
+        let crate::WriteObjectSource::Path(path) = &input.source else {
+            panic!("path source")
+        };
+        let path = path.clone();
+        std::fs::write(&path, b"changed before preparation").unwrap();
+        let decision = put_version(
+            &mut actor.client,
+            &mut actor.owner.as_mut().unwrap().state,
+            input,
+            false,
+            || {
+                std::fs::write(path, name.as_bytes()).unwrap();
+            },
+        )
+        .unwrap();
+        assert!(decision.is_err(), "prepared digest must skip");
+    }
+    assert_eq!(fixture.commands.lock().unwrap().len(), before);
+    crate::startup_checkpoint::RECONCILIATION_COUNT.with(|count| assert_eq!(count.get(), 1));
+    actor.finish().unwrap();
+}
+
+mod pool_sessions;

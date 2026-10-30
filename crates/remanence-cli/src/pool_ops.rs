@@ -315,7 +315,17 @@ fn print_archive_write_outcome(
 fn local_write_error(error: remanence_api::engine::drive_adapter::ActorFailure) -> String {
     error.pool_write_error.as_ref().map_or_else(
         || error.status.message().to_string(),
-        |cause| cause.to_string(),
+        |cause| {
+            let leading = cause.to_string();
+            let message = error.status.message();
+            if message.starts_with(&leading) {
+                message.to_string()
+            } else {
+                // Actor retry advice may precede the underlying cause; keep the
+                // legacy leading text without losing any of that local context.
+                format!("{leading}; {message}")
+            }
+        },
     )
 }
 

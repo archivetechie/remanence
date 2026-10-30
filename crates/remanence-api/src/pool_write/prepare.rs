@@ -33,7 +33,6 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::capacity::{now_rfc3339, uuid_text};
-use super::direct::{build_tape_bootstrap, write_tape_bootstrap};
 use super::model::{
     NoParityAppendContext, PoolWriteDurability, PoolWriteError, PoolWriteRepresentation,
     SelectedTape, TapeUuid, WriteObjectInputKind, WriteObjectSource, WriteObjectToPoolRequest,
@@ -41,6 +40,7 @@ use super::model::{
 use super::no_parity::no_parity_file_catalog_projection;
 use super::staging::{BlockSinkStats, ObjectDigestBlockSink};
 use crate::bytes_to_hex;
+use crate::tape_init::{build_tape_bootstrap, write_tape_bootstrap};
 
 pub(crate) struct PreparedPoolObject {
     pub(crate) content_sha256: [u8; 32],

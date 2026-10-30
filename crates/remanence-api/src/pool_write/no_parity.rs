@@ -360,28 +360,6 @@ pub(super) fn record_tape_io_fence_for_transfer_error(
     Ok(())
 }
 
-pub(super) fn fence_after_terminal_motion(
-    state: &mut CatalogIndex,
-    fence_cfg: &crate::write_owner::TerminalWriteConfig,
-    selected: &SelectedTape,
-    reason: &str,
-    error: PoolWriteError,
-) -> PoolWriteError {
-    let detail = error.to_string();
-    match record_tape_io_fence_for_transfer_error(
-        state,
-        fence_cfg,
-        selected,
-        reason,
-        detail.as_str(),
-    ) {
-        Ok(()) => error,
-        Err(fence_error) => PoolWriteError::InvalidInput(format!(
-            "{detail}; failed to persist required terminal tape-I/O fence: {fence_error}"
-        )),
-    }
-}
-
 pub(super) fn tape_io_fence_reason_for_transfer_error(error: &str) -> &'static str {
     if error.contains("reset UNIT ATTENTION") {
         "reset_unit_attention"

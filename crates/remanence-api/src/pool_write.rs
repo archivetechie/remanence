@@ -1,10 +1,8 @@
-//! Pool-targeted object write core for the Phase 1 non-hardware path.
+//! Shared object encoding, capacity, checkpoint projection and replay primitives.
 //!
-//! This module composes Layer 4 catalog state, Layer 3b `rem-object-v1`
-//! streaming, Layer 3c parity, and the existing in-memory-compatible
-//! `BlockSink` adapter. It intentionally contains the tape-selection boundary
-//! so the later policy workstream can replace that one function without
-//! changing the write engine.
+//! The write-owner actor owns session and terminal orchestration. Generic sinks
+//! keep the byte-writing primitives independently testable; production callers
+//! enter through the daemon or the in-process mounted-drive adapter.
 
 mod media;
 mod overlap;
@@ -52,8 +50,21 @@ mod resume_authority;
 #[cfg(test)]
 mod test_support;
 
-mod direct;
-pub use direct::*;
+pub(crate) use append::{
+    project_fresh_parity_bootstrap_bundle,
+    write_batched_parity_to_selected_tape_after_replay_check,
+    write_batched_to_selected_tape_after_replay_check,
+};
+pub(crate) use capacity::authorize_terminal_close_only_plan;
+pub use replay::replay_committed_pool_write_from_state;
+pub(crate) use replay::replay_committed_pool_write_reconciled;
+pub(crate) use resume_authority::{
+    validate_parity_resume_checkpoint_authority, ResumeAuthorityRefusal,
+};
+#[cfg(test)]
+pub(crate) use test_support::{
+    write_object_to_pool, write_to_selected_tape, write_to_selected_tape_with_live_counter,
+};
 
 mod no_parity;
 pub(crate) use no_parity::maybe_replay_pool_write;

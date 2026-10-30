@@ -242,7 +242,7 @@ impl MountedDrive {
             .map_err(crate::MountError::Actor)?;
         write_checkpointed(&mut self.client, &mut owner.state, request)
     }
-    fn start(
+    pub(crate) fn start(
         state: StateHandle,
         mounted: crate::MountedTape,
         policy: StaticAllowlist,

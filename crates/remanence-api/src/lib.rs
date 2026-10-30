@@ -106,7 +106,6 @@ mod io_memory;
 mod library;
 mod live_status;
 mod mount;
-mod mount_backend;
 pub mod mount_support;
 mod standalone_init;
 mod standalone_write;
@@ -150,18 +149,17 @@ pub use library::LibraryServiceApi;
 pub(crate) use live_status::{DriveByteCounters, LibrarySnapshot};
 pub use mount::{load_tape_by_uuid, LoadByUuidError};
 pub use pool_write::{
-    build_tape_bootstrap, can_read, can_write, check_writability_preconditions,
-    lto_generation_from_density, lto_generation_from_drive_product, raw_capacity_bytes,
-    replay_committed_pool_write_from_state, seal_decision_after_write, select_tape_in_pool,
-    select_tape_in_pool_for_write_session, tape_generation, verify_tape_identity,
-    write_tape_bootstrap, write_to_selected_drive_checkpointed, LtoGen, MediaObservation,
-    ObjectWriteMediaError, PoolWriteError, PoolWriteObjectCopyRecord, PoolWriteObjectRecord,
-    PoolWriteRepresentation, PoolWriteResources, PoolWriteResult, SelectTapeError, SelectedTape,
-    StreamedWriteSource, TapeIdentityError, TapePositionAfterWrite, TapeSealReason, TapeUuid,
-    WritabilityError, WriteObjectInputKind, WriteObjectSource, WriteObjectToPoolRequest,
+    can_read, can_write, check_writability_preconditions, lto_generation_from_density,
+    lto_generation_from_drive_product, raw_capacity_bytes, replay_committed_pool_write_from_state,
+    seal_decision_after_write, select_tape_in_pool, select_tape_in_pool_for_write_session,
+    tape_generation, LtoGen, MediaObservation, ObjectWriteMediaError, PoolWriteError,
+    PoolWriteObjectCopyRecord, PoolWriteObjectRecord, PoolWriteRepresentation, PoolWriteResult,
+    SelectTapeError, SelectedTape, StreamedWriteSource, TapeIdentityError, TapePositionAfterWrite,
+    TapeSealReason, TapeUuid, WritabilityError, WriteObjectInputKind, WriteObjectSource,
+    WriteObjectToPoolRequest,
 };
 #[cfg(test)]
-pub use pool_write::{write_object_to_pool, write_to_selected_tape};
+pub(crate) use pool_write::{write_object_to_pool, write_to_selected_tape};
 pub use read_plan::ReadPlanApi;
 pub use read_session_service::ReadSessionApi;
 pub use remanence_library::{resolve_load_target, LoadError, LoadPlan};
@@ -169,6 +167,8 @@ pub use startup_checkpoint::reconcile_checkpoint_journal_projections;
 pub(crate) use startup_guard::tape_io_runtime_config;
 pub use startup_media_readiness::reconcile_media_readiness_on_startup;
 pub(crate) use startup_media_readiness::status_from_state_error;
+pub use tape_identity::verify_tape_identity;
+pub use tape_init::{build_tape_bootstrap, write_tape_bootstrap};
 pub use tape_init::{
     classify_bootstrap_adoption_from_source, classify_bot_bytes, classify_bot_from_source,
     classify_bot_identity_bytes, decide_tape_init, has_canonical_adoption_geometry,

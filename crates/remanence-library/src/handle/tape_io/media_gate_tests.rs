@@ -597,6 +597,14 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
             },
         ),
         (
+            "remanence-api/src/engine/drive_adapter/tests/pool_sessions.rs",
+            DispatchPolicy::Exact {
+                execute_out: 1,
+                execute_none: 1,
+                why: "cfg(test) virtual fault transport for migrated session assertions; production uses DriveHandle",
+            },
+        ),
+        (
             "remanence-cli/src/lib.rs",
             DispatchPolicy::Exact {
                 execute_out: 1,
@@ -697,7 +705,7 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
         ),
         // P4 model-only failure and mounted-reader forwarders.
         (
-            "remanence-api/src/mount_backend/tests.rs",
+            "remanence-api/src/mount_support/tests.rs",
             DispatchPolicy::Exact {
                 execute_out: 1,
                 execute_none: 1,
