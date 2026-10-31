@@ -25,7 +25,7 @@ time      = { workspace = true }
 remanence-library = { path = "../remanence-library", features = ["test-support"] }
 remanence-api    = { path = "../remanence-api" }
 remanence-format = { path = "../remanence-format" }
-remanence-parity = { path = "../remanence-parity" }
+remanence-parity = { path = "../remanence-parity", features = ["fixtures"] }
 tempfile         = { workspace = true }
 
 [lints.rust]

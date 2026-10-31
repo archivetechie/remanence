@@ -34,19 +34,6 @@ pub struct CommittedObjectProjection {
     /// Full representation-aware recovery anchors.
     pub object_recovery_row: ObjectRecoveryRow,
 }
-impl From<&crate::CheckpointObjectProjection> for CommittedObjectProjection {
-    fn from(v: &crate::CheckpointObjectProjection) -> Self {
-        Self {
-            object: v.object.clone(),
-            copy: v.copy.clone(),
-            block_size: v.block_size,
-            block_count: v.block_count,
-            fresh_tape: v.fresh_tape,
-            total_committed_ordinals: v.total_committed_ordinals,
-            object_recovery_row: v.object_recovery_row.to_parity_row(),
-        }
-    }
-}
 /// Write one validated catalog header; rejection writes no bytes.
 pub fn encode_header(
     w: &mut impl Write,

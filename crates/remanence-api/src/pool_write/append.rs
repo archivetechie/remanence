@@ -27,9 +27,10 @@ use super::staging::{CountingBlockSink, LiveCounterBlockSink};
 use crate::bytes_to_hex;
 use crate::verify_tape_identity;
 use remanence_library::{BlockSink, DriveHandle, DriveHandleSource};
+use remanence_parity::authority::{FilePublication, FilePurpose};
 use remanence_parity::{
-    CommittedBundle, CommittedBundleKind, ParityConfig, ParityScheme, ParitySink,
-    ParitySinkSessionState, RawTapeSink, TapeFileEntry, TapeFileJournal, TapeFileKind,
+    ParityConfig, ParityScheme, ParitySink, ParitySinkSessionState, RawTapeSink, TapeFileEntry,
+    TapeFileKind, TapeReportPublisher,
 };
 use remanence_state::{CatalogIndex, TapeJournalIndexInput, TapePoolConfig};
 use remanence_stream::{write_prepared_object_to_parity_from_readers, StreamingObjectWriteReport};
@@ -44,9 +45,9 @@ pub(crate) fn project_fresh_parity_bootstrap_bundle(
     // after `ParitySink::write_bootstrap` returned success at the proved BOT
     // cursor. Project that exact sole-BOT write without asking ordinary
     // bounded-resume replay to accept its intentionally uncheckpointed state.
-    let bootstrap_bundle = CommittedBundle {
-        kind: CommittedBundleKind::BotBootstrap,
-        entries: vec![TapeFileEntry {
+    let bootstrap_bundle = FilePublication {
+        purpose: FilePurpose::Bootstrap,
+        files: vec![TapeFileEntry {
             tape_file_number: 0,
             kind: TapeFileKind::Bootstrap,
             block_count: 1,
@@ -59,10 +60,13 @@ pub(crate) fn project_fresh_parity_bootstrap_bundle(
             canonical_metadata_hash: None,
             object_recovery_row: None,
         }],
-        highest_protected_ordinal: 0,
-        total_committed_ordinals: 0,
+        protected: 0,
+        total: 0,
+        cursor: None,
+        check: None,
+        seal_due: None,
     };
-    state.project_committed_tape_file_bundle(
+    state.project_file_publication(
         TapeJournalIndexInput {
             tape_uuid: selected.tape_uuid,
             block_size: selected.block_size,
@@ -114,7 +118,7 @@ pub(crate) fn write_batched_to_selected_tape_after_replay_check(
 pub(crate) fn write_batched_parity_to_selected_tape_after_replay_check(
     state: &CatalogIndex,
     raw: &mut dyn RawTapeSink,
-    journal: &mut dyn TapeFileJournal,
+    journal: &mut dyn TapeReportPublisher,
     session_state: &mut Option<ParitySinkSessionState>,
     pool_cfg: &TapePoolConfig,
     request: WriteObjectToPoolRequest,
@@ -471,7 +475,7 @@ pub(super) fn write_to_selected_tape_inner<S: BlockSink + ?Sized>(
 /// durable append cursor before any post-checkpoint terminal modification.
 pub(crate) fn reprove_checkpoint_boundary(
     drive: &mut DriveHandle,
-    record: &remanence_state::CheckpointJournalRecord,
+    record: &remanence_state::authority::AuthorityCommit,
 ) -> Result<(), PoolWriteError> {
     drive.clear_append_admission();
     drive
@@ -487,8 +491,8 @@ pub(crate) fn reprove_checkpoint_boundary(
     require_rewritable_object_media(config)?;
     crate::drive_mode::configure_fixed_uncompressed_write(drive, config, record.block_size)?;
     drive.bind_identity_generation(generation)?;
-    let position = drive.locate(record.eod_lba)?;
-    if position.partition != record.eod_partition || position.lba != record.eod_lba {
+    let position = drive.locate(record.cursor.lba)?;
+    if position.partition != record.cursor.partition || position.lba != record.cursor.lba {
         return Err(PoolWriteError::InvalidInput(
             "checkpoint append position mismatch".into(),
         ));

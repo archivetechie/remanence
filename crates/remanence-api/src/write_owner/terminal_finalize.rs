@@ -1,5 +1,7 @@
 //! Terminal-triple planning, writing, reconciliation, and audit projection.
 
+use remanence_state::authority::TapeAuthorityView;
+use remanence_state::authority::TapeAuthorityWriter as _;
 use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 use std::path::Path;
@@ -9,7 +11,7 @@ use ciborium::value::Value as CborValue;
 use remanence_library::DriveHandle;
 use remanence_parity::{
     reconcile_terminal_prefix, reconcile_terminal_tail_next, DriveHandleRawSink,
-    DriveHandleRawSource, FileTapeFileJournal, PhysicalPositionHint, TerminalPrefixPlan,
+    DriveHandleRawSource, PhysicalPositionHint, TerminalPrefixPlan,
     TerminalPrefixReconcileEvidence, TerminalTailStepOutcome, TerminalTailWriteError,
     TerminalTripleWritePlan,
 };
@@ -22,9 +24,7 @@ use tonic::Status;
 use uuid::Uuid;
 
 use super::actor_runtime::{record_session_close_snapshot, WriteOwnerConfig};
-use super::checkpoint::{
-    fence_failed_parity_raw_write, parity_journal_path, project_checkpoint_authority_bounded,
-};
+use super::checkpoint::{fence_failed_parity_raw_write, project_checkpoint_authority_bounded};
 use super::read_session::session_open_reject_tape_io_fences;
 use super::readiness::session_open_short_probe_or_load;
 use super::restore::{status_from_parity_error, status_from_selected_write_error};
@@ -153,20 +153,20 @@ pub(crate) fn finalize_mounted_tape(
     validate_manual_finalize_owned_request(index, request)?;
     session_open_reject_tape_io_fences(index, &request.tape_uuid, barcode, "finalize tape")?;
 
-    let checkpoint_journal = remanence_state::FileCheckpointJournal::open(
+    let checkpoint_journal = remanence_state::TapeAuthority::open(
         cfg.checkpoint_journal_dir.as_path(),
         request.tape_uuid,
     )
     .map_err(crate::status_from_state_error)?;
     let pending_intent = checkpoint_journal
-        .terminal_finalization_intent()
+        .pending_finalization()
         .map_err(crate::status_from_state_error)?;
     let (mut checkpoint_lease, existing_intent) = if pending_intent.is_some() {
         let lease = checkpoint_journal
             .acquire_exclusive_for_terminal_recovery()
             .map_err(crate::status_from_state_error)?;
         let intent = lease
-            .terminal_finalization_intent()
+            .pending_finalization()
             .map_err(crate::status_from_state_error)?;
         (lease, intent)
     } else {
@@ -177,14 +177,11 @@ pub(crate) fn finalize_mounted_tape(
     };
     let records = project_checkpoint_authority_bounded(index, &checkpoint_lease)
         .map_err(crate::status_from_state_error)?;
-    if records
-        .last()
-        .is_some_and(|record| record.sealed_after_write)
-    {
+    if records.last().is_some_and(|record| record.sealed) {
         let sealed = records
             .last()
             .expect("sealed checkpoint predicate requires a final record");
-        let completion = sealed.terminal_finalization.as_ref().ok_or_else(|| {
+        let completion = sealed.finalization.as_ref().ok_or_else(|| {
             Status::failed_precondition(
                 "sealed checkpoint authority has no terminal-finalization completion",
             )
@@ -308,7 +305,7 @@ pub(crate) fn finalize_mounted_tape(
 
 pub(super) fn validate_manual_finalize_intent(
     request: &ManualFinalizeTapeActorRequest,
-    intent: &remanence_state::TerminalFinalizationIntent,
+    intent: &remanence_state::authority::AuthorityFinalization,
 ) -> Result<(), Status> {
     let manual = intent.manual.as_ref().ok_or_else(|| {
         Status::failed_precondition("pending terminal finalization is not an operator close-out")
@@ -336,7 +333,7 @@ pub(super) fn authorize_terminal_intent_capacity(
     index: &CatalogIndex,
     spec: &TerminalFinalizeSpec,
     selected: &SelectedTape,
-    intent: &remanence_state::TerminalFinalizationIntent,
+    intent: &remanence_state::authority::AuthorityFinalization,
     counts: remanence_parity::TapeIndexReplicaCounts,
 ) -> Result<(), Status> {
     if intent.progress == remanence_state::TerminalFinalizationProgress::AfterReplicaC {
@@ -362,15 +359,15 @@ pub(super) fn authorize_terminal_intent_capacity(
 pub(super) fn plan_terminal_prefix_without_motion(
     index: &CatalogIndex,
     selected: &SelectedTape,
-    checkpoint: &remanence_state::FileCheckpointJournalLease,
-    checkpoint_journal_dir: &Path,
-    previous: &remanence_state::CheckpointJournalRecord,
+    checkpoint: &remanence_state::TapeAuthorityLease,
+    _checkpoint_journal_dir: &Path,
+    previous: &remanence_state::authority::AuthorityCommit,
     request: &ManualFinalizeTapeActorRequest,
     spec: &TerminalFinalizeSpec,
     prepared_prefix: Option<&TerminalPrefixPlan>,
 ) -> Result<
     (
-        remanence_state::TerminalFinalizationIntent,
+        remanence_state::authority::AuthorityFinalization,
         TerminalTripleWritePlan,
     ),
     Status,
@@ -383,28 +380,16 @@ pub(super) fn plan_terminal_prefix_without_motion(
             ));
         }
     };
-    let journal_dir = checkpoint_journal_dir.parent().ok_or_else(|| {
-        Status::internal("checkpoint journal directory has no parent for the parity journal")
-    })?;
-    let journal_path = journal_dir.join(format!(
-        "{}.remjournal",
-        crate::bytes_to_hex(&request.tape_uuid)
-    ));
-    let journal = FileTapeFileJournal::open(
-        journal_path,
-        request.tape_uuid,
-        request.block_size,
-        scheme.clone(),
-    )
-    .map_err(|error| Status::failed_precondition(format!("open parity journal: {error}")))?;
+    let journal = checkpoint
+        .open_structural(request.block_size, scheme.clone())
+        .map_err(|error| Status::failed_precondition(format!("open parity journal: {error}")))?;
 
     // Prove the checkpoint/parity bijection and reject every orphan before
     // accepting the immutable terminal plan. The close seed retains only
     // one length-bounded bundle plus epoch-directory metadata.
-    let base_authority = remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed(
-        checkpoint, &journal,
-    )
-    .map_err(crate::status_from_state_error)?;
+    let base_authority =
+        remanence_state::TerminalIndexSource::new_replay_backed(checkpoint, &journal)
+            .map_err(crate::status_from_state_error)?;
     if base_authority
         .summary()
         .scope
@@ -416,7 +401,7 @@ pub(super) fn plan_terminal_prefix_without_motion(
         ));
     }
     let snapshot = journal
-        .committed_snapshot_bounded()
+        .freeze()
         .map_err(|error| Status::failed_precondition(format!("replay parity journal: {error}")))?;
     let prefix = if let Some(prefix) = prepared_prefix {
         prefix.clone()
@@ -429,21 +414,21 @@ pub(super) fn plan_terminal_prefix_without_motion(
         )
         .map_err(|error| status_from_parity_error(&error, error.to_string()))?
     };
-    let expected_start_file = previous.next_tape_file_number;
-    if prefix.start_tape_file_number != expected_start_file || prefix.start_lba != previous.eod_lba
+    let expected_start_file = previous.next_file;
+    if prefix.start_tape_file_number != expected_start_file
+        || prefix.start_lba != previous.cursor.lba
     {
         return Err(Status::failed_precondition(format!(
             "bounded terminal close seed starts at tape file {}/LBA {}, expected {expected_start_file}/{}",
-            prefix.start_tape_file_number, prefix.start_lba, previous.eod_lba
+            prefix.start_tape_file_number, prefix.start_lba, previous.cursor.lba
         )));
     }
-    let persisted = remanence_state::TerminalFinalizationPrefixPlan::from(&prefix);
-    let source = remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_with_planned_terminal_prefix(
-        checkpoint,
-        &journal,
-        &persisted,
-    )
-    .map_err(crate::status_from_state_error)?;
+    let persisted = remanence_state::authority::AuthorityPrefixPlan::from(&prefix);
+    let source =
+        remanence_state::TerminalIndexSource::new_replay_backed_with_planned_terminal_prefix(
+            checkpoint, &journal, &persisted,
+        )
+        .map_err(crate::status_from_state_error)?;
     let mut source = source;
     build_new_terminal_plan(
         index,
@@ -470,12 +455,12 @@ pub(super) fn build_new_terminal_plan(
     index: &CatalogIndex,
     selected: &SelectedTape,
     spec: &TerminalFinalizeSpec,
-    previous: &remanence_state::CheckpointJournalRecord,
-    source: &mut remanence_state::CheckpointTerminalIndexRecordSource<'_>,
+    previous: &remanence_state::authority::AuthorityCommit,
+    source: &mut remanence_state::TerminalIndexSource,
     position: TerminalPlanPosition<'_>,
 ) -> Result<
     (
-        remanence_state::TerminalFinalizationIntent,
+        remanence_state::authority::AuthorityFinalization,
         TerminalTripleWritePlan,
     ),
     Status,
@@ -541,7 +526,7 @@ pub(super) fn build_new_terminal_plan(
         remanence_parity::DEFAULT_INDEX_SEPARATION_BYTES,
     )
     .map_err(|error| Status::failed_precondition(format!("plan terminal edition: {error}")))?;
-    let intent = remanence_state::TerminalFinalizationIntent {
+    let intent = remanence_state::authority::AuthorityFinalization {
         tape_uuid: spec.tape_uuid,
         trigger: spec.trigger,
         manual: spec.manual.clone(),
@@ -552,7 +537,7 @@ pub(super) fn build_new_terminal_plan(
         edition_digest: plan.edition.edition_digest,
         writer_version,
         write_timestamp,
-        terminal_prefix: terminal_prefix.map(remanence_state::TerminalFinalizationPrefixPlan::from),
+        terminal_prefix: terminal_prefix.map(remanence_state::authority::AuthorityPrefixPlan::from),
         layout: remanence_state::TerminalFinalizationLayout::try_from(layout)
             .map_err(crate::status_from_state_error)?,
     };
@@ -561,12 +546,12 @@ pub(super) fn build_new_terminal_plan(
 
 pub(super) fn publish_terminal_intent(
     index: &mut CatalogIndex,
-    checkpoint: &mut remanence_state::FileCheckpointJournalLease,
+    checkpoint: &mut remanence_state::TapeAuthorityLease,
     spec: &TerminalFinalizeSpec,
-    intent: &remanence_state::TerminalFinalizationIntent,
+    intent: &remanence_state::authority::AuthorityFinalization,
 ) -> Result<(), Status> {
     checkpoint
-        .begin_terminal_finalization(intent)
+        .begin_finalization(intent)
         .map_err(crate::status_from_state_error)?;
     index
         .project_terminal_finalization(TerminalFinalizationProjectionInput {
@@ -591,8 +576,8 @@ pub(super) fn publish_terminal_intent(
 /// corruption, while seeing both requires exact equality before recovery.
 pub(crate) fn reconcile_manual_terminal_acceptance(
     index: &CatalogIndex,
-    checkpoint: &mut remanence_state::FileCheckpointJournalLease,
-    intent: &remanence_state::TerminalFinalizationIntent,
+    checkpoint: &mut remanence_state::TapeAuthorityLease,
+    intent: &remanence_state::authority::AuthorityFinalization,
 ) -> Result<bool, Status> {
     let manual = intent.manual.as_ref().ok_or_else(|| {
         Status::failed_precondition("manual acceptance reconciliation has no manual identity")
@@ -619,7 +604,7 @@ pub(crate) fn reconcile_manual_terminal_acceptance(
     match (projection, scope) {
         (None, None) => {
             checkpoint
-                .retire_provisional_manual_finalization(intent, false, false)
+                .retire_preparation(intent, false, false)
                 .map_err(crate::status_from_state_error)?;
             Ok(false)
         }
@@ -676,17 +661,17 @@ pub(crate) fn preflight_manual_finalize_cancellable(
     cancelled: impl Fn() -> bool,
 ) -> Result<Option<ManualFinalizeTapeActorReply>, Status> {
     let checkpoint_journal =
-        remanence_state::FileCheckpointJournal::open(cfg.checkpoint_journal_dir, request.tape_uuid)
+        remanence_state::TapeAuthority::open(cfg.checkpoint_journal_dir, request.tape_uuid)
             .map_err(crate::status_from_state_error)?;
     let pending_intent = checkpoint_journal
-        .terminal_finalization_intent()
+        .pending_finalization()
         .map_err(crate::status_from_state_error)?;
     let (mut checkpoint, mut existing_intent) = if pending_intent.is_some() {
         let lease = checkpoint_journal
             .acquire_exclusive_for_terminal_recovery()
             .map_err(crate::status_from_state_error)?;
         let intent = lease
-            .terminal_finalization_intent()
+            .pending_finalization()
             .map_err(crate::status_from_state_error)?;
         (lease, intent)
     } else {
@@ -765,14 +750,14 @@ pub(crate) fn preflight_manual_finalize_cancellable(
     }
     validate_manual_finalize_owned_request(index, request)?;
     let previous = checkpoint
-        .last_record_bounded()
+        .latest_commit()
         .map_err(crate::status_from_state_error)?
         .ok_or_else(|| {
             Status::failed_precondition(
                 "manual finalization requires at least one durable checkpoint",
             )
         })?;
-    if previous.sealed_after_write {
+    if previous.sealed {
         if had_existing_intent {
             project_sealed_checkpoint_then_retire_terminal_intent(
                 index,
@@ -781,10 +766,10 @@ pub(crate) fn preflight_manual_finalize_cancellable(
             )?;
         } else {
             index
-                .project_checkpoint_record(&previous)
+                .project_authority_commit(&previous)
                 .map_err(crate::status_from_state_error)?;
         }
-        let completion = previous.terminal_finalization.as_ref().ok_or_else(|| {
+        let completion = previous.finalization.as_ref().ok_or_else(|| {
             Status::failed_precondition(
                 "sealed checkpoint authority has no terminal-finalization completion",
             )
@@ -846,7 +831,10 @@ pub(crate) fn preflight_manual_finalize_cancellable(
                             "parity-off finalization intent unexpectedly has a parity prefix",
                         ));
                     }
-                    let mut source = remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_no_parity(&checkpoint)
+                    let mut source =
+                        remanence_state::TerminalIndexSource::new_replay_backed_no_parity(
+                            &checkpoint,
+                        )
                         .map_err(crate::status_from_state_error)?;
                     let plan = source
                         .reconstruct_final_plan(&intent)
@@ -864,53 +852,26 @@ pub(crate) fn preflight_manual_finalize_cancellable(
                     let persisted = intent.terminal_prefix.as_ref().ok_or_else(|| {
                         Status::failed_precondition("parity finalization intent has no prefix plan")
                     })?;
-                    let journal_dir = cfg.checkpoint_journal_dir.parent().ok_or_else(|| {
-                        Status::internal(
-                            "checkpoint journal directory has no parent for the parity journal",
-                        )
-                    })?;
-                    let path = journal_dir.join(format!(
-                        "{}.remjournal",
-                        crate::bytes_to_hex(&request.tape_uuid)
-                    ));
-                    let mut journal = FileTapeFileJournal::open(
-                        path,
-                        request.tape_uuid,
-                        request.block_size,
-                        scheme.clone(),
-                    )
-                    .map_err(|error| {
-                        Status::failed_precondition(format!("open parity journal: {error}"))
-                    })?;
+                    let journal = checkpoint
+                        .open_structural(request.block_size, scheme.clone())
+                        .map_err(|error| {
+                            Status::failed_precondition(format!("open parity journal: {error}"))
+                        })?;
                     let mut source = if journal
-                        .terminal_prefix_transition_is_durable(
-                            &TerminalPrefixPlan::try_from(persisted)
-                                .map_err(crate::status_from_state_error)?
-                                .committed_bundle,
-                            &remanence_parity::CommittedBundle {
-                                kind: remanence_parity::CommittedBundleKind::CheckpointedThrough,
-                                entries: Vec::new(),
-                                highest_protected_ordinal: persisted
-                                    .committed_bundle
-                                    .highest_protected_ordinal,
-                                total_committed_ordinals: persisted
-                                    .committed_bundle
-                                    .total_committed_ordinals,
-                            },
-                        )
+                        .prefix_is_durable(&persisted.publication)
                         .map_err(|error| {
                             Status::failed_precondition(format!(
                                 "inspect terminal-prefix journal transition: {error}"
                             ))
                         })?
                     {
-                        remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_after_terminal_prefix(
+                        remanence_state::TerminalIndexSource::new_replay_backed_after_terminal_prefix(
                             &checkpoint,
                             &journal,
                             persisted,
                         )
                     } else {
-                        remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_with_planned_terminal_prefix(
+                        remanence_state::TerminalIndexSource::new_replay_backed_with_planned_terminal_prefix(
                             &checkpoint,
                             &journal,
                             persisted,
@@ -921,22 +882,33 @@ pub(crate) fn preflight_manual_finalize_cancellable(
                         .reconstruct_final_plan(&intent)
                         .map_err(crate::status_from_state_error)?;
                     drop(source);
-                    let intent = reconcile_and_authorize_parity_resume(
-                        index,
-                        &mut checkpoint,
-                        &spec,
-                        &selected,
-                        intent,
-                        &plan,
-                        &mut journal,
-                    )?;
+                    checkpoint
+                        .retain_structural_publisher(journal)
+                        .map_err(crate::status_from_state_error)?;
+                    let intent = checkpoint
+                        .with_structural(|checkpoint, rows| {
+                            checkpoint.finish_structural_scope();
+                            reconcile_and_authorize_parity_resume(
+                                index,
+                                checkpoint,
+                                &spec,
+                                &selected,
+                                intent,
+                                &plan,
+                                rows.ok_or_else(|| {
+                                    Status::internal("missing retained structural capability")
+                                })?,
+                            )
+                        })
+                        .map_err(crate::status_from_state_error)??;
                     (intent, plan)
                 }
             }
         }
         None => match request.parity_config {
             remanence_parity::ParityConfig::None => {
-                let mut source = remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_no_parity(&checkpoint)
+                let mut source =
+                    remanence_state::TerminalIndexSource::new_replay_backed_no_parity(&checkpoint)
                         .map_err(crate::status_from_state_error)?;
                 let first_file = source.summary().scope.covered_prefix_tape_file_count;
                 build_new_terminal_plan(
@@ -947,7 +919,7 @@ pub(crate) fn preflight_manual_finalize_cancellable(
                     &mut source,
                     TerminalPlanPosition {
                         first_tape_file_number: first_file,
-                        first_start_lba: previous.eod_lba,
+                        first_start_lba: previous.cursor.lba,
                         terminal_prefix: None,
                     },
                 )?
@@ -1022,7 +994,7 @@ pub(crate) fn preflight_manual_finalize_cancellable(
                     projection,
                 },
                 || {
-                    checkpoint.begin_terminal_finalization(&intent)?;
+                    checkpoint.begin_finalization(&intent)?;
                     #[cfg(test)]
                     PREFLIGHT_INTENT_HOOK.with(|hook| {
                         if let Some(hook) = hook.borrow_mut().take() {
@@ -1030,7 +1002,7 @@ pub(crate) fn preflight_manual_finalize_cancellable(
                         }
                     });
                     if new_acceptance && cancelled() {
-                        checkpoint.retire_provisional_manual_finalization(&intent, false, false)?;
+                        checkpoint.retire_preparation(&intent, false, false)?;
                         return Err(remanence_state::StateError::ConfigInvalid(
                             "finalization request dropped before acceptance".into(),
                         ));
@@ -1093,13 +1065,11 @@ pub(crate) fn preflight_automatic_terminal_completion(
     selected: &SelectedTape,
     pool_cfg: &TapePoolConfig,
 ) -> Result<bool, Status> {
-    let checkpoint_journal = remanence_state::FileCheckpointJournal::open(
-        cfg.checkpoint_journal_dir,
-        selected.tape_uuid,
-    )
-    .map_err(crate::status_from_state_error)?;
+    let checkpoint_journal =
+        remanence_state::TapeAuthority::open(cfg.checkpoint_journal_dir, selected.tape_uuid)
+            .map_err(crate::status_from_state_error)?;
     let pending = checkpoint_journal
-        .terminal_finalization_intent()
+        .pending_finalization()
         .map_err(crate::status_from_state_error)?;
     if pending
         .as_ref()
@@ -1112,7 +1082,7 @@ pub(crate) fn preflight_automatic_terminal_completion(
             .acquire_exclusive_for_terminal_recovery()
             .map_err(crate::status_from_state_error)?;
         let intent = checkpoint
-            .terminal_finalization_intent()
+            .pending_finalization()
             .map_err(crate::status_from_state_error)?
             .ok_or_else(|| {
                 Status::internal("automatic terminal intent disappeared in preflight")
@@ -1127,7 +1097,7 @@ pub(crate) fn preflight_automatic_terminal_completion(
         )
     };
     let previous = checkpoint
-        .last_record_bounded()
+        .latest_commit()
         .map_err(crate::status_from_state_error)?;
     let Some(previous) = previous else {
         if intent.is_none() {
@@ -1137,8 +1107,8 @@ pub(crate) fn preflight_automatic_terminal_completion(
             "automatic terminal completion requires checkpoint authority",
         ));
     };
-    if previous.sealed_after_write {
-        let completion = previous.terminal_finalization.as_ref().ok_or_else(|| {
+    if previous.sealed {
+        let completion = previous.finalization.as_ref().ok_or_else(|| {
             Status::failed_precondition(
                 "sealed checkpoint authority has no terminal-finalization completion",
             )
@@ -1159,7 +1129,7 @@ pub(crate) fn preflight_automatic_terminal_completion(
             // authority; ordinary journal ownership excludes a concurrent
             // writer while it is projected.
             index
-                .project_checkpoint_record(&previous)
+                .project_authority_commit(&previous)
                 .map_err(crate::status_from_state_error)?;
         }
         ensure_tape_sealed_audit(
@@ -1189,10 +1159,8 @@ pub(crate) fn preflight_automatic_terminal_completion(
                 ));
             }
             let mut source =
-                remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_no_parity(
-                    &checkpoint,
-                )
-                .map_err(crate::status_from_state_error)?;
+                remanence_state::TerminalIndexSource::new_replay_backed_no_parity(&checkpoint)
+                    .map_err(crate::status_from_state_error)?;
             let plan = source
                 .reconstruct_final_plan(&intent)
                 .map_err(crate::status_from_state_error)?;
@@ -1209,44 +1177,28 @@ pub(crate) fn preflight_automatic_terminal_completion(
             let persisted = intent.terminal_prefix.as_ref().ok_or_else(|| {
                 Status::failed_precondition("parity finalization intent has no prefix plan")
             })?;
-            let journal_dir = cfg.checkpoint_journal_dir.parent().ok_or_else(|| {
-                Status::internal("checkpoint journal directory has no parent for parity journal")
-            })?;
-            let mut journal = FileTapeFileJournal::open(
-                journal_dir.join(format!(
-                    "{}.remjournal",
-                    crate::bytes_to_hex(&selected.tape_uuid)
-                )),
-                selected.tape_uuid,
-                selected.block_size,
-                scheme.clone(),
-            )
-            .map_err(|error| {
-                Status::failed_precondition(format!("open parity journal: {error}"))
-            })?;
+            let journal = checkpoint
+                .open_structural(selected.block_size, scheme.clone())
+                .map_err(|error| {
+                    Status::failed_precondition(format!("open parity journal: {error}"))
+                })?;
             let prefix =
                 TerminalPrefixPlan::try_from(persisted).map_err(crate::status_from_state_error)?;
-            let prefix_checkpoint = remanence_parity::CommittedBundle {
-                kind: remanence_parity::CommittedBundleKind::CheckpointedThrough,
-                entries: Vec::new(),
-                highest_protected_ordinal: prefix.committed_bundle.highest_protected_ordinal,
-                total_committed_ordinals: prefix.committed_bundle.total_committed_ordinals,
-            };
             let prefix_is_durable = journal
-                .terminal_prefix_transition_is_durable(&prefix.committed_bundle, &prefix_checkpoint)
+                .prefix_is_durable(&prefix.media_publication())
                 .map_err(|error| {
                     Status::failed_precondition(format!(
                         "inspect terminal-prefix journal transition: {error}"
                     ))
                 })?;
             let mut source = if prefix_is_durable {
-                remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_after_terminal_prefix(
+                remanence_state::TerminalIndexSource::new_replay_backed_after_terminal_prefix(
                     &checkpoint,
                     &journal,
                     persisted,
                 )
             } else {
-                remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_with_planned_terminal_prefix(
+                remanence_state::TerminalIndexSource::new_replay_backed_with_planned_terminal_prefix(
                     &checkpoint,
                     &journal,
                     persisted,
@@ -1257,15 +1209,25 @@ pub(crate) fn preflight_automatic_terminal_completion(
                 .reconstruct_final_plan(&intent)
                 .map_err(crate::status_from_state_error)?;
             drop(source);
-            let intent = reconcile_and_authorize_parity_resume(
-                index,
-                &mut checkpoint,
-                &spec,
-                selected,
-                intent,
-                &plan,
-                &mut journal,
-            )?;
+            checkpoint
+                .retain_structural_publisher(journal)
+                .map_err(crate::status_from_state_error)?;
+            let intent = checkpoint
+                .with_structural(|checkpoint, rows| {
+                    checkpoint.finish_structural_scope();
+                    reconcile_and_authorize_parity_resume(
+                        index,
+                        checkpoint,
+                        &spec,
+                        selected,
+                        intent,
+                        &plan,
+                        rows.ok_or_else(|| {
+                            Status::internal("missing retained structural capability")
+                        })?,
+                    )
+                })
+                .map_err(crate::status_from_state_error)??;
             (intent, plan)
         }
     };
@@ -1301,14 +1263,14 @@ pub(crate) fn preflight_automatic_terminal_completion(
 /// update; replay removes it only after projection succeeds.
 pub(super) fn project_sealed_checkpoint_then_retire_terminal_intent(
     index: &mut CatalogIndex,
-    checkpoint: &mut remanence_state::FileCheckpointJournalLease,
-    previous: &remanence_state::CheckpointJournalRecord,
+    checkpoint: &mut remanence_state::TapeAuthorityLease,
+    previous: &remanence_state::authority::AuthorityCommit,
 ) -> Result<(), Status> {
     index
-        .project_checkpoint_record(previous)
+        .project_authority_commit(previous)
         .map_err(crate::status_from_state_error)?;
     checkpoint
-        .replay_for_terminal_recovery()
+        .recover_finalization()
         .map_err(crate::status_from_state_error)?;
     Ok(())
 }
@@ -1318,9 +1280,9 @@ pub(super) fn finalize_terminal_no_parity(
     index: &mut CatalogIndex,
     cfg: &impl super::terminal_types::TerminalConfig,
     drive: &mut DriveHandle,
-    checkpoint: &mut remanence_state::FileCheckpointJournalLease,
-    previous: &remanence_state::CheckpointJournalRecord,
-    existing_intent: Option<remanence_state::TerminalFinalizationIntent>,
+    checkpoint: &mut remanence_state::TapeAuthorityLease,
+    previous: &remanence_state::authority::AuthorityCommit,
+    existing_intent: Option<remanence_state::authority::AuthorityFinalization>,
     spec: &TerminalFinalizeSpec,
     selected: &SelectedTape,
     manual_request: Option<&ManualFinalizeTapeActorRequest>,
@@ -1332,10 +1294,7 @@ pub(super) fn finalize_terminal_no_parity(
         .map_err(|error| {
             Status::failed_precondition(format!("TIX terminal fault plan: {error}"))
         })?;
-    let mut source =
-        remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_no_parity(
-            checkpoint,
-        )
+    let mut source = remanence_state::TerminalIndexSource::new_replay_backed_no_parity(checkpoint)
         .map_err(crate::status_from_state_error)?;
     let (intent, plan) = match existing_intent {
         Some(intent) => {
@@ -1366,7 +1325,7 @@ pub(super) fn finalize_terminal_no_parity(
                 &mut source,
                 TerminalPlanPosition {
                     first_tape_file_number: first_file,
-                    first_start_lba: previous.eod_lba,
+                    first_start_lba: previous.cursor.lba,
                     terminal_prefix: None,
                 },
             )?;
@@ -1401,7 +1360,7 @@ pub(super) fn finalize_terminal_no_parity(
         );
     }
     drive
-        .locate(previous.eod_lba)
+        .locate(previous.cursor.lba)
         .map_err(|error| Status::unavailable(format!("locate checkpoint EOD: {error}")))?;
     finish_terminal_tail(
         index,
@@ -1426,9 +1385,9 @@ pub(super) fn finalize_terminal_with_parity(
     index: &mut CatalogIndex,
     cfg: &impl super::terminal_types::TerminalConfig,
     drive: &mut DriveHandle,
-    checkpoint: &mut remanence_state::FileCheckpointJournalLease,
-    previous: &remanence_state::CheckpointJournalRecord,
-    existing_intent: Option<remanence_state::TerminalFinalizationIntent>,
+    checkpoint: &mut remanence_state::TapeAuthorityLease,
+    previous: &remanence_state::authority::AuthorityCommit,
+    existing_intent: Option<remanence_state::authority::AuthorityFinalization>,
     spec: &TerminalFinalizeSpec,
     selected: &SelectedTape,
     manual_request: Option<&ManualFinalizeTapeActorRequest>,
@@ -1444,14 +1403,9 @@ pub(super) fn finalize_terminal_with_parity(
             ));
         }
     };
-    let journal_path = parity_journal_path(cfg, spec.tape_uuid)?;
-    let journal = FileTapeFileJournal::open(
-        journal_path,
-        spec.tape_uuid,
-        spec.block_size,
-        scheme.clone(),
-    )
-    .map_err(|error| Status::failed_precondition(format!("open parity journal: {error}")))?;
+    let mut journal = checkpoint
+        .open_structural(spec.block_size, scheme)
+        .map_err(|error| Status::failed_precondition(format!("open parity journal: {error}")))?;
     finalize_terminal_with_parity_journal(
         index,
         cfg,
@@ -1462,7 +1416,7 @@ pub(super) fn finalize_terminal_with_parity(
         spec,
         selected,
         manual_request,
-        journal,
+        journal.as_mut(),
         rewritable,
         carried,
     )
@@ -1478,16 +1432,17 @@ pub(super) fn finalize_terminal_with_parity_journal(
     index: &mut CatalogIndex,
     cfg: &impl super::terminal_types::TerminalConfig,
     drive: &mut DriveHandle,
-    checkpoint: &mut remanence_state::FileCheckpointJournalLease,
-    previous: &remanence_state::CheckpointJournalRecord,
-    existing_intent: Option<remanence_state::TerminalFinalizationIntent>,
+    checkpoint: &mut remanence_state::TapeAuthorityLease,
+    previous: &remanence_state::authority::AuthorityCommit,
+    existing_intent: Option<remanence_state::authority::AuthorityFinalization>,
     spec: &TerminalFinalizeSpec,
     selected: &SelectedTape,
     manual_request: Option<&ManualFinalizeTapeActorRequest>,
-    mut journal: FileTapeFileJournal,
+    mut journal: &mut dyn remanence_parity::authority::StructuralAuthority,
     rewritable: bool,
     carried: Option<remanence_parity::ParitySinkSessionState>,
 ) -> Result<TerminalFinalizeResult, Status> {
+    checkpoint.finish_structural_scope();
     drive.clear_append_admission();
     let cfg = &cfg.terminal_config();
     let tix_fault = crate::terminal_fault::TerminalFaultPlan::from_env_for_tape(spec.tape_uuid)
@@ -1504,29 +1459,23 @@ pub(super) fn finalize_terminal_with_parity_journal(
             })?;
             let prefix =
                 TerminalPrefixPlan::try_from(persisted).map_err(crate::status_from_state_error)?;
-            let prefix_checkpoint = remanence_parity::CommittedBundle {
-                kind: remanence_parity::CommittedBundleKind::CheckpointedThrough,
-                entries: Vec::new(),
-                highest_protected_ordinal: prefix.committed_bundle.highest_protected_ordinal,
-                total_committed_ordinals: prefix.committed_bundle.total_committed_ordinals,
-            };
             let prefix_is_durable = journal
-                .terminal_prefix_transition_is_durable(&prefix.committed_bundle, &prefix_checkpoint)
+                .prefix_is_durable(&prefix.media_publication())
                 .map_err(|error| {
                     Status::failed_precondition(format!(
                         "inspect terminal-prefix journal transition: {error}"
                     ))
                 })?;
             let mut source = if prefix_is_durable {
-                remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_after_terminal_prefix(
+                remanence_state::TerminalIndexSource::new_replay_backed_after_terminal_prefix(
                     checkpoint,
-                    &journal,
+                    journal,
                     persisted,
                 )
             } else {
-                remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_with_planned_terminal_prefix(
+                remanence_state::TerminalIndexSource::new_replay_backed_with_planned_terminal_prefix(
                     checkpoint,
-                    &journal,
+                    journal,
                     persisted,
                 )
             }
@@ -1538,12 +1487,12 @@ pub(super) fn finalize_terminal_with_parity_journal(
                 (None, journal)
             } else {
                 let snapshot = journal
-                    .planned_terminal_prefix_base_snapshot_bounded(&prefix.committed_bundle)
+                    .freeze_before_terminal_prefix(&prefix.media_publication())
                     .map_err(|error| {
                         Status::failed_precondition(format!("freeze terminal-prefix base: {error}"))
                     })?;
                 epoch_state =
-                    terminal_epoch_state(drive, &mut journal, &snapshot, selected, carried.take())?;
+                    terminal_epoch_state(drive, journal, &snapshot, selected, carried.take())?;
                 let reconstructed = if let Some(state) = epoch_state.take() {
                     let mut raw = DriveHandleRawSink::new(drive);
                     let sink = remanence_parity::ParitySink::from_session_state_for_terminal_close(
@@ -1582,10 +1531,8 @@ pub(super) fn finalize_terminal_with_parity_journal(
             // Validate the checkpoint/parity bijection before the resume
             // session performs even positioning motion.
             let base_authority =
-                remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed(
-                    checkpoint, &journal,
-                )
-                .map_err(crate::status_from_state_error)?;
+                remanence_state::TerminalIndexSource::new_replay_backed(checkpoint, journal)
+                    .map_err(crate::status_from_state_error)?;
             if base_authority
                 .summary()
                 .scope
@@ -1596,11 +1543,11 @@ pub(super) fn finalize_terminal_with_parity_journal(
                     "checkpointed parity tape has no replayable committed prefix",
                 ));
             }
-            let snapshot = journal.committed_snapshot_bounded().map_err(|error| {
+            let snapshot = journal.freeze().map_err(|error| {
                 Status::failed_precondition(format!("freeze parity journal: {error}"))
             })?;
             epoch_state =
-                terminal_epoch_state(drive, &mut journal, &snapshot, selected, carried.take())?;
+                terminal_epoch_state(drive, journal, &snapshot, selected, carried.take())?;
             let diagnostics = remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION"))
                 .capture()
                 .map_err(|e| status_from_parity_error(&e, e.to_string()))?;
@@ -1621,19 +1568,19 @@ pub(super) fn finalize_terminal_with_parity_journal(
                 remanence_parity::plan_checkpointed_terminal_index_close(&snapshot, diagnostics)
                     .map_err(|e| status_from_parity_error(&e, e.to_string()))?
             };
-            let expected_start_file = previous.next_tape_file_number;
+            let expected_start_file = previous.next_file;
             if prefix.start_tape_file_number != expected_start_file
-                || prefix.start_lba != previous.eod_lba
+                || prefix.start_lba != previous.cursor.lba
             {
                 return Err(Status::failed_precondition(format!(
                     "bounded terminal close seed starts at tape file {}/LBA {}, expected {expected_start_file}/{}",
-                    prefix.start_tape_file_number, prefix.start_lba, previous.eod_lba
+                    prefix.start_tape_file_number, prefix.start_lba, previous.cursor.lba
                 )));
             }
-            let persisted = remanence_state::TerminalFinalizationPrefixPlan::from(&prefix);
-            let mut source = remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_with_planned_terminal_prefix(
+            let persisted = remanence_state::authority::AuthorityPrefixPlan::from(&prefix);
+            let mut source = remanence_state::TerminalIndexSource::new_replay_backed_with_planned_terminal_prefix(
                 checkpoint,
-                &journal,
+                journal,
                 &persisted,
             )
             .map_err(crate::status_from_state_error)?;
@@ -1666,22 +1613,11 @@ pub(super) fn finalize_terminal_with_parity_journal(
     // transition ahead, which is reconciled entirely in host durability first.
     let intent = if resuming_existing_intent {
         reconcile_and_authorize_parity_resume(
-            index,
-            checkpoint,
-            spec,
-            selected,
-            intent,
-            &plan,
-            &mut journal,
+            index, checkpoint, spec, selected, intent, &plan, journal,
         )?
     } else {
         reconcile_terminal_component_host_authority(
-            index,
-            checkpoint,
-            spec,
-            intent,
-            &plan,
-            &mut journal,
+            index, checkpoint, spec, intent, &plan, journal,
         )?
     };
     if let Some(request) = manual_request {
@@ -1711,14 +1647,8 @@ pub(super) fn finalize_terminal_with_parity_journal(
         );
     }
 
-    let prefix_checkpoint = remanence_parity::CommittedBundle {
-        kind: remanence_parity::CommittedBundleKind::CheckpointedThrough,
-        entries: Vec::new(),
-        highest_protected_ordinal: prefix.committed_bundle.highest_protected_ordinal,
-        total_committed_ordinals: prefix.committed_bundle.total_committed_ordinals,
-    };
     let prefix_already_journaled = journal
-        .terminal_prefix_transition_is_durable(&prefix.committed_bundle, &prefix_checkpoint)
+        .prefix_is_durable(&prefix.media_publication())
         .map_err(|error| {
             Status::failed_precondition(format!(
                 "inspect terminal-prefix journal transition: {error}"
@@ -1809,6 +1739,7 @@ pub(super) fn finalize_terminal_with_parity_journal(
                 .and_then(|sink| sink.close_for_terminal_index(&prefix, prefix_evidence))
                 .map(|result| {
                     remanence_parity::CheckpointedTerminalPrefixCloseResult {
+                        publication: result.publication,
                         used_tape_blocks: result.used_tape_blocks,
                     }
                 })
@@ -1861,7 +1792,7 @@ pub(super) fn finalize_terminal_with_parity_journal(
         intent,
         plan,
         source,
-        Some(&mut journal),
+        Some(journal),
         rewritable,
         tix_fault.as_ref(),
     )
@@ -1871,10 +1802,10 @@ pub(super) fn finalize_terminal_with_parity_journal(
 pub(super) fn complete_terminal_finalization_host_only(
     index: &mut CatalogIndex,
     audit: TerminalFinalizeAuditConfig<'_>,
-    checkpoint: &mut remanence_state::FileCheckpointJournalLease,
-    previous: &remanence_state::CheckpointJournalRecord,
+    checkpoint: &mut remanence_state::TapeAuthorityLease,
+    previous: &remanence_state::authority::AuthorityCommit,
     spec: &TerminalFinalizeSpec,
-    intent: remanence_state::TerminalFinalizationIntent,
+    intent: remanence_state::authority::AuthorityFinalization,
     plan: &TerminalTripleWritePlan,
     tix_fault: Option<&crate::terminal_fault::TerminalFaultPlan>,
 ) -> Result<TerminalFinalizeResult, Status> {
@@ -1889,39 +1820,45 @@ pub(super) fn complete_terminal_finalization_host_only(
     let mut completed_intent = intent.clone();
     completed_intent.recovery_required = false;
     let replica_c = plan.edition.descriptor.terminal_layout.components[4];
-    let final_bundle = remanence_parity::terminal_component_bundle(plan, replica_c)
+    let final_bundle = remanence_parity::terminal_component_publication(plan, replica_c)
         .map_err(|error| Status::internal(format!("build final C authority: {error}")))?;
-    let final_record = remanence_state::CheckpointJournalRecord {
-        ordinal: previous
-            .ordinal
-            .checked_add(1)
-            .ok_or_else(|| Status::internal("terminal checkpoint ordinal overflows u64"))?,
-        committed_object_count: previous.committed_object_count,
-        eod_partition: plan.edition.descriptor.terminal_layout.partition,
-        eod_lba: plan.edition.descriptor.terminal_layout.expected_eod_lba,
-        tape_uuid: spec.tape_uuid,
-        batch_id: intent.edition_id,
-        next_tape_file_number: replica_c
-            .planned_tape_file_number
-            .checked_add(1)
-            .ok_or_else(|| Status::internal("terminal next tape-file number overflows u64"))?,
-        block_size: spec.block_size,
-        objects: Vec::new(),
-        scheme: previous.scheme.clone(),
-        object_tape_file_bundles: Vec::new(),
-        barrier_bundle: Some(final_bundle),
-        terminal_finalization: Some(completed_intent),
-        sealed_after_write: true,
-        seal_due: None,
-    };
+    let final_record =
+        remanence_state::authority::complete_commit(remanence_state::authority::AuthorityCommit {
+            ordinal: previous
+                .ordinal
+                .checked_add(1)
+                .ok_or_else(|| Status::internal("terminal checkpoint ordinal overflows u64"))?,
+            object_count: previous.object_count,
+            tape_uuid: spec.tape_uuid,
+            operation_id: intent.edition_id,
+            next_file: replica_c
+                .planned_tape_file_number
+                .checked_add(1)
+                .ok_or_else(|| Status::internal("terminal next tape-file number overflows u64"))?,
+            block_size: spec.block_size,
+            payloads: Vec::new(),
+            scheme: previous.scheme.clone(),
+            object_files: Vec::new(),
+            barrier: Some(final_bundle),
+            finalization: Some(completed_intent),
+            sealed: true,
+            seal_due: None,
+            cursor: remanence_parity::CommitCursor {
+                partition: plan.edition.descriptor.terminal_layout.partition,
+                lba: plan.edition.descriptor.terminal_layout.expected_eod_lba,
+            },
+            protected: 0,
+            total: 0,
+            check: None,
+        });
     if let Some(fault) = tix_fault {
         fault
             .abort_if_matches(
                 "final_projection",
                 crate::terminal_fault::TerminalFaultCut::BeforeFinalCheckpointFsync,
                 Some(PhysicalPositionHint {
-                    partition: final_record.eod_partition,
-                    lba: final_record.eod_lba,
+                    partition: final_record.cursor.partition,
+                    lba: final_record.cursor.lba,
                 }),
                 None,
             )
@@ -1930,15 +1867,15 @@ pub(super) fn complete_terminal_finalization_host_only(
             })?;
     }
     checkpoint
-        .append_terminal_finalization_with_after_fsync(std::slice::from_ref(&final_record), || {
+        .publish_sealed_reports(std::slice::from_ref(&final_record), || {
             if let Some(fault) = tix_fault {
                 fault
                     .abort_if_matches(
                         "final_projection",
                         crate::terminal_fault::TerminalFaultCut::AfterFinalCheckpointFsync,
                         Some(PhysicalPositionHint {
-                            partition: final_record.eod_partition,
-                            lba: final_record.eod_lba,
+                            partition: final_record.cursor.partition,
+                            lba: final_record.cursor.lba,
                         }),
                         None,
                     )
@@ -1953,8 +1890,8 @@ pub(super) fn complete_terminal_finalization_host_only(
                 "final_projection",
                 crate::terminal_fault::TerminalFaultCut::BeforeFinalSqliteProjection,
                 Some(PhysicalPositionHint {
-                    partition: final_record.eod_partition,
-                    lba: final_record.eod_lba,
+                    partition: final_record.cursor.partition,
+                    lba: final_record.cursor.lba,
                 }),
                 None,
             )
@@ -1963,7 +1900,7 @@ pub(super) fn complete_terminal_finalization_host_only(
             })?;
     }
     index
-        .project_checkpoint_record(&final_record)
+        .project_authority_commit(&final_record)
         .map_err(crate::status_from_state_error)?;
     if let Some(fault) = tix_fault {
         fault
@@ -1971,8 +1908,8 @@ pub(super) fn complete_terminal_finalization_host_only(
                 "final_projection",
                 crate::terminal_fault::TerminalFaultCut::AfterFinalSqliteProjection,
                 Some(PhysicalPositionHint {
-                    partition: final_record.eod_partition,
-                    lba: final_record.eod_lba,
+                    partition: final_record.cursor.partition,
+                    lba: final_record.cursor.lba,
                 }),
                 None,
             )
@@ -1986,7 +1923,7 @@ pub(super) fn complete_terminal_finalization_host_only(
         audit.audit_append_lock,
         spec.tape_uuid,
     )?;
-    let completion = final_record.terminal_finalization.as_ref().ok_or_else(|| {
+    let completion = final_record.finalization.as_ref().ok_or_else(|| {
         Status::internal("sealed terminal checkpoint omitted its completion authority")
     })?;
     ensure_manual_finalize_finished_audit(
@@ -2011,15 +1948,15 @@ pub(super) fn finish_terminal_tail(
     index: &mut CatalogIndex,
     cfg: &impl super::terminal_types::TerminalConfig,
     drive: &mut DriveHandle,
-    checkpoint: &mut remanence_state::FileCheckpointJournalLease,
-    previous: &remanence_state::CheckpointJournalRecord,
+    checkpoint: &mut remanence_state::TapeAuthorityLease,
+    previous: &remanence_state::authority::AuthorityCommit,
     spec: &TerminalFinalizeSpec,
     selected: &SelectedTape,
     manual_request: Option<&ManualFinalizeTapeActorRequest>,
-    intent: remanence_state::TerminalFinalizationIntent,
+    intent: remanence_state::authority::AuthorityFinalization,
     plan: TerminalTripleWritePlan,
-    mut source: remanence_state::CheckpointTerminalIndexRecordSource<'_>,
-    parity_journal: Option<&mut FileTapeFileJournal>,
+    mut source: remanence_state::TerminalIndexSource,
+    parity_journal: Option<&mut dyn remanence_parity::authority::StructuralAuthority>,
     rewritable: bool,
     tix_fault: Option<&crate::terminal_fault::TerminalFaultPlan>,
 ) -> Result<TerminalFinalizeResult, Status> {
@@ -2107,7 +2044,7 @@ pub(super) fn finish_terminal_tail(
                 let state_progress = state_progress_from_parity(progress);
                 authority.intent = authority
                     .checkpoint
-                    .mark_terminal_recovery_required()
+                    .require_finalization_recovery()
                     .map_err(crate::status_from_state_error)?;
                 if authority.intent.progress != state_progress {
                     return Err(Status::internal(
@@ -2162,7 +2099,7 @@ pub(super) fn finish_terminal_tail(
     }
     let completed_intent = authority
         .checkpoint
-        .terminal_finalization_intent()
+        .pending_finalization()
         .map_err(crate::status_from_state_error)?
         .ok_or_else(|| Status::internal("completed terminal tail lost its durable intent"))?;
     if completed_intent.progress != remanence_state::TerminalFinalizationProgress::AfterReplicaC {
@@ -2506,7 +2443,7 @@ fn admit_terminal_write(
     index: &mut CatalogIndex,
     cfg: &impl super::terminal_types::TerminalConfig,
     drive: &mut DriveHandle,
-    previous: &remanence_state::CheckpointJournalRecord,
+    previous: &remanence_state::authority::AuthorityCommit,
     selected: &SelectedTape,
     plan: &TerminalTripleWritePlan,
     prefix: Option<&TerminalPrefixPlan>,
@@ -2514,8 +2451,8 @@ fn admit_terminal_write(
     let mut ctx = crate::append_admission::context(
         selected.tape_uuid,
         selected.block_size,
-        previous.eod_partition,
-        previous.eod_lba,
+        previous.cursor.partition,
+        previous.cursor.lba,
     );
     ctx.terminal_prefix = prefix.cloned();
     ctx.write_position = drive
@@ -2540,8 +2477,8 @@ fn admit_terminal_write(
 /// Rebuild only the open epoch needed by the terminal funnel, or take its live state.
 fn terminal_epoch_state(
     drive: &mut DriveHandle,
-    journal: &mut FileTapeFileJournal,
-    snapshot: &remanence_parity::FileTapeFileJournalCommittedSnapshot,
+    journal: &mut dyn remanence_parity::authority::StructuralAuthority,
+    snapshot: &remanence_parity::FrozenFileRows,
     selected: &SelectedTape,
     carried: Option<remanence_parity::ParitySinkSessionState>,
 ) -> Result<Option<remanence_parity::ParitySinkSessionState>, Status> {
@@ -2620,11 +2557,9 @@ pub(crate) fn plan_unretained_epoch_finalization(
         tape.voltag.as_deref(),
         "plan finalization",
     )?;
-    let checkpoint = remanence_state::FileCheckpointJournal::open(
-        &cfg.checkpoint_journal_dir,
-        request.tape_uuid,
-    )
-    .map_err(crate::status_from_state_error)?;
+    let checkpoint =
+        remanence_state::TapeAuthority::open(&cfg.checkpoint_journal_dir, request.tape_uuid)
+            .map_err(crate::status_from_state_error)?;
     let lease = checkpoint
         .acquire_exclusive()
         .map_err(crate::status_from_state_error)?;
@@ -2633,17 +2568,13 @@ pub(crate) fn plan_unretained_epoch_finalization(
         remanence_parity::ParityConfig::Scheme(scheme) => scheme.clone(),
         _ => return Err(Status::internal("open epoch requires parity")),
     };
-    let mut journal = FileTapeFileJournal::open(
-        parity_journal_path(cfg, request.tape_uuid)?,
-        request.tape_uuid,
-        request.block_size,
-        scheme,
-    )
-    .map_err(|e| Status::failed_precondition(format!("open parity journal: {e}")))?;
-    remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed(&lease, &journal)
+    let mut journal = lease
+        .open_structural(request.block_size, scheme)
+        .map_err(|e| Status::failed_precondition(format!("open parity journal: {e}")))?;
+    remanence_state::TerminalIndexSource::new_replay_backed(&lease, &journal)
         .map_err(crate::status_from_state_error)?;
     let snapshot = journal
-        .committed_snapshot_bounded()
+        .freeze()
         .map_err(|e| Status::failed_precondition(format!("freeze parity journal: {e}")))?;
     prepare_drive_for_write(
         drive,
@@ -2727,12 +2658,10 @@ pub(super) fn plan_mounted_epoch_finalization(
             tape.voltag.as_deref(),
         );
     }
-    let checkpoint = remanence_state::FileCheckpointJournal::open(
-        &cfg.checkpoint_journal_dir,
-        request.tape_uuid,
-    )
-    .map_err(crate::status_from_state_error)?;
-    let lease = checkpoint
+    let checkpoint =
+        remanence_state::TapeAuthority::open(&cfg.checkpoint_journal_dir, request.tape_uuid)
+            .map_err(crate::status_from_state_error)?;
+    let mut lease = checkpoint
         .acquire_exclusive()
         .map_err(crate::status_from_state_error)?;
     let records = project_checkpoint_authority_bounded(index, &lease)
@@ -2748,8 +2677,10 @@ pub(super) fn plan_mounted_epoch_finalization(
             .unwrap_or_else(|| "(unpooled)".into()),
     };
     let authority =
-        super::checkpoint::validate_parity_actor_authority(cfg, &selected, &lease, &records)?;
-    let mut journal = authority.journal;
+        super::checkpoint::validate_parity_actor_authority(cfg, &selected, &mut lease, &records)?;
+    let mut journal = lease
+        .structural_mut()
+        .ok_or_else(|| Status::internal("missing validated structural capability"))?;
     let epoch = retained.take().filter(|e| {
         e.selected.tape_uuid == selected.tape_uuid
             && e.identity_generation == drive.identity_generation()
@@ -2802,7 +2733,7 @@ pub(super) fn plan_mounted_epoch_finalization(
             .unwrap_or(0);
         (None, (permit, generation))
     };
-    let state = terminal_epoch_state(drive, &mut journal, &authority.snapshot, &selected, carried)?;
+    let state = terminal_epoch_state(drive, journal, &authority.snapshot, &selected, carried)?;
     let diagnostics = remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION"))
         .capture()
         .map_err(|e| status_from_parity_error(&e, e.to_string()))?;
@@ -2838,7 +2769,7 @@ pub(super) fn plan_mounted_epoch_finalization(
 pub(super) fn terminal_prefix_write_failure(
     index: &mut CatalogIndex,
     cfg: &impl TerminalConfig,
-    checkpoint: &mut remanence_state::FileCheckpointJournalLease,
+    checkpoint: &mut remanence_state::TapeAuthorityLease,
     spec: &TerminalFinalizeSpec,
     selected: &SelectedTape,
     raw_write_attempted: bool,
@@ -2874,7 +2805,7 @@ pub(super) fn terminal_prefix_write_failure(
 pub(super) fn terminal_tail_write_failure(
     index: &mut CatalogIndex,
     cfg: &impl TerminalConfig,
-    checkpoint: &mut remanence_state::FileCheckpointJournalLease,
+    checkpoint: &mut remanence_state::TapeAuthorityLease,
     spec: &TerminalFinalizeSpec,
     selected: &SelectedTape,
     manual_request: Option<&ManualFinalizeTapeActorRequest>,

@@ -1,5 +1,8 @@
 //! Parity-session authority and durable checkpoint barriers.
 
+use remanence_state::authority::TapeAuthorityView;
+use remanence_state::authority::TapeAuthorityWriter as _;
+#[cfg(test)]
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::{Duration as StdDuration, Instant};
@@ -8,8 +11,8 @@ use remanence_library::{DriveHandle, TapeIoError};
 use remanence_parity::{
     checked_bounded_resume_summary, rebuild_open_epoch_from_bounded_summary, resume_record_result,
     BoundedResumeSummary, BoundedResumeWriterSeed, CloseReason, DriveHandleRawSink,
-    DriveHandleRawSource, FileTapeFileJournal, FileTapeFileJournalCommittedSnapshot, ParityError,
-    ParitySink, ParitySinkSessionState, PhysicalPositionHint, RawTapeSink, RawWriteOutcome,
+    DriveHandleRawSource, FrozenFileRows, ParityError, ParitySink, ParitySinkSessionState,
+    PhysicalPositionHint, RawTapeSink, RawWriteOutcome,
 };
 use remanence_state::{AuditEvent, CatalogIndex, TapePoolConfig};
 use tokio::sync::mpsc;
@@ -65,7 +68,6 @@ pub(crate) struct PendingCheckpointBatch {
 pub(super) struct ParityActorSession {
     pub(super) scheme: remanence_parity::ParityScheme,
     pub(super) sink_state: Option<ParitySinkSessionState>,
-    pub(super) journal: Option<FileTapeFileJournal>,
     pub(super) retention: Option<crate::io_memory::IoMemoryPermit>,
     pub(super) close_at_barrier: bool,
 }
@@ -99,9 +101,8 @@ pub(super) fn retained_epoch_bytes(
 
 pub(super) struct ParityActorAuthority {
     pub(super) scheme: remanence_parity::ParityScheme,
-    pub(super) snapshot: FileTapeFileJournalCommittedSnapshot,
+    pub(super) snapshot: FrozenFileRows,
     pub(super) summary: BoundedResumeSummary,
-    pub(super) journal: FileTapeFileJournal,
 }
 
 /// Records entry into a direct parity raw-write boundary. Position-only
@@ -173,22 +174,23 @@ impl RawTapeSink for ActivityTrackingRawTapeSink<'_> {
     }
 }
 
-pub(super) fn parity_journal_path(
+#[cfg(test)]
+pub(super) fn parity_journal_directory(
     cfg: &impl super::terminal_types::TerminalConfig,
-    tape_uuid: TapeUuid,
+    _tape_uuid: TapeUuid,
 ) -> Result<PathBuf, Status> {
-    let cfg = &cfg.terminal_config();
-    let journal_dir = cfg.checkpoint_journal_dir.parent().ok_or_else(|| {
-        Status::internal("checkpoint journal directory has no parent for the parity journal")
-    })?;
-    Ok(journal_dir.join(format!("{}.remjournal", crate::bytes_to_hex(&tape_uuid))))
+    cfg.terminal_config()
+        .checkpoint_journal_dir
+        .parent()
+        .map(PathBuf::from)
+        .ok_or_else(|| Status::internal("checkpoint authority has no journal directory"))
 }
 
 pub(super) fn validate_parity_actor_authority(
-    cfg: &WriteOwnerConfig,
+    _cfg: &WriteOwnerConfig,
     selected: &SelectedTape,
-    checkpoint: &remanence_state::FileCheckpointJournalLease,
-    checkpoints: &[remanence_state::CheckpointJournalRecord],
+    checkpoint: &mut remanence_state::TapeAuthorityLease,
+    _checkpoints: &[remanence_state::authority::AuthorityCommit],
 ) -> Result<ParityActorAuthority, Status> {
     let scheme = match &selected.parity_config {
         remanence_parity::ParityConfig::Scheme(scheme) => scheme.clone(),
@@ -198,45 +200,42 @@ pub(super) fn validate_parity_actor_authority(
             ));
         }
     };
-    let path = parity_journal_path(cfg, selected.tape_uuid)?;
-    let journal = resume_record_result(FileTapeFileJournal::open(
-        path,
-        selected.tape_uuid,
-        selected.block_size,
-        scheme.clone(),
-    ))
-    .map_err(|err| status_from_parity_error(&err, format!("open parity tape journal: {err}")))?;
-    if journal.orphaned_bundles_preserved_on_open() != 0 {
+    let journal =
+        resume_record_result(checkpoint.open_structural(selected.block_size, scheme.clone()))
+            .map_err(|err| {
+                status_from_parity_error(&err, format!("open parity tape journal: {err}"))
+            })?;
+    if journal.pending_count() != 0 {
         tracing::warn!(
             tape_uuid = %Uuid::from_bytes(selected.tape_uuid),
-            orphaned_bundle_count = journal.orphaned_bundles_preserved_on_open(),
+            orphaned_bundle_count = journal.pending_count(),
             "preserved sink-journal bundles beyond the last checkpoint watermark; reconciliation required"
         );
     }
-    let snapshot = resume_record_result(journal.committed_snapshot_bounded()).map_err(|err| {
+    let snapshot = resume_record_result(journal.freeze()).map_err(|err| {
         status_from_parity_error(&err, format!("freeze parity tape journal: {err}"))
     })?;
     let summary = checked_bounded_resume_summary(&snapshot)
         .map_err(|err| status_from_parity_error(&err, err.to_string()))?;
-    crate::pool_write::validate_parity_resume_checkpoint_authority(
-        checkpoint,
-        &journal,
-        checkpoints.is_empty(),
-        summary.committed_tape_file_count,
-    )
-    .map_err(|refusal| match refusal {
-        crate::pool_write::ResumeAuthorityRefusal::Records(err) => {
-            status_from_parity_error(&err, err.to_string())
-        }
-        crate::pool_write::ResumeAuthorityRefusal::State(err) => {
-            crate::status_from_state_error(err)
-        }
-    })?;
+    checkpoint
+        .validate_append_rows(&snapshot)
+        .map_err(
+            |error| match crate::pool_write::ResumeAuthorityRefusal::from(error) {
+                crate::pool_write::ResumeAuthorityRefusal::Records(error) => {
+                    status_from_parity_error(&error, error.to_string())
+                }
+                crate::pool_write::ResumeAuthorityRefusal::State(error) => {
+                    crate::status_from_state_error(error)
+                }
+            },
+        )?;
+    checkpoint
+        .retain_structural_publisher(journal)
+        .map_err(crate::status_from_state_error)?;
     Ok(ParityActorAuthority {
         scheme,
         snapshot,
         summary,
-        journal,
     })
 }
 
@@ -245,14 +244,40 @@ pub(super) fn open_parity_actor_session(
     drive: &mut DriveHandle,
     cfg: &WriteOwnerConfig,
     selected: &SelectedTape,
-    checkpoints: &[remanence_state::CheckpointJournalRecord],
+    checkpoints: &[remanence_state::authority::AuthorityCommit],
     authority: ParityActorAuthority,
+    writer: &mut remanence_state::TapeAuthorityLease,
+) -> Result<ParityActorSession, Status> {
+    writer
+        .with_structural(|_, rows| {
+            let rows = rows
+                .ok_or_else(|| Status::internal("active parity session has no append journal"))?;
+            open_parity_actor_session_with_rows(
+                index,
+                drive,
+                cfg,
+                selected,
+                checkpoints,
+                authority,
+                rows,
+            )
+        })
+        .map_err(crate::status_from_state_error)?
+}
+
+fn open_parity_actor_session_with_rows(
+    index: &mut CatalogIndex,
+    drive: &mut DriveHandle,
+    cfg: &WriteOwnerConfig,
+    selected: &SelectedTape,
+    checkpoints: &[remanence_state::authority::AuthorityCommit],
+    authority: ParityActorAuthority,
+    mut journal: &mut dyn remanence_parity::authority::StructuralAuthority,
 ) -> Result<ParityActorSession, Status> {
     let ParityActorAuthority {
         scheme,
         snapshot,
         summary,
-        mut journal,
     } = authority;
     let sink_state = if summary.committed_tape_file_count == 0 {
         let preflight_state = {
@@ -320,7 +345,7 @@ pub(super) fn open_parity_actor_session(
             )
         })?;
         drive
-            .locate_admitted_append(checkpoint.eod_lba)
+            .locate_admitted_append(checkpoint.cursor.lba)
             .map_err(|err| Status::unavailable(format!("locate parity checkpoint EOD: {err}")))?;
         let plan = summary
             .append_plan(&scheme)
@@ -360,7 +385,7 @@ pub(super) fn open_parity_actor_session(
             None
         };
         drive
-            .locate_admitted_append(checkpoint.eod_lba)
+            .locate_admitted_append(checkpoint.cursor.lba)
             .map_err(|err| Status::unavailable(format!("restore parity append position: {err}")))?;
         let resume_result = plan
             .complete(Vec::new())
@@ -410,7 +435,6 @@ pub(super) fn open_parity_actor_session(
     Ok(ParityActorSession {
         scheme,
         sink_state: Some(sink_state),
-        journal: Some(journal),
         retention,
         close_at_barrier: false,
     })
@@ -463,13 +487,13 @@ pub(super) struct BarrierOutcome {
     pub(super) logical_bytes: u64,
     pub(super) filemark_drain: StdDuration,
     pub(super) journal_projection: StdDuration,
-    pub(super) checkpoint_record: remanence_state::CheckpointJournalRecord,
-    pub(super) terminal_checkpoint_record: Option<remanence_state::CheckpointJournalRecord>,
+    pub(super) checkpoint_record: remanence_state::authority::AuthorityCommit,
+    pub(super) terminal_checkpoint_record: Option<remanence_state::authority::AuthorityCommit>,
     pub(super) sealed_after_write: bool,
 }
 
 pub(super) fn extend_durable_checkpoint_records(
-    records: &mut Vec<remanence_state::CheckpointJournalRecord>,
+    records: &mut Vec<remanence_state::authority::AuthorityCommit>,
     outcome: &BarrierOutcome,
 ) {
     records.clear();
@@ -486,12 +510,12 @@ pub(super) fn extend_durable_checkpoint_records(
 /// retaining only the final record needed by the live writer actor.
 pub(super) fn project_checkpoint_authority_bounded(
     index: &mut CatalogIndex,
-    lease: &remanence_state::FileCheckpointJournalLease,
-) -> Result<Vec<remanence_state::CheckpointJournalRecord>, remanence_state::StateError> {
+    lease: &remanence_state::TapeAuthorityLease,
+) -> Result<Vec<remanence_state::authority::AuthorityCommit>, remanence_state::StateError> {
     let mut last = None;
-    lease.for_each_record_bounded(|record| {
-        index.project_checkpoint_record(record)?;
-        last = Some(record.clone());
+    lease.visit_commits(&mut |commit| {
+        index.project_authority_commit(commit)?;
+        last = Some(commit.clone());
         Ok(())
     })?;
     Ok(last.into_iter().collect())
@@ -569,11 +593,11 @@ impl CheckpointBarrierFailure {
 /// object/copy protobuf conversion.
 pub(super) fn checkpointed_objects_from_catalog(
     index: &CatalogIndex,
-    checkpoint_record: &remanence_state::CheckpointJournalRecord,
+    checkpoint_record: &remanence_state::authority::AuthorityCommit,
     sealed_after_write: bool,
 ) -> Result<Vec<pb::ObjectRecord>, CheckpointBarrierFailure> {
     checkpoint_record
-        .objects
+        .payloads
         .iter()
         .map(|projection| {
             let object_id = projection.object.object_id.as_str();
@@ -611,7 +635,7 @@ pub(super) fn checkpointed_objects_from_catalog(
 pub(super) fn perform_checkpoint_barrier(
     index: &mut CatalogIndex,
     drive: &mut DriveHandle,
-    journal: &mut remanence_state::FileCheckpointJournalLease,
+    journal: &mut remanence_state::TapeAuthorityLease,
     tape_uuid: TapeUuid,
     checkpoint_ordinal: &mut u64,
     tape_committed_object_count: &mut u64,
@@ -643,7 +667,47 @@ pub(super) fn perform_checkpoint_barrier(
 fn perform_checkpoint_barrier_mode(
     index: &mut CatalogIndex,
     drive: &mut DriveHandle,
-    journal: &mut remanence_state::FileCheckpointJournalLease,
+    journal: &mut remanence_state::TapeAuthorityLease,
+    tape_uuid: TapeUuid,
+    checkpoint_ordinal: &mut u64,
+    tape_committed_object_count: &mut u64,
+    batch: &PendingCheckpointBatch,
+    parity_session: Option<&mut ParityActorSession>,
+    selected: &SelectedTape,
+    pool_cfg: &TapePoolConfig,
+    cfg: &WriteOwnerConfig,
+    allow_finalization: bool,
+    media_written: &mut bool,
+) -> Result<BarrierOutcome, CheckpointBarrierFailure> {
+    journal
+        .with_structural_scope(|journal, structural| {
+            perform_checkpoint_barrier_with_rows(
+                index,
+                drive,
+                journal,
+                tape_uuid,
+                checkpoint_ordinal,
+                tape_committed_object_count,
+                batch,
+                parity_session,
+                selected,
+                pool_cfg,
+                cfg,
+                allow_finalization,
+                media_written,
+                structural,
+            )
+        })
+        .map_err(|error| {
+            CheckpointBarrierFailure::before_journal(crate::status_from_state_error(error))
+        })?
+}
+
+#[allow(clippy::too_many_arguments)]
+fn perform_checkpoint_barrier_with_rows(
+    index: &mut CatalogIndex,
+    drive: &mut DriveHandle,
+    journal: &mut remanence_state::TapeAuthorityLease,
     tape_uuid: TapeUuid,
     checkpoint_ordinal: &mut u64,
     tape_committed_object_count: &mut u64,
@@ -654,6 +718,7 @@ fn perform_checkpoint_barrier_mode(
     cfg: &WriteOwnerConfig,
     allow_finalization: bool,
     media_written: &mut bool,
+    structural: &mut Option<remanence_parity::authority::StructuralCapability>,
 ) -> Result<BarrierOutcome, CheckpointBarrierFailure> {
     let allow_finalization = allow_finalization
         && !cfg
@@ -736,7 +801,7 @@ fn perform_checkpoint_barrier_mode(
                 close_reason = if parity_session.retention.is_some() { "none" } else { "io_memory_ceiling" },
                 "remanence_write_diag");
         }
-        let parity_journal = parity_session.journal.as_mut().ok_or_else(|| {
+        let parity_journal = structural.as_mut().ok_or_else(|| {
             CheckpointBarrierFailure::before_journal(Status::internal(
                 "active parity session has no append journal",
             ))
@@ -798,7 +863,7 @@ fn perform_checkpoint_barrier_mode(
             closed.next_tape_file_number,
             selected.block_size,
             closed.barrier_outcome,
-            closed.committed_bundle,
+            closed.sidecar_publication(),
             Some(parity_session.scheme.clone()),
             parity_early_warning,
         )
@@ -861,23 +926,29 @@ fn perform_checkpoint_barrier_mode(
         )),
         ));
     }
-    let mut record = remanence_state::CheckpointJournalRecord {
-        ordinal: next_ordinal,
-        committed_object_count: next_committed_count,
-        eod_partition: captured.partition,
-        eod_lba: captured.lba,
-        tape_uuid,
-        batch_id: *batch.batch_id.as_bytes(),
-        next_tape_file_number,
-        block_size: checkpoint_block_size,
-        objects,
-        scheme,
-        object_tape_file_bundles,
-        barrier_bundle,
-        terminal_finalization: None,
-        sealed_after_write: false,
-        seal_due: None,
-    };
+    let mut record =
+        remanence_state::authority::complete_commit(remanence_state::authority::AuthorityCommit {
+            ordinal: next_ordinal,
+            object_count: next_committed_count,
+            tape_uuid,
+            operation_id: *batch.batch_id.as_bytes(),
+            next_file: next_tape_file_number,
+            block_size: checkpoint_block_size,
+            payloads: objects,
+            scheme,
+            object_files: object_tape_file_bundles,
+            barrier: barrier_bundle,
+            finalization: None,
+            sealed: false,
+            seal_due: None,
+            cursor: remanence_parity::CommitCursor {
+                partition: captured.partition,
+                lba: captured.lba,
+            },
+            protected: 0,
+            total: 0,
+            check: None,
+        });
     let barrier_used_bytes = captured
         .lba
         .checked_mul(u64::from(checkpoint_block_size))
@@ -924,7 +995,7 @@ fn perform_checkpoint_barrier_mode(
             "injected checkpoint journal append failure",
         )));
     }
-    if let Err(err) = journal.append(&record) {
+    if let Err(err) = journal.publish_report(&record) {
         return Err(if err.is_checkpoint_append_authority_uncertain() {
             CheckpointBarrierFailure::uncertain_journal(Status::internal(format!(
                 "checkpoint batch {} journal append failed with durable authority uncertain; close the session and retry only after journal reconciliation: {err}",
@@ -963,7 +1034,7 @@ fn perform_checkpoint_barrier_mode(
     } else {
         None
     };
-    let projection = index.project_checkpoint_record(&record);
+    let projection = index.project_authority_commit(&record);
     #[cfg(test)]
     drop(projection_lock);
     projection.map_err(|err| {
@@ -1038,17 +1109,13 @@ fn perform_checkpoint_barrier_mode(
                 index, cfg, drive, journal, &record, None, &spec, selected, None, rewritable,
             ),
             remanence_parity::ParityConfig::Scheme(_) => {
-                let carried = parity_session
-                    .as_deref_mut()
-                    .and_then(|s| s.sink_state.take());
-                let parity_journal = parity_session
-                    .and_then(|session| session.journal.take())
-                    .ok_or_else(|| {
-                        CheckpointBarrierFailure::after_projection(Status::internal(
-                            "automatic parity finalization has no session-owned append journal",
-                        ))
-                    })?;
-                finalize_terminal_with_parity_journal(
+                let carried = parity_session.and_then(|s| s.sink_state.take());
+                let parity_journal = structural.as_mut().ok_or_else(|| {
+                    CheckpointBarrierFailure::after_projection(Status::internal(
+                        "automatic parity finalization has no session-owned append journal",
+                    ))
+                })?;
+                let finalized = finalize_terminal_with_parity_journal(
                     index,
                     cfg,
                     drive,
@@ -1061,7 +1128,9 @@ fn perform_checkpoint_barrier_mode(
                     parity_journal,
                     rewritable,
                     carried,
-                )
+                );
+                drop(structural.take());
+                finalized
             }
         }
         .map_err(CheckpointBarrierFailure::after_projection)?;
@@ -1112,8 +1181,7 @@ fn perform_checkpoint_barrier_mode(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn fence_failed_checkpoint_batch(
     drive: &mut remanence_library::DriveHandle,
-    lease: &remanence_state::FileCheckpointJournalLease,
-    journal: Option<&mut FileTapeFileJournal>,
+    lease: &mut remanence_state::TapeAuthorityLease,
     index: &mut CatalogIndex,
     cfg: &WriteOwnerConfig,
     selected: &SelectedTape,
@@ -1121,7 +1189,7 @@ pub(super) fn fence_failed_checkpoint_batch(
     status: Status,
 ) -> Status {
     let original = status.clone();
-    let status = match crate::append_admission::abandon_pending_append(drive, lease, journal) {
+    let status = match crate::append_admission::abandon_pending_append(drive, lease) {
         Ok(()) => status,
         Err(error) => Status::unavailable(format!(
             "{}; abandonment marker failed: {error}",
@@ -1373,7 +1441,7 @@ pub(super) fn close_committed_epoch(
     index: &mut CatalogIndex,
     drive: &mut DriveHandle,
     cfg: &WriteOwnerConfig,
-    lease: &mut remanence_state::FileCheckpointJournalLease,
+    lease: &mut remanence_state::TapeAuthorityLease,
     ordinal: &mut u64,
     count: &mut u64,
     session: &mut ParityActorSession,
@@ -1402,18 +1470,13 @@ pub(super) fn close_committed_epoch(
         Ok(outcome) => Ok(outcome),
         Err(mut failure) => {
             if failure.fence_handled && failure.durability_uncertain {
-                if let Err(error) = crate::append_admission::abandon_pending_append(
-                    drive,
-                    lease,
-                    session.journal.as_mut(),
-                ) {
+                if let Err(error) = crate::append_admission::abandon_pending_append(drive, lease) {
                     tracing::error!(%error, "fenced epoch close abandonment marker fails");
                 }
             } else if media_written && failure.durability_uncertain {
                 failure.status = fence_failed_checkpoint_batch(
                     drive,
                     lease,
-                    session.journal.as_mut(),
                     index,
                     cfg,
                     selected,
@@ -1542,7 +1605,7 @@ pub(super) fn close_retained_before_removal(
             "tape_uuid",
             tracing::field::display(Uuid::from_bytes(tape_uuid)),
         );
-        if !remanence_state::FileCheckpointJournal::exists(&cfg.checkpoint_journal_dir, tape_uuid)
+        if !remanence_state::TapeAuthority::exists(&cfg.checkpoint_journal_dir, tape_uuid)
             .map_err(crate::status_from_state_error)?
         {
             tracing::info!(
@@ -1585,11 +1648,10 @@ pub(super) fn close_retained_before_removal(
                 "fenced removal leaves the epoch open until append recovery");
             return Ok(());
         }
-        let journal =
-            remanence_state::FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, tape_uuid)
-                .map_err(crate::status_from_state_error)?;
+        let journal = remanence_state::TapeAuthority::open(&cfg.checkpoint_journal_dir, tape_uuid)
+            .map_err(crate::status_from_state_error)?;
         let mut lease = if journal
-            .terminal_finalization_intent()
+            .pending_finalization()
             .map_err(crate::status_from_state_error)?
             .is_some()
         {
@@ -1605,7 +1667,7 @@ pub(super) fn close_retained_before_removal(
             .map_err(crate::status_from_state_error)?
             .ok_or_else(|| Status::failed_precondition("close tape disappears from catalog"))?;
         if lease
-            .terminal_finalization_intent()
+            .pending_finalization()
             .map_err(crate::status_from_state_error)?
             .is_some()
         {
@@ -1730,8 +1792,8 @@ pub(super) fn close_retained_before_removal(
             let context = crate::append_admission::context(
                 tape_uuid,
                 block_size,
-                last.eod_partition,
-                last.eod_lba,
+                last.cursor.partition,
+                last.cursor.lba,
             );
             let _admission = crate::append_admission::admit_append_boundary(
                 drive,
@@ -1747,7 +1809,7 @@ pub(super) fn close_retained_before_removal(
                 );
                 status
             })?;
-            let authority = validate_parity_actor_authority(cfg, &selected, &lease, &records)?;
+            let authority = validate_parity_actor_authority(cfg, &selected, &mut lease, &records)?;
             #[cfg(test)]
             let authority = if cfg.io_memory.epoch_test_action.load(Ordering::Relaxed) == 8 {
                 let mut authority = authority;
@@ -1761,7 +1823,7 @@ pub(super) fn close_retained_before_removal(
                     && e.selected.tape_uuid == tape_uuid
                     && e.identity_generation == drive.identity_generation()
                     && e.state.matches_committed_summary(&authority.summary)
-                    && e.state.used_tape_blocks() == last.eod_lba
+                    && e.state.used_tape_blocks() == last.cursor.lba
             });
             if shutdown && carried.is_none() {
                 return Err(Status::failed_precondition(
@@ -1775,16 +1837,17 @@ pub(super) fn close_retained_before_removal(
                 ParityActorSession {
                     scheme: authority.scheme,
                     sink_state: Some(e.state),
-                    journal: Some(authority.journal),
                     retention: Some(e.permit),
                     close_at_barrier: true,
                 }
             } else {
                 tracing::info!(tape_uuid = %Uuid::from_bytes(tape_uuid), "removal rebuilds the committed open epoch");
-                open_parity_actor_session(index, drive, cfg, &selected, &records, authority)?
+                open_parity_actor_session(
+                    index, drive, cfg, &selected, &records, authority, &mut lease,
+                )?
             };
             let mut ordinal = last.ordinal;
-            let mut count = last.committed_object_count;
+            let mut count = last.object_count;
             close_committed_epoch(
                 index,
                 drive,

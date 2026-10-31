@@ -10,6 +10,8 @@ publish.workspace = true
 repository  .workspace = true
 
 [features]
+# Deliberately destructive semantic fixtures; never enabled by production binaries.
+fixtures = []
 # Compile-time seam for cross-crate verification equivalence tests.
 test-support = []
 
@@ -45,5 +47,6 @@ unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "warn"
 
 [dev-dependencies]
+remanence-parity = { path = ".", features = ["fixtures"] }
 remanence-chaos = { path = "../remanence-chaos" }
 serde_json = { workspace = true }

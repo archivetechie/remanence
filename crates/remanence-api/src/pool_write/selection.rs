@@ -1,5 +1,6 @@
 //! Pool tape selection and pinned-tape admission.
 
+use remanence_state::authority::TapeAuthorityView;
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -253,16 +254,15 @@ pub fn admit_pinned_tape_for_write_session(
     }
     let checkpoint_journal_tapes = checkpoint_journal_tape_uuids(checkpoint_journal_dir)?;
     let host_only_after_replica_c = if checkpoint_journal_tapes.contains(&tape_uuid) {
-        let journal =
-            remanence_state::FileCheckpointJournal::open(checkpoint_journal_dir, tape_uuid)?;
-        if let Some(intent) = journal.terminal_finalization_intent()? {
+        let journal = remanence_state::TapeAuthority::open(checkpoint_journal_dir, tape_uuid)?;
+        if let Some(intent) = journal.pending_finalization()? {
             intent.progress == remanence_state::TerminalFinalizationProgress::AfterReplicaC
                 && intent.manual.is_none()
         } else {
             let checkpoint = journal.acquire_exclusive()?;
-            checkpoint.last_record_bounded()?.is_some_and(|record| {
-                record.sealed_after_write
-                    && record.terminal_finalization.is_some_and(|completion| {
+            checkpoint.latest_commit()?.is_some_and(|record| {
+                record.sealed
+                    && record.finalization.is_some_and(|completion| {
                         completion.progress
                             == remanence_state::TerminalFinalizationProgress::AfterReplicaC
                             && completion.manual.is_none()
@@ -510,8 +510,8 @@ pub(super) fn checkpoint_journal_tape_uuids(
     checkpoint_journal_dir: &Path,
 ) -> Result<HashSet<TapeUuid>, StateError> {
     let mut journal_tapes = HashSet::new();
-    for path in remanence_state::list_checkpoint_journals(checkpoint_journal_dir)? {
-        let tape_uuid = remanence_state::tape_uuid_from_checkpoint_path(path.as_path())?;
+    for path in remanence_state::TapeAuthority::list_entries(checkpoint_journal_dir)? {
+        let tape_uuid = remanence_state::TapeAuthority::entry_tape_uuid(path.as_path())?;
         journal_tapes.insert(tape_uuid);
     }
     Ok(journal_tapes)
@@ -525,7 +525,7 @@ pub(super) fn tape_carries_checkpoint(
     if !checkpoint_journal_tapes.contains(&tape_uuid) {
         return Ok(false);
     }
-    remanence_state::FileCheckpointJournal::open(checkpoint_journal_dir, tape_uuid)?
-        .last()
+    remanence_state::TapeAuthority::open(checkpoint_journal_dir, tape_uuid)?
+        .latest_commit()
         .map(|record| record.is_some())
 }

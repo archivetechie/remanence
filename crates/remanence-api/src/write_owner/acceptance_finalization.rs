@@ -16,7 +16,8 @@ use crate::pb::catalog_server::Catalog;
 use crate::pb::library_service_server::LibraryService;
 use crate::pb::read_session_service_server::ReadSessionService;
 use crate::ApiState;
-use remanence_state::TerminalFinalizationIntent;
+use remanence_state::authority::AuthorityFinalization;
+use remanence_state::authority::TapeAuthorityView;
 use std::time::Duration;
 use tokio_stream::StreamExt;
 use tonic::Request;
@@ -371,7 +372,7 @@ struct Session {
     records: Vec<Record>,
     receipts: Vec<Receipt>,
     verified: Mutex<Vec<Vec<Record>>>,
-    intent: TerminalFinalizationIntent,
+    intent: AuthorityFinalization,
     prefix: Vec<Record>,
     lost_cut: Option<usize>,
 }
@@ -469,11 +470,15 @@ async fn trace_finalization(lose_filemark: Option<(u64, bool)>) -> Session {
             let temp = tempfile::tempdir().unwrap();
             restore_disk(temp.path(), &cut.disk);
             cut.files.materialize(root.path(), temp.path()).unwrap();
-            FileCheckpointJournal::open(temp.path().join("journals/checkpoints"), TAPE)
-                .ok()?
-                .terminal_finalization_intent()
-                .ok()
-                .flatten()
+            remanence_state::authority::fixtures::AuthorityBuilder::new(
+                temp.path().join("journals/checkpoints"),
+                TAPE,
+            )
+            .build()
+            .ok()?
+            .pending_finalization()
+            .ok()
+            .flatten()
         })
         .expect("trace contains the terminal plan");
     let prefix_plan = intent.terminal_prefix.as_ref().unwrap();
@@ -604,8 +609,8 @@ async fn check(
     let world = Arc::new(Mutex::new(world));
     let prefix = session.intent.terminal_prefix.as_ref().unwrap();
     let mut allowed_files: Vec<_> = prefix
-        .committed_bundle
-        .entries
+        .publication
+        .files
         .iter()
         .map(|entry| {
             let start = entry.physical_start_hint.unwrap();
@@ -680,7 +685,7 @@ async fn check(
             assert_eq!(maps, vec![prefix_plan.parity_map_tape_file_number.unwrap()], "exactly one final ParityMap");
             assert_eq!(file_starts[prefix_plan.start_tape_file_number as usize] as u64, prefix_plan.start_lba);
             assert_eq!(prefix_plan.start_lba as usize, session.prefix.len());
-            for entry in &prefix_plan.committed_bundle.entries {
+            for entry in &prefix_plan.publication.files {
                 let magic = match entry.kind {
                     remanence_parity::TapeFileKind::ParitySidecar => remanence_parity::derive_sidecar_magic(&TAPE),
                     remanence_parity::TapeFileKind::ParityMap => map_magic,

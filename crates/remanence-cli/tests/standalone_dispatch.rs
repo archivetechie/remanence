@@ -2261,10 +2261,11 @@ fn restore_dates_listing_and_member_selection() {
         .unwrap()
         .expect("interrupted request was durable");
     let config = remanence_state::load_config(f.config()).unwrap();
-    let intent = remanence_state::FileCheckpointJournal::open(
+    let intent = remanence_state::authority::fixtures::AuthorityBuilder::new(
         config.journal.dir.join("checkpoints"),
         tape_uuid,
     )
+    .build()
     .unwrap()
     .terminal_finalization_intent()
     .unwrap()
@@ -3280,10 +3281,11 @@ fn finalize_stores_literal_defaults_for_fixed_tape() {
         "must reach the first terminal media write"
     );
     let config = remanence_state::load_config(f.config()).unwrap();
-    let intent = remanence_state::FileCheckpointJournal::open(
+    let intent = remanence_state::authority::fixtures::AuthorityBuilder::new(
         config.journal.dir.join("checkpoints"),
         tape_uuid,
     )
+    .build()
     .unwrap()
     .terminal_finalization_intent()
     .unwrap()

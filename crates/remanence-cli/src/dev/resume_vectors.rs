@@ -2,7 +2,6 @@
 //! frames claims without accepting or repairing them; production journal replay
 //! and bounded resume validation decide whether those claims authorize append.
 use crate::tape_image_vectors::{inputs, object, recipe, VectorImage, BLOCK};
-use ciborium::value::Value as Cbor;
 use remanence_chaos::{
     model::{DeviceRole, ModelTransport, Record, SharedVirtualWorld, VirtualTape, VirtualWorld},
     ChaosTransport, DeviceCtx, FaultEngine,
@@ -11,8 +10,6 @@ use remanence_library::DriveHandle;
 use remanence_parity::*;
 use serde_json::{json, Value};
 use std::{
-    fs::OpenOptions,
-    io::Write,
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -175,27 +172,15 @@ fn resolve_tape_fault(id: &str, fault: &Value, vector: &VectorImage) -> Value {
     json!({"record_edits": record_edits, "unreadable_records": unreadable})
 }
 
-/// Encode v4 reference journal frames, including contradictory claims. This is
-/// deliberately not `commit_bundle`: a writer rejects W > T before persisting
-/// it, whereas a resume executor must exercise replay of the claimed records.
-/// Nonportable sidecar hashes come from the unchanged source image's metadata.
+/// Build semantic host claims, including contradictions, through the selected
+/// fixture backend. Tape-side hashes still come from the unchanged source image.
 pub fn adapt(
     input: &Value,
     vector: &VectorImage,
     path: &Path,
-) -> Result<FileTapeFileJournal, ParityError> {
-    let journal = FileTapeFileJournal::open(
-        path,
-        vector.written.inputs.tape_uuid,
-        BLOCK,
-        vector.written.inputs.scheme.clone(),
-    )?;
-    let mut file = OpenOptions::new()
-        .append(true)
-        .open(path)
-        .map_err(JournalError::from)?;
-    let uint = |n: u64| Cbor::Integer(n.into());
-    let optional = |v: &Value| v.as_u64().map_or(Cbor::Null, &uint);
+) -> Result<TapeRowAuthority, ParityError> {
+    let mut claims = Vec::new();
+    let mut absent_block_counts = Vec::new();
     let mut w = 0;
     let mut t = 0;
     let mut lba = 0;
@@ -205,98 +190,83 @@ pub fn adapt(
             lba = physical;
         }
         let (kind, bundle) = match row["kind"].as_str().unwrap() {
-            "Bootstrap" => (2, 1),
-            "Object" => (0, 0),
-            "ParitySidecar" => (1, 3),
-            // The final ParityMap commits in the reference's TerminalPrefix
-            // bundle, its hash the payload SHA-256 of its header.
-            "ParityMap" => (3, 5),
+            "Bootstrap" => (TapeFileKind::Bootstrap, CommittedBundleKind::BotBootstrap),
+            "Object" => (TapeFileKind::Object, CommittedBundleKind::Object),
+            "ParitySidecar" => (
+                TapeFileKind::ParitySidecar,
+                CommittedBundleKind::CheckpointSidecars,
+            ),
+            "ParityMap" => (TapeFileKind::ParityMap, CommittedBundleKind::TerminalPrefix),
             other => panic!("unsupported resume row {other}"),
         };
         if let Some(first) = row["first_parity_data_ordinal"].as_u64() {
-            // A hostile claim whose end does not fit the journal's u64
-            // watermark leaves the watermark at the last claim that fits; the
-            // row's own block count is recorded unchanged. Honest claims
-            // always fit.
-            if let Some(end) = first.checked_add(row["block_count"].as_u64().unwrap()) {
+            if let Some(end) = row["block_count"]
+                .as_u64()
+                .and_then(|count| first.checked_add(count))
+            {
                 t = t.max(end);
             }
         }
         if let Some(end) = row["protected_ordinal_end_exclusive"].as_u64() {
             w = w.max(end);
         }
-        let hash = if kind == 3 {
-            Cbor::Bytes(vector.image.files[f as usize].bytes[0x38..0x58].to_vec())
+        let hash = if kind == TapeFileKind::ParityMap {
+            Some(
+                vector.image.files[f as usize].bytes[0x38..0x58]
+                    .try_into()
+                    .unwrap(),
+            )
         } else {
             vector
                 .written
                 .sidecars
                 .iter()
-                .find(|s| s.tape_file_number == f)
-                .map_or(Cbor::Null, |s| {
-                    Cbor::Bytes(s.canonical_metadata_hash.to_vec())
-                })
+                .find(|sidecar| sidecar.tape_file_number == f)
+                .map(|sidecar| sidecar.canonical_metadata_hash)
         };
-        let entry = Cbor::Map(vec![
-            (uint(1), uint(f)),
-            (uint(2), uint(kind)),
-            (uint(3), optional(&row["block_count"])),
-            (uint(4), uint(lba)),
-            (uint(5), Cbor::Null),
-            (uint(6), optional(&row["first_parity_data_ordinal"])),
-            (uint(7), optional(&row["epoch_id"])),
-            (uint(8), optional(&row["protected_ordinal_start"])),
-            (uint(9), optional(&row["protected_ordinal_end_exclusive"])),
-            (uint(10), hash),
-            (uint(11), Cbor::Null),
-        ]);
-        frame(&mut file, bundle, vec![entry], w, t)?;
-        // Supplemental hostile commit claims retain measured starts, avoiding
-        // arithmetic on their block counts inside the reference adapter.
+        if row["block_count"].as_u64().is_none() {
+            absent_block_counts.push((claims.len(), 0));
+        }
+        let entry = TapeFileEntry {
+            tape_file_number: f,
+            kind,
+            block_count: row["block_count"].as_u64().unwrap_or(0),
+            physical_start_hint: Some(lba),
+            object_id: None,
+            first_parity_data_ordinal: row["first_parity_data_ordinal"].as_u64(),
+            epoch_id: row["epoch_id"].as_u64(),
+            protected_ordinal_start: row["protected_ordinal_start"].as_u64(),
+            protected_ordinal_end_exclusive: row["protected_ordinal_end_exclusive"].as_u64(),
+            canonical_metadata_hash: hash,
+            object_recovery_row: None,
+        };
+        claims.push(CommittedBundle {
+            kind: bundle,
+            entries: vec![entry],
+            highest_protected_ordinal: w,
+            total_committed_ordinals: t,
+        });
         if row["physical_start_override"].is_null() {
-            lba += row["block_count"].as_u64().unwrap() + 1;
+            lba += row["block_count"].as_u64().unwrap_or(0) + 1;
         }
     }
-    frame(
-        &mut file,
-        4,
-        vec![],
-        input["W"].as_u64().unwrap(),
-        input["T"].as_u64().unwrap(),
-    )?;
-    file.sync_all().map_err(JournalError::from)?;
-    drop(file);
-    drop(journal);
-    resume_record_result(FileTapeFileJournal::open(
-        path,
-        vector.written.inputs.tape_uuid,
-        BLOCK,
-        vector.written.inputs.scheme.clone(),
-    ))
-}
-
-fn frame(
-    file: &mut std::fs::File,
-    kind: u64,
-    entries: Vec<Cbor>,
-    w: u64,
-    t: u64,
-) -> Result<(), ParityError> {
-    let uint = |n: u64| Cbor::Integer(n.into());
-    let value = Cbor::Map(vec![
-        (uint(1), uint(kind)),
-        (uint(2), Cbor::Array(entries)),
-        (uint(3), uint(w)),
-        (uint(4), uint(t)),
-    ]);
-    let mut bytes = Vec::new();
-    ciborium::into_writer(&value, &mut bytes).map_err(|e| JournalError::Codec(e.to_string()))?;
-    file.write_all(&u32::try_from(bytes.len()).unwrap().to_le_bytes())
-        .map_err(JournalError::from)?;
-    file.write_all(&bytes).map_err(JournalError::from)?;
-    file.write_all(&crc64_xz(&bytes).to_le_bytes())
-        .map_err(JournalError::from)?;
-    Ok(())
+    claims.push(CommittedBundle {
+        kind: CommittedBundleKind::CheckpointedThrough,
+        entries: Vec::new(),
+        highest_protected_ordinal: input["W"].as_u64().unwrap(),
+        total_committed_ordinals: input["T"].as_u64().unwrap(),
+    });
+    resume_record_result(
+        remanence_parity::authority::fixtures::RowAuthorityBuilder::new(
+            path,
+            vector.written.inputs.tape_uuid,
+            BLOCK,
+            vector.written.inputs.scheme.clone(),
+        )
+        .claims(claims)
+        .absent_block_counts(absent_block_counts)
+        .build_trusted(),
+    )
 }
 
 /// Load the unchanged source bytes, retaining command evidence for refusals.
@@ -795,7 +765,7 @@ pub fn assert_expected(id: &str, expected: &Value, actual: &Value) {
     assert!(agrees, "{id}: expected {expected}; actual {actual}");
 }
 
-pub const README: &str = "# Resume review candidates\n\nThe frozen specification-authored expected-cases.json is copied verbatim. Per-case expected.json retains each literal JSON object. Never regenerate expectations from reference behavior. Inputs are the image name, the mutated Section 7.1 committed prefix, W and T, the ordered data_shard_crc64 values for [W, T), and complete appended Object inputs where applicable. The CRC values are 16-digit hexadecimal strings computed from the original committed Object blocks before tape faults; the executor compares them to the actual read-back before parity accumulation. Existing expected outcomes remain unchanged; resume-evidence-mismatch changes one recorded CRC and expects ResumeAppend. These off-tape values are not Section 7.1 wire fields. Kinds use their names and absent fields are null.\n\nresume-open is informative: it pins one conforming result, not the only one. Section 11.4 (W4) and the last paragraph of Section 11.6 permit a resumed Writer to end or continue the open epoch. Its inputs and current result stay fixed. The byte manifest pins that example for reproduction; it does not require another Writer to choose it.\n\nMANIFEST.tsv pins every resumed tape file and ALL using the parent manifest's convention. Image bytes are regenerated, not checked in. resume-open-uninterrupted is the same three Objects written by write_tape_image in one session, stopped at CommittedPrefix with zero torn records. The generator's --check checks all resume descriptors, digests and the file set.\n\nThe reference adapter frames v4 off-tape journal records from these claims, then uses FileTapeFileJournal replay and checked_bounded_resume_summary. It does not prevalidate or repair negative inputs. Sidecar metadata hashes are taken from the source image; they are reference journal details, not portable authority. The closed case enters write_owner::checkpoint::open_parity_actor_session and resumes its ordinary ParitySink session; the open case uses rebuild_open_epoch_from_bounded_summary and new_sidecar_only_from_bounded_resume. Both append with ordinary capacity reservation, REM-OBJECT writing, finish_object and checkpoint. No test-only committed-prefix planner is used.\n\nRun cargo test -p remanence-cli -p remanence-api --lib resume_vectors -- --nocapture for PASS, INFORMATIVE and DISAGREEMENT lines. Informative annotations never decide a pass. Pinned errors assert the frozen expectations; record-content failures are classified at the production Resumer boundary.\n\n## Commit-record reporting layer\n\nresume-commit-records is not portable: the journal format is implementation-defined. Existing reference coverage is in remanence-parity's journal::tests::shared_bundle_validator_rejects_ambiguous_or_non_dense_shapes, journal::tests::journal_cbor_rejects_duplicate_and_non_integer_keys, journal::tests::file_journal_preserves_torn_trailing_record_and_fails_closed, journal::tests::file_journal_rejects_header_mismatch, journal::tests::bounded_committed_replay_matches_flattened_authority_and_rejects_orphans, and resume::tests::bounded_resume_fails_closed_on_bot_orphan_and_epoch_discontinuity. These do not establish all four required ResumeAppend outcomes before tape positioning.\n\nThe added reference executor tests are resume_vectors::tests::resume_vectors_commit_records_missing (missing Bootstrap record), resume_vectors::tests::resume_vectors_commit_records_conflicting (two different claims for one Object file), resume_vectors::tests::resume_vectors_commit_records_incomplete (torn checkpoint checksum), and resume_vectors::tests::resume_vectors_commit_records_ambiguous (duplicate Object authority). Each runs journal replay and bounded validation, asserts an empty chaos command log before refusal, and asserts the frozen ResumeAppend error. They are shared with the Layer-5 test build. resume_vectors::tests::resume_vectors_commit_records_checkpoint_w_conflict and resume_vectors_commit_records_checkpoint_t_conflict give a checkpoint marker whose W or T disagrees with the preceding bundle, which reaches the watermark validator rather than the density check. The Layer-5 tests resume_vectors_cross_record_conflict and resume_vectors_empty_checkpoint_authority cover the cross-record checks (the checkpoint journal against the parity journal, and a committed prefix with no checkpoint authority), which report ResumeAppend through one shared helper.\n\nResolved by REM-PARITY §14 step 2 and §3.4: resume-w-greater-than-t and incomplete commit records are ResumeAppend refusals. The shared production resume_record_result boundary preserves journal diagnostics and leaves operational failures unchanged. Both are refused before tape reads or writes; the executor uses that same boundary.\n";
+pub const README: &str = "# Resume review candidates\n\nThe frozen specification-authored expected-cases.json is copied verbatim. Per-case expected.json retains each literal JSON object. Never regenerate expectations from reference behavior. Inputs are the image name, the mutated Section 7.1 committed prefix, W and T, the ordered data_shard_crc64 values for [W, T), and complete appended Object inputs where applicable. The CRC values are 16-digit hexadecimal strings computed from the original committed Object blocks before tape faults; the executor compares them to the actual read-back before parity accumulation. Existing expected outcomes remain unchanged; resume-evidence-mismatch changes one recorded CRC and expects ResumeAppend. These off-tape values are not Section 7.1 wire fields. Kinds use their names and absent fields are null.\n\nresume-open is informative: it pins one conforming result, not the only one. Section 11.4 (W4) and the last paragraph of Section 11.6 permit a resumed Writer to end or continue the open epoch. Its inputs and current result stay fixed. The byte manifest pins that example for reproduction; it does not require another Writer to choose it.\n\nMANIFEST.tsv pins every resumed tape file and ALL using the parent manifest's convention. Image bytes are regenerated, not checked in. resume-open-uninterrupted is the same three Objects written by write_tape_image in one session, stopped at CommittedPrefix with zero torn records. The generator's --check checks all resume descriptors, digests and the file set.\n\nThe reference adapter supplies semantic claims to the selected backend, preserves the existing v4 journal bytes, and uses the production trusted-volume open and checked_bounded_resume_summary. It does not prevalidate or repair negative inputs. Sidecar metadata hashes are taken from the source image; they are reference journal details, not portable authority. The closed case enters write_owner::checkpoint::open_parity_actor_session and resumes its ordinary ParitySink session; the open case uses rebuild_open_epoch_from_bounded_summary and new_sidecar_only_from_bounded_resume. Both append with ordinary capacity reservation, REM-OBJECT writing, finish_object and checkpoint. No test-only committed-prefix planner is used.\n\nRun cargo test -p remanence-cli -p remanence-api --lib resume_vectors -- --nocapture for PASS, INFORMATIVE and DISAGREEMENT lines. Informative annotations never decide a pass. Pinned errors assert the frozen expectations; record-content failures are classified at the production Resumer boundary.\n\n## Commit-record reporting layer\n\nresume-commit-records is not portable: the journal format is implementation-defined. Existing reference coverage is in remanence-parity's journal::tests::shared_bundle_validator_rejects_ambiguous_or_non_dense_shapes, journal::tests::journal_cbor_rejects_duplicate_and_non_integer_keys, journal::tests::file_journal_preserves_torn_trailing_record_and_fails_closed, journal::tests::file_journal_rejects_header_mismatch, journal::tests::bounded_committed_replay_matches_flattened_authority_and_rejects_orphans, and resume::tests::bounded_resume_fails_closed_on_bot_orphan_and_epoch_discontinuity. These do not establish all four required ResumeAppend outcomes before tape positioning.\n\nThe added reference executor tests are resume_vectors::tests::resume_vectors_commit_records_missing (missing Bootstrap record), resume_vectors::tests::resume_vectors_commit_records_conflicting (two different claims for one Object file), resume_vectors::tests::resume_vectors_commit_records_incomplete (torn checkpoint checksum), and resume_vectors::tests::resume_vectors_commit_records_ambiguous (duplicate Object authority). Each runs journal replay and bounded validation, asserts an empty chaos command log before refusal, and asserts the frozen ResumeAppend error. They are shared with the Layer-5 test build. resume_vectors::tests::resume_vectors_commit_records_checkpoint_w_conflict and resume_vectors_commit_records_checkpoint_t_conflict give a checkpoint marker whose W or T disagrees with the preceding bundle, which reaches the watermark validator rather than the density check. The Layer-5 tests resume_vectors_cross_record_conflict and resume_vectors_empty_checkpoint_authority cover the cross-record checks (the checkpoint journal against the parity journal, and a committed prefix with no checkpoint authority), which report ResumeAppend through one shared helper.\n\nResolved by REM-PARITY §14 step 2 and §3.4: resume-w-greater-than-t and incomplete commit records are ResumeAppend refusals. The shared production resume_record_result boundary preserves journal diagnostics and leaves operational failures unchanged. Both are refused before tape reads or writes; the executor uses that same boundary.\n";
 
 /// Read the emitted portable input; missing fixtures are a hard test failure.
 pub fn recorded_input(id: &str) -> Value {
@@ -842,75 +812,17 @@ mod tests {
         let path = temp.path().join("resume.journal");
         let result = (|| -> Result<(), ParityError> {
             let journal = adapt(&input, &vector, &path)?;
-            // Mutate reference record frames, preserving every unchanged claim.
-            // Ambiguity is an exact duplicate frame, including its physical hint.
-            let bytes = std::fs::read(&path).unwrap();
-            let header_len = 41 + vector.written.inputs.scheme.id.as_str().len() + 8;
-            let mut cursor = header_len;
-            let mut frames = Vec::new();
-            while cursor < bytes.len() {
-                let size =
-                    u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-                let end = cursor + size + 12;
-                frames.push(bytes[cursor..end].to_vec());
-                cursor = end;
-            }
-            assert_eq!(frames.len(), 4, "Bootstrap, Object, sidecar, checkpoint");
-            match kind {
-                "missing" => {
-                    frames.remove(0);
-                }
-                "ambiguous" => frames.insert(2, frames[1].clone()),
-                "conflicting" => {
-                    let mut value: Cbor =
-                        ciborium::from_reader(&frames[1][4..frames[1].len() - 8]).unwrap();
-                    let Cbor::Map(bundle) = &mut value else {
-                        panic!("bundle map")
-                    };
-                    let Cbor::Array(entries) = &mut bundle[1].1 else {
-                        panic!("bundle entries")
-                    };
-                    let Cbor::Map(row) = &mut entries[0] else {
-                        panic!("Object row")
-                    };
-                    assert_eq!(row[2].0, Cbor::Integer(3.into()));
-                    row[2].1 = Cbor::Integer(3.into());
-                    let mut payload = Vec::new();
-                    ciborium::into_writer(&value, &mut payload).unwrap();
-                    let mut frame = u32::try_from(payload.len()).unwrap().to_le_bytes().to_vec();
-                    frame.extend_from_slice(&payload);
-                    frame.extend_from_slice(&crc64_xz(&payload).to_le_bytes());
-                    frames.insert(2, frame);
-                }
-                "checkpoint-w" | "checkpoint-t" => {
-                    // Keep the dense tape-file entries unchanged. Only the marker's
-                    // watermark contradicts its preceding bundle.
-                    let frame = frames.last_mut().unwrap();
-                    let mut value: Cbor =
-                        ciborium::from_reader(&frame[4..frame.len() - 8]).unwrap();
-                    let Cbor::Map(bundle) = &mut value else {
-                        panic!("checkpoint bundle map")
-                    };
-                    let key = if kind == "checkpoint-w" { 3 } else { 4 };
-                    let (_, watermark) = bundle
-                        .iter_mut()
-                        .find(|(k, _)| *k == Cbor::Integer(key.into()))
-                        .unwrap();
-                    *watermark = Cbor::Integer(if key == 3 { 3.into() } else { 5.into() });
-                    let mut payload = Vec::new();
-                    ciborium::into_writer(&value, &mut payload).unwrap();
-                    *frame = u32::try_from(payload.len()).unwrap().to_le_bytes().to_vec();
-                    frame.extend_from_slice(&payload);
-                    frame.extend_from_slice(&crc64_xz(&payload).to_le_bytes());
-                }
-                "incomplete" => {
-                    frames.last_mut().unwrap().pop().unwrap();
-                }
+            use remanence_parity::authority::fixtures::{inject_row_fault, RowFixtureFault};
+            let fault = match kind {
+                "missing" => RowFixtureFault::MissingFirst,
+                "ambiguous" => RowFixtureFault::DuplicateObject,
+                "conflicting" => RowFixtureFault::ConflictingObject,
+                "checkpoint-w" => RowFixtureFault::ProtectedWatermark,
+                "checkpoint-t" => RowFixtureFault::TotalWatermark,
+                "incomplete" => RowFixtureFault::IncompleteFinal,
                 _ => panic!("unknown commit-record mutation"),
-            }
-            let mut mutated = bytes[..header_len].to_vec();
-            mutated.extend(frames.into_iter().flatten());
-            std::fs::write(&path, mutated).unwrap();
+            };
+            inject_row_fault(&journal, fault)?;
             let snapshot = resume_record_result(journal.committed_snapshot_bounded())?;
             let summary = checked_bounded_resume_summary(&snapshot)?;
             rebuild_open_epoch_from_bounded_summary(
@@ -1426,3 +1338,7 @@ mod tests {
         assert!(disagreements.is_empty(), "{}", disagreements.join("\n"));
     }
 }
+
+#[cfg(test)]
+#[path = "resume_vectors/legacy_codec_tests.rs"]
+mod legacy_codec_tests;

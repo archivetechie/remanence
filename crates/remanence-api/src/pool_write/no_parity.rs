@@ -466,7 +466,7 @@ pub(super) fn checkpoint_projection_for_no_parity_write(
     prepared: &PreparedPoolObject,
     write_report: &StreamingObjectWriteReport,
     copy_representation: CopyRepresentation,
-) -> Result<remanence_state::CheckpointObjectProjection, PoolWriteError> {
+) -> Result<remanence_state::authority::ObjectPayload, PoolWriteError> {
     let file_projections = write_report
         .catalog
         .files
@@ -485,7 +485,7 @@ pub(super) fn checkpoint_projection_for_no_parity_write(
                         "prepared plaintext manifest has no body LBA".to_string(),
                     )
                 })?;
-            remanence_state::CheckpointObjectRecoveryRepresentation::Plaintext {
+            remanence_parity::ObjectRecoveryRepresentation::Plaintext {
                 manifest_first_chunk_lba: manifest_first_chunk_lba.0,
                 manifest_size_bytes: prepared.plan.layout.manifest.size_bytes,
                 manifest_chunk_count: prepared.plan.layout.manifest.chunk_count,
@@ -493,7 +493,7 @@ pub(super) fn checkpoint_projection_for_no_parity_write(
             }
         }
         OBJECT_COPY_REPRESENTATION_ENCRYPTED => {
-            remanence_state::CheckpointObjectRecoveryRepresentation::Encrypted {
+            remanence_parity::ObjectRecoveryRepresentation::Encrypted {
                 recipient_epoch_ids: copy_representation
                     .recovery_recipient_epoch_ids
                     .clone()
@@ -520,50 +520,49 @@ pub(super) fn checkpoint_projection_for_no_parity_write(
             )));
         }
     };
-    Ok(remanence_state::CheckpointObjectProjection {
-        object: NativeObjectProjectionInput {
-            object_id: write_report.catalog.object.object_id.clone(),
-            caller_object_id: Some(write_report.catalog.object.caller_object_id.clone()),
-            body_format: write_report.catalog.object.body_format.clone(),
-            logical_size_bytes: Some(write_report.catalog.object.logical_size_bytes),
-            content_hash: Some(prepared.content_sha256.to_vec()),
-            metadata_hash: (copy_representation.representation
-                == OBJECT_COPY_REPRESENTATION_PLAINTEXT)
-                .then(|| write_report.catalog.object.manifest_sha256.to_vec()),
-            created_at_utc: Some(prepared.write_timestamp.clone()),
-        },
+    Ok(remanence_state::authority::ObjectPayload {
         files: file_projections,
-        copy: NativeObjectCopyProjectionInput {
-            object_id: write_report.catalog.object_copy.object_id.clone(),
-            tape_uuid: selected.tape_uuid,
-            tape_file_number: write_report.catalog.object_copy.tape_file_number,
-            first_body_lba: first_payload_body_lba(write_report),
-            first_parity_data_ordinal: None,
-            protected_until_ordinal: None,
-            status: "committed".to_string(),
-            representation: copy_representation.representation.to_string(),
-            recipient_epoch_ids: copy_representation.recipient_epoch_ids,
-            metadata_frame_len: copy_representation.metadata_frame_len,
-            plaintext_digest: Some(write_report.catalog.object_copy.plaintext_digest.to_vec()),
-            stored_digest: Some(write_report.catalog.object_copy.stored_digest.to_vec()),
-        },
-        block_size: selected.block_size,
-        block_count: write_report.catalog.object_copy.data_block_count,
-        fresh_tape: write_report
-            .catalog
-            .tape_file_bundle
-            .entries
-            .first()
-            .is_some_and(|entry| entry.kind == TapeFileKind::Bootstrap),
-        total_committed_ordinals: write_report
-            .catalog
-            .tape_file_bundle
-            .total_committed_ordinals,
-        object_recovery_row: remanence_state::CheckpointObjectRecoveryRow {
-            tape_file_number: write_report.catalog.object_copy.tape_file_number,
-            stored_block_count: write_report.catalog.object_copy.data_block_count,
-            object_id: prepared.options.object_id.as_bytes().to_vec(),
-            representation,
+        projection: remanence_state::tape_log::payload::CommittedObjectProjection {
+            object: NativeObjectProjectionInput {
+                object_id: write_report.catalog.object.object_id.clone(),
+                caller_object_id: Some(write_report.catalog.object.caller_object_id.clone()),
+                body_format: write_report.catalog.object.body_format.clone(),
+                logical_size_bytes: Some(write_report.catalog.object.logical_size_bytes),
+                content_hash: Some(prepared.content_sha256.to_vec()),
+                metadata_hash: (copy_representation.representation
+                    == OBJECT_COPY_REPRESENTATION_PLAINTEXT)
+                    .then(|| write_report.catalog.object.manifest_sha256.to_vec()),
+                created_at_utc: Some(prepared.write_timestamp.clone()),
+            },
+            copy: NativeObjectCopyProjectionInput {
+                object_id: write_report.catalog.object_copy.object_id.clone(),
+                tape_uuid: selected.tape_uuid,
+                tape_file_number: write_report.catalog.object_copy.tape_file_number,
+                first_body_lba: first_payload_body_lba(write_report),
+                first_parity_data_ordinal: None,
+                protected_until_ordinal: None,
+                status: "committed".to_string(),
+                representation: copy_representation.representation.to_string(),
+                recipient_epoch_ids: copy_representation.recipient_epoch_ids,
+                metadata_frame_len: copy_representation.metadata_frame_len,
+                plaintext_digest: Some(write_report.catalog.object_copy.plaintext_digest.to_vec()),
+                stored_digest: Some(write_report.catalog.object_copy.stored_digest.to_vec()),
+            },
+            block_size: selected.block_size,
+            block_count: write_report.catalog.object_copy.data_block_count,
+            fresh_tape: write_report
+                .catalog
+                .tape_file_bundle
+                .files
+                .first()
+                .is_some_and(|entry| entry.kind == TapeFileKind::Bootstrap),
+            total_committed_ordinals: write_report.catalog.tape_file_bundle.total,
+            object_recovery_row: remanence_parity::ObjectRecoveryRow {
+                tape_file_number: write_report.catalog.object_copy.tape_file_number,
+                stored_block_count: write_report.catalog.object_copy.data_block_count,
+                object_id: Some(prepared.options.object_id.as_bytes().to_vec()),
+                representation,
+            },
         },
     })
 }
@@ -593,7 +592,7 @@ pub(super) fn pool_write_result(
     write_report: StreamingObjectWriteReport,
     append_commit_diagnostics: AppendCommitDiagnostics,
     sealed_after_write: bool,
-    checkpoint_projection: Option<remanence_state::CheckpointObjectProjection>,
+    checkpoint_projection: Option<remanence_state::authority::ObjectPayload>,
 ) -> Result<PoolWriteResult, PoolWriteError> {
     let input_kind = request.input_kind;
     let position_lba = write_report

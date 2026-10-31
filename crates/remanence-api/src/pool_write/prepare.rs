@@ -1,5 +1,6 @@
 //! Canonical input validation, hashing, encryption preparation, and fixed-block emission.
 
+use remanence_parity::authority::{FilePublication, FilePurpose};
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -18,8 +19,8 @@ use remanence_library::{
     WriteOutcome,
 };
 use remanence_parity::{
-    CommittedBundle, CommittedBundleKind, ObjectWriteSummary, ParityConfig, ParitySink,
-    TapeFileEntry, TapeFileKind, TerminalTripleObjectReservation,
+    ObjectWriteSummary, ParityConfig, ParitySink, TapeFileEntry, TapeFileKind,
+    TerminalTripleObjectReservation,
 };
 use remanence_state::{OBJECT_COPY_REPRESENTATION_ENCRYPTED, OBJECT_COPY_REPRESENTATION_PLAINTEXT};
 use remanence_stream::{
@@ -1180,6 +1181,7 @@ pub(crate) fn no_parity_write_report(
         .collect::<Result<Vec<_>, _>>()?;
     let object_start_lba = append.object_start_lba()?;
     let object_close = ObjectWriteSummary {
+        publication: remanence_parity::authority::PublicationReceipt::default(),
         tape_file_number: append.tape_file_number,
         first_parity_data_ordinal: 0,
         projected_size_blocks: prepared.plan.layout.projected_size_blocks,
@@ -1237,12 +1239,14 @@ pub(crate) fn no_parity_write_report(
         canonical_metadata_hash: None,
         object_recovery_row: None,
     });
-    let tape_file_bundle = CommittedBundle {
-        kind: CommittedBundleKind::Object,
-        entries: tape_file_entries,
-        highest_protected_ordinal: 0,
-        total_committed_ordinals: append
-            .object_total_committed_ordinals(layout.projected_size_blocks)?,
+    let tape_file_bundle = FilePublication {
+        purpose: FilePurpose::Object,
+        files: tape_file_entries,
+        protected: 0,
+        total: append.object_total_committed_ordinals(layout.projected_size_blocks)?,
+        cursor: None,
+        check: None,
+        seal_due: None,
     };
     let catalog = StreamingCatalogProjection {
         object,
@@ -1335,8 +1339,8 @@ pub(crate) fn parity_plaintext_write_report(
         plaintext_digest: object_digest,
         stored_digest: object_digest,
     };
-    let mut tape_file_bundle = object_close.committed_bundle()?;
-    for entry in &mut tape_file_bundle.entries {
+    let mut tape_file_bundle = object_close.file_publication()?;
+    for entry in &mut tape_file_bundle.files {
         if entry.kind == TapeFileKind::Object
             && entry.tape_file_number == object_close.tape_file_number
         {
@@ -1413,6 +1417,7 @@ pub(crate) fn no_parity_encrypted_write_report(
     let total_committed_ordinals =
         append.object_total_committed_ordinals(encrypted.envelope.stored_size_blocks)?;
     let object_close = ObjectWriteSummary {
+        publication: remanence_parity::authority::PublicationReceipt::default(),
         tape_file_number: append.tape_file_number,
         first_parity_data_ordinal: 0,
         projected_size_blocks: encrypted.envelope.stored_size_blocks,
@@ -1511,8 +1516,8 @@ pub(crate) fn encrypted_write_report(
         stored_digest: encrypted.envelope.stored_digest,
     };
     let tape_file_bundle = if has_parity {
-        let mut bundle = object_close.committed_bundle()?;
-        for entry in &mut bundle.entries {
+        let mut bundle = object_close.file_publication()?;
+        for entry in &mut bundle.files {
             if entry.kind == TapeFileKind::Object
                 && entry.tape_file_number == object_close.tape_file_number
             {
@@ -1556,11 +1561,14 @@ pub(crate) fn encrypted_write_report(
             canonical_metadata_hash: None,
             object_recovery_row: None,
         });
-        CommittedBundle {
-            kind: CommittedBundleKind::Object,
-            entries,
-            highest_protected_ordinal: 0,
-            total_committed_ordinals: unprotected_context.total_committed_ordinals,
+        FilePublication {
+            purpose: FilePurpose::Object,
+            files: entries,
+            protected: 0,
+            total: unprotected_context.total_committed_ordinals,
+            cursor: None,
+            check: None,
+            seal_due: None,
         }
     };
     let catalog = StreamingCatalogProjection {

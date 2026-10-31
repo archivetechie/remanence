@@ -1,12 +1,12 @@
 //! Terminal-finalization requests, plans, authority, and recovery helpers.
 
+use remanence_state::authority::TapeAuthorityWriter as _;
 use std::path::Path;
 use std::sync::Arc;
 
 use remanence_parity::{
-    FileTapeFileJournal, TapeFileJournal, TerminalComponentCommit,
-    TerminalComponentReconcileEvidence, TerminalTailAuthority, TerminalTailProgress,
-    TerminalTripleWritePlan,
+    TerminalComponentCommit, TerminalComponentReconcileEvidence, TerminalTailAuthority,
+    TerminalTailProgress, TerminalTripleWritePlan,
 };
 use remanence_state::{
     AuditActor, CatalogIndex, TapePoolConfig, TerminalFinalizationOutcome,
@@ -194,7 +194,7 @@ impl TerminalFinalizeSpec {
     }
 
     pub(super) fn resume(
-        intent: &remanence_state::TerminalFinalizationIntent,
+        intent: &remanence_state::authority::AuthorityFinalization,
         block_size: u32,
         pool_config: &TapePoolConfig,
     ) -> Self {
@@ -216,15 +216,15 @@ impl TerminalFinalizeSpec {
 #[derive(Clone, Debug)]
 pub(super) struct TerminalFinalizeResult {
     pub(super) projection: TerminalFinalizationProjection,
-    pub(super) final_record: Option<remanence_state::CheckpointJournalRecord>,
+    pub(super) final_record: Option<remanence_state::authority::AuthorityCommit>,
 }
 
 pub(super) struct TerminalTailCatalogAuthority<'a> {
-    pub(super) checkpoint: &'a mut remanence_state::FileCheckpointJournalLease,
-    pub(super) parity_journal: Option<&'a mut FileTapeFileJournal>,
+    pub(super) checkpoint: &'a mut remanence_state::TapeAuthorityLease,
+    pub(super) parity_journal: Option<&'a mut dyn remanence_parity::authority::StructuralAuthority>,
     pub(super) index: &'a mut CatalogIndex,
     pub(super) spec: &'a TerminalFinalizeSpec,
-    pub(super) intent: remanence_state::TerminalFinalizationIntent,
+    pub(super) intent: remanence_state::authority::AuthorityFinalization,
     pub(super) tix_fault: Option<&'a crate::terminal_fault::TerminalFaultPlan>,
     pub(super) reconciliation: Option<(
         TerminalTailProgress,
@@ -281,7 +281,7 @@ impl TerminalTailAuthority for TerminalTailCatalogAuthority<'_> {
         Ok(evidence)
     }
 
-    fn commit_after_barrier(&mut self, commit: &TerminalComponentCommit) -> Result<(), String> {
+    fn commit_after_barrier(&mut self, commit: &mut TerminalComponentCommit) -> Result<(), String> {
         if let Some(journal) = self.parity_journal.as_deref_mut() {
             if let Some(fault) = self.tix_fault {
                 fault.abort_component_if_matches(
@@ -290,11 +290,8 @@ impl TerminalTailAuthority for TerminalTailCatalogAuthority<'_> {
                     Some(commit.observed_position),
                 )?;
             }
-            journal
-                .commit_terminal_component_transition(
-                    &commit.journal_bundle,
-                    &commit.checkpoint_bundle,
-                )
+            commit.publication = journal
+                .publish_terminal_component(&commit.media_publication())
                 .map_err(|error| format!("commit terminal component journal: {error}"))?;
             if let Some(fault) = self.tix_fault {
                 fault.abort_component_if_matches(
@@ -315,7 +312,7 @@ impl TerminalTailAuthority for TerminalTailCatalogAuthority<'_> {
         }
         self.intent = self
             .checkpoint
-            .advance_terminal_finalization(expected, next)
+            .advance_finalization(expected, next)
             .map_err(|error| format!("advance terminal checkpoint progress: {error}"))?;
         if let Some(fault) = self.tix_fault {
             fault.abort_component_if_matches(
@@ -391,12 +388,12 @@ pub(super) const fn completed_terminal_component_count(
 
 pub(super) fn reconcile_terminal_component_host_authority(
     index: &mut CatalogIndex,
-    checkpoint: &mut remanence_state::FileCheckpointJournalLease,
+    checkpoint: &mut remanence_state::TapeAuthorityLease,
     spec: &TerminalFinalizeSpec,
-    mut intent: remanence_state::TerminalFinalizationIntent,
+    mut intent: remanence_state::authority::AuthorityFinalization,
     plan: &TerminalTripleWritePlan,
-    journal: &mut FileTapeFileJournal,
-) -> Result<remanence_state::TerminalFinalizationIntent, Status> {
+    journal: &mut dyn remanence_parity::authority::StructuralAuthority,
+) -> Result<remanence_state::authority::AuthorityFinalization, Status> {
     let transitions = plan
         .edition
         .descriptor
@@ -404,26 +401,17 @@ pub(super) fn reconcile_terminal_component_host_authority(
         .components
         .iter()
         .map(|component| {
-            let component =
-                remanence_parity::terminal_component_bundle(plan, *component).map_err(|error| {
+            let component = remanence_parity::terminal_component_publication(plan, *component)
+                .map_err(|error| {
                     Status::failed_precondition(format!(
                         "build canonical terminal component authority: {error}"
                     ))
                 })?;
-            let checkpoint = remanence_parity::CommittedBundle {
-                kind: remanence_parity::CommittedBundleKind::CheckpointedThrough,
-                entries: Vec::new(),
-                highest_protected_ordinal: component.highest_protected_ordinal,
-                total_committed_ordinals: component.total_committed_ordinals,
-            };
-            Ok((component, checkpoint))
+            Ok(component)
         })
         .collect::<Result<Vec<_>, Status>>()?;
     let relation = journal
-        .terminal_component_authority_relation(
-            completed_terminal_component_count(intent.progress),
-            &transitions,
-        )
+        .component_relation(completed_terminal_component_count(intent.progress), &transitions)
         .map_err(|error| {
             Status::failed_precondition(format!(
                 "terminal checkpoint/sink-journal authority disagreement before media motion: {error}"
@@ -458,11 +446,11 @@ pub(super) fn reconcile_terminal_component_host_authority(
             "sink journal is ahead of already-complete terminal checkpoint progress",
         )
     })?;
-    let (component, sink_checkpoint) = transitions.get(component_index).ok_or_else(|| {
+    let component = transitions.get(component_index).ok_or_else(|| {
         Status::internal("terminal authority relation selected an impossible component")
     })?;
     journal
-        .commit_terminal_component_transition(component, sink_checkpoint)
+        .publish_terminal_component(component)
         .map_err(|error| {
             Status::failed_precondition(format!(
                 "reconcile one-transition-ahead terminal sink journal: {error}"
@@ -473,7 +461,7 @@ pub(super) fn reconcile_terminal_component_host_authority(
     })?;
     let next_state = state_progress_from_parity(next);
     intent = checkpoint
-        .advance_terminal_finalization(intent.progress, next_state)
+        .advance_finalization(intent.progress, next_state)
         .map_err(|error| {
             Status::failed_precondition(format!(
                 "reconcile terminal checkpoint progress from sink journal: {error}"
@@ -496,13 +484,13 @@ pub(super) fn reconcile_terminal_component_host_authority(
 
 pub(super) fn reconcile_and_authorize_parity_resume(
     index: &mut CatalogIndex,
-    checkpoint: &mut remanence_state::FileCheckpointJournalLease,
+    checkpoint: &mut remanence_state::TapeAuthorityLease,
     spec: &TerminalFinalizeSpec,
     selected: &SelectedTape,
-    intent: remanence_state::TerminalFinalizationIntent,
+    intent: remanence_state::authority::AuthorityFinalization,
     plan: &TerminalTripleWritePlan,
-    journal: &mut FileTapeFileJournal,
-) -> Result<remanence_state::TerminalFinalizationIntent, Status> {
+    journal: &mut dyn remanence_parity::authority::StructuralAuthority,
+) -> Result<remanence_state::authority::AuthorityFinalization, Status> {
     let intent = reconcile_terminal_component_host_authority(
         index, checkpoint, spec, intent, plan, journal,
     )?;
@@ -518,11 +506,11 @@ pub(super) fn reconcile_and_authorize_parity_resume(
 
 pub(super) fn persist_terminal_recovery_required(
     index: &mut CatalogIndex,
-    checkpoint: &mut remanence_state::FileCheckpointJournalLease,
+    checkpoint: &mut remanence_state::TapeAuthorityLease,
     spec: &TerminalFinalizeSpec,
-) -> Result<remanence_state::TerminalFinalizationIntent, Status> {
+) -> Result<remanence_state::authority::AuthorityFinalization, Status> {
     let intent = checkpoint
-        .mark_terminal_recovery_required()
+        .require_finalization_recovery()
         .map_err(crate::status_from_state_error)?;
     index
         .project_terminal_finalization(TerminalFinalizationProjectionInput {

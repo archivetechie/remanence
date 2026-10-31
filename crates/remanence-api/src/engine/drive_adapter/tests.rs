@@ -738,10 +738,11 @@ fn provisional_representation_guard_and_session_lease_release() {
         receive(rx)
     };
     append(&owner, crate::PoolWriteRepresentation::Plaintext).unwrap();
-    let journal = remanence_state::FileCheckpointJournal::open(
+    let journal = remanence_state::authority::fixtures::AuthorityBuilder::new(
         fixture.config.journal.dir.join("checkpoints"),
         UUID,
     )
+    .build()
     .unwrap();
     assert!(journal.acquire_exclusive().is_err());
     let key = remanence_aead::RecipientPrivateKey::new([9; 16], "key", [7; 32]).unwrap();
@@ -997,10 +998,11 @@ fn automatic_terminal_media_completion_closes_audit_without_a_false_fence() {
     owner.close_session().unwrap();
     // Project the durable seal obligation at the recovery cut. The complete
     // object checkpoint remains the authority for the terminal suffix.
-    let journal = remanence_state::FileCheckpointJournal::open(
+    let journal = remanence_state::authority::fixtures::AuthorityBuilder::new(
         fixture.config.journal.dir.join("checkpoints"),
         UUID,
     )
+    .build()
     .unwrap();
     let mut checkpoint = journal.last().unwrap().unwrap();
     checkpoint.seal_due = Some(remanence_state::SealDueReason::ReachedLowWatermark);
@@ -1227,10 +1229,11 @@ async fn cleanup_spawn_failure_finishes_in_place_and_releases_every_obligation()
     });
     drop(owner);
     assert!(fixture.reopen().is_ok());
-    let journal = remanence_state::FileCheckpointJournal::open(
+    let journal = remanence_state::authority::fixtures::AuthorityBuilder::new(
         fixture.config.journal.dir.join("checkpoints"),
         UUID,
     )
+    .build()
     .unwrap();
     drop(journal.acquire_exclusive().unwrap());
     let commands = fixture.commands.lock().unwrap();

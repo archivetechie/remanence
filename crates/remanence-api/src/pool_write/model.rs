@@ -450,7 +450,7 @@ pub struct PoolWriteResult {
     pub write_report: Option<StreamingObjectWriteReport>,
     pub(super) append_commit_diagnostics: AppendCommitDiagnostics,
     pub(super) sealed_after_write: bool,
-    pub(super) checkpoint_projection: Option<remanence_state::CheckpointObjectProjection>,
+    pub(super) checkpoint_projection: Option<remanence_state::authority::ObjectPayload>,
     pub(super) post_write_used_bytes: u64,
     pub(super) hardware_early_warning: bool,
     pub(super) input_kind: WriteObjectInputKind,
@@ -479,7 +479,7 @@ impl PoolWriteResult {
     /// Borrow the replayable projection held until a batched barrier.
     pub(crate) fn checkpoint_projection(
         &self,
-    ) -> Option<&remanence_state::CheckpointObjectProjection> {
+    ) -> Option<&remanence_state::authority::ObjectPayload> {
         self.checkpoint_projection.as_ref()
     }
 

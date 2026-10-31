@@ -2,7 +2,7 @@
 use super::*;
 use remanence_library::BlockSink;
 use remanence_parity::{
-    ParityError, PhysicalPositionHint, RawTapeSink, RawWriteOutcome, TapeFileJournal,
+    ParityError, PhysicalPositionHint, RawTapeSink, RawWriteOutcome, TapeReportPublisher,
 };
 
 /// Count physical records while the real parity sink constructs a valid plan.
@@ -33,7 +33,8 @@ impl RawTapeSink for CounterSink {
 
 /// Keep sink bundles in memory so checkpoint annotations precede durable journal writes.
 struct Bundles(Vec<CommittedBundle>);
-impl TapeFileJournal for Bundles {
+impl TapeReportPublisher for Bundles {
+    remanence_parity::fixture_publication_methods!();
     fn load_committed(
         &self,
     ) -> Result<remanence_parity::CommittedState, remanence_parity::JournalError> {
@@ -42,11 +43,13 @@ impl TapeFileJournal for Bundles {
     fn tape_uuid(&self) -> TapeUuid {
         [0x91; 16]
     }
-    fn commit_bundle(
+    fn publish_fixture(
         &mut self,
-        bundle: &CommittedBundle,
+        report: &remanence_parity::authority::ShadowPublication,
     ) -> Result<(), remanence_parity::JournalError> {
-        self.0.push(bundle.clone());
+        for bundle in &report.bundles {
+            self.0.push(bundle.clone());
+        }
         Ok(())
     }
 }
@@ -133,32 +136,44 @@ fn planning_harness(
     object.entries[0].object_recovery_row =
         Some(checkpoint.objects[0].object_recovery_row.to_parity_row());
     checkpoint.object_tape_file_bundles = vec![object.clone()];
-    let mut journal = remanence_parity::FileTapeFileJournal::open(
-        h.state
-            .checkpoint_journal_dir
-            .parent()
-            .unwrap()
-            .join(format!("{}.remjournal", crate::bytes_to_hex(&uuid))),
+    let mut journal = remanence_parity::authority::fixtures::RowAuthorityBuilder::new(
+        h.state.checkpoint_journal_dir.parent().unwrap(),
         uuid,
         block_size,
         scheme.clone(),
     )
+    .build()
     .unwrap();
-    journal.commit_bundle(&bundles.0[0]).unwrap();
-    journal.commit_bundle(&object).unwrap();
     journal
-        .commit_bundle(&CommittedBundle {
-            kind: CommittedBundleKind::CheckpointedThrough,
-            entries: vec![],
-            highest_protected_ordinal: 0,
-            total_committed_ordinals: 3,
+        .publish_fixture(&remanence_parity::authority::ShadowPublication {
+            bundles: vec![(bundles.0[0]).clone()],
+        })
+        .unwrap();
+    journal
+        .publish_fixture(&remanence_parity::authority::ShadowPublication {
+            bundles: vec![(object).clone()],
+        })
+        .unwrap();
+    journal
+        .publish_fixture(&remanence_parity::authority::ShadowPublication {
+            bundles: vec![(CommittedBundle {
+                kind: CommittedBundleKind::CheckpointedThrough,
+                entries: vec![],
+                highest_protected_ordinal: 0,
+                total_committed_ordinals: 3,
+            })
+            .clone()],
         })
         .unwrap();
     drop(journal);
-    remanence_state::FileCheckpointJournal::open(h.state.checkpoint_journal_dir.as_ref(), uuid)
-        .unwrap()
-        .append(&checkpoint)
-        .unwrap();
+    remanence_state::authority::fixtures::AuthorityBuilder::new(
+        h.state.checkpoint_journal_dir.as_ref(),
+        uuid,
+    )
+    .build()
+    .unwrap()
+    .append(&checkpoint)
+    .unwrap();
     let mut index = h.state.index_write().unwrap();
     index
         .provision_tape(ProvisionTapeInput {
@@ -260,10 +275,11 @@ async fn released(h: &DismountHarness, uuid: TapeUuid) {
 }
 
 fn assert_unaccepted(h: &DismountHarness, admission: &ManualFinalizeTapeAdmission) {
-    assert!(remanence_state::FileCheckpointJournal::open(
+    assert!(remanence_state::authority::fixtures::AuthorityBuilder::new(
         h.state.checkpoint_journal_dir.as_ref(),
         admission.tape_uuid
     )
+    .build()
     .unwrap()
     .terminal_finalization_intent()
     .unwrap()

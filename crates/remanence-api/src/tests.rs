@@ -1941,7 +1941,7 @@ fn sealed_manual_completion_audit_repair_is_exactly_once() {
             &audit_dir,
             &lock,
             tape_uuid,
-            &completion,
+            &(&completion).into(),
         )
         .expect("ensure exact operation-finished evidence");
     }
@@ -2044,7 +2044,7 @@ fn sealed_manual_completion_audit_repair_is_exactly_once() {
         &audit_dir,
         &lock,
         tape_uuid,
-        &completion,
+        &(&completion).into(),
     )
     .expect_err("duplicate operation-finished evidence must fail closed");
     assert_eq!(duplicate_finish.code(), tonic::Code::FailedPrecondition);
@@ -2084,7 +2084,7 @@ fn sealed_manual_completion_audit_repair_is_exactly_once() {
         &audit_dir,
         &lock,
         tape_uuid,
-        &completion,
+        &(&completion).into(),
     )
     .expect_err("incompatible terminal evidence must fail closed");
     assert_eq!(
@@ -2104,8 +2104,10 @@ fn append_checkpoint_record(checkpoint_dir: &Path, tape_uuid: [u8; 16]) {
     const PAYLOAD: &[u8] = b"checkpoint selection test payload";
     let object_uuid = Uuid::from_bytes([0x51; 16]);
     let content_sha256 = Sha256::digest(PAYLOAD).to_vec();
-    let journal = remanence_state::FileCheckpointJournal::open(checkpoint_dir, tape_uuid)
-        .expect("open checkpoint journal");
+    let journal =
+        remanence_state::authority::fixtures::AuthorityBuilder::new(checkpoint_dir, tape_uuid)
+            .build()
+            .expect("open checkpoint journal");
     journal
         .append(&remanence_state::CheckpointJournalRecord {
             ordinal: 1,
@@ -2404,8 +2406,10 @@ fn startup_replay_repairs_live_restart_cycle_partial_projection() {
             force: false,
         })
         .expect("provision restart-cycle tape");
-    let journal = remanence_state::FileCheckpointJournal::open(&checkpoint_dir, tape_uuid)
-        .expect("open checkpoint journal");
+    let journal =
+        remanence_state::authority::fixtures::AuthorityBuilder::new(&checkpoint_dir, tape_uuid)
+            .build()
+            .expect("open checkpoint journal");
 
     // Append, checkpoint, kill, and restart through the daemon's startup replay helper.
     let first = restart_cycle_checkpoint_record(tape_uuid, 1, 0x71, 1, 3, 3);
@@ -2508,8 +2512,10 @@ fn startup_replay_retires_only_companion_only_manual_acceptance() {
             force: false,
         })
         .expect("provision restart-cycle tape");
-    let journal = remanence_state::FileCheckpointJournal::open(&checkpoint_dir, tape_uuid)
-        .expect("open checkpoint journal");
+    let journal =
+        remanence_state::authority::fixtures::AuthorityBuilder::new(&checkpoint_dir, tape_uuid)
+            .build()
+            .expect("open checkpoint journal");
     let mut checkpoint = restart_cycle_checkpoint_record(tape_uuid, 1, 0x74, 1, 3, 3);
     checkpoint.block_size = BLOCK_SIZE;
     checkpoint.objects[0].block_size = BLOCK_SIZE;
@@ -2685,8 +2691,10 @@ fn startup_replay_restores_pending_automatic_finalization_through_replica_c() {
             force: false,
         })
         .expect("provision restart-cycle tape");
-    let journal = remanence_state::FileCheckpointJournal::open(&checkpoint_dir, tape_uuid)
-        .expect("open checkpoint journal");
+    let journal =
+        remanence_state::authority::fixtures::AuthorityBuilder::new(&checkpoint_dir, tape_uuid)
+            .build()
+            .expect("open checkpoint journal");
     let mut checkpoint = restart_cycle_checkpoint_record(tape_uuid, 1, 0x73, 1, 3, 3);
     checkpoint.block_size = TERMINAL_BLOCK_SIZE;
     checkpoint.objects[0].block_size = TERMINAL_BLOCK_SIZE;
@@ -3373,7 +3381,7 @@ fn populated_state_with_file_catalog() -> ApiState {
                 scheme: Some(scheme),
                 journal_offset_bytes: 99,
             },
-            &CommittedBundle {
+            &(&CommittedBundle {
                 kind: CommittedBundleKind::Object,
                 entries: vec![TapeFileEntry {
                     tape_file_number: 4,
@@ -3390,7 +3398,8 @@ fn populated_state_with_file_catalog() -> ApiState {
                 }],
                 highest_protected_ordinal: 5,
                 total_committed_ordinals: 5,
-            },
+            })
+                .into(),
         )
         .expect("populate object file rows");
     state
@@ -4926,7 +4935,7 @@ fn fresh_tape_first_object_span_excludes_bootstrap_prefix_and_trailing_filemark(
     .expect("write no-parity object");
 
     let report = result.expect_write_report();
-    let entries = &report.catalog.tape_file_bundle.entries;
+    let entries = &report.catalog.tape_file_bundle.files;
     assert_eq!(entries.len(), 2, "fresh tape: bootstrap prefix + object");
     let bootstrap = &entries[0];
     assert_eq!(bootstrap.kind, remanence_parity::TapeFileKind::Bootstrap);
@@ -6554,7 +6563,7 @@ fn write_to_selected_tape_rejects_second_parity_object_before_tape_io() {
                 total_committed_ordinals
             } if tape_uuid == &Uuid::from_bytes(POOL_WRITE_TAPE_UUID).to_string()
                 && total_committed_ordinals
-                    == first.expect_write_report().catalog.tape_file_bundle.total_committed_ordinals
+                    == first.expect_write_report().catalog.tape_file_bundle.total
         ),
         "{err}"
     );
@@ -9679,12 +9688,12 @@ fn startup_checkpoint_replay_leaves_fenced_journal_untouched() {
     let checkpoints = dir.path().join("checkpoints");
     let mut index = CatalogIndex::open(dir.path().join("index.sqlite")).unwrap();
     let tape = [0x52; 16];
-    std::fs::create_dir_all(&checkpoints).unwrap();
-    let path = checkpoints.join(format!("{}.remcheckpoint", Uuid::from_bytes(tape)));
-    std::fs::write(&path, b"damaged journal remains evidence").unwrap();
-    let paths = remanence_state::list_checkpoint_journals(&checkpoints).unwrap();
+    let authority = remanence_state::authority::fixtures::AuthorityBuilder::new(&checkpoints, tape)
+        .build()
+        .unwrap();
+    let evidence = remanence_state::authority::fixtures::damage_authority(authority).unwrap();
+    let paths = remanence_state::TapeAuthority::list_entries(&checkpoints).unwrap();
     assert_eq!(paths.len(), 1);
-    std::fs::write(&paths[0], b"damaged journal remains evidence").unwrap();
     index
         .record_tape_io_fence(remanence_state::TapeIoFenceInput {
             tape_uuid: tape,
@@ -9694,10 +9703,7 @@ fn startup_checkpoint_replay_leaves_fenced_journal_untouched() {
         })
         .unwrap();
     replay_checkpoint_journal_projections(&mut index, &checkpoints).unwrap();
-    assert_eq!(
-        std::fs::read(&paths[0]).unwrap(),
-        b"damaged journal remains evidence"
-    );
+    assert!(evidence.is_unchanged().unwrap());
 }
 
 /// Release RPC validates requests, preserves evidence, and refreshes admission without restart.

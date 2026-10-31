@@ -24,7 +24,7 @@ pub mod fold;
 pub mod payload;
 mod wire;
 
-pub use crate::checkpoint::{SealDueReason, TerminalFinalizationTrigger};
+pub use remanence_parity::authority::{SealDueReason, TerminalFinalizationTrigger};
 pub use remanence_parity::{
     CheckProvenance, CheckValue, CommitCursor, ObjectRecoveryRow, ParityScheme, TapeFileEntry,
 };
@@ -172,7 +172,7 @@ pub struct FinalizationPlan {
     /// Admission trigger.
     pub trigger: TerminalFinalizationTrigger,
     /// Manual acceptance identity; automatic plans have none.
-    pub manual: Option<crate::checkpoint::ManualTerminalFinalizationIdentity>,
+    pub manual: Option<remanence_parity::authority::ManualTerminalFinalizationIdentity>,
     /// Exact edition identity.
     pub edition_id: [u8; 16],
     /// Edition sequence.

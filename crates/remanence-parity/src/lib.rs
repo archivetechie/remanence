@@ -31,6 +31,7 @@
 #![warn(missing_docs)]
 #![warn(unsafe_op_in_unsafe_fn)]
 
+pub mod authority;
 pub mod bootstrap;
 pub mod bot_recovery;
 pub mod capacity;
@@ -105,9 +106,7 @@ pub use index_separation::{
 pub use journal::{
     validate_committed_bundle_shape, validate_trusted_journal_volume, BoundedJournalReplayMetrics,
     CommittedBundle, CommittedBundleKind, CommittedBundleShapeError, CommittedState,
-    FileTapeFileJournal, FileTapeFileJournalCommittedReplay, FileTapeFileJournalCommittedSnapshot,
-    FileTapeFileJournalReader, JournalError, TapeFileEntry, TapeFileJournal,
-    TerminalComponentAuthorityRelation,
+    FrozenFileRows, JournalError, TapeFileEntry, TerminalComponentAuthorityRelation,
 };
 pub use mapping::data_shards_per_epoch;
 pub use model::{
@@ -212,9 +211,10 @@ pub use terminal_tail::{
 };
 pub use terminal_writer::{
     assemble_terminal_plan, reconcile_terminal_tail_next, terminal_component_bundle,
-    write_terminal_tail, write_terminal_tail_step, TerminalComponentCommit,
-    TerminalComponentReconcileEvidence, TerminalTailAuthority, TerminalTailRunOutcome,
-    TerminalTailStepOutcome, TerminalTailWriteError, TerminalTripleWritePlan,
+    terminal_component_publication, write_terminal_tail, write_terminal_tail_step,
+    TerminalComponentCommit, TerminalComponentReconcileEvidence, TerminalTailAuthority,
+    TerminalTailRunOutcome, TerminalTailStepOutcome, TerminalTailWriteError,
+    TerminalTripleWritePlan,
 };
 pub use verify_protected::{
     verify_protected_content, verify_sidecar, BlockFailureReason, FailedDataBlock,
@@ -361,6 +361,8 @@ fn stripes_for_tolerance(
     let stripes = target_loss_bytes.div_ceil(denom).max(1);
     u32::try_from(stripes).unwrap_or(u32::MAX)
 }
+
+pub use authority::{TapeReportPublisher, TapeRowAuthority, TapeRowReader};
 
 #[cfg(test)]
 mod parse_arg_tests {

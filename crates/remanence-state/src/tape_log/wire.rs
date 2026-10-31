@@ -1,10 +1,10 @@
 //! Small schema-directed CBOR codec: no generic Value tree and no member vectors.
 
 use super::*;
-use crate::checkpoint::ManualTerminalFinalizationIdentity;
 use crate::{
     NativeObjectCopyProjectionInput, NativeObjectFileProjectionInput, NativeObjectProjectionInput,
 };
+use remanence_parity::authority::ManualTerminalFinalizationIdentity;
 use remanence_parity::{
     ObjectRecoveryRepresentation, SchemeId, TapeFileKind, TerminalTailComponentKind,
     TerminalTailComponentPlan,

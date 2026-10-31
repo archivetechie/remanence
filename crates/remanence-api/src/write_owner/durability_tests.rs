@@ -730,10 +730,14 @@ async fn check_crash(
             });
         return read_receipts(temp.path(), world, &cut.receipts).await;
     }
-    let authority = FileCheckpointJournal::open(temp.path().join("journals/checkpoints"), TAPE)
-        .unwrap()
-        .replay()
-        .unwrap();
+    let authority = remanence_state::authority::fixtures::AuthorityBuilder::new(
+        temp.path().join("journals/checkpoints"),
+        TAPE,
+    )
+    .build()
+    .unwrap()
+    .replay()
+    .unwrap();
     let committed = authority
         .last()
         .map_or(0, |record| record.committed_object_count);

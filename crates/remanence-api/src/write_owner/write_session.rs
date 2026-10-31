@@ -1,5 +1,6 @@
 //! Write-session state, append handling, close, and media preparation.
 
+use remanence_state::authority::TapeAuthorityView;
 use std::time::{Duration as StdDuration, Instant};
 
 use remanence_library::{DriveHandle, DriveHandleSink, DriveHandleSource, TapeConfig};
@@ -164,8 +165,8 @@ pub(super) struct WriteSessionState<'a> {
     objects_committed: u64,
     bytes_committed: u64,
     last_checkpoint_at_utc: Option<String>,
-    checkpoint_lease: remanence_state::FileCheckpointJournalLease,
-    durable_checkpoint_records: Vec<remanence_state::CheckpointJournalRecord>,
+    checkpoint_lease: remanence_state::TapeAuthorityLease,
+    durable_checkpoint_records: Vec<remanence_state::authority::AuthorityCommit>,
     parity_session: Option<ParityActorSession>,
     next_batched_append: Option<crate::pool_write::BatchedNoParityAppendContext>,
     checkpoint_ordinal: u64,
@@ -389,10 +390,7 @@ impl WriteSessionState<'_> {
         if self.pending_batch.is_some() {
             if let Err(error) = crate::append_admission::abandon_pending_append(
                 self.drive,
-                &self.checkpoint_lease,
-                self.parity_session
-                    .as_mut()
-                    .and_then(|s| s.journal.as_mut()),
+                &mut self.checkpoint_lease,
             ) {
                 let _ = fence_failed_parity_raw_write(
                     self.index,
@@ -624,7 +622,7 @@ impl WriteSessionState<'_> {
             Ok(None) => {
                 if let Some(parity_session) = self.parity_session.as_mut() {
                     let mut raw = DriveHandleRawSink::new(self.drive);
-                    match parity_session.journal.as_mut() {
+                    match self.checkpoint_lease.structural_mut() {
                             Some(parity_journal) => {
                                 crate::pool_write::write_batched_parity_to_selected_tape_after_replay_check(
                                     self.index,
@@ -782,10 +780,7 @@ impl WriteSessionState<'_> {
                                     if let Err(error) =
                                         crate::append_admission::abandon_pending_append(
                                             self.drive,
-                                            &self.checkpoint_lease,
-                                            self.parity_session
-                                                .as_mut()
-                                                .and_then(|s| s.journal.as_mut()),
+                                            &mut self.checkpoint_lease,
                                         )
                                     {
                                         tracing::warn!(%error, "fenced batch abandonment marker failed");
@@ -797,10 +792,7 @@ impl WriteSessionState<'_> {
                                     } else {
                                         fence_failed_checkpoint_batch(
                                             self.drive,
-                                            &self.checkpoint_lease,
-                                            self.parity_session
-                                                .as_mut()
-                                                .and_then(|s| s.journal.as_mut()),
+                                            &mut self.checkpoint_lease,
                                             self.index,
                                             cfg,
                                             &selected,
@@ -911,33 +903,29 @@ impl WriteSessionState<'_> {
                     );
                     let spec =
                         TerminalFinalizeSpec::automatic(&selected, &pool_cfg, terminal_trigger);
-                    let terminal_result =
-                        match &selected.parity_config {
-                            remanence_parity::ParityConfig::None => finalize_terminal_no_parity(
-                                self.index,
-                                cfg,
-                                self.drive,
-                                &mut self.checkpoint_lease,
-                                self.durable_checkpoint_records
-                                    .last()
-                                    .expect("automatic finalization requires checkpoint authority"),
-                                None,
-                                &spec,
-                                &selected,
-                                None,
-                                rewritable,
-                            ),
-                            remanence_parity::ParityConfig::Scheme(_) => {
-                                match self
-                                .parity_session
-                                .as_mut()
-                                .and_then(|session| session.journal.take())
-                            {
+                    let terminal_result = match &selected.parity_config {
+                        remanence_parity::ParityConfig::None => finalize_terminal_no_parity(
+                            self.index,
+                            cfg,
+                            self.drive,
+                            &mut self.checkpoint_lease,
+                            self.durable_checkpoint_records
+                                .last()
+                                .expect("automatic finalization requires checkpoint authority"),
+                            None,
+                            &spec,
+                            &selected,
+                            None,
+                            rewritable,
+                        ),
+                        remanence_parity::ParityConfig::Scheme(_) => self
+                            .checkpoint_lease
+                            .with_structural(|checkpoint, structural| match structural {
                                 Some(parity_journal) => finalize_terminal_with_parity_journal(
                                     self.index,
                                     cfg,
                                     self.drive,
-                                    &mut self.checkpoint_lease,
+                                    checkpoint,
                                     self.durable_checkpoint_records.last().expect(
                                         "automatic finalization requires checkpoint authority",
                                     ),
@@ -947,14 +935,17 @@ impl WriteSessionState<'_> {
                                     None,
                                     parity_journal,
                                     rewritable,
-                                    self.parity_session.as_mut().and_then(|s| s.sink_state.take()),
+                                    self.parity_session
+                                        .as_mut()
+                                        .and_then(|s| s.sink_state.take()),
                                 ),
                                 None => Err(Status::internal(
                                     "automatic parity rollover has no session-owned append journal",
                                 )),
-                            }
-                            }
-                        };
+                            })
+                            .map_err(crate::status_from_state_error)
+                            .and_then(|result| result),
+                    };
                     match terminal_result {
                         Ok(result) => {
                             self.append_gate.record_sealed();
@@ -1016,10 +1007,7 @@ impl WriteSessionState<'_> {
                     if parity_raw_write_attempted {
                         if let Err(error) = crate::append_admission::abandon_pending_append(
                             self.drive,
-                            &self.checkpoint_lease,
-                            self.parity_session
-                                .as_mut()
-                                .and_then(|s| s.journal.as_mut()),
+                            &mut self.checkpoint_lease,
                         ) {
                             status = Status::unavailable(format!(
                                 "{}; abandonment marker failed: {error}",
@@ -1040,10 +1028,7 @@ impl WriteSessionState<'_> {
                     } else if let Some(batch) = failed_batch.as_ref() {
                         status = fence_failed_checkpoint_batch(
                             self.drive,
-                            &self.checkpoint_lease,
-                            self.parity_session
-                                .as_mut()
-                                .and_then(|s| s.journal.as_mut()),
+                            &mut self.checkpoint_lease,
                             self.index,
                             cfg,
                             &selected,
@@ -1052,10 +1037,7 @@ impl WriteSessionState<'_> {
                         );
                     } else if let Err(error) = crate::append_admission::abandon_pending_append(
                         self.drive,
-                        &self.checkpoint_lease,
-                        self.parity_session
-                            .as_mut()
-                            .and_then(|s| s.journal.as_mut()),
+                        &mut self.checkpoint_lease,
                     ) {
                         status = fence_failed_parity_raw_write(
                             self.index,
@@ -1274,10 +1256,7 @@ impl WriteSessionState<'_> {
                 if failure.fence_handled && failure.durability_uncertain {
                     if let Err(error) = crate::append_admission::abandon_pending_append(
                         self.drive,
-                        &self.checkpoint_lease,
-                        self.parity_session
-                            .as_mut()
-                            .and_then(|s| s.journal.as_mut()),
+                        &mut self.checkpoint_lease,
                     ) {
                         tracing::warn!(%error, "fenced batch abandonment marker failed");
                     }
@@ -1287,10 +1266,7 @@ impl WriteSessionState<'_> {
                 } else {
                     fence_failed_checkpoint_batch(
                         self.drive,
-                        &self.checkpoint_lease,
-                        self.parity_session
-                            .as_mut()
-                            .and_then(|s| s.journal.as_mut()),
+                        &mut self.checkpoint_lease,
                         self.index,
                         cfg,
                         &selected,
@@ -1448,10 +1424,7 @@ impl WriteSessionState<'_> {
                     if failure.fence_handled && failure.durability_uncertain {
                         if let Err(error) = crate::append_admission::abandon_pending_append(
                             self.drive,
-                            &self.checkpoint_lease,
-                            self.parity_session
-                                .as_mut()
-                                .and_then(|s| s.journal.as_mut()),
+                            &mut self.checkpoint_lease,
                         ) {
                             tracing::warn!(%error, "fenced batch abandonment marker failed");
                         }
@@ -1461,10 +1434,7 @@ impl WriteSessionState<'_> {
                     } else {
                         fence_failed_checkpoint_batch(
                             self.drive,
-                            &self.checkpoint_lease,
-                            self.parity_session
-                                .as_mut()
-                                .and_then(|s| s.journal.as_mut()),
+                            &mut self.checkpoint_lease,
                             self.index,
                             cfg,
                             &selected,
@@ -1548,10 +1518,7 @@ impl WriteSessionState<'_> {
         if self.pending_batch.is_some() {
             if let Err(error) = crate::append_admission::abandon_pending_append(
                 self.drive,
-                &self.checkpoint_lease,
-                self.parity_session
-                    .as_mut()
-                    .and_then(|s| s.journal.as_mut()),
+                &mut self.checkpoint_lease,
             ) {
                 let status = fence_failed_parity_raw_write(
                     self.index,
@@ -1746,17 +1713,16 @@ pub(super) fn handle_drive_open_write(
     // load, rewind, locate, drive-mode change, or write preparation. Keep both
     // journal leases across the later media work so another writer cannot
     // change the validated prefix in between.
-    let checkpoint_journal = match remanence_state::FileCheckpointJournal::open(
-        cfg.checkpoint_journal_dir.as_path(),
-        tape_uuid,
-    ) {
-        Ok(journal) => journal,
-        Err(err) => {
-            let _ = reply.send(Err(status_from_state_error(err)));
-            return None;
-        }
-    };
-    let pending_terminal_intent = match checkpoint_journal.terminal_finalization_intent() {
+    let checkpoint_journal =
+        match remanence_state::TapeAuthority::open(cfg.checkpoint_journal_dir.as_path(), tape_uuid)
+        {
+            Ok(journal) => journal,
+            Err(err) => {
+                let _ = reply.send(Err(status_from_state_error(err)));
+                return None;
+            }
+        };
+    let pending_terminal_intent = match checkpoint_journal.pending_finalization() {
         Ok(intent) => intent,
         Err(err) => {
             let _ = reply.send(Err(status_from_state_error(err)));
@@ -1781,7 +1747,7 @@ pub(super) fn handle_drive_open_write(
                 return None;
             }
         };
-        let intent = match lease.terminal_finalization_intent() {
+        let intent = match lease.pending_finalization() {
             Ok(intent) => intent,
             Err(err) => {
                 let _ = reply.send(Err(status_from_state_error(err)));
@@ -1809,7 +1775,7 @@ pub(super) fn handle_drive_open_write(
         };
     if durable_checkpoint_records
         .last()
-        .is_some_and(|record| record.sealed_after_write)
+        .is_some_and(|record| record.sealed)
     {
         let _ = reply.send(Err(Status::failed_precondition(format!(
             "checkpoint authority records tape {} as terminal and sealed",
@@ -2038,8 +2004,8 @@ pub(super) fn handle_drive_open_write(
     let ctx = crate::append_admission::context(
         tape_uuid,
         selected.block_size,
-        last.map_or(0, |r| r.eod_partition),
-        last.map_or(0, |r| r.eod_lba),
+        last.map_or(0, |r| r.cursor.partition),
+        last.map_or(0, |r| r.cursor.lba),
     );
     let authority = last.map_or(crate::append_admission::AppendAuthority::Fresh, |_| {
         crate::append_admission::AppendAuthority::Checkpoint { eod: ctx.boundary }
@@ -2085,7 +2051,7 @@ pub(super) fn handle_drive_open_write(
         match validate_parity_actor_authority(
             cfg,
             &selected,
-            &checkpoint_lease,
+            &mut checkpoint_lease,
             &durable_checkpoint_records,
         ) {
             Ok(authority) => Some(authority),
@@ -2151,7 +2117,7 @@ pub(super) fn handle_drive_open_write(
                 .is_some_and(|authority| epoch.state.matches_committed_summary(&authority.summary))
             && last_durable_checkpoint
                 .as_ref()
-                .is_some_and(|last| last.eod_lba == epoch.state.used_tape_blocks())
+                .is_some_and(|last| last.cursor.lba == epoch.state.used_tape_blocks())
     });
     if had_retained_epoch && carried.is_none() {
         cfg.io_memory.record_epoch_discard();
@@ -2161,7 +2127,6 @@ pub(super) fn handle_drive_open_write(
             Some(ParityActorSession {
                 scheme: authority.scheme,
                 sink_state: Some(epoch.state),
-                journal: Some(authority.journal),
                 retention: Some(epoch.permit),
                 close_at_barrier: false,
             })
@@ -2177,6 +2142,7 @@ pub(super) fn handle_drive_open_write(
                 &selected,
                 &durable_checkpoint_records,
                 authority,
+                &mut checkpoint_lease,
             ) {
                 Ok(session) => Some(session),
                 Err(status) => {
@@ -2220,7 +2186,7 @@ pub(super) fn handle_drive_open_write(
         .map_or(0, |record| record.ordinal);
     let tape_committed_object_count = last_durable_checkpoint
         .as_ref()
-        .map_or(0, |record| record.committed_object_count);
+        .map_or(0, |record| record.object_count);
     let pending_batch: Option<PendingCheckpointBatch> = None;
     let committed_receipts = Vec::<pb::ObjectRecord>::new();
     let timer_checkpoint_waiting: Option<Uuid> = None;
@@ -2317,7 +2283,7 @@ pub(super) fn handle_drive_open_write(
                     && session_state
                         .durable_checkpoint_records
                         .last()
-                        .is_some_and(|last| last.eod_lba == state.used_tape_blocks())
+                        .is_some_and(|last| last.cursor.lba == state.used_tape_blocks())
             })
     {
         if let Some(mut parity) = session_state.parity_session.take() {
@@ -2382,7 +2348,7 @@ pub(super) fn handle_drive_open_write(
                 let head_at_eod = session_state
                     .durable_checkpoint_records
                     .last()
-                    .is_some_and(|checkpoint| checkpoint.eod_lba == state.used_tape_blocks());
+                    .is_some_and(|checkpoint| checkpoint.cursor.lba == state.used_tape_blocks());
                 *retained = Some(super::checkpoint::RetainedParityEpoch {
                     state,
                     permit,
@@ -2637,7 +2603,10 @@ mod reply_tests {
     #[test]
     fn write_open_refusal_waits_for_checkpoint_lease_release() {
         let temp = tempfile::tempdir().unwrap();
-        let journal = remanence_state::FileCheckpointJournal::open(temp.path(), [94; 16]).unwrap();
+        let journal =
+            remanence_state::authority::fixtures::AuthorityBuilder::new(temp.path(), [94; 16])
+                .build()
+                .unwrap();
         let (sender, mut receiver) = oneshot::channel();
         {
             let mut reply = OpenWriteReply {

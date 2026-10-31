@@ -4,6 +4,7 @@
 use crate::catalogless_restore::{scan_append_suffix, AppendSuffix};
 use remanence_library::{AppendSession, DriveHandle, DriveHandleSource, TapeIoError, TapePosition};
 use remanence_parity::TerminalTripleWritePlan;
+use remanence_state::authority::TapeAuthorityView;
 
 /// Physical append proof owned by one write session. Only the funnel below can
 /// construct it; dropping it revokes the handle's adapters.
@@ -281,8 +282,17 @@ pub fn admit_checkpointed_tape(
 /// and admission are still held. The adapter rechecks the original generation.
 pub(crate) fn abandon_pending_append(
     drive: &mut DriveHandle,
-    lease: &remanence_state::FileCheckpointJournalLease,
-    journal: Option<&mut remanence_parity::FileTapeFileJournal>,
+    lease: &mut remanence_state::TapeAuthorityLease,
+) -> Result<(), String> {
+    lease
+        .with_structural(|lease, rows| abandon_pending_append_with_rows(drive, lease, rows))
+        .map_err(|error| error.to_string())?
+}
+
+fn abandon_pending_append_with_rows(
+    drive: &mut DriveHandle,
+    lease: &remanence_state::TapeAuthorityLease,
+    journal: Option<&mut dyn remanence_parity::authority::StructuralAuthority>,
 ) -> Result<(), String> {
     if !drive
         .append_session_has_dispatched_writes()
@@ -296,17 +306,17 @@ pub(crate) fn abandon_pending_append(
         return Err("abandonment lease belongs to a different tape".into());
     }
     if lease
-        .terminal_finalization_intent()
+        .pending_finalization()
         .map_err(|e| e.to_string())?
         .is_some()
     {
         return Err("terminal intent must be recovered, not abandoned".into());
     }
-    let last = lease.last_record_bounded().map_err(|e| e.to_string())?;
+    let last = lease.latest_commit().map_err(|e| e.to_string())?;
     // A fresh session has already emitted bootstrap + its delimiter. Preserve
     // both; the marker replaces only its first uncheckpointed object.
-    let lba = last.as_ref().map_or(2, |r| r.eod_lba);
-    let partition = last.as_ref().map_or(0, |r| r.eod_partition);
+    let lba = last.as_ref().map_or(2, |r| r.cursor.lba);
+    let partition = last.as_ref().map_or(0, |r| r.cursor.partition);
     let actual = drive.locate(lba).map_err(|e| e.to_string())?;
     if actual.partition != partition || actual.lba != lba {
         return Err("abandonment checkpoint position mismatch".into());
@@ -326,12 +336,12 @@ pub(crate) fn abandon_pending_append(
 /// Keep exactly that authority, including when the parity barrier was published
 /// just before a failed append to the shared checkpoint journal.
 pub(crate) fn discard_reconciled_parity_suffix(
-    journal: &mut remanence_parity::FileTapeFileJournal,
-    lease: &remanence_state::FileCheckpointJournalLease,
+    journal: &mut dyn remanence_parity::authority::StructuralAuthority,
+    lease: &remanence_state::TapeAuthorityLease,
 ) -> Result<(), String> {
-    let last = lease.last_record_bounded().map_err(|e| e.to_string())?;
+    let last = lease.latest_commit().map_err(|e| e.to_string())?;
     journal
-        .truncate_physically_discarded_suffix(last.as_ref().map_or(1, |r| r.next_tape_file_number))
+        .discard_suffix(last.as_ref().map_or(1, |r| r.next_file))
         .map_err(|e| e.to_string())
 }
 

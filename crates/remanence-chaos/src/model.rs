@@ -2532,8 +2532,8 @@ mod l1b_tests {
         scan_reconstruct_filemark_map, CommittedBundle, CommittedBundleKind, CommittedState,
         DriveHandleRawSink, DriveHandleRawSource, JournalError, ObjectParitySource, OpenTrust,
         ParityAuditHook, ParityError, ParityScheme, ParitySink, RecoveryEvent, RecoveryOutcome,
-        SchemeId, ScopedFilemarkMap, TapeFileJournal, TapeFilePosition, TerminalTripleCloseInput,
-        TerminalTripleObjectReservation, DEFAULT_INDEX_SEPARATION_BYTES,
+        SchemeId, ScopedFilemarkMap, TapeFilePosition, TapeReportPublisher,
+        TerminalTripleCloseInput, TerminalTripleObjectReservation, DEFAULT_INDEX_SEPARATION_BYTES,
     };
     use rusqlite::{params, Connection};
     use serde_json::{json, Value};
@@ -2570,13 +2570,19 @@ mod l1b_tests {
         bundles: Vec<CommittedBundle>,
     }
 
-    impl TapeFileJournal for ModelJournal {
+    impl TapeReportPublisher for ModelJournal {
+        remanence_parity::fixture_publication_methods!();
         fn tape_uuid(&self) -> [u8; 16] {
             TAPE_UUID
         }
 
-        fn commit_bundle(&mut self, bundle: &CommittedBundle) -> Result<(), JournalError> {
-            self.bundles.push(bundle.clone());
+        fn publish_fixture(
+            &mut self,
+            report: &remanence_parity::authority::ShadowPublication,
+        ) -> Result<(), JournalError> {
+            for bundle in &report.bundles {
+                self.bundles.push(bundle.clone());
+            }
             Ok(())
         }
 
