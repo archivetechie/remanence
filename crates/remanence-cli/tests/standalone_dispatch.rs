@@ -1739,6 +1739,84 @@ fn plaintext_downgrade_is_per_file_and_requires_override() {
     );
 }
 
+/// A fence naming the label or the BOT identity refuses standalone init
+/// before any media write, whatever override is passed, until it is released.
+#[test]
+fn standalone_tape_init_refuses_while_a_fence_names_the_label_or_bot_uuid() {
+    let f = VersionFixture::new();
+    let first = f.index().get_tape_by_voltag("FIRST").unwrap().unwrap();
+    let first_uuid: [u8; 16] = first.tape_uuid.clone().try_into().unwrap();
+    let by_uuid = f
+        .index()
+        .record_tape_io_fence(remanence_state::TapeIoFenceInput {
+            tape_uuid: first_uuid,
+            barcode: None,
+            reason: "partial_batch".into(),
+            evidence_json: None,
+        })
+        .unwrap();
+    let before = f.writes();
+    let (code, out, errors) = f.run(
+        &[
+            "tape",
+            "init",
+            "--label",
+            "FIRST",
+            "--generation",
+            "L9",
+            "--clobber-data",
+            "--confirm-clobber",
+            "CLOBBER FIRST",
+        ],
+        false,
+    );
+    assert_ne!(code, ExitCode::SUCCESS, "{out}\n{errors}");
+    assert!(
+        errors.contains(&format!(
+            "tape init refused before any media write: active tape-I/O fence {} (reason: partial_batch) names BOT uuid {}; release it with `rem tape quarantine release {} --after-settled-inventory --ack TEXT`",
+            by_uuid.quarantine_id,
+            uuid::Uuid::from_bytes(first_uuid),
+            by_uuid.quarantine_id
+        )),
+        "{out}\n{errors}"
+    );
+    assert_eq!(before, f.writes());
+
+    // A recycled cartridge: a fresh blank tape under a label a fence still names.
+    f.new_tape("SECOND");
+    let by_label = f
+        .index()
+        .record_tape_io_fence(remanence_state::TapeIoFenceInput {
+            tape_uuid: [0x5e; 16],
+            barcode: Some("SECOND".into()),
+            reason: "position_mismatch".into(),
+            evidence_json: None,
+        })
+        .unwrap();
+    let before = f.writes();
+    let (code, out, errors) = f.run(
+        &["tape", "init", "--label", "SECOND", "--generation", "L9"],
+        false,
+    );
+    assert_ne!(code, ExitCode::SUCCESS, "{out}\n{errors}");
+    assert!(
+        errors.contains(&format!(
+            "active tape-I/O fence {} (reason: position_mismatch) names barcode SECOND",
+            by_label.quarantine_id
+        )),
+        "{out}\n{errors}"
+    );
+    assert_eq!(before, f.writes());
+    assert!(f.index().get_tape_by_voltag("SECOND").unwrap().is_none());
+
+    f.index()
+        .release_tape_io_fence(&by_label.quarantine_id, "inventory settled")
+        .unwrap()
+        .unwrap();
+    f.ok(&["tape", "init", "--label", "SECOND", "--generation", "L9"]);
+    assert!(f.index().get_tape_by_voltag("SECOND").unwrap().is_some());
+}
+
 /// Rescue reads keep their ordinary path with a warning; release is local and audited.
 #[test]
 fn fence_allows_rescue_blocks_writes_and_releases_with_audit() {
@@ -1898,6 +1976,7 @@ fn clobber_confirmation_accepts_a_real_pty() {
 }
 
 /// Init must inspect the old BOT identity before planning its replacement UUID.
+/// The fence names no barcode, so only the post-BOT identity check can refuse.
 #[test]
 fn clobber_refuses_fenced_old_bot_on_another_endpoint() {
     let f = VersionFixture::new();
@@ -1905,11 +1984,12 @@ fn clobber_refuses_fenced_old_bot_on_another_endpoint() {
     std::fs::write(&source, b"old bytes").unwrap();
     f.ok(&["put", source.to_str().unwrap()]);
     let tape = f.index().get_tape_by_voltag("FIRST").unwrap().unwrap();
-    f.index()
+    let fence = f
+        .index()
         .record_tape_io_fence_at_endpoint(
             remanence_state::TapeIoFenceInput {
-                tape_uuid: tape.tape_uuid.try_into().unwrap(),
-                barcode: Some("FIRST".into()),
+                tape_uuid: tape.tape_uuid.clone().try_into().unwrap(),
+                barcode: None,
                 reason: "test".into(),
                 evidence_json: None,
             },
@@ -1934,8 +2014,14 @@ fn clobber_refuses_fenced_old_bot_on_another_endpoint() {
         true,
     );
     assert_ne!(code, ExitCode::SUCCESS);
+    // A standalone-raised fence is released without inventory settlement.
     assert!(
-        out.contains("write blocked by active tape-I/O fence"),
+        out.contains(&format!(
+            "tape init refused before any media write: active tape-I/O fence {} (reason: test) names BOT uuid {}; release it with `rem tape quarantine release {} --ack TEXT`",
+            fence.quarantine_id,
+            uuid::Uuid::from_slice(&tape.tape_uuid).unwrap(),
+            fence.quarantine_id
+        )),
         "{out}"
     );
     assert_eq!(before, f.writes());

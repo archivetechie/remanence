@@ -8899,6 +8899,13 @@ trait TapeInitStateOps {
         barcode: Option<&str>,
         library_robotics: bool,
     ) -> Result<Vec<remanence_state::MediaReadinessOperationRecord>, String>;
+
+    /// Refuse while an active tape-I/O fence names the barcode or BOT identity.
+    fn refuse_tape_init_while_fenced(
+        &mut self,
+        barcode: Option<&str>,
+        bot_uuid: Option<&remanence_api::TapeUuid>,
+    ) -> Result<(), String>;
 }
 
 impl TapeInitStateOps for remanence_state::StateHandle {
@@ -8977,6 +8984,14 @@ impl TapeInitStateOps for remanence_state::StateHandle {
                 library_robotics,
             )
             .map_err(|error| format!("check media readiness admission: {error}"))
+    }
+
+    fn refuse_tape_init_while_fenced(
+        &mut self,
+        barcode: Option<&str>,
+        bot_uuid: Option<&remanence_api::TapeUuid>,
+    ) -> Result<(), String> {
+        remanence_api::refuse_tape_init_while_fenced(self.catalog_index(), barcode, bot_uuid)
     }
 }
 
@@ -9214,6 +9229,14 @@ impl TapeInitStateOps for remanence_state::CatalogIndex {
         )
         .map_err(|error| format!("check media readiness admission: {error}"))
     }
+
+    fn refuse_tape_init_while_fenced(
+        &mut self,
+        barcode: Option<&str>,
+        bot_uuid: Option<&remanence_api::TapeUuid>,
+    ) -> Result<(), String> {
+        remanence_api::refuse_tape_init_while_fenced(self, barcode, bot_uuid)
+    }
 }
 
 struct DryRunTapeInitState {
@@ -9264,6 +9287,14 @@ impl TapeInitStateOps for DryRunTapeInitState {
                 library_robotics,
             )
             .map_err(|error| format!("check media readiness admission: {error}"))
+    }
+
+    fn refuse_tape_init_while_fenced(
+        &mut self,
+        barcode: Option<&str>,
+        bot_uuid: Option<&remanence_api::TapeUuid>,
+    ) -> Result<(), String> {
+        remanence_api::refuse_tape_init_while_fenced(&self.catalog, barcode, bot_uuid)
     }
 }
 
@@ -11444,8 +11475,17 @@ fn run_tape_init(
     let policy = configured_library_policy(&config);
 
     if args.dry_run {
-        let catalog = match remanence_state::CatalogIndex::open_read_only(&paths.sqlite_path) {
-            Ok(catalog) => catalog,
+        let catalog = match open_tape_init_dry_run_catalog(&paths.sqlite_path) {
+            Ok((catalog, DryRunCatalog::Absent)) => {
+                // Make a misconfigured state path visible rather than silent.
+                let _ = writeln!(
+                    err,
+                    "note: no catalog at {}; deciding against an empty catalog",
+                    paths.sqlite_path.display()
+                );
+                catalog
+            }
+            Ok((catalog, DryRunCatalog::Present)) => catalog,
             Err(error) => {
                 let _ = writeln!(err, "error: {error}");
                 print_warnings(report, err);
@@ -11484,6 +11524,34 @@ fn run_tape_init(
         args,
     };
     run_tape_init_candidates(&mut state, candidates, &ctx, input, out, err)
+}
+
+/// Open the catalog a dry run decides against without writing anything.
+/// An absent catalog (or catalog directory) is decided as an empty one: an
+/// in-memory catalog stands in, so the dry run never creates a file.
+/// Any catalog that exists but cannot be opened is still an error.
+fn open_tape_init_dry_run_catalog(
+    sqlite_path: &Path,
+) -> Result<(remanence_state::CatalogIndex, DryRunCatalog), String> {
+    let exists = sqlite_path
+        .try_exists()
+        .map_err(|error| format!("stat catalog {}: {error}", sqlite_path.display()))?;
+    if exists {
+        remanence_state::CatalogIndex::open_read_only(sqlite_path)
+            .map(|catalog| (catalog, DryRunCatalog::Present))
+            .map_err(|e| e.to_string())
+    } else {
+        remanence_state::CatalogIndex::open(":memory:")
+            .map(|catalog| (catalog, DryRunCatalog::Absent))
+            .map_err(|error| format!("open empty in-memory catalog for dry run: {error}"))
+    }
+}
+
+/// Whether a dry run decides against the configured catalog or an empty stand-in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DryRunCatalog {
+    Present,
+    Absent,
 }
 
 fn run_tape_init_candidates<S: TapeInitStateOps>(
@@ -11770,6 +11838,9 @@ fn run_one_tape_init<S: TapeInitStateOps>(
     if !conflicts.is_empty() {
         return Err(media_readiness_admission_error("tape init", &conflicts));
     }
+    // A fence naming the barcode refuses before any robotics; the BOT
+    // identity is checked again once BOT has been read.
+    state.refuse_tape_init_while_fenced(Some(voltag.as_str()), None)?;
     run_tape_init_hardware(
         library,
         state,
@@ -12132,6 +12203,12 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
         operation_id,
         "after_bot_classification",
         || signal_guard.requested_signal_name(),
+    )?;
+    // No init override releases a tape-I/O fence; refuse before any decision
+    // can reach the bootstrap write.
+    state.refuse_tape_init_while_fenced(
+        Some(voltag.as_str()),
+        remanence_api::bot_classification_uuid(&bot_projection.classification).as_ref(),
     )?;
     if matches!(drive_config.worm, WormMediaState::Worm)
         && !matches!(
@@ -21053,6 +21130,8 @@ pool_id = "init-test"
         stderr: String,
         input_consumed: u64,
         writes: usize,
+        /// Whether init opened any device before it finished.
+        transport_opened: bool,
         temp: tempfile::TempDir,
     }
 
@@ -21090,6 +21169,55 @@ pool_id = "init-test"
         extra: &[&str],
         input_text: &str,
     ) -> UnknownTapeInitRun {
+        let run = run_tape_init_on_bot_seeded(
+            bot_reads,
+            |config_path, root| {
+                if seed_committed_copy {
+                    seed_unknown_tape_committed_copy(config_path, root);
+                }
+            },
+            extra,
+            input_text,
+        );
+        assert!(
+            run.transport_opened,
+            "fixture transport is required: {}",
+            run.stderr
+        );
+        run
+    }
+
+    #[cfg(target_os = "linux")]
+    fn seed_unknown_tape_committed_copy(config_path: &Path, root: &Path) {
+        drop(
+            remanence_state::StateHandle::open_from_config_file(config_path)
+                .expect("create catalog"),
+        );
+        let conn =
+            rusqlite::Connection::open(root.join("index/rem-state.sqlite")).expect("open catalog");
+        conn.execute(
+            "insert into object_copies(object_id, tape_uuid, tape_file_number, status, pool_id)
+             values('seeded-object', ?1, ?2, 'committed', 'init-test')",
+            rusqlite::params![
+                Uuid::parse_str(UNKNOWN_BOT_UUID)
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec(),
+                1u64.to_be_bytes().to_vec()
+            ],
+        )
+        .expect("seed committed copy");
+    }
+
+    /// Like [`run_tape_init_on_bot`], with `seed(config_path, state_root)`
+    /// preparing state before init runs; init may refuse before any device IO.
+    #[cfg(target_os = "linux")]
+    fn run_tape_init_on_bot_seeded(
+        bot_reads: Option<Vec<Option<Vec<u8>>>>,
+        seed: impl FnOnce(&Path, &Path),
+        extra: &[&str],
+        input_text: &str,
+    ) -> UnknownTapeInitRun {
         let temp = tempfile::tempdir().expect("temp state directory");
         let config_path = write_retire_test_config(temp.path());
         let mut config_text = fs::read_to_string(&config_path).expect("read test config");
@@ -21106,26 +21234,7 @@ pool_id = "init-test"
 "#,
         );
         fs::write(&config_path, config_text).expect("write init config");
-        if seed_committed_copy {
-            drop(
-                remanence_state::StateHandle::open_from_config_file(&config_path)
-                    .expect("create catalog"),
-            );
-            let conn = rusqlite::Connection::open(temp.path().join("index/rem-state.sqlite"))
-                .expect("open catalog");
-            conn.execute(
-                "insert into object_copies(object_id, tape_uuid, tape_file_number, status, pool_id)
-                 values('seeded-object', ?1, ?2, 'committed', 'init-test')",
-                rusqlite::params![
-                    Uuid::parse_str(UNKNOWN_BOT_UUID)
-                        .unwrap()
-                        .as_bytes()
-                        .to_vec(),
-                    1u64.to_be_bytes().to_vec()
-                ],
-            )
-            .expect("seed committed copy");
-        }
+        seed(&config_path, temp.path());
 
         let mut library = fake_library("LIB-INIT-UNKNOWN");
         library.changer_sg = PathBuf::from("/fixture/changer");
@@ -21231,12 +21340,8 @@ pool_id = "init-test"
         );
         let stdout = String::from_utf8(out).unwrap();
         let stderr = String::from_utf8(err).unwrap();
-        TEST_CLI_TRANSPORT_FACTORY.with(|slot| {
-            assert!(
-                slot.borrow_mut().take().is_none(),
-                "fixture transport is required: {stderr}"
-            );
-        });
+        let transport_opened =
+            TEST_CLI_TRANSPORT_FACTORY.with(|slot| slot.borrow_mut().take().is_none());
         let writes = log
             .borrow()
             .iter()
@@ -21248,6 +21353,7 @@ pool_id = "init-test"
             stderr,
             input_consumed: input.position(),
             writes,
+            transport_opened,
             temp,
         }
     }
@@ -21527,6 +21633,268 @@ pool_id = "init-test"
         let (tape, audit) = unknown_tape_catalog_and_audit(&run);
         assert!(tape.is_none());
         assert!(audit.is_empty());
+    }
+
+    /// Record an active tape-I/O fence in a fresh catalog for an init run.
+    #[cfg(target_os = "linux")]
+    fn seed_tape_init_fence(
+        config_path: &Path,
+        root: &Path,
+        tape_uuid: [u8; 16],
+        barcode: Option<&str>,
+        reason: &str,
+    ) -> remanence_state::TapeIoFenceRecord {
+        drop(
+            remanence_state::StateHandle::open_from_config_file(config_path)
+                .expect("create catalog"),
+        );
+        remanence_state::CatalogIndex::open(root.join("index/rem-state.sqlite"))
+            .expect("open catalog")
+            .record_tape_io_fence(remanence_state::TapeIoFenceInput {
+                tape_uuid,
+                barcode: barcode.map(str::to_string),
+                reason: reason.to_string(),
+                evidence_json: None,
+            })
+            .expect("record tape-I/O fence")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn tape_init_fence_release_hint(fence: &remanence_state::TapeIoFenceRecord) -> String {
+        format!(
+            "release it with `rem tape quarantine release {} --after-settled-inventory --ack TEXT`",
+            fence.quarantine_id
+        )
+    }
+
+    /// A fence that still names a recycled cartridge's barcode refuses init
+    /// before any robotics or drive IO, with every override and in dry run.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tape_init_cli_refuses_while_a_fence_names_the_barcode() {
+        for extra in [
+            vec![],
+            vec!["--dry-run"],
+            vec![
+                "--force",
+                "--clobber-data",
+                "--confirm-clobber",
+                "CLOBBER RMT001L9",
+            ],
+        ] {
+            let mut fence = None;
+            let run = run_tape_init_on_bot_seeded(
+                None,
+                |config_path, root| {
+                    // The retired identity that owned the barcode, not the BOT's.
+                    fence = Some(seed_tape_init_fence(
+                        config_path,
+                        root,
+                        [0x5e; 16],
+                        Some("RMT001L9"),
+                        "partial_batch",
+                    ));
+                },
+                &extra,
+                "",
+            );
+            let fence = fence.expect("seeded fence");
+            let refusal = format!(
+                "tape init RMT001L9 in drive 0x0001: tape init refused before any media write: active tape-I/O fence {} (reason: partial_batch) names barcode RMT001L9; {}; --force and the clobber overrides do not release a fence",
+                fence.quarantine_id,
+                tape_init_fence_release_hint(&fence)
+            );
+            assert!(run.stderr.contains(&refusal), "{extra:?}\n{}", run.stderr);
+            assert!(!run.transport_opened, "{extra:?}: refused before device IO");
+            assert_eq!(run.writes, 0, "{extra:?}");
+            assert_eq!(run.input_consumed, 0, "{extra:?}");
+            assert!(run.stdout.is_empty(), "{extra:?}\n{}", run.stdout);
+            // A dry run reports the refusal and, by the dry-run rule, exits 0.
+            let expected = if extra.contains(&"--dry-run") {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            };
+            assert_eq!(run.code, expected, "{extra:?}");
+            let (tape, audit) = unknown_tape_catalog_and_audit(&run);
+            assert!(tape.is_none(), "{extra:?}");
+            assert!(audit.is_empty(), "{extra:?}");
+        }
+    }
+
+    /// A fence naming the identity read from BOT refuses init, even with
+    /// every override naming that identity for destruction.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tape_init_cli_refuses_while_a_fence_names_the_bot_uuid_even_with_clobber_flags() {
+        let bot_uuid = *Uuid::parse_str(UNKNOWN_BOT_UUID).unwrap().as_bytes();
+        for extra in [
+            vec![],
+            vec!["--force"],
+            vec![
+                "--force",
+                "--clobber-data",
+                "--clobber-unknown-tape",
+                UNKNOWN_BOT_UUID,
+                "--confirm-clobber",
+                "CLOBBER RMT001L9",
+            ],
+            vec!["--clobber-data", "--clobber-unknown-tape", UNKNOWN_BOT_UUID],
+        ] {
+            let mut fence = None;
+            let run = run_tape_init_on_bot_seeded(
+                Some(unknown_tape_reads(UNKNOWN_BOT_UUID)),
+                |config_path, root| {
+                    fence = Some(seed_tape_init_fence(
+                        config_path,
+                        root,
+                        bot_uuid,
+                        None,
+                        "position_mismatch",
+                    ));
+                },
+                &extra,
+                "CLOBBER RMT001L9\n",
+            );
+            let fence = fence.expect("seeded fence");
+            assert_eq!(run.code, ExitCode::from(1), "{extra:?}\n{}", run.stdout);
+            assert!(
+                run.transport_opened,
+                "{extra:?}: the BOT read names the uuid"
+            );
+            assert_eq!(run.writes, 0, "{extra:?}");
+            // Refused before any clobber confirmation prompt.
+            assert_eq!(run.input_consumed, 0, "{extra:?}");
+            assert!(!run.stderr.contains("to continue:"), "{}", run.stderr);
+            assert!(
+                run.stderr.contains(&format!(
+                    "tape init refused before any media write: active tape-I/O fence {} (reason: position_mismatch) names BOT uuid {UNKNOWN_BOT_UUID}; {}",
+                    fence.quarantine_id,
+                    tape_init_fence_release_hint(&fence)
+                )),
+                "{extra:?}\n{}",
+                run.stderr
+            );
+            let (tape, audit) = unknown_tape_catalog_and_audit(&run);
+            assert!(tape.is_none(), "{extra:?}");
+            assert!(audit.is_empty(), "{extra:?}");
+        }
+    }
+
+    /// Releasing the fence lets the same init proceed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tape_init_cli_proceeds_after_the_fence_is_released() {
+        let run = run_tape_init_on_bot_seeded(
+            None,
+            |config_path, root| {
+                let fence = seed_tape_init_fence(
+                    config_path,
+                    root,
+                    [0x5e; 16],
+                    Some("RMT001L9"),
+                    "partial_batch",
+                );
+                remanence_state::CatalogIndex::open(root.join("index/rem-state.sqlite"))
+                    .expect("open catalog")
+                    .release_tape_io_fence(&fence.quarantine_id, "inventory settled")
+                    .expect("release fence")
+                    .expect("released fence");
+            },
+            &["--clobber-data", "--confirm-clobber", "CLOBBER RMT001L9"],
+            "",
+        );
+        assert_eq!(run.code, ExitCode::SUCCESS, "{}", run.stderr);
+        assert!(!run.stderr.contains("tape-I/O fence"), "{}", run.stderr);
+        assert_eq!(run.writes, 2, "{}", run.stderr);
+        assert!(run.stdout.contains("wrote-bootstrap"), "{}", run.stdout);
+    }
+
+    /// A dry run on a state with no catalog yet decides against an empty one
+    /// and creates neither the catalog nor its directory.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tape_init_cli_dry_run_on_fresh_state_writes_nothing() {
+        for parent_exists in [false, true] {
+            let run = run_tape_init_on_bot_seeded(
+                None,
+                |_, root| {
+                    if parent_exists {
+                        fs::create_dir_all(root.join("index")).expect("create index dir");
+                    }
+                },
+                &["--dry-run"],
+                "",
+            );
+            assert_eq!(run.code, ExitCode::SUCCESS, "{}", run.stderr);
+            assert!(run.transport_opened, "{}", run.stderr);
+            assert!(!run.stderr.contains("unable to open"), "{}", run.stderr);
+            assert!(!run.stderr.contains("error:"), "{}", run.stderr);
+            assert!(
+                run.stderr.contains(&format!(
+                    "note: no catalog at {}; deciding against an empty catalog",
+                    run.temp.path().join("index/rem-state.sqlite").display()
+                )),
+                "{}",
+                run.stderr
+            );
+            assert!(
+                run.stdout
+                    .contains("decision: refuse-clobber: unrecognized BOT data"),
+                "{}",
+                run.stdout
+            );
+            assert_eq!(run.writes, 0);
+            let index_dir = run.temp.path().join("index");
+            assert_eq!(index_dir.exists(), parent_exists);
+            assert!(!index_dir.join("rem-state.sqlite").exists());
+            assert!(!run.temp.path().join("audit").exists());
+        }
+    }
+
+    /// Only an absent catalog stands in as empty: a catalog that exists but
+    /// cannot be opened still fails the dry run before any device IO.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tape_init_cli_dry_run_errors_on_corrupt_or_unreadable_catalog() {
+        use std::os::unix::fs::PermissionsExt;
+        for unreadable in [false, true] {
+            let mut root_bypasses_permissions = false;
+            let run = run_tape_init_on_bot_seeded(
+                None,
+                |config_path, root| {
+                    let catalog = root.join("index/rem-state.sqlite");
+                    if unreadable {
+                        drop(
+                            remanence_state::StateHandle::open_from_config_file(config_path)
+                                .expect("create catalog"),
+                        );
+                        fs::set_permissions(&catalog, fs::Permissions::from_mode(0o000))
+                            .expect("make catalog unreadable");
+                        // A privileged test runner reads through mode 000.
+                        root_bypasses_permissions = fs::File::open(&catalog).is_ok();
+                    } else {
+                        fs::create_dir_all(root.join("index")).expect("create index dir");
+                        fs::write(&catalog, b"not a sqlite catalog")
+                            .expect("write corrupt catalog");
+                    }
+                },
+                &["--dry-run"],
+                "",
+            );
+            if root_bypasses_permissions {
+                continue;
+            }
+            assert_eq!(run.code, ExitCode::from(1), "{unreadable}: {}", run.stderr);
+            assert!(
+                run.stderr.contains("error:"),
+                "{unreadable}: {}",
+                run.stderr
+            );
+            assert!(!run.stderr.contains("note: no catalog"), "{}", run.stderr);
+            assert!(!run.transport_opened, "{unreadable}: {}", run.stderr);
+            assert!(run.stdout.is_empty(), "{}", run.stdout);
+        }
     }
 
     /// The override needs --clobber-data and is refused for dry-run and batch init.

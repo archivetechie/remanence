@@ -404,6 +404,8 @@ pub(super) fn select_tape_in_pool_with_policy_and_eligibility(
     let mut reasons = Vec::new();
     let mut eligible = Vec::new();
     let mut batched_ineligible = Vec::new();
+    let mut fenced_skips = Vec::new();
+    let mut reserved_tape_count = 0usize;
     for tape in tapes {
         match check_writability_preconditions(&tape, object_size)
             .and_then(|_| check_pool_block_size_precondition(&tape, pool_cfg))
@@ -429,10 +431,23 @@ pub(super) fn select_tape_in_pool_with_policy_and_eligibility(
             .tape_io_admission_conflicts(&tape_uuid, tape.voltag.as_deref())
             .map_err(SelectTapeError::State)?;
         if let Some(conflict) = conflicts.first() {
+            fenced_skips.push(format!(
+                "{} ({}) fenced by {}: {}",
+                tape.voltag.as_deref().unwrap_or("<no-voltag>"),
+                Uuid::from_bytes(tape_uuid),
+                conflict.quarantine_id,
+                conflict.reason
+            ));
             reasons.push(WritabilityError::TapeIoFence {
                 quarantine_id: conflict.quarantine_id.clone(),
                 reason: conflict.reason.clone(),
             });
+            continue;
+        }
+        // A reserved tape belongs to a live owner that may hold its exclusive
+        // tape-log lease; drop it before any log peek below.
+        if reserved_tape_uuids.contains(&tape_uuid) {
+            reserved_tape_count += 1;
             continue;
         }
         if let (Some(checkpoint_journal_dir), Some(checkpoint_journal_tapes)) =
@@ -458,6 +473,14 @@ pub(super) fn select_tape_in_pool_with_policy_and_eligibility(
         eligible.push(tape);
     }
     if eligible.is_empty() {
+        // A reserved tape is held by a live checkpointed writer; report the
+        // reservation ahead of the batched-eligibility of the other tapes.
+        if reserved_tape_count > 0 {
+            return Err(SelectTapeError::NoUnreservedWritableTapes {
+                pool_id,
+                reserved_tape_count,
+            });
+        }
         if !batched_ineligible.is_empty() {
             return Err(SelectTapeError::NoBatchedEligibleTapes {
                 pool_id,
@@ -469,12 +492,8 @@ pub(super) fn select_tape_in_pool_with_policy_and_eligibility(
     eligible.sort_by(compare_tapes_for_pool_selection);
 
     let mut ranked = Vec::with_capacity(eligible.len());
-    let mut reserved_tape_count = 0usize;
     for (index, tape) in eligible.into_iter().enumerate() {
         match tape_fit_state_from_record(&tape, pool_cfg, pool_id.as_str(), index as u64) {
-            Ok(candidate) if reserved_tape_uuids.contains(&candidate.tape_uuid) => {
-                reserved_tape_count += 1;
-            }
             Ok(candidate) => ranked.push((tape, candidate)),
             Err(err) => reasons.push(err),
         }
@@ -499,18 +518,37 @@ pub(super) fn select_tape_in_pool_with_policy_and_eligibility(
         projected_footprint: object_size,
     };
     match policy.select(&ctx) {
-        Selection::UseTape { tape_uuid } => ranked
-            .into_iter()
-            .find(|(_, candidate)| candidate.tape_uuid == tape_uuid)
-            .map(|(tape, _)| selected_tape_from_record(tape, pool_id.as_str()))
-            .unwrap_or_else(|| {
-                Err(SelectTapeError::NoWritableTapes {
-                    pool_id: pool_id.clone(),
-                    reasons: Vec::new(),
-                })
-            }),
+        Selection::UseTape { tape_uuid } => {
+            let selected = ranked
+                .into_iter()
+                .find(|(_, candidate)| candidate.tape_uuid == tape_uuid)
+                .map(|(tape, _)| selected_tape_from_record(tape, pool_id.as_str()))
+                .unwrap_or_else(|| {
+                    Err(SelectTapeError::NoWritableTapes {
+                        pool_id: pool_id.clone(),
+                        reasons: Vec::new(),
+                    })
+                })?;
+            log_fenced_selection_skips(pool_id.as_str(), &selected, &fenced_skips);
+            Ok(selected)
+        }
         Selection::NeedFreshTape => Err(SelectTapeError::NoWritableTapes { pool_id, reasons }),
     }
+}
+
+/// Selection still succeeded, but active tape-I/O fences removed candidates;
+/// say which, so a silently skipped tape is visible to the operator.
+fn log_fenced_selection_skips(pool_id: &str, selected: &SelectedTape, fenced_skips: &[String]) {
+    if fenced_skips.is_empty() {
+        return;
+    }
+    tracing::info!(
+        pool_id,
+        selected_tape_uuid = %Uuid::from_bytes(selected.tape_uuid),
+        skipped_count = fenced_skips.len(),
+        skipped = %fenced_skips.join("; "),
+        "pool selection skipped tapes under an active tape-I/O fence"
+    );
 }
 
 pub(super) fn checkpoint_journal_tape_uuids(

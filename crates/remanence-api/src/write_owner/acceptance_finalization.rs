@@ -340,7 +340,9 @@ async fn status(api: &ApiState) -> Result<pb::TapeFinalization, Status> {
 
 async fn settled(api: &ApiState) -> Result<pb::TapeFinalization, String> {
     let started = tokio::time::Instant::now();
-    tokio::time::timeout(Duration::from_secs(60), async {
+    // Generous bounds: these waits observe progress and assert nothing about
+    // speed, and the trace runs for about a minute even on an idle host.
+    tokio::time::timeout(Duration::from_secs(300), async {
         loop {
             let value = status(api).await.map_err(|e| e.to_string())?;
             if let Some(id) = value
@@ -354,7 +356,7 @@ async fn settled(api: &ApiState) -> Result<pb::TapeFinalization, String> {
                         continue;
                     }
                     return Ok(value);
-                } else if started.elapsed() >= Duration::from_millis(100) {
+                } else if started.elapsed() >= Duration::from_secs(5) {
                     // A failed startup admission can leave the durable intent
                     // without a live worker. The same-key RPC supplies the
                     // operator retry and its concrete refusal.

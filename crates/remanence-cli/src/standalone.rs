@@ -2105,6 +2105,7 @@ fn prepare_init(
     if label.is_empty() || label.trim() != label {
         return Err("label must be non-empty and trimmed".into());
     }
+    remanence_api::refuse_tape_init_while_fenced(state.catalog_index(), Some(label), None)?;
     let ready = drive.wait_for_media_readiness(
         remanence_library::MediaFamily::Unknown,
         None,
@@ -2156,6 +2157,12 @@ fn prepare_init(
         remanence_api::BotClassification::OursBootstrap { uuid, .. } => Some(*uuid),
         _ => None,
     };
+    // No init override releases a tape-I/O fence on the label or BOT identity.
+    remanence_api::refuse_tape_init_while_fenced(
+        state.catalog_index(),
+        Some(label),
+        loaded_uuid.as_ref(),
+    )?;
     remanence_api::standalone_fence_policy(
         state.catalog_index(),
         loaded_uuid,

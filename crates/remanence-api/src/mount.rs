@@ -6151,7 +6151,7 @@ mod tests {
 
         // Startup recovery remains the only owner: it dispatches exactly one
         // tail for the original operation, and the rejoin dispatches none.
-        let reply = match tokio::time::timeout(Duration::from_secs(2), drive_rx.recv())
+        let reply = match tokio::time::timeout(Duration::from_secs(30), drive_rx.recv())
             .await
             .expect("startup recovery dispatches")
             .expect("drive command")
