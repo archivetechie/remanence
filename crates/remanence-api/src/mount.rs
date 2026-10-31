@@ -1289,6 +1289,16 @@ pub(crate) fn spawn_startup_terminal_recoveries(state: ApiState) {
             {
                 continue;
             }
+            // A retired identity refuses changed terminal authority. Its
+            // pending intent, if any, stays in its log as history.
+            if state
+                .index()
+                .and_then(|index| index.get_tape(&tape_uuid).map_err(status_from_state_error))
+                .is_ok_and(|tape| tape.is_some_and(|tape| tape.state == "retired"))
+            {
+                tracing::info!(tape_uuid = %Uuid::from_bytes(tape_uuid), "retired tape skipped by startup terminal recovery");
+                continue;
+            }
             let journal = match remanence_state::TapeAuthority::open(
                 state.checkpoint_journal_dir.as_path(),
                 tape_uuid,
@@ -5738,6 +5748,193 @@ mod tests {
                 remanence_state::TerminalFinalizationOutcome::Finalized
             );
         }
+    }
+
+    /// A retired identity keeps its pending terminal intent as history. Startup
+    /// recovery neither resumes it nor reports an error for it.
+    #[test]
+    fn startup_terminal_recovery_skips_a_retired_identity_with_a_pending_intent() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        const BLOCK_SIZE: u32 = 256 * 1024;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-startup-retired-terminal")
+            .tempdir()
+            .expect("tempdir");
+        let index_path = temp.path().join("state.sqlite");
+        let checkpoint_dir = temp.path().join("tapes");
+        let tape_uuid = [0xA7; 16];
+        let pool_id = "retired-finalize";
+        let pool_config = TapePoolConfig {
+            scheme: None,
+            id: pool_id.to_string(),
+            display_name: None,
+            copy_class: None,
+            content_class: None,
+            selection_policy: PoolSelectionPolicyName::CompleteOrFill,
+            watermark_low: 0.92,
+            watermark_high: 0.97,
+            capacity_cap_bytes: None,
+            block_size_bytes: u64::from(BLOCK_SIZE),
+            min_object_size_bytes: 0,
+        };
+        let mut index = CatalogIndex::open(&index_path).expect("open catalog");
+        index
+            .upsert_tape_pool_projection(TapePoolProjectionInput {
+                pool_id: pool_id.to_string(),
+                display_name: None,
+                copy_class: None,
+                content_class: None,
+                created_at_utc: None,
+            })
+            .expect("project pool");
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "RET001L9".to_string(),
+                block_size: BLOCK_SIZE,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision tape");
+        index
+            .project_tape_pool_membership(tape_uuid, pool_id)
+            .expect("assign pool");
+        let checkpoint = manual_finalize_checkpoint(tape_uuid, BLOCK_SIZE);
+        remanence_state::authority::fixtures::AuthorityBuilder::new(&checkpoint_dir, tape_uuid)
+            .build()
+            .expect("open checkpoint journal")
+            .append(&checkpoint)
+            .expect("append checkpoint");
+        index
+            .project_checkpoint_record(&checkpoint)
+            .expect("project checkpoint");
+
+        let mut state = ApiState::new_with_pool_configs(index, [pool_config]);
+        state.default_library_serial = Some(Arc::new("LIB001".to_string()));
+        let mut loaded = drive_bay(0x0101, true, Some("RET001L9"));
+        loaded.source_slot = None;
+        state.library_snapshot = Some(Arc::new(std::sync::RwLock::new(Arc::new(
+            crate::live_status::LibrarySnapshot {
+                report: remanence_library::DiscoveryReport {
+                    unattached_drives: Vec::new(),
+                    complete: true,
+                    incomplete_evidence: Vec::new(),
+                    libraries: vec![test_library(vec![loaded], vec![])],
+                    warnings: Vec::new(),
+                },
+                captured_at: time::OffsetDateTime::UNIX_EPOCH,
+            },
+        ))));
+        let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel(2);
+        let (changer_tx, mut changer_rx) = tokio::sync::mpsc::channel(1);
+        let pool = crate::write_owner::DrivePool::new(
+            changer_tx,
+            std::collections::HashMap::from([(0x0101, drive_tx)]),
+            Arc::new(std::collections::HashMap::from([(
+                0x0101,
+                AtomicBool::new(false),
+            )])),
+        );
+        state.drive_pool = Some(pool.clone());
+        let admission = ManualFinalizeTapeAdmission {
+            candidate_operation_id: Uuid::from_u128(0xA703),
+            actor: remanence_state::AuditActor::User("retired@example.invalid".to_string()),
+            actor_fingerprint: "sha256:retired-finalize".to_string(),
+            idempotency_key: Uuid::from_u128(0xA704),
+            request_fingerprint: [0xA7; 32],
+            tape_uuid,
+            expected_pool_id: Some(pool_id.to_string()),
+            reason: "finalize before recycle".to_string(),
+        };
+
+        // Accept a manual finalization, then lose its worker before any media
+        // write, leaving the durable intent pending.
+        runtime.block_on(async {
+            let accepted = manual_finalize_tape(&state, admission)
+                .await
+                .expect("durable acceptance");
+            assert!(matches!(
+                accepted,
+                crate::write_owner::ManualFinalizeTapeResult::Accepted(_)
+            ));
+            let command = tokio::time::timeout(Duration::from_secs(1), drive_rx.recv())
+                .await
+                .expect("accepted worker dispatches")
+                .expect("drive command");
+            match command {
+                crate::write_owner::DriveCommand::FinalizeTape { reply, .. } => drop(reply),
+                _ => panic!("unexpected worker command"),
+            }
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if let Ok(probe) = pool.reserve_tape(tape_uuid) {
+                        drop(probe);
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("lost worker releases exact-tape ownership");
+        });
+        let retired = state
+            .index_write()
+            .unwrap()
+            .retire_tape(remanence_state::RetireTapeInput {
+                tape_uuid,
+                reason: "recycled".into(),
+            })
+            .expect("retire the identity");
+        assert!(retired.newly_retired);
+        let journal_path = remanence_state::TapeAuthority::list_entries(&checkpoint_dir)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let journal_before = std::fs::read(&journal_path).unwrap();
+        let pending = |state: &ApiState| {
+            remanence_state::TapeAuthority::open(&checkpoint_dir, tape_uuid, &index_path)
+                .unwrap()
+                .pending_finalization()
+                .unwrap()
+                .map(|intent| {
+                    (
+                        remanence_state::TerminalFinalizationIntent::from(&intent),
+                        state
+                            .index()
+                            .unwrap()
+                            .terminal_finalization(&tape_uuid)
+                            .unwrap(),
+                    )
+                })
+        };
+        let before = pending(&state).expect("retired identity keeps its pending intent");
+
+        let warnings = crate::tests::capture_warnings(|| {
+            runtime.block_on(async {
+                spawn_startup_terminal_recoveries(state.clone());
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            })
+        });
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            drive_rx.try_recv().is_err(),
+            "retired intent never relaunches"
+        );
+        assert!(changer_rx.try_recv().is_err());
+        assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
+        assert_eq!(pending(&state), Some(before));
+        assert!(state
+            .index()
+            .unwrap()
+            .list_active_tape_io_fences()
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

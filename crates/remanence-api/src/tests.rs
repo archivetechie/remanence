@@ -674,7 +674,7 @@ impl Subscriber for WarningCaptureSubscriber {
     }
 }
 
-fn capture_warnings<F>(f: F) -> Vec<String>
+pub(crate) fn capture_warnings<F>(f: F) -> Vec<String>
 where
     F: FnOnce(),
 {

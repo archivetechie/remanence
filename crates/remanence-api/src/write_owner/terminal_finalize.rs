@@ -2070,10 +2070,14 @@ pub(super) fn finish_terminal_tail(
             let mut raw = DriveHandleRawSource::new(drive);
             reconcile_terminal_tail_next(&mut raw, &plan, progress, rewritable)
         };
+        // A complete, unpublished component is adopted without rewriting, but
+        // its zero-count barrier is still a media write after its filemark,
+        // where reconciliation left the cursor.
         if matches!(
             evidence,
             remanence_parity::TerminalComponentReconcileEvidence::Absent
                 | remanence_parity::TerminalComponentReconcileEvidence::TornRewritable
+                | remanence_parity::TerminalComponentReconcileEvidence::Complete
         ) && admission.is_none()
         {
             admission = Some(admit_terminal_write(
@@ -2088,6 +2092,7 @@ pub(super) fn finish_terminal_tail(
             )?);
         }
         authority.set_reconciliation(progress, component, evidence);
+        let dispatches_before = drive.media_write_dispatch_count();
         let step_result = {
             let mut raw = DriveHandleRawSink::new(drive);
             let mut faulting = crate::terminal_fault::TerminalFaultSink::new(
@@ -2110,6 +2115,8 @@ pub(super) fn finish_terminal_tail(
                         "terminal component is durable; retry after tape-log replay: {error}"
                     )));
                 }
+                let raw_write_reached_drive =
+                    super::checkpoint::raw_write_reached_drive(drive, dispatches_before, true);
                 return Err(terminal_tail_write_failure(
                     authority.index,
                     cfg,
@@ -2117,6 +2124,7 @@ pub(super) fn finish_terminal_tail(
                     authority.spec,
                     selected,
                     manual_request,
+                    raw_write_reached_drive,
                     &error,
                 ));
             }
@@ -2896,6 +2904,9 @@ pub(super) fn terminal_prefix_write_failure(
 }
 
 /// Fence a failed terminal tail before recovery marking, projection, or audit can fail.
+/// A failure that dispatched no media-modifying command leaves the medium
+/// unchanged and is a plain error.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn terminal_tail_write_failure(
     index: &mut CatalogIndex,
     cfg: &impl TerminalConfig,
@@ -2903,19 +2914,26 @@ pub(super) fn terminal_tail_write_failure(
     spec: &TerminalFinalizeSpec,
     selected: &SelectedTape,
     manual_request: Option<&ManualFinalizeTapeActorRequest>,
+    raw_write_reached_drive: bool,
     error: &TerminalTailWriteError,
 ) -> Status {
     let detail = error.to_string();
-    let (status, _) = fence_failed_parity_raw_write(
-        index,
-        cfg,
-        selected,
-        "terminal_tail",
-        None,
-        None,
-        &detail,
-        status_from_terminal_tail_error(error),
-    );
+    let status = status_from_terminal_tail_error(error);
+    let status = if raw_write_reached_drive {
+        fence_failed_parity_raw_write(
+            index,
+            cfg,
+            selected,
+            "terminal_tail",
+            None,
+            None,
+            &detail,
+            status,
+        )
+        .0
+    } else {
+        status
+    };
     let recovery = persist_terminal_recovery_required(index, checkpoint, spec).and_then(|intent| {
         record_terminal_finalize_event(
             index,
