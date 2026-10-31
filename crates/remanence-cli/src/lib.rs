@@ -96,6 +96,8 @@ mod capability_tests;
 #[allow(dead_code)]
 #[path = "dev/damage_vectors.rs"]
 mod damage_vectors;
+#[cfg(test)]
+mod drive_unload_tests;
 mod get;
 mod pool_ops;
 pub use pool_ops::{
@@ -1563,6 +1565,9 @@ enum DriveClientCommand {
     /// Load a selected tape into a selected drive bay and wait for completion.
     Load(DriveLoadArgs),
 
+    /// Unload a selected drive bay into a storage slot and wait for completion.
+    Unload(DriveUnloadArgs),
+
     /// List cataloged drives.
     List {
         /// Include foreign drives.
@@ -1646,6 +1651,21 @@ struct DriveLoadArgs {
     /// Return after legacy LOAD completion without waiting for cartridge readiness.
     #[arg(long)]
     no_wait: bool,
+}
+
+#[derive(Args, Debug)]
+struct DriveUnloadArgs {
+    /// Library serial or UUID.
+    #[arg(long, value_name = "LIBRARY")]
+    library: String,
+
+    /// Source drive bay element address.
+    #[arg(long, value_parser = parse_element_addr)]
+    bay: u16,
+
+    /// Destination slot element address. Defaults to the cartridge's recorded source slot.
+    #[arg(long, value_parser = parse_element_addr)]
+    dest: Option<u16>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -6004,6 +6024,78 @@ fn drive_uuid_from_selector(
     Ok(drive.drive_uuid)
 }
 
+/// Where `rem drive unload` left the cartridge, as the daemon's inventory shows it.
+struct DriveUnloadLocation {
+    library_serial: String,
+    bay: u16,
+    barcode: Option<String>,
+    slot: Option<u32>,
+}
+
+/// The daemon's current view of one library, or `None` when it cannot report one.
+async fn library_state(
+    client: &mut pb::library_service_client::LibraryServiceClient<Channel>,
+    library_uuid: &[u8],
+) -> Option<pb::LibraryState> {
+    client
+        .get_library(pb::GetLibraryRequest {
+            library_uuid: library_uuid.to_vec(),
+        })
+        .await
+        .ok()
+        .map(tonic::Response::into_inner)
+}
+
+/// The slot now holding the unloaded barcode; otherwise the slot the caller named.
+fn unloaded_slot(
+    barcode: Option<&str>,
+    requested: Option<u16>,
+    slots: Option<&[pb::Slot]>,
+) -> Option<u32> {
+    barcode
+        .zip(slots)
+        .and_then(|(barcode, slots)| {
+            slots
+                .iter()
+                .find(|slot| slot.voltag.as_deref() == Some(barcode))
+                .map(|slot| slot.element_address)
+        })
+        .or(requested.map(u32::from))
+}
+
+fn print_drive_unload(
+    operation: pb::OperationStatus,
+    location: &DriveUnloadLocation,
+    json_output: bool,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    if json_output {
+        let mut data = operation_json(&operation);
+        data["location"] = json!({
+            "library_serial": location.library_serial,
+            "bay": location.bay,
+            "barcode": location.barcode,
+            "slot": location.slot,
+        });
+        return print_json_envelope("rem.operation.status.v1", "item", data, out);
+    }
+    print_operation(operation, false, out)?;
+    let cartridge = location.barcode.as_deref().unwrap_or("cartridge");
+    match location.slot {
+        Some(slot) => writeln!(
+            out,
+            "unloaded {cartridge} from bay 0x{:04x} to slot 0x{slot:04x}",
+            location.bay
+        ),
+        None => writeln!(
+            out,
+            "unloaded {cartridge} from bay 0x{:04x}; the daemon inventory does not show its slot",
+            location.bay
+        ),
+    }
+    .map_err(|error| error.to_string())
+}
+
 fn poll_drive_request(drive: &str) -> pb::PollDriveRequest {
     pb::PollDriveRequest {
         drive: drive.to_string(),
@@ -6070,6 +6162,46 @@ fn run_drive_client_command(
                         .into_inner();
                     let status = wait_for_operation(channel, operation.operation_id).await?;
                     print_operation(status, json_output, out).map_err(DaemonClientError::from)
+                }
+                DriveClientCommand::Unload(args) => {
+                    if args.dest == Some(0) {
+                        return Err(DaemonClientError::client(
+                            "drive unload --dest must name a storage slot; omit it to return the cartridge to its source slot",
+                        ));
+                    }
+                    let library = resolve_library_arg(&mut client, args.library.as_str()).await?;
+                    // Inventory reads only label the result; the daemon decides the move.
+                    let barcode = library_state(&mut client, &library.library_uuid)
+                        .await
+                        .and_then(|state| {
+                            state
+                                .drives
+                                .into_iter()
+                                .find(|drive| drive.element_address == Some(u32::from(args.bay)))
+                                .and_then(|drive| drive.loaded_tape_barcode)
+                        });
+                    let operation = client
+                        .unload_drive(pb::UnloadDriveRequest {
+                            library_uuid: library.library_uuid.clone(),
+                            drive_element_address: u32::from(args.bay),
+                            destination_slot_address: args.dest.map_or(0, u32::from),
+                            idempotency_key: None,
+                        })
+                        .await
+                        .map_err(status_error)?
+                        .into_inner();
+                    let status = wait_for_operation(channel, operation.operation_id).await?;
+                    let slots = library_state(&mut client, &library.library_uuid)
+                        .await
+                        .map(|state| state.slots);
+                    let location = DriveUnloadLocation {
+                        slot: unloaded_slot(barcode.as_deref(), args.dest, slots.as_deref()),
+                        library_serial: library.library_serial,
+                        bay: args.bay,
+                        barcode,
+                    };
+                    print_drive_unload(status, &location, json_output, out)
+                        .map_err(DaemonClientError::from)
                 }
                 DriveClientCommand::List { foreign, retired } => {
                     let drives = client

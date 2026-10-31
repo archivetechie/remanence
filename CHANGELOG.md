@@ -7,6 +7,12 @@ per-release summaries.
 <!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/index.rs crates/remanence-library/src/discovery.rs @ 638210f7 -->
 ## Unreleased
 
+- `rem drive unload --library <SERIAL> --bay <BAY> [--dest <SLOT>]` unloads a
+  drive bay through the daemon and waits for completion. The daemon closes any
+  retained parity epoch before the cartridge leaves the drive. Without `--dest`
+  the cartridge returns to its recorded source slot. The command reports the
+  slot that now holds it, and exits 1 with the daemon's message on a refusal.
+
 - `rem tape init` can now erase a Remanence tape whose BOT UUID has no catalog
   row, which previously could only be adopted. Pass `--clobber-data
   --clobber-unknown-tape <UUID>` with the clobber confirmation; the UUID must
