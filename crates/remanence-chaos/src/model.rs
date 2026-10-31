@@ -353,6 +353,38 @@ pub struct VirtualWorld {
     pub drive_states: HashMap<u16, VirtualDriveState>,
     /// Changer element layout.
     pub element_layout: ElementLayout,
+    /// A magazine the operator has pulled out of the changer, if any.
+    pub removed_magazine: Option<RemovedMagazine>,
+    /// Unit attention the changer reports to its next command other than
+    /// INQUIRY, as (key, ASC, ASCQ).
+    pub changer_unit_attention: Option<(u8, u8, u8)>,
+    /// Changer TEST UNIT READY commands still to answer with status BUSY.
+    pub changer_busy_polls: u32,
+}
+
+/// A storage magazine pulled out of the virtual changer.
+///
+/// While it is out, element status reports its slots empty, inaccessible and
+/// with element exception `3B/12` (medium magazine removed), and a MOVE MEDIUM
+/// touching one of them answers `02/3B/12`. Cartridges stay in `slots`, so a
+/// test can change them while the magazine is out, as an operator might. The
+/// operator reinserts it after `reinsert_after_polls` changer TEST UNIT READY
+/// commands; reinsertion queues unit attention `06/28/00` when
+/// `unit_attention_on_insert` is set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemovedMagazine {
+    /// Storage slot addresses the magazine carries.
+    pub slots: BTreeSet<u16>,
+    /// Changer TEST UNIT READY polls before reinsertion; `None` keeps it out.
+    pub reinsert_after_polls: Option<u32>,
+    /// Changer TEST UNIT READY polls answered while it is out.
+    pub polls: u32,
+    /// The whole changer answers NOT READY `02/3B/12` to TEST UNIT READY and
+    /// MOVE MEDIUM while it is out, as a single-magazine autoloader does.
+    /// Otherwise TEST UNIT READY is GOOD and only its slots are unavailable.
+    pub not_ready_while_removed: bool,
+    /// Reinsertion queues unit attention `06/28/00`.
+    pub unit_attention_on_insert: bool,
 }
 
 /// Per-drive mechanical, removal-lock and cleaning simulation state.
@@ -430,7 +462,38 @@ impl VirtualWorld {
                 ie_start: 0,
                 ie_count: 0,
             },
+            removed_magazine: None,
+            changer_unit_attention: None,
+            changer_busy_polls: 0,
         }
+    }
+
+    /// Pull a magazine carrying `slots` out of the changer. It stays out until
+    /// [`Self::reinsert_magazine`] or its configured poll count.
+    pub fn remove_magazine(&mut self, slots: impl IntoIterator<Item = u16>) {
+        self.removed_magazine = Some(RemovedMagazine {
+            slots: slots.into_iter().collect(),
+            reinsert_after_polls: None,
+            polls: 0,
+            not_ready_while_removed: false,
+            unit_attention_on_insert: true,
+        });
+    }
+
+    /// Reinsert the removed magazine now, queueing its unit attention.
+    pub fn reinsert_magazine(&mut self) {
+        if let Some(magazine) = self.removed_magazine.take() {
+            if magazine.unit_attention_on_insert {
+                self.changer_unit_attention = Some((0x06, 0x28, 0x00));
+            }
+        }
+    }
+
+    /// True while a magazine is out and carries `slot`.
+    pub fn slot_in_removed_magazine(&self, slot: u16) -> bool {
+        self.removed_magazine
+            .as_ref()
+            .is_some_and(|magazine| magazine.slots.contains(&slot))
     }
 
     /// Cut drive power, retaining exactly `keep` records, including every durable record.
@@ -623,6 +686,13 @@ impl VirtualWorld {
             .slots
             .iter()
             .map(|slot| {
+                if self.slot_in_removed_magazine(slot.address) {
+                    let mut desc =
+                        descriptor_with_voltag(slot.address, false, None, None, None, false, true);
+                    desc[4] = 0x3b;
+                    desc[5] = 0x12;
+                    return desc;
+                }
                 descriptor_with_voltag(
                     slot.address,
                     slot.full,
@@ -771,10 +841,18 @@ impl ModelTransport {
     }
 
     fn prepare_command(&self, cdb: &[u8]) -> Result<(), ScsiError> {
+        let opcode = cdb.first().copied().unwrap_or(0);
         let DeviceRole::Drive { bay } = self.role else {
+            // INQUIRY does not consume a pending unit attention; changer TEST
+            // UNIT READY reports it after modelling the magazine.
+            if !matches!(opcode, 0x00 | 0x12) {
+                let mut world = self.world.lock().expect("virtual world lock");
+                if let Some((key, asc, ascq)) = world.changer_unit_attention.take() {
+                    return Err(check_condition(fixed_sense(key, asc, ascq, None, 0), 0));
+                }
+            }
             return Ok(());
         };
-        let opcode = cdb.first().copied().unwrap_or(0);
         let mut world = self.world.lock().expect("virtual world lock");
         let state = world.drive_states.entry(bay).or_default();
         // INQUIRY does not consume a pending unit attention.
@@ -1055,7 +1133,38 @@ impl ModelTransport {
         Ok(TransferOutcome::clean(n as u32))
     }
 
+    fn changer_test_unit_ready(&self) -> Result<(), ScsiError> {
+        let mut world = self.world.lock().expect("virtual world lock");
+        if world.changer_busy_polls > 0 {
+            world.changer_busy_polls -= 1;
+            return Err(busy_status());
+        }
+        // A pending unit attention is reported before any not-ready state.
+        if let Some((key, asc, ascq)) = world.changer_unit_attention.take() {
+            return Err(check_condition(fixed_sense(key, asc, ascq, None, 0), 0));
+        }
+        if let Some(magazine) = world.removed_magazine.as_mut() {
+            magazine.polls = magazine.polls.saturating_add(1);
+            let not_ready = magazine.not_ready_while_removed;
+            if magazine
+                .reinsert_after_polls
+                .is_some_and(|polls| magazine.polls >= polls)
+            {
+                world.reinsert_magazine();
+            } else if not_ready {
+                return Err(check_condition(magazine_removed_sense(), 0));
+            }
+        }
+        if let Some((key, asc, ascq)) = world.changer_unit_attention.take() {
+            return Err(check_condition(fixed_sense(key, asc, ascq, None, 0), 0));
+        }
+        Ok(())
+    }
+
     fn test_unit_ready(&self) -> Result<(), ScsiError> {
+        if self.role == DeviceRole::Changer {
+            return self.changer_test_unit_ready();
+        }
         let bay = self.drive_bay()?;
         let world = self.world.lock().expect("virtual world lock");
         if world.awaits_initializing_command(bay) {
@@ -1529,6 +1638,14 @@ impl ModelTransport {
         let src = u16::from_be_bytes([cdb[4], cdb[5]]);
         let dst = u16::from_be_bytes([cdb[6], cdb[7]]);
         let mut world = self.world.lock().expect("virtual world lock");
+        let magazine_blocks_move = world.removed_magazine.as_ref().is_some_and(|magazine| {
+            magazine.not_ready_while_removed
+                || magazine.slots.contains(&src)
+                || magazine.slots.contains(&dst)
+        });
+        if magazine_blocks_move {
+            return Err(check_condition(magazine_removed_sense(), 0));
+        }
         let barcode = take_from_element(&mut world, src)?;
         put_into_element(&mut world, dst, barcode, Some(src))
     }
@@ -1935,6 +2052,20 @@ fn blank_check_eod_sense() -> Vec<u8> {
 
 fn blank_check_eod_sense_with_residual(residual: usize) -> Vec<u8> {
     fixed_sense(0x08, 0x00, 0x05, Some(residual as i64), 0x00)
+}
+
+#[cfg(target_os = "linux")]
+fn busy_status() -> ScsiError {
+    ScsiError::UnexpectedStatus { status: 0x08 }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn busy_status() -> ScsiError {
+    ScsiError::InvalidInput("target busy")
+}
+
+fn magazine_removed_sense() -> Vec<u8> {
+    fixed_sense(0x02, 0x3b, 0x12, None, 0)
 }
 
 fn no_medium_sense() -> Vec<u8> {
@@ -3841,6 +3972,854 @@ mod l1b_tests {
             .expect("MED-05 event");
         assert_eq!(med05["barcode"], BARCODE);
         assert_eq!(med05["mutation_summary"]["applied_length"], 16);
+    }
+
+    // ---- Transient changer not-ready: magazine and door ----------------
+
+    const HOME_SLOT: u16 = SLOT;
+    const OTHER_SLOT: u16 = SLOT + 1;
+
+    type Captured = Arc<Mutex<Vec<String>>>;
+
+    /// Bounded, fast wait for tests: polls every millisecond.
+    fn fast_wait(timeout: std::time::Duration) -> remanence_library::ChangerReadyWait {
+        remanence_library::ChangerReadyWait::bounded(timeout)
+            .with_poll_interval(std::time::Duration::from_millis(1))
+            .with_progress_interval(std::time::Duration::from_millis(2))
+    }
+
+    fn observed_wait(
+        timeout: std::time::Duration,
+    ) -> (remanence_library::ChangerReadyWait, Captured) {
+        let phases: Captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&phases);
+        let wait = fast_wait(timeout).with_observer(Arc::new(move |event| {
+            sink.lock()
+                .expect("phase lock")
+                .push(format!("{:?} {}", event.phase, event.condition));
+        }));
+        (wait, phases)
+    }
+
+    /// Cartridge seated in the drive, its home slot and one spare slot empty.
+    fn unloaded_drive_world() -> SharedVirtualWorld {
+        let mut world = VirtualWorld::single_drive(LIB_SERIAL, BAY, DRIVE_SERIAL, SLOT, 2);
+        world.put_tape_in_drive(
+            BAY,
+            BARCODE,
+            Some(HOME_SLOT),
+            VirtualTape::empty(64 * 1024 * 1024, BLOCK_SIZE),
+        );
+        Arc::new(Mutex::new(world))
+    }
+
+    fn capture_move_audit(handle: &mut LibraryHandle) -> Captured {
+        let captured: Captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&captured);
+        handle.set_audit_hook(move |event| {
+            let operation = match event {
+                AuditEvent::Started { operation, .. }
+                | AuditEvent::Finished { operation, .. }
+                | AuditEvent::Refused { operation, .. }
+                | AuditEvent::Warning { operation, .. } => operation,
+            };
+            if !matches!(operation, remanence_library::AuditOp::Move { .. }) {
+                return;
+            }
+            let entry = match event {
+                AuditEvent::Started { .. } => "started".to_string(),
+                AuditEvent::Finished {
+                    outcome: AuditOutcome::Success { .. },
+                    ..
+                } => "finished ok".to_string(),
+                AuditEvent::Finished {
+                    outcome:
+                        AuditOutcome::ScsiError {
+                            sense: Some(sense), ..
+                        },
+                    ..
+                } => {
+                    let (key, asc, ascq) = sense_tuple(sense);
+                    format!("finished {key:02x}/{asc:02x}/{ascq:02x}")
+                }
+                AuditEvent::Finished { .. } => "finished other".to_string(),
+                AuditEvent::Refused { reason, .. } => format!("refused {reason}"),
+                AuditEvent::Warning { .. } => return,
+            };
+            sink.lock().expect("audit lock").push(entry);
+        });
+        captured
+    }
+
+    fn changer_opcodes(world: &SharedVirtualWorld) -> Vec<u8> {
+        world
+            .lock()
+            .expect("world lock")
+            .command_log
+            .iter()
+            .filter(|command| command.role == DeviceRole::Changer)
+            .map(|command| command.opcode)
+            .collect()
+    }
+
+    fn count(opcodes: &[u8], opcode: u8) -> usize {
+        opcodes
+            .iter()
+            .filter(|candidate| **candidate == opcode)
+            .count()
+    }
+
+    fn strings(entries: &Captured) -> Vec<String> {
+        entries.lock().expect("capture lock").clone()
+    }
+
+    #[test]
+    fn magazine_out_before_the_unload_move_waits_first_then_moves_home_after_checking_both_ends() {
+        let world = unloaded_drive_world();
+        let mut handle = open_handle(Arc::clone(&world), None);
+        let (wait, phases) = observed_wait(std::time::Duration::from_secs(10));
+        handle.set_changer_ready_wait(wait);
+        let audit = capture_move_audit(&mut handle);
+        {
+            let mut world = world.lock().expect("world lock");
+            world.remove_magazine([HOME_SLOT, OTHER_SLOT]);
+            let magazine = world.removed_magazine.as_mut().expect("magazine out");
+            magazine.reinsert_after_polls = Some(3);
+            magazine.unit_attention_on_insert = false;
+        }
+        let before = changer_opcodes(&world).len();
+
+        handle
+            .move_medium(BAY, HOME_SLOT, &policy())
+            .expect("the move home rides out the open magazine");
+
+        {
+            let world = world.lock().expect("world lock");
+            assert!(world.removed_magazine.is_none());
+            assert_eq!(world.drive_bays[&BAY], None);
+            assert_eq!(world.slots[0].barcode.as_deref(), Some(BARCODE));
+        }
+        let opcodes = changer_opcodes(&world)[before..].to_vec();
+        // Fresh element status already shows the home slot in an open
+        // magazine, so the wait starts before any MOVE is issued.
+        assert_eq!(count(&opcodes, 0xa5), 1, "{opcodes:02x?}");
+        assert_eq!(count(&opcodes, 0x00), 3, "{opcodes:02x?}");
+        // Element status is read after the changer answers ready and before
+        // the MOVE MEDIUM.
+        let last_tur = opcodes.iter().rposition(|op| *op == 0x00).unwrap();
+        let retry = opcodes.iter().rposition(|op| *op == 0xa5).unwrap();
+        assert!(opcodes[last_tur..retry].contains(&0xb8), "{opcodes:02x?}");
+        assert_eq!(strings(&audit), ["started", "finished ok"]);
+        let phases = strings(&phases);
+        assert_eq!(
+            phases.first().map(String::as_str),
+            Some("Waiting element 0x0400 medium magazine removed (3b/12)")
+        );
+        assert!(
+            phases
+                .last()
+                .is_some_and(|phase| phase.starts_with("Ready ")),
+            "{phases:?}"
+        );
+        assert!(!handle.is_dirty());
+        let slot = &handle.library().slots[0];
+        assert!(slot.full && slot.accessible);
+        assert_eq!(slot.cartridge.as_deref(), Some(BARCODE));
+    }
+
+    #[test]
+    fn magazine_still_open_at_the_deadline_refuses_with_refreshed_inventory_and_no_move() {
+        let world = unloaded_drive_world();
+        let mut handle = open_handle(Arc::clone(&world), None);
+        let (wait, phases) = observed_wait(std::time::Duration::from_millis(40));
+        handle.set_changer_ready_wait(wait);
+        let audit = capture_move_audit(&mut handle);
+        world
+            .lock()
+            .expect("world lock")
+            .remove_magazine([HOME_SLOT, OTHER_SLOT]);
+
+        let err = handle
+            .move_medium(BAY, HOME_SLOT, &policy())
+            .expect_err("the magazine never returns");
+
+        match err {
+            MoveError::NotReady { src, dst, detail } => {
+                assert_eq!((src, dst), (BAY, HOME_SLOT));
+                assert!(detail.contains("medium magazine removed"), "{detail}");
+            }
+            other => panic!("expected NotReady, got {other:?}"),
+        }
+        // The pre-move wait ran out: the move bound to fail is never sent.
+        assert_eq!(strings(&audit), ["refused NotReady"]);
+        assert_eq!(count(&changer_opcodes(&world), 0xa5), 0);
+        assert!(strings(&phases)
+            .last()
+            .is_some_and(|phase| phase.starts_with("GaveUp ")));
+        assert_eq!(
+            world.lock().expect("world lock").loaded_barcode(BAY),
+            Some(BARCODE)
+        );
+        assert!(!handle.is_dirty());
+        // The refreshed inventory still names the cartridge in the drive and
+        // shows the home slot temporarily unavailable.
+        let bay = &handle.library().drive_bays[0];
+        assert!(bay.loaded);
+        assert_eq!(bay.loaded_tape.as_deref(), Some(BARCODE));
+        let home = &handle.library().slots[0];
+        assert!(!home.accessible);
+        assert_eq!(
+            home.exception,
+            Some(remanence_library::ElementException {
+                asc: 0x3b,
+                ascq: 0x12
+            })
+        );
+    }
+
+    #[test]
+    fn inventory_change_while_the_magazine_is_out_refuses_without_retry() {
+        let world = unloaded_drive_world();
+        let mut handle = open_handle(Arc::clone(&world), None);
+        let operator_world = Arc::clone(&world);
+        // While the magazine is out, the operator loads a cartridge into the
+        // home slot.
+        let wait =
+            fast_wait(std::time::Duration::from_secs(10)).with_observer(Arc::new(move |event| {
+                if event.phase == remanence_library::ChangerWaitPhase::Waiting {
+                    let mut world = operator_world.lock().expect("world lock");
+                    world.tapes.insert("OTHER01".into(), VirtualTape::default());
+                    world.slots[0].full = true;
+                    world.slots[0].barcode = Some("OTHER01".into());
+                    world
+                        .removed_magazine
+                        .as_mut()
+                        .expect("magazine out")
+                        .reinsert_after_polls = Some(2);
+                }
+            }));
+        handle.set_changer_ready_wait(wait);
+        let audit = capture_move_audit(&mut handle);
+        world
+            .lock()
+            .expect("world lock")
+            .remove_magazine([HOME_SLOT, OTHER_SLOT]);
+
+        let err = handle
+            .move_medium(BAY, HOME_SLOT, &policy())
+            .expect_err("a changed destination is never retried");
+
+        match err {
+            MoveError::InventoryChanged { addr, found, .. } => {
+                assert_eq!(addr, HOME_SLOT);
+                assert!(found.contains("OTHER01"), "{found}");
+            }
+            other => panic!("expected InventoryChanged, got {other:?}"),
+        }
+        assert_eq!(strings(&audit), ["refused InventoryChanged"]);
+        assert_eq!(count(&changer_opcodes(&world), 0xa5), 0);
+        let world = world.lock().expect("world lock");
+        assert_eq!(world.loaded_barcode(BAY), Some(BARCODE));
+        assert_eq!(world.slots[0].barcode.as_deref(), Some("OTHER01"));
+        let home = &handle.library().slots[0];
+        assert!(home.full);
+        assert_eq!(home.cartridge.as_deref(), Some("OTHER01"));
+    }
+
+    #[test]
+    fn unit_attention_after_the_magazine_closes_is_consumed_and_the_load_succeeds() {
+        let world = slotted_world(64 * 1024 * 1024);
+        let mut handle = open_handle(Arc::clone(&world), None);
+        handle.set_changer_ready_wait(fast_wait(std::time::Duration::from_secs(10)));
+        let audit = capture_move_audit(&mut handle);
+        {
+            let mut world = world.lock().expect("world lock");
+            world.remove_magazine([]);
+            let magazine = world.removed_magazine.as_mut().expect("magazine out");
+            // A single-magazine changer: the whole unit is not ready.
+            magazine.not_ready_while_removed = true;
+            magazine.reinsert_after_polls = Some(2);
+        }
+        let before = changer_opcodes(&world).len();
+
+        handle
+            .move_medium(SLOT, BAY, &policy())
+            .expect("load succeeds after the unit attention");
+
+        let opcodes = changer_opcodes(&world)[before..].to_vec();
+        // Poll 1: 02/3B/12. Poll 2: reinsertion, 06/28/00. Poll 3: GOOD.
+        assert_eq!(count(&opcodes, 0x00), 3, "{opcodes:02x?}");
+        assert_eq!(count(&opcodes, 0xa5), 2, "{opcodes:02x?}");
+        assert_eq!(
+            strings(&audit),
+            ["started", "finished 02/3b/12", "started", "finished ok"]
+        );
+        let world = world.lock().expect("world lock");
+        assert_eq!(world.changer_unit_attention, None);
+        assert_eq!(world.loaded_barcode(BAY), Some(BARCODE));
+        assert!(!world.slots[0].full);
+    }
+
+    #[test]
+    fn door_open_sense_is_waited_out_and_the_move_retried_once() {
+        let world = slotted_world(64 * 1024 * 1024);
+        let (_temp, state_path) =
+            chaos_state("remanence-chaos-door-wait", "door-wait", "seed-door-wait");
+        let engine = arm_library_fault(
+            &state_path,
+            "door-wait",
+            "LIB-08",
+            "move_medium",
+            json!({}),
+            "transient",
+        );
+        let mut handle = open_handle(Arc::clone(&world), Some(engine));
+        handle.set_changer_ready_wait(fast_wait(std::time::Duration::from_secs(10)));
+        let audit = capture_move_audit(&mut handle);
+
+        handle
+            .move_medium(SLOT, BAY, &policy())
+            .expect("the door closes before the retry");
+
+        assert_eq!(
+            strings(&audit),
+            ["started", "finished 02/04/18", "started", "finished ok"]
+        );
+        assert_eq!(
+            world.lock().expect("world lock").loaded_barcode(BAY),
+            Some(BARCODE)
+        );
+    }
+
+    #[test]
+    fn non_transient_move_failures_fail_at_once_with_the_wait_enabled() {
+        for (catalogue_id, expected) in [
+            ("LIB-01", (0x05, 0x3b, 0x0e)),
+            ("LIB-07", (0x04, 0x44, 0x00)),
+        ] {
+            let world = slotted_world(64 * 1024 * 1024);
+            let scenario = format!("no-wait-{catalogue_id}");
+            let (_temp, state_path) =
+                chaos_state("remanence-chaos-no-wait", &scenario, "seed-no-wait");
+            let engine = arm_library_fault(
+                &state_path,
+                &scenario,
+                catalogue_id,
+                "move_medium",
+                json!({}),
+                "library",
+            );
+            let mut handle = open_handle(Arc::clone(&world), Some(engine));
+            handle.set_changer_ready_wait(fast_wait(std::time::Duration::from_secs(10)));
+            let audit = capture_move_audit(&mut handle);
+            let before = changer_opcodes(&world).len();
+
+            let err = handle
+                .move_medium(SLOT, BAY, &policy())
+                .expect_err("non-transient sense fails");
+
+            match (catalogue_id, err) {
+                ("LIB-01", MoveError::DestinationFull { addr }) => assert_eq!(addr, BAY),
+                ("LIB-07", MoveError::ScsiError(err)) => {
+                    assert_eq!(scsi_error_tuple(&err), expected)
+                }
+                (_, other) => panic!("{catalogue_id}: unexpected {other:?}"),
+            }
+            let (key, asc, ascq) = expected;
+            assert_eq!(
+                strings(&audit),
+                [
+                    "started".to_string(),
+                    format!("finished {key:02x}/{asc:02x}/{ascq:02x}")
+                ]
+            );
+            assert_eq!(
+                count(&changer_opcodes(&world)[before..], 0x00),
+                0,
+                "{catalogue_id} must not poll for readiness"
+            );
+            assert!(!handle.is_dirty());
+        }
+    }
+
+    #[test]
+    fn open_magazine_slots_are_unavailable_without_poisoning_inventory_or_other_moves() {
+        let mut world = VirtualWorld::single_drive(LIB_SERIAL, BAY, DRIVE_SERIAL, SLOT, 2);
+        world.put_tape_in_slot(OTHER_SLOT, BARCODE, VirtualTape::default());
+        let world = Arc::new(Mutex::new(world));
+        let mut handle = open_handle(Arc::clone(&world), None);
+        handle.set_changer_ready_wait(fast_wait(std::time::Duration::from_secs(10)));
+        world
+            .lock()
+            .expect("world lock")
+            .remove_magazine([HOME_SLOT]);
+
+        handle
+            .refresh()
+            .expect("refresh succeeds with a magazine out");
+        assert!(!handle.is_dirty());
+        let open = &handle.library().slots[0];
+        assert!(!open.accessible && !open.full);
+        assert_eq!(
+            open.exception,
+            Some(remanence_library::ElementException {
+                asc: 0x3b,
+                ascq: 0x12
+            })
+        );
+        assert!(handle.library().slots[1].accessible);
+
+        let before = changer_opcodes(&world).len();
+        handle
+            .move_medium(OTHER_SLOT, BAY, &policy())
+            .expect("a move between available elements is unaffected");
+        assert_eq!(count(&changer_opcodes(&world)[before..], 0x00), 0);
+        assert_eq!(
+            world.lock().expect("world lock").loaded_barcode(BAY),
+            Some(BARCODE)
+        );
+    }
+
+    /// A single-magazine changer: the whole unit answers 02/3B/12 while the
+    /// magazine is out, so element status hides nothing and the MOVE fails.
+    fn whole_unit_magazine_out(world: &SharedVirtualWorld, reinsert_after_polls: Option<u32>) {
+        let mut world = world.lock().expect("world lock");
+        world.remove_magazine([]);
+        let magazine = world.removed_magazine.as_mut().expect("magazine out");
+        magazine.not_ready_while_removed = true;
+        magazine.reinsert_after_polls = reinsert_after_polls;
+    }
+
+    fn persistent_door_open(
+        world: &SharedVirtualWorld,
+        scenario: &str,
+    ) -> (TempDir, LibraryHandle) {
+        let (temp, state_path) = chaos_state("remanence-chaos-door", scenario, "seed-door");
+        let engine = arm_library_fault(
+            &state_path,
+            scenario,
+            "LIB-08",
+            "move_medium",
+            json!({}),
+            "library",
+        );
+        (temp, open_handle(Arc::clone(world), Some(engine)))
+    }
+
+    fn move_error_tuple(err: MoveError) -> (u8, u8, u8) {
+        match err {
+            MoveError::ScsiError(err) => scsi_error_tuple(&err),
+            other => panic!("expected the original sense, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_swapped_and_seen_by_another_handle_during_the_wait_is_not_retried() {
+        let world = slotted_world(64 * 1024 * 1024);
+        let mut handle = open_handle(Arc::clone(&world), None);
+        // A drive handle shares the changer inventory; its unload pre-check
+        // refreshes that inventory mid-wait, so only the move's own pre-move
+        // snapshot still remembers the original cartridge.
+        let drive = Arc::new(Mutex::new(
+            handle.open_drive(BAY, &policy()).expect("open drive"),
+        ));
+        let operator_world = Arc::clone(&world);
+        let wait =
+            fast_wait(std::time::Duration::from_secs(10)).with_observer(Arc::new(move |event| {
+                if event.phase == remanence_library::ChangerWaitPhase::Waiting {
+                    {
+                        let mut world = operator_world.lock().expect("world lock");
+                        world.tapes.insert("SWAP01".into(), VirtualTape::default());
+                        world.slots[0].barcode = Some("SWAP01".into());
+                    }
+                    let _ = drive.lock().expect("drive lock").unload();
+                }
+            }));
+        handle.set_changer_ready_wait(wait);
+        let audit = capture_move_audit(&mut handle);
+        whole_unit_magazine_out(&world, Some(2));
+
+        let err = handle
+            .move_medium(SLOT, BAY, &policy())
+            .expect_err("a swapped source is never moved");
+
+        match err {
+            MoveError::InventoryChanged {
+                addr,
+                expected,
+                found,
+            } => {
+                assert_eq!(addr, SLOT);
+                assert!(expected.contains(BARCODE), "{expected}");
+                assert!(found.contains("SWAP01"), "{found}");
+            }
+            other => panic!("expected InventoryChanged, got {other:?}"),
+        }
+        assert_eq!(
+            strings(&audit),
+            ["started", "finished 02/3b/12", "refused InventoryChanged"]
+        );
+        assert_eq!(count(&changer_opcodes(&world), 0xa5), 1);
+        assert_eq!(world.lock().expect("world lock").loaded_barcode(BAY), None);
+    }
+
+    #[test]
+    fn unlabelled_source_is_never_waited_for_or_retried() {
+        let world = slotted_world(64 * 1024 * 1024);
+        assert!(world
+            .lock()
+            .expect("world lock")
+            .set_slot_full_without_voltag(SLOT));
+        let mut handle = open_handle(Arc::clone(&world), None);
+        let (wait, phases) = observed_wait(std::time::Duration::from_secs(10));
+        handle.set_changer_ready_wait(wait);
+        let audit = capture_move_audit(&mut handle);
+        whole_unit_magazine_out(&world, Some(1));
+        let before = changer_opcodes(&world).len();
+
+        let err = handle
+            .move_medium(SLOT, BAY, &policy())
+            .expect_err("an unlabelled source fails as before");
+
+        assert_eq!(move_error_tuple(err), (0x02, 0x3b, 0x12));
+        assert_eq!(strings(&audit), ["started", "finished 02/3b/12"]);
+        assert!(strings(&phases).is_empty());
+        assert_eq!(count(&changer_opcodes(&world)[before..], 0x00), 0);
+    }
+
+    #[test]
+    fn retries_run_out_and_the_last_sense_is_returned() {
+        let world = slotted_world(64 * 1024 * 1024);
+        let (_temp, mut handle) = persistent_door_open(&world, "door-retries");
+        handle.set_changer_ready_wait(
+            fast_wait(std::time::Duration::from_secs(10)).with_max_retries(2),
+        );
+        let audit = capture_move_audit(&mut handle);
+
+        let err = handle
+            .move_medium(SLOT, BAY, &policy())
+            .expect_err("the door never closes for MOVE MEDIUM");
+
+        assert_eq!(move_error_tuple(err), (0x02, 0x04, 0x18));
+        assert_eq!(
+            strings(&audit),
+            [
+                "started",
+                "finished 02/04/18",
+                "started",
+                "finished 02/04/18",
+                "started",
+                "finished 02/04/18",
+            ]
+        );
+        assert_eq!(world.lock().expect("world lock").loaded_barcode(BAY), None);
+    }
+
+    #[test]
+    fn one_deadline_spans_every_retry() {
+        let world = slotted_world(64 * 1024 * 1024);
+        let (_temp, mut handle) = persistent_door_open(&world, "door-deadline");
+        let (wait, phases) = observed_wait(std::time::Duration::from_millis(60));
+        handle.set_changer_ready_wait(wait.with_max_retries(10_000));
+        let audit = capture_move_audit(&mut handle);
+        let started = std::time::Instant::now();
+
+        let err = handle
+            .move_medium(SLOT, BAY, &policy())
+            .expect_err("the deadline ends the retries");
+
+        let elapsed = started.elapsed();
+        assert_eq!(move_error_tuple(err), (0x02, 0x04, 0x18));
+        assert!(
+            elapsed >= std::time::Duration::from_millis(60),
+            "{elapsed:?}"
+        );
+        assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+        let audit = strings(&audit);
+        let attempts = audit.iter().filter(|entry| *entry == "started").count();
+        assert!((2..10_000).contains(&attempts), "{attempts}");
+        let phases = strings(&phases);
+        assert_eq!(
+            phases.iter().filter(|p| p.starts_with("GaveUp ")).count(),
+            1,
+            "{phases:?}"
+        );
+        assert!(phases.iter().filter(|p| p.starts_with("Waiting ")).count() >= 2);
+    }
+
+    #[test]
+    fn non_transient_poll_answer_ends_the_wait_at_once() {
+        let world = slotted_world(64 * 1024 * 1024);
+        let mut handle = open_handle(Arc::clone(&world), None);
+        let operator_world = Arc::clone(&world);
+        let phases: Captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&phases);
+        handle.set_changer_ready_wait(fast_wait(std::time::Duration::from_secs(30)).with_observer(
+            Arc::new(move |event| {
+                sink.lock()
+                    .expect("phase lock")
+                    .push(format!("{:?}", event.phase));
+                if event.phase == remanence_library::ChangerWaitPhase::Waiting {
+                    // The next changer command answers a hardware error.
+                    operator_world
+                        .lock()
+                        .expect("world lock")
+                        .changer_unit_attention = Some((0x04, 0x44, 0x00));
+                }
+            }),
+        ));
+        whole_unit_magazine_out(&world, None);
+        let before = changer_opcodes(&world).len();
+        let started = std::time::Instant::now();
+
+        let err = handle
+            .move_medium(SLOT, BAY, &policy())
+            .expect_err("a hardware error ends the wait");
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(move_error_tuple(err), (0x02, 0x3b, 0x12));
+        assert_eq!(strings(&phases), ["Waiting", "GaveUp"]);
+        assert_eq!(count(&changer_opcodes(&world)[before..], 0x00), 1);
+    }
+
+    #[test]
+    fn busy_polls_are_tolerated_a_few_times_then_end_the_wait() {
+        for (busy, succeeds) in [(remanence_library::CHANGER_BUSY_POLLS, true), (5, false)] {
+            let world = slotted_world(64 * 1024 * 1024);
+            let scenario = format!("door-busy-{busy}");
+            let (_temp, state_path) = chaos_state("remanence-chaos-busy", &scenario, "seed-busy");
+            let engine = arm_library_fault(
+                &state_path,
+                &scenario,
+                "LIB-08",
+                "move_medium",
+                json!({}),
+                "transient",
+            );
+            let mut handle = open_handle(Arc::clone(&world), Some(engine));
+            handle.set_changer_ready_wait(fast_wait(std::time::Duration::from_secs(10)));
+            world.lock().expect("world lock").changer_busy_polls = busy;
+
+            let result = handle.move_medium(SLOT, BAY, &policy());
+
+            if succeeds {
+                result.expect("busy polls within the tolerance");
+                assert_eq!(
+                    world.lock().expect("world lock").loaded_barcode(BAY),
+                    Some(BARCODE)
+                );
+            } else {
+                let err = result.expect_err("a changer that stays busy ends the wait");
+                assert_eq!(move_error_tuple(err), (0x02, 0x04, 0x18));
+                assert_eq!(world.lock().expect("world lock").loaded_barcode(BAY), None);
+            }
+        }
+    }
+
+    #[test]
+    fn a_stop_signal_ends_or_prevents_the_wait() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for preset in [true, false] {
+            let world = slotted_world(64 * 1024 * 1024);
+            let mut handle = open_handle(Arc::clone(&world), None);
+            let stop = Arc::new(AtomicBool::new(preset));
+            let trigger = Arc::clone(&stop);
+            let phases: Captured = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&phases);
+            handle.set_changer_ready_wait(
+                fast_wait(std::time::Duration::from_secs(30))
+                    .with_stop_signal("daemon shutdown", Arc::clone(&stop))
+                    .with_observer(Arc::new(move |event| {
+                        sink.lock()
+                            .expect("phase lock")
+                            .push(format!("{:?}", event.phase));
+                        trigger.store(true, Ordering::SeqCst);
+                    })),
+            );
+            whole_unit_magazine_out(&world, None);
+            let before = changer_opcodes(&world).len();
+            let started = std::time::Instant::now();
+
+            let err = handle
+                .move_medium(SLOT, BAY, &policy())
+                .expect_err("a stopped wait fails as before");
+
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+            assert_eq!(move_error_tuple(err), (0x02, 0x3b, 0x12));
+            assert_eq!(count(&changer_opcodes(&world)[before..], 0x00), 0);
+            let expected: &[&str] = if preset { &[] } else { &["Waiting", "GaveUp"] };
+            assert_eq!(strings(&phases), expected, "preset={preset}");
+        }
+    }
+
+    #[test]
+    fn a_stop_during_the_pre_move_wait_sends_no_move() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let world = unloaded_drive_world();
+        let mut handle = open_handle(Arc::clone(&world), None);
+        let stop = Arc::new(AtomicBool::new(false));
+        let trigger = Arc::clone(&stop);
+        handle.set_changer_ready_wait(
+            fast_wait(std::time::Duration::from_secs(30))
+                .with_stop_signal("daemon shutdown", Arc::clone(&stop))
+                .with_observer(Arc::new(move |event| {
+                    if event.phase == remanence_library::ChangerWaitPhase::Waiting {
+                        trigger.store(true, Ordering::SeqCst);
+                    }
+                })),
+        );
+        let audit = capture_move_audit(&mut handle);
+        world
+            .lock()
+            .expect("world lock")
+            .remove_magazine([HOME_SLOT, OTHER_SLOT]);
+        let started = std::time::Instant::now();
+
+        let err = handle
+            .move_medium(BAY, HOME_SLOT, &policy())
+            .expect_err("a stopped pre-move wait refuses");
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(matches!(err, MoveError::NotReady { .. }), "{err:?}");
+        assert_eq!(strings(&audit), ["refused NotReady"]);
+        assert_eq!(count(&changer_opcodes(&world), 0xa5), 0);
+        assert_eq!(
+            world.lock().expect("world lock").loaded_barcode(BAY),
+            Some(BARCODE)
+        );
+        // A stop already set before the move spends no time; the MOVE goes
+        // out exactly as without the wait.
+        stop.store(true, Ordering::SeqCst);
+        let err = handle
+            .move_medium(BAY, HOME_SLOT, &policy())
+            .expect_err("the move fails as without the wait");
+        assert_eq!(move_error_tuple(err), (0x02, 0x3b, 0x12));
+        assert_eq!(count(&changer_opcodes(&world), 0xa5), 1);
+    }
+
+    #[test]
+    fn source_swapped_during_a_pre_move_wait_that_gives_up_sends_no_move() {
+        let world = unloaded_drive_world();
+        let mut handle = open_handle(Arc::clone(&world), None);
+        let operator_world = Arc::clone(&world);
+        handle.set_changer_ready_wait(fast_wait(std::time::Duration::from_secs(30)).with_observer(
+            Arc::new(move |event| {
+                if event.phase == remanence_library::ChangerWaitPhase::Waiting {
+                    let mut world = operator_world.lock().expect("world lock");
+                    // The operator swaps the drive's cartridge, and the next
+                    // poll answers a hardware error, ending the wait.
+                    world.tapes.insert("SWAP02".into(), VirtualTape::default());
+                    world.drive_bays.insert(BAY, Some("SWAP02".into()));
+                    world.changer_unit_attention = Some((0x04, 0x44, 0x00));
+                }
+            }),
+        ));
+        let audit = capture_move_audit(&mut handle);
+        world
+            .lock()
+            .expect("world lock")
+            .remove_magazine([HOME_SLOT, OTHER_SLOT]);
+
+        let err = handle
+            .move_medium(BAY, HOME_SLOT, &policy())
+            .expect_err("a swapped source is never moved");
+
+        match err {
+            MoveError::InventoryChanged { addr, found, .. } => {
+                assert_eq!(addr, BAY);
+                assert!(found.contains("SWAP02"), "{found}");
+            }
+            other => panic!("expected InventoryChanged, got {other:?}"),
+        }
+        assert_eq!(strings(&audit), ["refused InventoryChanged"]);
+        assert_eq!(count(&changer_opcodes(&world), 0xa5), 0);
+    }
+
+    #[test]
+    fn unit_attention_on_the_move_after_a_pre_move_wait_is_waited_out() {
+        let world = unloaded_drive_world();
+        let (_temp, state_path) = chaos_state(
+            "remanence-chaos-prewait-ua",
+            "prewait-ua",
+            "seed-prewait-ua",
+        );
+        let engine = arm_library_fault(
+            &state_path,
+            "prewait-ua",
+            "LIB-04",
+            "move_medium",
+            json!({}),
+            "transient",
+        );
+        let mut handle = open_handle(Arc::clone(&world), Some(engine));
+        let (wait, phases) = observed_wait(std::time::Duration::from_secs(10));
+        handle.set_changer_ready_wait(wait);
+        let audit = capture_move_audit(&mut handle);
+        {
+            let mut world = world.lock().expect("world lock");
+            world.remove_magazine([HOME_SLOT, OTHER_SLOT]);
+            let magazine = world.removed_magazine.as_mut().expect("magazine out");
+            magazine.reinsert_after_polls = Some(2);
+            magazine.unit_attention_on_insert = false;
+        }
+
+        handle
+            .move_medium(BAY, HOME_SLOT, &policy())
+            .expect("the unit attention on the first MOVE is a retry-path answer");
+
+        assert_eq!(
+            strings(&audit),
+            ["started", "finished 06/29/02", "started", "finished ok"]
+        );
+        // Pre-move wait plus one retry wait.
+        let waits = strings(&phases)
+            .iter()
+            .filter(|phase| phase.starts_with("Waiting "))
+            .count();
+        assert_eq!(waits, 2);
+        assert_eq!(
+            world.lock().expect("world lock").slots[0]
+                .barcode
+                .as_deref(),
+            Some(BARCODE)
+        );
+    }
+
+    #[test]
+    fn the_pre_move_wait_counts_against_the_retry_bound() {
+        let world = unloaded_drive_world();
+        let (_temp, state_path) = chaos_state(
+            "remanence-chaos-prewait-bound",
+            "prewait-bound",
+            "seed-prewait-bound",
+        );
+        let engine = arm_library_fault(
+            &state_path,
+            "prewait-bound",
+            "LIB-04",
+            "move_medium",
+            json!({}),
+            "transient",
+        );
+        let mut handle = open_handle(Arc::clone(&world), Some(engine));
+        handle.set_changer_ready_wait(
+            fast_wait(std::time::Duration::from_secs(10)).with_max_retries(1),
+        );
+        let audit = capture_move_audit(&mut handle);
+        {
+            let mut world = world.lock().expect("world lock");
+            world.remove_magazine([HOME_SLOT, OTHER_SLOT]);
+            let magazine = world.removed_magazine.as_mut().expect("magazine out");
+            magazine.reinsert_after_polls = Some(1);
+            magazine.unit_attention_on_insert = false;
+        }
+
+        let err = handle
+            .move_medium(BAY, HOME_SLOT, &policy())
+            .expect_err("the one permitted wait was spent before the move");
+
+        assert_eq!(move_error_tuple(err), (0x06, 0x29, 0x02));
+        assert_eq!(strings(&audit), ["started", "finished 06/29/02"]);
     }
 }
 

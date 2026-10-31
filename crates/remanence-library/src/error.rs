@@ -369,6 +369,19 @@ pub enum MoveError {
         serial: String,
     },
 
+    /// The changer stayed not ready (an open magazine or door) through a
+    /// readiness wait that ended by its deadline or a stop signal before any
+    /// MOVE MEDIUM was issued. The inventory was refreshed; nothing moved.
+    #[error("library not ready ({detail}); MOVE MEDIUM 0x{src:04x} -> 0x{dst:04x} not issued")]
+    NotReady {
+        /// Source element of the move.
+        src: u16,
+        /// Destination element of the move.
+        dst: u16,
+        /// The last not-ready condition observed.
+        detail: String,
+    },
+
     /// The SCSI changer returned CHECK CONDITION or some other error.
     /// Sense bytes (when available) are preserved verbatim inside
     /// [`remanence_scsi::ScsiError`].
@@ -580,8 +593,13 @@ pub enum RescanWarning {
 /// - [`AuditEvent::Finished`] — the CDB returned (success or failure).
 ///   Carries the [`AuditOutcome`].
 /// - [`AuditEvent::Refused`] — preflight refused at the *public op*
-///   level. **No CDB issued.** A single event for the whole public
-///   op; no `Started` / `Finished` follow.
+///   level. **No CDB issued** after it. Usually a single event for the
+///   whole public op, with no `Started` / `Finished`. The exception is a
+///   MOVE MEDIUM that waited out a not-ready changer: each issued attempt
+///   has its `Started` / `Finished(sense)` pair, and a refusal after the
+///   wait (changed inventory, or [`MoveError::NotReady`]) closes the op
+///   with `Refused` and no further CDB, for example `Started`,
+///   `Finished(02/3B/12)`, `Refused`.
 /// - [`AuditEvent::Warning`] — a non-fatal observation produced by
 ///   reconciliation (drive replaced, appeared, vanished — see
 ///   [`RescanWarning`]). Fires between `Started` and `Finished` for
@@ -627,7 +645,9 @@ pub enum AuditEvent<'a> {
         /// Wall-clock time at the moment of dispatch.
         at: std::time::SystemTime,
     },
-    /// Preflight refused. No CDB ever issued.
+    /// Preflight refused, or a not-ready wait refused before a retry. No CDB
+    /// is issued after this event; earlier attempts of the same op may have
+    /// their own `Started` / `Finished` pair.
     Refused {
         /// Durable library or standalone drive subject.
         subject: AuditSubject<'a>,

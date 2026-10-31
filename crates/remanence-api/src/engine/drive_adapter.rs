@@ -793,6 +793,7 @@ pub(crate) fn mounted_config(
         checkpoint_max_age_seconds: c.daemon.checkpoint_max_age_seconds,
         session_idle_seconds: c.daemon.default_idle_timeout_seconds,
         lifecycle: None,
+        changer_ready_wait: remanence_library::ChangerReadyWait::default(),
         calibration_store: state.calibration_control().clone(),
     })
 }

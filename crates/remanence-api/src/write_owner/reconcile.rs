@@ -75,6 +75,7 @@ pub(crate) fn handle_reconcile(
             return;
         }
     };
+    cfg.configure_operation_library(&mut library, &handle);
     let mut drive = match load_tape_by_uuid(index, &mut library, &cfg.policy, &tape_uuid) {
         Ok(drive) => drive,
         Err(err) => {

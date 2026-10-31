@@ -278,6 +278,11 @@ message LibraryState {
   repeated PortalSlot import_export_ports = 4;
   google.protobuf.Timestamp last_inventory_at = 5;
   string managed           = 6; // "rem" or "foreign" for drive-stewardship views.
+  // Set while the daemon waits for this library's changer to become ready
+  // again before retrying a move (an open magazine or door), for example
+  // "waiting for library: medium magazine removed (02/3b/12); move 0x0101 ->
+  // 0x03ec; 60s of 600s". Absent when no move is waiting.
+  optional string changer_wait = 7;
 }
 
 // How the drive catalog answered when the live-status projection looked up the

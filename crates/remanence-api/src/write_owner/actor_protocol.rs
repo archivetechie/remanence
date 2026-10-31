@@ -77,6 +77,9 @@ pub(crate) enum ChangerCommand {
         dst: u16,
         // Owned by the queued command/actor even if the requester disappears.
         recovery_guard: Option<crate::mount_support::UnloadRecoveryGuard>,
+        // Set when the requester has gone away: a not-ready wait for this
+        // move stops and the move fails as it would without the wait.
+        caller_gone: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
         reply: oneshot::Sender<Result<(), Status>>,
     },
     Reconcile {

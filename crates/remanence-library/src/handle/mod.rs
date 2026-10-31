@@ -54,6 +54,10 @@ use crate::{DriveKey, MountEndpoint};
 // types + error enum re-export cleanly at the crate root.
 pub mod tape_io;
 
+// Bounded wait-and-retry for transient changer not-ready MOVE failures.
+pub mod changer_ready;
+use changer_ready::{GaveUp, WaitOutcome};
+
 /// Audit hook type alias. The hook is called synchronously with a
 /// short-lived `&AuditEvent<'_>` reference and may not retain it; it
 /// can copy fields it wants to keep. `Send` makes the hook callable
@@ -244,6 +248,9 @@ pub struct ChangerHandle {
     /// This lifts the old borrowed `DriveHandle` shape while preserving
     /// one unified audit stream and dirty bit for library + drive ops.
     shared: Arc<Mutex<DriveShared>>,
+    /// How MOVE MEDIUM waits out a transient not-ready changer. Disabled
+    /// unless the owner enables it.
+    ready_wait: changer_ready::ChangerReadyWait,
 }
 
 /// A policy-gated, identity-revalidated facade for one library.
@@ -683,8 +690,12 @@ impl ChangerHandle {
 
     /// Read element status with volume tags for both endpoints, then move.
     /// Occupancy or barcode changes update inventory and return a typed refusal
-    /// before motion. Failed commands refresh inventory without automatic retry.
-    /// Transport failures retain the completion-unknown dirty marker.
+    /// before motion. Failed commands refresh inventory. A transient not-ready
+    /// failure (an open magazine or door) is waited out and retried only when
+    /// [`Self::set_ready_wait`] enables it, and only after the refreshed
+    /// endpoints match the inventory from before the attempt; see
+    /// [`changer_ready`]. Transport failures retain the completion-unknown
+    /// dirty marker and are never retried.
     pub fn move_medium(
         &mut self,
         src: u16,
@@ -756,7 +767,192 @@ impl ChangerHandle {
             );
             return Err(error);
         }
-        let plan = ops::plan_move(&self.library, src, dst)?;
+        let mut plan = ops::plan_move(&self.library, src, dst)?;
+        // A transient not-ready failure may be waited out and retried; see
+        // `changer_ready`. The deadline runs from the first wait. A retry
+        // requires both endpoints to match this pre-move observation, whatever
+        // other handles sharing the inventory have seen meanwhile.
+        let observed = [
+            element_state(&self.library, src)?,
+            element_state(&self.library, dst)?,
+        ];
+        // An unlabelled source cannot be told apart from another unlabelled
+        // cartridge swapped in during the wait, so it is never retried.
+        let source_known = observed[0].1.is_some();
+        // Waits spent so far; it bounds the waits and, once non-zero, the
+        // MOVE that follows counts as a retry.
+        let mut retries = 0u32;
+        let mut first_failure: Option<Instant> = None;
+        // Set once a wait ends without readiness: no second wait follows.
+        let mut wait_spent = false;
+        if source_known && self.ready_wait.is_enabled() {
+            if let Some(condition) = self.endpoint_unavailable(src, dst) {
+                // Element status already shows the move bound to fail; wait
+                // before issuing it rather than after.
+                let first = *first_failure.get_or_insert_with(Instant::now);
+                match self.wait_for_ready(src, dst, condition, first, retries) {
+                    WaitOutcome::Ready => {
+                        plan = self.recheck_after_wait(src, dst, op, &observed)?;
+                        retries += 1;
+                    }
+                    // Nothing was waited; issue exactly as without the wait.
+                    WaitOutcome::GaveUp(GaveUp::StoppedOnEntry) => wait_spent = true,
+                    // Time has passed: the move would be bound to fail, so
+                    // refresh and refuse without sending it.
+                    WaitOutcome::GaveUp(GaveUp::Stopped | GaveUp::Deadline) => {
+                        let refresh = self.check_elements(&[src, dst]);
+                        let error = match refresh {
+                            Err(error) => error,
+                            Ok(()) => MoveError::NotReady {
+                                src,
+                                dst,
+                                detail: self
+                                    .endpoint_unavailable(src, dst)
+                                    .unwrap_or(condition)
+                                    .to_string(),
+                            },
+                        };
+                        fire_refused(
+                            &mut lock_drive_shared(&self.shared).audit_hook,
+                            &self.library.serial,
+                            op,
+                            &error,
+                        );
+                        return Err(error);
+                    }
+                    // The changer answered with something waiting does not
+                    // clear; re-read and compare before the one MOVE that
+                    // follows, which fails or succeeds as without the wait.
+                    WaitOutcome::GaveUp(GaveUp::Unavailable) => {
+                        plan = self.recheck_after_wait(src, dst, op, &observed)?;
+                        wait_spent = true;
+                    }
+                }
+            }
+        }
+        loop {
+            match self.issue_planned_move(src, dst, &plan, op) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let transient = if wait_spent {
+                        None
+                    } else {
+                        self.transient_move_failure(&e, retries)
+                    };
+                    if let Some(condition) = transient {
+                        if !source_known {
+                            tracing::warn!(
+                                library_serial = %self.library.serial,
+                                src = format_args!("0x{src:04x}"),
+                                %condition,
+                                "library not ready but the source volume tag is unknown; MOVE MEDIUM is not retried",
+                            );
+                        } else {
+                            let first = *first_failure.get_or_insert_with(Instant::now);
+                            if let WaitOutcome::Ready =
+                                self.wait_for_ready(src, dst, condition, first, retries)
+                            {
+                                plan = self.recheck_after_wait(src, dst, op, &observed)?;
+                                retries += 1;
+                                // A stop signal set during the re-check still
+                                // prevents the retry.
+                                match self.ready_wait.stop_reason() {
+                                    None => {
+                                        tracing::warn!(
+                                            library_serial = %self.library.serial,
+                                            src = format_args!("0x{src:04x}"),
+                                            dst = format_args!("0x{dst:04x}"),
+                                            retry = retries,
+                                            max_retries = self.ready_wait.max_retries,
+                                            "library {} ready; source and destination unchanged; retrying MOVE MEDIUM 0x{src:04x} -> 0x{dst:04x}",
+                                            self.library.serial,
+                                        );
+                                        continue;
+                                    }
+                                    Some(reason) => tracing::warn!(
+                                        library_serial = %self.library.serial,
+                                        "library {} ready but the wait is stopped ({reason}); MOVE MEDIUM 0x{src:04x} -> 0x{dst:04x} is not retried",
+                                        self.library.serial,
+                                    ),
+                                }
+                            }
+                            // Otherwise falls through to the failure below.
+                        }
+                    }
+                    // Refresh after every failed move, including destination-full and
+                    // not-ready sense. No automatic retry uses the old inventory.
+                    let refresh = self.check_elements(&[src, dst]);
+                    if let ScsiError::CheckCondition { sense, .. } = &e {
+                        if let Some(sense) = remanence_scsi::decode_sense(sense) {
+                            // Known mislabel, kept deliberately: SPC names
+                            // 3B/0E MEDIUM SOURCE ELEMENT EMPTY (3B/0D is
+                            // destination full), but callers and tests rely on
+                            // this mapping.
+                            if sense.key == 0x05 && sense.asc == 0x3b && sense.ascq == 0x0e {
+                                return Err(MoveError::DestinationFull { addr: dst });
+                            }
+                        }
+                    }
+                    refresh?;
+                    return Err(MoveError::ScsiError(e));
+                }
+            }
+        }
+    }
+
+    /// After a readiness wait: the existing element check, then a comparison
+    /// with the pre-move observation, then a fresh plan. Any difference
+    /// refuses with an audited `Refused` event and no retry.
+    fn recheck_after_wait(
+        &mut self,
+        src: u16,
+        dst: u16,
+        op: AuditOp,
+        observed: &[(bool, Option<String>); 2],
+    ) -> Result<ops::MovePlan, MoveError> {
+        let refuse = |handle: &mut Self, error: MoveError| {
+            tracing::warn!(
+                library_serial = %handle.library.serial,
+                src = format_args!("0x{src:04x}"),
+                dst = format_args!("0x{dst:04x}"),
+                %error,
+                "library inventory changes while the changer is not ready; MOVE MEDIUM is not retried",
+            );
+            fire_refused(
+                &mut lock_drive_shared(&handle.shared).audit_hook,
+                &handle.library.serial,
+                op,
+                &error,
+            );
+            error
+        };
+        if let Err(error) = self.check_elements(&[src, dst]) {
+            return Err(refuse(self, error));
+        }
+        for (addr, expected) in [src, dst].into_iter().zip(observed) {
+            let found = element_state(&self.library, addr)?;
+            if &found != expected {
+                let error = MoveError::InventoryChanged {
+                    addr,
+                    expected: format!("{expected:?}"),
+                    found: format!("{found:?}"),
+                };
+                return Err(refuse(self, error));
+            }
+        }
+        ops::plan_move(&self.library, src, dst).map_err(|error| refuse(self, error))
+    }
+
+    /// Issue one planned MOVE MEDIUM with its Started and Finished audit
+    /// events. Success patches the snapshot; failure only marks it dirty when
+    /// completion is unknown. The caller owns refresh and retry.
+    fn issue_planned_move(
+        &mut self,
+        src: u16,
+        dst: u16,
+        plan: &ops::MovePlan,
+        op: AuditOp,
+    ) -> Result<(), ScsiError> {
         // Build CDB + Started event.
         let cdb = move_medium_cdb::build_cdb(
             self.library.layout.robot_address,
@@ -788,7 +984,7 @@ impl ChangerHandle {
         match result {
             Ok(()) => {
                 let duration = started.elapsed();
-                ops::apply_planned_move(&mut self.library, &plan);
+                ops::apply_planned_move(&mut self.library, plan);
                 lock_drive_shared(&self.shared).inventory = Some(self.library.clone());
                 // IE-port endpoints make the patch vendor-specific:
                 // HPE physical libraries park the cartridge in the IE
@@ -843,18 +1039,7 @@ impl ChangerHandle {
                         at: SystemTime::now(),
                     },
                 );
-                // Refresh after every failed move, including destination-full and
-                // not-ready sense. No automatic retry uses the old inventory.
-                let refresh = self.check_elements(&[src, dst]);
-                if let ScsiError::CheckCondition { sense, .. } = &e {
-                    if let Some(sense) = remanence_scsi::decode_sense(sense) {
-                        if sense.key == 0x05 && sense.asc == 0x3b && sense.ascq == 0x0e {
-                            return Err(MoveError::DestinationFull { addr: dst });
-                        }
-                    }
-                }
-                refresh?;
-                Err(MoveError::ScsiError(e))
+                Err(e)
             }
         }
     }
@@ -929,6 +1114,13 @@ impl LibraryHandle {
         policy: &dyn AccessPolicy,
     ) -> Result<(), MoveError> {
         self.changer.move_medium(src, dst, policy)
+    }
+
+    /// Replace how every changer move of this handle, including the moves of
+    /// composed load, unload, export and import, waits out a transient
+    /// not-ready changer.
+    pub fn set_changer_ready_wait(&mut self, wait: changer_ready::ChangerReadyWait) {
+        self.changer.set_ready_wait(wait);
     }
 
     /// Move from `slot` to the first available IE port.
@@ -2272,6 +2464,7 @@ fn fire_refused(hook: &mut Option<AuditHook>, library_serial: &str, op: AuditOp,
         MoveError::DerivedDriveBay { .. } => "DerivedDriveBay",
         MoveError::ScsiError(_) => "ScsiError",
         MoveError::InventoryChanged { .. } => "InventoryChanged",
+        MoveError::NotReady { .. } => "NotReady",
     };
     fire_audit(
         hook,
@@ -2394,6 +2587,7 @@ impl Library {
             library: self.clone(),
             transport,
             shared,
+            ready_wait: changer_ready::ChangerReadyWait::default(),
         };
 
         Ok(LibraryHandle {

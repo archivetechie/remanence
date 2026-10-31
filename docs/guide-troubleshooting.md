@@ -564,6 +564,95 @@ A failed move also refreshes inventory. Sense `05/3B/0E` reports a full
 destination. An unload followed by a failed move does not prove that the
 cartridge remains in the drive; use the fresh element status for recovery.
 
+<!-- code-anchor: crates/remanence-library/src/handle/changer_ready.rs crates/remanence-api/src/live_status.rs @ 72bdca17 -->
+## Waiting for the library (open magazine or door)
+
+A library shared with another system has its magazines and doors opened
+while Remanence works. A MOVE MEDIUM issued while a magazine is out fails
+with `02/3B/12` (medium magazine removed) and is not executed, so the
+cartridge stays where it was. Before this wait existed, such a failure ended
+the client operation even when the operator closed the magazine a minute
+later.
+
+The daemon now waits instead. A wait starts when a move fails with
+`02/3B/12`, `02/04/01` (becoming ready) or `02/04/18` (a door is open), or
+when the element status read just before the move already shows the source
+or destination with exception `3B/12`; in that case the wait starts before
+the MOVE instead of after a MOVE that is bound to fail. The daemon logs a warning such as `library <serial> not ready (medium
+magazine removed); waiting up to 10m before retrying MOVE MEDIUM 0x0101 ->
+0x03ec`, polls the changer with TEST UNIT READY every five seconds, and logs
+progress every minute. The changer counts as ready when it answers TEST UNIT
+READY and element status shows both the source and the destination
+accessible and without an exception. A unit attention reported after the
+magazine closes (`06/28/00`, `06/29/xx`, `06/3B/13`) is consumed by the poll,
+and a BUSY answer is polled again up to three times. While the wait runs,
+`rem top` shows `waiting for library: ...` with the time since the wait began
+in the drive band title, `rem top --once` prints it under the library line,
+and the live status carries it in `changer_wait`.
+
+When the changer is ready, the daemon reads element status again and
+compares the source and destination with what it saw before the move. It
+retries only if the source still holds the same cartridge, by occupancy and
+barcode, and the destination is still empty. If the operator moved a
+cartridge into or out of either element while the magazine was open, it
+refuses as in [Element inventory changes before unload or move](#element-inventory-changes-before-unload-or-move),
+records a `Refused` audit event, and does not retry. At most three waits
+are spent on one move, a wait before the first MOVE included, and one
+deadline, `[daemon] changer_not_ready_wait_seconds` (default 600, at most
+3600), covers all of them. A unit attention on the MOVE that follows a wait
+is waited out like any retry.
+
+The move ends without success in these cases. When a MOVE has already been
+sent, it fails as it did before, with the original sense and the refreshed
+inventory. When the wait began before any MOVE and ends by its deadline or
+a stop, no MOVE is sent; the daemon refreshes the inventory, records a
+`Refused` audit event, and reports `library not ready (...); MOVE MEDIUM
+0x.... -> 0x.... not issued`. When such a wait ends because a poll answered
+with something waiting does not clear, the daemon re-reads and compares
+both elements, as after a successful wait, before sending the one MOVE that
+follows.
+
+- the deadline passes;
+- a poll answers with something waiting does not clear, for example a
+  hardware error;
+- the source cartridge had no readable barcode before the move, because an
+  unlabelled cartridge swapped in during the wait could not be told apart
+  from it, so no wait starts at all;
+- the daemon is shutting down. Shutdown park moves do not wait, and a wait
+  already running stops within a fraction of a second, so a stop is not
+  held up by an open magazine. A stop set before a move starts spends no
+  time, and that move is sent as it would be without the wait. A cartridge whose move home fails this way
+  stays unthreaded in its drive, as before, and the next start reconciles
+  it as described in [A drive stays not ready after a daemon crash](#a-drive-stays-not-ready-after-a-daemon-crash);
+- a robotics or reconcile operation is cancelled while it waits;
+- the client of a write session open goes away while the load move for its
+  tape waits. A client that goes away after that move has completed still
+  gets its session opened, and the session is closed by the idle timeout as
+  before. The move home of an evicted cartridge always runs to the end of
+  its wait, because stopping it would leave that cartridge unthreaded in the
+  drive.
+
+The drive bay stays reserved for the whole wait. The cartridge has not
+moved, so the reservation still describes where it is, and no other
+operation can load into the bay or unload it in between. Other changer
+commands for the same library queue behind the wait.
+
+Every other changer failure keeps its existing handling: `05/3B/0E` and
+other ILLEGAL REQUEST senses, hardware and medium errors, deferred errors,
+`02/04/02` (initializing command required) and transport failures fail at
+once. Element status that reports the slots of an open magazine empty with
+exception `3B/12` does not affect the rest of the library; a cartridge in
+such a slot is not located until the magazine is back, so pool selection
+does not pick it. A seated cartridge whose home slot is already reported
+unavailable is not evicted, so it is never unloaded towards a slot the
+changer cannot reach. `rem-debug` and other direct library callers do not
+wait.
+
+In plain terms: when the operator has a magazine open, the daemon holds the
+move until the magazine is back, checks that nothing it was about to touch
+has changed, and then finishes the move; it gives up as before when the
+bound passes, the daemon stops, or nobody is waiting for the result.
+
 ## Catalog and checkpoint lock refusals
 
 Catalog writers use immediate transactions and a five-second busy timeout.

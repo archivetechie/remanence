@@ -12,6 +12,21 @@ per-release summaries.
   retained parity epoch before the cartridge leaves the drive. Without `--dest`
   the cartridge returns to its recorded source slot. The command reports the
   slot that now holds it, and exits 1 with the daemon's message on a refusal.
+- A daemon changer move that fails because the library is transiently not
+  ready (`02/3B/12` medium magazine removed, `02/04/01` becoming ready,
+  `02/04/18` door open), or whose endpoint already reports exception `3B/12`,
+  now waits for the library instead of failing the client operation. The
+  daemon polls with TEST UNIT READY, re-reads the source and destination once
+  the changer and both elements are ready, and retries up to three times only
+  when both are unchanged and the source barcode was known; a changed
+  inventory refuses as before with a `Refused` audit event. The bound is the
+  new `[daemon] changer_not_ready_wait_seconds` (default 600, at most 3600,
+  `0` keeps the old behaviour). Daemon shutdown, a cancelled robotics or
+  reconcile operation, and a write-open client that goes away during the load
+  move end the wait. A wait that began before any MOVE and ends by its
+  deadline or a stop sends no MOVE and reports `MoveError::NotReady`. The wait
+  is logged, shown by `rem top`, and carried in the new live-status field
+  `LibraryState.changer_wait`.
 
 - `rem tape init` can now erase a Remanence tape whose BOT UUID has no catalog
   row, which previously could only be adopted. Pass `--clobber-data
