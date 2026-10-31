@@ -4466,6 +4466,161 @@ fn checkpoint_selection_reports_every_accept_sealed_legacy_candidate() {
     assert!(message.contains("re-initialized before reuse"), "{message}");
 }
 
+/// Run `f` and return every INFO+ event it logged, rendered as text.
+fn capture_info_logs<F: FnOnce() -> T, T>(f: F) -> (T, String) {
+    let log_file = tempfile::tempfile().expect("log capture file");
+    let mut reader = log_file.try_clone().expect("clone log capture file");
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .with_writer(move || log_file.try_clone().expect("clone log writer"))
+        .finish();
+    let result = tracing::subscriber::with_default(subscriber, f);
+    let mut logs = String::new();
+    std::io::Seek::rewind(&mut reader).expect("rewind log capture");
+    reader.read_to_string(&mut logs).expect("read log capture");
+    (result, logs)
+}
+
+#[test]
+fn selection_logs_fenced_skips_when_another_tape_is_selected() {
+    let mut index = test_index();
+    project_pool(&mut index, "camera.copy-a");
+    project_no_parity_tape(&mut index, "camera.copy-a", POOL_WRITE_TAPE_UUID);
+    project_no_parity_tape(&mut index, "camera.copy-a", SECOND_POOL_WRITE_TAPE_UUID);
+    let fence = index
+        .record_tape_io_fence(remanence_state::TapeIoFenceInput {
+            tape_uuid: [0x0f; 16],
+            barcode: Some("RMN004L9".to_string()),
+            reason: "position_mismatch".to_string(),
+            evidence_json: None,
+        })
+        .expect("record barcode fence");
+    let cfg = pool_config("camera.copy-a");
+
+    let (selected, logs) =
+        capture_info_logs(|| select_tape_in_pool(&index, &cfg, 123, &HashSet::new()));
+    let selected = selected.expect("the unfenced tape is selected");
+    assert_eq!(selected.tape_uuid, SECOND_POOL_WRITE_TAPE_UUID);
+    assert!(
+        logs.contains("pool selection skipped tapes under an active tape-I/O fence"),
+        "{logs}"
+    );
+    assert!(
+        logs.contains(&format!(
+            "RMN004L9 ({}) fenced by {}: position_mismatch",
+            Uuid::from_bytes(POOL_WRITE_TAPE_UUID),
+            fence.quarantine_id
+        )),
+        "{logs}"
+    );
+    assert!(logs.contains("skipped_count=1"), "{logs}");
+
+    // Nothing is logged when no candidate was fenced.
+    index
+        .release_tape_io_fence(&fence.quarantine_id, "operator released")
+        .expect("release fence")
+        .expect("released fence");
+    let (selected, logs) =
+        capture_info_logs(|| select_tape_in_pool(&index, &cfg, 123, &HashSet::new()));
+    assert_eq!(
+        selected.expect("selection after release").tape_uuid,
+        POOL_WRITE_TAPE_UUID
+    );
+    assert!(!logs.contains("active tape-I/O fence"), "{logs}");
+}
+
+#[test]
+fn selection_ranks_unlabelled_rows_after_every_labelled_row() {
+    let mut index = test_index();
+    project_pool(&mut index, "camera.copy-a");
+    // The unlabelled row has the lower UUID, so neither the voltag nor the
+    // UUID tie-break may put it first.
+    project_no_parity_tape(&mut index, "camera.copy-a", POOL_WRITE_TAPE_UUID);
+    project_no_parity_tape(&mut index, "camera.copy-a", SECOND_POOL_WRITE_TAPE_UUID);
+    project_no_parity_tape(&mut index, "camera.copy-a", [9u8; 16]);
+    let conn = rusqlite::Connection::open(index.path()).expect("open catalog");
+    conn.execute(
+        "update tapes set voltag = null, voltag_source = null where tape_uuid = ?1",
+        rusqlite::params![POOL_WRITE_TAPE_UUID.to_vec()],
+    )
+    .expect("clear voltag");
+    drop(conn);
+    let cfg = pool_config("camera.copy-a");
+
+    for policy in [
+        &crate::pool_selection::CompleteOrFill as &dyn crate::pool_selection::PoolSelectionPolicy,
+        &crate::pool_selection::FillOldest,
+    ] {
+        let selected = crate::pool_write::select_tape_in_pool_with_policy(
+            &index,
+            &cfg,
+            123,
+            &HashSet::new(),
+            policy,
+        )
+        .expect("select labelled tape");
+        assert_eq!(selected.tape_uuid, SECOND_POOL_WRITE_TAPE_UUID);
+    }
+
+    // Once every labelled row is out of the way, the unlabelled row is still
+    // a candidate; it only ranks last.
+    let reserved = HashSet::from([SECOND_POOL_WRITE_TAPE_UUID, [9u8; 16]]);
+    let selected = select_tape_in_pool(&index, &cfg, 123, &reserved).expect("select remaining");
+    assert_eq!(selected.tape_uuid, POOL_WRITE_TAPE_UUID);
+}
+
+#[test]
+fn checkpoint_selection_skips_reserved_tape_before_peeking_its_log() {
+    let mut index = test_index();
+    project_pool(&mut index, "camera.copy-a");
+    project_no_parity_tape(&mut index, "camera.copy-a", POOL_WRITE_TAPE_UUID);
+    project_no_parity_tape(&mut index, "camera.copy-a", SECOND_POOL_WRITE_TAPE_UUID);
+    project_no_parity_tape_usage(&mut index, POOL_WRITE_TAPE_UUID, 3);
+    let checkpoint_dir = temp_dir("remanence-selection-reserved-lease");
+    append_checkpoint_record(checkpoint_dir.as_path(), POOL_WRITE_TAPE_UUID);
+    // The live owner of the reserved tape holds its exclusive tape-log lease.
+    let owner = remanence_state::TapeAuthority::open(
+        checkpoint_dir.as_path(),
+        POOL_WRITE_TAPE_UUID,
+        index.path(),
+    )
+    .expect("open owner authority");
+    let _lease = owner.acquire_exclusive().expect("owner holds the lease");
+    let reserved = HashSet::from([POOL_WRITE_TAPE_UUID]);
+
+    let selected = crate::pool_write::select_tape_in_pool_for_write_session(
+        &index,
+        &pool_config("camera.copy-a"),
+        123,
+        &reserved,
+        checkpoint_dir.as_path(),
+    )
+    .expect("selection never peeks the reserved tape's log");
+    assert_eq!(selected.tape_uuid, SECOND_POOL_WRITE_TAPE_UUID);
+
+    // With only the reserved tape left, the reservation is what is reported.
+    let both = HashSet::from([POOL_WRITE_TAPE_UUID, SECOND_POOL_WRITE_TAPE_UUID]);
+    let error = crate::pool_write::select_tape_in_pool_for_write_session(
+        &index,
+        &pool_config("camera.copy-a"),
+        123,
+        &both,
+        checkpoint_dir.as_path(),
+    )
+    .expect_err("every tape is reserved");
+    assert!(
+        matches!(
+            error,
+            SelectTapeError::NoUnreservedWritableTapes {
+                reserved_tape_count: 2,
+                ..
+            }
+        ),
+        "{error}"
+    );
+}
+
 #[test]
 fn select_tape_in_pool_reports_unknown_pool() {
     let index = test_index();

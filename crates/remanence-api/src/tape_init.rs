@@ -13,7 +13,7 @@ use remanence_parity::{
     default_scheme_for_block_size, sole_bot_filemark_map_digest, ParityConfig, ParityScheme,
     ParitySchemeRecord, SchemeId,
 };
-use remanence_state::{CatalogIndex, LabelProvenance, StateError, TapeRecord};
+use remanence_state::{CatalogIndex, LabelProvenance, StateError, TapeIoFenceRecord, TapeRecord};
 
 use crate::pool_write::{write_fixed_blocks, PoolWriteError, TapeUuid};
 
@@ -769,6 +769,108 @@ pub fn project_tape_init_catalog_inputs(
         committed_copies,
         notes,
     })
+}
+
+/// Active tape-I/O fences that bar `tape init` on one cartridge: every fence
+/// naming the target barcode or the identity read from its BOT.
+///
+/// A fence keeps naming its barcode after the fenced identity is retired, so
+/// a recycled cartridge stays fenced until an operator releases the fence.
+pub fn tape_init_fence_conflicts(
+    catalog: &CatalogIndex,
+    barcode: Option<&str>,
+    bot_uuid: Option<&TapeUuid>,
+) -> Result<Vec<TapeIoFenceRecord>, StateError> {
+    let barcode = barcode.map(str::trim).filter(|value| !value.is_empty());
+    if barcode.is_none() && bot_uuid.is_none() {
+        return Ok(Vec::new());
+    }
+    Ok(catalog
+        .list_active_tape_io_fences()?
+        .into_iter()
+        .filter(|fence| fence_names_init_target(fence, barcode, bot_uuid))
+        .collect())
+}
+
+fn fence_names_init_target(
+    fence: &TapeIoFenceRecord,
+    barcode: Option<&str>,
+    bot_uuid: Option<&TapeUuid>,
+) -> bool {
+    fence_names_barcode(fence, barcode) || bot_uuid.is_some_and(|uuid| fence.tape_uuid == uuid)
+}
+
+fn fence_names_barcode(fence: &TapeIoFenceRecord, barcode: Option<&str>) -> bool {
+    barcode.is_some_and(|barcode| {
+        fence
+            .barcode
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|fenced| !fenced.is_empty() && fenced.eq_ignore_ascii_case(barcode))
+    })
+}
+
+/// The BOT identity a tape-init classification read, when BOT carried one.
+pub fn bot_classification_uuid(bot: &BotClassification) -> Option<TapeUuid> {
+    match bot {
+        BotClassification::OursBootstrap { uuid, .. } => Some(*uuid),
+        _ => None,
+    }
+}
+
+/// Operator-facing `tape init` refusal for active fences on its target, or
+/// `None` when no fence applies. No init override (`--force`, `--clobber-data`,
+/// `--clobber-unknown-tape`) relaxes it; the operator must release each fence.
+pub fn tape_init_fence_refusal(
+    fences: &[TapeIoFenceRecord],
+    barcode: Option<&str>,
+    bot_uuid: Option<&TapeUuid>,
+) -> Option<String> {
+    let barcode = barcode.map(str::trim).filter(|value| !value.is_empty());
+    let named = fences
+        .iter()
+        .map(|fence| {
+            let by_barcode = fence_names_barcode(fence, barcode);
+            let by_uuid = bot_uuid.is_some_and(|uuid| fence.tape_uuid == uuid);
+            let target = match (by_barcode, by_uuid) {
+                (true, true) => format!(
+                    "barcode {} and BOT uuid {}",
+                    barcode.unwrap_or_default(),
+                    uuid_display(&fence.tape_uuid)
+                ),
+                (false, true) => format!("BOT uuid {}", uuid_display(&fence.tape_uuid)),
+                _ => format!("barcode {}", barcode.unwrap_or_default()),
+            };
+            let release = crate::mount_support::fence_release_options(fence);
+            format!(
+                "active tape-I/O fence {id} (reason: {reason}) names {target}; release it with `rem tape quarantine release {id} {release}`",
+                id = fence.quarantine_id,
+                reason = fence.reason,
+            )
+        })
+        .collect::<Vec<_>>();
+    if named.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "tape init refused before any media write: {}; --force and the clobber overrides do not release a fence",
+        named.join("; ")
+    ))
+}
+
+/// Refuse `tape init` while an active tape-I/O fence names the target
+/// barcode or BOT identity.
+pub fn refuse_tape_init_while_fenced(
+    catalog: &CatalogIndex,
+    barcode: Option<&str>,
+    bot_uuid: Option<&TapeUuid>,
+) -> Result<(), String> {
+    let fences = tape_init_fence_conflicts(catalog, barcode, bot_uuid)
+        .map_err(|error| format!("check tape-I/O fences for tape init: {error}"))?;
+    match tape_init_fence_refusal(&fences, barcode, bot_uuid) {
+        Some(refusal) => Err(refusal),
+        None => Ok(()),
+    }
 }
 
 /// Read BOT through a [`remanence_library::BlockSource`] and project the exact
@@ -2628,5 +2730,105 @@ mod tests {
             let mut changed = VecBlockSource::new(blocks);
             assert!(!bot_still_carries_named_unknown_tape(&mut changed, named));
         }
+    }
+
+    fn fenced_catalog(barcode: Option<&str>) -> (CatalogIndex, TapeIoFenceRecord) {
+        let mut catalog = CatalogIndex::open(":memory:").expect("open in-memory catalog");
+        let fence = catalog
+            .record_tape_io_fence(remanence_state::TapeIoFenceInput {
+                tape_uuid: BOT_UUID,
+                barcode: barcode.map(str::to_string),
+                reason: "partial_batch".to_string(),
+                evidence_json: None,
+            })
+            .expect("record tape-I/O fence");
+        (catalog, fence)
+    }
+
+    fn release_command(fence: &TapeIoFenceRecord) -> String {
+        format!(
+            "`rem tape quarantine release {} --after-settled-inventory --ack TEXT`",
+            fence.quarantine_id
+        )
+    }
+
+    #[test]
+    fn tape_init_fence_refuses_by_barcode_even_after_identity_change() {
+        let (catalog, fence) = fenced_catalog(Some("RMT001L9"));
+        // The cartridge now carries a fresh identity the fence never named.
+        for bot_uuid in [None, Some(OTHER_UUID)] {
+            let refusal =
+                refuse_tape_init_while_fenced(&catalog, Some("rmt001l9"), bot_uuid.as_ref())
+                    .expect_err("a fence naming the barcode refuses init");
+            assert!(
+                refusal.starts_with("tape init refused before any media write: "),
+                "{refusal}"
+            );
+            assert!(
+                refusal.contains(&format!(
+                    "active tape-I/O fence {} (reason: partial_batch) names barcode rmt001l9",
+                    fence.quarantine_id
+                )),
+                "{refusal}"
+            );
+            assert!(refusal.contains(&release_command(&fence)), "{refusal}");
+            assert!(
+                refusal.contains("--force and the clobber overrides do not release a fence"),
+                "{refusal}"
+            );
+        }
+        refuse_tape_init_while_fenced(&catalog, Some("RMT002L9"), Some(&OTHER_UUID))
+            .expect("a fence on another barcode and identity does not apply");
+    }
+
+    #[test]
+    fn tape_init_fence_matches_barcode_with_surrounding_spaces() {
+        let (catalog, fence) = fenced_catalog(Some("  RMT001L9 "));
+        for target in ["RMT001L9", " rmt001l9  "] {
+            let refusal = refuse_tape_init_while_fenced(&catalog, Some(target), None)
+                .expect_err("trimmed barcodes still match");
+            assert!(
+                refusal.contains(&format!(
+                    "active tape-I/O fence {} (reason: partial_batch) names barcode {}",
+                    fence.quarantine_id,
+                    target.trim()
+                )),
+                "{refusal}"
+            );
+        }
+        refuse_tape_init_while_fenced(&catalog, Some("   "), None)
+            .expect("a blank target names no fenced barcode");
+    }
+
+    #[test]
+    fn tape_init_fence_refuses_by_bot_uuid() {
+        let (catalog, fence) = fenced_catalog(None);
+        refuse_tape_init_while_fenced(&catalog, Some("RMT009L9"), None)
+            .expect("a UUID-only fence does not name an unread cartridge");
+        let refusal = refuse_tape_init_while_fenced(&catalog, Some("RMT009L9"), Some(&BOT_UUID))
+            .expect_err("a fence naming the BOT identity refuses init");
+        assert!(
+            refusal.contains(&format!(
+                "active tape-I/O fence {} (reason: partial_batch) names BOT uuid {}",
+                fence.quarantine_id,
+                uuid::Uuid::from_bytes(BOT_UUID)
+            )),
+            "{refusal}"
+        );
+        assert!(refusal.contains(&release_command(&fence)), "{refusal}");
+    }
+
+    #[test]
+    fn tape_init_fence_refusal_lifts_after_release() {
+        let (mut catalog, fence) = fenced_catalog(Some("RMT001L9"));
+        assert!(
+            refuse_tape_init_while_fenced(&catalog, Some("RMT001L9"), Some(&BOT_UUID)).is_err()
+        );
+        catalog
+            .release_tape_io_fence(&fence.quarantine_id, "inventory settled")
+            .expect("release fence")
+            .expect("released fence");
+        refuse_tape_init_while_fenced(&catalog, Some("RMT001L9"), Some(&BOT_UUID))
+            .expect("a released fence no longer refuses init");
     }
 }

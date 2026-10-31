@@ -24,7 +24,7 @@ pub fn standalone_fence_releasable(fence: &remanence_state::TapeIoFenceRecord) -
     )
 }
 
-/// Shared recovery advice for startup and standalone write admission.
+/// Shared recovery advice for startup, standalone write admission and tape init.
 pub(crate) fn fence_release_options(fence: &remanence_state::TapeIoFenceRecord) -> &'static str {
     if standalone_fence_releasable(fence) {
         "--ack TEXT"

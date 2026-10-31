@@ -733,11 +733,20 @@ pub(crate) fn compare_tapes_for_pool_selection(
     left: &TapeRecord,
     right: &TapeRecord,
 ) -> std::cmp::Ordering {
-    left.voltag
-        .as_deref()
-        .unwrap_or("")
-        .cmp(right.voltag.as_deref().unwrap_or(""))
-        .then_with(|| left.tape_uuid.cmp(&right.tape_uuid))
+    // A row without a voltag cannot be located on a library, so every
+    // labelled row ranks ahead of it.
+    fn label(tape: &TapeRecord) -> Option<&str> {
+        tape.voltag
+            .as_deref()
+            .filter(|voltag| !voltag.trim().is_empty())
+    }
+    match (label(left), label(right)) {
+        (Some(left_label), Some(right_label)) => left_label.cmp(right_label),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+    .then_with(|| left.tape_uuid.cmp(&right.tape_uuid))
 }
 
 pub(crate) fn tape_uuid_from_vec(
