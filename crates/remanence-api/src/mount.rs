@@ -1261,6 +1261,13 @@ async fn manual_finalize_attempt(
 /// stopped, including accepted manual operations whose callers disconnected.
 pub(crate) fn spawn_startup_terminal_recoveries(state: ApiState) {
     tokio::spawn(async move {
+        let pool = match state.drive_pool() {
+            Ok(pool) => pool.clone(),
+            Err(error) => {
+                tracing::error!(%error, "cannot own tapes for startup terminal recoveries");
+                return;
+            }
+        };
         let paths = match remanence_state::TapeAuthority::list_entries(
             state.checkpoint_journal_dir.as_path(),
         ) {
@@ -1299,6 +1306,14 @@ pub(crate) fn spawn_startup_terminal_recoveries(state: ApiState) {
                 tracing::info!(tape_uuid = %Uuid::from_bytes(tape_uuid), "retired tape skipped by startup terminal recovery");
                 continue;
             }
+            // Own the exact tape before touching its log, as every live
+            // terminal owner does. A refused reservation means a live owner,
+            // such as a same-key FinalizeTape, already holds the tape and
+            // drives its pending intent itself.
+            let Ok(tape_reservation) = pool.reserve_tape(tape_uuid) else {
+                tracing::info!(tape_uuid = %Uuid::from_bytes(tape_uuid), "owned tape skipped by startup terminal recovery");
+                continue;
+            };
             let journal = match remanence_state::TapeAuthority::open(
                 state.checkpoint_journal_dir.as_path(),
                 tape_uuid,
@@ -1323,6 +1338,8 @@ pub(crate) fn spawn_startup_terminal_recoveries(state: ApiState) {
             if intent.manual.is_some() {
                 let reconciled = (|| {
                     let mut lease = journal.acquire_exclusive_for_terminal_recovery()?;
+                    #[cfg(test)]
+                    run_startup_terminal_lease_hook(tape_uuid);
                     let index = CatalogIndex::open(state.index_path.as_ref())?;
                     crate::write_owner::reconcile_manual_terminal_acceptance(
                         &index, &mut lease, &intent,
@@ -1341,9 +1358,9 @@ pub(crate) fn spawn_startup_terminal_recoveries(state: ApiState) {
                 }
             }
             let recovery = if intent.manual.is_some() {
-                recover_manual_terminal_tape(&state, &intent).await
+                recover_manual_terminal_tape(&state, &pool, tape_reservation, &intent).await
             } else {
-                recover_automatic_terminal_tape(&state, tape_uuid).await
+                recover_automatic_terminal_tape(&state, &pool, tape_reservation, tape_uuid).await
             };
             if let Err(error) = recovery {
                 tracing::error!(
@@ -1357,18 +1374,48 @@ pub(crate) fn spawn_startup_terminal_recoveries(state: ApiState) {
     });
 }
 
+/// One-shot pause for one tape, taken while startup recovery holds that
+/// tape's exclusive log lease. A process-wide slot, because startup recovery
+/// runs on whichever runtime worker the scheduler picks.
+#[cfg(test)]
+type StartupTerminalLeaseHook = (TapeUuid, Box<dyn FnOnce() + Send>);
+
+#[cfg(test)]
+static STARTUP_TERMINAL_LEASE_HOOK: std::sync::Mutex<Option<StartupTerminalLeaseHook>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn run_startup_terminal_lease_hook(tape_uuid: TapeUuid) {
+    let hook = {
+        let mut slot = STARTUP_TERMINAL_LEASE_HOOK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match slot.take() {
+            Some((hooked, hook)) if hooked == tape_uuid => Some(hook),
+            other => {
+                *slot = other;
+                None
+            }
+        }
+    };
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// Reconstruct an accepted manual operation exclusively from durable intent
-/// and current guarded catalog/config data, then resume its physical tail.
+/// and current guarded catalog/config data, then resume its physical tail
+/// under the exact-tape ownership startup recovery took before its log peek.
 async fn recover_manual_terminal_tape(
     state: &ApiState,
+    pool: &crate::write_owner::DrivePool,
+    tape_reservation: crate::write_owner::TapeReservation,
     intent: &remanence_state::authority::AuthorityFinalization,
 ) -> Result<(), Status> {
-    let pool = state.drive_pool()?.clone();
-    let tape_reservation = pool.reserve_tape(intent.tape_uuid)?;
     let request = manual_finalize_request_from_intent(state, intent)?;
     run_manual_finalize_worker(
         state.clone(),
-        pool,
+        pool.clone(),
         std::sync::Arc::new(tape_reservation),
         request,
     )
@@ -1427,10 +1474,10 @@ fn manual_finalize_request_from_intent(
 
 async fn recover_automatic_terminal_tape(
     state: &ApiState,
+    pool: &crate::write_owner::DrivePool,
+    _tape_reservation: crate::write_owner::TapeReservation,
     tape_uuid: TapeUuid,
 ) -> Result<(), Status> {
-    let pool = state.drive_pool()?.clone();
-    let _tape_reservation = pool.reserve_tape(tape_uuid)?;
     let index = CatalogIndex::open_read_only(state.index_path.as_ref())
         .map_err(|error| Status::internal(error.to_string()))?;
     if index
@@ -1478,12 +1525,12 @@ async fn recover_automatic_terminal_tape(
         return Ok(());
     }
     drop(host_index);
-    let library_serial = resolve_tape_library_serial(state, &pool, &tape_uuid)?;
+    let library_serial = resolve_tape_library_serial(state, pool, &tape_uuid)?;
     let (mount, drive_reservation) =
-        resolve_and_reserve_actor_mount(state, &pool, &library_serial, &tape_uuid).await?;
+        resolve_and_reserve_actor_mount(state, pool, &library_serial, &tape_uuid).await?;
     let drive = pool.drive_tx(&mount.drive_key())?;
     if let Some(slot) = mount.source_slot {
-        if let Err(error) = changer_move(&pool, &mount.library_serial, slot, mount.bay).await {
+        if let Err(error) = changer_move(pool, &mount.library_serial, slot, mount.bay).await {
             drop(drive_reservation);
             return Err(error);
         }
@@ -1506,7 +1553,7 @@ async fn recover_automatic_terminal_tape(
         .await
         .is_err()
     {
-        compensate_open_mount(&pool, &mount).await;
+        compensate_open_mount(pool, &mount).await;
         drop(drive_reservation);
         return Err(Status::unavailable(
             "drive actor is unavailable for automatic terminal recovery",
@@ -3641,6 +3688,13 @@ mod tests {
     };
     use std::path::{Path, PathBuf};
 
+    /// Own the exact tape as startup recovery does, then run the automatic route.
+    async fn recover_automatic_owned(state: &ApiState, tape_uuid: TapeUuid) -> Result<(), Status> {
+        let pool = state.drive_pool()?.clone();
+        let tape_reservation = pool.reserve_tape(tape_uuid)?;
+        recover_automatic_terminal_tape(state, &pool, tape_reservation, tape_uuid).await
+    }
+
     #[test]
     fn batched_selection_avoids_no_free_bay_failure_for_loaded_fresh_tape() {
         const LEGACY_UUID: [u8; 16] = [1; 16];
@@ -5472,7 +5526,7 @@ mod tests {
         let saved_companion =
             remanence_state::authority::fixtures::save_finalization(&stale_journal)
                 .expect("save exact companion bytes");
-        recover_automatic_terminal_tape(&state, STALE_COMPANION_TAPE)
+        recover_automatic_owned(&state, STALE_COMPANION_TAPE)
             .await
             .expect("first automatic completion seals the checkpoint");
         let sealed_before_retry = stale_journal
@@ -5616,7 +5670,7 @@ mod tests {
         // checkpoint is durable and its companion is gone, but SQLite/audit
         // bookkeeping has not completed. A same-process pinned retry must
         // route that sealed record through host-only preflight without media.
-        recover_automatic_terminal_tape(&state, SEALED_NO_COMPANION_TAPE)
+        recover_automatic_owned(&state, SEALED_NO_COMPANION_TAPE)
             .await
             .expect("seed sealed automatic authority without a companion");
         let sealed_no_companion_journal =
@@ -5721,7 +5775,7 @@ mod tests {
         )
         .await
         .unwrap();
-        recover_automatic_terminal_tape(&lowered_state, STARTUP_TAPE)
+        recover_automatic_owned(&lowered_state, STARTUP_TAPE)
             .await
             .expect("automatic route seals after C despite a newly lowered capacity cap");
         assert!(
@@ -5935,6 +5989,190 @@ mod tests {
             .list_active_tape_io_fences()
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_terminal_recovery_owns_the_tape_before_its_lease_so_same_key_finalize_rejoins()
+    {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        const BLOCK_SIZE: u32 = 256 * 1024;
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-startup-terminal-owner")
+            .tempdir()
+            .expect("tempdir");
+        let index_path = temp.path().join("state.sqlite");
+        let checkpoint_dir = temp.path().join("tapes");
+        let tape_uuid = [0xA9; 16];
+        let pool_id = "startup-owner-finalize";
+        let pool_config = TapePoolConfig {
+            scheme: None,
+            id: pool_id.to_string(),
+            display_name: None,
+            copy_class: None,
+            content_class: None,
+            selection_policy: PoolSelectionPolicyName::CompleteOrFill,
+            watermark_low: 0.92,
+            watermark_high: 0.97,
+            capacity_cap_bytes: None,
+            block_size_bytes: u64::from(BLOCK_SIZE),
+            min_object_size_bytes: 0,
+        };
+        let mut index = CatalogIndex::open(&index_path).expect("open catalog");
+        index
+            .upsert_tape_pool_projection(TapePoolProjectionInput {
+                pool_id: pool_id.to_string(),
+                display_name: None,
+                copy_class: None,
+                content_class: None,
+                created_at_utc: None,
+            })
+            .expect("project pool");
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "OWN001L9".to_string(),
+                block_size: BLOCK_SIZE,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision tape");
+        index
+            .project_tape_pool_membership(tape_uuid, pool_id)
+            .expect("assign pool");
+        let checkpoint = manual_finalize_checkpoint(tape_uuid, BLOCK_SIZE);
+        remanence_state::authority::fixtures::AuthorityBuilder::new(&checkpoint_dir, tape_uuid)
+            .build()
+            .expect("open checkpoint journal")
+            .append(&checkpoint)
+            .expect("append checkpoint");
+        index
+            .project_checkpoint_record(&checkpoint)
+            .expect("project checkpoint");
+
+        let mut state = ApiState::new_with_pool_configs(index, [pool_config]);
+        state.default_library_serial = Some(Arc::new("LIB001".to_string()));
+        let mut loaded = drive_bay(0x0101, true, Some("OWN001L9"));
+        loaded.source_slot = None;
+        state.library_snapshot = Some(Arc::new(std::sync::RwLock::new(Arc::new(
+            crate::live_status::LibrarySnapshot {
+                report: remanence_library::DiscoveryReport {
+                    unattached_drives: Vec::new(),
+                    complete: true,
+                    incomplete_evidence: Vec::new(),
+                    libraries: vec![test_library(vec![loaded], vec![])],
+                    warnings: Vec::new(),
+                },
+                captured_at: time::OffsetDateTime::UNIX_EPOCH,
+            },
+        ))));
+        let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel(2);
+        let (changer_tx, mut changer_rx) = tokio::sync::mpsc::channel(1);
+        let pool = crate::write_owner::DrivePool::new(
+            changer_tx,
+            std::collections::HashMap::from([(0x0101, drive_tx)]),
+            Arc::new(std::collections::HashMap::from([(
+                0x0101,
+                AtomicBool::new(false),
+            )])),
+        );
+        state.drive_pool = Some(pool.clone());
+        let admission = ManualFinalizeTapeAdmission {
+            candidate_operation_id: Uuid::from_u128(0xA903),
+            actor: remanence_state::AuditActor::User("owner@example.invalid".to_string()),
+            actor_fingerprint: "sha256:startup-owner-finalize".to_string(),
+            idempotency_key: Uuid::from_u128(0xA904),
+            request_fingerprint: [0xA9; 32],
+            tape_uuid,
+            expected_pool_id: Some(pool_id.to_string()),
+            reason: "finalize across a restart".to_string(),
+        };
+
+        // Accept a manual finalization, then lose its worker before any media
+        // write, leaving the durable intent pending as a restart would.
+        let accepted = manual_finalize_tape(&state, admission.clone())
+            .await
+            .expect("durable acceptance");
+        let crate::write_owner::ManualFinalizeTapeResult::Accepted(accepted) = accepted else {
+            panic!("durable admission must not return BUSY");
+        };
+        match tokio::time::timeout(Duration::from_secs(1), drive_rx.recv())
+            .await
+            .expect("accepted worker dispatches")
+            .expect("drive command")
+        {
+            crate::write_owner::DriveCommand::FinalizeTape { reply, .. } => drop(reply),
+            _ => panic!("unexpected worker command"),
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(probe) = pool.reserve_tape(tape_uuid) {
+                    drop(probe);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("lost worker releases exact-tape ownership");
+
+        // Pause startup recovery while it holds the tape's exclusive log
+        // lease, and send the operator's same-key FinalizeTape in that window.
+        let (leased_tx, leased_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        let hook_pool = pool.clone();
+        *STARTUP_TERMINAL_LEASE_HOOK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some((
+            tape_uuid,
+            Box::new(move || {
+                let lease_owner_owns_tape = hook_pool.reserve_tape(tape_uuid).is_err();
+                let _ = leased_tx.send(lease_owner_owns_tape);
+                let _ = resume_rx.recv_timeout(Duration::from_secs(10));
+            }),
+        ));
+        spawn_startup_terminal_recoveries(state.clone());
+        let lease_owner_owns_tape = tokio::time::timeout(Duration::from_secs(5), leased_rx)
+            .await
+            .expect("startup recovery takes the tape-log lease")
+            .expect("lease hook reports exact-tape ownership");
+        let replay = manual_finalize_tape(&state, admission.clone()).await;
+        resume_tx.send(()).expect("resume startup recovery");
+        assert!(
+            lease_owner_owns_tape,
+            "startup recovery holds the tape-log lease without owning the tape; same-key FinalizeTape saw {replay:?}"
+        );
+        let replay = replay.expect("same-key FinalizeTape rejoins startup recovery");
+        let crate::write_owner::ManualFinalizeTapeResult::Accepted(replay) = replay else {
+            panic!("same-key FinalizeTape must not degrade to BUSY during startup recovery");
+        };
+        assert_eq!(replay.operation_id, accepted.operation_id);
+
+        // Startup recovery remains the only owner: it dispatches exactly one
+        // tail for the original operation, and the rejoin dispatches none.
+        let reply = match tokio::time::timeout(Duration::from_secs(2), drive_rx.recv())
+            .await
+            .expect("startup recovery dispatches")
+            .expect("drive command")
+        {
+            crate::write_owner::DriveCommand::FinalizeTape { request, reply, .. } => {
+                assert_eq!(request.candidate_operation_id, accepted.operation_id);
+                reply
+            }
+            _ => panic!("unexpected startup recovery command"),
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), drive_rx.recv())
+                .await
+                .is_err(),
+            "same-key FinalizeTape duplicated tail dispatch"
+        );
+        assert!(
+            changer_rx.try_recv().is_err(),
+            "loaded-tape tail moved media"
+        );
+        drop(reply);
     }
 
     #[tokio::test]
