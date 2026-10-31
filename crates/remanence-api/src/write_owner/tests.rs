@@ -15505,8 +15505,19 @@ fn terminal_tail_fence_precedes_recovery_persistence_failure() {
     check_terminal_fence_precedes_recovery_failure(true);
 }
 
-/// Exercise the production failure handlers without a recoverable terminal intent.
+/// A tail failure that dispatched nothing leaves the medium unchanged: it is
+/// a plain error with recovery marking, not a tape fence.
+#[test]
+fn terminal_tail_failure_before_dispatch_is_not_fenced() {
+    check_terminal_write_failure(true, false);
+}
+
 fn check_terminal_fence_precedes_recovery_failure(tail: bool) {
+    check_terminal_write_failure(tail, true);
+}
+
+/// Exercise the production failure handlers without a recoverable terminal intent.
+fn check_terminal_write_failure(tail: bool, reached_drive: bool) {
     let root = tempfile::tempdir().unwrap();
     let mut index = CatalogIndex::open(root.path().join("index.sqlite")).unwrap();
     let uuid = [0x68; 16];
@@ -15562,6 +15573,7 @@ fn check_terminal_fence_precedes_recovery_failure(tail: bool) {
             &spec,
             &selected,
             None,
+            reached_drive,
             &remanence_parity::TerminalTailWriteError::Media(ParityError::Invariant(
                 "terminal write fails",
             )),
@@ -15573,7 +15585,7 @@ fn check_terminal_fence_precedes_recovery_failure(tail: bool) {
             &mut lease,
             &spec,
             &selected,
-            true,
+            reached_drive,
             &ParityError::Invariant("terminal write fails"),
         )
     };
@@ -15582,6 +15594,10 @@ fn check_terminal_fence_precedes_recovery_failure(tail: bool) {
         "{status}"
     );
     let fences = index.list_active_tape_io_fences().unwrap();
+    if !reached_drive {
+        assert!(fences.is_empty(), "{fences:?}");
+        return;
+    }
     assert_eq!(fences.len(), 1);
     assert!(fences[0]
         .evidence_json

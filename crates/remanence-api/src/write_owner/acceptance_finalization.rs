@@ -756,6 +756,12 @@ async fn check(
 /// images. Drive counters have no fault triggers in this fixture; reset removes
 /// position knowledge, and the source slot and loaded cartridge stay fixed.
 fn maximum_loss_groups(session: &Session) -> Vec<Vec<usize>> {
+    restart_groups(session, |cut| cut.world.tapes[BARCODE].durable_frontier)
+}
+
+/// Collapse cuts whose restart images are byte-identical when the tape keeps
+/// `keep(cut)` records and unsynced host bytes are lost.
+fn restart_groups(session: &Session, keep: impl Fn(&FinalCut) -> usize) -> Vec<Vec<usize>> {
     use sha2::{Digest, Sha256};
     let mut groups: BTreeMap<[u8; 32], Vec<usize>> = BTreeMap::new();
     let mut snapshots = BTreeMap::new();
@@ -785,9 +791,10 @@ fn maximum_loss_groups(session: &Session) -> Vec<Vec<usize>> {
         assert_eq!(cut.world.drive_bays[&BAY].as_deref(), Some(BARCODE));
         let mut hash = Sha256::new();
         hash.update(host_digest);
-        let keep = cut.world.tapes[BARCODE].durable_frontier;
+        let keep = keep(cut);
         let mut reset = cut.world.clone();
         let tape = reset.tapes.get_mut(BARCODE).unwrap();
+        tape.durable_frontier = keep;
         tape.written_bytes = session.records[..keep]
             .iter()
             .map(|record| match record {
@@ -840,6 +847,42 @@ async fn finalization_maximum_loss_matrix() {
         );
         if let Err(error) = result {
             failures.push((cut.number, cut.boundary.clone(), error));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A daemon abort keeps every record the drive accepted, buffered or not.
+/// Each distinct restart image of the trace finishes without a tape fence.
+/// `ABORT_MATRIX_SHARD=i/n` runs every n-th image from i, for parallel processes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "daemon-abort retention matrix; run with --release --ignored --nocapture"]
+async fn finalization_daemon_abort_retention_matrix() {
+    let (shard, shards) = std::env::var("ABORT_MATRIX_SHARD").map_or((0, 1), |value| {
+        let (shard, shards) = value.split_once('/').expect("ABORT_MATRIX_SHARD is i/n");
+        (shard.parse().unwrap(), shards.parse().unwrap())
+    });
+    assert!(shard < shards, "ABORT_MATRIX_SHARD is i/n with i < n");
+    let session = trace_finalization(None).await;
+    let groups = restart_groups(&session, |cut| cut.end);
+    eprintln!(
+        "{} distinct daemon-abort restart images; shard {shard}/{shards}",
+        groups.len()
+    );
+    let mut failures = Vec::new();
+    for group in groups.into_iter().skip(shard).step_by(shards) {
+        let cut = &session.cuts[group[0]];
+        let result = check(&session, cut, cut.end, BTreeMap::new(), false).await;
+        eprintln!(
+            "abort C{:03}..C{:03} ({} cuts) {} => {result:?}",
+            cut.number,
+            session.cuts[*group.last().unwrap()].number,
+            group.len(),
+            cut.boundary
+        );
+        match result {
+            Ok("startup" | "operator retry") => {}
+            other => failures.push((cut.number, cut.boundary.clone(), other)),
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
@@ -913,6 +956,30 @@ async fn finalization_cuts_complete() {
         assert!(
             result.is_ok(),
             "C{} {}: {result:?}",
+            cut.number,
+            cut.boundary
+        );
+    }
+    // A daemon abort keeps every record already written. After a component's
+    // filemark, startup reconciles that component as complete, re-admits its
+    // zero-count barrier there and finishes without a fence.
+    for component in [4, 0] {
+        let plan = session.intent.layout.components[component];
+        let end = (plan.start_lba + plan.record_count + 1) as usize;
+        let cut = session
+            .cuts
+            .iter()
+            .find(|c| c.boundary.starts_with("command [10, 01,") && c.end == end)
+            .unwrap();
+        let result = check(&session, cut, cut.end, BTreeMap::new(), false).await;
+        eprintln!(
+            "default abort C{} {} => {result:?}",
+            cut.number, cut.boundary
+        );
+        assert_eq!(
+            result,
+            Ok("startup"),
+            "C{} {}: complete unpublished component",
             cut.number,
             cut.boundary
         );
