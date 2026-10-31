@@ -143,7 +143,9 @@ pub trait TapeAuthorityView {
         structural: Option<&dyn StructuralAuthority>,
         prefix: TerminalPrefixMode<&Self::TerminalPrefix>,
     ) -> Result<Self::TerminalSource, Self::Error>;
-    /// Last durable semantic commit, preserving the backend's admission rules.
+    /// Last durable ordinary commit's admission fields. Catalog payloads and
+    /// physical publication bundles may be omitted; use visit_commits or a frozen
+    /// snapshot for complete payloads. Preserves the backend's admission rules.
     fn latest_commit(&self) -> Result<Option<Self::Commit>, Self::Error>;
     /// Stream semantic commits without retaining complete history.
     fn visit_commits(
@@ -162,7 +164,14 @@ pub trait TapeAuthorityView {
     /// Prove ordinary append agreement against the exact structural prefix.
     /// Terminal-prefix/component authority is not an ordinary append boundary.
     fn validate_append_rows(&self, rows: &FrozenFileRows) -> Result<(), Self::Error>;
-    /// Capture one immutable prefix under the owner's lease.
+    /// Capture one immutable prefix under the owner's lease. Snapshot agreement
+    /// is the actor's storage-consistency check, not ordinary append admission:
+    /// with a parity scheme, ordinary tapes require exact base-row agreement;
+    /// sealed tapes and tapes with an intent use the recovery-aware terminal
+    /// agreement (durable rows, identity, geometry and counters). Without a
+    /// scheme no independent structural agreement is required. Implementations
+    /// must never turn planned rows into durable rows. `validate_append_rows`
+    /// remains the stricter ordinary-append proof regardless of this contract.
     fn freeze(&self) -> Result<Self::Snapshot, Self::Error>;
     /// Read finalization status, including a durably completed plan.
     fn finalization_status(&self) -> Result<Option<Self::Finalization>, Self::Error>;

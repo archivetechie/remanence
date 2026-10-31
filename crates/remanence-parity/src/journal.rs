@@ -44,6 +44,9 @@ const MAX_RECORD_LEN: u64 = 64 * 1024 * 1024;
 /// Durable-append journal failures from Layer 3c v0.7.2 §10.2/§10.6.
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
+    /// An old-format publication phase has no single-log equivalent.
+    #[error("authority operation requires B3b migration: {0}")]
+    UnsupportedOperation(&'static str),
     /// Underlying filesystem I/O failed.
     #[error("journal I/O: {0}")]
     Io(#[from] std::io::Error),

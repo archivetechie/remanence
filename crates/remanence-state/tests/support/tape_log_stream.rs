@@ -102,7 +102,7 @@ fn commit(reference: GroupRef, next_file: u64, lba: u64, objects: u64) -> Commit
         group: reference,
         cursor: CommitCursor { partition: 0, lba },
         protected: 0,
-        total: 0,
+        total: 3,
         check: CheckValue::EMPTY,
         provenance: CheckProvenance::Empty,
         unverified_end: None,
@@ -139,7 +139,7 @@ impl MillionMemberStream {
         m.mtime = None;
         m.executable = None;
         let mut member_bytes = Vec::new();
-        encode_member(&mut member_bytes, &header(&object(1, 2, None, 3), 0), &m).unwrap();
+        encode_member(&mut member_bytes, &header(&object(1, 2, None, 3), 3), &m).unwrap();
         let id_offset = member_bytes
             .windows(16)
             .position(|w| w == b"0000000000000000")
@@ -178,7 +178,7 @@ impl MillionMemberStream {
             }
             2 => {
                 if self.chunk == 0 {
-                    encode_header(&mut payload, &header(&object(1, 2, None, 3), 0)).unwrap();
+                    encode_header(&mut payload, &header(&object(1, 2, None, 3), 3)).unwrap();
                 }
                 while self.emitted < self.members
                     && payload.len() + self.member_bytes.len() <= 16 * 1024
@@ -246,4 +246,44 @@ impl Read for MillionMemberStream {
         self.position += n;
         Ok(n)
     }
+}
+
+/// One semantic Object report, without materializing its member list.
+#[allow(dead_code)]
+pub fn semantic_report() -> remanence_state::authority::AuthorityCommit {
+    remanence_state::authority::AuthorityCommit {
+        ordinal: 1,
+        object_count: 1,
+        protected: 0,
+        total: 3,
+        cursor: CommitCursor {
+            partition: 0,
+            lba: 6,
+        },
+        tape_uuid: UUID,
+        operation_id: [8; 16],
+        next_file: 2,
+        block_size: BLOCK,
+        payloads: vec![remanence_state::authority::ObjectPayload {
+            projection: header(&object(1, 2, None, 3), 3),
+            files: Vec::new(),
+        }],
+        scheme: None,
+        object_files: Vec::new(),
+        barrier: None,
+        finalization: None,
+        sealed: false,
+        seal_due: None,
+        check: None,
+    }
+}
+/// Exactly the member used by MillionMemberStream, generated independently.
+#[allow(dead_code)]
+pub fn semantic_member(index: u64) -> NativeObjectFileProjectionInput {
+    let mut m = member();
+    m.file_id = format!("{index:016x}");
+    m.path = "p".into();
+    m.mtime = None;
+    m.executable = None;
+    m
 }

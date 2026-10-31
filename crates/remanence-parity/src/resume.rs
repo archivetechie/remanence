@@ -53,7 +53,7 @@ pub fn resume_record_result<T>(result: Result<T, JournalError>) -> Result<T, Par
             | JournalError::Codec(_)
             | JournalError::InvalidBundleShape(_)
             | JournalError::RecoveryRequired(_) => true,
-            JournalError::UntrustedVolume(_) => false,
+            JournalError::UntrustedVolume(_) | JournalError::UnsupportedOperation(_) => false,
         };
         if content {
             ParityError::ResumeAppend(error.to_string())

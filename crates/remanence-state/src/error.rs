@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 /// Layer 4 state-management failures.
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
+    /// Unwired per-tape authority storage failure, preserving publication outcome.
+    #[error(transparent)]
+    TapeLog(Box<crate::tape_log::store::StoreError>),
     /// A filesystem operation failed.
     #[error("{context}{}: {source}", io_path_suffix(path))]
     Io {
@@ -146,6 +149,12 @@ impl StateError {
     /// replayable durable authority behind.
     pub fn is_checkpoint_append_authority_uncertain(&self) -> bool {
         matches!(self, Self::CheckpointAppendAuthorityUncertain(_))
+    }
+}
+
+impl From<crate::tape_log::store::StoreError> for StateError {
+    fn from(error: crate::tape_log::store::StoreError) -> Self {
+        Self::TapeLog(Box::new(error))
     }
 }
 

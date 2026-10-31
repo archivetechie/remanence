@@ -105,7 +105,7 @@ fn commit(reference: GroupRef, next_file: u64, lba: u64, objects: u64) -> Commit
         group: reference,
         cursor: CommitCursor { partition: 0, lba },
         protected: 0,
-        total: 0,
+        total: objects * 3,
         check: CheckValue::EMPTY,
         provenance: CheckProvenance::Empty,
         unverified_end: None,
@@ -195,7 +195,7 @@ impl Log {
         log.push(init(parity), &[]);
         let row = object(1, 2, parity.then_some(0), 3);
         log.row(row.clone());
-        log.catalog(&row, if parity { 3 } else { 0 }, 2, 31);
+        log.catalog(&row, 3, 2, 31);
         let mut c = commit(log.reference(), 2, 6, 1);
         if parity {
             c.total = 3;
@@ -515,44 +515,26 @@ fn tail_matrix_distinguishes_short_prefix_short_body_zeros_and_corruption() {
         let mut bytes = base.bytes.clone();
         bytes.extend_from_slice(&final_frame[..n]);
         assert_row_full_agreement(&bytes);
+        let (summary, tail) = fold::replay(bytes.as_slice()).unwrap();
+        assert_eq!(summary.last_closed_sequence, old.last_closed_sequence);
         assert_eq!(
-            fault(fold::replay(bytes.as_slice()).unwrap_err()),
-            Fault::ShortPrefix
+            tail,
+            Tail::Torn {
+                offset: base.bytes.len() as u64,
+                kind: TornKind::ShortPrefix
+            }
         );
     }
-    let structural = u32::from_le_bytes(final_frame[4..8].try_into().unwrap()) as usize;
     for n in PREFIX_LEN..final_frame.len() {
         let mut bytes = base.bytes.clone();
         bytes.extend_from_slice(&final_frame[..n]);
         assert_row_full_agreement(&bytes);
-        match fold::replay(bytes.as_slice()) {
-            Ok((s, Tail::Torn { offset, kind })) => {
-                assert_eq!(s.last_closed_sequence, old.last_closed_sequence);
-                assert_eq!(offset, base.bytes.len() as u64);
-                assert!(matches!(kind, TornKind::ShortBody | TornKind::ZeroFilled));
-            }
-            Err(e) => {
-                // Interrupted zeros in an incomplete, unproved section now
-                // require recovery, even for otherwise ordinary truncations.
-                let start = if n >= PREFIX_LEN + structural + 8 {
-                    PREFIX_LEN + structural + 8
-                } else {
-                    PREFIX_LEN
-                };
-                let zero = final_frame[start..n].iter().position(|b| *b == 0).unwrap();
-                let nonzero = final_frame[start + zero..n]
-                    .iter()
-                    .position(|b| *b != 0)
-                    .unwrap();
-                assert_eq!(
-                    fault(e),
-                    Fault::NonZeroAfterZeros {
-                        offset: (base.bytes.len() + start + zero + nonzero) as u64,
-                    }
-                );
-            }
-            other => panic!("unexpected truncation result: {other:?}"),
-        }
+        let (s, tail) = fold::replay(bytes.as_slice()).unwrap();
+        assert_eq!(s.last_closed_sequence, old.last_closed_sequence);
+        assert!(
+            matches!(tail, Tail::Torn { offset, kind: TornKind::ShortBody | TornKind::ZeroFilled }
+            if offset == base.bytes.len() as u64)
+        );
     }
     for n in [1, 27, 28, 8192, 18000] {
         let mut bytes = base.bytes.clone();
@@ -566,28 +548,41 @@ fn tail_matrix_distinguishes_short_prefix_short_body_zeros_and_corruption() {
             }
         );
         *bytes.last_mut().unwrap() = 1;
-        let expected = if n == 1 {
-            Fault::ShortPrefix
-        } else {
-            Fault::NonZeroAfterZeros {
-                offset: (base.bytes.len() + n - 1) as u64,
-            }
-        };
         assert_row_full_agreement(&bytes);
-        assert_eq!(fault(fold::classify(&bytes).unwrap_err()), expected);
+        if n == 1 {
+            assert_eq!(
+                fold::classify(&bytes).unwrap(),
+                Tail::Torn {
+                    offset: base.bytes.len() as u64,
+                    kind: TornKind::ShortPrefix,
+                }
+            );
+        } else {
+            assert_eq!(
+                fault(fold::classify(&bytes).unwrap_err()),
+                Fault::NonZeroAfterZeros {
+                    offset: (base.bytes.len() + n - 1) as u64,
+                }
+            );
+        }
     }
     for suffix in [&b"garbage"[..], &[0, 0, 0, 1][..]] {
         let mut bytes = base.bytes.clone();
         bytes.extend_from_slice(suffix);
-        let expected = if suffix[0] == 0 {
-            Fault::NonZeroAfterZeros {
-                offset: (base.bytes.len() + 3) as u64,
-            }
-        } else {
-            Fault::ShortPrefix
-        };
         assert_row_full_agreement(&bytes);
-        assert_eq!(fault(fold::classify(&bytes).unwrap_err()), expected);
+        if suffix[0] == 0 {
+            assert_eq!(
+                fault(fold::classify(&bytes).unwrap_err()),
+                Fault::NonZeroAfterZeros {
+                    offset: (base.bytes.len() + 3) as u64
+                }
+            );
+        } else {
+            assert_eq!(
+                fault(fold::classify(&bytes).unwrap_err()),
+                Fault::Version(u16::from_le_bytes(*b"ga"))
+            );
+        }
     }
     let mut bytes = base.bytes.clone();
     bytes.extend_from_slice(&final_frame);
@@ -636,7 +631,7 @@ fn unclosed_catalog_group_is_absent_but_malformed_group_is_recovery() {
     let seq = log.seq;
     let row = object(2, 6, None, 3);
     log.row(row.clone());
-    log.catalog(&row, 0, 3, 7);
+    log.catalog(&row, row.tape_file_number * 3, 3, 7);
     assert_row_full_agreement(&log.bytes);
     let (s, tail) = fold::replay(log.bytes.as_slice()).unwrap();
     assert_eq!(s.last_closed_sequence, seq);
@@ -724,7 +719,7 @@ fn continuation_order_object_bijection_and_closed_group_digest_are_checked() {
             log.row(object(3, 10, None, 3));
         } else {
             let mut payload = Vec::new();
-            encode_header(&mut payload, &header(&row, 0)).unwrap();
+            encode_header(&mut payload, &header(&row, 6)).unwrap();
             log.push(
                 Record::PayloadContinuation(Continuation {
                     group: if case == 1 { 999 } else { log.group_start() },
@@ -753,7 +748,7 @@ fn continuation_order_object_bijection_and_closed_group_digest_are_checked() {
     let mut log = Log::first(false);
     let row = object(2, 6, None, 3);
     log.row(row.clone());
-    log.catalog(&row, 0, 0, 11);
+    log.catalog(&row, row.tape_file_number * 3, 0, 11);
     let mut reference = log.reference();
     reference.digest[0] ^= 1;
     log.push(Record::Committed(commit(reference, 3, 10, 2)), &[]);
@@ -1037,29 +1032,48 @@ fn premature_seal_wrong_component_and_wrong_plan_are_refused() {
 }
 
 #[test]
-fn a_single_catalog_text_larger_than_a_frame_validates_without_buffering_it() {
+fn a_single_catalog_field_larger_than_a_frame_is_refused_before_consumption() {
     let row = object(1, 2, None, 3);
     let mut encoded = Vec::new();
-    encode_header(&mut encoded, &header(&row, 0)).unwrap();
+    encode_header(&mut encoded, &header(&row, 3)).unwrap();
     let start = encoded.windows(6).position(|w| w == b"caller").unwrap();
-    assert_eq!(encoded[start - 1], 0x66);
-    let size = MAX_FRAME_BODY as u64 + 19;
     let mut head = Vec::new();
-    wire::head(&mut head, 3, size).unwrap();
-    let mut validator = CatalogValidator::new(&row, UUID, BLOCK, 0).unwrap();
+    wire::head(&mut head, 3, MAX_FRAME_BODY as u64 + 1).unwrap();
+    let mut validator = CatalogValidator::new(&row, UUID, BLOCK, 3).unwrap();
     validator.feed(&encoded[..start - 1]).unwrap();
-    validator.feed(&head).unwrap();
-    let scratch = [b'x'; 8192];
-    let mut remaining = size;
-    while remaining > 0 {
-        let n = remaining.min(scratch.len() as u64) as usize;
-        validator.feed(&scratch[..n]).unwrap();
-        remaining -= n as u64;
-        assert!(validator.retained_bytes() < 4096);
-    }
-    validator.feed(&encoded[start + 6..]).unwrap();
-    assert_eq!(validator.finish().unwrap(), 0);
+    assert_eq!(validator.feed(&head).unwrap_err(), Fault::FrameTooLarge);
+    // Typed decoding must refuse the same declared length before reading data.
+    use wire::Wire;
+    let mut reader = std::io::Cursor::new(head.clone());
+    assert_eq!(
+        String::get(&mut reader).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    assert_eq!(reader.position(), head.len() as u64);
+    let mut payload = encoded[..start - 1].to_vec();
+    payload.extend_from_slice(&head);
+    let mut log = Log::default();
+    log.push(init(false), &[]);
+    log.row(row);
+    log.push(
+        Record::PayloadContinuation(Continuation {
+            group: 1,
+            chunk: Chunk::Catalog {
+                tape_file_number: 1,
+                ordinal: 0,
+                last: true,
+            },
+        }),
+        &payload,
+    );
+    // All frame CRCs are correct; the incremental fold rejects the scalar length
+    // before a typed visitor can consume the remainder as a single field.
+    assert_eq!(
+        fault(fold::replay(log.bytes.as_slice()).unwrap_err()),
+        Fault::FrameTooLarge
+    );
 }
+
 fn directory(row: &TapeFileEntry) -> SidecarEpochDirectoryEntry {
     SidecarEpochDirectoryEntry {
         tape_file_number: row.tape_file_number,
@@ -1395,7 +1409,7 @@ fn valid_crc_does_not_hide_malformed_catalog_or_bad_closed_member_count() {
     let row = object(2, 6, None, 3);
     log.row(row.clone());
     let mut bytes = Vec::new();
-    encode_header(&mut bytes, &header(&row, 0)).unwrap();
+    encode_header(&mut bytes, &header(&row, 6)).unwrap();
     bytes.push(0xff);
     log.push(
         Record::PayloadContinuation(Continuation {
@@ -1415,7 +1429,7 @@ fn valid_crc_does_not_hide_malformed_catalog_or_bad_closed_member_count() {
     let mut log = Log::first(false);
     let row = object(2, 6, None, 3);
     log.row(row.clone());
-    log.catalog(&row, 0, 2, 19);
+    log.catalog(&row, row.tape_file_number * 3, 2, 19);
     let mut reference = log.reference();
     reference.member_count = 3;
     log.push(Record::Committed(commit(reference, 3, 10, 2)), &[]);
@@ -1743,15 +1757,26 @@ fn zero_extension_inside_final_frame_is_torn_only_through_eof() {
         let (summary, classification) = fold::replay(bytes.as_slice()).unwrap();
         assert_eq!(summary.closed_end, offset as u64);
         assert!(matches!(classification,Tail::Torn{offset:at,..} if at==offset as u64));
-        // Even one non-zero byte after the zero region forbids automatic repair.
+        // A full-sized filled region followed by garbage still requires repair;
+        // EOF-short bodies cannot distinguish such bytes from ordinary payload.
         bytes.push(1);
         assert_row_full_agreement(&bytes);
-        assert_eq!(
-            fault(fold::classify(&bytes).unwrap_err()),
-            Fault::NonZeroAfterZeros {
-                offset: (offset + end) as u64
-            }
-        );
+        if end < frame.len() {
+            assert_eq!(
+                fold::classify(&bytes).unwrap(),
+                Tail::Torn {
+                    offset: offset as u64,
+                    kind: TornKind::ShortBody
+                }
+            );
+        } else {
+            assert_eq!(
+                fault(fold::classify(&bytes).unwrap_err()),
+                Fault::NonZeroAfterZeros {
+                    offset: (offset + end) as u64
+                }
+            );
+        }
     }
     // A normal all-zero empty-payload CRC cannot excuse structural corruption.
     frame[PREFIX_LEN] ^= 1;
@@ -1871,16 +1896,17 @@ fn assert_row_full_agreement(bytes: &[u8]) {
 }
 
 #[test]
-fn short_body_with_interrupted_zero_run_requires_recovery() {
+fn eof_short_body_with_internal_zero_bytes_is_torn() {
     let mut frame = Vec::new();
     encode_frame(&mut frame, 1, &init(false), &[]).unwrap();
     frame.truncate(PREFIX_LEN + 1); // One actual structural data byte.
     frame.extend_from_slice(&[0, 0, 0, 0x07]);
     assert_row_full_agreement(&frame);
     assert_eq!(
-        fault(codec::classify_frames(&frame).unwrap_err()),
-        Fault::NonZeroAfterZeros {
-            offset: (PREFIX_LEN + 4) as u64
+        codec::classify_frames(&frame).unwrap(),
+        Tail::Torn {
+            offset: 0,
+            kind: TornKind::ShortBody
         }
     );
 }
@@ -1912,7 +1938,145 @@ fn row_and_full_classifier_agree_on_payload_zero_extension_and_damage() {
         );
         bytes.push(7);
         assert_row_full_agreement(&bytes);
-        let expected = Fault::NonZeroAfterZeros { offset: end as u64 };
-        assert_eq!(fault(codec::classify_frames(&bytes).unwrap_err()), expected);
+        if end < frame.len() {
+            assert_eq!(
+                codec::classify_frames(&bytes).unwrap(),
+                Tail::Torn {
+                    offset: 0,
+                    kind: TornKind::ShortBody
+                }
+            );
+        } else {
+            let expected = Fault::NonZeroAfterZeros { offset: end as u64 };
+            assert_eq!(fault(codec::classify_frames(&bytes).unwrap_err()), expected);
+        }
+    }
+}
+
+#[path = "store_tests.rs"]
+mod disk;
+
+#[test]
+fn parity_off_total_grows_and_refuses_regression_and_protection() {
+    let first = Log::first(false);
+    assert_eq!((first.summary().protected, first.summary().total), (0, 3));
+    assert!(first.summary().uncovered.is_empty());
+    for (total, protected, valid) in [(6, 0, true), (2, 0, false), (6, 1, false)] {
+        let mut log = Log::first(false);
+        let row = object(2, 6, None, 3);
+        log.row(row.clone());
+        log.catalog(&row, 6, 0, 31);
+        let mut c = commit(log.reference(), 3, 10, 2);
+        c.total = total;
+        c.protected = protected;
+        log.push(Record::Committed(c), &[]);
+        let result = fold::replay(log.bytes.as_slice());
+        assert_eq!(result.is_ok(), valid);
+        if let Ok((summary, _)) = result {
+            assert_eq!(summary.total, 6);
+            assert!(summary.uncovered.is_empty());
+        }
+    }
+}
+
+// Exercise both readers at every cut after a contradiction first becomes visible.
+fn short_prefix_fault(mut prefix: Vec<u8>, first_visible: usize, expected: Fault) {
+    let base = Log::first(false);
+    prefix.truncate(PREFIX_LEN);
+    for end in first_visible..PREFIX_LEN {
+        let mut bytes = base.bytes.clone();
+        bytes.extend_from_slice(&prefix[..end]);
+        assert_row_full_agreement(&bytes);
+        assert_eq!(
+            fault(fold::replay(bytes.as_slice()).unwrap_err()),
+            expected,
+            "cut={end}"
+        );
+    }
+}
+fn valid_next_prefix() -> Vec<u8> {
+    let base = Log::first(false);
+    let mut bytes = Vec::new();
+    encode_frame(
+        &mut bytes,
+        base.next(),
+        &Record::Committed(commit(base.reference(), 2, 6, 1)),
+        &[],
+    )
+    .unwrap();
+    bytes
+}
+#[test]
+fn short_prefix_refuses_visible_version_contradictions() {
+    let mut bytes = valid_next_prefix();
+    bytes[0] = 2;
+    short_prefix_fault(bytes, 1, Fault::Version(2));
+    let mut bytes = valid_next_prefix();
+    bytes[1] = 1;
+    short_prefix_fault(bytes, 2, Fault::Version(257));
+}
+#[test]
+fn short_prefix_refuses_visible_unknown_and_reserved_tags() {
+    for (value, expected) in [
+        (11u16, Fault::UnknownTag(11)),
+        (16, Fault::ReservedTag(Tag::FinalizationPlanned)),
+    ] {
+        let mut bytes = valid_next_prefix();
+        bytes[2..4].copy_from_slice(&value.to_le_bytes());
+        short_prefix_fault(bytes, 3, expected);
+    }
+    let mut bytes = valid_next_prefix();
+    bytes[3] = 1;
+    short_prefix_fault(bytes, 4, Fault::UnknownTag(259));
+}
+#[test]
+fn short_prefix_refuses_visible_body_length_overflow() {
+    let mut bytes = valid_next_prefix();
+    bytes[4..8].copy_from_slice(&(MAX_FRAME_BODY as u32 + 1).to_le_bytes());
+    short_prefix_fault(bytes, 8, Fault::FrameTooLarge);
+    let mut bytes = valid_next_prefix();
+    bytes[4..8].copy_from_slice(&(MAX_FRAME_BODY as u32).to_le_bytes());
+    bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+    short_prefix_fault(bytes, 9, Fault::FrameTooLarge);
+}
+#[test]
+fn short_prefix_refuses_visible_sequence_mismatch() {
+    let base = Log::first(false);
+    let mut bytes = valid_next_prefix();
+    bytes[12..20].copy_from_slice(&(base.next() + 1).to_le_bytes());
+    short_prefix_fault(
+        bytes,
+        13,
+        Fault::Sequence {
+            expected: base.next(),
+            actual: base.next() + 1,
+        },
+    );
+    let mut bytes = valid_next_prefix();
+    bytes[19] = 1;
+    short_prefix_fault(
+        bytes,
+        20,
+        Fault::Sequence {
+            expected: base.next(),
+            actual: base.next() + (1 << 56),
+        },
+    );
+}
+#[test]
+fn short_prefix_accepts_compatible_partial_sequence_bytes() {
+    let expected = 0x1122334455667788;
+    let mut bytes = valid_next_prefix();
+    bytes[12..20].copy_from_slice(&u64::to_le_bytes(expected));
+    for cut in 13..PREFIX_LEN {
+        let mut decoder = Decoder::at(&bytes[..cut], expected, 0);
+        assert!(decoder.next_frame().unwrap().is_none());
+        assert_eq!(
+            decoder.tail(),
+            Tail::Torn {
+                offset: 0,
+                kind: TornKind::ShortPrefix
+            }
+        );
     }
 }

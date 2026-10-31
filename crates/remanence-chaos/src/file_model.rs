@@ -284,6 +284,22 @@ impl DurableDirectory for MemoryDirectory {
         self.event(FileEvent::Rename(from.to_owned(), to.to_owned()));
         Ok(())
     }
+    fn rename_noreplace(&self, from: &Path, to: &Path) -> io::Result<()> {
+        {
+            let mut state = self.state.lock().expect("file model lock");
+            if state.entries.contains_key(to) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "publication target exists",
+                ));
+            }
+            let id = state.entries.remove(from).ok_or_else(missing_file)?;
+            state.known_paths.insert(to.to_owned());
+            state.entries.insert(to.to_owned(), id);
+        }
+        self.event(FileEvent::Rename(from.to_owned(), to.to_owned()));
+        Ok(())
+    }
     fn sync(&self, path: &Path) -> io::Result<()> {
         {
             let mut state = self.state.lock().expect("file model lock");

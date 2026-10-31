@@ -129,10 +129,11 @@ impl Wire for Vec<u8> {
 }
 fn bytes(r: &mut dyn Read, major: u8) -> io::Result<Vec<u8>> {
     let len = expect(r, major)?;
+    // A catalog spans frames, but each scalar field is bounded independently.
+    // Refuse before allocating or consuming bytes from subsequent fields.
     if len > MAX_FRAME_BODY as u64 {
         return Err(invalid());
     }
-    // Grow only from actual bytes, not a hostile declared length.
     let mut out = Vec::new();
     let read = r.take(len).read_to_end(&mut out)?;
     if read as u64 != len {
