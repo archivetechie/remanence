@@ -1283,6 +1283,8 @@ async fn fetch_object(
 ) -> AppResult<pb::ObjectRecord> {
     Ok(catalog_client
         .get_object(pb::GetObjectRequest {
+            // An object id lookup needs no pool scope.
+            pool_id: String::new(),
             key: Some(pb::get_object_request::Key::ObjectId(
                 object_id.as_bytes().to_vec(),
             )),
