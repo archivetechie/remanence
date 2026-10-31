@@ -173,6 +173,18 @@ impl RawTapeSink for ActivityTrackingRawTapeSink<'_> {
     }
 }
 
+/// Whether a tracked write attempt on `drive` may have changed the tape.
+/// The drive adapters refuse a missing, expired or mismatched append admission
+/// before dispatch; such a refusal leaves the media unchanged and is a plain
+/// error. Any media-modifying command handed to the transport stays fenceable.
+pub(super) fn raw_write_reached_drive(
+    drive: &DriveHandle,
+    dispatches_before: u64,
+    write_attempted: bool,
+) -> bool {
+    write_attempted && drive.media_write_dispatch_count() != dispatches_before
+}
+
 #[cfg(test)]
 pub(super) fn parity_journal_directory(
     cfg: &impl super::terminal_types::TerminalConfig,

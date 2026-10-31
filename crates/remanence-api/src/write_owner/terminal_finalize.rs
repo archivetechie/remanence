@@ -1758,10 +1758,14 @@ pub(super) fn finalize_terminal_with_parity_journal(
         let snapshot = prefix_snapshot.as_ref().ok_or_else(|| {
             Status::internal("bounded parity prefix authority snapshot is missing")
         })?;
+        // A complete, unpublished prefix is adopted without rewriting, but its
+        // zero-count barrier is still a media write at `tail_start_lba`, where
+        // reconciliation left the cursor. The admission ends with this block.
         let _admission = if matches!(
             prefix_evidence,
             TerminalPrefixReconcileEvidence::Absent
                 | TerminalPrefixReconcileEvidence::TornRewritable
+                | TerminalPrefixReconcileEvidence::Complete
         ) {
             Some(admit_terminal_write(
                 &spec.actor,
@@ -1776,6 +1780,7 @@ pub(super) fn finalize_terminal_with_parity_journal(
         } else {
             None
         };
+        let dispatches_before = drive.media_write_dispatch_count();
         let mut raw_write_attempted = false;
         let close_result = {
             let mut raw = DriveHandleRawSink::new(drive);
@@ -1813,6 +1818,11 @@ pub(super) fn finalize_terminal_with_parity_journal(
                 )
             }
         };
+        let raw_write_attempted = super::checkpoint::raw_write_reached_drive(
+            drive,
+            dispatches_before,
+            raw_write_attempted,
+        );
         let prefix_result = match close_result {
             Ok(result) => result,
             Err(error) => {

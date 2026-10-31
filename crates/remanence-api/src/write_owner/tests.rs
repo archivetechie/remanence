@@ -2099,6 +2099,74 @@ fn parity_raw_activity_tracks_write_entry_but_not_position_queries() {
     );
 }
 
+#[test]
+fn parity_raw_admission_refusal_before_dispatch_is_not_fenceable() {
+    const BLOCK_SIZE: u32 = 4096;
+    let tape_uuid = [0x48; 16];
+    let bootstrap = crate::build_tape_bootstrap(
+        tape_uuid,
+        BLOCK_SIZE,
+        ParityConfig::None,
+        "2026-10-31T00:00:00Z",
+        "test",
+    );
+    let mut block = vec![0; BLOCK_SIZE as usize];
+    write_bootstrap_block(&bootstrap, &mut block).expect("encode bootstrap");
+    let mut tape = VirtualTape::empty(1024 * 1024, BLOCK_SIZE);
+    tape.records = vec![Record::Block(block), Record::Filemark];
+    let mut world = VirtualWorld::single_drive(
+        "LIB-ADMISSION-REFUSAL",
+        0x0100,
+        "DRV-ADMISSION-REFUSAL",
+        0x0400,
+        1,
+    );
+    world.put_tape_in_drive(0x0100, "ADMIT001", Some(0x0400), tape);
+    let world = Arc::new(Mutex::new(world));
+    let mut library = open_model_library(Arc::clone(&world));
+    let serial = library.library().serial.clone();
+    let policy = remanence_library::StaticAllowlist::new([serial.as_str()]);
+    let mut drive = library
+        .open_drive(0x0100, &policy)
+        .expect("open model drive");
+    drive.locate(2).expect("locate the bootstrap EOD");
+
+    // Without an admission the adapter refuses the barrier before dispatch.
+    let before = drive.media_write_dispatch_count();
+    let mut write_attempted = false;
+    let error = {
+        let mut raw = DriveHandleRawSink::new(&mut drive);
+        let mut tracked = ActivityTrackingRawTapeSink::new(&mut raw, &mut write_attempted);
+        tracked
+            .write_filemarks(0, false)
+            .expect_err("an unadmitted barrier is refused")
+    };
+    assert!(
+        error.to_string().contains("missing append admission"),
+        "{error}"
+    );
+    assert!(write_attempted, "the tracker saw the write attempt");
+    assert!(
+        !raw_write_reached_drive(&drive, before, write_attempted),
+        "a refusal that dispatched nothing must not fence the tape"
+    );
+
+    // An admitted barrier reaches the drive and stays fenceable.
+    let _admission =
+        crate::append_admission::admit_initialized_tape(&mut drive, tape_uuid, BLOCK_SIZE)
+            .expect("admit the initialized tape");
+    let before = drive.media_write_dispatch_count();
+    let mut write_attempted = false;
+    {
+        let mut raw = DriveHandleRawSink::new(&mut drive);
+        let mut tracked = ActivityTrackingRawTapeSink::new(&mut raw, &mut write_attempted);
+        tracked
+            .write_filemarks(0, false)
+            .expect("an admitted barrier dispatches");
+    }
+    assert!(raw_write_reached_drive(&drive, before, write_attempted));
+}
+
 #[tokio::test]
 async fn daemon_rejects_corrupt_checkpoint_authority_before_position_or_config_commands() {
     const BLOCK_SIZE: u32 = 256 * 1024;
