@@ -39,7 +39,7 @@ chacha20           = { version = "0.10", features = ["zeroize"] }
 ciborium            = "0.2"
 clap                = { version = "4",   features = ["derive"] }
 hkdf                = "0.13"
-hpke                = { version = "=0.14.1", default-features = false, features = ["alloc", "x25519", "chacha"] }
+hpke                = { version = "=0.15.1", default-features = false, features = ["alloc", "x25519", "chacha"] }
 getrandom           = "=0.4.3"
 rand_core           = "=0.10.1"
 hmac                = { version = "0.13", features = ["zeroize"] }
