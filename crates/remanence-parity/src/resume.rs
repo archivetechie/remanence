@@ -53,7 +53,9 @@ pub fn resume_record_result<T>(result: Result<T, JournalError>) -> Result<T, Par
             | JournalError::Codec(_)
             | JournalError::InvalidBundleShape(_)
             | JournalError::RecoveryRequired(_) => true,
-            JournalError::UntrustedVolume(_) | JournalError::UnsupportedOperation(_) => false,
+            JournalError::UntrustedVolume(_)
+            | JournalError::UnsupportedOperation(_)
+            | JournalError::AfterDurable(_) => false,
         };
         if content {
             ParityError::ResumeAppend(error.to_string())
@@ -831,7 +833,7 @@ pub fn plan_checkpointed_terminal_index_close(
 /// exact TerminalPrefix/checkpoint transition used by the ordinary sink path.
 pub fn close_checkpointed_terminal_index_prefix(
     raw: &mut dyn RawTapeSink,
-    journal: &mut dyn TapeReportPublisher,
+    _journal: &mut dyn TapeReportPublisher,
     snapshot: &FrozenFileRows,
     expected_plan: &TerminalPrefixPlan,
     evidence: TerminalPrefixReconcileEvidence,
@@ -888,7 +890,8 @@ pub fn close_checkpointed_terminal_index_prefix(
             position_after, observed, expected_plan.tail_start_lba
         )));
     }
-    let publication = journal.publish_terminal_prefix(&(&expected_plan.committed_bundle).into())?;
+    let publication =
+        crate::authority::PublicationReceipt::pending(expected_plan.media_publication()?);
     Ok(CheckpointedTerminalPrefixCloseResult {
         publication,
         used_tape_blocks: observed.lba,
@@ -1574,7 +1577,7 @@ where
 
 fn emit_resume_rebuilt_sidecars_to_raw_inner<F>(
     sink: &mut dyn RawTapeSink,
-    mut journal: Option<&mut dyn TapeReportPublisher>,
+    journal: Option<&mut dyn TapeReportPublisher>,
     plan: ResumeAppendPlan,
     rebuilt_sidecars: &[ResumeRebuiltSidecar],
     expected_tape_uuid: [u8; 16],
@@ -1661,17 +1664,6 @@ where
         durable_boundary
             .commit_tape_file(TapeFileKind::ParitySidecar, expected_tape_file_number)
             .map_err(resume_boundary_error)?;
-        if let Some(journal) = journal.as_deref_mut() {
-            journal.publish_commit(
-                &(&crate::journal::CommittedBundle {
-                    kind: crate::journal::CommittedBundleKind::ResumeSidecars,
-                    entries: vec![summary.tape_file_entry()],
-                    highest_protected_ordinal: summary.protected_ordinal_end_exclusive,
-                    total_committed_ordinals: plan.next_data_ordinal,
-                })
-                    .into(),
-            )?;
-        }
         emitted.push(summary);
     }
 
@@ -4831,11 +4823,11 @@ mod tests {
         for unit in &result.publication.items {
             assert_eq!(
                 unit.disposition,
-                crate::authority::PublicationDisposition::Appended
+                crate::authority::PublicationDisposition::Pending
             );
             assert_eq!(
                 unit.durability,
-                crate::authority::PublicationDisposition::Appended
+                crate::authority::PublicationDisposition::Pending
             );
         }
         expected_units.extend(crate::authority::fixtures::appended_legacy_units(
@@ -4878,8 +4870,8 @@ mod tests {
         .expect("adopt complete planned media");
         assert_eq!(adopted.publication.items.len(), 1);
         assert!(adopted.publication.items.iter().all(|unit| unit.disposition
-            == crate::authority::PublicationDisposition::AlreadyPresent
-            && unit.durability == crate::authority::PublicationDisposition::AlreadyPresent));
+            == crate::authority::PublicationDisposition::Pending
+            && unit.durability == crate::authority::PublicationDisposition::Pending));
         assert_eq!(journal.published_units_for_test().unwrap(), expected_units);
 
         assert_eq!(
@@ -4896,7 +4888,7 @@ mod tests {
             highest_protected_ordinal: bounded.committed_bundle.highest_protected_ordinal,
             total_committed_ordinals: bounded.committed_bundle.total_committed_ordinals,
         };
-        assert!(journal
+        assert!(!journal
             .terminal_prefix_transition_is_durable(&bounded.committed_bundle, &checkpoint)
             .expect("inspect durable bounded transition"));
     }

@@ -1,4 +1,4 @@
-//! P1 C2 oracles: migrate real v0.1.0-shaped data and preserve assignment authority.
+//! Predecessor-reset and assignment-authority oracles for real v0.1.0-shaped data.
 //! SQL is used only for fixture construction, observation, and a crash-cut trigger;
 //! all assignments and reconciliation under test use CatalogIndex entry points.
 
@@ -8,7 +8,7 @@ use rusqlite::{params, Connection};
 const AT: &str = "2026-10-15T00:00:00Z";
 
 #[test]
-fn c2_schema_v010_backfills_label_and_generation_provenance() {
+fn c2_schema_v010_requires_reset_without_backfilling_provenance() {
     // Exercise both the released schema (no assignment_generation column) and
     // a pre-migration additive shape with existing nonzero projection versions.
     for has_generation in [false, true] {
@@ -54,60 +54,14 @@ fn c2_schema_v010_backfills_label_and_generation_provenance() {
             }
         }
         drop(db);
-        drop(CatalogIndex::open(&path).expect("C2: preserve and migrate legacy rows"));
-        // Reopening cannot append another migration event.
-        drop(CatalogIndex::open(&path).unwrap());
-        let db = Connection::open(&path).unwrap();
-        for (id, label, generation, pool, assignment_generation) in cases {
-            let row = db.query_row(
-                "SELECT voltag, voltag_source, cartridge_generation, generation_source,
-                    pool_id, block_size, state, assignment_generation FROM tapes WHERE tape_uuid = ?1",
-                [[id; 16].as_slice()],
-                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?,
-                    r.get::<_, Option<String>>(2)?, r.get::<_, Option<String>>(3)?,
-                    r.get::<_, Option<String>>(4)?, r.get::<_, i64>(5)?,
-                    r.get::<_, String>(6)?, r.get::<_, i64>(7)?)),
-            ).unwrap();
-            assert_eq!(row.0.as_deref(), label);
-            if label.is_some() {
-                assert_eq!(row.1.as_deref(), Some("changer"));
-            }
-            assert_eq!(row.2.as_deref(), generation);
-            assert_eq!(row.3.as_deref(), generation.map(|_| "label"));
-            assert_eq!(
-                (row.4.as_deref(), row.5, row.6.as_str()),
-                (pool, 262144, "ready")
-            );
-            if has_generation {
-                assert_eq!(
-                    row.7, assignment_generation,
-                    "preserve pre-migration projection version"
-                );
-            }
-            let rows = ledger(&db, id);
-            if let Some(pool) = pool {
-                assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0].1.as_deref(), Some(pool));
-                assert_eq!(rows[0].2, "rule");
-                assert_eq!(
-                    rows[0].3, row.7,
-                    "ledger exactly matches projection generation"
-                );
-            } else {
-                assert!(rows.is_empty(), "unassigned tape has no backfill event");
-            }
+        let before = std::fs::read(&path).unwrap();
+        for _ in 0..2 {
+            let error = CatalogIndex::open(&path).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains(remanence_state::authority_layout::RESET_REQUIRED));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
         }
-        assert_eq!(
-            db.query_row("SELECT count(*) FROM tapes", [], |r| r.get::<_, i64>(0))
-                .unwrap(),
-            4
-        );
-        assert_eq!(
-            db.query_row("SELECT count(*) FROM tape_pool_assignments", [], |r| r
-                .get::<_, i64>(0))
-                .unwrap(),
-            3
-        );
     }
 }
 

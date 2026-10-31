@@ -815,6 +815,7 @@ async fn manual_finalize_tape_critical(
     let pending_intent = remanence_state::TapeAuthority::open(
         state.checkpoint_journal_dir.as_path(),
         actor_request.tape_uuid,
+        state.index_path.as_path(),
     )
     .and_then(|j| j.pending_finalization())
     .map_err(crate::status_from_state_error)?;
@@ -1227,6 +1228,7 @@ pub(crate) fn spawn_startup_terminal_recoveries(state: ApiState) {
             let journal = match remanence_state::TapeAuthority::open(
                 state.checkpoint_journal_dir.as_path(),
                 tape_uuid,
+                state.index_path.as_path(),
             ) {
                 Ok(journal) => journal,
                 Err(error) => {
@@ -3581,7 +3583,7 @@ mod tests {
             &cfg,
             0,
             &HashSet::new(),
-            &temp.path().join("checkpoints"),
+            &temp.path().join("tapes"),
         )
         .expect("batched selection should choose the loaded fresh tape");
         assert_eq!(batched.tape_uuid, FRESH_UUID);
@@ -5060,10 +5062,7 @@ mod tests {
             .clone_from(&object_id);
         checkpoint.objects[0].copy.object_id.clone_from(&object_id);
         checkpoint.objects[0].object_recovery_row.object_id = object_id.into_bytes();
-        let checkpoint_dir = index_path
-            .parent()
-            .expect("catalog parent")
-            .join("checkpoints");
+        let checkpoint_dir = index_path.parent().expect("catalog parent").join("tapes");
         let journal =
             remanence_state::authority::fixtures::AuthorityBuilder::new(&checkpoint_dir, tape_uuid)
                 .build()
@@ -5315,6 +5314,8 @@ mod tests {
                 .join("stale-companion-projection-failure.sqlite"),
         )
         .expect("open empty projection-failure catalog");
+        rusqlite::Connection::open(temp.path().join("stale-companion-projection-failure.sqlite")).unwrap()
+            .execute_batch("create trigger fail_native_projection before insert on tape_log_projection begin select raise(abort, 'injected projection failure'); end;").unwrap();
         crate::write_owner::preflight_automatic_terminal_completion(
             &mut projection_failure_index,
             crate::write_owner::ManualFinalizePreflightConfig {
@@ -5329,7 +5330,7 @@ mod tests {
         )
         .expect_err("failed sealed projection must not consume retry authority");
         let pending = stale_journal
-            .pending_finalization()
+            .finalization_status()
             .map(|intent| {
                 intent
                     .as_ref()
@@ -5581,7 +5582,7 @@ mod tests {
             .tempdir()
             .expect("tempdir");
         let index_path = temp.path().join("state.sqlite");
-        let checkpoint_dir = temp.path().join("checkpoints");
+        let checkpoint_dir = temp.path().join("tapes");
         let tape_uuid = [0xA5; 16];
         let pool_id = "async-finalize";
         let pool_config = TapePoolConfig {
@@ -6454,7 +6455,7 @@ mod tests {
             .tempdir()
             .expect("tempdir");
         let index_path = temp.path().join("state.sqlite");
-        let checkpoint_dir = temp.path().join("checkpoints");
+        let checkpoint_dir = temp.path().join("tapes");
         let tape_uuid = [0xA5; 16];
         let pool_id = "async-finalize";
         let pool_config = TapePoolConfig {

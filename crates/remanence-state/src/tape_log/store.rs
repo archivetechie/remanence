@@ -1,4 +1,4 @@
-//! Unwired per-tape disk authority. A stable companion flock covers creation,
+//! Per-tape disk authority. A stable companion flock covers creation,
 //! append and copy-prefix repair. Prepared groups are disk spools; staging writes
 //! provisional frames and fdatasyncs them before media work; completion writes
 //! only the closer and fsyncs it. Provisional durability never grants authority.
@@ -65,6 +65,37 @@ pub enum StoreError {
     /// Invalid repair boundary or append protocol.
     #[error("tape-log operation refused: {0}")]
     Refused(&'static str),
+    /// The catalog projection mark points inside the validated prefix, but
+    /// not at a decodable frame with the sequence it names.
+    #[error("tape-log projection mark does not name a decodable frame: {0}")]
+    ProjectionMarkInvalid(String),
+}
+/// Refusal for a log that is absent or shorter than its projection mark.
+pub const BELOW_PROJECTION_MARK: &str =
+    "tape log is below its projected-through sequence; recovery required";
+/// Refusal for a projection offset outside the validated closed prefix.
+pub const PROJECTION_MARK_MISMATCH: &str =
+    "tape-log projection mark does not match its validated boundary";
+/// Refusal for a projection mark that names a provisional frame.
+pub const PROJECTION_MARK_NOT_CLOSING: &str =
+    "tape-log projection sequence is not a closed boundary";
+impl StoreError {
+    /// The log is absent or ends below the catalog's projection mark.
+    pub fn is_below_projection(&self) -> bool {
+        matches!(
+            self,
+            Self::BelowProjection { .. } | Self::Refused(BELOW_PROJECTION_MARK)
+        )
+    }
+    /// The log reaches the catalog's projection mark, but the mark does not
+    /// name one of its closing frames. Only an operator can resolve this.
+    pub fn is_invalid_projection_mark(&self) -> bool {
+        matches!(
+            self,
+            Self::ProjectionMarkInvalid(_)
+                | Self::Refused(PROJECTION_MARK_MISMATCH | PROJECTION_MARK_NOT_CLOSING)
+        )
+    }
 }
 /// Identity bound by every file, independently of its frames and group digests.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,13 +191,18 @@ pub struct Store {
     pub(super) path: PathBuf,
     pub(super) header: Header,
     discover: bool,
+    projection_path: Option<PathBuf>,
 }
 impl Store {
     /// The supplied directory is the already durably provisioned
     /// `journal.dir/tapes` directory. Volume policy is checked here; directory
     /// provisioning belongs to the caller's state-layout initialization.
-    pub fn new(directory: impl AsRef<Path>, header: Header) -> Result<Self, StoreError> {
-        let store = Self::paths(directory.as_ref(), header)?;
+    pub fn new(
+        directory: impl AsRef<Path>,
+        header: Header,
+        index_path: &Path,
+    ) -> Result<Self, StoreError> {
+        let store = Self::paths(directory.as_ref(), header)?.bind_projection(index_path);
         remanence_parity::validate_trusted_journal_volume(&store.path)?;
         Ok(store)
     }
@@ -187,11 +223,16 @@ impl Store {
             path,
             header,
             discover: false,
+            projection_path: None,
         })
     }
     /// Open by identity without consulting the catalog. Fresh geometry is bound
     /// by the first report while holding the exclusive lease.
-    pub fn open(directory: impl AsRef<Path>, tape_uuid: [u8; 16]) -> Result<Self, StoreError> {
+    pub fn open(
+        directory: impl AsRef<Path>,
+        tape_uuid: [u8; 16],
+        index_path: &Path,
+    ) -> Result<Self, StoreError> {
         let mut store = Self::new(
             directory,
             Header {
@@ -199,6 +240,7 @@ impl Store {
                 block_size: 262144,
                 scheme: None,
             },
+            index_path,
         )?;
         store.discover = true;
         store.discover_header()?;
@@ -223,7 +265,9 @@ impl Store {
         Ok(store)
     }
     fn discover_header(&mut self) -> Result<(), StoreError> {
-        let _lock = self.lock(false)?;
+        // Headers are immutable and first publication is an atomic rename.
+        // Admission revalidates identity under its stable lease; merely opening
+        // a factory neither takes a second lock nor creates authority.
         match fs::File::open(&self.path) {
             Ok(mut file) => self.header = Header::decode(&mut file, self.header.tape_uuid)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => (),
@@ -244,6 +288,20 @@ impl Store {
         }
         Ok(current)
     }
+    /// Bind the configured catalog once at factory construction. Every writer
+    /// reads its current floor under the tape lease, including terminal recovery.
+    pub(crate) fn bind_projection(mut self, path: &Path) -> Self {
+        self.projection_path = Some(path.to_path_buf());
+        self
+    }
+    fn projection_floor(&self) -> Result<u64, StoreError> {
+        match &self.projection_path {
+            Some(path) => crate::CatalogIndex::open_read_only(path)
+                .and_then(|index| index.projected_through_sequence(self.header.tape_uuid))
+                .map_err(|e| StoreError::Io(io::Error::other(e))),
+            None => Ok(0), // explicit low-level fixture/inspection store
+        }
+    }
     /// Active file path, for diagnostics and offline inspection.
     pub fn path(&self) -> &Path {
         &self.path
@@ -261,7 +319,10 @@ impl Store {
             } else {
                 FlockArg::LockSharedNonblock
             },
-        )
+        ).map_err(|error| {
+            tracing::warn!(tape_uuid = %uuid::Uuid::from_bytes(self.header.tape_uuid), operation = if exclusive { "writer" } else { "snapshot" }, %error, "tape-log lock refusal");
+            error
+        })
     }
     /// Capture inode/header/end under a short shared lease, then validate unlocked.
     pub fn snapshot(&self) -> Result<super::snapshot::Snapshot, StoreError> {
@@ -275,10 +336,19 @@ impl Store {
     /// Acquire the only mutation capability. Torn tails are replaced before append.
     /// `fresh` refuses an existing active file even if it contains no closed group.
     pub fn acquire(&self, fresh: bool) -> Result<Lease, StoreError> {
+        self.acquire_inner(fresh, false)
+    }
+    /// Recovery-only owner: inspection is allowed, but publication stays fenced
+    /// until the caller proves the physical tail under this same lease.
+    pub(crate) fn acquire_for_tail_reconciliation(&self) -> Result<Lease, StoreError> {
+        self.acquire_inner(false, true)
+    }
+    fn acquire_inner(&self, fresh: bool, recovery: bool) -> Result<Lease, StoreError> {
         let lock = self.lock(true)?;
         self.cleanup_temporary()?;
         self.check_ambiguity()?;
-        if self.path.with_extension("repair-required").try_exists()? {
+        let repair_pending = self.path.with_extension("repair-required").try_exists()?;
+        if repair_pending && !recovery {
             return Err(StoreError::Refused(
                 "explicit repair requires physical-tail reconciliation before append",
             ));
@@ -294,6 +364,13 @@ impl Store {
                 "active log has no closed initialization; fresh creation cannot replace it",
             ));
         }
+        let projected_through_sequence = self.projection_floor()?;
+        if snapshot.summary.last_closed_sequence < projected_through_sequence {
+            return Err(StoreError::BelowProjection {
+                requested: snapshot.summary.last_closed_sequence,
+                projected: projected_through_sequence,
+            });
+        }
         let fold = Fold::from_validated(snapshot.summary.clone());
         Ok(Lease {
             store: current,
@@ -302,15 +379,20 @@ impl Store {
             plan_base: snapshot.plan_base,
             tail: snapshot.tail,
             fenced: false,
+            repair_pending,
+            projected_through_sequence,
+            publication_observer: None,
         })
     }
-    fn check_ambiguity(&self) -> Result<(), StoreError> {
-        if process_fences()
+    pub(super) fn has_ambiguity(&self) -> Result<bool, StoreError> {
+        Ok(process_fences()
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .contains(&self.path)
-            || self.path.with_extension("ambiguous").try_exists()?
-        {
+            || self.path.with_extension("ambiguous").try_exists()?)
+    }
+    fn check_ambiguity(&self) -> Result<(), StoreError> {
+        if self.has_ambiguity()? {
             Err(StoreError::Fenced)
         } else {
             Ok(())
@@ -338,11 +420,21 @@ impl Store {
     /// prefix to a new inode, fsync it and its replacement name, then retire the
     /// ambiguity fence durably. A physical-tail repair fence is never cleared here.
     pub fn clear_ambiguity(&self) -> Result<(), StoreError> {
+        self.clear_ambiguity_above(0)
+    }
+    /// Restart reconciliation may not discard an acknowledged projected group.
+    pub fn clear_ambiguity_above(&self, projected: u64) -> Result<(), StoreError> {
         let _lock = self.lock(true)?;
         self.cleanup_temporary()?;
         let result = (|| -> Result<(), StoreError> {
             let current = self.current_header()?;
             let snapshot = super::snapshot::Captured::open(&current)?.validate()?;
+            if snapshot.summary().last_closed_sequence < projected {
+                return Err(StoreError::BelowProjection {
+                    requested: snapshot.summary().last_closed_sequence,
+                    projected,
+                });
+            }
             if self.path.try_exists()? {
                 if snapshot.summary().is_fresh() {
                     return Err(StoreError::Refused(
@@ -389,9 +481,34 @@ impl Store {
         }
         Ok(())
     }
-    /// Explicit corruption repair. B3a has no projection rebuild transaction, so
-    /// cuts below the supplied mark are always refused. The exact damaged inode
-    /// is archived and hashed before atomic installation of the validated prefix.
+    /// Inspect a frozen boundary and damage without modifying authority.
+    /// Read-only: inspection never creates the lease file. Every owner creates
+    /// it before publishing, so a log without one (for example, restored from a
+    /// copy) has no live owner and is captured without a shared lease.
+    pub fn inspect_tail(&self) -> Result<TailInspection, StoreError> {
+        let lease = match File::open(self.path.with_extension("lock")) {
+            Ok(file) => Some(lock(file, FlockArg::LockSharedNonblock)?),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let captured = super::snapshot::Captured::open(&self.current_header()?)?;
+        drop(lease);
+        captured.inspect_tail()
+    }
+    /// Validate the proposed retained prefix without archiving or replacing any
+    /// bytes, so the state owner can protect accepted terminal obligations first.
+    pub(crate) fn preview_repair(
+        &self,
+        through: u64,
+    ) -> Result<super::snapshot::Snapshot, StoreError> {
+        let _lock = self.lock(false)?;
+        super::snapshot::Captured::open(&self.current_header()?)?.repair_prefix(
+            through,
+            self.path.with_extension("repair-required").try_exists()?,
+        )
+    }
+    /// Explicit corruption repair, retaining every valid closed group. The
+    /// caller must rebuild the tape projection when cutting below its mark.
     pub fn repair_tail(&self, through: u64, projected: u64) -> Result<RepairEvidence, StoreError> {
         if through < projected {
             return Err(StoreError::BelowProjection {
@@ -442,6 +559,7 @@ impl Store {
             through_sequence: through,
         };
         let record = RepairRecord {
+            operator: operator_name(),
             tape_uuid: self.header.tape_uuid,
             retained_digest: file_digest(&self.path, end)?,
             evidence,
@@ -505,6 +623,7 @@ pub struct RepairEvidence {
     /// Complete original damaged file, including its header.
     pub archive: PathBuf,
     /// SHA-256 over every archived byte.
+    #[serde(with = "hex_bytes")]
     pub digest: [u8; 32],
     /// Original byte length.
     pub original_len: u64,
@@ -512,6 +631,28 @@ pub struct RepairEvidence {
     pub retained_end: u64,
     /// Validated last closed sequence.
     pub through_sequence: u64,
+}
+/// Read-only damaged-tail diagnosis; no missing authority is inferred.
+#[derive(Debug, serde::Serialize)]
+pub struct TailInspection {
+    /// Last fully validated closing sequence.
+    pub through_sequence: u64,
+    /// Exclusive end of that closed prefix.
+    pub valid_bytes: u64,
+    /// Captured file length.
+    pub original_bytes: u64,
+    /// Corruption or unclosed suffix, absent for a complete log.
+    pub damage: Option<String>,
+}
+/// Release fault seam installed by the actor. `after` is true only after log
+/// fsync and first-creation directory fsync, before any summary or SQL projection.
+#[derive(Clone)]
+pub struct PublicationObserver(pub std::sync::Arc<PublicationCallback>);
+type PublicationCallback = dyn Fn(&Record, u64, bool) -> io::Result<()> + Send + Sync;
+impl std::fmt::Debug for PublicationObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PublicationObserver")
+    }
 }
 /// Exclusive owner; no in-place truncation is ever performed.
 #[derive(Debug)]
@@ -522,8 +663,99 @@ pub struct Lease {
     plan_base: super::snapshot::PlanBase,
     tail: Tail,
     fenced: bool,
+    repair_pending: bool,
+    projected_through_sequence: u64,
+    publication_observer: Option<PublicationObserver>,
 }
 impl Lease {
+    pub(crate) fn repair_pending(&self) -> bool {
+        self.repair_pending
+    }
+    /// The recovery owner has proved the exact retained cursor and completed any
+    /// explicitly confirmed physical supersede. Keep the original repair record
+    /// and archive; durably record reconciliation before removing its fence.
+    pub(crate) fn reconcile_repaired_tail(
+        &mut self,
+        cursor: CommitCursor,
+    ) -> Result<(), StoreError> {
+        self.check()?;
+        self.check_projection_floor()?;
+        if !self.repair_pending {
+            return Ok(());
+        }
+        if cursor != self.summary().cursor {
+            return Err(StoreError::Refused(
+                "physical repair cursor differs from retained authority",
+            ));
+        }
+        let fence = self.store.path.with_extension("repair-required");
+        let record: RepairRecord = serde_json::from_reader(fs::File::open(&fence)?.take(16 * 1024))
+            .map_err(|_| StoreError::Refused("invalid repair record"))?;
+        if record.tape_uuid != self.header().tape_uuid
+            || record.evidence.through_sequence != self.summary().last_closed_sequence
+            || record.evidence.retained_end != self.summary().closed_end
+            || fs::metadata(self.store.path())?.len() != record.evidence.retained_end
+            || file_digest(self.store.path(), record.evidence.retained_end)?
+                != record.retained_digest
+        {
+            return Err(StoreError::Refused(
+                "repaired authority changed before physical reconciliation",
+            ));
+        }
+        let result = (|| -> Result<(), StoreError> {
+            let mut evidence = Temporary::new(&self.store, "repair-reconciled")?;
+            serde_json::to_writer(
+                &mut evidence.file,
+                &serde_json::json!({
+                    "repair": record,
+                    "physical_tail_reconciliation_required": false,
+                    "observed_partition": cursor.partition,
+                    "observed_lba": cursor.lba.to_string(),
+                    "tape_log_sequence": self.summary().last_closed_sequence.to_string(),
+                    "tape_incarnation": 1,
+                    "operator": operator_name(),
+                }),
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            evidence.file.sync_all()?;
+            evidence.keep = true;
+            File::open(&self.store.directory)?.sync_all()?;
+            fs::remove_file(&fence)?;
+            File::open(&self.store.directory)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.fenced = true;
+            self.store.fence_ambiguity();
+        } else {
+            self.repair_pending = false;
+        }
+        result
+    }
+    /// Install the actor's one before/after-fsync pair.
+    pub fn set_publication_observer(&mut self, observer: PublicationObserver) {
+        self.publication_observer = Some(observer);
+    }
+
+    /// Bind the catalog's transactional projection floor before any append or
+    /// automatic torn-tail repair. A missing acknowledged group is recovery
+    /// required even when its remaining bytes look like an ordinary torn tail.
+    pub fn set_projection_floor(&mut self, sequence: u64) -> Result<(), StoreError> {
+        if sequence < self.projected_through_sequence {
+            return Err(StoreError::Refused("projection floor cannot regress"));
+        }
+        self.projected_through_sequence = sequence;
+        self.check_projection_floor()
+    }
+    fn check_projection_floor(&self) -> Result<(), StoreError> {
+        if self.summary().last_closed_sequence < self.projected_through_sequence {
+            return Err(StoreError::BelowProjection {
+                requested: self.summary().last_closed_sequence,
+                projected: self.projected_through_sequence,
+            });
+        }
+        Ok(())
+    }
     /// Header identity held by this owner.
     pub fn header(&self) -> &Header {
         &self.store.header
@@ -562,13 +794,18 @@ impl Lease {
     /// Create a bounded disk spool at this lease's next sequence and offset.
     pub fn prepare(&self) -> Result<GroupWriter, StoreError> {
         self.check()?;
+        if self.repair_pending {
+            return Err(StoreError::Refused(
+                "physical-tail reconciliation is required before publication",
+            ));
+        }
         GroupWriter::new(
             &self.store,
             self.summary().last_closed_sequence + 1,
             self.summary().closed_end,
         )
     }
-    fn check(&self) -> Result<(), StoreError> {
+    pub(crate) fn check(&self) -> Result<(), StoreError> {
         if self.fenced {
             Err(StoreError::Fenced)
         } else {
@@ -579,8 +816,21 @@ impl Lease {
     /// frame separately and fdatasync it before the media barrier. The retained
     /// trial has no closer. A failed data sync rolls back the provisional prefix
     /// under this lease before returning a known pre-media I/O failure.
-    pub fn stage(&mut self, mut group: GroupWriter) -> Result<Staged<'_>, StoreError> {
+    pub fn stage(&mut self, group: GroupWriter) -> Result<Staged<'_>, StoreError> {
+        self.stage_inner(group, true)
+    }
+    fn stage_inner(
+        &mut self,
+        mut group: GroupWriter,
+        before_media: bool,
+    ) -> Result<Staged<'_>, StoreError> {
         self.check()?;
+        if self.repair_pending {
+            return Err(StoreError::Refused(
+                "physical-tail reconciliation is required before publication",
+            ));
+        }
+        self.check_projection_floor()?;
         if group.offset != self.summary().closed_end
             || group.sequence != self.summary().last_closed_sequence + 1
         {
@@ -633,7 +883,7 @@ impl Lease {
         if let Err(error) = copied {
             return Err(self.ambiguous(error));
         }
-        if group.next != group.sequence {
+        if before_media && group.next != group.sequence {
             if let Err(error) = output.sync_data() {
                 // No media barrier has run and no closer was written. Restore
                 // only the already acknowledged prefix, preserving old snapshots.
@@ -671,7 +921,118 @@ impl Lease {
         writer.temp.file.seek(SeekFrom::Start(0))?;
         self.fold
             .preflight((&mut writer.temp.file).chain(bytes.as_slice()))?;
-        self.stage(writer)?.complete(&closer)
+        self.stage_inner(
+            writer,
+            !matches!(
+                closer,
+                Record::TerminalPrefix { .. } | Record::ComponentWritten { .. }
+            ),
+        )?
+        .complete(&closer)
+    }
+    /// Stage provisional frames while retaining the exclusive OS lease, without
+    /// keeping a Rust mutex guard across media I/O. Only this owner can complete.
+    pub fn stage_detached(&mut self, group: GroupWriter) -> Result<StagedGroup, StoreError> {
+        let Staged {
+            group,
+            trial,
+            output,
+            temporary,
+            ..
+        } = self.stage(group)?;
+        Ok(StagedGroup {
+            group,
+            trial,
+            output,
+            temporary,
+        })
+    }
+    /// Cancel a group for which no closing append has been attempted. Only a
+    /// successfully synced rollback makes abandonment of the media suffix safe.
+    pub(crate) fn cancel_detached(&mut self, staged: StagedGroup) -> Result<(), StoreError> {
+        if !self.fenced
+            || staged.group.sequence != self.summary().last_closed_sequence + 1
+            || self.store.has_ambiguity()?
+        {
+            return Err(StoreError::Fenced);
+        }
+        let StagedGroup {
+            output, temporary, ..
+        } = staged;
+        drop(output);
+        if let Some(mut temp) = temporary {
+            fs::remove_file(&temp.path)?;
+            temp.keep = true;
+            File::open(&self.store.directory)?.sync_all()?;
+        } else {
+            replace_prefix(&self.store, self.summary().closed_end)?;
+        }
+        self.fenced = false;
+        Ok(())
+    }
+    /// Close a detached group after the actor has proved the media barrier.
+    pub fn complete_detached(
+        &mut self,
+        staged: StagedGroup,
+        closer: &Record,
+    ) -> Result<(), StoreError> {
+        if !self.fenced || staged.group.sequence != self.summary().last_closed_sequence + 1 {
+            return Err(StoreError::Refused(
+                "detached group does not belong to this pending lease",
+            ));
+        }
+        let StagedGroup {
+            group,
+            trial,
+            output,
+            temporary,
+        } = staged;
+        Staged {
+            lease: self,
+            group,
+            trial,
+            output,
+            temporary,
+        }
+        .complete(closer)
+    }
+}
+/// Provisional frames whose live lease remains fenced until completion. It owns
+/// no lock guard; dropping it cannot make the owner reusable.
+pub struct StagedGroup {
+    group: GroupWriter,
+    trial: Fold,
+    output: File,
+    temporary: Option<Temporary>,
+}
+impl std::fmt::Debug for StagedGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StagedGroup")
+            .field("sequence", &self.group.sequence)
+            .finish_non_exhaustive()
+    }
+}
+impl StagedGroup {
+    /// Complete range binding after any post-barrier sidecar rows are appended.
+    pub fn reference(&self, members: u64) -> GroupRef {
+        self.group.reference(members)
+    }
+    /// Add only the bounded physical rows learned at the barrier. Catalog
+    /// payloads were staged and data-synced before the media operation.
+    pub fn push_file_row(&mut self, row: TapeFileEntry) -> Result<(), StoreError> {
+        let record = Record::PayloadContinuation(Continuation {
+            group: self.group.sequence(),
+            chunk: Chunk::FileRow(row),
+        });
+        let bytes = self.group.encode(&record, &[])?;
+        let mut decoder = Decoder::at(bytes.as_slice(), self.group.next, self.group.end);
+        let frame = decoder
+            .next_frame()?
+            .ok_or(StoreError::Refused("empty staged row"))?;
+        self.trial.push(&frame).map_err(CodecError::from)?;
+        self.output.write_all(&bytes)?;
+        self.group.temp.file.seek(SeekFrom::End(0))?;
+        self.group.push(&record, &[])
     }
 }
 /// A staged group keeps the exclusive lease borrowed through the media barrier.
@@ -718,6 +1079,9 @@ impl Staged<'_> {
         }
         let durable = (|| -> io::Result<()> {
             self.output.write_all(&bytes)?;
+            if let Some(observer) = &self.lease.publication_observer {
+                (observer.0)(closer, self.group.next, false)?;
+            }
             self.output.sync_all()?;
             if let Some(temp) = &self.temporary {
                 durable_file::rename_noreplace(&temp.path, &self.lease.store.path)?;
@@ -727,6 +1091,10 @@ impl Staged<'_> {
         })();
         if let Err(error) = durable {
             return Err(self.lease.ambiguous(error));
+        }
+        if let Some(observer) = &self.lease.publication_observer {
+            (observer.0)(closer, self.group.next, true)
+                .map_err(|e| StoreError::AfterDurable(Box::new(e.into())))?;
         }
         self.group
             .temp
@@ -901,6 +1269,14 @@ fn replace_prefix(store: &Store, end: u64) -> Result<(), StoreError> {
     File::open(&store.directory)?.sync_all()?;
     Ok(())
 }
+#[cfg(test)]
+thread_local! {
+    static ON_READER_CONTENTION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn on_reader_contention(hook: impl FnOnce() + 'static) {
+    ON_READER_CONTENTION.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
 fn lock(mut file: File, operation: FlockArg) -> Result<Flock<File>, StoreError> {
     let deadline = Instant::now() + Duration::from_millis(250);
     loop {
@@ -920,6 +1296,12 @@ fn lock(mut file: File, operation: FlockArg) -> Result<Flock<File>, StoreError> 
         file = reader
             .unlock()
             .map_err(|(_, error)| StoreError::Locked(error))?;
+        #[cfg(test)]
+        ON_READER_CONTENTION.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().take() {
+                hook();
+            }
+        });
         std::thread::sleep(
             Duration::from_millis(5).min(deadline.saturating_duration_since(Instant::now())),
         );
@@ -940,7 +1322,10 @@ fn process_fences() -> &'static Mutex<BTreeSet<PathBuf>> {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct RepairRecord {
+    operator: String,
+    #[serde(with = "hex_bytes")]
     tape_uuid: [u8; 16],
+    #[serde(with = "hex_bytes")]
     retained_digest: [u8; 32],
     evidence: RepairEvidence,
     physical_tail_reconciliation_required: bool,
@@ -962,4 +1347,41 @@ fn file_digest(path: &Path, end: u64) -> io::Result<[u8; 32]> {
         return Err(io::ErrorKind::UnexpectedEof.into());
     }
     Ok(digest.finalize().into())
+}
+
+// Stable operator evidence, independent of Rust's diagnostic formatting.
+fn operator_name() -> String {
+    match crate::AuditActor::local_user() {
+        crate::AuditActor::User(name) | crate::AuditActor::Service(name) => name,
+        crate::AuditActor::System => "system".into(),
+    }
+}
+mod hex_bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer, const N: usize>(
+        bytes: &[u8; N],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&bytes.iter().map(|b| format!("{b:02x}")).collect::<String>())
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>, const N: usize>(
+        deserializer: D,
+    ) -> Result<[u8; N], D::Error> {
+        let text = String::deserialize(deserializer)?;
+        if text.len() != N * 2
+            || !text
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(serde::de::Error::custom(
+                "expected lowercase hexadecimal string",
+            ));
+        }
+        let mut bytes = [0; N];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16)
+                .map_err(serde::de::Error::custom)?;
+        }
+        Ok(bytes)
+    }
 }

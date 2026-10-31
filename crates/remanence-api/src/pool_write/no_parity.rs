@@ -616,6 +616,8 @@ pub(super) fn pool_write_result(
         body_format: FORMAT_ID.to_string(),
         created_at_utc: prepared.write_timestamp,
         copies: vec![PoolWriteObjectCopyRecord {
+            tape_log_sequence: None,
+            tape_incarnation: None,
             tape_uuid: selected.tape_uuid,
             tape_file_number: write_report.catalog.object_copy.tape_file_number,
             first_body_lba,
@@ -870,6 +872,8 @@ pub(super) fn pool_write_copy_record_from_native(
             replay_object_invalid(&copy.object_id, "copy tape_uuid is not 16 bytes")
         })?;
     Ok(PoolWriteObjectCopyRecord {
+        tape_log_sequence: copy.tape_log_sequence,
+        tape_incarnation: copy.tape_incarnation,
         tape_uuid,
         tape_file_number: copy.tape_file_number,
         first_body_lba: copy.first_body_lba,

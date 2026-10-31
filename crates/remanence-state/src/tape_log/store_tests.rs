@@ -604,6 +604,48 @@ fn bot_group(lease: &Lease) -> crate::tape_log::store::PreparedGroup {
     group.close(&c).unwrap()
 }
 #[test]
+fn single_log_fault_observer_surrounds_fsync_and_first_directory_publication() {
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let faults = Arc::new(Faults::default());
+    let _registration = remanence_library::durable_file::test_support::register(
+        dir.path().to_owned(),
+        Arc::new(FaultDirectory(faults.clone())),
+    );
+    let store = store(dir.path());
+    let mut lease = store.acquire(true).unwrap();
+    let observed = faults.clone();
+    lease.set_publication_observer(crate::tape_log::store::PublicationObserver(Arc::new(
+        move |record, sequence, after| {
+            assert!(matches!(record, Record::Committed(_)));
+            assert_eq!(sequence, 2);
+            observed.events.lock().unwrap().push(
+                if after {
+                    "after_tape_log_fsync"
+                } else {
+                    "before_tape_log_fsync"
+                }
+                .into(),
+            );
+            Ok(())
+        },
+    )));
+    lease.append(bot_group(&lease)).unwrap();
+    let events = faults.events.lock().unwrap();
+    assert_eq!(
+        &events[events.len() - 6..],
+        &[
+            "append",
+            "before_tape_log_fsync",
+            "fsync",
+            "rename",
+            "directory",
+            "after_tape_log_fsync"
+        ]
+    );
+}
+
+#[test]
 fn provisional_data_sync_then_closing_fsync_and_first_directory_sync() {
     use std::sync::{atomic::Ordering::SeqCst, Arc};
     for failure in 0..=4 {
@@ -791,11 +833,42 @@ fn explicit_repair_persists_append_fence_and_exact_boundary_record() {
     let record = std::fs::read_to_string(evidence.reconciliation_record).unwrap();
     assert!(record.contains(&format!("\"through_sequence\":{through}")));
     assert!(record.contains("\"physical_tail_reconciliation_required\":true"));
+    let json: serde_json::Value = serde_json::from_str(&record).unwrap();
+    assert_eq!(
+        json["tape_uuid"],
+        uuid::Uuid::from_bytes(store.header.tape_uuid)
+            .simple()
+            .to_string()
+    );
+    for digest in [&json["retained_digest"], &json["evidence"]["digest"]] {
+        let text = digest.as_str().unwrap();
+        assert_eq!(text.len(), 64);
+        assert!(text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+    }
+    assert!(!json["operator"].as_str().unwrap().contains("User("));
     assert!(matches!(store.acquire(false), Err(StoreError::Refused(_))));
     assert_eq!(
         store.snapshot().unwrap().summary().last_closed_sequence,
         through
     );
+    let mut recovery = store.acquire_for_tail_reconciliation().unwrap();
+    assert!(recovery.repair_pending());
+    assert!(recovery.prepare().is_err());
+    let cursor = recovery.summary().cursor;
+    assert!(recovery
+        .reconcile_repaired_tail(CommitCursor {
+            lba: cursor.lba + 1,
+            ..cursor
+        })
+        .is_err());
+    assert!(store.path().with_extension("repair-required").exists());
+    recovery.reconcile_repaired_tail(cursor).unwrap();
+    assert!(!recovery.repair_pending());
+    assert!(!store.path().with_extension("repair-required").exists());
+    drop(recovery);
+    assert!(store.acquire(false).is_ok());
 }
 #[test]
 fn unverified_cold_check_is_retained_in_disk_snapshot() {
@@ -998,3 +1071,151 @@ fn unclosed_initialized_is_a_torn_group_but_never_a_fresh_name() {
 
 #[path = "review_store_tests.rs"]
 mod review;
+
+#[test]
+fn automatic_torn_tail_repair_refuses_below_projected_sequence() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let mut lease = store.acquire(true).unwrap();
+    append_object(&mut lease);
+    let first_end = lease.summary().closed_end;
+    append_object(&mut lease);
+    let mark = lease.summary().last_closed_sequence;
+    drop(lease);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(store.path())
+        .unwrap()
+        .set_len(first_end + 5)
+        .unwrap();
+    let before = std::fs::read(store.path()).unwrap();
+    let mut lease = store.acquire(false).unwrap();
+    assert!(matches!(
+        lease.set_projection_floor(mark),
+        Err(StoreError::BelowProjection { .. })
+    ));
+    let group = lease.prepare().unwrap();
+    assert!(matches!(
+        lease.stage(group),
+        Err(StoreError::BelowProjection { .. })
+    ));
+    assert_eq!(std::fs::read(store.path()).unwrap(), before);
+}
+
+#[test]
+fn tail_inspection_preserves_complete_and_damaged_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let store = store(root.path());
+    let mut lease = store.acquire(true).unwrap();
+    append_object(&mut lease);
+    let through = lease.summary().last_closed_sequence;
+    drop(lease);
+    let before = std::fs::read(store.path()).unwrap();
+    let report = store.inspect_tail().unwrap();
+    assert_eq!(report.through_sequence, through);
+    assert!(report.damage.is_none());
+    assert!(store.repair_tail(through, through).is_err());
+    assert_eq!(std::fs::read(store.path()).unwrap(), before);
+    let mut damaged = before.clone();
+    damaged.extend_from_slice(&[0xff; 36]);
+    std::fs::write(store.path(), &damaged).unwrap();
+    let report = store.inspect_tail().unwrap();
+    assert_eq!(report.through_sequence, through);
+    assert_eq!(report.valid_bytes, before.len() as u64);
+    assert!(report.damage.is_some());
+    assert_eq!(std::fs::read(store.path()).unwrap(), damaged);
+}
+
+#[test]
+fn native_writer_waits_for_startup_reader() {
+    let root = tempfile::tempdir().unwrap();
+    let store = store(root.path());
+    let reader = store.lock(false).unwrap();
+    crate::tape_log::store::on_reader_contention(move || drop(reader));
+    let mut writer = store.acquire(true).unwrap();
+    append_object(&mut writer);
+    drop(writer);
+    assert_eq!(store.snapshot().unwrap().summary().object_count, 1);
+}
+#[test]
+fn native_writer_bounds_reader_wait() {
+    let root = tempfile::tempdir().unwrap();
+    let store = store(root.path());
+    let _reader = store.lock(false).unwrap();
+    let started = std::time::Instant::now();
+    assert!(matches!(store.acquire(true), Err(StoreError::Locked(_))));
+    assert!(started.elapsed() >= std::time::Duration::from_millis(250));
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+}
+#[test]
+fn native_writer_keeps_writer_conflict() {
+    let root = tempfile::tempdir().unwrap();
+    let store = store(root.path());
+    let _writer = store.acquire(true).unwrap();
+    let started = std::time::Instant::now();
+    assert!(matches!(store.acquire(true), Err(StoreError::Locked(_))));
+    assert!(started.elapsed() < std::time::Duration::from_millis(100));
+}
+#[test]
+fn native_writer_refuses_writer_arriving_after_reader() {
+    let root = tempfile::tempdir().unwrap();
+    let store = store(root.path());
+    let reader = store.lock(false).unwrap();
+    let held = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let other = store.clone();
+    let acquired = held.clone();
+    crate::tape_log::store::on_reader_contention(move || {
+        drop(reader);
+        *acquired.borrow_mut() = Some(other.acquire(true).unwrap());
+    });
+    let started = std::time::Instant::now();
+    assert!(matches!(store.acquire(true), Err(StoreError::Locked(_))));
+    assert!(held.borrow().is_some());
+    assert!(started.elapsed() < std::time::Duration::from_millis(100));
+}
+
+#[test]
+fn post_barrier_prefix_and_component_use_only_one_closing_sync() {
+    use crate::authority::{TapeAuthority, TapeAuthorityWriter};
+    use std::sync::Arc;
+    let root = tempfile::tempdir().unwrap();
+    let id = [0x85; 16];
+    let faults = Arc::new(Faults::default());
+    let _registration = remanence_library::durable_file::test_support::register(
+        root.path().into(),
+        Arc::new(FaultDirectory(faults.clone())),
+    );
+    let (report, plan, _) = crate::authority::contract_tests::structural_fixture(id);
+    let authority = TapeAuthority::open_fixture(root.path(), id).unwrap();
+    let mut writer = authority.acquire_exclusive().unwrap();
+    writer.publish_report(&(&report).into()).unwrap();
+    let plan: crate::authority::AuthorityFinalization = (&plan).into();
+    writer.begin_finalization(&plan).unwrap();
+    writer.accept_preparation().unwrap();
+    faults.events.lock().unwrap().clear();
+    writer
+        .publish_terminal_prefix(&plan.terminal_prefix.as_ref().unwrap().publication)
+        .unwrap();
+    let assert_syncs = || {
+        let events = faults.events.lock().unwrap();
+        assert_eq!(
+            events.iter().filter(|s| *s == "fdatasync").count(),
+            0,
+            "{events:?}"
+        );
+        assert_eq!(
+            events.iter().filter(|s| *s == "fsync").count(),
+            1,
+            "{events:?}"
+        );
+    };
+    assert_syncs();
+    faults.events.lock().unwrap().clear();
+    writer
+        .advance_finalization(
+            crate::TerminalFinalizationProgress::BeforeReplicaA,
+            crate::TerminalFinalizationProgress::AfterReplicaA,
+        )
+        .unwrap();
+    assert_syncs();
+}

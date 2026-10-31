@@ -1002,12 +1002,16 @@ impl OperatorMount<'_> {
             tape.pool_id.as_deref().unwrap_or("(unpooled)"),
         )
         .map_err(refusal)?;
-        let source_dir = from.join("checkpoints");
+        let source_dir = from.join("tapes");
         if !source_dir.is_dir() {
             return Err(refusal("import source has no checkpoints directory"));
         }
-        let source =
-            remanence_state::TapeAuthority::open(source_dir, mounted.tape_uuid).map_err(refusal)?;
+        let source = remanence_state::TapeAuthority::open(
+            source_dir,
+            mounted.tape_uuid,
+            &self.state.paths().sqlite_path,
+        )
+        .map_err(refusal)?;
         if !source.is_regular_import_source().map_err(refusal)? {
             return Err(refusal(
                 "import checkpoint must be an existing regular file",
@@ -1023,29 +1027,28 @@ impl OperatorMount<'_> {
         }
         let journal_dir = self.state.paths().journal_dir.clone();
         let staging = tempfile::tempdir_in(&journal_dir).map_err(refusal)?;
-        let checkpoints = staging.path().join("checkpoints");
+        let checkpoints = staging.path().join("tapes");
         std::fs::create_dir(&checkpoints).map_err(refusal)?;
         let checkpoint_publication = source
-            .stage_import_member(&checkpoints, &journal_dir.join("checkpoints"))
+            .stage_import_member(&checkpoints, &journal_dir.join("tapes"))
             .map_err(refusal)?;
-        let staged = remanence_state::TapeAuthority::open(&checkpoints, mounted.tape_uuid)
-            .map_err(refusal)?;
+        let staged = remanence_state::TapeAuthority::open(
+            &checkpoints,
+            mounted.tape_uuid,
+            &self.state.paths().sqlite_path,
+        )
+        .map_err(refusal)?;
         let lease = staged.acquire_exclusive().map_err(refusal)?;
         let last = lease
             .latest_commit()
             .map_err(refusal)?
             .ok_or_else(|| refusal("import requires a nonempty checkpoint journal"))?;
-        let parity_for_projection = parity.clone();
+
         let mut publications = Vec::new();
-        if let remanence_parity::ParityConfig::Scheme(scheme) = parity {
-            let publication = remanence_state::authority::stage_structural_import(
-                from,
-                staging.path(),
-                &journal_dir,
-                mounted.tape_uuid,
-            )
-            .map_err(refusal)?;
-            let journal = lease.open_structural(block_size, scheme).map_err(refusal)?;
+        if let remanence_parity::ParityConfig::Scheme(ref scheme) = parity {
+            let journal = lease
+                .open_structural(block_size, scheme.clone())
+                .map_err(refusal)?;
             let snapshot = journal.freeze().map_err(refusal)?;
             let summary =
                 remanence_parity::checked_bounded_resume_summary(&snapshot).map_err(refusal)?;
@@ -1056,7 +1059,6 @@ impl OperatorMount<'_> {
                 summary.committed_tape_file_count,
             )
             .map_err(|e| refusal(format!("import journal authority: {e:?}")))?;
-            publications.push(publication);
         } else {
             remanence_state::TerminalIndexSource::new_replay_backed_no_parity(&lease)
                 .map_err(refusal)?;
@@ -1073,15 +1075,14 @@ impl OperatorMount<'_> {
             ctx,
         )
         .map_err(refusal)?;
-        let destination = journal_dir.join("checkpoints");
+        let destination = journal_dir.join("tapes");
         std::fs::create_dir_all(&destination).map_err(refusal)?;
         publications.push(checkpoint_publication);
         remanence_state::authority::publish_import_authority(&publications).map_err(refusal)?;
-        let parity_journal = match &parity_for_projection {
+        let parity_journal = match &parity {
             remanence_parity::ParityConfig::None => None,
             remanence_parity::ParityConfig::Scheme(scheme) => Some(
-                remanence_state::TapeAuthority::open(&destination, mounted.tape_uuid)
-                    .map_err(refusal)?
+                lease
                     .open_structural(block_size, scheme.clone())
                     .map_err(refusal)?,
             ),
@@ -1094,24 +1095,9 @@ impl OperatorMount<'_> {
                 mounted.endpoint.durable_key().expect("durable mount"),
             )
             .map_err(refusal)?;
-        drop(parity_journal);
-        if let remanence_parity::ParityConfig::Scheme(scheme) = &parity_for_projection {
-            match self
-                .state
-                .ingest_tape_journal(mounted.tape_uuid, block_size, scheme.clone())
-                .map_err(refusal)?
-            {
-                remanence_state::TapeJournalIngestionOutcome::Pending(_) => {
-                    return Err(refusal(
-                        "imported parity journal is locked; retry import before appending",
-                    ))
-                }
-                remanence_state::TapeJournalIngestionOutcome::Indexed(_) => {}
-            }
-        }
         self.state
             .catalog_index()
-            .project_authority_commit(&last)
+            .project_tape_log(&lease.freeze().map_err(refusal)?)
             .map_err(refusal)?;
         self.flush_audit()?;
         Ok(())

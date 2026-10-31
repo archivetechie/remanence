@@ -1,4 +1,4 @@
-//! Unwired step-2 per-tape authority format. Storage remains unwired; no tape I/O.
+//! Step-2 per-tape host authority format; this module performs no tape I/O.
 //!
 //! The fixed little-endian prefix is CRC protected before lengths are trusted;
 //! structural and catalog sections have independent CRC-64/XZ trailers. The
@@ -21,7 +21,7 @@
 //! internal zeros followed by data are torn: such a frame cannot close a group.
 //! Only a successful close advances the public summary. Catalog callbacks must
 //! therefore stage output until close; they must not publish provisional rows.
-//! Frames and group digests do not bind a tape UUID: B3a must validate the
+//! Frames and group digests do not bind a tape UUID: storage validates the
 //! file header and its tape identity before folding these bytes.
 //! Session tags and step-6 semantics are reserved, not accepted by the fold.
 
@@ -352,5 +352,7 @@ impl Record {
     }
 }
 
+#[cfg(test)]
+mod reference_fixtures;
 #[cfg(test)]
 mod tests;

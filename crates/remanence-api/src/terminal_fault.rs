@@ -19,9 +19,9 @@ use uuid::Uuid;
 
 pub(crate) const ENABLE_ENV: &str = "REM_TIX_TERMINAL_FAULT_ENABLE";
 pub(crate) const PLAN_ENV: &str = "REM_TIX_TERMINAL_FAULT_PLAN";
-const ENABLE_VALUE: &str = "terminal-index-stage7-v1-abort";
-const PLAN_SCHEMA: &str = "rem.tix.terminal-fault-plan.v1";
-const EVIDENCE_SCHEMA: &str = "rem.tix.terminal-fault-evidence.v1";
+const ENABLE_VALUE: &str = "terminal-index-tape-log-v2-abort";
+const PLAN_SCHEMA: &str = "rem.tix.terminal-fault-plan.v2";
+const EVIDENCE_SCHEMA: &str = "rem.tix.terminal-fault-evidence.v2";
 const TIX_FAULT_ROOT: &str = "/tmp/system-harness/scenario-tix/terminal-faults";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,15 +35,11 @@ pub(crate) enum TerminalFaultCut {
     AfterFilemark,
     BeforeBarrier,
     AfterBarrier,
-    BeforeParityJournalFsync,
-    AfterParityJournalFsync,
-    BeforeCheckpointJournalFsync,
-    AfterCheckpointJournalFsync,
+    BeforeTapeLogFsync,
+    AfterTapeLogFsync,
     BeforeSqliteProjection,
     AfterSqliteProjection,
     AfterTerminalPrefix,
-    BeforeFinalCheckpointFsync,
-    AfterFinalCheckpointFsync,
     BeforeFinalSqliteProjection,
     AfterFinalSqliteProjection,
     BeforeAssignmentReread,
@@ -62,15 +58,11 @@ impl TerminalFaultCut {
             Self::AfterFilemark => "after_filemark",
             Self::BeforeBarrier => "before_barrier",
             Self::AfterBarrier => "after_barrier",
-            Self::BeforeParityJournalFsync => "before_parity_journal_fsync",
-            Self::AfterParityJournalFsync => "after_parity_journal_fsync",
-            Self::BeforeCheckpointJournalFsync => "before_checkpoint_journal_fsync",
-            Self::AfterCheckpointJournalFsync => "after_checkpoint_journal_fsync",
+            Self::BeforeTapeLogFsync => "before_tape_log_fsync",
+            Self::AfterTapeLogFsync => "after_tape_log_fsync",
             Self::BeforeSqliteProjection => "before_sqlite_projection",
             Self::AfterSqliteProjection => "after_sqlite_projection",
             Self::AfterTerminalPrefix => "after_terminal_prefix",
-            Self::BeforeFinalCheckpointFsync => "before_final_checkpoint_fsync",
-            Self::AfterFinalCheckpointFsync => "after_final_checkpoint_fsync",
             Self::BeforeFinalSqliteProjection => "before_final_sqlite_projection",
             Self::AfterFinalSqliteProjection => "after_final_sqlite_projection",
             Self::BeforeAssignmentReread => "before_assignment_reread",
@@ -91,15 +83,11 @@ impl TerminalFaultCut {
             "after_filemark" => Self::AfterFilemark,
             "before_barrier" => Self::BeforeBarrier,
             "after_barrier" => Self::AfterBarrier,
-            "before_parity_journal_fsync" => Self::BeforeParityJournalFsync,
-            "after_parity_journal_fsync" => Self::AfterParityJournalFsync,
-            "before_checkpoint_journal_fsync" => Self::BeforeCheckpointJournalFsync,
-            "after_checkpoint_journal_fsync" => Self::AfterCheckpointJournalFsync,
+            "before_tape_log_fsync" => Self::BeforeTapeLogFsync,
+            "after_tape_log_fsync" => Self::AfterTapeLogFsync,
             "before_sqlite_projection" => Self::BeforeSqliteProjection,
             "after_sqlite_projection" => Self::AfterSqliteProjection,
             "after_terminal_prefix" => Self::AfterTerminalPrefix,
-            "before_final_checkpoint_fsync" => Self::BeforeFinalCheckpointFsync,
-            "after_final_checkpoint_fsync" => Self::AfterFinalCheckpointFsync,
             "before_final_sqlite_projection" => Self::BeforeFinalSqliteProjection,
             "after_final_sqlite_projection" => Self::AfterFinalSqliteProjection,
             "before_assignment_reread" => Self::BeforeAssignmentReread,
@@ -121,6 +109,53 @@ pub(crate) struct TerminalFaultPlan {
 }
 
 impl TerminalFaultPlan {
+    /// Bind release cuts to the store's actual fsync boundary, including first
+    /// publication's directory sync. No API-level split-journal cuts remain.
+    pub(crate) fn install(
+        &self,
+        authority: &remanence_state::TapeAuthorityLease,
+    ) -> Result<(), String> {
+        use remanence_state::authority::TapeAuthorityView;
+        use remanence_state::tape_log::{store::PublicationObserver, Record};
+        let layout = authority
+            .finalization_status()
+            .map_err(|e| e.to_string())?
+            .map(|p| p.layout.try_to_parity_layout())
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        let layout = std::sync::Mutex::new(layout);
+        let fault = self.clone();
+        authority.set_publication_observer(PublicationObserver(std::sync::Arc::new(move |record, sequence, after| {
+            let cut = if after { TerminalFaultCut::AfterTapeLogFsync } else { TerminalFaultCut::BeforeTapeLogFsync };
+            let mut layout = layout.lock().map_err(|_| std::io::Error::other("terminal fault layout poisoned"))?;
+            if let Record::FinalizationPrepared(plan) | Record::FinalizationDecided(plan) = record { *layout = Some(plan.layout); }
+            let (component, position, component_plan) = match record {
+                Record::ComponentWritten { component, commit, .. } => (
+                    ["replica_a", "separation_ab", "replica_b", "separation_bc", "replica_c"][usize::from(*component)],
+                    Some(commit.cursor), layout.as_ref().map(|p| p.components[usize::from(*component)])),
+                Record::TerminalPrefix { commit, .. } => ("parity_closeout", Some(commit.cursor), None),
+                Record::Sealed { cursor, .. } => ("final_projection", Some(*cursor), None),
+                Record::FinalizationDecided(_) => ("decision", None, None),
+                Record::FinalizationPrepared(_) => ("preparation", None, None),
+                _ => return Ok(()),
+            };
+            if fault.component != component || fault.cut != cut { return Ok(()); }
+            if fault.evidence_path.exists() { return fault.validate_existing_evidence().map_err(std::io::Error::other); }
+            let evidence = json!({
+                "schema": EVIDENCE_SCHEMA, "tape_uuid": Uuid::from_bytes(fault.tape_uuid).to_string(),
+                "nonce": fault.nonce.to_string(), "process_id": std::process::id(), "component": component, "cut": cut.name(),
+                "record_tag": format!("{:?}", record.tag()), "tape_log_sequence": sequence.to_string(), "tape_incarnation": 1,
+                "tape_log_sequence_status": if after { "committed" } else { "attempted" },
+                "position": position.map(|p| json!({"partition":p.partition, "lba":p.lba.to_string()})),
+                "component_plan": component_plan.map(|p| json!({
+                    "kind": match p.kind { TerminalTailComponentKind::TapeIndexReplica => "tape_index_replica", TerminalTailComponentKind::IndexSeparationExtent => "index_separation_extent" },
+                    "ordinal": p.ordinal, "planned_tape_file_number": p.planned_tape_file_number.to_string(), "planned_start_lba": p.planned_start_lba.to_string(), "record_count": p.record_count.to_string(),
+                })),
+            });
+            write_durable_new_json(&fault.evidence_path, &evidence).map_err(std::io::Error::other)?;
+            std::process::abort()
+        }))).map_err(|e| e.to_string())
+    }
     /// Load an exact TIX plan. Disabled operation is the default.
     pub(crate) fn from_env_for_tape(tape_uuid: [u8; 16]) -> Result<Option<Self>, String> {
         let enabled = std::env::var_os(ENABLE_ENV);
@@ -190,6 +225,8 @@ impl TerminalFaultPlan {
         if !matches!(
             component.as_str(),
             "parity_closeout"
+                | "decision"
+                | "preparation"
                 | "replica_a"
                 | "separation_ab"
                 | "replica_b"
@@ -338,6 +375,10 @@ impl TerminalFaultPlan {
             .map_err(|error| format!("commit TIX assignment-race CAS: {error}"))?;
         let evidence = json!({
             "schema": EVIDENCE_SCHEMA,
+            "record_tag": serde_json::Value::Null,
+            "tape_log_sequence": serde_json::Value::Null,
+            "tape_incarnation": 1,
+            "tape_log_sequence_status": serde_json::Value::Null,
             "tape_uuid": Uuid::from_bytes(self.tape_uuid).to_string(),
             "component": self.component,
             "cut": self.cut.name(),
@@ -369,6 +410,10 @@ impl TerminalFaultPlan {
         }
         let evidence = json!({
             "schema": EVIDENCE_SCHEMA,
+            "record_tag": serde_json::Value::Null,
+            "tape_log_sequence": serde_json::Value::Null,
+            "tape_incarnation": 1,
+            "tape_log_sequence_status": serde_json::Value::Null,
             "tape_uuid": Uuid::from_bytes(self.tape_uuid).to_string(),
             "component": component,
             "cut": cut.name(),
@@ -421,6 +466,10 @@ impl TerminalFaultPlan {
         };
         let evidence = json!({
             "schema": EVIDENCE_SCHEMA,
+            "record_tag": serde_json::Value::Null,
+            "tape_log_sequence": serde_json::Value::Null,
+            "tape_incarnation": 1,
+            "tape_log_sequence_status": serde_json::Value::Null,
             "tape_uuid": Uuid::from_bytes(self.tape_uuid).to_string(),
             "component": self.component,
             "cut": cut.name(),
@@ -490,17 +539,23 @@ fn component_name(component: TerminalTailComponentPlan) -> &'static str {
 
 fn validate_component_cut(component: &str, cut: TerminalFaultCut) -> Result<(), String> {
     let valid = match component {
+        "decision" | "preparation" => matches!(
+            cut,
+            TerminalFaultCut::BeforeTapeLogFsync | TerminalFaultCut::AfterTapeLogFsync
+        ),
         "parity_closeout" => matches!(
             cut,
             TerminalFaultCut::BeforeTerminalPrefix
+                | TerminalFaultCut::BeforeTapeLogFsync
+                | TerminalFaultCut::AfterTapeLogFsync
                 | TerminalFaultCut::BeforeFinalParityMap
                 | TerminalFaultCut::AfterFinalParityMap
                 | TerminalFaultCut::AfterTerminalPrefix
         ),
         "final_projection" => matches!(
             cut,
-            TerminalFaultCut::BeforeFinalCheckpointFsync
-                | TerminalFaultCut::AfterFinalCheckpointFsync
+            TerminalFaultCut::BeforeTapeLogFsync
+                | TerminalFaultCut::AfterTapeLogFsync
                 | TerminalFaultCut::BeforeFinalSqliteProjection
                 | TerminalFaultCut::AfterFinalSqliteProjection
         ),
@@ -515,8 +570,6 @@ fn validate_component_cut(component: &str, cut: TerminalFaultCut) -> Result<(), 
                 | TerminalFaultCut::BeforeFinalParityMap
                 | TerminalFaultCut::AfterFinalParityMap
                 | TerminalFaultCut::AfterTerminalPrefix
-                | TerminalFaultCut::BeforeFinalCheckpointFsync
-                | TerminalFaultCut::AfterFinalCheckpointFsync
                 | TerminalFaultCut::BeforeFinalSqliteProjection
                 | TerminalFaultCut::AfterFinalSqliteProjection
                 | TerminalFaultCut::BeforeAssignmentReread
@@ -921,6 +974,24 @@ mod tests {
         let root = Path::new(TIX_FAULT_ROOT);
         let valid = root.join("contract/evidence.json");
         TerminalFaultPlan::parse(&plan_value(&valid)).expect("exact plan");
+        let mut obsolete = plan_value(&valid);
+        obsolete["schema"] = Value::String("rem.tix.terminal-fault-plan.v1".into());
+        assert!(TerminalFaultPlan::parse(&obsolete).is_err());
+        obsolete = plan_value(&valid);
+        for cut in [
+            "before_parity_journal_fsync",
+            "after_parity_journal_fsync",
+            "before_checkpoint_journal_fsync",
+            "after_checkpoint_journal_fsync",
+            "before_final_checkpoint_fsync",
+            "after_final_checkpoint_fsync",
+        ] {
+            obsolete["cut"] = Value::String(cut.into());
+            assert!(
+                TerminalFaultPlan::parse(&obsolete).is_err(),
+                "obsolete cut {cut}"
+            );
+        }
 
         let mut outside = plan_value(Path::new("/tmp/outside.json"));
         assert!(TerminalFaultPlan::parse(&outside).is_err());
@@ -944,7 +1015,7 @@ mod tests {
 
         let mut final_before = plan_value(&valid);
         final_before["component"] = Value::String("final_projection".to_string());
-        final_before["cut"] = Value::String("before_final_checkpoint_fsync".to_string());
+        final_before["cut"] = Value::String("before_tape_log_fsync".to_string());
         TerminalFaultPlan::parse(&final_before).expect("final checkpoint before cut");
         final_before["cut"] = Value::String("before_final_sqlite_projection".to_string());
         TerminalFaultPlan::parse(&final_before).expect("final SQLite before cut");
@@ -1089,12 +1160,16 @@ mod tests {
             write_durable_new_json(
                 &evidence,
                 &json!({
-                    "schema": EVIDENCE_SCHEMA,
-                    "tape_uuid": "71717171-7171-7171-7171-717171717171",
-                    "component": "parity_closeout",
-                    "cut": cut.name(),
-                    "nonce": "91919191-9191-9191-9191-919191919191",
-                }),
+                        "schema": EVIDENCE_SCHEMA,
+                "record_tag": serde_json::Value::Null,
+                "tape_log_sequence": serde_json::Value::Null,
+                "tape_incarnation": 1,
+                "tape_log_sequence_status": serde_json::Value::Null,
+                        "tape_uuid": "71717171-7171-7171-7171-717171717171",
+                        "component": "parity_closeout",
+                        "cut": cut.name(),
+                        "nonce": "91919191-9191-9191-9191-919191919191",
+                    }),
             )
             .expect("write intentionally mismatched evidence");
             let prefix = terminal_prefix_plan();

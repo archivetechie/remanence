@@ -524,6 +524,57 @@ fn finish_reports_allow_failure_once_and_releases_device_and_state() {
 }
 
 #[test]
+fn repaired_log_requires_confirmed_physical_tail_reconciliation() {
+    use remanence_state::authority::TapeAuthorityView;
+    use std::io::Write as _;
+    for parity in [false, true] {
+        let (fixture, state) = Fixture::new(parity);
+        let mut owner = fixture.owner(state);
+        owner
+            .write_checkpointed(fixture.request("before-repair"))
+            .unwrap();
+        owner.finish().unwrap();
+        let directory = fixture.config.journal.dir.join("tapes");
+        let authority = remanence_state::TapeAuthority::open(
+            &directory,
+            UUID,
+            &fixture.config.index.sqlite_path,
+        )
+        .unwrap();
+        let through = authority.freeze().unwrap().log_reference().0;
+        let path = directory.join(format!("{}.remtape", Uuid::from_bytes(UUID).simple()));
+        let original = std::fs::read(&path).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[0xff; 28])
+            .unwrap();
+        let mut state = fixture.reopen().unwrap();
+        let repair = state.repair_tape_log_tail(UUID, through, true).unwrap();
+        let mut owner = fixture.owner(state);
+        assert!(owner.open_session("default").is_err());
+        assert!(owner
+            .supersede_tail_confirmed("HAND", |_, _| Err("operator declined".into()))
+            .is_err());
+        assert!(repair.reconciliation_record.exists());
+        owner
+            .supersede_tail_confirmed("HAND", |confirmation, _| {
+                assert_eq!(confirmation, "SUPERSEDE HAND");
+                Ok(())
+            })
+            .unwrap();
+        assert!(!repair.reconciliation_record.exists());
+        assert!(repair.archive.exists());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        owner
+            .write_checkpointed(fixture.request("after-repair"))
+            .unwrap();
+        owner.finish().unwrap();
+    }
+}
+
+#[test]
 fn fresh_state_rollback_refuses_complete_tail_then_explicit_supersede_repairs() {
     for parity in [false, true] {
         let (fixture, state) = Fixture::new(parity);
@@ -739,7 +790,7 @@ fn provisional_representation_guard_and_session_lease_release() {
     };
     append(&owner, crate::PoolWriteRepresentation::Plaintext).unwrap();
     let journal = remanence_state::authority::fixtures::AuthorityBuilder::new(
-        fixture.config.journal.dir.join("checkpoints"),
+        fixture.config.journal.dir.join("tapes"),
         UUID,
     )
     .build()
@@ -999,7 +1050,7 @@ fn automatic_terminal_media_completion_closes_audit_without_a_false_fence() {
     // Project the durable seal obligation at the recovery cut. The complete
     // object checkpoint remains the authority for the terminal suffix.
     let journal = remanence_state::authority::fixtures::AuthorityBuilder::new(
-        fixture.config.journal.dir.join("checkpoints"),
+        fixture.config.journal.dir.join("tapes"),
         UUID,
     )
     .build()
@@ -1230,7 +1281,7 @@ async fn cleanup_spawn_failure_finishes_in_place_and_releases_every_obligation()
     drop(owner);
     assert!(fixture.reopen().is_ok());
     let journal = remanence_state::authority::fixtures::AuthorityBuilder::new(
-        fixture.config.journal.dir.join("checkpoints"),
+        fixture.config.journal.dir.join("tapes"),
         UUID,
     )
     .build()

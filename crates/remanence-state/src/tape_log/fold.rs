@@ -92,6 +92,8 @@ pub struct TapeSummary {
     pub last_media_commit: Option<u64>,
     /// API barrier ordinal, separate from sequence and journal_record_ordinal.
     pub barrier_count: u64,
+    /// Ordinary checkpoint barriers, excluding terminal media barriers.
+    pub ordinary_count: u64,
     /// Outstanding seal obligation.
     pub seal_due: Option<SealDueReason>,
     /// Durable replica C followed by Sealed.
@@ -125,6 +127,7 @@ impl Default for TapeSummary {
             last_ordinary_record: None,
             last_media_commit: None,
             barrier_count: 0,
+            ordinary_count: 0,
             seal_due: None,
             sealed: false,
             uncovered: VecDeque::new(),
@@ -158,6 +161,7 @@ impl TapeSummary {
             last_ordinary_record: self.last_ordinary_record.clone(),
             last_media_commit: self.last_media_commit,
             barrier_count: self.barrier_count,
+            ordinary_count: self.ordinary_count,
             seal_due: self.seal_due,
             sealed: self.sealed,
             uncovered: VecDeque::new(),
@@ -587,6 +591,7 @@ impl Fold {
                 check_commit(&mut p, &self.summary, commit)?;
                 p.state.last_ordinary_commit = Some(f.sequence);
                 p.state.last_ordinary_record = Some(commit.clone());
+                p.state.ordinary_count = add(p.state.ordinary_count, 1)?;
                 media_commit(&mut p.state, f.sequence)?;
                 self.publish_media(p.state);
             }

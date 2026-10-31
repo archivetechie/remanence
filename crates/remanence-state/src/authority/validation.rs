@@ -7,6 +7,9 @@ pub(crate) struct CommitShapeError(String);
 
 #[derive(Debug)]
 pub(crate) struct ValidatedCommitLayout<'a> {
+    // Retained for the full-record legacy fixture projector; production only
+    // needs successful layout validation. Remove with the B4 codec fixtures.
+    #[cfg_attr(not(any(test, feature = "fixtures")), allow(dead_code))]
     pub(crate) last_tape_file: &'a remanence_parity::TapeFileEntry,
 }
 

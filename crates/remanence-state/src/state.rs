@@ -1,5 +1,6 @@
 //! Public Layer 4 state handle.
 
+use crate::authority::TapeAuthorityView;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::Write;
@@ -24,8 +25,8 @@ use crate::error::StateError;
 use crate::index::{
     AdoptBootstrapIdentityInput, AdoptBootstrapIdentityOutcome, AdoptedTapeState,
     AuditReplayReport, CatalogIndex, CatalogResetPreservedTape, ProvisionTapeInput, RebuildReport,
-    RebuildTapeJournalInput, RetireTapeInput, RetireTapeOutcome, TapeIoFenceRecord,
-    TapeJournalIndexReport, TapeKindFilter, TapePoolProjectionInput, TapeRecord,
+    RetireTapeInput, RetireTapeOutcome, TapeIoFenceRecord, TapeJournalIndexReport, TapeKindFilter,
+    TapePoolProjectionInput, TapeRecord,
 };
 use crate::lock::StateLockGuard;
 use crate::paths::StatePaths;
@@ -504,6 +505,8 @@ impl StateHandle {
         let lock = StateLockGuard::acquire(&paths.state_dir)?;
         ensure_no_catalog_reset_fence(&paths)?;
         ensure_state_directories(&paths)?;
+        crate::authority_layout::admit(&paths)?;
+        create_private_dir(&paths.journal_dir.join("tapes"))?;
         validate_trusted_volume_paths(&config)?;
         let audit = FileAuditLog::open_with_clock_forward_tolerance(
             &paths.audit_dir,
@@ -658,6 +661,8 @@ impl StateHandle {
             &token,
         )?;
         if already_swapped {
+            reset_helper_tripwire();
+            record_catalog_reset_boundary(&paths, &request_digest)?;
             sync_regular_file(&paths.sqlite_path)?;
             if let Some(parent) = paths.sqlite_path.parent() {
                 sync_directory(parent)?;
@@ -665,6 +670,7 @@ impl StateHandle {
             sync_directory(&paths.audit_dir)?;
             sync_directory(&paths.journal_dir)?;
             sync_directory(&paths.tape_cache_dir)?;
+            crate::authority_layout::install(&paths, true)?;
             clear_catalog_reset_fence(&paths)?;
             let preserve_set = preserve.iter().map(String::as_str).collect::<HashSet<_>>();
             return Ok(CatalogResetReport {
@@ -1246,22 +1252,93 @@ impl StateHandle {
         self.index.replay_audit_records(&records)
     }
 
-    /// Rebuild the SQLite projection from audit logs and all local 3c journals.
+    /// Compatibility name for the projection-only audit and tape-log rebuild.
     pub fn rebuild_index_from_journals(&mut self) -> Result<RebuildReport, StateError> {
-        let audit_records = FileAuditLog::replay(&self.paths.audit_dir)?;
-        let tape_journals = self.load_tape_journal_rebuild_inputs()?;
-        let report = self
-            .index
-            .rebuild_from_authoritative_sources(&audit_records, &tape_journals)?;
-        // Rebuild cleared the wrap_maps projection (design §6.5:
-        // "catalog projection rebuild → UNCALIBRATED for every
-        // evicted map; control rows and allocator remain"). Record
-        // the matching durable transitions so every volume carries a
-        // fresh generation and stays uncalibrated until its next
-        // load harvest.
-        self.calibration
-            .record_all_maps_evicted("projection_rebuild")?;
+        self.rebuild_projection_from_tape_logs()
+    }
+
+    /// Offline projection-only entry point. Unlike opening a normal StateHandle,
+    /// this never opens an audit writer (which could rotate or trim a segment).
+    /// State ownership covers validation, snapshots, SQL and calibration eviction.
+    pub fn rebuild_projection_from_config_file(
+        config_path: impl AsRef<Path>,
+    ) -> Result<RebuildReport, StateError> {
+        let config_path = config_path.as_ref();
+        let config = crate::load_config(config_path)?;
+        let paths = StatePaths::from_config(config_path, &config);
+        let _owner = StateLockGuard::acquire(&paths.state_dir)?;
+        crate::authority_layout::validate_owned_config_layout(&config)?;
+        if !paths.state_dir.join("authority-format").exists() {
+            return Err(StateError::ConfigInvalid(
+                "projection rebuild requires an existing authority-format marker".into(),
+            ));
+        }
+        let mut index = CatalogIndex::open(&paths.sqlite_path)?;
+        project_configured_tape_pools(&mut index, &config)?;
+        index.reconcile_cleaning_prefixes(&config.cleaning.voltag_prefixes)?;
+        let calibration = CalibrationControlStore::open(&paths.calibration_dir)?;
+        Self::rebuild_projection_inputs(&paths, &mut index, &calibration)
+    }
+
+    /// Rebuild derived SQLite rows without changing tape or audit logs. Evict
+    /// wrap maps and invalidate their calibration using the existing allocator.
+    pub fn rebuild_projection_from_tape_logs(&mut self) -> Result<RebuildReport, StateError> {
+        crate::authority_layout::validate_owned_config_layout(&self.config)?;
+        Self::rebuild_projection_inputs(&self.paths, &mut self.index, &self.calibration)
+    }
+
+    /// Only immutable authority inputs and derived stores enter this operation.
+    /// It has neither an audit writer nor access to any reset helper.
+    fn rebuild_projection_inputs(
+        paths: &StatePaths,
+        index: &mut CatalogIndex,
+        calibration: &CalibrationControlStore,
+    ) -> Result<RebuildReport, StateError> {
+        let audit = FileAuditLog::replay(&paths.audit_dir)?;
+        let directory = paths.journal_dir.join("tapes");
+        let mut snapshots = Vec::new();
+        for path in crate::TapeAuthority::list_entries(&directory)? {
+            let uuid = crate::TapeAuthority::entry_tape_uuid(&path)?;
+            snapshots
+                .push(crate::TapeAuthority::open(&directory, uuid, &paths.sqlite_path)?.freeze()?);
+        }
+        let report = index.rebuild_tape_log_projection(&audit, &snapshots)?;
+        calibration.record_all_maps_evicted("projection_rebuild")?;
         Ok(report)
+    }
+
+    /// Explicit offline tail repair. A cut below the projection mark requires
+    /// rebuilding this tape in the same fenced operation; media is never touched.
+    pub fn repair_tape_log_tail(
+        &mut self,
+        uuid: [u8; 16],
+        through: u64,
+        rebuild_projection: bool,
+    ) -> Result<crate::tape_log::store::RepairEvidence, StateError> {
+        crate::authority_layout::admit(&self.paths)?;
+        let projected = self.index.projected_through_sequence(uuid)?;
+        let store = crate::tape_log::store::Store::open(
+            self.paths.journal_dir.join("tapes"),
+            uuid,
+            &self.paths.sqlite_path,
+        )?;
+        let retained =
+            crate::tape_log::authority::AuthoritySnapshot::new(store.preview_repair(through)?)?;
+        self.index.validate_repair_prefix(&retained)?;
+        let evidence =
+            store.repair_tail(through, if rebuild_projection { 0 } else { projected })?;
+        if rebuild_projection {
+            let snapshot = crate::TapeAuthority::open(
+                self.paths.journal_dir.join("tapes"),
+                uuid,
+                &self.paths.sqlite_path,
+            )?
+            .freeze()?;
+            self.index.rebuild_repaired_tape_projection(&snapshot)?;
+        } else {
+            self.index.mark_repaired_tape(uuid)?;
+        }
+        Ok(evidence)
     }
 
     /// Run startup replay and mark non-terminal prior work as lost by restart.
@@ -1346,17 +1423,39 @@ impl StateHandle {
         block_size: u32,
         scheme: ParityScheme,
     ) -> Result<TapeJournalIngestionOutcome, StateError> {
-        crate::authority::legacy_ingest_structural(
-            &mut self.index,
-            &self.paths.journal_dir,
+        let authority = crate::TapeAuthority::open(
+            self.paths.journal_dir.join("tapes"),
             tape_uuid,
-            block_size,
-            scheme,
-        )
-    }
-
-    fn load_tape_journal_rebuild_inputs(&self) -> Result<Vec<RebuildTapeJournalInput>, StateError> {
-        crate::authority::legacy_rebuild_structural(&self.paths.journal_dir)
+            &self.paths.sqlite_path,
+        )?;
+        let snapshot = match authority.freeze() {
+            Ok(snapshot) => snapshot,
+            Err(StateError::TapeLog(error))
+                if matches!(*error, crate::tape_log::store::StoreError::Locked(_)) =>
+            {
+                return Ok(TapeJournalIngestionOutcome::Pending(
+                    self.index
+                        .mark_tape_journal_ingestion_pending(tape_uuid, block_size, &scheme)?,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        use crate::authority::TapeAuthoritySnapshot;
+        if snapshot.summary().block_size != Some(block_size)
+            || snapshot.raw.header().scheme.as_ref() != Some(&scheme)
+        {
+            return Err(StateError::JournalReplayFailed(
+                "tape-log ingestion geometry mismatch".into(),
+            ));
+        }
+        self.index.project_tape_log(&snapshot)?;
+        Ok(TapeJournalIngestionOutcome::Indexed(
+            TapeJournalIndexReport {
+                ingestion_pending: false,
+                tape_files_rebuilt: snapshot.summary().next_file,
+                object_copies_rebuilt: snapshot.summary().object_count,
+            },
+        ))
     }
 
     fn mark_lost_operations_by_restart(&mut self) -> Result<u64, StateError> {
@@ -1793,7 +1892,7 @@ fn preflight_catalog_reset_source(
     ),
     StateError,
 > {
-    match CatalogIndex::open_read_only(&paths.sqlite_path) {
+    match CatalogIndex::open_reset_source(&paths.sqlite_path) {
         Ok(index) => preflight_catalog_reset_index(
             &index,
             paths,
@@ -1946,14 +2045,62 @@ fn catalog_reset_output_directories_clean(paths: &StatePaths) -> Result<bool, St
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Ok(false);
         }
-        let mut entries = fs::read_dir(path)
-            .map_err(|err| StateError::io_at("read catalog reset output directory", path, err))?;
-        if entries
-            .next()
-            .transpose()
-            .map_err(|err| StateError::io_at("iterate catalog reset output directory", path, err))?
-            .is_some()
+        if path == &paths.audit_dir {
+            let records = match FileAuditLog::replay(path) {
+                Ok(records) => records,
+                Err(_) => return Ok(false),
+            };
+            let fence = catalog_reset_fence_evidence(paths)?;
+            if records.len() == 1
+                && records[0].event == AuditEvent::RecoveryEvent
+                && records[0].detail.get("action")
+                    == Some(&CborValue::Text("declared_state_reset".into()))
+                && fence.is_some_and(|(request, _, _)| {
+                    records[0].detail.get("reset_request_digest") == Some(&CborValue::Text(request))
+                })
+            {
+                let entries = fs::read_dir(path)
+                    .map_err(|e| StateError::io_at("read reset audit output", path, e))?;
+                let mut count = 0;
+                for entry in entries {
+                    let entry =
+                        entry.map_err(|e| StateError::io_at("read reset audit entry", path, e))?;
+                    if !entry
+                        .file_type()
+                        .map_err(|e| {
+                            StateError::io_at("inspect reset audit entry", entry.path(), e)
+                        })?
+                        .is_file()
+                        || entry.path().extension().is_none_or(|e| e != "remaudit")
+                    {
+                        return Ok(false);
+                    }
+                    count += 1;
+                }
+                if count == 1 {
+                    continue;
+                }
+            }
+        }
+        for entry in fs::read_dir(path)
+            .map_err(|err| StateError::io_at("read catalog reset output directory", path, err))?
         {
+            let entry = entry.map_err(|err| {
+                StateError::io_at("iterate catalog reset output directory", path, err)
+            })?;
+            if path == &paths.journal_dir
+                && entry.file_name() == "tapes"
+                && entry
+                    .file_type()
+                    .map_err(|err| StateError::io_at("inspect tape directory", entry.path(), err))?
+                    .is_dir()
+                && fs::read_dir(entry.path())
+                    .map_err(|err| StateError::io_at("read tape directory", entry.path(), err))?
+                    .next()
+                    .is_none()
+            {
+                continue;
+            }
             return Ok(false);
         }
     }
@@ -2400,7 +2547,7 @@ fn catalog_reset_fence_path(paths: &StatePaths) -> PathBuf {
     paths.state_dir.join(CATALOG_RESET_FENCE_FILE)
 }
 
-fn ensure_no_catalog_reset_fence(paths: &StatePaths) -> Result<(), StateError> {
+pub(crate) fn ensure_no_catalog_reset_fence(paths: &StatePaths) -> Result<(), StateError> {
     let fence = catalog_reset_fence_path(paths);
     if fence.exists() {
         return Err(StateError::CatalogResetInProgress(format!(
@@ -2552,6 +2699,32 @@ fn reset_catalog_locked(
     reset_catalog_locked_with_hook(paths, config, preserved_tapes, admission, |_| Ok(()))
 }
 
+#[cfg(any(test, feature = "fixtures"))]
+thread_local! { static REJECT_RESET_HELPER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+/// Test-only guard that makes every destructive reset route fail immediately.
+#[cfg(any(test, feature = "fixtures"))]
+pub struct RejectResetHelpers(bool);
+#[cfg(any(test, feature = "fixtures"))]
+impl RejectResetHelpers {
+    /// Install on the current thread, including CLI entry-point tests.
+    pub fn install() -> Self {
+        Self(REJECT_RESET_HELPER.replace(true))
+    }
+}
+#[cfg(any(test, feature = "fixtures"))]
+impl Drop for RejectResetHelpers {
+    fn drop(&mut self) {
+        REJECT_RESET_HELPER.set(self.0);
+    }
+}
+
+fn reset_helper_tripwire() {
+    #[cfg(any(test, feature = "fixtures"))]
+    REJECT_RESET_HELPER
+        .with(|flag| assert!(!flag.get(), "projection rebuild reached reset helper"));
+}
+
 fn reset_catalog_locked_with_hook<F>(
     paths: &StatePaths,
     config: &RemConfig,
@@ -2562,13 +2735,14 @@ fn reset_catalog_locked_with_hook<F>(
 where
     F: FnMut(CatalogResetPhase) -> Result<(), StateError>,
 {
+    reset_helper_tripwire();
     begin_or_resume_catalog_reset_fence(
         paths,
         admission.request_digest,
         admission.preflight_token,
         admission.output_token,
     )?;
-    archive_reset_authoritative_inputs(paths)?;
+    archive_reset_authoritative_inputs(paths, admission.request_digest)?;
     phase_hook(CatalogResetPhase::AuthoritativeInputsArchived)?;
     ensure_state_directories(paths)?;
 
@@ -2581,8 +2755,13 @@ where
                 expected_schema_version,
             )?;
         } else {
-            let source = CatalogIndex::open(&paths.sqlite_path)?;
-            source.prepare_catalog_reset_atomic_swap()?;
+            let source = CatalogIndex::open_reset_source(&paths.sqlite_path)?;
+            let version = source.schema_version()?;
+            drop(source);
+            CatalogIndex::prepare_admitted_catalog_reset_source_atomic_swap(
+                &paths.sqlite_path,
+                version,
+            )?;
         }
     }
     phase_hook(CatalogResetPhase::SourceCheckpointed)?;
@@ -2607,6 +2786,7 @@ where
         reset_directory_contents(&paths.audit_dir)?;
         reset_directory_contents(&paths.journal_dir)?;
         reset_directory_contents(&paths.tape_cache_dir)?;
+        record_catalog_reset_boundary(paths, admission.request_digest)?;
         phase_hook(CatalogResetPhase::AuthoritativeInputsCleared)?;
 
         // The source main file was checkpointed above. Its sidecars can now be
@@ -2620,6 +2800,7 @@ where
         if let Some(parent) = paths.sqlite_path.parent() {
             sync_directory(parent)?;
         }
+        crate::authority_layout::install(paths, true)?;
         phase_hook(CatalogResetPhase::AfterAtomicSwap)?;
         clear_catalog_reset_fence(paths)?;
         Ok(())
@@ -2708,7 +2889,61 @@ fn reset_directory_contents(path: &Path) -> Result<(), StateError> {
 
 const RESET_ARCHIVE_DIR: &str = "reset-archives";
 
-fn archive_reset_authoritative_inputs(paths: &StatePaths) -> Result<(), StateError> {
+/// Persist the declared boundary in the new audit chain as well as its archive.
+/// Exact reset retries do not append a second boundary record.
+fn record_catalog_reset_boundary(
+    paths: &StatePaths,
+    request_digest: &str,
+) -> Result<(), StateError> {
+    if FileAuditLog::replay(&paths.audit_dir)?.iter().any(|r| {
+        r.event == AuditEvent::RecoveryEvent
+            && r.detail.get("reset_request_digest") == Some(&CborValue::Text(request_digest.into()))
+    }) {
+        return Ok(());
+    }
+    let mut audit = FileAuditLog::open(&paths.audit_dir, true)?;
+    audit.append(AuditEventRecord {
+        actor: AuditActor::local_user(),
+        source_layer: SourceLayer::Layer4,
+        operation_id: None,
+        session_id: None,
+        idempotency_key: None,
+        event: AuditEvent::RecoveryEvent,
+        subject: AuditSubject {
+            kind: "authority-layout".into(),
+            id: Some(crate::authority_layout::FORMAT.into()),
+        },
+        detail: BTreeMap::from([
+            (
+                "action".into(),
+                CborValue::Text("declared_state_reset".into()),
+            ),
+            (
+                "reset_request_digest".into(),
+                CborValue::Text(request_digest.into()),
+            ),
+            (
+                "state_dir".into(),
+                CborValue::Text(paths.state_dir.display().to_string()),
+            ),
+            (
+                "journal_dir".into(),
+                CborValue::Text(paths.journal_dir.display().to_string()),
+            ),
+            (
+                "audit_dir".into(),
+                CborValue::Text(paths.audit_dir.display().to_string()),
+            ),
+        ]),
+    })?;
+    Ok(())
+}
+
+fn archive_reset_authoritative_inputs(
+    paths: &StatePaths,
+    request_digest: &str,
+) -> Result<(), StateError> {
+    reset_helper_tripwire();
     if !paths.audit_dir.exists() && !paths.journal_dir.exists() {
         return Ok(());
     }
@@ -2716,6 +2951,30 @@ fn archive_reset_authoritative_inputs(paths: &StatePaths) -> Result<(), StateErr
     let archive_dir = create_unique_reset_archive_dir(&paths.state_dir)?;
     archive_directory_if_exists(&paths.audit_dir, &archive_dir.join("audit"))?;
     archive_directory_if_exists(&paths.journal_dir, &archive_dir.join("journals"))?;
+    let binding = archive_dir.join("authority-reset.json");
+    let mut manifest = fs::File::create(&binding)
+        .map_err(|e| StateError::io_at("create reset archive binding", &binding, e))?;
+    serde_json::to_writer(
+        &mut manifest,
+        &serde_json::json!({
+            "state_dir": paths.state_dir, "journal_dir": paths.journal_dir,
+            "audit_dir": paths.audit_dir, "config_path": paths.config_path,
+            "replacement_authority_format": crate::authority_layout::FORMAT,
+            "request_digest": request_digest,
+        }),
+    )
+    .map_err(|e| StateError::ConfigInvalid(format!("write reset archive binding: {e}")))?;
+    manifest
+        .sync_all()
+        .map_err(|e| StateError::io_at("sync reset archive binding", &binding, e))?;
+    let marker = paths.state_dir.join("authority-format");
+    if marker.exists() {
+        let saved = archive_dir.join("authority-format");
+        fs::copy(&marker, &saved)
+            .map_err(|e| StateError::io_at("archive authority format", &marker, e))?;
+        sync_regular_file(&saved)?;
+    }
+
     sync_directory(&archive_dir)?;
     if let Some(root) = archive_dir.parent() {
         sync_directory(root)?;
@@ -2877,7 +3136,7 @@ mod tests {
     use crate::config::parse_config_toml;
     use crate::index::{StoredWrapDescriptor, TapeKindFilter, WrapMapCacheRecord};
 
-    fn config_text(root: &Path) -> String {
+    pub(super) fn config_text(root: &Path) -> String {
         format!(
             r#"
 [daemon]
@@ -3483,6 +3742,12 @@ pool_id = "camera.copy-a"
         );
         assert_eq!(first.assignment_generation, 1);
         assert_eq!(first.state, AdoptedTapeState::Ready);
+        assert_eq!(
+            fs::read_dir(handle.paths().journal_dir.join("tapes"))
+                .unwrap()
+                .count(),
+            0
+        );
         let mut explicit_pool = adoption_input(Uuid::new_v4());
         explicit_pool.pool_id = Some("camera.copy-a".into());
         assert!(
@@ -3915,6 +4180,17 @@ pool_id = "camera.copy-a"
         assert!(!temp.path().join("index/rem-state.sqlite-wal").exists());
         assert!(!temp.path().join("index/rem-state.sqlite-shm").exists());
         let archive_dir = temp.path().join("reset-archives/reset-000001");
+        let binding: serde_json::Value =
+            serde_json::from_slice(&fs::read(archive_dir.join("authority-reset.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            binding["replacement_authority_format"],
+            crate::authority_layout::FORMAT
+        );
+        assert_eq!(
+            fs::read(archive_dir.join("authority-format")).unwrap(),
+            fs::read(temp.path().join("authority-format")).unwrap()
+        );
         assert_eq!(
             fs::read(archive_dir.join("audit/old.remaudit")).expect("archived audit"),
             b"audit"
@@ -3944,6 +4220,76 @@ pool_id = "camera.copy-a"
                 .as_deref(),
             Some("Camera copy A")
         );
+    }
+
+    /// `authority-reset.json` names the request it archived: a scoped reset
+    /// writes exactly the preflight's `request_digest`, an ordinary full reset
+    /// the digest of its own fixed request. Both equal the new audit boundary.
+    #[test]
+    fn reset_archive_request_digest_is_the_preflight_and_audit_digest() {
+        let reset_binding = |root: &Path| -> (String, String) {
+            let binding: serde_json::Value = serde_json::from_slice(
+                &fs::read(root.join("reset-archives/reset-000001/authority-reset.json")).unwrap(),
+            )
+            .unwrap();
+            let digest = binding["request_digest"].as_str().unwrap().to_string();
+            assert_eq!(digest.len(), 64);
+            assert!(digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+            let records = FileAuditLog::replay(root.join("audit")).unwrap();
+            assert_eq!(records.len(), 1);
+            let Some(CborValue::Text(audited)) = records[0].detail.get("reset_request_digest")
+            else {
+                panic!("reset boundary has no request digest");
+            };
+            (digest, audited.clone())
+        };
+        for scoped in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let config_path = temp.path().join("config.toml");
+            fs::write(&config_path, config_text(temp.path())).unwrap();
+            {
+                let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
+                handle
+                    .catalog_index()
+                    .provision_tape(crate::index::ProvisionTapeInput {
+                        tape_uuid: [0x93; 16],
+                        voltag: "ACM001L9".to_string(),
+                        block_size: 512 * 1024,
+                        parity: ParityConfig::None,
+                        force: false,
+                    })
+                    .unwrap();
+            }
+            fs::write(temp.path().join("journals/source.remjournal"), b"journal").unwrap();
+            let expected = if scoped {
+                let admitted = StateHandle::preflight_catalog_reset_from_config_file(
+                    &config_path,
+                    &[],
+                    &["ACM001L9".to_string()],
+                )
+                .unwrap();
+                StateHandle::reset_catalog_preserving_with_preflight_token_from_config_file(
+                    &config_path,
+                    &[],
+                    &["ACM001L9".to_string()],
+                    &admitted.preflight_token,
+                )
+                .unwrap();
+                admitted.request_digest
+            } else {
+                StateHandle::reset_catalog_from_config_file(&config_path).unwrap();
+                let paths =
+                    StatePaths::from_config(&config_path, &load_config(&config_path).unwrap());
+                let (_, config_bytes) = load_catalog_reset_config_snapshot(&config_path).unwrap();
+                catalog_reset_request_digest(&paths, &config_bytes, &[], &[], true, &"0".repeat(64))
+                    .unwrap()
+            };
+            let (archived, audited) = reset_binding(temp.path());
+            assert_eq!(archived, expected, "scoped={scoped}");
+            assert_eq!(audited, expected, "scoped={scoped}");
+        }
     }
 
     #[test]
@@ -4019,6 +4365,12 @@ pool_id = "camera.copy-a"
         assert_eq!(tape.total_committed_ordinals, 0);
         assert_eq!(tape.written_extent_lba, None);
         assert_eq!(tape.terminal_finalization, None);
+        assert_eq!(
+            fs::read_dir(temp.path().join("journals/tapes"))
+                .unwrap()
+                .count(),
+            0
+        );
         assert!(handle
             .catalog_index()
             .get_tape(&discarded_uuid)
@@ -4926,7 +5278,9 @@ pool_id = "camera.copy-a"
         )
         .expect_err("legacy preservation must remain closed");
         assert!(
-            preserve_error.to_string().contains("empty preserve list"),
+            preserve_error
+                .to_string()
+                .contains(crate::authority_layout::RESET_REQUIRED),
             "{preserve_error}"
         );
         let incomplete_error = StateHandle::preflight_catalog_reset_from_config_file(
@@ -6257,5 +6611,257 @@ pool_id = "camera.copy-a"
             read_row.write_epoch, read_map_epoch,
             "a lost read session dispatches nothing media-modifying and is not invalidated"
         );
+    }
+}
+
+#[cfg(test)]
+mod cutover_tests {
+    use super::*;
+    use crate::authority::{fixtures::AuthorityBuilder, TapeAuthorityWriter};
+
+    fn setup() -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("config.toml");
+        fs::write(&config, super::tests::config_text(root.path())).unwrap();
+        (root, config)
+    }
+    fn hash_files(path: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        if !path.exists() {
+            return;
+        }
+        if path.is_file() {
+            out.insert(
+                path.to_path_buf(),
+                Sha256::digest(fs::read(path).unwrap()).to_vec(),
+            );
+            return;
+        }
+        for entry in fs::read_dir(path).unwrap() {
+            hash_files(&entry.unwrap().path(), out);
+        }
+    }
+
+    /// Every file and directory below `path`, sorted.
+    fn tree(path: &Path) -> Vec<PathBuf> {
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap().path();
+            if entry.is_dir() {
+                entries.extend(tree(&entry));
+            }
+            entries.push(entry);
+        }
+        entries.sort();
+        entries
+    }
+
+    /// Read-only validation succeeds beside the daemon's lifetime state lock and
+    /// creates nothing: no lock file, marker or journal namespace.
+    #[test]
+    fn layout_validation_is_read_only_beside_the_owner_state_lock() {
+        let (root, config_path) = setup();
+        let config = crate::load_config(&config_path).unwrap();
+        let before = tree(root.path());
+        crate::authority_layout::validate_config_layout(&config).unwrap();
+        crate::authority_layout::load_runtime_config(&config_path).unwrap();
+        assert_eq!(tree(root.path()), before, "an empty state stays empty");
+        assert!(!root.path().join("state.lock").exists());
+        assert!(!root.path().join("authority-format").exists());
+
+        let state = StateHandle::open_from_config_file(&config_path).unwrap();
+        crate::authority_layout::validate_owned_config_layout(state.config()).unwrap();
+        let before = tree(root.path());
+        crate::authority_layout::validate_config_layout(state.config()).unwrap();
+        crate::authority_layout::load_runtime_config(&config_path).unwrap();
+        assert_eq!(tree(root.path()), before);
+        assert!(StateLockGuard::acquire(&state.paths.state_dir)
+            .unwrap_err()
+            .is_state_lock_held());
+
+        // A marker-less, non-empty state is still refused without installing one.
+        let paths = state.paths.clone();
+        drop(state);
+        fs::remove_file(paths.state_dir.join("authority-format")).unwrap();
+        assert!(crate::authority_layout::validate_config_layout(&config)
+            .unwrap_err()
+            .to_string()
+            .contains(crate::authority_layout::RESET_REQUIRED));
+        assert!(!paths.state_dir.join("authority-format").exists());
+    }
+
+    #[test]
+    fn owned_runtime_installs_marker_before_catalog_and_writes_no_tape_log() {
+        let (_root, config_path) = setup();
+        let config = crate::load_config(&config_path).unwrap();
+        let paths = StatePaths::from_config(&config_path, &config);
+        let lock = StateLockGuard::acquire(&paths.state_dir).unwrap();
+        crate::authority_layout::admit_owned_config(&config).unwrap();
+        assert!(paths.state_dir.join("authority-format").is_file());
+        assert!(!paths.sqlite_path.exists());
+        assert_eq!(
+            fs::read_dir(paths.journal_dir.join("tapes"))
+                .unwrap()
+                .count(),
+            0
+        );
+        drop(CatalogIndex::open(&paths.sqlite_path).unwrap());
+        crate::authority_layout::admit_owned_config(&config).unwrap();
+        drop(lock);
+        StateHandle::open_from_config_file(&config_path).unwrap();
+    }
+
+    #[test]
+    fn authority_layout_refuses_unmarked_schema22_and_marked_mixed_authority() {
+        let (_root, config) = setup();
+        let state = StateHandle::open_from_config_file(&config).unwrap();
+        let paths = state.paths.clone();
+        assert!(paths.state_dir.join("authority-format").exists());
+        drop(state);
+        fs::remove_file(paths.state_dir.join("authority-format")).unwrap();
+        let conn = rusqlite::Connection::open(&paths.sqlite_path).unwrap();
+        conn.pragma_update(None, "user_version", 22).unwrap();
+        drop(conn);
+        assert!(StateHandle::open_from_config_file(&config)
+            .unwrap_err()
+            .to_string()
+            .contains(crate::authority_layout::RESET_REQUIRED));
+        assert!(CatalogIndex::open(&paths.sqlite_path)
+            .unwrap_err()
+            .to_string()
+            .contains(crate::authority_layout::RESET_REQUIRED));
+        crate::authority_layout::install(&paths, true).unwrap();
+        fs::write(paths.journal_dir.join("old.remjournal"), b"old authority").unwrap();
+        assert!(StateHandle::open_from_config_file(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("old authority files in active paths"));
+    }
+
+    #[test]
+    fn repair_without_rebuild_marks_ready_projection_recovery_required() {
+        use crate::authority::{TapeAuthorityView, TapeAuthorityWriter};
+        use std::io::Write;
+        let (_root, config) = setup();
+        let mut state = StateHandle::open_from_config_file(&config).unwrap();
+        let id = [0x76; 16];
+        let directory = state.paths.journal_dir.join("tapes");
+        let authority =
+            crate::TapeAuthority::open(&directory, id, &state.paths.sqlite_path).unwrap();
+        let mut writer = authority.acquire_exclusive().unwrap();
+        writer
+            .publish_report(&(&crate::checkpoint::tests::record(id)).into())
+            .unwrap();
+        let snapshot = writer.freeze().unwrap();
+        state.index.project_tape_log(&snapshot).unwrap();
+        let through = state.index.projected_through_sequence(id).unwrap();
+        drop(writer);
+        let path = directory.join(format!("{}.remtape", uuid::Uuid::from_bytes(id).simple()));
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(b"torn")
+            .unwrap();
+        state.repair_tape_log_tail(id, through, false).unwrap();
+        assert_eq!(
+            state.index.get_tape(&id).unwrap().unwrap().state,
+            "recovery_required"
+        );
+        assert!(authority.acquire_exclusive().is_err());
+    }
+
+    #[test]
+    fn repair_refuses_corrupt_seal_or_decision_before_changing_authority() {
+        use crate::authority::{TapeAuthorityView, TapeAuthorityWriter};
+        use crate::tape_log::Record;
+        for cut_seal in [false, true] {
+            let (_root, config) = setup();
+            let mut state = StateHandle::open_from_config_file(&config).unwrap();
+            let id = [0x74; 16];
+            let directory = state.paths.journal_dir.join("tapes");
+            let authority =
+                crate::TapeAuthority::open(&directory, id, &state.paths.sqlite_path).unwrap();
+            let mut writer = authority.acquire_exclusive().unwrap();
+            writer
+                .publish_report(&(&crate::checkpoint::tests::record(id)).into())
+                .unwrap();
+            writer
+                .begin_finalization(&(&crate::checkpoint::tests::finalization_intent(id)).into())
+                .unwrap();
+            let mut progress = crate::TerminalFinalizationProgress::BeforeReplicaA;
+            while let Some(next) = progress.successor() {
+                writer.advance_finalization(progress, next).unwrap();
+                progress = next;
+            }
+            writer.seal(|| Ok(())).unwrap();
+            let snapshot = writer.freeze().unwrap();
+            state.index.project_tape_log(&snapshot).unwrap();
+            let mut decoder = snapshot.raw.decoder().unwrap();
+            let mut cut = None;
+            while let Some(frame) = decoder.next_row_frame().unwrap() {
+                if (cut_seal && matches!(frame.record, Record::Sealed { .. }))
+                    || (!cut_seal && matches!(frame.record, Record::FinalizationDecided(_)))
+                {
+                    cut = Some(frame.offset);
+                    break;
+                }
+            }
+            drop(writer);
+            let path = directory.join(format!("{}.remtape", uuid::Uuid::from_bytes(id).simple()));
+            let mut bytes = fs::read(&path).unwrap();
+            bytes[cut.unwrap() as usize + 28] ^= 0x80;
+            fs::write(&path, &bytes).unwrap();
+            let store =
+                crate::tape_log::store::Store::open(&directory, id, &state.paths.sqlite_path)
+                    .unwrap();
+            let through = store.inspect_tail().unwrap().through_sequence;
+            let error = state.repair_tape_log_tail(id, through, true).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("separate explicit forensic recovery path"),
+                "{error}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(state.index.get_tape(&id).unwrap().unwrap().state, "sealed");
+            assert!(authority.acquire_for_tail_reconciliation().is_err());
+        }
+    }
+    #[test]
+    fn projection_rebuild_hashes_authority_audit_and_never_resets() {
+        let (_root, config) = setup();
+        let mut state = StateHandle::open_from_config_file(&config).unwrap();
+        let id = [0x69; 16];
+        let authority = AuthorityBuilder::new(state.paths.journal_dir.join("tapes"), id)
+            .build()
+            .unwrap();
+        let mut lease = authority.acquire_exclusive().unwrap();
+        lease
+            .publish_report(&(&crate::checkpoint::tests::record(id)).into())
+            .unwrap();
+        drop(lease);
+        state.calibration.record_harvest_success(id, 0).unwrap();
+        let mut before = BTreeMap::new();
+        for path in [&state.paths.journal_dir, &state.paths.audit_dir] {
+            hash_files(path, &mut before);
+        }
+        REJECT_RESET_HELPER.with(|flag| flag.set(true));
+        state.rebuild_projection_from_tape_logs().unwrap();
+        state.rebuild_projection_from_tape_logs().unwrap();
+        let fault = rusqlite::Connection::open(&state.paths.sqlite_path).unwrap();
+        fault.execute_batch("create trigger interrupt_projection before insert on tape_log_projection begin select raise(abort, 'interrupted rebuild'); end").unwrap();
+        assert!(state.rebuild_projection_from_tape_logs().is_err());
+        assert_eq!(state.index.projected_through_sequence(id).unwrap(), 4);
+        fault
+            .execute_batch("drop trigger interrupt_projection")
+            .unwrap();
+        state.rebuild_projection_from_tape_logs().unwrap();
+        REJECT_RESET_HELPER.with(|flag| flag.set(false));
+        let mut after = BTreeMap::new();
+        for path in [&state.paths.journal_dir, &state.paths.audit_dir] {
+            hash_files(path, &mut after);
+        }
+        assert_eq!(before, after);
+        assert_eq!(state.index.projected_through_sequence(id).unwrap(), 4);
     }
 }

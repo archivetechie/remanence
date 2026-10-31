@@ -44,6 +44,9 @@ const MAX_RECORD_LEN: u64 = 64 * 1024 * 1024;
 /// Durable-append journal failures from Layer 3c v0.7.2 §10.2/§10.6.
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
+    /// Authority is durable but a subsequent fold/projection step failed.
+    #[error("journal authority is durable; replay is required: {0}")]
+    AfterDurable(String),
     /// An old-format publication phase has no single-log equivalent.
     #[error("authority operation requires B3b migration: {0}")]
     UnsupportedOperation(&'static str),
@@ -3346,7 +3349,9 @@ mod tests {
                 .expect("orphan-prefix probe"));
             let before = reopened.published_units_for_test().unwrap();
             let receipt = reopened
-                .publish_terminal_prefix(&(&prefix).into())
+                .publish_terminal_prefix(
+                    &crate::authority::FilePublication::try_from(&prefix).unwrap(),
+                )
                 .expect("exact orphan gains checkpoint");
             assert_eq!(
                 receipt
@@ -3371,7 +3376,9 @@ mod tests {
             .expect("reopen checkpointed prefix");
             let before = reopened.published_units_for_test().unwrap();
             let receipt = reopened
-                .publish_terminal_prefix(&(&prefix).into())
+                .publish_terminal_prefix(
+                    &crate::authority::FilePublication::try_from(&prefix).unwrap(),
+                )
                 .expect("checkpointed prefix is idempotent");
             assert_eq!(
                 receipt
@@ -3405,7 +3412,9 @@ mod tests {
             .expect("reopen component orphan");
             let before = reopened.published_units_for_test().unwrap();
             let receipt = reopened
-                .publish_terminal_component(&(&component).into())
+                .publish_terminal_component(
+                    &crate::authority::FilePublication::try_from(&component).unwrap(),
+                )
                 .expect("exact component orphan gains checkpoint");
             assert_eq!(
                 receipt
@@ -3430,7 +3439,9 @@ mod tests {
             .expect("reopen checkpointed component");
             let before = reopened.published_units_for_test().unwrap();
             let receipt = reopened
-                .publish_terminal_component(&(&component).into())
+                .publish_terminal_component(
+                    &crate::authority::FilePublication::try_from(&component).unwrap(),
+                )
                 .expect("checkpointed component is idempotent");
             assert_eq!(
                 receipt

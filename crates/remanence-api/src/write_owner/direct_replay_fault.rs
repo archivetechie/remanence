@@ -15,9 +15,9 @@ use uuid::Uuid;
 
 pub(crate) const ENABLE_ENV: &str = "REM_WOR_DIRECT_REPLAY_FAULT_ENABLE";
 pub(crate) const PLAN_ENV: &str = "REM_WOR_DIRECT_REPLAY_FAULT_PLAN";
-const ENABLE_VALUE: &str = "direct-replay-after-checkpoint-v1-abort";
-const PLAN_SCHEMA: &str = "rem.wor.direct-replay-fault-plan.v1";
-const EVIDENCE_SCHEMA: &str = "rem.wor.direct-replay-fault-evidence.v1";
+const ENABLE_VALUE: &str = "direct-replay-after-tape-log-v2-abort";
+const PLAN_SCHEMA: &str = "rem.wor.direct-replay-fault-plan.v2";
+const EVIDENCE_SCHEMA: &str = "rem.wor.direct-replay-fault-evidence.v2";
 const FAULT_ROOT: &str = "/tmp/system-harness/scenario-wor/direct-replay-faults";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -132,16 +132,23 @@ impl DirectReplayFaultPlan {
         })
     }
 
-    fn publish(&self, record: &AuthorityCommit) -> Result<(), String> {
-        if record.tape_uuid != self.tape_uuid || record.payloads.len() != 1 {
+    fn publish(&self, record: &AuthorityCommit, sequence: u64) -> Result<(), String> {
+        if record.tape_uuid != self.tape_uuid {
             return Err(
                 "direct-replay checkpoint record does not match the planned tape/object"
                     .to_string(),
             );
         }
-        let projection = &record.payloads[0];
-        if projection.object.caller_object_id.as_deref() != Some(self.caller_object_id.as_str()) {
-            return Err("direct-replay checkpoint caller object id changed before the cut".into());
+        let mut selected = record.payloads.iter().filter(|p| {
+            p.object.caller_object_id.as_deref() == Some(self.caller_object_id.as_str())
+        });
+        let projection = selected.next().ok_or_else(|| {
+            "direct-replay checkpoint caller object id changed before the cut".to_string()
+        })?;
+        if selected.next().is_some() {
+            return Err(
+                "direct-replay checkpoint contains duplicate selected caller object ids".into(),
+            );
         }
         let evidence = json!({
             "schema": EVIDENCE_SCHEMA,
@@ -149,18 +156,20 @@ impl DirectReplayFaultPlan {
             "caller_object_id": self.caller_object_id,
             "object_id": projection.object.object_id,
             "nonce": self.nonce.to_string(),
-            "checkpoint_ordinal": record.ordinal.to_string(),
-            "checkpoint_eod_partition": record.cursor.partition,
-            "checkpoint_eod_lba": record.cursor.lba.to_string(),
+            "tape_log_sequence": sequence.to_string(),
+            "tape_incarnation": 1,
+            "committed_eod_partition": record.cursor.partition,
+            "committed_eod_lba": record.cursor.lba.to_string(),
         });
         write_durable_new_json(&self.evidence_path, &evidence)
     }
 
-    pub(crate) fn abort_after_checkpoint_append(
+    pub(crate) fn abort_after_tape_log_append(
         &self,
         record: &AuthorityCommit,
+        sequence: u64,
     ) -> Result<(), String> {
-        self.publish(record)?;
+        self.publish(record, sequence)?;
         std::process::abort()
     }
 }
@@ -392,28 +401,29 @@ mod tests {
 
         let mut invalid = record.clone();
         invalid.tape_uuid = [0x99; 16];
-        assert!(plan.publish(&(&invalid).into()).is_err());
+        assert!(plan.publish(&(&invalid).into(), 7).is_err());
         invalid = record.clone();
         invalid.objects.push(record.objects[0].clone());
         assert!(
-            plan.publish(&(&invalid).into()).is_err(),
+            plan.publish(&(&invalid).into(), 7).is_err(),
             "the cut requires exactly one object"
         );
         invalid = record.clone();
         invalid.objects[0].object.caller_object_id = Some("other-caller".into());
-        assert!(plan.publish(&(&invalid).into()).is_err());
+        assert!(plan.publish(&(&invalid).into(), 7).is_err());
         assert!(
             !plan.evidence_path.exists(),
             "mismatches publish no evidence"
         );
         assert!(plan.require_object(tape_uuid, "other-caller").is_err());
-        plan.publish(&(&record).into()).expect("publish evidence");
+        plan.publish(&(&record).into(), 7)
+            .expect("publish evidence");
         let evidence: Value =
             serde_json::from_slice(&fs::read(&plan.evidence_path).expect("read evidence"))
                 .expect("decode evidence");
         assert_eq!(evidence["schema"], EVIDENCE_SCHEMA);
         assert_eq!(evidence["object_id"], object_id);
-        assert_eq!(evidence["checkpoint_ordinal"], "7");
-        assert_eq!(evidence["checkpoint_eod_lba"], "19");
+        assert_eq!(evidence["tape_log_sequence"], "7");
+        assert_eq!(evidence["committed_eod_lba"], "19");
     }
 }

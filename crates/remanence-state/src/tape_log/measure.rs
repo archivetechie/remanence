@@ -6,6 +6,8 @@ use std::cell::Cell;
 /// Byte totals normalize partial/group scans into whole-log pass equivalents.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScanCounts {
+    /// Catalog Object/member payloads decoded.
+    pub catalog_payloads: u64,
     /// Full-decoder traversals started (a group or one frame also counts).
     pub full_scans: u64,
     /// Structural-decoder traversals started.
@@ -54,6 +56,13 @@ pub(super) fn copied(bytes: u64) {
     update(|mut c| {
         c.copied_frames += 1;
         c.copied_bytes += bytes;
+        c
+    });
+}
+
+pub(super) fn catalog_payload() {
+    update(|mut c| {
+        c.catalog_payloads += 1;
         c
     });
 }

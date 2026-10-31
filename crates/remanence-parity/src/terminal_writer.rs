@@ -537,8 +537,10 @@ pub struct TerminalComponentCommit {
 
 impl TerminalComponentCommit {
     /// Files and counters proved by this component's media barrier.
-    pub fn media_publication(&self) -> crate::authority::FilePublication {
-        (&self.journal_bundle).into()
+    pub fn media_publication(
+        &self,
+    ) -> Result<crate::authority::FilePublication, crate::JournalError> {
+        crate::authority::FilePublication::try_from(&self.journal_bundle)
     }
 }
 
@@ -547,7 +549,9 @@ pub fn terminal_component_publication(
     plan: &TerminalTripleWritePlan,
     component: TerminalTailComponentPlan,
 ) -> Result<crate::authority::FilePublication, TerminalTailWriteError> {
-    terminal_component_bundle(plan, component).map(|bundle| (&bundle).into())
+    let bundle = terminal_component_bundle(plan, component)?;
+    crate::authority::FilePublication::try_from(&bundle)
+        .map_err(|e| TerminalTailWriteError::Authority(e.to_string()))
 }
 
 /// Durable progress and physical-reconciliation seam.

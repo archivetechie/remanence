@@ -285,6 +285,9 @@ pub(crate) fn abandon_pending_append(
     lease: &mut remanence_state::TapeAuthorityLease,
 ) -> Result<(), String> {
     lease
+        .ensure_abandonment_allowed()
+        .map_err(|e| e.to_string())?;
+    lease
         .with_structural(|lease, rows| abandon_pending_append_with_rows(drive, lease, rows))
         .map_err(|error| error.to_string())?
 }

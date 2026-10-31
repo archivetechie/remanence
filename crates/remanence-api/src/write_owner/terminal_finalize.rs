@@ -156,6 +156,7 @@ pub(crate) fn finalize_mounted_tape(
     let checkpoint_journal = remanence_state::TapeAuthority::open(
         cfg.checkpoint_journal_dir.as_path(),
         request.tape_uuid,
+        index.path(),
     )
     .map_err(crate::status_from_state_error)?;
     let pending_intent = checkpoint_journal
@@ -550,6 +551,13 @@ pub(super) fn publish_terminal_intent(
     spec: &TerminalFinalizeSpec,
     intent: &remanence_state::authority::AuthorityFinalization,
 ) -> Result<(), Status> {
+    if let Some(fault) = crate::terminal_fault::TerminalFaultPlan::from_env_for_tape(spec.tape_uuid)
+        .map_err(Status::failed_precondition)?
+    {
+        fault
+            .install(checkpoint)
+            .map_err(Status::failed_precondition)?;
+    }
     checkpoint
         .begin_finalization(intent)
         .map_err(crate::status_from_state_error)?;
@@ -623,6 +631,7 @@ pub(crate) fn reconcile_manual_terminal_acceptance(
                     "manual terminal acceptance database authority differs from its checkpoint companion",
                 ));
             }
+            checkpoint.accept_preparation().map_err(crate::status_from_state_error)?;
             Ok(true)
         }
     }
@@ -660,9 +669,12 @@ pub(crate) fn preflight_manual_finalize_cancellable(
     prefix: Option<&TerminalPrefixPlan>,
     cancelled: impl Fn() -> bool,
 ) -> Result<Option<ManualFinalizeTapeActorReply>, Status> {
-    let checkpoint_journal =
-        remanence_state::TapeAuthority::open(cfg.checkpoint_journal_dir, request.tape_uuid)
-            .map_err(crate::status_from_state_error)?;
+    let checkpoint_journal = remanence_state::TapeAuthority::open(
+        cfg.checkpoint_journal_dir,
+        request.tape_uuid,
+        index.path(),
+    )
+    .map_err(crate::status_from_state_error)?;
     let pending_intent = checkpoint_journal
         .pending_finalization()
         .map_err(crate::status_from_state_error)?;
@@ -688,6 +700,10 @@ pub(crate) fn preflight_manual_finalize_cancellable(
         }
     });
 
+    // A durable Decided group reconstructs both acceptance halves; a Prepared
+    // group projects neither and remains subject to the retirement guard.
+    project_checkpoint_authority_bounded(index, &checkpoint)
+        .map_err(crate::status_from_state_error)?;
     if let Some(intent) = existing_intent
         .as_ref()
         .filter(|intent| intent.manual.is_some())
@@ -766,7 +782,11 @@ pub(crate) fn preflight_manual_finalize_cancellable(
             )?;
         } else {
             index
-                .project_authority_commit(&previous)
+                .project_tape_log(
+                    &checkpoint
+                        .freeze()
+                        .map_err(crate::status_from_state_error)?,
+                )
                 .map_err(crate::status_from_state_error)?;
         }
         let completion = previous.finalization.as_ref().ok_or_else(|| {
@@ -994,6 +1014,11 @@ pub(crate) fn preflight_manual_finalize_cancellable(
                     projection,
                 },
                 || {
+                    if let Some(fault) = tix_fault.as_ref() {
+                        fault
+                            .install(&checkpoint)
+                            .map_err(remanence_state::StateError::JournalReplayFailed)?;
+                    }
                     checkpoint.begin_finalization(&intent)?;
                     #[cfg(test)]
                     PREFLIGHT_INTENT_HOOK.with(|hook| {
@@ -1024,6 +1049,9 @@ pub(crate) fn preflight_manual_finalize_cancellable(
             .project_terminal_finalization(projection)
             .map_err(crate::status_from_state_error)?;
     }
+    checkpoint
+        .accept_preparation()
+        .map_err(crate::status_from_state_error)?;
     // A crash after acceptance but before this append is repaired from the
     // accepted companion before any physical dispatch.
     record_manual_finalize_request_with(
@@ -1065,9 +1093,12 @@ pub(crate) fn preflight_automatic_terminal_completion(
     selected: &SelectedTape,
     pool_cfg: &TapePoolConfig,
 ) -> Result<bool, Status> {
-    let checkpoint_journal =
-        remanence_state::TapeAuthority::open(cfg.checkpoint_journal_dir, selected.tape_uuid)
-            .map_err(crate::status_from_state_error)?;
+    let checkpoint_journal = remanence_state::TapeAuthority::open(
+        cfg.checkpoint_journal_dir,
+        selected.tape_uuid,
+        index.path(),
+    )
+    .map_err(crate::status_from_state_error)?;
     let pending = checkpoint_journal
         .pending_finalization()
         .map_err(crate::status_from_state_error)?;
@@ -1129,7 +1160,11 @@ pub(crate) fn preflight_automatic_terminal_completion(
             // authority; ordinary journal ownership excludes a concurrent
             // writer while it is projected.
             index
-                .project_authority_commit(&previous)
+                .project_tape_log(
+                    &checkpoint
+                        .freeze()
+                        .map_err(crate::status_from_state_error)?,
+                )
                 .map_err(crate::status_from_state_error)?;
         }
         ensure_tape_sealed_audit(
@@ -1185,7 +1220,11 @@ pub(crate) fn preflight_automatic_terminal_completion(
             let prefix =
                 TerminalPrefixPlan::try_from(persisted).map_err(crate::status_from_state_error)?;
             let prefix_is_durable = journal
-                .prefix_is_durable(&prefix.media_publication())
+                .prefix_is_durable(
+                    &prefix
+                        .media_publication()
+                        .map_err(|e| Status::failed_precondition(e.to_string()))?,
+                )
                 .map_err(|error| {
                     Status::failed_precondition(format!(
                         "inspect terminal-prefix journal transition: {error}"
@@ -1264,10 +1303,14 @@ pub(crate) fn preflight_automatic_terminal_completion(
 pub(super) fn project_sealed_checkpoint_then_retire_terminal_intent(
     index: &mut CatalogIndex,
     checkpoint: &mut remanence_state::TapeAuthorityLease,
-    previous: &remanence_state::authority::AuthorityCommit,
+    _previous: &remanence_state::authority::AuthorityCommit,
 ) -> Result<(), Status> {
     index
-        .project_authority_commit(previous)
+        .project_tape_log(
+            &checkpoint
+                .freeze()
+                .map_err(crate::status_from_state_error)?,
+        )
         .map_err(crate::status_from_state_error)?;
     checkpoint
         .recover_finalization()
@@ -1449,6 +1492,11 @@ pub(super) fn finalize_terminal_with_parity_journal(
         .map_err(|error| {
             Status::failed_precondition(format!("TIX terminal fault plan: {error}"))
         })?;
+    if let Some(fault) = tix_fault.as_ref() {
+        fault
+            .install(checkpoint)
+            .map_err(Status::failed_precondition)?;
+    }
     let mut carried = carried;
     let mut epoch_state = None;
     let resuming_existing_intent = existing_intent.is_some();
@@ -1460,7 +1508,11 @@ pub(super) fn finalize_terminal_with_parity_journal(
             let prefix =
                 TerminalPrefixPlan::try_from(persisted).map_err(crate::status_from_state_error)?;
             let prefix_is_durable = journal
-                .prefix_is_durable(&prefix.media_publication())
+                .prefix_is_durable(
+                    &prefix
+                        .media_publication()
+                        .map_err(|e| Status::failed_precondition(e.to_string()))?,
+                )
                 .map_err(|error| {
                     Status::failed_precondition(format!(
                         "inspect terminal-prefix journal transition: {error}"
@@ -1487,7 +1539,11 @@ pub(super) fn finalize_terminal_with_parity_journal(
                 (None, journal)
             } else {
                 let snapshot = journal
-                    .freeze_before_terminal_prefix(&prefix.media_publication())
+                    .freeze_before_terminal_prefix(
+                        &prefix
+                            .media_publication()
+                            .map_err(|e| Status::failed_precondition(e.to_string()))?,
+                    )
                     .map_err(|error| {
                         Status::failed_precondition(format!("freeze terminal-prefix base: {error}"))
                     })?;
@@ -1648,7 +1704,11 @@ pub(super) fn finalize_terminal_with_parity_journal(
     }
 
     let prefix_already_journaled = journal
-        .prefix_is_durable(&prefix.media_publication())
+        .prefix_is_durable(
+            &prefix
+                .media_publication()
+                .map_err(|e| Status::failed_precondition(e.to_string()))?,
+        )
         .map_err(|error| {
             Status::failed_precondition(format!(
                 "inspect terminal-prefix journal transition: {error}"
@@ -1767,6 +1827,35 @@ pub(super) fn finalize_terminal_with_parity_journal(
                 ));
             }
         };
+        checkpoint
+            .publish_terminal_prefix(
+                &prefix
+                    .media_publication()
+                    .map_err(|e| Status::failed_precondition(e.to_string()))?,
+            )
+            .map_err(|error| {
+                if matches!(error, remanence_parity::JournalError::AfterDurable(_)) {
+                    return Status::internal(format!(
+                        "terminal prefix is durable; retry after tape-log replay: {error}"
+                    ));
+                }
+                terminal_prefix_write_failure(
+                    index,
+                    cfg,
+                    checkpoint,
+                    spec,
+                    selected,
+                    true,
+                    &error.into(),
+                )
+            })?;
+        index
+            .project_tape_log(
+                &checkpoint
+                    .freeze()
+                    .map_err(crate::status_from_state_error)?,
+            )
+            .map_err(crate::status_from_state_error)?;
         if let Some(fault) = tix_fault.as_ref() {
             fault
                 .abort_prefix_if_matches(
@@ -1809,6 +1898,11 @@ pub(super) fn complete_terminal_finalization_host_only(
     plan: &TerminalTripleWritePlan,
     tix_fault: Option<&crate::terminal_fault::TerminalFaultPlan>,
 ) -> Result<TerminalFinalizeResult, Status> {
+    if let Some(fault) = tix_fault {
+        fault
+            .install(checkpoint)
+            .map_err(Status::failed_precondition)?;
+    }
     if intent.progress != remanence_state::TerminalFinalizationProgress::AfterReplicaC {
         return Err(Status::internal(
             "host-only terminal completion requires durable replica C progress",
@@ -1851,38 +1945,8 @@ pub(super) fn complete_terminal_finalization_host_only(
             total: 0,
             check: None,
         });
-    if let Some(fault) = tix_fault {
-        fault
-            .abort_if_matches(
-                "final_projection",
-                crate::terminal_fault::TerminalFaultCut::BeforeFinalCheckpointFsync,
-                Some(PhysicalPositionHint {
-                    partition: final_record.cursor.partition,
-                    lba: final_record.cursor.lba,
-                }),
-                None,
-            )
-            .map_err(|error| {
-                Status::failed_precondition(format!("TIX terminal fault plan: {error}"))
-            })?;
-    }
     checkpoint
-        .publish_sealed_reports(std::slice::from_ref(&final_record), || {
-            if let Some(fault) = tix_fault {
-                fault
-                    .abort_if_matches(
-                        "final_projection",
-                        crate::terminal_fault::TerminalFaultCut::AfterFinalCheckpointFsync,
-                        Some(PhysicalPositionHint {
-                            partition: final_record.cursor.partition,
-                            lba: final_record.cursor.lba,
-                        }),
-                        None,
-                    )
-                    .map_err(remanence_state::StateError::JournalReplayFailed)?;
-            }
-            Ok(())
-        })
+        .publish_sealed_reports(std::slice::from_ref(&final_record), || Ok(()))
         .map_err(crate::status_from_state_error)?;
     if let Some(fault) = tix_fault {
         fault
@@ -1900,7 +1964,11 @@ pub(super) fn complete_terminal_finalization_host_only(
             })?;
     }
     index
-        .project_authority_commit(&final_record)
+        .project_tape_log(
+            &checkpoint
+                .freeze()
+                .map_err(crate::status_from_state_error)?,
+        )
         .map_err(crate::status_from_state_error)?;
     if let Some(fault) = tix_fault {
         fault
@@ -1956,10 +2024,15 @@ pub(super) fn finish_terminal_tail(
     intent: remanence_state::authority::AuthorityFinalization,
     plan: TerminalTripleWritePlan,
     mut source: remanence_state::TerminalIndexSource,
-    parity_journal: Option<&mut dyn remanence_parity::authority::StructuralAuthority>,
+    _parity_journal: Option<&mut dyn remanence_parity::authority::StructuralAuthority>,
     rewritable: bool,
     tix_fault: Option<&crate::terminal_fault::TerminalFaultPlan>,
 ) -> Result<TerminalFinalizeResult, Status> {
+    if let Some(fault) = tix_fault {
+        fault
+            .install(checkpoint)
+            .map_err(Status::failed_precondition)?;
+    }
     let cfg = &cfg.terminal_config();
     let prefix_plan = intent
         .terminal_prefix
@@ -1969,12 +2042,12 @@ pub(super) fn finish_terminal_tail(
         .map_err(crate::status_from_state_error)?;
     let mut authority = TerminalTailCatalogAuthority {
         checkpoint,
-        parity_journal,
         index,
         spec,
         intent,
         tix_fault,
         reconciliation: None,
+        durable_projection_pending: false,
     };
     let mut admission = None;
     loop {
@@ -2022,6 +2095,11 @@ pub(super) fn finish_terminal_tail(
         let step = match step_result {
             Ok(step) => step,
             Err(error) => {
+                if authority.durable_projection_pending {
+                    return Err(Status::internal(format!(
+                        "terminal component is durable; retry after tape-log replay: {error}"
+                    )));
+                }
                 return Err(terminal_tail_write_failure(
                     authority.index,
                     cfg,
@@ -2557,9 +2635,12 @@ pub(crate) fn plan_unretained_epoch_finalization(
         tape.voltag.as_deref(),
         "plan finalization",
     )?;
-    let checkpoint =
-        remanence_state::TapeAuthority::open(&cfg.checkpoint_journal_dir, request.tape_uuid)
-            .map_err(crate::status_from_state_error)?;
+    let checkpoint = remanence_state::TapeAuthority::open(
+        &cfg.checkpoint_journal_dir,
+        request.tape_uuid,
+        index.path(),
+    )
+    .map_err(crate::status_from_state_error)?;
     let lease = checkpoint
         .acquire_exclusive()
         .map_err(crate::status_from_state_error)?;
@@ -2658,9 +2739,12 @@ pub(super) fn plan_mounted_epoch_finalization(
             tape.voltag.as_deref(),
         );
     }
-    let checkpoint =
-        remanence_state::TapeAuthority::open(&cfg.checkpoint_journal_dir, request.tape_uuid)
-            .map_err(crate::status_from_state_error)?;
+    let checkpoint = remanence_state::TapeAuthority::open(
+        &cfg.checkpoint_journal_dir,
+        request.tape_uuid,
+        index.path(),
+    )
+    .map_err(crate::status_from_state_error)?;
     let mut lease = checkpoint
         .acquire_exclusive()
         .map_err(crate::status_from_state_error)?;

@@ -61,8 +61,9 @@ pub(crate) fn supersede_mounted_tail(
         tape.pool_id.as_deref().unwrap_or("(unpooled)"),
     )
     .map_err(|e| failure(e.to_string()))?;
-    let journal = remanence_state::TapeAuthority::open(&cfg.checkpoint_journal_dir, tape_uuid)
-        .map_err(crate::status_from_state_error)?;
+    let journal =
+        remanence_state::TapeAuthority::open(&cfg.checkpoint_journal_dir, tape_uuid, index.path())
+            .map_err(crate::status_from_state_error)?;
     let terminal_guidance = "retry FinalizeTape with its original idempotency key. If rolled-back state cannot resume that intent, restore a newer copy of the state directory; supersede-tail cannot clear a stale terminal intent";
     if journal
         .pending_finalization()
@@ -77,8 +78,28 @@ pub(crate) fn supersede_mounted_tail(
             "terminal finalization intent prevents tail discard; {terminal_guidance}"
         )));
     }
+    // The log's own seal refuses too: SQLite may not have projected it yet,
+    // and pending_finalization reports nothing for a sealed log.
+    let sealed = "tape log is sealed; supersede-tail cannot make a sealed tape writable";
+    if journal
+        .authority_summary()
+        .map_err(crate::status_from_state_error)?
+        .sealed
+    {
+        return Err(failure(sealed.into()));
+    }
     let mut lease = journal
-        .acquire_exclusive()
+        .acquire_for_tail_reconciliation()
+        .map_err(crate::status_from_state_error)?;
+    lease
+        .set_projection_floor(
+            index
+                .projected_through_sequence(tape_uuid)
+                .map_err(crate::status_from_state_error)?,
+        )
+        .map_err(crate::status_from_state_error)?;
+    let repaired_tail = lease
+        .repair_pending()
         .map_err(crate::status_from_state_error)?;
     if lease
         .pending_finalization()
@@ -88,6 +109,13 @@ pub(crate) fn supersede_mounted_tail(
         return Err(failure(
             "terminal finalization intent prevents tail discard; retry FinalizeTape with its original idempotency key. If rolled-back state cannot resume that intent, restore a newer copy of the state directory; supersede-tail cannot clear a stale terminal intent".into(),
         ));
+    }
+    if lease
+        .authority_summary()
+        .map_err(crate::status_from_state_error)?
+        .sealed
+    {
+        return Err(failure(sealed.into()));
     }
     let last = lease
         .latest_commit()
@@ -126,6 +154,7 @@ pub(crate) fn supersede_mounted_tail(
             }) => (found, object_ids, false),
             Err(AdmissionError::MissingBootstrapFilemark) => (Vec::new(), Vec::new(), true),
             Err(e) => return Err(failure(e.to_string())),
+            Ok(_) if repaired_tail => (Vec::new(), Vec::new(), false),
             Ok(_) => return Err(failure("no foreign tail requires superseding".into())),
         };
     confirm(&format!("SUPERSEDE {label}"), &found).map_err(failure)?;
@@ -176,6 +205,19 @@ pub(crate) fn supersede_mounted_tail(
         },
     )?;
     let result = (|| {
+        // READ POSITION proves the retained boundary before the synchronous
+        // recovery filemark advances it. Do not LOCATE merely to compare its
+        // requested argument with itself.
+        if repaired_tail {
+            let expected = last
+                .as_ref()
+                .ok_or_else(|| "repaired tail has no retained commit".to_string())?
+                .cursor;
+            let observed = drive.position().map_err(|e| e.to_string())?;
+            if observed.partition != expected.partition || observed.lba != expected.lba {
+                return Err("physical repair cursor differs from retained authority".into());
+            }
+        }
         let mut sink = remanence_library::DriveHandleSink(drive);
         if last.is_none() {
             let bootstrap = crate::tape_init::build_tape_bootstrap(
@@ -209,6 +251,15 @@ pub(crate) fn supersede_mounted_tail(
                     )
                 })
                 .map_err(|error| error.to_string())??;
+        }
+        if repaired_tail {
+            let expected = last
+                .as_ref()
+                .ok_or_else(|| "repaired tail has no retained commit".to_string())?
+                .cursor;
+            lease
+                .reconcile_repaired_tail(expected)
+                .map_err(|e| e.to_string())?;
         }
         Ok::<_, String>(())
     })();

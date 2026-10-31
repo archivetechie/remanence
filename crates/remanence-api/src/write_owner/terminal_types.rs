@@ -1,5 +1,6 @@
 //! Terminal-finalization requests, plans, authority, and recovery helpers.
 
+use remanence_state::authority::TapeAuthorityView;
 use remanence_state::authority::TapeAuthorityWriter as _;
 use std::path::Path;
 use std::sync::Arc;
@@ -221,11 +222,11 @@ pub(super) struct TerminalFinalizeResult {
 
 pub(super) struct TerminalTailCatalogAuthority<'a> {
     pub(super) checkpoint: &'a mut remanence_state::TapeAuthorityLease,
-    pub(super) parity_journal: Option<&'a mut dyn remanence_parity::authority::StructuralAuthority>,
     pub(super) index: &'a mut CatalogIndex,
     pub(super) spec: &'a TerminalFinalizeSpec,
     pub(super) intent: remanence_state::authority::AuthorityFinalization,
     pub(super) tix_fault: Option<&'a crate::terminal_fault::TerminalFaultPlan>,
+    pub(super) durable_projection_pending: bool,
     pub(super) reconciliation: Option<(
         TerminalTailProgress,
         remanence_parity::TerminalTailComponentPlan,
@@ -282,45 +283,17 @@ impl TerminalTailAuthority for TerminalTailCatalogAuthority<'_> {
     }
 
     fn commit_after_barrier(&mut self, commit: &mut TerminalComponentCommit) -> Result<(), String> {
-        if let Some(journal) = self.parity_journal.as_deref_mut() {
-            if let Some(fault) = self.tix_fault {
-                fault.abort_component_if_matches(
-                    commit.component,
-                    crate::terminal_fault::TerminalFaultCut::BeforeParityJournalFsync,
-                    Some(commit.observed_position),
-                )?;
-            }
-            commit.publication = journal
-                .publish_terminal_component(&commit.media_publication())
-                .map_err(|error| format!("commit terminal component journal: {error}"))?;
-            if let Some(fault) = self.tix_fault {
-                fault.abort_component_if_matches(
-                    commit.component,
-                    crate::terminal_fault::TerminalFaultCut::AfterParityJournalFsync,
-                    Some(commit.observed_position),
-                )?;
-            }
-        }
+        self.durable_projection_pending = false;
         let expected = state_progress_from_parity(commit.previous_progress);
         let next = state_progress_from_parity(commit.next_progress);
-        if let Some(fault) = self.tix_fault {
-            fault.abort_component_if_matches(
-                commit.component,
-                crate::terminal_fault::TerminalFaultCut::BeforeCheckpointJournalFsync,
-                Some(commit.observed_position),
-            )?;
-        }
         self.intent = self
             .checkpoint
             .advance_finalization(expected, next)
-            .map_err(|error| format!("advance terminal checkpoint progress: {error}"))?;
-        if let Some(fault) = self.tix_fault {
-            fault.abort_component_if_matches(
-                commit.component,
-                crate::terminal_fault::TerminalFaultCut::AfterCheckpointJournalFsync,
-                Some(commit.observed_position),
-            )?;
-        }
+            .map_err(|error| {
+                self.durable_projection_pending = error.is_checkpoint_append_durable();
+                format!("advance terminal checkpoint progress: {error}")
+            })?;
+        self.durable_projection_pending = true;
         if let Some(fault) = self.tix_fault {
             fault.abort_component_if_matches(
                 commit.component,
@@ -329,10 +302,8 @@ impl TerminalTailAuthority for TerminalTailCatalogAuthority<'_> {
             )?;
         }
         self.index
-            .project_terminal_finalization(
-                self.projection_input(next, TerminalFinalizationOutcome::InProgress),
-            )
-            .map_err(|error| format!("project terminal progress: {error}"))?;
+            .project_tape_log(&self.checkpoint.freeze().map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
         if let Some(fault) = self.tix_fault {
             fault.abort_component_if_matches(
                 commit.component,
@@ -340,6 +311,7 @@ impl TerminalTailAuthority for TerminalTailCatalogAuthority<'_> {
                 Some(commit.observed_position),
             )?;
         }
+        self.durable_projection_pending = false;
         Ok(())
     }
 }

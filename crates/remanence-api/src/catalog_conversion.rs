@@ -532,6 +532,8 @@ pub(crate) fn append_commit_info_from_native_copy(
         position_before_lba: None,
         position_after_lba: None,
         journal_record_ordinal: None,
+        tape_log_sequence: copy.tape_log_sequence,
+        tape_incarnation: copy.tape_incarnation,
         estimated_remaining_bytes: None,
         sealed_after_write: None,
         durability: pb::AppendDurability::Checkpointed as i32,

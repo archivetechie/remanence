@@ -227,6 +227,7 @@ pub(crate) fn handle_drive_tape_inventory(
             bot_recovery::recover_terminal_inventory_with_checkpoint_authority_controlled(
                 &mut source,
                 &cfg.checkpoint_journal_dir,
+                &cfg.index_path,
                 &tape_uuid,
                 block_size,
                 remanence_parity::ScanMode::Recovery(hints),
@@ -612,6 +613,7 @@ pub(crate) fn handle_drive_verify_tape_index(
             bot_recovery::verify_terminal_index_with_checkpoint_authority(
                 &mut source,
                 &cfg.checkpoint_journal_dir,
+                &cfg.index_path,
                 &tape_uuid,
                 block_size,
                 remanence_parity::ScanMode::Recovery(hints),

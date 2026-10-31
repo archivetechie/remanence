@@ -553,7 +553,7 @@ impl MountedCommands {
             .find(|p| p.id == pool_id)
             .cloned()
             .ok_or_else(|| ActorFailure::from(Status::invalid_argument("unconfigured pool")))?;
-        let journals = state.paths().journal_dir.join("checkpoints");
+        let journals = state.paths().journal_dir.join("tapes");
         let (selected, host_only_recovery) =
             match crate::pool_write::admit_pinned_tape_for_write_session(
                 state.catalog_index(),
@@ -787,7 +787,7 @@ pub(crate) fn mounted_config(
         io_memory: crate::io_memory::IoMemoryReservation::new(c.daemon.io_memory_ceiling)
             .map_err(|e| ActorFailure::from(Status::invalid_argument(e)))?,
         write_admissions: Default::default(),
-        checkpoint_journal_dir: state.paths().journal_dir.join("checkpoints"),
+        checkpoint_journal_dir: state.paths().journal_dir.join("tapes"),
         checkpoint_max_bytes: c.daemon.checkpoint_max_bytes,
         checkpoint_max_objects: c.daemon.checkpoint_max_objects,
         checkpoint_max_age_seconds: c.daemon.checkpoint_max_age_seconds,
