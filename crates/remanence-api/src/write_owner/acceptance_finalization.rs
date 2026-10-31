@@ -917,6 +917,25 @@ async fn finalization_cuts_complete() {
             cut.boundary
         );
     }
+    // A daemon stop after the final ParityMap's filemark leaves the whole
+    // terminal prefix on tape but unpublished. Startup adopts it, re-admits
+    // the zero-count barrier at the tail start and finishes without a fence.
+    let prefix_plan = session.intent.terminal_prefix.as_ref().unwrap();
+    let end = prefix_plan.tail_start_lba as usize;
+    let cut = session
+        .cuts
+        .iter()
+        .find(|c| c.boundary.starts_with("command [10, 01,") && c.end == end)
+        .unwrap();
+    let result = check(&session, cut, cut.end, BTreeMap::new(), false).await;
+    eprintln!("default C{} {} => {result:?}", cut.number, cut.boundary);
+    assert_eq!(
+        result,
+        Ok("startup"),
+        "C{} {}: complete unpublished prefix",
+        cut.number,
+        cut.boundary
+    );
 }
 
 /// Byte tears retain a prefix of an unsynced append independently of tape.
