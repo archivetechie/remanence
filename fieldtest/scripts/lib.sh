@@ -1649,7 +1649,8 @@ parts.extend([
     "snapshot_miss_alarm = 3",
     "",
     "[cleaning]",
-    "auto = true",
+    # Automatic cleaning needs an allowlisted cleaning cartridge to load.
+    f"auto = {'true' if cleaning else 'false'}",
     "voltag_prefixes = [\"CLN\"]",
     "use_warn = 45",
     "complete_timeout = \"10m\"",
