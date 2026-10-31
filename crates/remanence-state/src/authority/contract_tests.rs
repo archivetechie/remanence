@@ -9,6 +9,7 @@ pub(crate) fn view_writer_contract<W>(
     writer: &mut W,
     mut first: super::AuthorityCommit,
     second: super::AuthorityCommit,
+    normalize_ordinal: fn(u64) -> u64,
 ) where
     W: TapeAuthorityWriter<
         Error = StateError,
@@ -19,6 +20,18 @@ pub(crate) fn view_writer_contract<W>(
     >,
     W::Snapshot: TapeAuthoritySnapshot<Payload = crate::authority::CatalogPayload>,
 {
+    let normalize = |mut commit: super::AuthorityCommit| {
+        commit.ordinal = normalize_ordinal(commit.ordinal);
+        commit
+    };
+    // Latest is an admission summary: payload equality is pinned independently
+    // by complete replay and the frozen catalog events below.
+    let structural = |mut commit: super::AuthorityCommit| {
+        commit.payloads.clear();
+        commit.object_files.clear();
+        commit.barrier = None;
+        commit
+    };
     let object_id = first.payloads[0].projection.object.object_id.clone();
     first.payloads[0]
         .files
@@ -35,11 +48,18 @@ pub(crate) fn view_writer_contract<W>(
         });
     assert_eq!(writer.authority_summary().unwrap().cursor, None);
     writer.publish_report(&first).unwrap();
-    assert_eq!(writer.latest_commit().unwrap(), Some(first.clone()));
+    assert_eq!(
+        writer
+            .latest_commit()
+            .unwrap()
+            .map(normalize)
+            .map(structural),
+        Some(structural(first.clone()))
+    );
     let frozen = writer.freeze().unwrap();
     let summary = writer.authority_summary().unwrap();
     assert_eq!(summary.object_count, 1);
-    assert_eq!(summary.checkpoint_ordinal, 1);
+    assert_eq!(normalize_ordinal(summary.checkpoint_ordinal), 1);
     assert_eq!(
         summary.cursor,
         Some(CommitCursor {
@@ -54,7 +74,14 @@ pub(crate) fn view_writer_contract<W>(
     let mut inconsistent = second.clone();
     inconsistent.total += 1;
     assert!(writer.publish_report(&inconsistent).is_err());
-    assert_eq!(writer.latest_commit().unwrap(), Some(first.clone()));
+    assert_eq!(
+        writer
+            .latest_commit()
+            .unwrap()
+            .map(normalize)
+            .map(structural),
+        Some(structural(first.clone()))
+    );
     writer.publish_report(&second).unwrap();
     assert_eq!(frozen.summary().object_count, 1);
     assert!(frozen.finalization().is_none());
@@ -97,7 +124,12 @@ pub(crate) fn view_writer_contract<W>(
     );
     assert_eq!(writer.authority_summary().unwrap().object_count, 2);
     assert_eq!(
-        writer.replay_commits().unwrap(),
+        writer
+            .replay_commits()
+            .unwrap()
+            .into_iter()
+            .map(normalize)
+            .collect::<Vec<_>>(),
         vec![first.clone(), second.clone()]
     );
     let mut commits = 0;
@@ -167,17 +199,11 @@ where
 
 /// Shared structural writer contract: explicit operations reject ambiguous
 /// dispatch before writing, and retries report the units actually appended.
-pub(crate) fn structural_writer_contract<W: TapeAuthorityWriter>(writer: &mut W) {
+pub(crate) fn structural_writer_contract<W: TapeAuthorityWriter>(
+    writer: &mut W,
+    prefix: remanence_parity::authority::FilePublication,
+) {
     use remanence_parity::authority::{FilePublication, FilePurpose, PublicationDisposition};
-    let prefix = FilePublication {
-        purpose: FilePurpose::TerminalPrefix,
-        files: Vec::new(),
-        protected: 0,
-        total: 0,
-        cursor: None,
-        check: None,
-        seal_due: None,
-    };
     assert!(writer.publish_commit(&prefix).is_err());
     let component = FilePublication {
         purpose: FilePurpose::TerminalComponent,
@@ -201,4 +227,104 @@ pub(crate) fn structural_writer_contract<W: TapeAuthorityWriter>(writer: &mut W)
     assert!(retry.items.iter().all(|unit| unit.disposition
         == PublicationDisposition::AlreadyPresent
         && unit.durability == PublicationDisposition::AlreadyPresent));
+}
+
+/// A physically contiguous committed Object and its actual prefix plan. Shared
+/// structural tests start here because production refuses empty finalization.
+pub(crate) fn structural_fixture(
+    id: [u8; 16],
+) -> (
+    crate::CheckpointJournalRecord,
+    crate::TerminalFinalizationIntent,
+    remanence_parity::authority::ShadowPublication,
+) {
+    use remanence_parity::{CommittedBundle, CommittedBundleKind, TapeFileEntry, TapeFileMapEntry};
+    let mut record = crate::checkpoint::tests::partial_epoch_parity_record(id);
+    record.object_tape_file_bundles[0].entries[0].physical_start_hint = Some(2);
+    record.barrier_bundle.as_mut().unwrap().entries[0].physical_start_hint = Some(6);
+    record.eod_lba = 8;
+    let prefix = crate::checkpoint::tests::terminal_prefix_plan_for_parity_record(&record);
+    let mut plan = crate::checkpoint::tests::finalization_intent(id);
+    plan.layout = remanence_parity::TerminalTailLayout::new(
+        0,
+        record.block_size,
+        prefix.tail_start_tape_file_number,
+        prefix.tail_start_lba,
+        4,
+        4096,
+    )
+    .unwrap()
+    .try_into()
+    .unwrap();
+    plan.terminal_prefix = Some(prefix);
+    let mut bot = TapeFileEntry::from_map_entry(TapeFileMapEntry::bootstrap(0, 1));
+    bot.physical_start_hint = Some(0);
+    let mut bundles = vec![CommittedBundle {
+        kind: CommittedBundleKind::BotBootstrap,
+        entries: vec![bot],
+        highest_protected_ordinal: 0,
+        total_committed_ordinals: 0,
+    }];
+    bundles.extend(record.object_tape_file_bundles.clone());
+    bundles.push(record.barrier_bundle.clone().unwrap());
+    bundles.push(CommittedBundle {
+        kind: CommittedBundleKind::CheckpointedThrough,
+        entries: Vec::new(),
+        highest_protected_ordinal: 3,
+        total_committed_ordinals: 3,
+    });
+    (
+        record,
+        plan,
+        remanence_parity::authority::ShadowPublication { bundles },
+    )
+}
+
+/// The same capture contract for ordinary, planned and durably extended tapes.
+/// An immutable plan alone cannot add a physical row to a frozen snapshot.
+pub(crate) fn snapshot_agreement_contract<W>(writer: &mut W, plan: AuthorityFinalization)
+where
+    W: TapeAuthorityWriter<
+        Error = StateError,
+        Finalization = AuthorityFinalization,
+        Progress = TerminalFinalizationProgress,
+    >,
+{
+    let snapshot = writer.freeze().unwrap();
+    assert_eq!(
+        (snapshot.summary().protected, snapshot.summary().total),
+        (3, 3)
+    );
+    let mut before = Vec::new();
+    snapshot
+        .visit_file_rows(&mut |row| {
+            before.push(row.clone());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(before.len(), 3);
+    writer.begin_finalization(&plan).unwrap();
+    let planned = writer.freeze().unwrap();
+    assert_eq!(planned.finalization(), Some(&plan));
+    let mut rows = Vec::new();
+    planned
+        .visit_file_rows(&mut |row| {
+            rows.push(row.clone());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(rows, before);
+    let prefix = &plan.terminal_prefix.as_ref().unwrap().publication;
+    writer.publish_terminal_prefix(prefix).unwrap();
+    let durable = writer.freeze().unwrap();
+    assert_eq!(durable.summary().next_file, 4);
+    let mut count = 0;
+    durable
+        .visit_file_rows(&mut |_| {
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(count, 4);
+    assert_eq!(planned.summary().next_file, 3);
 }

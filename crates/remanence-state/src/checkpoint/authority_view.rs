@@ -786,13 +786,61 @@ mod tests {
 
     use crate::authority::contract_tests::{finalization_contract, view_writer_contract};
     #[test]
-    fn old_authority_explicit_structural_writer_contract() {
+    fn old_authority_seeded_structural_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = [0x39; 16];
+        let (record, plan, rows) = crate::authority::contract_tests::structural_fixture(id);
+        let prefix = crate::authority::AuthorityFinalization::from(&plan)
+            .terminal_prefix
+            .unwrap()
+            .publication;
+        let mut writer = AuthorityBuilder::new(dir.path().join("checkpoints"), id)
+            .commit(record)
+            .rows(rows)
+            .plan(plan)
+            .build_lease()
+            .unwrap();
+        crate::authority::contract_tests::structural_writer_contract(&mut writer, prefix);
+    }
+    #[test]
+    fn old_authority_snapshot_agreement_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = [0x39; 16];
+        let (record, plan, rows) = crate::authority::contract_tests::structural_fixture(id);
+        let mut writer = AuthorityBuilder::new(dir.path().join("checkpoints"), id)
+            .commit(record)
+            .rows(rows)
+            .build_lease()
+            .unwrap();
+        crate::authority::contract_tests::snapshot_agreement_contract(&mut writer, (&plan).into());
+    }
+    #[test]
+    fn old_authority_accepts_terminal_first() {
         let directory = tempfile::tempdir().unwrap();
         let mut writer = AuthorityBuilder::new(directory.path().join("checkpoints"), [0x39; 16])
             .geometry(256 * 1024, remanence_parity::default_scheme())
             .build_lease()
             .unwrap();
-        crate::authority::contract_tests::structural_writer_contract(&mut writer);
+        use remanence_parity::authority::{FilePublication, FilePurpose, PublicationDisposition};
+        let prefix = FilePublication {
+            purpose: FilePurpose::TerminalPrefix,
+            files: Vec::new(),
+            protected: 0,
+            total: 0,
+            cursor: None,
+            check: None,
+            seal_due: None,
+        };
+        let receipt = writer.publish_terminal_prefix(&prefix).unwrap();
+        assert_eq!(receipt.items[0].publication, prefix);
+        assert_eq!(
+            receipt.items[0].disposition,
+            PublicationDisposition::Appended
+        );
+        assert_eq!(
+            writer.publish_terminal_prefix(&prefix).unwrap().items[0].disposition,
+            PublicationDisposition::AlreadyPresent
+        );
     }
 
     #[test]
@@ -805,7 +853,38 @@ mod tests {
             &mut lease,
             (&record(id)).into(),
             (&second_record(id)).into(),
+            |ordinal| ordinal,
         );
+    }
+
+    #[test]
+    fn old_authority_latest_commit_preserves_full_payload_and_physical_bundles() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = [0x3a; 16];
+        let authority = AuthorityBuilder::new(dir.path(), id).build().unwrap();
+        let mut writer = authority.acquire_exclusive().unwrap();
+        let mut report: crate::authority::AuthorityCommit =
+            (&super::super::tests::partial_epoch_parity_record(id)).into();
+        let object_id = report.payloads[0].projection.object.object_id.clone();
+        report.payloads[0]
+            .files
+            .push(crate::NativeObjectFileProjectionInput {
+                object_id,
+                file_id: "member".into(),
+                path: "payload.txt".into(),
+                size_bytes: 1,
+                file_sha256: vec![0x77; 32],
+                first_chunk_lba: Some(0),
+                chunk_count: 1,
+                mtime: Some("1.25".into()),
+                executable: Some(true),
+            });
+        assert!(!report.object_files.is_empty());
+        assert!(report.barrier.is_some());
+        writer.publish_report(&report).unwrap();
+        assert_eq!(writer.latest_commit().unwrap(), Some(report.clone()));
+        drop(writer);
+        assert_eq!(authority.latest_commit().unwrap(), Some(report));
     }
 
     #[test]

@@ -86,6 +86,8 @@ pub struct TapeSummary {
     pub object_count: u64,
     /// Last ordinary Committed sequence.
     pub last_ordinary_commit: Option<u64>,
+    /// Constant-size last ordinary closer; never retains catalog payloads.
+    pub last_ordinary_record: Option<Committed>,
     /// Last barrier record sequence.
     pub last_media_commit: Option<u64>,
     /// API barrier ordinal, separate from sequence and journal_record_ordinal.
@@ -120,6 +122,7 @@ impl Default for TapeSummary {
             next_file: 0,
             object_count: 0,
             last_ordinary_commit: None,
+            last_ordinary_record: None,
             last_media_commit: None,
             barrier_count: 0,
             seal_due: None,
@@ -152,6 +155,7 @@ impl TapeSummary {
             next_file: self.next_file,
             object_count: self.object_count,
             last_ordinary_commit: self.last_ordinary_commit,
+            last_ordinary_record: self.last_ordinary_record.clone(),
             last_media_commit: self.last_media_commit,
             barrier_count: self.barrier_count,
             seal_due: self.seal_due,
@@ -283,6 +287,15 @@ impl Default for Fold {
     }
 }
 impl Fold {
+    /// Resume only a summary obtained by a full validated immutable-prefix scan.
+    pub(super) fn from_validated(summary: TapeSummary) -> Self {
+        Self {
+            next_sequence: summary.last_closed_sequence + 1,
+            summary,
+            pending: None,
+            poisoned: false,
+        }
+    }
     /// Begin at a fresh tape. Streaming snapshots/resume are a later storage concern.
     pub fn new() -> Self {
         Self {
@@ -312,25 +325,52 @@ impl Fold {
         if self.pending.is_some() {
             return Err(invalid("preflight requires closed boundary").into());
         }
+        let trial = self.preflight_prefix(reader, true)?;
+        if trial.summary.last_closed_sequence < self.next_sequence || trial.pending.is_some() {
+            return Err(invalid("candidate must contain one closed group").into());
+        }
+        Ok(())
+    }
+    /// Retain an unpublished trial across the media barrier. With `closed` false,
+    /// only provisional frames are accepted; the caller validates the closer later.
+    pub(super) fn preflight_prefix(
+        &self,
+        reader: impl Read,
+        closed: bool,
+    ) -> Result<Self, CodecError> {
+        let invalid = |why| {
+            CodecError::Recovery(TapeLogError {
+                offset: self.summary.closed_end,
+                sequence: Some(self.next_sequence),
+                fault: Fault::Invalid(why),
+            })
+        };
+        if self.poisoned || self.pending.is_some() {
+            return Err(invalid("preflight requires healthy closed boundary"));
+        }
         let mut trial = Self {
             summary: self.summary.pending_copy(),
             pending: None,
             next_sequence: self.next_sequence,
             poisoned: false,
         };
-        let mut decoder = Decoder::at(reader, self.next_sequence, offset);
-        let mut closed = false;
+        let mut decoder = Decoder::at(reader, self.next_sequence, self.summary.closed_end);
         while let Some(frame) = decoder.next_frame()? {
-            if closed {
-                return Err(invalid("candidate must contain one closed group").into());
+            if trial.summary.last_closed_sequence >= self.next_sequence
+                || (!closed
+                    && !matches!(
+                        frame.record,
+                        Record::Initialized(_) | Record::PayloadContinuation(_)
+                    ))
+            {
+                return Err(invalid("candidate must contain one closed group"));
             }
             trial.push(&frame)?;
-            closed = trial.summary.last_closed_sequence >= self.next_sequence;
         }
-        if !closed || trial.pending.is_some() || decoder.tail() != Tail::Complete {
-            return Err(invalid("candidate must contain one closed group").into());
+        if decoder.tail() != Tail::Complete {
+            return Err(invalid("candidate must contain one closed group"));
         }
-        Ok(())
+        Ok(trial)
     }
     /// Actual retained extent capacity, counting both pending and closed summaries.
     pub fn retained_extent_capacity(&self) -> usize {
@@ -546,6 +586,7 @@ impl Fold {
                 }
                 check_commit(&mut p, &self.summary, commit)?;
                 p.state.last_ordinary_commit = Some(f.sequence);
+                p.state.last_ordinary_record = Some(commit.clone());
                 media_commit(&mut p.state, f.sequence)?;
                 self.publish_media(p.state);
             }
@@ -829,8 +870,11 @@ fn apply_row(p: &mut Pending, row: &TapeFileEntry, bot: bool) -> Result<(), Faul
                     start_lba: add(s.cursor.lba, first - s.total)?,
                 });
                 s.total = end;
-            } else if row.first_parity_data_ordinal.is_some() {
-                return Err(Fault::Invalid("parity-off ordinal"));
+            } else {
+                if row.first_parity_data_ordinal.is_some() {
+                    return Err(Fault::Invalid("parity-off ordinal"));
+                }
+                s.total = add(s.total, row.block_count)?;
             }
             s.object_count = add(s.object_count, 1)?;
             p.objects = add(p.objects, 1)?;
@@ -928,10 +972,12 @@ fn check_commit(p: &mut Pending, previous: &TapeSummary, c: &Committed) -> Resul
     if c.protected > c.total || (s.scheme.is_some() && c.total - c.protected >= s.epoch_blocks()) {
         return Err(Fault::Invalid("uncovered range exceeds epoch"));
     }
-    if s.scheme.is_none() && (c.total != 0 || c.protected != 0 || !s.uncovered.is_empty()) {
+    if s.scheme.is_none()
+        && (c.protected != 0 || !s.uncovered.is_empty() || c.unverified_end.is_some())
+    {
         return Err(Fault::Invalid("parity-off state"));
     }
-    if c.total == c.protected {
+    if s.scheme.is_none() || c.total == c.protected {
         if c.check != CheckValue::EMPTY || c.provenance != CheckProvenance::Empty {
             return Err(Fault::Invalid("nonempty check for empty range"));
         }
@@ -986,7 +1032,7 @@ fn validate_plan(
         || plan.edition_id == [0; 16]
         || plan.edition_digest == [0; 32]
         || plan.edition_sequence == 0
-        || p.state.protected != p.state.total
+        || (s.scheme.is_some() && p.state.protected != p.state.total)
     {
         return Err(Fault::Invalid("terminal plan binding"));
     }

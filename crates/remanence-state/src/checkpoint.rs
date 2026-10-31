@@ -1019,7 +1019,7 @@ impl remanence_parity::TapeIndexReplicaRecordSource for CheckpointTerminalIndexR
     }
 }
 
-fn terminal_map_entry_from_committed(
+pub(crate) fn terminal_map_entry_from_committed(
     entry: &remanence_parity::TapeFileEntry,
 ) -> Result<remanence_parity::TapeIndexReplicaMapEntry, remanence_parity::ParityError> {
     let kind = match entry.kind {
@@ -1053,7 +1053,7 @@ fn terminal_map_entry_from_committed(
     })
 }
 
-fn terminal_object_row_from_recovery(
+pub(crate) fn terminal_object_row_from_recovery(
     row: &remanence_parity::ObjectRecoveryRow,
 ) -> Result<remanence_parity::TapeIndexReplicaObjectRow, remanence_parity::ParityError> {
     let object_id = row
@@ -4027,11 +4027,11 @@ fn checkpoint_record_watermarks(record: &CheckpointJournalRecord) -> (u64, u64) 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use remanence_parity::authority::StructuralAuthority;
 
-    pub(super) fn record(tape_uuid: [u8; 16]) -> CheckpointJournalRecord {
+    pub(crate) fn record(tape_uuid: [u8; 16]) -> CheckpointJournalRecord {
         let object_uuid = uuid::Uuid::from_bytes([0x51; 16]);
         CheckpointJournalRecord {
             ordinal: 1,
@@ -4092,7 +4092,7 @@ mod tests {
         }
     }
 
-    pub(super) fn second_record(tape_uuid: [u8; 16]) -> CheckpointJournalRecord {
+    pub(crate) fn second_record(tape_uuid: [u8; 16]) -> CheckpointJournalRecord {
         let mut record = record(tape_uuid);
         let object_uuid = uuid::Uuid::from_bytes([0x52; 16]);
         record.ordinal = 2;
@@ -4272,7 +4272,7 @@ mod tests {
         );
     }
 
-    pub(super) fn finalization_intent(tape_uuid: [u8; 16]) -> TerminalFinalizationIntent {
+    pub(crate) fn finalization_intent(tape_uuid: [u8; 16]) -> TerminalFinalizationIntent {
         let layout = remanence_parity::TerminalTailLayout::new(0, 256 * 1024, 2, 6, 4, 4_096)
             .expect("terminal layout");
         TerminalFinalizationIntent {
@@ -4408,7 +4408,7 @@ mod tests {
         }
     }
 
-    pub(super) fn partial_epoch_parity_record(tape_uuid: [u8; 16]) -> CheckpointJournalRecord {
+    pub(crate) fn partial_epoch_parity_record(tape_uuid: [u8; 16]) -> CheckpointJournalRecord {
         let mut record = record(tape_uuid);
         record.eod_lba = 12;
         record.next_tape_file_number = 3;
@@ -4539,7 +4539,7 @@ mod tests {
         }
     }
 
-    pub(super) fn terminal_prefix_plan_for_parity_record(
+    pub(crate) fn terminal_prefix_plan_for_parity_record(
         record: &CheckpointJournalRecord,
     ) -> TerminalFinalizationPrefixPlan {
         let mut parity_map = parity_entry(3, remanence_parity::TapeFileKind::ParityMap);

@@ -394,6 +394,9 @@ impl CatalogValidator {
                 }
             }
             Bytes(_) | Text | Id | Tape => {
+                if n > super::MAX_FRAME_BODY as u64 {
+                    return Err(Fault::FrameTooLarge);
+                }
                 let is_text = matches!(schema, Text | Id);
                 if m != if is_text { 3 } else { 2 } {
                     return Err(bad);

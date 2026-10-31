@@ -1,4 +1,4 @@
-//! Unwired step-2 per-tape authority format. No storage, tape I/O or publication.
+//! Unwired step-2 per-tape authority format. Storage remains unwired; no tape I/O.
 //!
 //! The fixed little-endian prefix is CRC protected before lengths are trusted;
 //! structural and catalog sections have independent CRC-64/XZ trailers. The
@@ -13,15 +13,28 @@
 //! record. Their SHA-256 covers each preceding frame's prefix fields (without
 //! CRC), structural bytes and payload bytes, in order. The closing reference
 //! binds first sequence, byte offset, frame/byte/member counts and this digest.
+//! Provisional frames are fdatasynced before the media barrier; the closing
+//! record and its fsync follow the barrier and remain the commit point. Staging
+//! without provisional frames needs no data sync. A failed stage data sync rolls
+//! back the provisional suffix before any media work, without an ambiguity fence.
+//! EOF-short prefixes must agree with every visible field. EOF-short bodies with
+//! internal zeros followed by data are torn: such a frame cannot close a group.
 //! Only a successful close advances the public summary. Catalog callbacks must
 //! therefore stage output until close; they must not publish provisional rows.
 //! Frames and group digests do not bind a tape UUID: B3a must validate the
 //! file header and its tape identity before folding these bytes.
 //! Session tags and step-6 semantics are reserved, not accepted by the fold.
 
+pub mod authority;
 pub mod codec;
 pub mod fold;
+#[cfg(any(test, feature = "fixtures"))]
+pub mod measure;
 pub mod payload;
+mod rows;
+pub mod snapshot;
+pub mod store;
+mod terminal_source;
 mod wire;
 
 pub use remanence_parity::authority::{SealDueReason, TerminalFinalizationTrigger};

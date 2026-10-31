@@ -8,12 +8,17 @@ use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-/// The two operations required by an append-only commit authority.
+/// Append and durability operations required by journal authorities.
 pub trait DurableFile: Send {
     /// Append bytes without promising that they survive power loss.
     fn append(&mut self, bytes: &[u8]) -> io::Result<()>;
     /// Prove all prior bytes durable, or return an error.
     fn sync(&mut self) -> io::Result<()>;
+    /// Prove file data (and metadata needed to retrieve it) durable. Test
+    /// backends may conservatively use their existing full-sync model.
+    fn sync_data(&mut self) -> io::Result<()> {
+        self.sync()
+    }
 }
 
 impl DurableFile for fs::File {
@@ -22,6 +27,9 @@ impl DurableFile for fs::File {
     }
     fn sync(&mut self) -> io::Result<()> {
         self.sync_all()
+    }
+    fn sync_data(&mut self) -> io::Result<()> {
+        fs::File::sync_data(self)
     }
 }
 
@@ -34,6 +42,13 @@ pub trait DurableDirectory: Send + Sync {
     fn open(&self, path: &Path) -> io::Result<Box<dyn DurableFile>>;
     /// Rename a directory entry; durability still requires directory sync.
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+    /// Publish a new name without ever replacing an existing entry.
+    fn rename_noreplace(&self, _from: &Path, _to: &Path) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "backend lacks no-replace publication",
+        ))
+    }
     /// Make the directory's current entries durable.
     fn sync(&self, path: &Path) -> io::Result<()>;
     /// Truncate a file during rollback or explicit tail recovery.
@@ -53,6 +68,9 @@ impl DurableDirectory for StdDirectory {
     }
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         fs::rename(from, to)
+    }
+    fn rename_noreplace(&self, from: &Path, to: &Path) -> io::Result<()> {
+        host_rename_noreplace(from, to)
     }
     fn sync(&self, path: &Path) -> io::Result<()> {
         fs::File::open(path)?.sync_all()
@@ -152,6 +170,16 @@ impl File {
         self.inner.sync_all()
     }
 
+    /// Sync provisional file data before the media barrier, without a namespace
+    /// sync or any claim that the containing commit group is authoritative.
+    pub fn sync_data(&self) -> io::Result<()> {
+        #[cfg(feature = "test-support")]
+        if let Some(writer) = &self.context.writer {
+            writer.lock().expect("durable writer lock").sync_data()?;
+        }
+        self.inner.sync_data()
+    }
+
     /// Change length without making the change durable.
     pub fn set_len(&self, len: u64) -> io::Result<()> {
         #[cfg(feature = "test-support")]
@@ -185,6 +213,9 @@ impl DurableFile for File {
     }
     fn sync(&mut self) -> io::Result<()> {
         self.sync_all()
+    }
+    fn sync_data(&mut self) -> io::Result<()> {
+        File::sync_data(self)
     }
 }
 
@@ -288,3 +319,20 @@ pub fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
 /// Scoped backend substitution used only by hermetic crash tests.
 #[cfg(feature = "test-support")]
 pub mod test_support;
+
+/// Atomically publish a newly created file, refusing any existing target. The
+/// caller must sync the containing directory before reporting durability.
+pub fn rename_noreplace(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
+    let (from, to) = (from.as_ref(), to.as_ref());
+    #[cfg(feature = "test-support")]
+    if let Some(backend) = test_support::backend(from) {
+        backend.rename_noreplace(from, to)?;
+    }
+    host_rename_noreplace(from, to)
+}
+fn host_rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    // link is atomic and fails with AlreadyExists. Both names are in the same
+    // directory/filesystem. An interrupted unlink leaves only an unused temp name.
+    fs::hard_link(from, to)?;
+    fs::remove_file(from)
+}

@@ -1,6 +1,9 @@
 //! Streaming frame codec and byte-tail classification. A row scan deliberately
 //! skips healthy non-final payloads; final/damaged frames share full classification.
 //! It is not a payload trust-validation pass over the preceding stream.
+//! EOF-short prefixes are torn only when every visible field agrees with the
+//! format and next sequence. EOF-short bodies may contain zeros followed by data:
+//! they cannot close a group, so internal zero bytes do not make them corruption.
 
 use super::*;
 use remanence_crc::crc64_xz;
@@ -19,9 +22,11 @@ pub enum Tail {
         kind: TornKind,
     },
 }
-/// Permitted absent suffixes; a short nonzero prefix is deliberately excluded.
+/// Permitted EOF-short or zero-filled append suffixes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TornKind {
+    /// EOF interrupts the fixed frame prefix before its CRC can be checked.
+    ShortPrefix,
     /// Integrity-checked prefix, short body or section trailer.
     ShortBody,
     /// Zero-filled suffix from a frame boundary or inside a damaged final body.
@@ -154,6 +159,8 @@ pub struct Decoder<R> {
     expected: u64,
     tail: Tail,
     halted: bool,
+    #[cfg(any(test, feature = "fixtures"))]
+    measured: bool,
 }
 impl<R: Read> Decoder<R> {
     /// Start a complete frame stream, sequence one at byte zero.
@@ -165,6 +172,8 @@ impl<R: Read> Decoder<R> {
             expected: 1,
             tail: Tail::Complete,
             halted: false,
+            #[cfg(any(test, feature = "fixtures"))]
+            measured: false,
         }
     }
     /// Start at a known frame boundary in an immutable snapshot. This validates
@@ -177,6 +186,8 @@ impl<R: Read> Decoder<R> {
             expected: sequence,
             tail: Tail::Complete,
             halted: false,
+            #[cfg(any(test, feature = "fixtures"))]
+            measured: false,
         }
     }
     /// Tail classification after next_frame returns None.
@@ -189,7 +200,21 @@ impl<R: Read> Decoder<R> {
     }
     /// Decode and validate all three CRCs. No catalog DOM is constructed.
     pub fn next_frame(&mut self) -> Result<Option<Frame<'_>>, CodecError> {
-        self.read_frame(|_, _| Ok(()), true)
+        #[cfg(any(test, feature = "fixtures"))]
+        self.measure_start(false);
+        let frame = self.read_frame(|_, _| Ok(()), true)?;
+        #[cfg(any(test, feature = "fixtures"))]
+        if let Some(frame) = &frame {
+            super::measure::frame(false, frame.end - frame.offset);
+        }
+        Ok(frame)
+    }
+    #[cfg(any(test, feature = "fixtures"))]
+    fn measure_start(&mut self, row: bool) {
+        if !self.measured {
+            super::measure::start(row);
+            self.measured = true;
+        }
     }
     fn read_frame(
         &mut self,
@@ -221,14 +246,29 @@ impl<R: Read> Decoder<R> {
             };
             return Ok(None);
         }
-        if n < PREFIX_LEN
-            || crc64_xz(&prefix[..20]) != u64::from_le_bytes(prefix[20..].try_into().unwrap())
-        {
-            let fallback = if n < PREFIX_LEN {
-                Fault::ShortPrefix
-            } else {
-                Fault::Crc(Section::Prefix)
+        if n < PREFIX_LEN {
+            // Version one cannot start with zero. Preserve the refusal for
+            // garbage following a zero-filled frame boundary, even at short EOF.
+            if prefix[0] == 0 {
+                let at = prefix[..n].iter().position(|b| *b != 0).unwrap();
+                return Err(error(
+                    offset,
+                    None,
+                    Fault::NonZeroAfterZeros {
+                        offset: offset + at as u64,
+                    },
+                ));
+            }
+            validate_short_prefix(&prefix, n, self.expected)
+                .map_err(|fault| error(offset, None, fault))?;
+            self.tail = Tail::Torn {
+                offset,
+                kind: TornKind::ShortPrefix,
             };
+            return Ok(None);
+        }
+        if crc64_xz(&prefix[..20]) != u64::from_le_bytes(prefix[20..].try_into().unwrap()) {
+            let fallback = Fault::Crc(Section::Prefix);
             if prefix[0] == 0 {
                 let suffix = scan_suffix(&mut self.reader, offset + n as u64)?;
                 if !suffix.has_frame {
@@ -350,7 +390,7 @@ impl<R: Read> Decoder<R> {
         if suffix.has_frame {
             return Err(fail(Fault::Crc(bad.unwrap_or(Section::Structural))));
         }
-        if body.first() == Some(&0) {
+        if !short && body.first() == Some(&0) {
             if let Some(at) = body.iter().position(|b| *b != 0) {
                 return Err(fail(Fault::NonZeroAfterZeros {
                     offset: offset + PREFIX_LEN as u64 + at as u64,
@@ -374,17 +414,8 @@ impl<R: Read> Decoder<R> {
             return Err(fail(Fault::Crc(section)));
         }
         if short {
-            // Bytes in a CRC-proved structural section are not tail evidence.
-            // In the remaining incomplete section, an interrupted zero run is
-            // ambiguous; conservatively require recovery rather than discard it.
-            let start = if body.len() >= s + 8 { s + 8 } else { 0 };
-            if let Some(zero) = body[start..].iter().position(|b| *b == 0) {
-                if let Some(nonzero) = body[start + zero..].iter().position(|b| *b != 0) {
-                    return Err(fail(Fault::NonZeroAfterZeros {
-                        offset: offset + PREFIX_LEN as u64 + (start + zero + nonzero) as u64,
-                    }));
-                }
-            }
+            // A valid prefix bounds an EOF-short section. Internal zero bytes
+            // are ordinary CBOR/payload data, not evidence of a filled hole.
             return Ok(TornKind::ShortBody);
         }
         unreachable!("classifier requires a short body or failed CRC")
@@ -396,6 +427,8 @@ impl<R: Read + Seek> Decoder<R> {
     /// which reads their payloads. Returned rows never certify payload integrity
     /// of the preceding stream and cannot be passed to the fold.
     pub fn next_row_frame(&mut self) -> Result<Option<Frame<'_>>, CodecError> {
+        #[cfg(any(test, feature = "fixtures"))]
+        self.measure_start(true);
         if self.halted {
             return Ok(None);
         }
@@ -421,6 +454,10 @@ impl<R: Read + Seek> Decoder<R> {
             },
             full,
         )?;
+        #[cfg(any(test, feature = "fixtures"))]
+        if let Some(frame) = &frame {
+            super::measure::frame(true, frame.end - frame.offset);
+        }
         Ok(frame.map(|mut frame| {
             frame.payload = &[];
             frame.payload_validated = false;
@@ -429,6 +466,35 @@ impl<R: Read + Seek> Decoder<R> {
     }
 }
 
+// Unread bytes in the decoder's prefix buffer are zero. For lengths they give
+// a lower bound; for fixed fields compare only bytes actually present.
+fn validate_short_prefix(prefix: &[u8; PREFIX_LEN], n: usize, expected: u64) -> Result<(), Fault> {
+    if prefix[..n.min(2)] != VERSION.to_le_bytes()[..n.min(2)] {
+        return Err(Fault::Version(u16::from_le_bytes(
+            prefix[..2].try_into().unwrap(),
+        )));
+    }
+    if n > 2 {
+        // Every currently valid non-reserved tag fits in its low byte. Thus a
+        // partial tag is decidable too, without guessing a missing high byte.
+        let tag = Tag::try_from(u16::from_le_bytes(prefix[2..4].try_into().unwrap()))?;
+        if tag as u16 >= 16 {
+            return Err(Fault::ReservedTag(tag));
+        }
+    }
+    let structural = u32::from_le_bytes(prefix[4..8].try_into().unwrap()) as u64;
+    let payload = u32::from_le_bytes(prefix[8..12].try_into().unwrap()) as u64;
+    if structural + payload > MAX_FRAME_BODY as u64 {
+        return Err(Fault::FrameTooLarge);
+    }
+    if n > 12 && prefix[12..n.min(20)] != expected.to_le_bytes()[..n.min(20) - 12] {
+        return Err(Fault::Sequence {
+            expected,
+            actual: u64::from_le_bytes(prefix[12..20].try_into().unwrap()),
+        });
+    }
+    Ok(())
+}
 fn valid_prefix(bytes: &[u8]) -> bool {
     bytes.len() == PREFIX_LEN
         && bytes[..2] == VERSION.to_le_bytes()
