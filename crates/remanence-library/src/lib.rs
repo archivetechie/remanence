@@ -41,6 +41,13 @@ pub use error::{
     DriveOpError, IoErrorKind, LoadError, MoveError, OpenError, RescanError, RescanWarning,
     UnloadError,
 };
+pub use handle::changer_ready::{
+    changer_sense_name, classify_changer_not_ready, classify_changer_ready_transition,
+    is_transient_element_exception, ChangerNotReady, ChangerReadyWait, ChangerWaitEvent,
+    ChangerWaitObserver, ChangerWaitPhase, CHANGER_BUSY_POLLS, DEFAULT_CHANGER_NOT_READY_POLL,
+    DEFAULT_CHANGER_NOT_READY_PROGRESS, DEFAULT_CHANGER_NOT_READY_RETRIES,
+    DEFAULT_CHANGER_NOT_READY_WAIT, MAX_CHANGER_NOT_READY_WAIT, MIN_CHANGER_NOT_READY_POLL,
+};
 pub use handle::tape_io::{
     classify_media_readiness_error_ref, media_readiness_poll_interval, media_readiness_sense_label,
     media_readiness_sense_name, verification_read_completion, wrap_map_is_servable,

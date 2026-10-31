@@ -21,6 +21,10 @@ pub const DEFAULT_READ_RESERVOIR_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 pub const DEFAULT_RANGED_POSITION_CHECK_BYTES: u64 = 256 * 1024 * 1024;
 /// Default delay before an idle library drive is rewound and unloaded.
 pub const DEFAULT_DRIVE_IDLE_UNLOAD_SECONDS: u64 = 300;
+/// Default bound on waiting out a transient changer not-ready MOVE failure.
+pub const DEFAULT_CHANGER_NOT_READY_WAIT_SECONDS: u64 = 600;
+/// Largest accepted `daemon.changer_not_ready_wait_seconds`.
+pub const MAX_CHANGER_NOT_READY_WAIT_SECONDS: u64 = 3600;
 /// Default byte threshold for a batched filemark checkpoint.
 pub const DEFAULT_CHECKPOINT_MAX_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 /// Default object threshold for a batched filemark checkpoint.
@@ -145,6 +149,11 @@ pub struct DaemonConfig {
     /// Zero keeps idle cartridges seated until eviction or daemon shutdown.
     #[serde(default = "default_drive_idle_unload_seconds")]
     pub drive_idle_unload_seconds: u64,
+    /// Longest wait for a changer MOVE MEDIUM that failed because the library
+    /// was transiently not ready (an open magazine or door) before the move
+    /// fails. Zero fails such a move at once.
+    #[serde(default = "default_changer_not_ready_wait_seconds")]
+    pub changer_not_ready_wait_seconds: u64,
     /// Whether state-changing operations must be rejected.
     #[serde(default)]
     pub read_only: bool,
@@ -469,6 +478,10 @@ const fn default_drive_idle_unload_seconds() -> u64 {
     DEFAULT_DRIVE_IDLE_UNLOAD_SECONDS
 }
 
+const fn default_changer_not_ready_wait_seconds() -> u64 {
+    DEFAULT_CHANGER_NOT_READY_WAIT_SECONDS
+}
+
 const fn default_checkpoint_max_bytes() -> u64 {
     DEFAULT_CHECKPOINT_MAX_BYTES
 }
@@ -618,6 +631,11 @@ pub fn validate_config(config: &RemConfig) -> Result<(), StateError> {
         return Err(StateError::ConfigInvalid(
             "daemon.default_idle_timeout_seconds must be non-zero".to_string(),
         ));
+    }
+    if config.daemon.changer_not_ready_wait_seconds > MAX_CHANGER_NOT_READY_WAIT_SECONDS {
+        return Err(StateError::ConfigInvalid(format!(
+            "daemon.changer_not_ready_wait_seconds must be at most {MAX_CHANGER_NOT_READY_WAIT_SECONDS}"
+        )));
     }
     if config.daemon.spool_tmpfs_ram_budget == Some(0) {
         return Err(StateError::ConfigInvalid(
@@ -1260,6 +1278,28 @@ id = "camera copy a"
             config.daemon.drive_idle_unload_seconds,
             DEFAULT_DRIVE_IDLE_UNLOAD_SECONDS
         );
+        assert_eq!(
+            config.daemon.changer_not_ready_wait_seconds,
+            DEFAULT_CHANGER_NOT_READY_WAIT_SECONDS
+        );
+        for (value, accepted) in [(0, true), (3600, true), (3601, false)] {
+            let text = valid_config().replace(
+                "default_idle_timeout_seconds = 1800",
+                &format!(
+                    "default_idle_timeout_seconds = 1800\nchanger_not_ready_wait_seconds = {value}"
+                ),
+            );
+            match parse_config_toml(&text) {
+                Ok(config) => {
+                    assert!(accepted, "{value} accepted");
+                    assert_eq!(config.daemon.changer_not_ready_wait_seconds, value);
+                }
+                Err(err) => {
+                    assert!(!accepted, "{value}: {err}");
+                    assert!(err.to_string().contains("changer_not_ready_wait_seconds"));
+                }
+            }
+        }
         assert_eq!(
             config.daemon.socket_path_or_default(),
             config.daemon.state_dir.join("rem.sock")

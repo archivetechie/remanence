@@ -211,6 +211,76 @@ impl DriveByteCounters {
     }
 }
 
+/// Libraries whose changer the daemon is waiting on, keyed by serial. The
+/// changer actor's readiness wait writes it; live status reads it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ChangerWaitBoard(Arc<Mutex<HashMap<String, ChangerWaitEntry>>>);
+
+#[derive(Clone, Debug)]
+struct ChangerWaitEntry {
+    condition: String,
+    src: u16,
+    dst: u16,
+    /// When the wait began: the move's first transient failure.
+    started: Instant,
+    timeout: Duration,
+}
+
+impl ChangerWaitBoard {
+    /// An observer that posts a library while its changer wait runs and
+    /// clears it when the wait ends.
+    pub(crate) fn observer(&self) -> remanence_library::ChangerWaitObserver {
+        let board = self.clone();
+        Arc::new(move |event| board.observe(event))
+    }
+
+    fn observe(&self, event: &remanence_library::ChangerWaitEvent<'_>) {
+        use remanence_library::ChangerWaitPhase;
+        let mut waits = self.0.lock().unwrap_or_else(|err| err.into_inner());
+        match event.phase {
+            ChangerWaitPhase::Waiting | ChangerWaitPhase::StillWaiting => {
+                let started = Instant::now()
+                    .checked_sub(event.elapsed)
+                    .unwrap_or_else(Instant::now);
+                let entry =
+                    waits
+                        .entry(event.library_serial.to_string())
+                        .or_insert(ChangerWaitEntry {
+                            condition: String::new(),
+                            src: event.src,
+                            dst: event.dst,
+                            started,
+                            timeout: event.timeout,
+                        });
+                entry.condition = event.condition.to_string();
+                entry.src = event.src;
+                entry.dst = event.dst;
+                entry.timeout = event.timeout;
+                entry.started = entry.started.min(started);
+            }
+            ChangerWaitPhase::Ready | ChangerWaitPhase::GaveUp => {
+                waits.remove(event.library_serial);
+            }
+        }
+    }
+
+    /// The current wait for `library_serial`, with the time elapsed since the
+    /// wait began, for example `waiting for library: medium magazine removed
+    /// (02/3b/12); move 0x0101 -> 0x03ec; 60s of 600s`.
+    pub(crate) fn get(&self, library_serial: &str) -> Option<String> {
+        let waits = self.0.lock().unwrap_or_else(|err| err.into_inner());
+        let entry = waits.get(library_serial)?;
+        Some(format!(
+            "waiting for library: {}; move 0x{:04x} -> 0x{:04x}; {}s of {}s",
+            entry.condition,
+            entry.src,
+            entry.dst,
+            entry.started.elapsed().as_secs(),
+            entry.timeout.as_secs(),
+        ))
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct LiveStatusState {
     pub(crate) min_poll_interval: Duration,
@@ -313,5 +383,42 @@ impl LiveStatusState {
                 )))
             })
             .clone()
+    }
+}
+
+#[cfg(test)]
+mod changer_wait_board_tests {
+    use super::*;
+    use remanence_library::{ChangerNotReady, ChangerWaitEvent, ChangerWaitPhase};
+
+    fn event(phase: ChangerWaitPhase, elapsed: Duration) -> ChangerWaitEvent<'static> {
+        ChangerWaitEvent {
+            library_serial: "LIB-BOARD",
+            src: 0x0101,
+            dst: 0x03ec,
+            phase,
+            condition: ChangerNotReady::Sense {
+                key: 0x02,
+                asc: 0x3b,
+                ascq: 0x12,
+            },
+            elapsed,
+            timeout: Duration::from_secs(600),
+        }
+    }
+
+    #[test]
+    fn board_reports_elapsed_since_the_wait_began_and_clears_at_the_end() {
+        let board = ChangerWaitBoard::default();
+        let observer = board.observer();
+        observer(&event(ChangerWaitPhase::Waiting, Duration::from_secs(42)));
+        assert_eq!(
+            board.get("LIB-BOARD").as_deref(),
+            Some(
+                "waiting for library: medium magazine removed (02/3b/12); move 0x0101 -> 0x03ec; 42s of 600s"
+            )
+        );
+        observer(&event(ChangerWaitPhase::GaveUp, Duration::from_secs(43)));
+        assert_eq!(board.get("LIB-BOARD"), None);
     }
 }

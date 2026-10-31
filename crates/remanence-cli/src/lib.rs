@@ -7553,6 +7553,15 @@ fn drive_live_json(drive: &pb::Drive) -> Value {
 }
 
 fn library_state_json(state: &pb::LibraryState) -> Value {
+    let mut value = library_state_fields_json(state);
+    // Present only while a move waits for the library to become ready.
+    if let (Some(wait), Some(object)) = (state.changer_wait.as_ref(), value.as_object_mut()) {
+        object.insert("changer_wait".to_string(), json!(wait));
+    }
+    value
+}
+
+fn library_state_fields_json(state: &pb::LibraryState) -> Value {
     json!({
         "library": state.library.as_ref().map(|library| json!({
             "library_serial": library.library_serial,
@@ -7626,6 +7635,9 @@ fn print_live_status_text(
             .unwrap_or("<unknown>");
         let managed = library.managed.as_str();
         let _ = writeln!(out, "library {serial} [{managed}]");
+        if let Some(wait) = library.changer_wait.as_deref() {
+            let _ = writeln!(out, "  {wait}");
+        }
         for drive in &library.drives {
             let tape = or_dash(drive.loaded_tape_barcode.as_deref());
             let _ = writeln!(
@@ -17219,6 +17231,8 @@ mod tests {
                 checkpoint_max_age_seconds: remanence_state::DEFAULT_CHECKPOINT_MAX_AGE_SECONDS,
                 default_idle_timeout_seconds: 1800,
                 drive_idle_unload_seconds: remanence_state::DEFAULT_DRIVE_IDLE_UNLOAD_SECONDS,
+                changer_not_ready_wait_seconds:
+                    remanence_state::DEFAULT_CHANGER_NOT_READY_WAIT_SECONDS,
                 read_only: false,
                 socket_path: None,
                 listen: None,
@@ -19640,6 +19654,7 @@ mod tests {
                     nanos: 0,
                 }),
                 managed: "rem".to_string(),
+                changer_wait: None,
             }],
             operations: vec![pb::OperationRef {
                 operation_id: Uuid::from_u128(5).as_bytes().to_vec(),

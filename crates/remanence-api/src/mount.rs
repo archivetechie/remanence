@@ -6,6 +6,8 @@ use remanence_library::{
 use remanence_state::authority::TapeAuthorityView;
 use remanence_state::{CatalogIndex, StateError};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
@@ -193,13 +195,52 @@ pub(crate) async fn open_write_session(
     library_constraint: Option<String>,
 ) -> Result<pb::WriteSession, Status> {
     let state = state.clone();
-    await_critical_task(
+    // The critical task outlives a dropped handler (a client that goes away)
+    // so cleanup completes. The flag tells its load move not to wait out a
+    // not-ready library for a session nobody will hold.
+    let caller = CallerPresence::new();
+    let caller_gone = caller.flag();
+    let result = await_critical_task(
         "open_write_session",
         tokio::spawn(async move {
-            open_write_session_critical(actor, state, target, library_constraint).await
+            open_write_session_critical(actor, state, target, library_constraint, caller_gone).await
         }),
     )
-    .await
+    .await;
+    caller.finish();
+    result
+}
+
+/// Sets its flag when dropped before [`Self::finish`], that is, when the
+/// handler future holding it is dropped mid-await.
+struct CallerPresence {
+    gone: Arc<AtomicBool>,
+    finished: bool,
+}
+
+impl CallerPresence {
+    fn new() -> Self {
+        Self {
+            gone: Arc::new(AtomicBool::new(false)),
+            finished: false,
+        }
+    }
+
+    fn flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.gone)
+    }
+
+    fn finish(mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for CallerPresence {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.gone.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 }
 
 async fn open_write_session_critical(
@@ -207,17 +248,40 @@ async fn open_write_session_critical(
     state: ApiState,
     target: WriteSessionTarget,
     library_constraint: Option<String>,
+    caller_gone: Arc<AtomicBool>,
 ) -> Result<pb::WriteSession, Status> {
     let pool = state.drive_pool()?.clone();
-    open_write_session_reserved(actor, &state, &pool, target, library_constraint).await
+    open_write_session_reserved_for_caller(
+        actor,
+        &state,
+        &pool,
+        target,
+        library_constraint,
+        Some(caller_gone),
+    )
+    .await
 }
 
+/// The reserved open without a caller-presence signal, for tests.
+#[cfg(test)]
 async fn open_write_session_reserved(
     actor: remanence_state::AuditActor,
     state: &ApiState,
     pool: &crate::write_owner::DrivePool,
     target: WriteSessionTarget,
     library_constraint: Option<String>,
+) -> Result<pb::WriteSession, Status> {
+    open_write_session_reserved_for_caller(actor, state, pool, target, library_constraint, None)
+        .await
+}
+
+async fn open_write_session_reserved_for_caller(
+    actor: remanence_state::AuditActor,
+    state: &ApiState,
+    pool: &crate::write_owner::DrivePool,
+    target: WriteSessionTarget,
+    library_constraint: Option<String>,
+    caller_gone: Option<Arc<AtomicBool>>,
 ) -> Result<pb::WriteSession, Status> {
     enum ReservedWriteDisposition {
         Writable {
@@ -364,7 +428,7 @@ async fn open_write_session_reserved(
     let mut changer_move_ms = 0.0;
     if let Some(slot) = mount.source_slot {
         let changer_started = Instant::now();
-        changer_move(pool, &mount.library_serial, slot, mount.bay).await?;
+        changer_move_for_caller(pool, &mount.library_serial, slot, mount.bay, caller_gone).await?;
         changer_move_ms = crate::diagnostics::duration_ms(changer_started.elapsed());
     }
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -1997,7 +2061,18 @@ async fn changer_move(
     src: u16,
     dst: u16,
 ) -> Result<(), Status> {
-    changer_move_guarded(pool, library_serial, src, dst, None).await
+    changer_move_guarded(pool, library_serial, src, dst, None, None).await
+}
+
+/// A move whose not-ready wait stops once `caller_gone` is set.
+async fn changer_move_for_caller(
+    pool: &crate::write_owner::DrivePool,
+    library_serial: &str,
+    src: u16,
+    dst: u16,
+    caller_gone: Option<Arc<AtomicBool>>,
+) -> Result<(), Status> {
+    changer_move_guarded(pool, library_serial, src, dst, None, caller_gone).await
 }
 
 /// Transfer removal recovery's flock into the queued MOVE, so cancellation of
@@ -2009,7 +2084,15 @@ pub(crate) async fn changer_move_after_unload(
     dst: u16,
     unloaded: crate::write_owner::DriveUnloadOutcome,
 ) -> Result<(), Status> {
-    changer_move_guarded(pool, library_serial, src, dst, unloaded.recovery_guard).await
+    changer_move_guarded(
+        pool,
+        library_serial,
+        src,
+        dst,
+        unloaded.recovery_guard,
+        None,
+    )
+    .await
 }
 
 async fn changer_move_guarded(
@@ -2018,6 +2101,7 @@ async fn changer_move_guarded(
     src: u16,
     dst: u16,
     recovery_guard: Option<crate::mount_support::UnloadRecoveryGuard>,
+    caller_gone: Option<Arc<AtomicBool>>,
 ) -> Result<(), Status> {
     let changer = pool.changer_tx(library_serial)?;
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -2026,6 +2110,7 @@ async fn changer_move_guarded(
             src,
             dst,
             recovery_guard,
+            caller_gone,
             reply: reply_tx,
         })
         .await
@@ -3430,6 +3515,48 @@ async fn plan_epoch_finalization(
         .into_result()
 }
 
+/// Run the full pinned write open, as a handler would, with a caller-gone
+/// flag the test controls.
+#[cfg(test)]
+pub(crate) async fn test_open_write_for_caller(
+    state: &ApiState,
+    tape_uuid: TapeUuid,
+    pool_id: &str,
+    caller_gone: Arc<AtomicBool>,
+) -> Result<pb::WriteSession, Status> {
+    let pool = state.drive_pool()?.clone();
+    open_write_session_reserved_for_caller(
+        remanence_state::AuditActor::System,
+        state,
+        &pool,
+        WriteSessionTarget::PinnedTape {
+            tape_uuid,
+            required_pool_id: pool_id.to_string(),
+        },
+        None,
+        Some(caller_gone),
+    )
+    .await
+}
+
+/// Run a write open's mount resolution with model actors: any eviction
+/// (unload, move home), then the load move. Returns the bay and source slot.
+#[cfg(test)]
+pub(crate) async fn test_mount_for_write(
+    state: &ApiState,
+    library_serial: &str,
+    tape_uuid: &TapeUuid,
+) -> Result<(u16, Option<u16>), Status> {
+    let pool = state.drive_pool()?;
+    let (mount, reservation) =
+        resolve_and_reserve_actor_mount(state, pool, library_serial, tape_uuid).await?;
+    if let Some(slot) = mount.source_slot {
+        changer_move(pool, &mount.library_serial, slot, mount.bay).await?;
+    }
+    drop(reservation);
+    Ok((mount.bay, mount.source_slot))
+}
+
 /// Exercise the real idle timer and eviction removal entry points with model actors.
 #[cfg(test)]
 pub(crate) async fn test_remove_seated_epoch(
@@ -3881,6 +4008,48 @@ mod tests {
             drive_rxs,
             changer_rx,
         }
+    }
+
+    /// A write open's caller presence flips only when the handler is dropped
+    /// before the critical task's result arrives.
+    #[test]
+    fn caller_presence_marks_a_dropped_handler_gone() {
+        let finished = CallerPresence::new();
+        let flag = finished.flag();
+        finished.finish();
+        assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
+        let dropped = CallerPresence::new();
+        let flag = dropped.flag();
+        drop(dropped);
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// Element status reports the slots of an open magazine empty and
+    /// inaccessible with exception 3B/12 (as the chaos model does). Location
+    /// keeps working for the rest of the library; the hidden cartridge is not
+    /// located, so pool selection cannot pick it until the magazine is back.
+    #[test]
+    fn open_magazine_slots_leave_the_rest_of_the_library_located() {
+        let mut open = empty_slot(0x0401);
+        open.accessible = false;
+        open.exception = Some(remanence_library::ElementException {
+            asc: 0x3b,
+            ascq: 0x12,
+        });
+        let harness = three_bay_two_pool_harness(
+            vec![
+                drive_bay(0x0101, false, None),
+                drive_bay(0x0102, false, None),
+                drive_bay(0x0103, false, None),
+            ],
+            vec![open, slot(0x0402, "FTB001L9")],
+        );
+        let located = located_tapes_in_operated_libraries(&harness.state, &harness.pool, None)
+            .expect("an open magazine does not fail location");
+        assert_eq!(
+            located.into_keys().collect::<HashSet<_>>(),
+            HashSet::from([POOL_TAPE_B])
+        );
     }
 
     /// RPC lifecycle retains the exact actor verdict, releases ownership and replays freshness.

@@ -69,6 +69,8 @@ pub struct ApiState {
     pub(crate) library_snapshot: Option<Arc<RwLock<Arc<LibrarySnapshot>>>>,
     pub(crate) live_status: Arc<LiveStatusState>,
     pub(crate) drive_idle_unload_seconds: u64,
+    /// Libraries whose changer a move is currently waiting on.
+    pub(crate) changer_waits: crate::live_status::ChangerWaitBoard,
     pub(crate) daemon_epoch: u64,
     pub(crate) daemon_version: String,
     pub(crate) api_version: String,
@@ -95,6 +97,22 @@ pub(crate) enum BayResolution {
     Uncatalogued,
     /// More than one row claims the bay. The chosen row is the preferred one.
     Ambiguous(remanence_state::DriveRecord),
+}
+
+/// The daemon's changer not-ready wait: `[daemon] changer_not_ready_wait_seconds`,
+/// reported to live status through `board`. Once `shutting_down` is set no
+/// move waits: shutdown park moves fail at once, as before, rather than each
+/// holding the stop for the full bound.
+pub(crate) fn changer_ready_wait_from_config(
+    config: &RemConfig,
+    board: &crate::live_status::ChangerWaitBoard,
+    shutting_down: Arc<std::sync::atomic::AtomicBool>,
+) -> remanence_library::ChangerReadyWait {
+    remanence_library::ChangerReadyWait::bounded(std::time::Duration::from_secs(
+        config.daemon.changer_not_ready_wait_seconds,
+    ))
+    .with_observer(board.observer())
+    .with_stop_signal("daemon shutdown", shutting_down)
 }
 
 impl ApiState {
@@ -252,6 +270,7 @@ impl ApiState {
             library_snapshot: None,
             live_status: Arc::new(LiveStatusState::new(live_status_interval)),
             drive_idle_unload_seconds: remanence_state::DEFAULT_DRIVE_IDLE_UNLOAD_SECONDS,
+            changer_waits: crate::live_status::ChangerWaitBoard::default(),
             daemon_epoch,
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             api_version: "v1-draft".to_string(),
@@ -338,6 +357,15 @@ impl ApiState {
                 "drive-pool daemon mode requires at least one configured library",
             ));
         }
+        let (timer_park_tx, timer_park_rx) = tokio::sync::mpsc::unbounded_channel();
+        let drive_pool_lifecycle =
+            crate::write_owner::DrivePoolLifecycle::with_timer_park_sender(timer_park_tx);
+        let changer_waits = crate::live_status::ChangerWaitBoard::default();
+        let changer_ready_wait = changer_ready_wait_from_config(
+            config,
+            &changer_waits,
+            Arc::clone(&drive_pool_lifecycle.shutting_down),
+        );
         let mut opened_libraries = Vec::new();
         for configured in &config.libraries {
             let library_serial = configured.serial.trim();
@@ -348,6 +376,7 @@ impl ApiState {
             })?;
             let mut library = open(discovered, &policy)
                 .map_err(|err| Status::internal(format!("open library {library_serial}: {err}")))?;
+            library.set_changer_ready_wait(changer_ready_wait.clone());
             let mut opened_drives = Vec::new();
             for bay in library.library().drive_bays.clone() {
                 let Some(installed) = bay.installed.as_ref() else {
@@ -404,9 +433,6 @@ impl ApiState {
         let managed_library_serials = drive_managed_library_serials(config);
         let io_memory = crate::io_memory::IoMemoryReservation::new(config.daemon.io_memory_ceiling)
             .map_err(Status::invalid_argument)?;
-        let (timer_park_tx, timer_park_rx) = tokio::sync::mpsc::unbounded_channel();
-        let drive_pool_lifecycle =
-            crate::write_owner::DrivePoolLifecycle::with_timer_park_sender(timer_park_tx);
         let calibration_store = open_calibration_store_for_config(config)?;
         let base_cfg = crate::write_owner::WriteOwnerConfig {
             index_path: index_path.clone(),
@@ -436,6 +462,7 @@ impl ApiState {
             checkpoint_max_age_seconds: config.daemon.checkpoint_max_age_seconds,
             session_idle_seconds: config.daemon.default_idle_timeout_seconds,
             lifecycle: Some(drive_pool_lifecycle.clone()),
+            changer_ready_wait: changer_ready_wait.clone(),
             calibration_store: calibration_store.clone(),
         };
         let mut drive_txs = HashMap::new();
@@ -493,6 +520,7 @@ impl ApiState {
         state.default_library_serial = default_library_serial;
         state.library_snapshot = Some(library_snapshot);
         state.drive_idle_unload_seconds = config.daemon.drive_idle_unload_seconds;
+        state.changer_waits = changer_waits;
         crate::mount::spawn_timer_idle_dismount_listener(state.clone(), timer_park_rx);
         state.reconcile_drive_catalog_from_report(config, &report)?;
         state.reconcile_clean_runs_from_report(&report)?;
@@ -773,6 +801,7 @@ impl ApiState {
                 &voltags,
                 &busy_bays,
                 &HashSet::new(),
+                self.changer_waits.get(library.serial.as_str()),
             );
             state.managed = if self.library_is_managed(library.serial.as_str()) {
                 "rem".to_string()
@@ -900,6 +929,7 @@ impl ApiState {
                 .as_ref()
                 .map(|library| library.library_serial.as_str())
                 .unwrap_or_default();
+            library_state.changer_wait = self.changer_waits.get(library_serial);
             for drive in &mut library_state.drives {
                 self.live_status.observe_mount(library_serial, drive);
                 self.enrich_live_counters(drive);

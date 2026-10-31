@@ -294,6 +294,12 @@ fn render_pinned_band(frame: &mut Frame<'_>, area: Rect, state: &TopState) {
         })
         .collect::<Vec<_>>()
         .join("  ");
+    // A move waiting for the library (an open magazine or door) leads the
+    // title so the operator sees why robotics has paused.
+    let title = match library.and_then(|library| library.changer_wait.as_deref()) {
+        Some(wait) => format!("{wait}  alarms: {alarms}"),
+        None => format!("alarms: {alarms}"),
+    };
     let rows = library
         .map(|library| {
             library
@@ -364,7 +370,7 @@ fn render_pinned_band(frame: &mut Frame<'_>, area: Rect, state: &TopState) {
     ]))
     .block(
         Block::default()
-            .title(format!("alarms: {alarms}"))
+            .title(title)
             .title_bottom(pending_parity)
             .borders(Borders::ALL),
     );
@@ -552,6 +558,7 @@ mod tests {
                     nanos: 0,
                 }),
                 managed: "rem".to_string(),
+                changer_wait: None,
             }],
             operations: vec![pb::OperationRef {
                 operation_id: Uuid::from_u128(5).as_bytes().to_vec(),
@@ -609,6 +616,33 @@ mod tests {
         assert!(text.contains("CLN001"));
         assert!(text.contains("1m23s"));
         assert!(text.contains("parity pending [128,131)"));
+    }
+
+    #[test]
+    fn renders_a_library_wait_in_the_pinned_band() {
+        let mut response = sample_response();
+        response.libraries[0].changer_wait = Some(
+            "waiting for library: medium magazine removed (02/3b/12); move 0x0100 -> 0x0200; 12s of 600s"
+                .to_string(),
+        );
+        let state = TopState {
+            live: Some(response),
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        terminal.draw(|frame| render_top(frame, &state)).unwrap();
+        let text = terminal
+            .backend_mut()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            text.contains("waiting for library: medium magazine removed"),
+            "{text}"
+        );
+        assert!(text.contains("alarms:"), "{text}");
     }
 
     /// Fence identities remain visible on an ordinary terminal, below the status row.

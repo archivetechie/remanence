@@ -567,6 +567,16 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
             },
         ),
         (
+            "remanence-library/src/handle/changer_ready.rs",
+            DispatchPolicy::Exact {
+                execute_out: 0,
+                // One CHANGER-transport site: the TEST UNIT READY readiness
+                // poll while a MOVE MEDIUM waits out a not-ready library.
+                execute_none: 1,
+                why: "changer-transport readiness poll only",
+            },
+        ),
+        (
             "remanence-library/src/transport.rs",
             DispatchPolicy::Exact {
                 execute_out: 4,

@@ -4172,6 +4172,7 @@ fn test_write_owner_config(
         checkpoint_max_age_seconds: remanence_state::DEFAULT_CHECKPOINT_MAX_AGE_SECONDS,
         session_idle_seconds: 1800,
         lifecycle: None,
+        changer_ready_wait: remanence_library::ChangerReadyWait::default(),
         calibration_store: remanence_state::CalibrationControlStore::open(
             std::env::temp_dir().join(format!("rem-calibration-tests-{}", Uuid::new_v4())),
         )
@@ -6382,6 +6383,7 @@ async fn changer_move_succeeds_and_publishes_snapshot_when_catalog_observation_f
         checkpoint_max_age_seconds: remanence_state::DEFAULT_CHECKPOINT_MAX_AGE_SECONDS,
         session_idle_seconds: 1800,
         lifecycle: None,
+        changer_ready_wait: remanence_library::ChangerReadyWait::default(),
         calibration_store: remanence_state::CalibrationControlStore::open(
             temp.path().join("calibration"),
         )
@@ -6395,6 +6397,7 @@ async fn changer_move_succeeds_and_publishes_snapshot_when_catalog_observation_f
             src: 0x0400,
             dst: 0x0100,
             recovery_guard: None,
+            caller_gone: None,
             reply: reply_tx,
         })
         .await
@@ -13663,6 +13666,437 @@ async fn check_open_checkpoint_projection_busy(
         Arc::new(AtomicU64::new(0)),
     )
     .await;
+}
+
+/// A write that must first evict a seated cartridge: the operator pulls the
+/// magazine holding its home slot after the mount was planned. Returns the
+/// mount outcome, the world, the live-status waits observed, and the daemon
+/// state for the caller to shut down.
+async fn write_mount_with_magazine_opened_during_eviction(
+    wait_seconds: u64,
+) -> (
+    Result<(u16, Option<u16>), Status>,
+    Arc<Mutex<VirtualWorld>>,
+    Vec<String>,
+    crate::ApiState,
+    tempfile::TempDir,
+) {
+    let (outcome, world, seen, api, temp) =
+        magazine_eviction_scenario(wait_seconds, MagazineEvictionEntry::Mount).await;
+    (
+        outcome.map(|done| done.expect("mount outcome")),
+        world,
+        seen,
+        api,
+        temp,
+    )
+}
+
+/// How the magazine-eviction scenario enters the write path.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MagazineEvictionEntry {
+    /// Mount resolution and the load move only.
+    Mount,
+    /// The full pinned write open, whose caller goes away while the
+    /// eviction's move home waits for the magazine.
+    WriteOpenCallerGone,
+}
+
+async fn magazine_eviction_scenario(
+    wait_seconds: u64,
+    entry: MagazineEvictionEntry,
+) -> (
+    Result<Option<(u16, Option<u16>)>, Status>,
+    Arc<Mutex<VirtualWorld>>,
+    Vec<String>,
+    crate::ApiState,
+    tempfile::TempDir,
+) {
+    const SERIAL: &str = "LIB-MAGAZINE";
+    const POOL: &str = "magazine-pool";
+    const HOME: u16 = 0x0400;
+    const NEW_SLOT: u16 = 0x0401;
+    let temp = tempfile::Builder::new()
+        .prefix("remanence-magazine-eviction-")
+        .tempdir()
+        .expect("tempdir");
+    let index_path = temp.path().join("rem-state.sqlite");
+    let new_uuid: TapeUuid = [0x5e; 16];
+    let mut index = CatalogIndex::open(&index_path).expect("catalog");
+    index
+        .provision_tape(ProvisionTapeInput {
+            tape_uuid: new_uuid,
+            voltag: "NEW001L9".to_string(),
+            block_size: 262_144,
+            parity: ParityConfig::None,
+            force: false,
+        })
+        .expect("provision target tape");
+    index
+        .upsert_tape_pool_projection(TapePoolProjectionInput {
+            pool_id: POOL.to_string(),
+            display_name: None,
+            copy_class: None,
+            content_class: None,
+            created_at_utc: None,
+        })
+        .expect("project pool");
+    index
+        .project_tape_pool_membership(new_uuid, POOL)
+        .expect("assign pool tape");
+    drop(index);
+    let caller_gone = Arc::new(AtomicBool::new(false));
+    let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
+        SERIAL, 0x0100, "DRV-MAG", HOME, 2,
+    )));
+    {
+        let mut world = world.lock().unwrap();
+        world.put_tape_in_drive(0x0100, "OLD001L9", Some(HOME), VirtualTape::default());
+        world.put_tape_in_slot(NEW_SLOT, "NEW001L9", VirtualTape::default());
+    }
+    let mut library = open_model_library(world.clone());
+    let mut cfg = test_write_owner_config(
+        index_path.clone(),
+        temp.path().join("audit"),
+        &library,
+        library_snapshot_cell(library.library().clone()),
+    );
+    std::fs::create_dir_all(&cfg.audit_dir).unwrap();
+    let board = crate::live_status::ChangerWaitBoard::default();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let observer = {
+        let board_observer = board.observer();
+        let board = board.clone();
+        let seen = Arc::clone(&seen);
+        let caller_gone = Arc::clone(&caller_gone);
+        Arc::new(move |event: &remanence_library::ChangerWaitEvent<'_>| {
+            if entry == MagazineEvictionEntry::WriteOpenCallerGone
+                && event.phase == remanence_library::ChangerWaitPhase::Waiting
+            {
+                caller_gone.store(true, Ordering::SeqCst);
+            }
+            board_observer(event);
+            if let Some(wait) = board.get(event.library_serial) {
+                seen.lock().unwrap().push(wait);
+            }
+        })
+    };
+    cfg.changer_ready_wait =
+        remanence_library::ChangerReadyWait::bounded(StdDuration::from_secs(wait_seconds))
+            .with_poll_interval(StdDuration::from_millis(1))
+            .with_observer(observer);
+    cfg.tape_pools = vec![remanence_state::TapePoolConfig {
+        scheme: None,
+        id: POOL.to_string(),
+        display_name: None,
+        copy_class: None,
+        content_class: None,
+        selection_policy: remanence_state::PoolSelectionPolicyName::CompleteOrFill,
+        watermark_low: 0.92,
+        watermark_high: 0.97,
+        capacity_cap_bytes: None,
+        block_size_bytes: 262_144,
+        min_object_size_bytes: 0,
+    }];
+    library.set_changer_ready_wait(cfg.changer_ready_wait.clone());
+    let key = crate::drive_pool::DriveKey::new(SERIAL, 0x0100);
+    let drive = library.open_drive(0x0100, &cfg.policy).unwrap();
+    let lifecycle = crate::drive_pool::DrivePoolLifecycle::default();
+    cfg.lifecycle = Some(lifecycle.clone());
+    let actor = spawn_drive_actor(0x0100, drive, cfg.clone());
+    let changer = spawn_changer_actor(library.into_changer(), cfg.clone());
+    let pool = DrivePool::new_with_lifecycle(
+        HashMap::from([(SERIAL.to_string(), changer)]),
+        HashMap::from([(key.clone(), actor)]),
+        Arc::new(HashMap::from([(key, AtomicBool::new(false))])),
+        lifecycle,
+    );
+    let mut api = crate::ApiState::new_with_pool_configs(
+        CatalogIndex::open(&index_path).unwrap(),
+        cfg.tape_pools.clone(),
+    );
+    api.audit_dir = Arc::new(cfg.audit_dir.clone());
+    api.library_snapshot = Some(cfg.library().snapshot.clone());
+    api.drive_pool = Some(pool);
+    api.changer_waits = board.clone();
+    {
+        // The plan above saw an empty, reachable home slot; now the
+        // magazine carrying it comes out, and goes back after three polls.
+        let mut world = world.lock().unwrap();
+        world.remove_magazine([HOME]);
+        world
+            .removed_magazine
+            .as_mut()
+            .unwrap()
+            .reinsert_after_polls = Some(3);
+    }
+    let outcome = match entry {
+        MagazineEvictionEntry::Mount => crate::mount::test_mount_for_write(&api, SERIAL, &new_uuid)
+            .await
+            .map(Some),
+        MagazineEvictionEntry::WriteOpenCallerGone => {
+            crate::mount::test_open_write_for_caller(&api, new_uuid, POOL, caller_gone)
+                .await
+                .map(|_| None)
+        }
+    };
+    let seen = seen.lock().unwrap().clone();
+    (outcome, world, seen, api, temp)
+}
+
+fn changer_wait_config(extra: &str) -> remanence_state::RemConfig {
+    remanence_state::parse_config_toml(&format!(
+        r#"
+[daemon]
+state_dir = "/nonexistent/rem"
+default_idle_timeout_seconds = 1800
+{extra}
+
+[journal]
+dir = "/nonexistent/rem/journals"
+require_trusted_volume = false
+
+[audit]
+dir = "/nonexistent/rem/audit"
+
+[index]
+sqlite_path = "/nonexistent/rem/index/rem-state.sqlite"
+
+[cache]
+tape_catalog_dir = "/nonexistent/rem/cache/tapes"
+"#
+    ))
+    .expect("parse config")
+}
+
+/// `[daemon] changer_not_ready_wait_seconds` becomes the actors' wait, which
+/// daemon shutdown stops; robotics and reconcile handles add the operation's
+/// own cancellation through `configure_operation_library`.
+#[test]
+fn daemon_config_sets_the_changer_wait_and_operation_handles_inherit_it() {
+    let board = crate::live_status::ChangerWaitBoard::default();
+    for (extra, timeout, enabled) in [
+        ("", 600, true),
+        ("changer_not_ready_wait_seconds = 120", 120, true),
+        ("changer_not_ready_wait_seconds = 0", 0, false),
+    ] {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let wait = crate::api_state::changer_ready_wait_from_config(
+            &changer_wait_config(extra),
+            &board,
+            Arc::clone(&shutdown),
+        );
+        assert_eq!(wait.timeout, StdDuration::from_secs(timeout), "{extra}");
+        assert_eq!(wait.is_enabled(), enabled, "{extra}");
+        assert_eq!(wait.stop_reason(), None);
+        shutdown.store(true, Ordering::SeqCst);
+        assert_eq!(wait.stop_reason(), Some("daemon shutdown"));
+    }
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
+        "LIB-WAIT-CFG",
+        0x0100,
+        "DRV-WAIT-CFG",
+        0x0400,
+        1,
+    )));
+    let mut library = open_model_library(world);
+    let temp = tempfile::tempdir().unwrap();
+    let mut cfg = test_write_owner_config(
+        temp.path().join("rem-state.sqlite"),
+        temp.path().join("audit"),
+        &library,
+        library_snapshot_cell(library.library().clone()),
+    );
+    cfg.changer_ready_wait = crate::api_state::changer_ready_wait_from_config(
+        &changer_wait_config("changer_not_ready_wait_seconds = 120"),
+        &board,
+        Arc::clone(&shutdown),
+    );
+    let registry = crate::operations::OperationRegistry::default();
+    let operation_id = Uuid::from_u128(0x77);
+    let handle = registry.register(operation_id, "move_medium");
+    cfg.configure_operation_library(&mut library, &handle);
+    let wait = library.changer().ready_wait();
+    assert_eq!(wait.timeout, StdDuration::from_secs(120));
+    assert_eq!(wait.stop_reason(), None);
+    registry.request_cancel(&operation_id).unwrap();
+    assert_eq!(wait.stop_reason(), Some("operation cancelled"));
+    shutdown.store(true, Ordering::SeqCst);
+    assert!(wait.stop_reason().is_some());
+}
+
+/// A queued changer move stops waiting once its caller is gone, and does not
+/// wait at all during daemon shutdown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changer_actor_move_wait_stops_for_a_gone_caller_and_skips_during_shutdown() {
+    for shutting_down in [false, true] {
+        let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
+            "LIB-WAIT-STOP",
+            0x0100,
+            "DRV-WAIT-STOP",
+            0x0400,
+            1,
+        )));
+        world
+            .lock()
+            .unwrap()
+            .put_tape_in_slot(0x0400, "STOP01L9", VirtualTape::default());
+        let library = open_model_library(world.clone());
+        let temp = tempfile::tempdir().unwrap();
+        let mut cfg = test_write_owner_config(
+            temp.path().join("rem-state.sqlite"),
+            temp.path().join("audit"),
+            &library,
+            library_snapshot_cell(library.library().clone()),
+        );
+        std::fs::create_dir_all(&cfg.audit_dir).unwrap();
+        CatalogIndex::open(&cfg.index_path).unwrap();
+        let shutdown = Arc::new(AtomicBool::new(shutting_down));
+        cfg.changer_ready_wait =
+            remanence_library::ChangerReadyWait::bounded(StdDuration::from_secs(60))
+                .with_poll_interval(remanence_library::MIN_CHANGER_NOT_READY_POLL)
+                .with_stop_signal("daemon shutdown", Arc::clone(&shutdown));
+        {
+            let mut world = world.lock().unwrap();
+            world.remove_magazine([]);
+            world
+                .removed_magazine
+                .as_mut()
+                .unwrap()
+                .not_ready_while_removed = true;
+        }
+        let actor = spawn_changer_actor(library.into_changer(), cfg);
+        let caller_gone = Arc::new(AtomicBool::new(false));
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        actor
+            .send(ChangerCommand::Move {
+                src: 0x0400,
+                dst: 0x0100,
+                recovery_guard: None,
+                caller_gone: Some(Arc::clone(&caller_gone)),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        if !shutting_down {
+            // Polls run at least 100 ms apart; let a few happen first.
+            tokio::time::sleep(StdDuration::from_millis(350)).await;
+            caller_gone.store(true, Ordering::SeqCst);
+        }
+        let result = tokio::time::timeout(StdDuration::from_secs(10), reply_rx)
+            .await
+            .expect("the wait stops promptly")
+            .unwrap();
+        let error = result.expect_err("a stopped wait fails the move as before");
+        assert!(error.message().contains("3b, 12"), "{error}");
+        assert!(started.elapsed() < StdDuration::from_secs(10));
+        let polls = world
+            .lock()
+            .unwrap()
+            .command_log
+            .iter()
+            .filter(|command| {
+                command.role == remanence_chaos::model::DeviceRole::Changer && command.opcode == 0
+            })
+            .count();
+        if shutting_down {
+            assert_eq!(polls, 0, "no readiness poll during shutdown");
+        } else {
+            assert!(polls > 0, "the wait polled before the caller left");
+        }
+        assert_eq!(
+            world.lock().unwrap().slots[0].barcode.as_deref(),
+            Some("STOP01L9")
+        );
+    }
+}
+
+/// A write open whose client goes away while the eviction's move home waits
+/// for the magazine: that move still completes, so the evicted cartridge is
+/// not left unthreaded in the drive. Whatever the open does next, the old
+/// cartridge is home.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_open_caller_gone_during_eviction_still_moves_the_old_cartridge_home() {
+    let (outcome, world, seen, api, _temp) =
+        magazine_eviction_scenario(60, MagazineEvictionEntry::WriteOpenCallerGone).await;
+
+    assert!(
+        seen.iter()
+            .any(|wait| wait.contains("move 0x0100 -> 0x0400")),
+        "the move home waited: {seen:?}"
+    );
+    {
+        let world = world.lock().unwrap();
+        assert!(world.removed_magazine.is_none());
+        assert_eq!(
+            world.slots[0].barcode.as_deref(),
+            Some("OLD001L9"),
+            "open outcome {outcome:?}"
+        );
+        assert_ne!(world.loaded_barcode(0x0100), Some("OLD001L9"));
+    }
+    let _ = api.shutdown_drive_pool().await;
+}
+
+/// The write's eviction rides out the open magazine: the unloaded cartridge
+/// goes home once the magazine is back, and the target tape loads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_eviction_rides_out_a_magazine_opened_before_the_move_home() {
+    let (outcome, world, seen, api, _temp) =
+        write_mount_with_magazine_opened_during_eviction(60).await;
+
+    assert_eq!(
+        outcome.expect("write mount succeeds"),
+        (0x0100, Some(0x0401))
+    );
+    {
+        let world = world.lock().unwrap();
+        assert!(world.removed_magazine.is_none());
+        assert_eq!(world.slots[0].barcode.as_deref(), Some("OLD001L9"));
+        assert_eq!(world.loaded_barcode(0x0100), Some("NEW001L9"));
+    }
+    assert!(
+        seen.iter().any(|wait| wait
+            .starts_with("waiting for library: element 0x0400 medium magazine removed (3b/12)")
+            || wait.starts_with("waiting for library: medium magazine removed (02/3b/12)")),
+        "{seen:?}"
+    );
+    assert_eq!(
+        api.changer_waits.get("LIB-MAGAZINE"),
+        None,
+        "the wait clears once ready"
+    );
+    api.shutdown_drive_pool().await.unwrap();
+}
+
+/// With the wait disabled the same window fails the write as before, naming
+/// the cartridge and asking for refreshed inventory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_eviction_without_the_wait_fails_as_before_on_an_open_magazine() {
+    let (outcome, world, seen, api, _temp) =
+        write_mount_with_magazine_opened_during_eviction(0).await;
+
+    let error = outcome.expect_err("the move home fails at once");
+    for text in [
+        "OLD001L9",
+        "location requires refreshed inventory",
+        "0x0400",
+        "3b, 12",
+    ] {
+        assert!(error.message().contains(text), "missing {text}: {error}");
+    }
+    assert!(seen.is_empty());
+    {
+        let mut world = world.lock().unwrap();
+        assert_eq!(world.loaded_barcode(0x0100), Some("OLD001L9"));
+        // The operator closes the magazine; shutdown can then park the cartridge.
+        world.reinsert_magazine();
+        world.changer_unit_attention = None;
+    }
+    api.shutdown_drive_pool().await.unwrap();
 }
 
 /// Remove an adopted cartridge through the idle actor path before journal import.

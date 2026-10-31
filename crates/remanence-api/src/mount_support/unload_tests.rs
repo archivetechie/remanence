@@ -526,6 +526,7 @@ async fn stranded_prevent_cancelled_move_keeps_recovery_lock_in_command() {
         dst,
         recovery_guard,
         reply,
+        ..
     } = command
     else {
         panic!("MOVE command")

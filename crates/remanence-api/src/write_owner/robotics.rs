@@ -160,6 +160,7 @@ pub(crate) fn handle_robotics(
             }
         }
     };
+    cfg.configure_operation_library(&mut library, handle);
 
     publish_running(handle, &[("phase", "execute")]);
     let action = match &action {

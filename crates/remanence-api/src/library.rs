@@ -170,6 +170,7 @@ pub(crate) fn project_library_state(
     voltags: &HashMap<String, Vec<u8>>,
     busy_bays: &HashSet<u16>,
     fenced_bays: &HashSet<u16>,
+    changer_wait: Option<String>,
 ) -> pb::LibraryState {
     pb::LibraryState {
         library: Some(project_library(library)),
@@ -193,6 +194,7 @@ pub(crate) fn project_library_state(
             nanos: captured_at.nanosecond() as i32,
         }),
         managed: "rem".to_string(),
+        changer_wait,
     }
 }
 
@@ -1449,6 +1451,7 @@ mod tests {
             &voltags,
             &HashSet::new(),
             &HashSet::new(),
+            None,
         );
         assert_eq!(
             state.library.expect("library").library_serial,
@@ -1486,6 +1489,7 @@ mod tests {
             &voltags,
             &HashSet::from([1]),
             &HashSet::new(),
+            None,
         );
 
         assert_eq!(
@@ -1502,6 +1506,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &HashSet::from([1]),
+            None,
         );
 
         assert_eq!(
@@ -1533,6 +1538,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &HashSet::new(),
+            None,
         );
 
         let debug = format!("{state:?}");

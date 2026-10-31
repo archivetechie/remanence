@@ -6960,6 +6960,7 @@ async fn drive_target_read_open_uses_virtual_world_actor_and_proves_bot_identity
         checkpoint_max_age_seconds: remanence_state::DEFAULT_CHECKPOINT_MAX_AGE_SECONDS,
         session_idle_seconds: 1800,
         lifecycle: None,
+        changer_ready_wait: remanence_library::ChangerReadyWait::default(),
         calibration_store: state.calibration_store().clone(),
     };
     let drive_tx = crate::write_owner::spawn_drive_actor(BAY, drive, owner_config.clone());

@@ -63,10 +63,40 @@ pub(crate) struct WriteOwnerConfig {
     pub checkpoint_max_age_seconds: u64,
     pub session_idle_seconds: u64,
     pub lifecycle: Option<crate::drive_pool::DrivePoolLifecycle>,
+    /// How changer moves wait out a transient not-ready library (an open
+    /// magazine or door). Every library handle the actors open carries it.
+    pub changer_ready_wait: remanence_library::ChangerReadyWait,
     /// Durable calibration-control store for the wrap-map read-ordering lifecycle. The drive
     /// actors run the load harvest against it at session open when
     /// the open freshly mounted the cartridge.
     pub calibration_store: remanence_state::CalibrationControlStore,
+}
+
+impl WriteOwnerConfig {
+    /// The configured changer wait, which also stops once `stop` is set.
+    pub(crate) fn changer_ready_wait_for(
+        &self,
+        stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+        reason: &'static str,
+    ) -> remanence_library::ChangerReadyWait {
+        let wait = self.changer_ready_wait.clone();
+        match stop {
+            Some(flag) => wait.with_stop_signal(reason, flag),
+            None => wait,
+        }
+    }
+
+    /// Give a library handle the actors open for one operation the
+    /// configured changer wait, stopped also by the operation's cancellation.
+    pub(crate) fn configure_operation_library(
+        &self,
+        library: &mut remanence_library::LibraryHandle,
+        handle: &crate::operations::OperationHandle,
+    ) {
+        library.set_changer_ready_wait(
+            self.changer_ready_wait_for(Some(handle.cancel_flag()), "operation cancelled"),
+        );
+    }
 }
 
 pub(crate) fn spawn_changer_actor(
@@ -196,7 +226,9 @@ pub(super) fn changer_loop(
                 dst,
                 reply,
                 recovery_guard,
+                caller_gone,
             } => {
+                changer.set_ready_wait(cfg.changer_ready_wait_for(caller_gone, "caller gone"));
                 let result =
                     super::robotics::admit_fenced_elements(&index, changer.library(), &[src, dst])
                         .and_then(|()| {
@@ -204,6 +236,7 @@ pub(super) fn changer_loop(
                                 Status::failed_precondition(format!("move medium: {err}"))
                             })
                         });
+                changer.set_ready_wait(cfg.changer_ready_wait.clone());
                 {
                     match observe_refreshed_library(&mut index, &cfg, changer.library()) {
                         Ok(()) => clear_library_snapshot_persist_alarm(
