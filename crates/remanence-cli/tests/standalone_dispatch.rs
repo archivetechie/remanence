@@ -1520,6 +1520,158 @@ fn used_cartridge_requires_exact_clobber_confirmation() {
     }
 }
 
+/// A Remanence identity unknown to the catalog is erased only when its exact
+/// UUID is named alongside --clobber-data and the typed confirmation.
+#[test]
+fn unknown_remanence_tape_requires_exact_named_uuid_to_clobber() {
+    use remanence_chaos::model::{Record, VirtualTape};
+    let bot = "5b1f0c2e-8d4a-4c3b-9e7f-1a2b3c4d5e6f";
+    let simple = bot.replace('-', "");
+    let wrong = "0f0e0d0c-0b0a-4908-8706-050403020100";
+    let hint = format!(
+        "Cannot initialize this cartridge: missing catalog row for {bot}. It carries a Remanence identity unknown to this catalog: adopt it with `rem tape adopt --label STRAY --pool default` (the default), or erase it by re-running with --clobber-data --clobber-unknown-tape {bot} and the clobber confirmation."
+    );
+    let mismatch =
+        format!("--clobber-unknown-tape {wrong} does not match BOT uuid {bot}; no write attempted");
+    let copies = format!(
+        "--clobber-unknown-tape refuses: committed copies in this catalog reference BOT uuid {bot}; no write attempted"
+    );
+    let named = [
+        "--clobber-data",
+        "--clobber-unknown-tape",
+        bot,
+        "--confirm-clobber",
+        "CLOBBER STRAY",
+    ];
+    for (options, seed_copy, succeeds, message) in [
+        (vec![], false, false, hint.as_str()),
+        (
+            vec!["--clobber-data", "--confirm-clobber", "CLOBBER STRAY"],
+            false,
+            false,
+            hint.as_str(),
+        ),
+        (named.to_vec(), true, false, copies.as_str()),
+        (
+            vec![
+                "--clobber-data",
+                "--clobber-unknown-tape",
+                wrong,
+                "--confirm-clobber",
+                "CLOBBER STRAY",
+            ],
+            false,
+            false,
+            mismatch.as_str(),
+        ),
+        (
+            vec!["--clobber-data", "--clobber-unknown-tape", bot],
+            false,
+            false,
+            "non-interactive clobber requires",
+        ),
+        (
+            vec![
+                "--clobber-data",
+                "--clobber-unknown-tape",
+                bot,
+                "--confirm-clobber",
+                "WRONG",
+            ],
+            false,
+            false,
+            "did not match",
+        ),
+        (
+            vec![
+                "--clobber-data",
+                "--clobber-unknown-tape",
+                simple.as_str(),
+                "--confirm-clobber",
+                "CLOBBER STRAY",
+            ],
+            false,
+            true,
+            "",
+        ),
+    ] {
+        let f = VersionFixture::new();
+        let payload = remanence_api::build_tape_bootstrap(
+            *uuid::Uuid::parse_str(bot).unwrap().as_bytes(),
+            262144,
+            remanence_api::ParityConfig::None,
+            "2026-01-01T00:00:00Z",
+            "remanence-test",
+        );
+        let mut block = vec![0u8; 262144];
+        remanence_parity::bootstrap::write_bootstrap_block(&payload, &mut block).unwrap();
+        let mut tape = VirtualTape::empty(256 * 1024 * 1024, 262144);
+        tape.records = vec![Record::Block(block), Record::Filemark];
+        f.world
+            .lock()
+            .unwrap()
+            .put_tape_in_drive(0x100, "STRAY", None, tape);
+        if seed_copy {
+            // A committed copy on the BOT UUID with no tape row for it.
+            let config = remanence_state::load_config(f.config()).unwrap();
+            rusqlite::Connection::open(config.index.sqlite_path)
+                .unwrap()
+                .execute(
+                    "insert into object_copies(object_id, tape_uuid, tape_file_number, status, pool_id)
+                     values('seeded-object', ?1, ?2, 'committed', 'default')",
+                    rusqlite::params![
+                        uuid::Uuid::parse_str(bot).unwrap().as_bytes().to_vec(),
+                        1u64.to_be_bytes().to_vec()
+                    ],
+                )
+                .unwrap();
+        }
+        let before = f.writes();
+        let mut args = vec!["tape", "init", "--label", "STRAY", "--generation", "L9"];
+        args.extend(options.iter().copied());
+        let (code, out, errors) = f.run(&args, true);
+        assert_eq!(code == ExitCode::SUCCESS, succeeds, "{out}\n{errors}");
+        let config = remanence_state::load_config(f.config()).unwrap();
+        let paths = remanence_state::StatePaths::from_config(f.config(), &config);
+        let clobber_audit: Vec<_> = remanence_state::FileAuditLog::replay(&paths.audit_dir)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event == remanence_state::AuditEvent::TapeProvisioned)
+            .filter(|r| r.detail.contains_key("clobbered_uuid"))
+            .collect();
+        if succeeds {
+            assert!(errors.is_empty(), "{errors}");
+            assert!(f.writes() > before);
+            let result = VersionFixture::envelope(&out)["result"].clone();
+            assert_eq!(result["clobbered_unknown_uuid"], bot, "{result}");
+            assert_eq!(result["clobbered_identity"], "unknown-to-catalog");
+            let tape = f.index().get_tape_by_voltag("STRAY").unwrap().unwrap();
+            let fresh = uuid::Uuid::from_slice(&tape.tape_uuid).unwrap();
+            assert_ne!(fresh.to_string(), bot);
+            assert_eq!(result["tape_uuid"], fresh.to_string());
+            assert_eq!(clobber_audit.len(), 1);
+            let detail = &clobber_audit[0].detail;
+            assert_eq!(
+                detail.get("clobbered_uuid"),
+                Some(&ciborium::value::Value::Text(simple.clone()))
+            );
+            assert_eq!(
+                detail.get("clobbered_identity"),
+                Some(&ciborium::value::Value::Text("unknown-to-catalog".into()))
+            );
+            assert_eq!(
+                detail.get("forced"),
+                Some(&ciborium::value::Value::Bool(true))
+            );
+        } else {
+            assert!(out.contains(message), "{options:?}\n{out}");
+            assert_eq!(f.writes(), before, "{options:?}");
+            assert!(f.index().get_tape_by_voltag("STRAY").unwrap().is_none());
+            assert!(clobber_audit.is_empty());
+        }
+    }
+}
+
 /// Encrypted newest versions require an explicit downgrade; other files continue.
 #[test]
 fn plaintext_downgrade_is_per_file_and_requires_override() {

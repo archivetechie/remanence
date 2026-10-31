@@ -359,6 +359,29 @@ pub struct TapeInitWriteOptions {
     pub force: bool,
     /// Separate confirmed override for data-clobber refusals.
     pub clobber_data_confirmed: bool,
+    /// A Remanence identity this catalog does not know, named by the operator
+    /// for destruction and matched by [`match_unknown_tape_clobber`], the only
+    /// way to construct one. Honoured only together with
+    /// `clobber_data_confirmed`, and only for a `MissingCatalogRow` decision
+    /// carrying the same UUID; every other decision refuses while it is set.
+    pub clobber_unknown_tape: Option<UnknownTapeClobber>,
+}
+
+/// Proof that an operator-named BOT UUID matched an unknown-identity init
+/// decision with no committed copies referencing it.
+///
+/// Only [`match_unknown_tape_clobber`] constructs this, so the write gate
+/// cannot be handed a named clobber that skipped the committed-copy check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnknownTapeClobber {
+    bot_uuid: TapeUuid,
+}
+
+impl UnknownTapeClobber {
+    /// The BOT UUID this clobber is authorized to destroy.
+    pub fn bot_uuid(&self) -> TapeUuid {
+        self.bot_uuid
+    }
 }
 
 /// Result of attempting to apply the BOT write portion of an init decision.
@@ -380,12 +403,72 @@ pub enum TapeInitWriteError {
     /// `--clobber-data` is never meaningful during dry-run.
     #[error("--clobber-data is rejected in --dry-run")]
     ClobberDataInDryRun,
+    /// `--clobber-unknown-tape` is never meaningful during dry-run.
+    #[error("--clobber-unknown-tape is rejected in --dry-run")]
+    ClobberUnknownTapeInDryRun,
     /// Lower-level bootstrap write failed.
     #[error(transparent)]
     Write(#[from] PoolWriteError),
     /// Timestamp formatting failed.
     #[error(transparent)]
     TimeFormat(#[from] time::error::Format),
+}
+
+/// Why a named unknown-tape clobber does not apply to an init decision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UnknownTapeClobberRefusal {
+    /// The BOT carries a different Remanence UUID from the one named.
+    UuidMismatch {
+        /// UUID the operator named for destruction.
+        requested: TapeUuid,
+        /// UUID actually found at BOT.
+        bot_uuid: TapeUuid,
+    },
+    /// Committed copies in this catalog still reference the BOT UUID, so the
+    /// identity is not unknown even though its tape row is absent.
+    CommittedCopiesPresent {
+        /// UUID found at BOT.
+        bot_uuid: TapeUuid,
+    },
+    /// The decision is not a Remanence identity missing from the catalog; the
+    /// named override never relaxes any other decision.
+    NotUnknownTape {
+        /// UUID the operator named for destruction.
+        requested: TapeUuid,
+    },
+}
+
+/// Match an operator-named unknown-tape clobber against an init decision.
+///
+/// Succeeds, returning the proof the write gate requires, only when the decision is
+/// `NeedsExplicitRebuild { MissingCatalogRow { bot_uuid } }`, `requested`
+/// equals `bot_uuid` exactly, and no committed copy references that UUID. The
+/// caller must still obtain the ordinary typed data-clobber confirmation.
+pub fn match_unknown_tape_clobber(
+    decision: &InitDecision,
+    committed_copies: &CommittedCopyState,
+    requested: TapeUuid,
+) -> Result<UnknownTapeClobber, UnknownTapeClobberRefusal> {
+    let InitDecision::NeedsExplicitRebuild {
+        reason: TapeInitError::MissingCatalogRow { bot_uuid },
+    } = decision
+    else {
+        return Err(UnknownTapeClobberRefusal::NotUnknownTape { requested });
+    };
+    if requested != *bot_uuid {
+        return Err(UnknownTapeClobberRefusal::UuidMismatch {
+            requested,
+            bot_uuid: *bot_uuid,
+        });
+    }
+    if committed_copies.has_committed_copies() {
+        return Err(UnknownTapeClobberRefusal::CommittedCopiesPresent {
+            bot_uuid: *bot_uuid,
+        });
+    }
+    Ok(UnknownTapeClobber {
+        bot_uuid: *bot_uuid,
+    })
 }
 
 /// Decide whether `rem tape init` may write, must no-op, or must refuse.
@@ -735,11 +818,25 @@ pub fn maybe_write_tape_init_bootstrap(
     parity: ParityConfig,
     identity: &remanence_parity::WriterIdentity,
 ) -> Result<TapeInitWriteAction, TapeInitWriteError> {
+    if options.dry_run && options.clobber_unknown_tape.is_some() {
+        return Err(TapeInitWriteError::ClobberUnknownTapeInDryRun);
+    }
     if options.dry_run && options.clobber_data_confirmed {
         return Err(TapeInitWriteError::ClobberDataInDryRun);
     }
 
     let may_write = match decision {
+        // A named unknown-tape clobber authorizes exactly one decision and
+        // never travels with any other.
+        InitDecision::NeedsExplicitRebuild {
+            reason: TapeInitError::MissingCatalogRow { bot_uuid },
+        } => {
+            options.clobber_data_confirmed
+                && options
+                    .clobber_unknown_tape
+                    .is_some_and(|named| named.bot_uuid == *bot_uuid)
+        }
+        _ if options.clobber_unknown_tape.is_some() => false,
         InitDecision::FreshInit => true,
         InitDecision::RequireForce { .. } => options.force,
         InitDecision::RefuseClobber {
@@ -753,7 +850,9 @@ pub fn maybe_write_tape_init_bootstrap(
 
     if !may_write {
         return Ok(match decision {
-            InitDecision::IdempotentNoOp => TapeInitWriteAction::IdempotentNoOp,
+            InitDecision::IdempotentNoOp if options.clobber_unknown_tape.is_none() => {
+                TapeInitWriteAction::IdempotentNoOp
+            }
             _ => TapeInitWriteAction::Refused,
         });
     }
@@ -1103,6 +1202,18 @@ impl remanence_library::BlockSink for DriveHandleInitSink<'_> {
     }
 }
 
+/// Re-read BOT just before a named unknown-tape clobber writes: the medium
+/// must still carry exactly the Remanence identity the operator named.
+fn bot_still_carries_named_unknown_tape(
+    source: &mut dyn remanence_library::BlockSource,
+    named: UnknownTapeClobber,
+) -> bool {
+    matches!(
+        classify_bot_from_source(source).classification,
+        BotClassification::OursBootstrap { uuid, .. } if uuid == named.bot_uuid
+    )
+}
+
 /// Apply the init gauntlet to a physical drive without exposing its ungated sink.
 #[allow(clippy::too_many_arguments)]
 pub fn maybe_write_tape_init_bootstrap_on_drive(
@@ -1118,6 +1229,16 @@ pub fn maybe_write_tape_init_bootstrap_on_drive(
     if matches!(decision, InitDecision::FreshInit) {
         let facts = classify_bot_from_source(&mut remanence_library::DriveHandleSource(drive));
         if !matches!(facts.classification, BotClassification::BlankCheckEod) {
+            return Ok(TapeInitWriteAction::Refused);
+        }
+    }
+    if let Some(named) = options.clobber_unknown_tape {
+        if !options.dry_run
+            && !bot_still_carries_named_unknown_tape(
+                &mut remanence_library::DriveHandleSource(drive),
+                named,
+            )
+        {
             return Ok(TapeInitWriteAction::Refused);
         }
     }
@@ -2109,6 +2230,7 @@ mod tests {
                 dry_run: false,
                 force: false,
                 clobber_data_confirmed: true,
+                clobber_unknown_tape: None,
             },
             BOT_UUID,
             4096,
@@ -2161,6 +2283,7 @@ mod tests {
                 dry_run: true,
                 force: false,
                 clobber_data_confirmed: false,
+                clobber_unknown_tape: None,
             },
             BOT_UUID,
             4096,
@@ -2175,5 +2298,335 @@ mod tests {
         assert_eq!(action, TapeInitWriteAction::DryRunWouldWrite);
         assert!(sink.blocks.is_empty());
         assert!(sink.filemarks.is_empty());
+    }
+
+    fn test_identity() -> remanence_parity::WriterIdentity {
+        remanence_parity::WriterIdentity::fixed(
+            "remanence-test".into(),
+            std::time::SystemTime::UNIX_EPOCH.into(),
+        )
+    }
+
+    fn unknown_tape_decision() -> InitDecision {
+        decide(
+            &ours_bot(),
+            None,
+            &LabelLifecycleState::Available,
+            true,
+            &CommittedCopyState::None,
+        )
+    }
+
+    /// Every projected decision other than an unknown Remanence identity.
+    fn decisions_other_than_unknown_tape() -> Vec<InitDecision> {
+        let changer_label = LabelLifecycleState::AssignedTo {
+            uuid: BOT_UUID,
+            provenance: LabelProvenance::Changer,
+        };
+        let mut swapped = catalog_row();
+        swapped.uuid = OTHER_UUID;
+        let mut relabeled = catalog_row();
+        relabeled.barcode_relation = CatalogBarcodeRelation::DiffersWithoutRelabel;
+        let mut mismatched_geometry = catalog_row();
+        mismatched_geometry.geometry = other_geometry();
+        let mut written = catalog_row();
+        written.catalog_unwritten = false;
+        let none = CommittedCopyState::None;
+        let available = LabelLifecycleState::Available;
+        let decisions = vec![
+            decide(
+                &BotClassification::BlankCheckEod,
+                None,
+                &available,
+                false,
+                &none,
+            ),
+            decide(
+                &ours_bot(),
+                Some(&catalog_row()),
+                &changer_label,
+                false,
+                &none,
+            ),
+            decide(
+                &BotClassification::BlankCheckEod,
+                None,
+                &LabelLifecycleState::AssignedTo {
+                    uuid: OTHER_UUID,
+                    provenance: LabelProvenance::Operator,
+                },
+                false,
+                &none,
+            ),
+            decide(
+                &ours_bot(),
+                None,
+                &LabelLifecycleState::AssignedTo {
+                    uuid: OTHER_UUID,
+                    provenance: LabelProvenance::Changer,
+                },
+                false,
+                &none,
+            ),
+            decide(
+                &ours_bot(),
+                None,
+                &LabelLifecycleState::Retired,
+                false,
+                &none,
+            ),
+            decide(&ours_bot(), Some(&swapped), &available, false, &none),
+            decide(&ours_bot(), Some(&relabeled), &changer_label, false, &none),
+            decide(
+                &ours_bot(),
+                Some(&retired_catalog_row()),
+                &available,
+                true,
+                &none,
+            ),
+            decide(
+                &ours_bot(),
+                Some(&catalog_row()),
+                &changer_label,
+                true,
+                &none,
+            ),
+            decide(
+                &ours_bot(),
+                Some(&catalog_row()),
+                &changer_label,
+                false,
+                &CommittedCopyState::Pool(POOL_A.into()),
+            ),
+            decide(
+                &ours_bot(),
+                None,
+                &available,
+                false,
+                &CommittedCopyState::Pool(POOL_B.into()),
+            ),
+            decide(
+                &ours_bot(),
+                Some(&mismatched_geometry),
+                &changer_label,
+                false,
+                &none,
+            ),
+            decide(&ours_bot(), Some(&written), &changer_label, false, &none),
+            decide(
+                &BotClassification::ReadError,
+                None,
+                &available,
+                false,
+                &none,
+            ),
+            decide(
+                &BotClassification::ForeignFormat {
+                    name: "ltfs".to_string(),
+                },
+                None,
+                &available,
+                false,
+                &none,
+            ),
+            decide(
+                &BotClassification::UnrecognizedData,
+                None,
+                &available,
+                false,
+                &none,
+            ),
+        ];
+        for decision in &decisions {
+            assert!(
+                !matches!(
+                    decision,
+                    InitDecision::NeedsExplicitRebuild {
+                        reason: TapeInitError::MissingCatalogRow { .. }
+                    }
+                ),
+                "fixture {decision:?} is the unknown-tape decision"
+            );
+        }
+        decisions
+    }
+
+    #[test]
+    fn unknown_tape_clobber_matches_only_the_exact_missing_catalog_row_uuid() {
+        let decision = unknown_tape_decision();
+        assert_eq!(
+            match_unknown_tape_clobber(&decision, &CommittedCopyState::None, BOT_UUID),
+            Ok(UnknownTapeClobber { bot_uuid: BOT_UUID })
+        );
+        assert_eq!(
+            match_unknown_tape_clobber(&decision, &CommittedCopyState::None, OTHER_UUID),
+            Err(UnknownTapeClobberRefusal::UuidMismatch {
+                requested: OTHER_UUID,
+                bot_uuid: BOT_UUID,
+            })
+        );
+        // Copies still indexed under the BOT UUID mean the identity is known.
+        let copies = CommittedCopyState::Pool(POOL_A.into());
+        let decision = decide(
+            &ours_bot(),
+            None,
+            &LabelLifecycleState::Available,
+            false,
+            &copies,
+        );
+        assert_eq!(decision, unknown_tape_decision());
+        assert_eq!(
+            match_unknown_tape_clobber(&decision, &copies, BOT_UUID),
+            Err(UnknownTapeClobberRefusal::CommittedCopiesPresent { bot_uuid: BOT_UUID })
+        );
+        // Copies with no recorded pool are a pool-conflict anomaly first.
+        let copies = CommittedCopyState::UnknownPool;
+        let decision = decide(
+            &ours_bot(),
+            None,
+            &LabelLifecycleState::Available,
+            false,
+            &copies,
+        );
+        assert!(matches!(decision, InitDecision::Anomaly { .. }));
+        assert_eq!(
+            match_unknown_tape_clobber(&decision, &copies, BOT_UUID),
+            Err(UnknownTapeClobberRefusal::NotUnknownTape {
+                requested: BOT_UUID
+            })
+        );
+        for decision in decisions_other_than_unknown_tape() {
+            assert_eq!(
+                match_unknown_tape_clobber(&decision, &CommittedCopyState::None, BOT_UUID),
+                Err(UnknownTapeClobberRefusal::NotUnknownTape {
+                    requested: BOT_UUID
+                }),
+                "{decision:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn named_unknown_tape_clobber_writes_fresh_bootstrap_only_when_confirmed_and_exact() {
+        let decision = unknown_tape_decision();
+        for (confirmed, named, writes) in [
+            (true, Some(BOT_UUID), true),
+            (false, Some(BOT_UUID), false),
+            (true, Some(OTHER_UUID), false),
+            (true, None, false),
+            (false, None, false),
+        ] {
+            let mut sink = VecBlockSink::new();
+            let action = maybe_write_tape_init_bootstrap(
+                &mut sink,
+                &decision,
+                TapeInitWriteOptions {
+                    dry_run: false,
+                    force: true,
+                    clobber_data_confirmed: confirmed,
+                    clobber_unknown_tape: named.map(|bot_uuid| UnknownTapeClobber { bot_uuid }),
+                },
+                OTHER_UUID,
+                4096,
+                ParityConfig::None,
+                &test_identity(),
+            )
+            .expect("write gate returns");
+            if writes {
+                assert_eq!(action, TapeInitWriteAction::WroteBootstrap);
+                assert_eq!(sink.filemarks, vec![1]);
+                let bootstrap = remanence_parity::bootstrap::parse_bootstrap_block(&sink.blocks[0])
+                    .expect("decode written BOT bootstrap");
+                assert_eq!(bootstrap.tape_uuid, OTHER_UUID);
+            } else {
+                assert_eq!(
+                    action,
+                    TapeInitWriteAction::Refused,
+                    "{confirmed} {named:?}"
+                );
+                assert!(sink.blocks.is_empty());
+                assert!(sink.filemarks.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn named_unknown_tape_clobber_never_relaxes_another_decision() {
+        for decision in decisions_other_than_unknown_tape() {
+            let mut sink = VecBlockSink::new();
+            let action = maybe_write_tape_init_bootstrap(
+                &mut sink,
+                &decision,
+                TapeInitWriteOptions {
+                    dry_run: false,
+                    force: true,
+                    clobber_data_confirmed: true,
+                    clobber_unknown_tape: Some(UnknownTapeClobber { bot_uuid: BOT_UUID }),
+                },
+                OTHER_UUID,
+                4096,
+                ParityConfig::None,
+                &test_identity(),
+            )
+            .expect("write gate returns");
+            assert_eq!(action, TapeInitWriteAction::Refused, "{decision:?}");
+            assert!(sink.blocks.is_empty(), "decision {decision:?} wrote BOT");
+            assert!(sink.filemarks.is_empty(), "decision {decision:?} wrote FM");
+        }
+    }
+
+    #[test]
+    fn named_unknown_tape_clobber_is_rejected_in_dry_run() {
+        let mut sink = VecBlockSink::new();
+        let error = maybe_write_tape_init_bootstrap(
+            &mut sink,
+            &unknown_tape_decision(),
+            TapeInitWriteOptions {
+                dry_run: true,
+                force: false,
+                clobber_data_confirmed: false,
+                clobber_unknown_tape: Some(UnknownTapeClobber { bot_uuid: BOT_UUID }),
+            },
+            OTHER_UUID,
+            4096,
+            ParityConfig::None,
+            &test_identity(),
+        )
+        .expect_err("dry-run refuses the named clobber");
+        assert!(matches!(
+            error,
+            TapeInitWriteError::ClobberUnknownTapeInDryRun
+        ));
+        assert!(sink.blocks.is_empty());
+    }
+
+    fn encoded_bootstrap(tape_uuid: TapeUuid) -> Vec<u8> {
+        let payload = build_tape_bootstrap(
+            tape_uuid,
+            4096,
+            ParityConfig::None,
+            "2026-05-30T00:00:00Z",
+            "test",
+        );
+        let mut block = vec![0; payload.block_size_bytes as usize];
+        write_bootstrap_block(&payload, &mut block).expect("encode bootstrap");
+        block
+    }
+
+    #[test]
+    fn named_unknown_tape_clobber_recheck_requires_the_same_bot_uuid() {
+        let named = UnknownTapeClobber { bot_uuid: BOT_UUID };
+        let mut same = VecBlockSource::new(vec![encoded_bootstrap(BOT_UUID)]);
+        assert!(bot_still_carries_named_unknown_tape(&mut same, named));
+        // The BOT changed between decision and write: another identity, a
+        // blank medium, or unrecognized bytes all refuse.
+        for blocks in [
+            vec![encoded_bootstrap(OTHER_UUID)],
+            Vec::new(),
+            vec![vec![0u8; 4096]],
+        ] {
+            let mut changed = VecBlockSource::new(blocks);
+            assert!(!bot_still_carries_named_unknown_tape(&mut changed, named));
+        }
     }
 }

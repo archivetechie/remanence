@@ -201,7 +201,9 @@ After `retire`, what `rem tape init RMJ101L9` does depends on what the medium ca
   nonblank media as a fresh tape. Rescue any bytes you need before confirming.
 - Media carrying a uuid the catalog has never seen (for example uuid Y in Scenario A):
   retiring X does not make Y writable. Init returns `NeedsExplicitRebuild` and does
-  not write.
+  not write. Adopting Y by catalog rebuild is the default. To destroy Y instead,
+  name it exactly: `--clobber-data --clobber-unknown-tape Y` with the usual
+  `CLOBBER` confirmation.
 - A barcode paired with some other live uuid is still refused as an anomaly. Scenario D
   stays protected. Retire covers one specific dead identity and never a whole category
   of tapes.
@@ -209,7 +211,7 @@ After `retire`, what `rem tape init RMJ101L9` does depends on what the medium ca
 So in Scenario A the sequence retire, then init, works for cartridges that come back
 blank; cartridges still carrying X also need confirmed clobber. A cartridge
 re-initialized by another tool under a new uuid Y needs the explicit rebuild
-path.
+path, or a clobber that names Y.
 
 The flow for a recycled tape, with and without `retire`:
 
