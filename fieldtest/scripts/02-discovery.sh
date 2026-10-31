@@ -79,9 +79,14 @@ PY
       exit 1
     fi
   else
-    if [[ "$selected_count" -lt 2 ]]; then
-      fieldtest_evidence_record "$SCRIPT_NAME" drive-count FAIL "real environment should expose at least two drives"
+    # A single-drive partition sets FIELD_MIN_DRIVES=1; the dual-drive legs then refuse on their own.
+    local min_drives="${FIELD_MIN_DRIVES:-2}"
+    if [[ "$selected_count" -lt "$min_drives" ]]; then
+      fieldtest_evidence_record "$SCRIPT_NAME" drive-count FAIL "real environment should expose at least $min_drives drives (FIELD_MIN_DRIVES)"
       exit 1
+    fi
+    if [[ "$selected_count" -lt 2 ]]; then
+      fieldtest_evidence_record "$SCRIPT_NAME" drive-count INFO "single-drive window: $selected_count drive(s); dual-drive legs do not apply"
     fi
   fi
 
