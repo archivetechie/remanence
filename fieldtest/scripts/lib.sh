@@ -44,6 +44,10 @@ fieldtest_init_layout() {
     "$home" \
     "$home/bin" \
     "$home/state" \
+    "$home/state/journals" \
+    "$home/state/audit" \
+    "$home/state/index" \
+    "$home/state/cache/tapes" \
     "$home/spool" \
     "$home/log" \
     "$home/evidence"
