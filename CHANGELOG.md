@@ -7,6 +7,19 @@ per-release summaries.
 <!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/index.rs crates/remanence-library/src/discovery.rs @ 638210f7 -->
 ## Unreleased
 
+- `rem tape init` can now erase a Remanence tape whose BOT UUID has no catalog
+  row, which previously could only be adopted. Pass `--clobber-data
+  --clobber-unknown-tape <UUID>` with the clobber confirmation; the UUID must
+  equal the BOT UUID exactly. Adoption stays the default, and the
+  `needs-explicit-rebuild` refusal now gives both adoption and the override as
+  runnable commands with the UUID filled in. A mismatch refuses and names both
+  UUIDs. Committed copies in the catalog that still reference the BOT UUID also
+  refuse. BOT is re-read just before the write and must still carry the named
+  UUID. The override is rejected for dry-run and batch init and relaxes no other
+  decision. The fresh identity's `TapeProvisioned` audit record carries
+  `clobbered_identity = "unknown-to-catalog"` and `clobbered_uuid`. Standalone
+  `rem tape init` has the same flag.
+
 - Removed the duplicate direct session writer and mount-session forwarding.
   Standalone and pool-selected writes share the actor; ordinary checkpoints
   retain partial parity epochs and owner finish closes them without unloading.

@@ -928,6 +928,18 @@ fn parse_archive_file_size_bytes(s: &str) -> Result<u64, String> {
     parse_binary_byte_count(s, "file size")
 }
 
+/// Parse `--clobber-unknown-tape`, accepting only the 32-hex and hyphenated
+/// spellings of the BOT UUID being destroyed.
+fn parse_clobber_unknown_tape_uuid(value: &str) -> Result<Uuid, String> {
+    let simple = value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if !simple && value.len() != 36 {
+        return Err(format!(
+            "expected the tape UUID as 32 hex digits or in hyphenated form, got {value:?}"
+        ));
+    }
+    Uuid::try_parse(value).map_err(|error| format!("invalid tape UUID {value:?}: {error}"))
+}
+
 /// Parse a tape-init block size override and apply the same limits as pool config.
 fn parse_tape_block_size(s: &str) -> Result<u64, String> {
     let bytes = parse_binary_byte_count(s, "block size")?;
@@ -2408,6 +2420,15 @@ struct TapeInitArgs {
     /// Exact destructive confirmation for non-interactive initialization.
     #[arg(long, requires = "clobber_data")]
     confirm_clobber: Option<String>,
+    /// Erase a Remanence tape this catalog does not know. Names the exact BOT
+    /// UUID being destroyed; requires --clobber-data and its confirmation.
+    #[arg(
+        long,
+        value_name = "UUID",
+        requires = "clobber_data",
+        value_parser = parse_clobber_unknown_tape_uuid
+    )]
+    clobber_unknown_tape: Option<Uuid>,
 
     /// Fixed tape block size for a fresh initialization.
     #[arg(long, value_name = "BYTES", value_parser = parse_tape_block_size)]
@@ -2441,6 +2462,14 @@ impl TapeInitParity {
 impl TapeInitArgs {
     fn validate_before_discovery(&self) -> Result<(), String> {
         let target = parse_tape_init_target(self.target.as_str())?;
+        if self.clobber_unknown_tape.is_some() && self.dry_run {
+            return Err("tape init rejects --clobber-unknown-tape with --dry-run".to_string());
+        }
+        if self.clobber_unknown_tape.is_some() && target.is_batch() {
+            return Err(
+                "tape init rejects --clobber-unknown-tape for batch slot ranges".to_string(),
+            );
+        }
         if self.clobber_data && self.dry_run {
             return Err("tape init rejects --clobber-data with --dry-run".to_string());
         }
@@ -8652,6 +8681,10 @@ struct TapeInitRunResult {
     drive_element: u16,
     decision: remanence_api::InitDecision,
     action: remanence_api::TapeInitWriteAction,
+    /// BOT identity unknown to this catalog that a confirmed clobber destroyed.
+    clobbered_unknown_uuid: Option<remanence_api::TapeUuid>,
+    /// Runnable next steps when the BOT carries an identity unknown to this catalog.
+    unknown_tape_next: Option<String>,
     notes: Vec<String>,
 }
 
@@ -8671,6 +8704,16 @@ struct TapeInitRunContext<'a> {
     args: &'a TapeInitArgs,
 }
 
+/// The override that authorized a tape-init bootstrap write, for provisioning
+/// and its audit record.
+#[derive(Clone, Copy, Debug, Default)]
+struct TapeInitProvisionAuthority {
+    /// `--force` or a confirmed data clobber authorized the write.
+    force: bool,
+    /// The destroyed BOT identity had no row in this catalog.
+    clobbered_unknown_uuid: Option<remanence_api::TapeUuid>,
+}
+
 trait TapeInitStateOps {
     fn project_catalog_inputs(
         &mut self,
@@ -8686,7 +8729,7 @@ trait TapeInitStateOps {
         voltag: String,
         block_size: u32,
         parity: remanence_api::ParityConfig,
-        force: bool,
+        authority: TapeInitProvisionAuthority,
     ) -> Result<(), String>;
 
     fn record_media_readiness_operation(
@@ -8732,7 +8775,7 @@ impl TapeInitStateOps for remanence_state::StateHandle {
         voltag: String,
         block_size: u32,
         parity: remanence_api::ParityConfig,
-        force: bool,
+        authority: TapeInitProvisionAuthority,
     ) -> Result<(), String> {
         let observation = remanence_state::MediaObservation::label_hint(&voltag);
         provision_initialized_tape_with_media(
@@ -8743,13 +8786,14 @@ impl TapeInitStateOps for remanence_state::StateHandle {
                 voltag,
                 block_size,
                 parity,
-                force,
+                force: authority.force,
             },
             ProvisioningContext {
                 provenance: remanence_state::LabelProvenance::Changer,
                 observation,
                 explicit_pool: None,
                 previous_uuid: None,
+                clobbered_unknown_uuid: authority.clobbered_unknown_uuid,
             },
         )
     }
@@ -8799,6 +8843,8 @@ struct ProvisioningContext<'a> {
     observation: Option<remanence_state::MediaObservation>,
     explicit_pool: Option<&'a str>,
     previous_uuid: Option<[u8; 16]>,
+    /// A confirmed clobber destroyed this BOT identity, unknown to the catalog.
+    clobbered_unknown_uuid: Option<[u8; 16]>,
 }
 fn provision_initialized_tape_with_media(
     state: &mut remanence_state::StateHandle,
@@ -8929,6 +8975,16 @@ fn append_tape_provisioned_audit_event(
     if let Some(pool_id) = pool_id {
         detail.insert("pool_id".to_string(), CborValue::Text(pool_id.to_string()));
     }
+    if let Some(clobbered_uuid) = context.clobbered_unknown_uuid {
+        detail.insert(
+            "clobbered_identity".into(),
+            CborValue::Text("unknown-to-catalog".into()),
+        );
+        detail.insert(
+            "clobbered_uuid".into(),
+            CborValue::Text(bytes_to_hex(&clobbered_uuid)),
+        );
+    }
     state
         .audit()
         .append(remanence_state::AuditEventRecord {
@@ -8975,7 +9031,7 @@ impl TapeInitStateOps for remanence_state::CatalogIndex {
         _voltag: String,
         _block_size: u32,
         _parity: remanence_api::ParityConfig,
-        _force: bool,
+        _authority: TapeInitProvisionAuthority,
     ) -> Result<(), String> {
         Err("internal error: dry-run attempted to provision catalog state".to_string())
     }
@@ -9044,7 +9100,7 @@ impl TapeInitStateOps for DryRunTapeInitState {
         _voltag: String,
         _block_size: u32,
         _parity: remanence_api::ParityConfig,
-        _force: bool,
+        _authority: TapeInitProvisionAuthority,
     ) -> Result<(), String> {
         Err("internal error: dry-run attempted to provision catalog state".to_string())
     }
@@ -11958,7 +12014,25 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
         bot_projection.physical_data_past_bootstrap,
         &catalog_projection.committed_copies,
     );
-    let clobber_data_confirmed = if should_confirm_clobber(args.clobber_data, &decision) {
+    // A named unknown-tape clobber must match this exact decision before any
+    // confirmation prompt; a mismatch or any other decision refuses unwritten.
+    let clobber_unknown_tape: Option<remanence_api::UnknownTapeClobber> = args
+        .clobber_unknown_tape
+        .map(|requested| {
+            remanence_api::match_unknown_tape_clobber(
+                &decision,
+                &catalog_projection.committed_copies,
+                *requested.as_bytes(),
+            )
+            .map_err(|refusal| unknown_tape_clobber_refusal_text(&decision, &refusal))
+        })
+        .transpose()?;
+    let confirm_clobber = should_confirm_clobber(
+        args.clobber_data,
+        &decision,
+        clobber_unknown_tape.map(|named| named.bot_uuid()),
+    );
+    let clobber_data_confirmed = if confirm_clobber {
         let confirmed = match confirm_clobber_data(
             voltag.as_str(),
             &decision,
@@ -12037,6 +12111,7 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
                 dry_run: args.dry_run,
                 force: args.force,
                 clobber_data_confirmed,
+                clobber_unknown_tape,
             },
             planned_uuid,
             block_size,
@@ -12060,6 +12135,34 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
             return Err(format!("apply init write gate: {error}"));
         }
     };
+    if let Some(named) = clobber_unknown_tape {
+        if action != remanence_api::TapeInitWriteAction::WroteBootstrap {
+            return Err(format!(
+                "BOT no longer carries the named identity {} at write time; no write attempted",
+                Uuid::from_bytes(named.bot_uuid())
+            ));
+        }
+    }
+    let clobbered_unknown_uuid = clobber_unknown_tape.map(|named| named.bot_uuid());
+    let unknown_tape_next = match &decision {
+        remanence_api::InitDecision::NeedsExplicitRebuild {
+            reason: remanence_api::TapeInitError::MissingCatalogRow { bot_uuid },
+        } if clobbered_unknown_uuid.is_none() => {
+            let home_slot = if candidate.location == TapeInitLocation::Slot {
+                Some(candidate.element_address)
+            } else {
+                drive_bay.and_then(|bay| bay.source_slot)
+            };
+            Some(unknown_tape_next_steps(
+                library.serial.as_str(),
+                voltag.as_str(),
+                home_slot,
+                bot_uuid,
+                &args.config,
+            ))
+        }
+        _ => None,
+    };
     if action == remanence_api::TapeInitWriteAction::WroteBootstrap {
         state.provision_initialized_tape(
             config,
@@ -12067,7 +12170,10 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
             voltag.clone(),
             block_size,
             parity.clone(),
-            args.force || clobber_data_confirmed,
+            TapeInitProvisionAuthority {
+                force: args.force || clobber_data_confirmed,
+                clobbered_unknown_uuid,
+            },
         )?;
     }
 
@@ -12085,6 +12191,8 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
         drive_element,
         decision,
         action,
+        clobbered_unknown_uuid,
+        unknown_tape_next,
         notes: catalog_projection.notes,
     })
 }
@@ -12189,18 +12297,82 @@ fn describe_media_readiness(readiness: &MediaReadiness) -> String {
     }
 }
 
-fn should_confirm_clobber(clobber_data: bool, decision: &remanence_api::InitDecision) -> bool {
+/// `clobber_unknown_tape` is the BOT UUID already matched by
+/// `remanence_api::match_unknown_tape_clobber`; it adds exactly one decision.
+fn should_confirm_clobber(
+    clobber_data: bool,
+    decision: &remanence_api::InitDecision,
+    clobber_unknown_tape: Option<remanence_api::TapeUuid>,
+) -> bool {
     clobber_data
-        && matches!(
-            decision,
+        && match decision {
             remanence_api::InitDecision::RefuseClobber {
-                reason: remanence_api::TapeInitError::ForeignFormat(_)
+                reason:
+                    remanence_api::TapeInitError::ForeignFormat(_)
                     | remanence_api::TapeInitError::UnrecognizedData
                     | remanence_api::TapeInitError::PhysicalDataPastBootstrap
                     | remanence_api::TapeInitError::CommittedCopiesPresent
-                    | remanence_api::TapeInitError::CatalogIndicatesWritten
-            }
-        )
+                    | remanence_api::TapeInitError::CatalogIndicatesWritten,
+            } => true,
+            remanence_api::InitDecision::NeedsExplicitRebuild {
+                reason: remanence_api::TapeInitError::MissingCatalogRow { bot_uuid },
+            } => clobber_unknown_tape == Some(*bot_uuid),
+            _ => false,
+        }
+}
+
+/// The exact override an operator copies to erase a Remanence identity this
+/// catalog does not know.
+fn unknown_tape_clobber_flags(bot_uuid: &remanence_api::TapeUuid) -> String {
+    format!(
+        "--clobber-data --clobber-unknown-tape {}",
+        Uuid::from_bytes(*bot_uuid)
+    )
+}
+
+/// Runnable choices for a BOT identity unknown to this catalog: adoption by
+/// catalog rebuild first, as the default, then the named clobber.
+fn unknown_tape_next_steps(
+    library_serial: &str,
+    voltag: &str,
+    home_slot: Option<u16>,
+    bot_uuid: &remanence_api::TapeUuid,
+    config: &Path,
+) -> String {
+    let home_slot = home_slot
+        .map(|slot| format!("0x{slot:04x}"))
+        .unwrap_or_else(|| "<HOME-SLOT>".to_string());
+    format!(
+        "identity {uuid} is unknown to this catalog; adopt it (the default) with `rem-debug --allow {library_serial} tape adopt-bootstrap {voltag} --library {library_serial} --expected-home-slot {home_slot} --expected-existing-tape-uuid {uuid} --json --config {config}`, or erase it with `rem tape init {voltag} --library {library_serial} {flags} --config {config}`",
+        uuid = Uuid::from_bytes(*bot_uuid),
+        flags = unknown_tape_clobber_flags(bot_uuid),
+        config = config.display(),
+    )
+}
+
+fn unknown_tape_clobber_refusal_text(
+    decision: &remanence_api::InitDecision,
+    refusal: &remanence_api::UnknownTapeClobberRefusal,
+) -> String {
+    match refusal {
+        remanence_api::UnknownTapeClobberRefusal::UuidMismatch {
+            requested,
+            bot_uuid,
+        } => format!(
+            "--clobber-unknown-tape {} does not match BOT uuid {}; no write attempted",
+            Uuid::from_bytes(*requested),
+            Uuid::from_bytes(*bot_uuid)
+        ),
+        remanence_api::UnknownTapeClobberRefusal::CommittedCopiesPresent { bot_uuid } => format!(
+            "--clobber-unknown-tape refuses: committed copies in this catalog reference BOT uuid {}; no write attempted",
+            Uuid::from_bytes(*bot_uuid)
+        ),
+        remanence_api::UnknownTapeClobberRefusal::NotUnknownTape { requested } => format!(
+            "--clobber-unknown-tape {} applies only to a Remanence tape unknown to this catalog, but the decision is {}; no write attempted",
+            Uuid::from_bytes(*requested),
+            init_decision_label(decision)
+        ),
+    }
 }
 
 /// Library scripts retain stdin confirmation; standalone requires a terminal
@@ -12235,11 +12407,22 @@ fn confirm_clobber_data(
             "non-interactive clobber requires --confirm-clobber {expected:?}; no write attempted"
         ));
     }
-    let _ = writeln!(
-        err,
-        "danger: {voltag} would clobber data ({})",
-        init_decision_label(decision)
-    );
+    if let remanence_api::InitDecision::NeedsExplicitRebuild {
+        reason: remanence_api::TapeInitError::MissingCatalogRow { bot_uuid },
+    } = decision
+    {
+        let _ = writeln!(
+            err,
+            "danger: {voltag} carries Remanence identity {}, unknown to this catalog; it and any data on the tape will be destroyed",
+            Uuid::from_bytes(*bot_uuid)
+        );
+    } else {
+        let _ = writeln!(
+            err,
+            "danger: {voltag} would clobber data ({})",
+            init_decision_label(decision)
+        );
+    }
     let _ = writeln!(err, "type {expected:?} to continue:");
     let mut line = String::new();
     let bytes_read = input
@@ -12321,6 +12504,15 @@ fn print_tape_init_result(result: &TapeInitRunResult, out: &mut dyn Write) {
         parity_label(&result.parity)
     );
     let _ = writeln!(out, "  decision: {}", init_decision_label(&result.decision));
+    if let Some(clobbered_uuid) = result.clobbered_unknown_uuid {
+        let _ = writeln!(
+            out,
+            "  clobbered: identity {} was unknown to this catalog; it was erased and replaced",
+            Uuid::from_bytes(clobbered_uuid)
+        );
+    } else if let Some(next) = &result.unknown_tape_next {
+        let _ = writeln!(out, "  next: {next}");
+    }
     for note in &result.notes {
         let _ = writeln!(out, "  note: {note}");
     }
@@ -20279,6 +20471,9 @@ mod tests {
         inner: FixtureTransport,
         written_bytes: u32,
         used: bool,
+        /// Scripted READ results served first: a record, or blank-check EOD
+        /// for `None`. Once exhausted, `used` decides every later READ.
+        bot_reads: std::collections::VecDeque<Option<Vec<u8>>>,
     }
 
     #[cfg(target_os = "linux")]
@@ -20289,6 +20484,16 @@ mod tests {
             buf: &mut [u8],
         ) -> Result<remanence_library::transport::TransferOutcome, ScsiError> {
             if cdb[0] == 0x08 {
+                match self.bot_reads.pop_front() {
+                    Some(Some(block)) => {
+                        buf[..block.len()].copy_from_slice(&block);
+                        return Ok(remanence_library::transport::TransferOutcome::clean(
+                            block.len() as u32,
+                        ));
+                    }
+                    Some(None) => return Err(readiness_check_condition(0x08, 0x00, 0x05)),
+                    None => {}
+                }
                 if self.used {
                     buf.fill(0x42);
                     return Ok(remanence_library::transport::TransferOutcome::clean(
@@ -20389,6 +20594,7 @@ pool_id = "init-test"
                 ]),
                 written_bytes,
                 used: false,
+                bot_reads: Default::default(),
             });
             let log = RecordingLog::new();
             let transport_log = log.clone();
@@ -20560,6 +20766,7 @@ pool_id = "init-test"
                     ]),
                     written_bytes: 262144,
                     used: true,
+                    bot_reads: Default::default(),
                 });
                 let log = RecordingLog::new();
                 let transport_log = log.clone();
@@ -20666,6 +20873,571 @@ pool_id = "init-test"
                     assert!(stderr.contains(message), "{stderr}");
                     assert!(stdout.is_empty(), "{stdout}");
                 }
+            }
+        }
+    }
+
+    const UNKNOWN_BOT_UUID: &str = "5b1f0c2e-8d4a-4c3b-9e7f-1a2b3c4d5e6f";
+
+    /// A Remanence bootstrap whose identity the test catalog has never seen.
+    #[cfg(target_os = "linux")]
+    fn unknown_remanence_bot_block() -> Vec<u8> {
+        remanence_bot_block(UNKNOWN_BOT_UUID)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn remanence_bot_block(uuid: &str) -> Vec<u8> {
+        let payload = remanence_api::build_tape_bootstrap(
+            *Uuid::parse_str(uuid).unwrap().as_bytes(),
+            262144,
+            remanence_api::ParityConfig::None,
+            "2026-01-01T00:00:00Z",
+            "remanence-test",
+        );
+        let mut block = vec![0u8; 262144];
+        remanence_parity::bootstrap::write_bootstrap_block(&payload, &mut block)
+            .expect("encode unknown bootstrap");
+        block
+    }
+
+    struct UnknownTapeInitRun {
+        code: ExitCode,
+        stdout: String,
+        stderr: String,
+        input_consumed: u64,
+        writes: usize,
+        temp: tempfile::TempDir,
+    }
+
+    /// Run library `tape init` on a loaded tape carrying an unknown Remanence BOT.
+    #[cfg(target_os = "linux")]
+    fn run_unknown_tape_init(extra: &[&str], input_text: &str) -> UnknownTapeInitRun {
+        run_tape_init_on_bot(
+            Some(unknown_tape_reads(UNKNOWN_BOT_UUID)),
+            false,
+            extra,
+            input_text,
+        )
+    }
+
+    /// Decision-time BOT read and data probe, then the pre-write recheck
+    /// finding `recheck_uuid`.
+    #[cfg(target_os = "linux")]
+    fn unknown_tape_reads(recheck_uuid: &str) -> Vec<Option<Vec<u8>>> {
+        vec![
+            Some(unknown_remanence_bot_block()),
+            None,
+            Some(remanence_bot_block(recheck_uuid)),
+            None,
+        ]
+    }
+
+    /// Run library `tape init` on a loaded tape whose READs follow
+    /// `bot_reads`, or return unrecognized bytes when it is `None`. With
+    /// `seed_committed_copy`, the catalog first records a committed copy on
+    /// the unknown BOT UUID while having no tape row for it.
+    #[cfg(target_os = "linux")]
+    fn run_tape_init_on_bot(
+        bot_reads: Option<Vec<Option<Vec<u8>>>>,
+        seed_committed_copy: bool,
+        extra: &[&str],
+        input_text: &str,
+    ) -> UnknownTapeInitRun {
+        let temp = tempfile::tempdir().expect("temp state directory");
+        let config_path = write_retire_test_config(temp.path());
+        let mut config_text = fs::read_to_string(&config_path).expect("read test config");
+        config_text.push_str(
+            r#"
+[[libraries]]
+serial = "LIB-INIT-UNKNOWN"
+[[tape_pools]]
+id = "init-test"
+block_size = "256KiB"
+[[tape_pool_rules]]
+prefix = "RMT"
+pool_id = "init-test"
+"#,
+        );
+        fs::write(&config_path, config_text).expect("write init config");
+        if seed_committed_copy {
+            drop(
+                remanence_state::StateHandle::open_from_config_file(&config_path)
+                    .expect("create catalog"),
+            );
+            let conn = rusqlite::Connection::open(temp.path().join("index/rem-state.sqlite"))
+                .expect("open catalog");
+            conn.execute(
+                "insert into object_copies(object_id, tape_uuid, tape_file_number, status, pool_id)
+                 values('seeded-object', ?1, ?2, 'committed', 'init-test')",
+                rusqlite::params![
+                    Uuid::parse_str(UNKNOWN_BOT_UUID)
+                        .unwrap()
+                        .as_bytes()
+                        .to_vec(),
+                    1u64.to_be_bytes().to_vec()
+                ],
+            )
+            .expect("seed committed copy");
+        }
+
+        let mut library = fake_library("LIB-INIT-UNKNOWN");
+        library.changer_sg = PathBuf::from("/fixture/changer");
+        library.drive_bays = vec![DriveBay {
+            element_address: 1,
+            accessible: true,
+            exception: None,
+            installed: Some(InstalledDrive {
+                serial: "DRV-INIT-UNKNOWN".into(),
+                identity_source: IdentitySource::DvcidInline,
+                vendor: Some("HPE".into()),
+                product: Some("Ultrium 9-SCSI".into()),
+                revision: Some("R3G3".into()),
+                sg_path: Some(PathBuf::from("/fixture/drive")),
+                sysfs_path: None,
+            }),
+            loaded: true,
+            loaded_tape: Some("RMT001L9".into()),
+            source_slot: Some(0x0400),
+        }];
+        let mut mode_page = vec![0u8; 28];
+        mode_page[0] = 27;
+        mode_page[1] = 0x98;
+        mode_page[2] = 0x10;
+        mode_page[3] = 8;
+        mode_page[12] = 0x0f;
+        mode_page[13] = 14;
+        let mut position = vec![0u8; 32];
+        position[8..16].copy_from_slice(&1u64.to_be_bytes());
+        let mut filemark_position = position.clone();
+        filemark_position[8..16].copy_from_slice(&2u64.to_be_bytes());
+        let mut changer = Some(FixtureTransport::new().with_responses([
+            changer_inquiry_response(),
+            vpd80_response("LIB-INIT-UNKNOWN"),
+        ]));
+        let mut responses = vec![
+            lto9_inquiry_response(),
+            vpd80_response("DRV-INIT-UNKNOWN"),
+            vec![11, 0, 0, 0, 0x11, 6, 1, 0, 0, 0, 0, 0],
+            vec![0, 0x10, 0, 0, 0, 1],
+            mode_page,
+            vec![0u8; 32], // LOCATE(0) for BOT classification.
+        ];
+        if bot_reads.is_some() {
+            responses.push(vec![0u8; 32]); // A named clobber rechecks BOT.
+        }
+        responses.extend([position, filemark_position]);
+        let mut drive = Some(BootstrapTransport {
+            inner: FixtureTransport::new().with_responses(responses),
+            written_bytes: 262144,
+            used: bot_reads.is_none(),
+            bot_reads: bot_reads.unwrap_or_default().into(),
+        });
+        let log = RecordingLog::new();
+        let transport_log = log.clone();
+        TEST_CLI_TRANSPORT_FACTORY.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(move |path| {
+                let transport: Box<dyn SgTransport> = match path.to_str().unwrap() {
+                    "/fixture/changer" => Box::new(changer.take().expect("open changer once")),
+                    "/fixture/drive" => Box::new(drive.take().expect("open drive once")),
+                    _ => panic!("unexpected device path: {path:?}"),
+                };
+                Ok(Box::new(RecordingTransport::with_log(
+                    transport,
+                    transport_log.clone(),
+                )))
+            }));
+        });
+        let mut argv = vec![
+            "rem",
+            "tape",
+            "init",
+            "RMT001L9",
+            "--library",
+            "LIB-INIT-UNKNOWN",
+            "--parity",
+            "none",
+            "--config",
+            config_path.to_str().unwrap(),
+        ];
+        argv.extend(extra);
+        let cli = Cli::try_parse_from(&argv).unwrap().into();
+        let mut input = Cursor::new(input_text.as_bytes());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_with_mode(
+            cli,
+            CliMode::Rem,
+            || {
+                Ok(DiscoveryReport {
+                    unattached_drives: vec![],
+                    complete: true,
+                    incomplete_evidence: vec![],
+                    libraries: vec![library],
+                    warnings: vec![],
+                })
+            },
+            &mut input,
+            &mut out,
+            &mut err,
+            &ForeignFormatRegistry::default(),
+        );
+        let stdout = String::from_utf8(out).unwrap();
+        let stderr = String::from_utf8(err).unwrap();
+        TEST_CLI_TRANSPORT_FACTORY.with(|slot| {
+            assert!(
+                slot.borrow_mut().take().is_none(),
+                "fixture transport is required: {stderr}"
+            );
+        });
+        let writes = log
+            .borrow()
+            .iter()
+            .filter(|cdb| matches!(cdb[0], 0x0a | 0x10))
+            .count();
+        UnknownTapeInitRun {
+            code,
+            stdout,
+            stderr,
+            input_consumed: input.position(),
+            writes,
+            temp,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn unknown_tape_catalog_and_audit(
+        run: &UnknownTapeInitRun,
+    ) -> (
+        Option<remanence_state::TapeRecord>,
+        Vec<remanence_state::AuditRecord>,
+    ) {
+        let catalog = remanence_state::CatalogIndex::open_read_only(
+            run.temp.path().join("index/rem-state.sqlite"),
+        )
+        .unwrap();
+        let tape = catalog.get_tape_by_voltag("RMT001L9").unwrap();
+        let audit = remanence_state::FileAuditLog::replay(run.temp.path().join("audit"))
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.event == remanence_state::AuditEvent::TapeProvisioned)
+            .collect();
+        (tape, audit)
+    }
+
+    /// The named override erases an unknown Remanence identity only with the
+    /// exact UUID and the typed confirmation, then audits what it destroyed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tape_init_cli_clobber_unknown_tape_erases_only_the_named_identity() {
+        let simple = UNKNOWN_BOT_UUID.replace('-', "");
+        for (named, confirmation, input) in [
+            (UNKNOWN_BOT_UUID, Some("CLOBBER RMT001L9"), ""),
+            (simple.as_str(), None, "CLOBBER RMT001L9\n"),
+        ] {
+            let mut extra = vec!["--clobber-data", "--clobber-unknown-tape", named];
+            if let Some(confirmation) = confirmation {
+                extra.extend(["--confirm-clobber", confirmation]);
+            }
+            let run = run_unknown_tape_init(&extra, input);
+            assert_eq!(
+                run.code,
+                ExitCode::SUCCESS,
+                "{}\n{}",
+                run.stdout,
+                run.stderr
+            );
+            assert_eq!(run.input_consumed, input.len() as u64);
+            assert_eq!(run.writes, 2, "{}", run.stderr);
+            assert_eq!(
+                run.stderr.contains(&format!(
+                    "danger: RMT001L9 carries Remanence identity {UNKNOWN_BOT_UUID}, unknown to this catalog; it and any data on the tape will be destroyed"
+                )),
+                confirmation.is_none(),
+                "{}",
+                run.stderr
+            );
+            assert!(run.stdout.contains("wrote-bootstrap"), "{}", run.stdout);
+            assert!(
+                run.stdout.contains(&format!(
+                    "clobbered: identity {UNKNOWN_BOT_UUID} was unknown to this catalog; it was erased and replaced"
+                )),
+                "{}",
+                run.stdout
+            );
+            let (tape, audit) = unknown_tape_catalog_and_audit(&run);
+            let tape = tape.expect("fresh catalog row");
+            assert_ne!(
+                tape.tape_uuid.as_slice(),
+                Uuid::parse_str(UNKNOWN_BOT_UUID).unwrap().as_bytes()
+            );
+            assert!(run.stdout.contains(&format!(
+                "uuid: {}",
+                Uuid::from_slice(&tape.tape_uuid).unwrap()
+            )));
+            assert_eq!(audit.len(), 1);
+            let detail = &audit[0].detail;
+            assert_eq!(
+                detail.get("forced"),
+                Some(&ciborium::value::Value::Bool(true))
+            );
+            assert_eq!(
+                detail.get("clobbered_identity"),
+                Some(&ciborium::value::Value::Text("unknown-to-catalog".into()))
+            );
+            assert_eq!(
+                detail.get("clobbered_uuid"),
+                Some(&ciborium::value::Value::Text(simple.clone()))
+            );
+            assert_eq!(
+                audit[0].subject.id.as_deref(),
+                Some(bytes_to_hex(&tape.tape_uuid).as_str())
+            );
+        }
+    }
+
+    /// A wrong UUID, a failed confirmation, or no override writes nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tape_init_cli_clobber_unknown_tape_refusals_write_nothing() {
+        let wrong = "0f0e0d0c-0b0a-4908-8706-050403020100";
+        let hint = format!(
+            "next: identity {UNKNOWN_BOT_UUID} is unknown to this catalog; adopt it (the default) with `rem-debug --allow LIB-INIT-UNKNOWN tape adopt-bootstrap RMT001L9 --library LIB-INIT-UNKNOWN --expected-home-slot 0x0400 --expected-existing-tape-uuid {UNKNOWN_BOT_UUID} --json --config "
+        );
+        let erase = format!(
+            "`, or erase it with `rem tape init RMT001L9 --library LIB-INIT-UNKNOWN --clobber-data --clobber-unknown-tape {UNKNOWN_BOT_UUID} --config "
+        );
+        let mismatch = format!(
+            "--clobber-unknown-tape {wrong} does not match BOT uuid {UNKNOWN_BOT_UUID}; no write attempted"
+        );
+        for (extra, input, stdout_text, stderr_text) in [
+            (vec![], "", Some(hint.as_str()), None),
+            (vec!["--clobber-data"], "", Some(hint.as_str()), None),
+            (
+                vec!["--clobber-data", "--confirm-clobber", "CLOBBER RMT001L9"],
+                "",
+                Some(hint.as_str()),
+                None,
+            ),
+            (
+                vec![
+                    "--clobber-data",
+                    "--clobber-unknown-tape",
+                    wrong,
+                    "--confirm-clobber",
+                    "CLOBBER RMT001L9",
+                ],
+                "",
+                None,
+                Some(mismatch.as_str()),
+            ),
+            (
+                vec!["--clobber-data", "--clobber-unknown-tape", wrong],
+                "CLOBBER RMT001L9\n",
+                None,
+                Some(mismatch.as_str()),
+            ),
+            (
+                vec!["--clobber-data", "--clobber-unknown-tape", UNKNOWN_BOT_UUID],
+                "WRONG\n",
+                None,
+                Some("clobber confirmation did not match; no write attempted"),
+            ),
+            (
+                vec!["--clobber-data", "--clobber-unknown-tape", UNKNOWN_BOT_UUID],
+                "",
+                None,
+                Some("no clobber confirmation received"),
+            ),
+            (
+                vec![
+                    "--clobber-data",
+                    "--clobber-unknown-tape",
+                    UNKNOWN_BOT_UUID,
+                    "--confirm-clobber",
+                    "CLOBBER OTHER",
+                ],
+                "",
+                None,
+                Some("clobber confirmation did not match; no write attempted"),
+            ),
+        ] {
+            let run = run_unknown_tape_init(&extra, input);
+            assert_eq!(run.code, ExitCode::from(1), "{extra:?}\n{}", run.stdout);
+            assert_eq!(run.writes, 0, "{extra:?}");
+            let (tape, audit) = unknown_tape_catalog_and_audit(&run);
+            assert!(tape.is_none(), "{extra:?}");
+            assert!(audit.is_empty(), "{extra:?}");
+            if let Some(text) = stdout_text {
+                assert!(run.stdout.contains("refused-no-write"), "{}", run.stdout);
+                assert!(
+                    run.stdout.contains(&format!(
+                        "decision: needs-explicit-rebuild: missing catalog row for {UNKNOWN_BOT_UUID}"
+                    )),
+                    "{}",
+                    run.stdout
+                );
+                assert!(run.stdout.contains(text), "{}", run.stdout);
+                assert!(run.stdout.contains(&erase), "{}", run.stdout);
+            }
+            if let Some(text) = stderr_text {
+                assert!(run.stderr.contains(text), "{extra:?}\n{}", run.stderr);
+                assert!(run.stdout.is_empty(), "{}", run.stdout);
+            }
+            // A mismatch refuses before any confirmation prompt.
+            if stderr_text == Some(mismatch.as_str()) {
+                assert_eq!(run.input_consumed, 0);
+                assert!(!run.stderr.contains("to continue:"), "{}", run.stderr);
+            }
+        }
+    }
+
+    /// The override never relaxes another decision, even one plain
+    /// --clobber-data would erase.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tape_init_cli_clobber_unknown_tape_refuses_unrecognized_data_it_does_not_name() {
+        let clobber = ["--clobber-data", "--confirm-clobber", "CLOBBER RMT001L9"];
+        let plain = run_tape_init_on_bot(None, false, &clobber, "");
+        assert_eq!(plain.code, ExitCode::SUCCESS, "{}", plain.stderr);
+        assert_eq!(plain.writes, 2);
+
+        let mut named = clobber.to_vec();
+        named.extend(["--clobber-unknown-tape", UNKNOWN_BOT_UUID]);
+        let run = run_tape_init_on_bot(None, false, &named, "");
+        assert_eq!(run.code, ExitCode::from(1), "{}", run.stdout);
+        assert_eq!(run.writes, 0);
+        assert!(
+            run.stderr.contains(&format!(
+                "--clobber-unknown-tape {UNKNOWN_BOT_UUID} applies only to a Remanence tape unknown to this catalog, but the decision is refuse-clobber: unrecognized BOT data; no write attempted"
+            )),
+            "{}",
+            run.stderr
+        );
+        let (tape, audit) = unknown_tape_catalog_and_audit(&run);
+        assert!(tape.is_none());
+        assert!(audit.is_empty());
+    }
+
+    /// The named clobber re-reads BOT before writing; a different identity
+    /// found there refuses with nothing written.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tape_init_cli_clobber_unknown_tape_refuses_when_bot_changes_before_write() {
+        let changed = "0f0e0d0c-0b0a-4908-8706-050403020100";
+        let run = run_tape_init_on_bot(
+            Some(unknown_tape_reads(changed)),
+            false,
+            &[
+                "--clobber-data",
+                "--clobber-unknown-tape",
+                UNKNOWN_BOT_UUID,
+                "--confirm-clobber",
+                "CLOBBER RMT001L9",
+            ],
+            "",
+        );
+        assert_eq!(run.code, ExitCode::from(1), "{}", run.stdout);
+        assert_eq!(run.writes, 0, "{}", run.stderr);
+        assert!(
+            run.stderr.contains(&format!(
+                "BOT no longer carries the named identity {UNKNOWN_BOT_UUID} at write time; no write attempted"
+            )),
+            "{}",
+            run.stderr
+        );
+        let (tape, audit) = unknown_tape_catalog_and_audit(&run);
+        assert!(tape.is_none());
+        assert!(audit.is_empty());
+    }
+
+    /// Committed copies still indexed under the BOT UUID mean the identity is
+    /// not unknown; the named clobber refuses with nothing written.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tape_init_cli_clobber_unknown_tape_refuses_committed_copies_on_that_uuid() {
+        let run = run_tape_init_on_bot(
+            Some(unknown_tape_reads(UNKNOWN_BOT_UUID)),
+            true,
+            &[
+                "--clobber-data",
+                "--clobber-unknown-tape",
+                UNKNOWN_BOT_UUID,
+                "--confirm-clobber",
+                "CLOBBER RMT001L9",
+            ],
+            "",
+        );
+        assert_eq!(run.code, ExitCode::from(1), "{}", run.stdout);
+        assert_eq!(run.writes, 0, "{}", run.stderr);
+        assert!(
+            run.stderr.contains(&format!(
+                "--clobber-unknown-tape refuses: committed copies in this catalog reference BOT uuid {UNKNOWN_BOT_UUID}; no write attempted"
+            )),
+            "{}",
+            run.stderr
+        );
+        let (tape, audit) = unknown_tape_catalog_and_audit(&run);
+        assert!(tape.is_none());
+        assert!(audit.is_empty());
+    }
+
+    /// The override needs --clobber-data and is refused for dry-run and batch init.
+    #[test]
+    fn tape_init_clobber_unknown_tape_is_refused_without_clobber_data_dry_run_or_batch() {
+        let base = ["rem", "tape", "init"];
+        let parse = |rest: &[&str]| {
+            let mut argv = base.to_vec();
+            argv.extend(rest);
+            Cli::try_parse_from(argv)
+        };
+        let error = parse(&["RMT001L9", "--clobber-unknown-tape", UNKNOWN_BOT_UUID])
+            .expect_err("override requires --clobber-data");
+        assert!(error.to_string().contains("--clobber-data"), "{error}");
+        for malformed in [
+            "not-a-uuid",
+            "{5b1f0c2e-8d4a-4c3b-9e7f-1a2b3c4d5e6f}",
+            "urn:uuid:5b1f0c2e-8d4a-4c3b-9e7f-1a2b3c4d5e6f",
+            "5b1f0c2e8d4a4c3b9e7f1a2b3c4d5e6",
+        ] {
+            assert!(
+                parse(&[
+                    "RMT001L9",
+                    "--clobber-data",
+                    "--clobber-unknown-tape",
+                    malformed
+                ])
+                .is_err(),
+                "{malformed}"
+            );
+        }
+        for (rest, expected) in [
+            (
+                vec![
+                    "RMT001L9",
+                    "--dry-run",
+                    "--clobber-data",
+                    "--clobber-unknown-tape",
+                    UNKNOWN_BOT_UUID,
+                ],
+                "tape init rejects --clobber-unknown-tape with --dry-run",
+            ),
+            (
+                vec![
+                    "0x0400..0x0407",
+                    "--clobber-data",
+                    "--clobber-unknown-tape",
+                    UNKNOWN_BOT_UUID,
+                ],
+                "tape init rejects --clobber-unknown-tape for batch slot ranges",
+            ),
+        ] {
+            let cli = parse(&rest).expect("parses");
+            match cli.command {
+                RemCommand::Tape {
+                    command: RemTapeCommand::Init(args),
+                } => assert_eq!(args.validate_before_discovery(), Err(expected.to_string())),
+                other => panic!("unexpected command: {other:?}"),
             }
         }
     }
@@ -22448,7 +23220,7 @@ tape_catalog_dir = "{0}/cache/tapes"
                 "RMJ107L9".to_string(),
                 4096,
                 remanence_api::ParityConfig::None,
-                false,
+                TapeInitProvisionAuthority::default(),
             )
             .expect("provision initialized tape");
         }
@@ -22482,6 +23254,8 @@ tape_catalog_dir = "{0}/cache/tapes"
             record.detail.get("forced"),
             Some(&ciborium::value::Value::Bool(false))
         );
+        assert!(!record.detail.contains_key("clobbered_identity"));
+        assert!(!record.detail.contains_key("clobbered_uuid"));
     }
 
     #[test]

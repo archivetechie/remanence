@@ -172,13 +172,14 @@ pub use tape_init::{build_tape_bootstrap, write_tape_bootstrap};
 pub use tape_init::{
     classify_bootstrap_adoption_from_source, classify_bot_bytes, classify_bot_from_source,
     classify_bot_identity_bytes, decide_tape_init, has_canonical_adoption_geometry,
-    maybe_write_tape_init_bootstrap, maybe_write_tape_init_bootstrap_on_drive,
-    probe_bot_identity_from_source, project_tape_init_catalog_inputs, sniff,
-    BootstrapAdoptionProjection, BootstrapTailClassification, BotClassification,
-    BotIdentityClassification, BotInitProjection, CatalogBarcodeRelation, CatalogRowDisposition,
-    CatalogTapeInitRow, CommittedCopyState, FormatId, InitDecision, LabelLifecycleState,
-    TapeInitCatalogProjection, TapeInitError, TapeInitGeometry, TapeInitWriteAction,
-    TapeInitWriteError, TapeInitWriteOptions, CANONICAL_ADOPTION_BLOCK_SIZE_BYTES,
+    match_unknown_tape_clobber, maybe_write_tape_init_bootstrap,
+    maybe_write_tape_init_bootstrap_on_drive, probe_bot_identity_from_source,
+    project_tape_init_catalog_inputs, sniff, BootstrapAdoptionProjection,
+    BootstrapTailClassification, BotClassification, BotIdentityClassification, BotInitProjection,
+    CatalogBarcodeRelation, CatalogRowDisposition, CatalogTapeInitRow, CommittedCopyState,
+    FormatId, InitDecision, LabelLifecycleState, TapeInitCatalogProjection, TapeInitError,
+    TapeInitGeometry, TapeInitWriteAction, TapeInitWriteError, TapeInitWriteOptions,
+    UnknownTapeClobber, UnknownTapeClobberRefusal, CANONICAL_ADOPTION_BLOCK_SIZE_BYTES,
 };
 pub use write_session_ingress::WriteSessionApi;
 

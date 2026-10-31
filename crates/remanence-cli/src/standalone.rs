@@ -219,6 +219,15 @@ enum Tape {
         /// Non-interactive confirmation: CLOBBER followed by the exact label.
         #[arg(long, requires = "clobber_data")]
         confirm_clobber: Option<String>,
+        /// Erase a Remanence tape this catalog does not know. Names the exact
+        /// BOT UUID being destroyed; requires --clobber-data and its confirmation.
+        #[arg(
+            long,
+            value_name = "UUID",
+            requires = "clobber_data",
+            value_parser = crate::parse_clobber_unknown_tape_uuid
+        )]
+        clobber_unknown_tape: Option<Uuid>,
     },
     /// Import the loaded tape identity into the catalog.
     Adopt {
@@ -1574,6 +1583,7 @@ where
                 block_size,
                 clobber_data,
                 confirm_clobber,
+                clobber_unknown_tape,
             },
     } = &cli.command
     {
@@ -1593,6 +1603,7 @@ where
                             confirm_clobber.as_deref(),
                             env.test_input,
                             errors,
+                            *clobber_unknown_tape,
                         ),
                     )
                 },
@@ -2072,6 +2083,8 @@ struct InitPlan {
     decision: remanence_api::InitDecision,
     clobber_data_confirmed: bool,
     previous_uuid: Option<[u8; 16]>,
+    /// Confirmed destruction of a BOT identity unknown to this catalog.
+    clobber_unknown_tape: Option<remanence_api::UnknownTapeClobber>,
 }
 fn prepare_init(
     drive: &mut DriveHandle,
@@ -2080,7 +2093,7 @@ fn prepare_init(
     pool: &str,
     generation: Option<&str>,
     block_size: Option<u32>,
-    clobber: (bool, Option<&str>, bool, &mut dyn Write),
+    clobber: (bool, Option<&str>, bool, &mut dyn Write, Option<Uuid>),
 ) -> Result<([u8; 16], InitPlan), String> {
     let pool_config = state
         .config()
@@ -2188,7 +2201,25 @@ fn prepare_init(
             .as_ref()
             .is_some_and(|row| row.disposition != remanence_api::CatalogRowDisposition::Retired)
     });
-    if crate::should_confirm_clobber(clobber.0, &decision) {
+    // A named unknown-tape clobber must match this exact decision before any
+    // confirmation prompt; a mismatch or any other decision refuses unwritten.
+    let clobber_unknown_tape = clobber
+        .4
+        .map(|requested| {
+            remanence_api::match_unknown_tape_clobber(
+                &decision,
+                &facts.committed_copies,
+                *requested.as_bytes(),
+            )
+            .map_err(|refusal| crate::unknown_tape_clobber_refusal_text(&decision, &refusal))
+        })
+        .transpose()?;
+    let confirm_clobber = crate::should_confirm_clobber(
+        clobber.0,
+        &decision,
+        clobber_unknown_tape.map(|named| named.bot_uuid()),
+    );
+    if confirm_clobber {
         state
             .catalog_index()
             .provision_replacing_media(
@@ -2206,7 +2237,7 @@ fn prepare_init(
             )
             .map_err(err)?;
     }
-    let clobber_data_confirmed = if crate::should_confirm_clobber(clobber.0, &decision) {
+    let clobber_data_confirmed = if confirm_clobber {
         use std::io::IsTerminal;
         if clobber.2 {
             crate::confirm_clobber_data(
@@ -2246,6 +2277,8 @@ fn prepare_init(
                 "this cartridge holds unrecognized data at the beginning; re-run with --clobber-data to erase it for Remanence".into(),
             InitDecision::RefuseClobber { reason } =>
                 format!("Cannot initialize this cartridge: {}; re-run with --clobber-data to erase it for Remanence.", crate::init_error_label(reason)),
+            InitDecision::NeedsExplicitRebuild { reason: reason @ TapeInitError::MissingCatalogRow { bot_uuid } } =>
+                format!("Cannot initialize this cartridge: {}. It carries a Remanence identity unknown to this catalog: adopt it with `rem tape adopt --label {label} --pool {pool}` (the default), or erase it by re-running with {} and the clobber confirmation.", crate::init_error_label(reason), crate::unknown_tape_clobber_flags(bot_uuid)),
             InitDecision::RequireForce { reason }
             | InitDecision::Anomaly { reason } | InitDecision::NeedsExplicitRebuild { reason } =>
                 format!("Cannot initialize this cartridge: {}.", crate::init_error_label(reason)),
@@ -2285,6 +2318,7 @@ fn prepare_init(
             } else {
                 None
             },
+            clobber_unknown_tape: clobber_unknown_tape.filter(|_| clobber_data_confirmed),
         },
     ))
 }
@@ -2320,12 +2354,14 @@ fn complete_init(
         decision,
         clobber_data_confirmed,
         previous_uuid,
+        clobber_unknown_tape,
     } = plan;
     let action = remanence_api::maybe_write_tape_init_bootstrap_on_drive(
         drive,
         &decision,
         remanence_api::TapeInitWriteOptions {
             clobber_data_confirmed,
+            clobber_unknown_tape,
             ..Default::default()
         },
         uuid,
@@ -2335,8 +2371,15 @@ fn complete_init(
     )
     .map_err(err)?;
     if action == remanence_api::TapeInitWriteAction::Refused {
+        if let Some(named) = clobber_unknown_tape {
+            return Err(format!(
+                "BOT no longer carries the named identity {} at write time; no write attempted",
+                Uuid::from_bytes(named.bot_uuid())
+            ));
+        }
         return Err("initialization refused by the media write gate; no write attempted".into());
     }
+    let clobbered_unknown_uuid = clobber_unknown_tape.map(|named| named.bot_uuid());
     if action == remanence_api::TapeInitWriteAction::WroteBootstrap {
         let config = state.config().clone();
         crate::provision_initialized_tape_with_media(
@@ -2354,12 +2397,18 @@ fn complete_init(
                 observation: Some(observation),
                 explicit_pool: Some(&pool),
                 previous_uuid,
+                clobbered_unknown_uuid,
             },
         )?;
     }
-    Ok(
-        json!({"tape_uuid":Uuid::from_bytes(uuid),"label":label,"pool":pool,"action":format!("{action:?}")}),
-    )
+    let mut result = json!({"tape_uuid":Uuid::from_bytes(uuid),"label":label,"pool":pool,"action":format!("{action:?}")});
+    if let Some(clobbered) = clobbered_unknown_uuid
+        .filter(|_| action == remanence_api::TapeInitWriteAction::WroteBootstrap)
+    {
+        result["clobbered_unknown_uuid"] = json!(Uuid::from_bytes(clobbered));
+        result["clobbered_identity"] = json!("unknown-to-catalog");
+    }
+    Ok(result)
 }
 fn terminal_summary(drive: &mut DriveHandle, verifying: bool) -> Result<Value, String> {
     let bootstrap = remanence_parity::bootstrap::discover_bootstrap(
