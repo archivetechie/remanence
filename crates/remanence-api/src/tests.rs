@@ -321,7 +321,7 @@ fn mount_age_resets_on_barcode_change_or_empty_bay() {
     assert_eq!(drive.mount_age_seconds, None);
 }
 const SECOND_POOL_WRITE_TAPE_UUID: [u8; 16] = [5u8; 16];
-const API_SESSION_BLOCK_SIZE: u32 = 4096;
+const API_SESSION_BLOCK_SIZE: u32 = 256 * 1024;
 
 fn media_readiness_record(
     operation_id: Uuid,
@@ -782,6 +782,8 @@ fn object_record_to_proto_carries_append_commit_info() {
         metadata_hash_algorithm: None,
         created_at_utc: "2026-07-05T00:00:00Z".to_string(),
         copies: vec![NativeObjectCopyRecord {
+            tape_log_sequence: None,
+            tape_incarnation: None,
             object_id: OBJECT_ID_TEXT.to_string(),
             tape_uuid: TAPE_UUID.to_vec(),
             tape_file_number: 2,
@@ -838,6 +840,8 @@ fn wire_span_and_extent_keep_absent_distinguishable_from_zero() {
     // Block 0 is a valid position, so Some(0) must survive the wire as
     // present-zero — distinguishable from absent.
     let mut copy_record = NativeObjectCopyRecord {
+        tape_log_sequence: None,
+        tape_incarnation: None,
         object_id: OBJECT_ID_TEXT.to_string(),
         tape_uuid: TAPE_UUID.to_vec(),
         tape_file_number: 1,
@@ -2101,83 +2105,87 @@ fn project_no_parity_tape(index: &mut CatalogIndex, pool_id: &str, tape_uuid: [u
 }
 
 fn append_checkpoint_record(checkpoint_dir: &Path, tape_uuid: [u8; 16]) {
-    const PAYLOAD: &[u8] = b"checkpoint selection test payload";
-    let object_uuid = Uuid::from_bytes([0x51; 16]);
-    let content_sha256 = Sha256::digest(PAYLOAD).to_vec();
     let journal =
         remanence_state::authority::fixtures::AuthorityBuilder::new(checkpoint_dir, tape_uuid)
             .build()
             .expect("open checkpoint journal");
     journal
-        .append(&remanence_state::CheckpointJournalRecord {
-            ordinal: 1,
-            committed_object_count: 1,
-            eod_partition: 0,
-            eod_lba: 6,
-            tape_uuid,
-            batch_id: [0x42; 16],
-            next_tape_file_number: 2,
-            block_size: API_SESSION_BLOCK_SIZE,
-            objects: vec![remanence_state::CheckpointObjectProjection {
-                object: NativeObjectProjectionInput {
-                    object_id: object_uuid.to_string(),
-                    caller_object_id: Some("checkpoint-selection-test".to_string()),
-                    body_format: "rem-object-v1".to_string(),
-                    logical_size_bytes: Some(PAYLOAD.len() as u64),
-                    content_hash: Some(content_sha256.clone()),
-                    metadata_hash: Some(vec![0x22; 32]),
-                    created_at_utc: Some("2026-07-21T00:00:00Z".to_string()),
-                },
-                files: vec![NativeObjectFileProjectionInput {
-                    object_id: object_uuid.to_string(),
-                    file_id: "checkpoint-selection-file".to_string(),
-                    path: "payload.bin".to_string(),
-                    size_bytes: PAYLOAD.len() as u64,
-                    file_sha256: content_sha256,
-                    first_chunk_lba: Some(1),
-                    chunk_count: 1,
-                    mtime: Some("0".to_string()),
-                    executable: Some(false),
-                }],
-                copy: NativeObjectCopyProjectionInput {
-                    object_id: object_uuid.to_string(),
-                    tape_uuid,
-                    tape_file_number: 1,
-                    first_body_lba: 0,
-                    first_parity_data_ordinal: None,
-                    protected_until_ordinal: None,
-                    status: "committed".to_string(),
-                    representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
-                    recipient_epoch_ids: None,
-                    metadata_frame_len: None,
-                    plaintext_digest: Some(vec![0x33; 32]),
-                    stored_digest: Some(vec![0x33; 32]),
-                },
-                block_size: API_SESSION_BLOCK_SIZE,
-                block_count: 3,
-                fresh_tape: true,
-                total_committed_ordinals: 3,
-                object_recovery_row: remanence_state::CheckpointObjectRecoveryRow {
-                    tape_file_number: 1,
-                    stored_block_count: 3,
-                    object_id: object_uuid.to_string().into_bytes(),
-                    representation:
-                        remanence_state::CheckpointObjectRecoveryRepresentation::Plaintext {
-                            manifest_first_chunk_lba: 1,
-                            manifest_size_bytes: 1,
-                            manifest_chunk_count: 1,
-                            manifest_sha256: [0x44; 32],
-                        },
-                },
-            }],
-            scheme: None,
-            object_tape_file_bundles: Vec::new(),
-            barrier_bundle: None,
-            terminal_finalization: None,
-            sealed_after_write: false,
-            seal_due: None,
-        })
+        .append(&selection_checkpoint_record(tape_uuid))
         .expect("append checkpoint record");
+}
+
+fn selection_checkpoint_record(tape_uuid: [u8; 16]) -> remanence_state::CheckpointJournalRecord {
+    const PAYLOAD: &[u8] = b"checkpoint selection test payload";
+    let object_uuid = Uuid::from_bytes([0x51; 16]);
+    let content_sha256 = Sha256::digest(PAYLOAD).to_vec();
+    remanence_state::CheckpointJournalRecord {
+        ordinal: 1,
+        committed_object_count: 1,
+        eod_partition: 0,
+        eod_lba: 6,
+        tape_uuid,
+        batch_id: [0x42; 16],
+        next_tape_file_number: 2,
+        block_size: API_SESSION_BLOCK_SIZE,
+        objects: vec![remanence_state::CheckpointObjectProjection {
+            object: NativeObjectProjectionInput {
+                object_id: object_uuid.to_string(),
+                caller_object_id: Some("checkpoint-selection-test".to_string()),
+                body_format: "rem-object-v1".to_string(),
+                logical_size_bytes: Some(PAYLOAD.len() as u64),
+                content_hash: Some(content_sha256.clone()),
+                metadata_hash: Some(vec![0x22; 32]),
+                created_at_utc: Some("2026-07-21T00:00:00Z".to_string()),
+            },
+            files: vec![NativeObjectFileProjectionInput {
+                object_id: object_uuid.to_string(),
+                file_id: "checkpoint-selection-file".to_string(),
+                path: "payload.bin".to_string(),
+                size_bytes: PAYLOAD.len() as u64,
+                file_sha256: content_sha256,
+                first_chunk_lba: Some(1),
+                chunk_count: 1,
+                mtime: Some("0".to_string()),
+                executable: Some(false),
+            }],
+            copy: NativeObjectCopyProjectionInput {
+                object_id: object_uuid.to_string(),
+                tape_uuid,
+                tape_file_number: 1,
+                first_body_lba: 0,
+                first_parity_data_ordinal: None,
+                protected_until_ordinal: None,
+                status: "committed".to_string(),
+                representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
+                recipient_epoch_ids: None,
+                metadata_frame_len: None,
+                plaintext_digest: Some(vec![0x33; 32]),
+                stored_digest: Some(vec![0x33; 32]),
+            },
+            block_size: API_SESSION_BLOCK_SIZE,
+            block_count: 3,
+            fresh_tape: true,
+            total_committed_ordinals: 3,
+            object_recovery_row: remanence_state::CheckpointObjectRecoveryRow {
+                tape_file_number: 1,
+                stored_block_count: 3,
+                object_id: object_uuid.to_string().into_bytes(),
+                representation:
+                    remanence_state::CheckpointObjectRecoveryRepresentation::Plaintext {
+                        manifest_first_chunk_lba: 1,
+                        manifest_size_bytes: 1,
+                        manifest_chunk_count: 1,
+                        manifest_sha256: [0x44; 32],
+                    },
+            },
+        }],
+        scheme: None,
+        object_tape_file_bundles: Vec::new(),
+        barrier_bundle: None,
+        terminal_finalization: None,
+        sealed_after_write: false,
+        seal_due: None,
+    }
 }
 
 #[test]
@@ -2219,7 +2227,7 @@ tape_catalog_dir = "{0}/cache/tapes"
     );
     let config = remanence_state::parse_config_toml(&config_text).expect("parse config");
     let paths = remanence_state::StatePaths::from_config(temp.path().join("config.toml"), &config);
-    let checkpoint_dir = paths.journal_dir.join("checkpoints");
+    let checkpoint_dir = paths.journal_dir.join("tapes");
     let mut state = StateHandle::open_with_config(paths, config).expect("open locked state");
     let tape_uuid = [0x93; 16];
     state
@@ -2394,7 +2402,7 @@ fn startup_replay_repairs_live_restart_cycle_partial_projection() {
         .tempdir()
         .expect("tempdir");
     let index_path = temp.path().join("rem-state.sqlite");
-    let checkpoint_dir = temp.path().join("checkpoints");
+    let checkpoint_dir = temp.path().join("tapes");
     let tape_uuid = [0x91; 16];
     let mut index = CatalogIndex::open(&index_path).expect("open index");
     index
@@ -2466,26 +2474,33 @@ fn startup_replay_repairs_live_restart_cycle_partial_projection() {
         "missing"
     );
 
-    // A genuine contradiction still refuses startup and names the record and both views.
+    // Incremental startup does not reread historical payloads. Full rebuild
+    // compares historical contradictions and names the record and both views.
     let mut divergent_object = second.objects[0].object.clone();
     divergent_object.content_hash = Some(vec![0xff; 32]);
     index
         .upsert_native_object_projection(divergent_object, &[])
         .expect("seed contradictory SQLite object view");
-    let error = replay_checkpoint_journal_projections(&mut index, &checkpoint_dir)
-        .expect_err("contradictory projection must refuse startup");
-    let message = error.message();
+    replay_checkpoint_journal_projections(&mut index, &checkpoint_dir)
+        .expect("incremental startup does not compare historical payloads");
+    use remanence_state::authority::TapeAuthorityView;
+    let authority =
+        remanence_state::TapeAuthority::open(&checkpoint_dir, tape_uuid, &index_path).unwrap();
+    let error = index
+        .rebuild_tape_log_projection(&[], &[authority.freeze().unwrap()])
+        .expect_err("contradictory projection must refuse full rebuild");
+    let message = error.to_string();
     assert!(
         message.contains("tape=91919191919191919191919191919191"),
         "{message}"
     );
-    assert!(message.contains("ordinal=2"), "{message}");
+    assert!(message.contains("sequence=7"), "{message}");
     assert!(
         message.contains("batch=62626262626262626262626262626262"),
         "{message}"
     );
     assert!(message.contains(second_object_id), "{message}");
-    assert!(message.contains("journal="), "{message}");
+    assert!(message.contains("log="), "{message}");
     assert!(message.contains("sqlite="), "{message}");
 }
 
@@ -2497,7 +2512,7 @@ fn startup_replay_retires_only_companion_only_manual_acceptance() {
         .tempdir()
         .expect("tempdir");
     let index_path = temp.path().join("rem-state.sqlite");
-    let checkpoint_dir = temp.path().join("checkpoints");
+    let checkpoint_dir = temp.path().join("tapes");
     let tape_uuid = [0x93; 16];
     let operation_id = Uuid::from_u128(0x9301);
     let idempotency_key = Uuid::from_u128(0x9302);
@@ -2679,7 +2694,7 @@ fn startup_replay_restores_pending_automatic_finalization_through_replica_c() {
         .tempdir()
         .expect("tempdir");
     let index_path = temp.path().join("rem-state.sqlite");
-    let checkpoint_dir = temp.path().join("checkpoints");
+    let checkpoint_dir = temp.path().join("tapes");
     let tape_uuid = [0x92; 16];
     let mut index = CatalogIndex::open(&index_path).expect("open index");
     index
@@ -2888,10 +2903,11 @@ fn startup_replay_restores_pending_automatic_finalization_through_replica_c() {
     );
     assert!(
         journal
-            .terminal_finalization_intent()
-            .expect("read companion after startup projection failure")
-            .is_some(),
-        "startup must not retire the companion before every checkpoint projection succeeds"
+            .last()
+            .expect("read seal after startup projection failure")
+            .unwrap()
+            .sealed_after_write,
+        "Sealed remains durable after a projection failure"
     );
 
     let mut index = CatalogIndex::open(&index_path).expect("restart after sealed checkpoint");
@@ -3399,7 +3415,8 @@ fn populated_state_with_file_catalog() -> ApiState {
                 highest_protected_ordinal: 5,
                 total_committed_ordinals: 5,
             })
-                .into(),
+                .try_into()
+                .unwrap(),
         )
         .expect("populate object file rows");
     state
@@ -6933,7 +6950,11 @@ async fn drive_target_read_open_uses_virtual_world_actor_and_proves_bot_identity
         )
         .expect("test I/O memory manager"),
         write_admissions: crate::write_owner::WriteAdmissionCoordinator::default(),
-        checkpoint_journal_dir: temp.path().join("checkpoints"),
+        checkpoint_journal_dir: {
+            let p = temp.path().join("tapes");
+            std::fs::create_dir_all(&p).unwrap();
+            p
+        },
         checkpoint_max_bytes: remanence_state::DEFAULT_CHECKPOINT_MAX_BYTES,
         checkpoint_max_objects: remanence_state::DEFAULT_CHECKPOINT_MAX_OBJECTS,
         checkpoint_max_age_seconds: remanence_state::DEFAULT_CHECKPOINT_MAX_AGE_SECONDS,
@@ -9683,9 +9704,440 @@ fn startup_fence_scope_and_readiness_recovery() {
 
 /// Fenced checkpoint recovery does not open or repair a damaged journal.
 #[test]
+fn startup_fences_only_the_tape_below_its_projection_mark() {
+    use remanence_state::authority::TapeAuthorityView;
+    let dir = tempfile::tempdir().unwrap();
+    let tapes = dir.path().join("tapes");
+    let mut index = CatalogIndex::open(dir.path().join("index.sqlite")).unwrap();
+    for id in [[0x51; 16], [0x52; 16]] {
+        let authority = remanence_state::authority::fixtures::AuthorityBuilder::new(&tapes, id)
+            .build()
+            .unwrap();
+        append_checkpoint_record(&tapes, id);
+        index
+            .project_tape_log(&authority.freeze().unwrap())
+            .unwrap();
+    }
+    let path = tapes.join(format!("{}.remtape", Uuid::from_bytes([0x51; 16]).simple()));
+    std::fs::remove_file(path).unwrap();
+    replay_checkpoint_journal_projections(&mut index, &tapes).unwrap();
+    assert!(index
+        .tape_io_is_fenced(Some(&[0x51; 16]), None, None)
+        .unwrap());
+    assert!(!index
+        .tape_io_is_fenced(Some(&[0x52; 16]), None, None)
+        .unwrap());
+}
+
+/// Active fences of one tape, oldest first.
+fn active_fences_for(
+    index: &CatalogIndex,
+    id: [u8; 16],
+) -> Vec<remanence_state::TapeIoFenceRecord> {
+    let mut fences: Vec<_> = index
+        .list_active_tape_io_fences()
+        .unwrap()
+        .into_iter()
+        .filter(|fence| fence.tape_uuid.as_slice() == id)
+        .collect();
+    fences.sort_by_key(|fence| fence.fence_id);
+    fences
+}
+
+/// A hidden log fences its tape once. The fence stays while the log is absent
+/// or comes back below the mark, and clears with audit evidence once it reaches it.
+#[test]
+fn below_projection_fence_clears_with_audit_only_when_the_log_reaches_the_mark() {
+    use remanence_state::authority::{TapeAuthorityView, TapeAuthorityWriter};
+    use remanence_state::fence::{RESTORED_PROJECTION_RELEASE_ACK, TAPE_LOG_BELOW_PROJECTION};
+    let dir = tempfile::tempdir().unwrap();
+    let tapes = dir.path().join("tapes");
+    let audit = dir.path().join("audit");
+    let mut index = CatalogIndex::open(dir.path().join("index.sqlite")).unwrap();
+    let id = [0x53; 16];
+    let authority = remanence_state::authority::fixtures::AuthorityBuilder::new(&tapes, id)
+        .build()
+        .unwrap();
+    append_checkpoint_record(&tapes, id);
+    let path = tapes.join(format!("{}.remtape", Uuid::from_bytes(id).simple()));
+    let below = std::fs::read(&path).unwrap();
+    let mut second = selection_checkpoint_record(id);
+    let object = Uuid::from_bytes([0x5a; 16]).to_string();
+    second.ordinal = 2;
+    second.committed_object_count = 2;
+    second.eod_lba = 10;
+    second.batch_id = [0x43; 16];
+    second.next_tape_file_number = 3;
+    let projection = &mut second.objects[0];
+    projection.object.object_id = object.clone();
+    projection.object.caller_object_id = Some("checkpoint-selection-test-2".into());
+    projection.files[0].object_id = object.clone();
+    projection.copy.object_id = object.clone();
+    projection.copy.tape_file_number = 2;
+    projection.fresh_tape = false;
+    projection.total_committed_ordinals = 6;
+    projection.object_recovery_row.tape_file_number = 2;
+    projection.object_recovery_row.object_id = object.into_bytes();
+    authority
+        .acquire_exclusive()
+        .unwrap()
+        .publish_report(&(&second).into())
+        .unwrap();
+    index
+        .project_tape_log(&authority.freeze().unwrap())
+        .unwrap();
+    let mark = index.projected_through_sequence(id).unwrap();
+    let full = std::fs::read(&path).unwrap();
+
+    std::fs::remove_file(&path).unwrap();
+    for _ in 0..2 {
+        replay_checkpoint_journal_projections(&mut index, &tapes).unwrap();
+        let fences = active_fences_for(&index, id);
+        assert_eq!(fences.len(), 1, "a hidden log fences its tape exactly once");
+        assert_eq!(fences[0].reason, TAPE_LOG_BELOW_PROJECTION);
+    }
+    let raised = active_fences_for(&index, id).remove(0);
+    std::fs::write(&path, &below).unwrap();
+    replay_checkpoint_journal_projections(&mut index, &tapes).unwrap();
+    assert_eq!(
+        active_fences_for(&index, id),
+        vec![raised.clone()],
+        "a log restored below its mark stays fenced"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), below);
+
+    std::fs::write(&path, &full).unwrap();
+    replay_checkpoint_journal_projections(&mut index, &tapes).unwrap();
+    assert!(!index.tape_io_is_fenced(Some(&id), None, None).unwrap());
+    let released = index
+        .tape_io_fence_by_quarantine_id(&raised.quarantine_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(released.state, "released");
+    assert_eq!(
+        released.release_ack.as_deref(),
+        Some(RESTORED_PROJECTION_RELEASE_ACK)
+    );
+    assert_eq!(index.projected_through_sequence(id).unwrap(), mark);
+    let records = remanence_state::FileAuditLog::replay(&audit).unwrap();
+    let events: Vec<_> = records.iter().map(|r| r.event.clone()).collect();
+    assert_eq!(
+        events,
+        vec![
+            remanence_state::AuditEvent::TapeIoFenceRaised,
+            remanence_state::AuditEvent::TapeIoFenceReleased
+        ]
+    );
+    let text = |key: &str| match records[1].detail.get(key) {
+        Some(CborValue::Text(value)) => value.clone(),
+        other => panic!("{key}: {other:?}"),
+    };
+    assert_eq!(text("quarantine_id"), raised.quarantine_id);
+    assert_eq!(text("release_ack"), RESTORED_PROJECTION_RELEASE_ACK);
+    let evidence: serde_json::Value = serde_json::from_str(&text("evidence_json")).unwrap();
+    assert_eq!(evidence["projected_through_sequence"], mark.to_string());
+    assert_eq!(
+        records[1].detail.get("automatic_release"),
+        Some(&CborValue::Bool(true))
+    );
+    // The automatic release projects like an operator's: a catalog rebuilt from
+    // audit evidence alone finds no active fence for the tape.
+    let mut rebuilt = CatalogIndex::open(dir.path().join("rebuilt.sqlite")).unwrap();
+    remanence_state::fence::reconcile(&mut rebuilt, &audit).unwrap();
+    assert!(active_fences_for(&rebuilt, id).is_empty());
+}
+
+/// Startup never releases a fence of any other reason. A below-projection
+/// fence beside one stays too, because the tape cannot project while fenced:
+/// it clears itself only on the first startup after the operator's release.
+#[test]
+fn only_below_projection_fences_clear_themselves() {
+    use remanence_state::authority::TapeAuthorityView;
+    let dir = tempfile::tempdir().unwrap();
+    let tapes = dir.path().join("tapes");
+    let audit = dir.path().join("audit");
+    let mut index = CatalogIndex::open(dir.path().join("index.sqlite")).unwrap();
+    let id = [0x54; 16];
+    let authority = remanence_state::authority::fixtures::AuthorityBuilder::new(&tapes, id)
+        .build()
+        .unwrap();
+    append_checkpoint_record(&tapes, id);
+    index
+        .project_tape_log(&authority.freeze().unwrap())
+        .unwrap();
+    let mark = index.projected_through_sequence(id).unwrap();
+    let raise = |index: &mut CatalogIndex, reason: &str| {
+        remanence_state::fence::raise(
+            index,
+            &audit,
+            remanence_state::TapeIoFenceInput {
+                tape_uuid: id,
+                barcode: None,
+                reason: reason.into(),
+                evidence_json: Some(
+                    serde_json::json!({"projected_through_sequence": mark.to_string()}).to_string(),
+                ),
+            },
+            None,
+            remanence_state::AuditActor::System,
+        )
+        .unwrap()
+    };
+    let other = raise(&mut index, "checkpoint_barrier_failed");
+    replay_checkpoint_journal_projections(&mut index, &tapes).unwrap();
+    assert_eq!(active_fences_for(&index, id), vec![other.clone()]);
+    let below = raise(
+        &mut index,
+        remanence_state::fence::TAPE_LOG_BELOW_PROJECTION,
+    );
+    replay_checkpoint_journal_projections(&mut index, &tapes).unwrap();
+    assert_eq!(
+        active_fences_for(&index, id),
+        vec![other.clone(), below.clone()]
+    );
+    remanence_state::fence::release(
+        &mut index,
+        &audit,
+        &other.quarantine_id,
+        "operator checked",
+        remanence_state::AuditActor::System,
+    )
+    .unwrap();
+    replay_checkpoint_journal_projections(&mut index, &tapes).unwrap();
+    assert!(!index.tape_io_is_fenced(Some(&id), None, None).unwrap());
+    assert_eq!(
+        index
+            .tape_io_fence_by_quarantine_id(&below.quarantine_id)
+            .unwrap()
+            .unwrap()
+            .release_ack
+            .as_deref(),
+        Some(remanence_state::fence::RESTORED_PROJECTION_RELEASE_ACK)
+    );
+}
+
+/// Two-group log for the fence-release tests: returns the log path, the bytes
+/// after the first group, and the bytes after both.
+fn two_group_log(
+    tapes: &Path,
+    index: &mut CatalogIndex,
+    id: [u8; 16],
+) -> (PathBuf, Vec<u8>, Vec<u8>) {
+    use remanence_state::authority::{TapeAuthorityView, TapeAuthorityWriter};
+    let authority = remanence_state::authority::fixtures::AuthorityBuilder::new(tapes, id)
+        .build()
+        .unwrap();
+    append_checkpoint_record(tapes, id);
+    let path = tapes.join(format!("{}.remtape", Uuid::from_bytes(id).simple()));
+    let below = std::fs::read(&path).unwrap();
+    let mut second = selection_checkpoint_record(id);
+    let object = Uuid::from_bytes([id[0] ^ 0x0f; 16]).to_string();
+    second.ordinal = 2;
+    second.committed_object_count = 2;
+    second.eod_lba = 10;
+    second.batch_id = [0x43; 16];
+    second.next_tape_file_number = 3;
+    let projection = &mut second.objects[0];
+    projection.object.object_id = object.clone();
+    projection.object.caller_object_id = Some(format!("two-group-log-{}", id[0]));
+    projection.files[0].object_id = object.clone();
+    projection.copy.object_id = object.clone();
+    projection.copy.tape_file_number = 2;
+    projection.fresh_tape = false;
+    projection.total_committed_ordinals = 6;
+    projection.object_recovery_row.tape_file_number = 2;
+    projection.object_recovery_row.object_id = object.into_bytes();
+    authority
+        .acquire_exclusive()
+        .unwrap()
+        .publish_report(&(&second).into())
+        .unwrap();
+    index
+        .project_tape_log(&authority.freeze().unwrap())
+        .unwrap();
+    let full = std::fs::read(&path).unwrap();
+    (path, below, full)
+}
+
+/// The fence records the mark it was raised at, so a lost and rebuilt catalog,
+/// which no longer knows that mark, cannot release it for an older log.
+#[test]
+fn below_projection_fence_survives_a_rebuilt_catalog_and_an_older_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let tapes = dir.path().join("tapes");
+    let audit = dir.path().join("audit");
+    let mut index = CatalogIndex::open(dir.path().join("index.sqlite")).unwrap();
+    let id = [0x55; 16];
+    let (path, below, full) = two_group_log(&tapes, &mut index, id);
+    let mark = index.projected_through_sequence(id).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    replay_checkpoint_journal_projections(&mut index, &tapes).unwrap();
+    let raised = active_fences_for(&index, id).remove(0);
+    let evidence: serde_json::Value =
+        serde_json::from_str(raised.evidence_json.as_deref().unwrap()).unwrap();
+    assert_eq!(evidence["projected_through_sequence"], mark.to_string());
+    drop(index);
+
+    // The catalog is lost and rebuilt from audit evidence alone: the fence is
+    // back, the projection mark is not.
+    let mut rebuilt = CatalogIndex::open(dir.path().join("rebuilt.sqlite")).unwrap();
+    remanence_state::fence::reconcile(&mut rebuilt, &audit).unwrap();
+    assert_eq!(rebuilt.projected_through_sequence(id).unwrap(), 0);
+    replay_checkpoint_journal_projections(&mut rebuilt, &tapes).unwrap();
+    assert_eq!(active_fences_for(&rebuilt, id).len(), 1, "a missing log");
+    std::fs::write(&path, &below).unwrap();
+    replay_checkpoint_journal_projections(&mut rebuilt, &tapes).unwrap();
+    assert_eq!(
+        active_fences_for(&rebuilt, id).len(),
+        1,
+        "an older log, below the recorded mark, stays fenced"
+    );
+    assert_eq!(rebuilt.projected_through_sequence(id).unwrap(), 0);
+    assert_eq!(std::fs::read(&path).unwrap(), below);
+
+    std::fs::write(&path, &full).unwrap();
+    replay_checkpoint_journal_projections(&mut rebuilt, &tapes).unwrap();
+    assert!(!rebuilt.tape_io_is_fenced(Some(&id), None, None).unwrap());
+    assert_eq!(rebuilt.projected_through_sequence(id).unwrap(), mark);
+}
+
+fn corrupt_projection_offset(index: &CatalogIndex, id: [u8; 16]) {
+    let conn = rusqlite::Connection::open(index.path()).unwrap();
+    let offset: Vec<u8> = conn
+        .query_row(
+            "select projected_through_offset from tape_log_projection where tape_uuid = ?1",
+            [id.as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let offset = u64::from_be_bytes(offset.try_into().unwrap()) + 1;
+    conn.execute(
+        "update tape_log_projection set projected_through_offset = ?2 where tape_uuid = ?1",
+        rusqlite::params![id.as_slice(), offset.to_be_bytes().as_slice()],
+    )
+    .unwrap();
+}
+
+/// A mark that points inside the log but at no frame fences that tape alone,
+/// with a reason that never releases itself; every other tape still starts.
+#[test]
+fn invalid_projection_mark_fences_only_its_tape_and_never_releases_itself() {
+    use remanence_state::authority::TapeAuthorityView;
+    use remanence_state::fence::TAPE_LOG_PROJECTION_MARK_INVALID;
+    let dir = tempfile::tempdir().unwrap();
+    let tapes = dir.path().join("tapes");
+    let mut index = CatalogIndex::open(dir.path().join("index.sqlite")).unwrap();
+    let (bad, good) = ([0x56; 16], [0x57; 16]);
+    for id in [bad, good] {
+        let authority = remanence_state::authority::fixtures::AuthorityBuilder::new(&tapes, id)
+            .build()
+            .unwrap();
+        append_checkpoint_record(&tapes, id);
+        index
+            .project_tape_log(&authority.freeze().unwrap())
+            .unwrap();
+    }
+    corrupt_projection_offset(&index, bad);
+    for _ in 0..2 {
+        replay_checkpoint_journal_projections(&mut index, &tapes).unwrap();
+        let fences = active_fences_for(&index, bad);
+        assert_eq!(fences.len(), 1);
+        assert_eq!(fences[0].reason, TAPE_LOG_PROJECTION_MARK_INVALID);
+        let evidence: serde_json::Value =
+            serde_json::from_str(fences[0].evidence_json.as_deref().unwrap()).unwrap();
+        assert!(
+            evidence["error"]
+                .as_str()
+                .unwrap()
+                .contains("projection mark does not name a decodable frame"),
+            "{evidence}"
+        );
+        assert!(!index.tape_io_is_fenced(Some(&good), None, None).unwrap());
+    }
+}
+
+/// Releasing a restored tape waits for its projection: when that fails, the
+/// below-projection fence stays, nothing is released, and startup continues.
+#[test]
+fn restored_log_that_fails_to_project_stays_fenced_and_startup_continues() {
+    use remanence_state::authority::TapeAuthorityView;
+    use remanence_state::fence::{TAPE_LOG_BELOW_PROJECTION, TAPE_LOG_PROJECTION_MARK_INVALID};
+    let dir = tempfile::tempdir().unwrap();
+    let tapes = dir.path().join("tapes");
+    let audit = dir.path().join("audit");
+    let mut index = CatalogIndex::open(dir.path().join("index.sqlite")).unwrap();
+    let id = [0x58; 16];
+    let other = [0x59; 16];
+    let (path, _, full) = two_group_log(&tapes, &mut index, id);
+    let authority = remanence_state::authority::fixtures::AuthorityBuilder::new(&tapes, other)
+        .build()
+        .unwrap();
+    append_checkpoint_record(&tapes, other);
+    index
+        .project_tape_log(&authority.freeze().unwrap())
+        .unwrap();
+    std::fs::remove_file(&path).unwrap();
+    replay_checkpoint_journal_projections(&mut index, &tapes).unwrap();
+    let below = active_fences_for(&index, id).remove(0);
+    assert_eq!(below.reason, TAPE_LOG_BELOW_PROJECTION);
+
+    // The log comes back complete, but the catalog's mark no longer names a
+    // frame in it, so the projection that must precede the release fails.
+    std::fs::write(&path, &full).unwrap();
+    corrupt_projection_offset(&index, id);
+    replay_checkpoint_journal_projections(&mut index, &tapes).unwrap();
+    let fences = active_fences_for(&index, id);
+    let reasons: Vec<_> = fences.iter().map(|f| f.reason.as_str()).collect();
+    assert_eq!(
+        reasons,
+        vec![TAPE_LOG_BELOW_PROJECTION, TAPE_LOG_PROJECTION_MARK_INVALID]
+    );
+    assert_eq!(
+        fences[0], below,
+        "the below-projection fence is not released"
+    );
+    assert!(!index.tape_io_is_fenced(Some(&other), None, None).unwrap());
+    let events: Vec<_> = remanence_state::FileAuditLog::replay(&audit)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.event)
+        .collect();
+    assert!(!events.contains(&remanence_state::AuditEvent::TapeIoFenceReleased));
+}
+
+/// A retired tape's leftover mark does not fence its archived log.
+#[test]
+fn retired_tape_mark_does_not_fence_its_archived_log() {
+    use remanence_state::authority::TapeAuthorityView;
+    let dir = tempfile::tempdir().unwrap();
+    let tapes = dir.path().join("tapes");
+    let mut index = CatalogIndex::open(dir.path().join("index.sqlite")).unwrap();
+    let id = [0x5a; 16];
+    let authority = remanence_state::authority::fixtures::AuthorityBuilder::new(&tapes, id)
+        .build()
+        .unwrap();
+    append_checkpoint_record(&tapes, id);
+    index
+        .project_tape_log(&authority.freeze().unwrap())
+        .unwrap();
+    assert!(index.get_tape(&id).unwrap().is_some());
+    index
+        .retire_tape(remanence_state::RetireTapeInput {
+            tape_uuid: id,
+            reason: "recycled".into(),
+        })
+        .unwrap();
+    assert!(index.projected_through_sequence(id).unwrap() > 0);
+    let path = tapes.join(format!("{}.remtape", Uuid::from_bytes(id).simple()));
+    std::fs::rename(&path, dir.path().join("archived.remtape")).unwrap();
+    replay_checkpoint_journal_projections(&mut index, &tapes).unwrap();
+    assert!(active_fences_for(&index, id).is_empty());
+}
+
+#[test]
 fn startup_checkpoint_replay_leaves_fenced_journal_untouched() {
     let dir = tempfile::tempdir().unwrap();
-    let checkpoints = dir.path().join("checkpoints");
+    let checkpoints = dir.path().join("tapes");
     let mut index = CatalogIndex::open(dir.path().join("index.sqlite")).unwrap();
     let tape = [0x52; 16];
     let authority = remanence_state::authority::fixtures::AuthorityBuilder::new(&checkpoints, tape)

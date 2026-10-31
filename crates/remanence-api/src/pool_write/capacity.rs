@@ -384,15 +384,7 @@ pub(crate) fn first_batched_append_context(
                     "checkpoint journal tape UUID does not match selected tape".to_string(),
                 ));
             }
-            let previous_total_committed_ordinals = checkpoint
-                .payloads
-                .last()
-                .map(|object| object.total_committed_ordinals)
-                .ok_or_else(|| {
-                    PoolWriteError::MissingTapeGeometry(
-                        "checkpoint record has no object projection".to_string(),
-                    )
-                })?;
+            let previous_total_committed_ordinals = checkpoint.total;
             let tape_file_number = checkpoint.next_file;
             let object_row_count = checkpoint.object_count;
             Ok(BatchedNoParityAppendContext {

@@ -734,9 +734,12 @@ impl From<&CheckpointJournalRecord> for super::AuthorityCommit {
             object_files: record
                 .object_tape_file_bundles
                 .iter()
-                .map(Into::into)
+                .filter_map(|b| remanence_parity::authority::FilePublication::try_from(b).ok())
                 .collect(),
-            barrier: record.barrier_bundle.as_ref().map(Into::into),
+            barrier: record
+                .barrier_bundle
+                .as_ref()
+                .and_then(|b| remanence_parity::authority::FilePublication::try_from(b).ok()),
             finalization: record.terminal_finalization.as_ref().map(Into::into),
             sealed: record.sealed_after_write,
             seal_due: record.seal_due,
@@ -1017,7 +1020,10 @@ impl From<&crate::TerminalFinalizationPrefixPlan> for super::AuthorityPrefixPlan
                 .iter()
                 .map(Into::into)
                 .collect(),
-            publication: (&value.committed_bundle).into(),
+            publication: remanence_parity::authority::FilePublication::try_from(
+                &value.committed_bundle,
+            )
+            .expect("legacy terminal prefix"),
         }
     }
 }
@@ -1095,7 +1101,11 @@ impl crate::CatalogIndex {
         input: crate::TapeJournalIndexInput,
         bundle: &remanence_parity::CommittedBundle,
     ) -> Result<crate::TapeJournalIndexReport, StateError> {
-        self.project_file_publication(input, &bundle.into())
+        self.project_file_publication(
+            input,
+            &remanence_parity::authority::FilePublication::try_from(bundle)
+                .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?,
+        )
     }
 }
 

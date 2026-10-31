@@ -586,7 +586,10 @@ impl CheckpointTerminalIndexRecordSource<'static> {
     ) -> Result<Self, StateError> {
         let checkpoint = checkpoint.bounded_replay_snapshot()?;
         let parity = parity
-            .freeze_before_terminal_prefix(&(&prefix.committed_bundle).into())
+            .freeze_before_terminal_prefix(
+                &remanence_parity::authority::FilePublication::try_from(&prefix.committed_bundle)
+                    .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?,
+            )
             .map_err(|error| StateError::JournalReplayFailed(error.to_string()))?;
         let (summary, tape_uuid) = validate_replay_backed_parity_terminal_rows(
             &checkpoint,
@@ -4117,9 +4120,17 @@ pub(crate) mod tests {
         let tape_uuid = [0x31; 16];
         let path = checkpoint_journal_path(dir.path(), tape_uuid);
 
-        let authority =
-            crate::authority::BotRecoveryAuthority::try_open(dir.path(), tape_uuid, 256 * 1024)
-                .expect("probe missing checkpoint authority");
+        let authority = crate::authority::BotRecoveryAuthority::try_open(
+            dir.path(),
+            &{
+                let p = dir.path().join("bot-index.sqlite");
+                drop(crate::CatalogIndex::open(&p).unwrap());
+                p
+            },
+            tape_uuid,
+            256 * 1024,
+        )
+        .expect("probe missing checkpoint authority");
 
         assert!(authority.is_none());
         assert!(!path.exists(), "foreign recovery must not invent authority");
@@ -4141,10 +4152,18 @@ pub(crate) mod tests {
             .expect("append second checkpoint");
         drop(lease);
 
-        let mut authority =
-            crate::authority::BotRecoveryAuthority::try_open(dir.path(), tape_uuid, 256 * 1024)
-                .expect("open checkpoint recovery authority")
-                .expect("checkpoint authority exists");
+        let mut authority = crate::authority::BotRecoveryAuthority::try_open(
+            dir.path(),
+            &{
+                let p = dir.path().join("bot-index.sqlite");
+                drop(crate::CatalogIndex::open(&p).unwrap());
+                p
+            },
+            tape_uuid,
+            256 * 1024,
+        )
+        .expect("open checkpoint recovery authority")
+        .expect("checkpoint authority exists");
         let mut rows = Vec::new();
         let scope = remanence_parity::BotObjectRecoveryAuthority::visit_object_rows(
             &mut authority,
@@ -4183,16 +4202,29 @@ pub(crate) mod tests {
         let completed = completed_finalization_intent(tape_uuid);
         let terminal = structured_terminal_record(&prior, completed);
         let mut lease = journal.acquire_exclusive().expect("acquire journal lease");
-        advance_test_finalization_to_replica_c(&mut lease, &initial);
+        lease.begin_terminal_finalization(&initial).unwrap();
+        let mut progress = TerminalFinalizationProgress::BeforeReplicaA;
+        while let Some(next) = progress.successor() {
+            lease.advance_terminal_finalization(progress, next).unwrap();
+            progress = next;
+        }
         lease
             .append_terminal_finalization(std::slice::from_ref(&terminal))
             .expect("append terminal completion");
         drop(lease);
 
-        let mut authority =
-            crate::authority::BotRecoveryAuthority::try_open(dir.path(), tape_uuid, 256 * 1024)
-                .expect("open sealed checkpoint recovery authority")
-                .expect("checkpoint authority exists");
+        let mut authority = crate::authority::BotRecoveryAuthority::try_open(
+            dir.path(),
+            &{
+                let p = dir.path().join("bot-index.sqlite");
+                drop(crate::CatalogIndex::open(&p).unwrap());
+                p
+            },
+            tape_uuid,
+            256 * 1024,
+        )
+        .expect("open sealed checkpoint recovery authority")
+        .expect("checkpoint authority exists");
         let mut rows = Vec::new();
         let scope = remanence_parity::BotObjectRecoveryAuthority::visit_object_rows(
             &mut authority,
@@ -4355,7 +4387,7 @@ pub(crate) mod tests {
     }
 
     fn advance_test_finalization_to_replica_c(
-        lease: &mut crate::authority::TapeAuthorityLease,
+        lease: &mut crate::authority::legacy::TapeAuthorityLease,
         intent: &TerminalFinalizationIntent,
     ) {
         lease
@@ -4807,9 +4839,10 @@ pub(crate) mod tests {
         )
         .unwrap();
         intent.terminal_prefix = Some(prefix);
-        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
-            .build()
-            .unwrap();
+        let journal =
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+                .build()
+                .unwrap();
         journal.append(&record).unwrap();
         write_terminal_finalization_intent(journal.path(), &intent, false).unwrap();
         assert_eq!(
@@ -4889,9 +4922,10 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x25; 16];
         let record = partial_epoch_parity_record(tape_uuid);
-        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
-            .build()
-            .expect("open journal");
+        let journal =
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+                .build()
+                .expect("open journal");
 
         journal.append(&record).expect("append sidecar checkpoint");
         assert_eq!(
@@ -4904,9 +4938,10 @@ pub(crate) mod tests {
     fn append_and_rollback_failure_is_typed_as_uncertain_authority() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x26; 16];
-        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
-            .build()
-            .expect("open journal");
+        let journal =
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+                .build()
+                .expect("open journal");
         let mut lease = journal.acquire_exclusive().expect("acquire journal lease");
         FAIL_NEXT_CHECKPOINT_FRAME_WRITE.with(|fail| fail.set(true));
         FAIL_NEXT_CHECKPOINT_FRAME_ROLLBACK.with(|fail| fail.set(true));
@@ -4924,9 +4959,10 @@ pub(crate) mod tests {
     fn exclusive_checkpoint_lease_waits_for_startup_reader() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x24; 16];
-        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
-            .build()
-            .unwrap();
+        let journal =
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+                .build()
+                .unwrap();
         drop(journal.acquire_exclusive().unwrap());
         let reader = acquire_checkpoint_lock(
             journal.path(),
@@ -4959,9 +4995,10 @@ pub(crate) mod tests {
     #[test]
     fn exclusive_checkpoint_lease_bounds_reader_wait() {
         let dir = tempfile::tempdir().unwrap();
-        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), [0x24; 16])
-            .build()
-            .unwrap();
+        let journal =
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), [0x24; 16])
+                .build()
+                .unwrap();
         let reader = acquire_checkpoint_lock(
             journal.path(),
             FlockArg::LockSharedNonblock,
@@ -4988,9 +5025,10 @@ pub(crate) mod tests {
     fn exclusive_checkpoint_lease_keeps_writer_conflict() {
         let dir = tempfile::tempdir().unwrap();
         let tape_uuid = [0x24; 16];
-        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
-            .build()
-            .unwrap();
+        let journal =
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+                .build()
+                .unwrap();
         for recovery in [false, true] {
             let mut lease = journal.acquire_exclusive().unwrap();
             if recovery {
@@ -5017,9 +5055,10 @@ pub(crate) mod tests {
     #[test]
     fn exclusive_checkpoint_lease_refuses_writer_after_reader() {
         let dir = tempfile::tempdir().unwrap();
-        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), [0x24; 16])
-            .build()
-            .unwrap();
+        let journal =
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), [0x24; 16])
+                .build()
+                .unwrap();
         let reader = acquire_checkpoint_lock(
             journal.path(),
             FlockArg::LockSharedNonblock,
@@ -5076,9 +5115,10 @@ pub(crate) mod tests {
     fn exclusive_checkpoint_lease_serializes_replay_through_append() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x24; 16];
-        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
-            .build()
-            .expect("open journal");
+        let journal =
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+                .build()
+                .expect("open journal");
         let mut lease = journal
             .acquire_exclusive()
             .expect("acquire write-session lease");
@@ -5105,9 +5145,10 @@ pub(crate) mod tests {
     fn first_use_contention_never_publishes_a_partial_checkpoint_header() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x23; 16];
-        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
-            .build()
-            .expect("open journal");
+        let journal =
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+                .build()
+                .expect("open journal");
         let creator_lock = acquire_checkpoint_lock(
             journal.path(),
             FlockArg::LockExclusiveNonblock,
@@ -5220,9 +5261,10 @@ pub(crate) mod tests {
     fn torn_final_frame_fails_closed_and_is_not_repaired_by_append() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x11; 16];
-        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
-            .build()
-            .expect("open journal");
+        let journal =
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+                .build()
+                .expect("open journal");
         journal
             .append(&record(tape_uuid))
             .expect("append checkpoint");
@@ -5263,9 +5305,10 @@ pub(crate) mod tests {
     fn headerless_checkpoint_tail_fails_closed_as_legacy_or_incomplete() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x31; 16];
-        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
-            .build()
-            .expect("open journal");
+        let journal =
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+                .build()
+                .expect("open journal");
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -5284,9 +5327,10 @@ pub(crate) mod tests {
     fn checksum_damage_fails_closed_before_any_later_record() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x32; 16];
-        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
-            .build()
-            .expect("open journal");
+        let journal =
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+                .build()
+                .expect("open journal");
         journal
             .append(&record(tape_uuid))
             .expect("append first checkpoint");
@@ -5327,9 +5371,10 @@ pub(crate) mod tests {
     fn hostile_declared_record_length_rejects_before_allocation() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x33; 16];
-        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
-            .build()
-            .expect("open journal");
+        let journal =
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+                .build()
+                .expect("open journal");
         journal
             .append(&record(tape_uuid))
             .expect("create versioned journal");
@@ -5361,9 +5406,10 @@ pub(crate) mod tests {
     fn append_rejects_non_monotonic_count() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x22; 16];
-        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
-            .build()
-            .expect("open journal");
+        let journal =
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+                .build()
+                .expect("open journal");
         journal
             .append(&record(tape_uuid))
             .expect("append checkpoint");
@@ -5380,9 +5426,10 @@ pub(crate) mod tests {
     fn append_rejects_a_checkpoint_after_terminal_seal_authority() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x25; 16];
-        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
-            .build()
-            .expect("open journal");
+        let journal =
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+                .build()
+                .expect("open journal");
         let prior = record(tape_uuid);
         journal
             .append(&prior)
@@ -5417,9 +5464,10 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x71; 16];
         let base = partial_epoch_parity_record(tape_uuid);
-        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
-            .build()
-            .expect("open journal");
+        let journal =
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+                .build()
+                .expect("open journal");
         journal.append(&base).expect("append ordinary checkpoint");
         let mut intent = finalization_intent(tape_uuid);
         let prefix = terminal_prefix_plan_for_parity_record(&base);
@@ -5578,9 +5626,10 @@ pub(crate) mod tests {
     fn provisional_manual_intent_retires_only_with_both_database_halves_absent() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x73; 16];
-        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
-            .build()
-            .expect("open journal");
+        let journal =
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+                .build()
+                .expect("open journal");
         journal
             .append(&record(tape_uuid))
             .expect("append ordinary checkpoint");
@@ -5614,9 +5663,10 @@ pub(crate) mod tests {
     fn structured_completion_survives_intent_cleanup_and_checkpoint_only_replay() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x74; 16];
-        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
-            .build()
-            .expect("open journal");
+        let journal =
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+                .build()
+                .expect("open journal");
         let prior = record(tape_uuid);
         journal.append(&prior).expect("append ordinary authority");
         let initial = finalization_intent(tape_uuid);
@@ -5659,11 +5709,12 @@ pub(crate) mod tests {
         drop(lease);
 
         assert!(!terminal_finalization_intent_path(journal.path()).exists());
-        let replayed = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
-            .build()
-            .expect("reopen checkpoint-only authority")
-            .replay()
-            .expect("replay completed terminal authority");
+        let replayed =
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+                .build()
+                .expect("reopen checkpoint-only authority")
+                .replay()
+                .expect("replay completed terminal authority");
         assert_eq!(replayed, vec![prior, terminal]);
         let recovered = replayed
             .last()
@@ -5687,9 +5738,10 @@ pub(crate) mod tests {
     fn sealed_fsync_interruption_is_cleared_only_for_the_exact_completion() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x75; 16];
-        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
-            .build()
-            .expect("open journal");
+        let journal =
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+                .build()
+                .expect("open journal");
         let prior = record(tape_uuid);
         let completed = completed_finalization_intent(tape_uuid);
         let terminal = structured_terminal_record(&prior, completed.clone());
@@ -5811,10 +5863,12 @@ pub(crate) mod tests {
     fn checkpoint_record_rejects_versions_one_and_two() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x72; 16];
-        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
-            .build()
+        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).unwrap();
+        journal
+            .acquire_exclusive()
+            .unwrap()
+            .append(&record(tape_uuid))
             .unwrap();
-        journal.append(&record(tape_uuid)).unwrap();
         let mut lease = journal.acquire_exclusive().unwrap();
         let mut bytes = fs::read(journal.path()).unwrap();
         let offset = CHECKPOINT_JOURNAL_HEADER_LEN as usize;
@@ -5831,7 +5885,6 @@ pub(crate) mod tests {
                 "{error}"
             );
             let error = lease
-                .checkpoint
                 .bounded_replay_snapshot()
                 .expect_err("bounded replay must reject legacy records");
             assert!(
@@ -5847,9 +5900,10 @@ pub(crate) mod tests {
     fn structured_finalization_rejects_pool_guard_and_corrupt_frame_before_motion() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x72; 16];
-        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
-            .build()
-            .expect("open journal");
+        let journal =
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+                .build()
+                .expect("open journal");
         journal
             .append(&record(tape_uuid))
             .expect("append ordinary checkpoint prefix");
@@ -5955,9 +6009,10 @@ pub(crate) mod tests {
     fn replay_backed_no_parity_terminal_source_replays_each_replica_pass() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x74; 16];
-        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
-            .build()
-            .expect("open journal");
+        let journal =
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+                .build()
+                .expect("open journal");
         let mut lease = journal.acquire_exclusive().expect("acquire journal lease");
         lease
             .append(&record(tape_uuid))
@@ -6011,9 +6066,10 @@ pub(crate) mod tests {
     fn owned_no_parity_snapshot_allows_checkpoint_append_and_keeps_frozen_rows() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x7D; 16];
-        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
-            .build()
-            .expect("open journal");
+        let journal =
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+                .build()
+                .expect("open journal");
         let mut lease = journal.acquire_exclusive().expect("acquire journal lease");
         lease
             .append(&record(tape_uuid))
@@ -6054,7 +6110,7 @@ pub(crate) mod tests {
         record.barrier_bundle.as_mut().unwrap().entries[0].physical_start_hint = Some(6);
         let scheme = record.scheme.clone().expect("parity scheme");
         let checkpoint_journal =
-            crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
                 .build()
                 .expect("open checkpoint journal");
         let mut checkpoint_lease = checkpoint_journal
@@ -6139,9 +6195,10 @@ pub(crate) mod tests {
             .unwrap();
         drop(checkpoint_lease);
         drop(checkpoint_journal);
-        let reopened = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
-            .build()
-            .unwrap();
+        let reopened =
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+                .build()
+                .unwrap();
         let restored = reopened
             .terminal_finalization_intent()
             .unwrap()
@@ -6197,7 +6254,7 @@ pub(crate) mod tests {
         let record = partial_epoch_parity_record(tape_uuid);
         let scheme = record.scheme.clone().expect("parity scheme");
         let checkpoint_journal =
-            crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
                 .build()
                 .expect("open checkpoint journal");
         let mut checkpoint_lease = checkpoint_journal
@@ -6383,9 +6440,10 @@ pub(crate) mod tests {
         const CHECKPOINT_COUNT: u64 = 128;
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x75; 16];
-        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
-            .build()
-            .expect("open journal");
+        let journal =
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+                .build()
+                .expect("open journal");
         let mut lease = journal.acquire_exclusive().expect("acquire journal lease");
         let mut prior = None;
         for index in 0..CHECKPOINT_COUNT {
@@ -6498,9 +6556,10 @@ pub(crate) mod tests {
     fn finalization_resume_reconstructs_persisted_intent_through_shared_assembly() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x7C; 16];
-        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
-            .build()
-            .expect("open journal");
+        let journal =
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+                .build()
+                .expect("open journal");
         let mut lease = journal.acquire_exclusive().expect("acquire lease");
         let checkpoint = record(tape_uuid);
         lease.append(&checkpoint).expect("persist checkpoint");
@@ -6547,9 +6606,10 @@ pub(crate) mod tests {
         drop(lease);
         drop(journal);
 
-        let reopened = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
-            .build()
-            .expect("reopen journal");
+        let reopened =
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+                .build()
+                .expect("reopen journal");
         let lease = reopened
             .acquire_exclusive_for_terminal_recovery()
             .expect("resume lease");
@@ -6599,9 +6659,10 @@ pub(crate) mod tests {
     fn checkpoint_batch_is_one_integrity_frame_and_torn_batch_fails_closed() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x27; 16];
-        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
-            .build()
-            .expect("open journal");
+        let journal =
+            crate::authority::legacy_fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+                .build()
+                .expect("open journal");
         let first = record(tape_uuid);
         let second = second_record(tape_uuid);
         let mut lease = journal.acquire_exclusive().expect("acquire journal lease");

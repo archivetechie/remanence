@@ -304,17 +304,22 @@ pub(super) fn hide_fixture_rows(location: &Path) -> Result<HiddenRowAuthority, J
 }
 
 // Only the old implementation maps physical purposes to legacy codec tags.
-impl From<&CommittedBundle> for super::FilePublication {
-    fn from(bundle: &CommittedBundle) -> Self {
+impl TryFrom<&CommittedBundle> for super::FilePublication {
+    type Error = JournalError;
+    fn try_from(bundle: &CommittedBundle) -> Result<Self, Self::Error> {
         use super::FilePurpose as New;
         use crate::CommittedBundleKind as Old;
-        Self {
+        Ok(Self {
             purpose: match bundle.kind {
                 Old::BotBootstrap => New::Bootstrap,
                 Old::Object => New::Object,
                 Old::ResumeSidecars => New::Sidecars(super::SidecarProvenance::Reconstructed),
                 Old::CheckpointSidecars => New::Sidecars(super::SidecarProvenance::Fresh),
-                Old::CheckpointedThrough => New::Checkpoint,
+                Old::CheckpointedThrough => {
+                    return Err(JournalError::UnsupportedOperation(
+                        "legacy watermark is not a physical file publication",
+                    ))
+                }
                 Old::TerminalPrefix => New::TerminalPrefix,
                 Old::TerminalComponent => New::TerminalComponent,
             },
@@ -324,7 +329,7 @@ impl From<&CommittedBundle> for super::FilePublication {
             cursor: None,
             check: None,
             seal_due: None,
-        }
+        })
     }
 }
 impl From<&super::FilePublication> for CommittedBundle {
@@ -337,7 +342,6 @@ impl From<&super::FilePublication> for CommittedBundle {
                 New::Object => Old::Object,
                 New::Sidecars(super::SidecarProvenance::Reconstructed) => Old::ResumeSidecars,
                 New::Sidecars(super::SidecarProvenance::Fresh) => Old::CheckpointSidecars,
-                New::Checkpoint => Old::CheckpointedThrough,
                 New::TerminalPrefix => Old::TerminalPrefix,
                 New::TerminalComponent => Old::TerminalComponent,
             },
@@ -362,9 +366,12 @@ pub(super) fn open_shared_fixture(
 impl super::StructuralAuthority for TapeRowAuthority {
     #[cfg(any(test, feature = "fixtures"))]
     fn fixture_publications(&self) -> Result<Vec<super::FilePublication>, JournalError> {
-        self.0
-            .published_units_for_test()
-            .map(|units| units.iter().map(Into::into).collect())
+        self.0.published_units_for_test().map(|units| {
+            units
+                .iter()
+                .filter_map(|b| super::FilePublication::try_from(b).ok())
+                .collect()
+        })
     }
 
     fn freeze(&self) -> Result<FrozenFileRows, JournalError> {
@@ -426,7 +433,11 @@ impl From<&CommittedState> for super::StructuralState {
             files: state.entries.clone(),
             protected: state.highest_protected_ordinal,
             total: state.total_committed_ordinals,
-            pending: state.orphaned_bundles.iter().map(Into::into).collect(),
+            pending: state
+                .orphaned_bundles
+                .iter()
+                .filter_map(|b| super::FilePublication::try_from(b).ok())
+                .collect(),
         }
     }
 }

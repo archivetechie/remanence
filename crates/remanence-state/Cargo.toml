@@ -10,7 +10,7 @@ publish.workspace = true
 repository  .workspace = true
 
 [features]
-fixtures = ["remanence-parity/fixtures"]
+fixtures = ["remanence-parity/fixtures", "remanence-library/test-support"]
 
 [dependencies]
 remanence-library = { path = "../remanence-library" }
@@ -30,6 +30,7 @@ tracing   = { workspace = true }
 uuid      = { workspace = true, features = ["v5"] }
 
 [dev-dependencies]
+rusqlite = { workspace = true, features = ["trace"] }
 remanence-library = { path = "../remanence-library", features = ["test-support"] }
 remanence-state = { path = ".", features = ["fixtures"] }
 remanence-parity = { path = "../remanence-parity", features = ["fixtures"] }

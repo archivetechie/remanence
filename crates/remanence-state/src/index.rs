@@ -23,9 +23,9 @@
 //! | `tape_audit_cursors.record_uuid` | assignment/label replay | replay integrity checks | The durable event identity distinguishes a repeated event from conflicting authority. |
 
 use crate::authority::TapeAuthorityView as _;
-use remanence_parity::authority::{
-    FilePublication, FilePurpose, SidecarProvenance, StructuralState,
-};
+#[cfg(any(test, feature = "fixtures"))]
+use remanence_parity::authority::SidecarProvenance;
+use remanence_parity::authority::{FilePublication, FilePurpose, StructuralState};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::ops::ControlFlow;
@@ -49,11 +49,14 @@ use crate::error::StateError;
 use crate::{DriveKey, LabelProvenance, MediaObservation};
 
 /// Current Layer 4 SQLite schema version.
-pub const SCHEMA_VERSION: u32 = 22;
+pub const SCHEMA_VERSION: u32 = 23;
+
+#[path = "tape_log/projection.rs"]
+mod tape_log_projection;
 
 /// Oldest clean-break catalog whose tape table can be inspected safely by the
-/// exact full-catalog erase admission path. Ordinary opens migrate the supported
-/// released predecessor schemas transactionally.
+/// exact full-catalog erase admission path. Ordinary opens refuse all predecessor
+/// schemas; only the declared reset may read this older catalog shape.
 const MIN_EXACT_ERASE_SCHEMA_VERSION: u32 = 16;
 
 const STRUCTURAL_U64_COLUMNS: &[(&str, &str)] = &[
@@ -1073,6 +1076,10 @@ pub struct NativeObjectRecord {
 /// Native object-copy locator and status row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeObjectCopyRecord {
+    /// Closing Committed sequence, absent for a catalog-only copy without a join.
+    pub tape_log_sequence: Option<u64>,
+    /// Tape incarnation from the same authority join.
+    pub tape_incarnation: Option<u64>,
     /// Remanence object UUID.
     pub object_id: String,
     /// Tape UUID containing this copy.
@@ -1368,6 +1375,14 @@ impl CatalogIndex {
                 .map_err(|err| StateError::io_at("create sqlite directory", parent, err))?;
         }
         let conn = Connection::open(&path).map_err(|err| sqlite_open_error(&path, err))?;
+        let version: u32 = conn
+            .query_row("pragma user_version", [], |r| r.get(0))
+            .map_err(|e| sqlite_error("read sqlite user_version", e))?;
+        if (1..=22).contains(&version) {
+            return Err(StateError::IndexMigrationFailed(
+                crate::authority_layout::RESET_REQUIRED.into(),
+            ));
+        }
         configure_sqlite(&conn)?;
         migrate(&conn)?;
         Ok(Self {
@@ -1377,6 +1392,26 @@ impl CatalogIndex {
         })
     }
 
+    /// Read the schema-22 predecessor only inside declared reset admission.
+    /// This capability cannot mutate or migrate the predecessor catalog.
+    pub(crate) fn open_reset_source(path: &Path) -> Result<Self, StateError> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| sqlite_open_error(path, e))?;
+        configure_read_only_sqlite(&conn)?;
+        let version: u32 = conn
+            .query_row("pragma user_version", [], |r| r.get(0))
+            .map_err(|e| sqlite_error("read reset source version", e))?;
+        if version != 22 {
+            validate_schema(&conn)?;
+        } else {
+            validate_unsigned_structural_schema(&conn)?;
+        }
+        Ok(Self {
+            conn,
+            path: path.to_path_buf(),
+            readiness_observer: None,
+        })
+    }
     /// Open the SQLite projection for read-only query serving.
     ///
     /// This does not create directories or run migrations. The owner process
@@ -2175,7 +2210,8 @@ impl CatalogIndex {
     /// at the commit boundary. This method updates the same rebuildable tables
     /// used by full tape-journal replay, without clearing earlier rows for the
     /// tape.
-    pub fn project_file_publication(
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn project_file_publication(
         &mut self,
         input: TapeJournalIndexInput,
         bundle: &FilePublication,
@@ -4266,7 +4302,8 @@ impl CatalogIndex {
     /// A fully projected record is idempotent. A compatible partial projection
     /// is repaired from the fsynced journal; only a contradictory SQLite view
     /// is corruption.
-    pub fn project_authority_commit(
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn project_authority_commit(
         &mut self,
         record: &crate::authority::AuthorityCommit,
     ) -> Result<(), StateError> {
@@ -4448,6 +4485,7 @@ impl CatalogIndex {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "fixtures"))]
     fn project_terminal_checkpoint_record(
         &mut self,
         record: &crate::authority::AuthorityCommit,
@@ -4455,6 +4493,7 @@ impl CatalogIndex {
         self.project_structured_terminal_checkpoint_record(record)
     }
 
+    #[cfg(any(test, feature = "fixtures"))]
     fn project_structured_terminal_checkpoint_record(
         &mut self,
         record: &crate::authority::AuthorityCommit,
@@ -5882,7 +5921,8 @@ impl CatalogIndex {
                 }
                 current = Some(native_object_from_row(row)?);
             }
-            if let Some(copy) = native_object_copy_from_join_row(row, 9)? {
+            if let Some(mut copy) = native_object_copy_from_join_row(row, 9)? {
+                self.join_object_log_reference(&mut copy)?;
                 if let Some(object) = current.as_mut() {
                     object.copies.push(copy);
                 }
@@ -6259,7 +6299,9 @@ impl CatalogIndex {
             .next()
             .map_err(|err| sqlite_error("iterate native object copies", err))?
         {
-            copies.push(native_object_copy_from_row(row)?);
+            let mut copy = native_object_copy_from_row(row)?;
+            self.join_object_log_reference(&mut copy)?;
+            copies.push(copy);
         }
         Ok(copies)
     }
@@ -6324,7 +6366,9 @@ impl CatalogIndex {
             .next()
             .map_err(|err| sqlite_error("iterate all native object copies", err))?
         {
-            copies.push(native_object_copy_from_row(row)?);
+            let mut copy = native_object_copy_from_row(row)?;
+            self.join_object_log_reference(&mut copy)?;
+            copies.push(copy);
         }
         Ok(copies)
     }
@@ -7753,6 +7797,8 @@ fn clear_rebuildable_tables(tx: &rusqlite::Transaction<'_>) -> Result<(), StateE
         "operations",
         "sessions",
         "ingested_sources",
+        "tape_log_projection",
+        "tape_log_object_commits",
         // The wrap-map cache is an evicted projection (design
         // §6.5): rebuild discards it rather than preserving or
         // replaying it, and the next load harvest rebuilds it. Its
@@ -8277,6 +8323,7 @@ fn insert_native_object_file_projection_tx(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(test, feature = "fixtures"))]
 enum CheckpointReplayPlan {
     AlreadyProjected,
     StrictAppend,
@@ -8348,6 +8395,7 @@ struct CheckpointTapeFileView {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(any(test, feature = "fixtures"))]
 struct CheckpointCatalogUnitView {
     tape_uuid: Vec<u8>,
     origin_kind: String,
@@ -8356,6 +8404,7 @@ struct CheckpointCatalogUnitView {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(any(test, feature = "fixtures"))]
 struct CheckpointTapeView {
     block_size: Option<i64>,
     scheme_id: Option<String>,
@@ -8368,6 +8417,7 @@ struct CheckpointTapeView {
     state: String,
 }
 
+#[cfg(any(test, feature = "fixtures"))]
 fn checkpoint_object_bundle(
     record: &crate::authority::AuthorityCommit,
     projection_index: usize,
@@ -8437,6 +8487,7 @@ fn checkpoint_object_bundle(
 /// the measured EOD therefore reproduces exactly the dead-reckoned starts the
 /// write path captured forward — the same barrier proves both — so a
 /// checkpoint replay agrees with the live projection by construction.
+#[cfg(any(test, feature = "fixtures"))]
 fn no_parity_checkpoint_object_start(
     record: &crate::authority::AuthorityCommit,
     projection_index: usize,
@@ -8462,6 +8513,7 @@ fn no_parity_checkpoint_object_start(
     Ok(cursor)
 }
 
+#[cfg(any(test, feature = "fixtures"))]
 fn validate_checkpoint_record_bundle_shape(
     record: &crate::authority::AuthorityCommit,
     object_bundles: &[FilePublication],
@@ -8659,6 +8711,7 @@ fn validate_checkpoint_record_bundle_shape(
     Ok(())
 }
 
+#[cfg(any(test, feature = "fixtures"))]
 fn inspect_checkpoint_projection_tx(
     tx: &rusqlite::Transaction<'_>,
     record: &crate::authority::AuthorityCommit,
@@ -9298,6 +9351,7 @@ fn optional_projection_conflicts<T: PartialEq>(expected: &Option<T>, actual: &Op
     actual.is_some() && actual != expected
 }
 
+#[cfg(any(test, feature = "fixtures"))]
 fn checkpoint_projection_conflict(
     record: &crate::authority::AuthorityCommit,
     component: &str,
@@ -9542,6 +9596,7 @@ fn validate_append_bundle_extension_tx(
     Ok(())
 }
 
+#[cfg(any(test, feature = "fixtures"))]
 fn validate_checkpoint_sidecar_extension_tx(
     tx: &rusqlite::Transaction<'_>,
     input: &TapeJournalIndexInput,
@@ -12921,6 +12976,8 @@ fn native_object_copy_from_row(
         _ => None,
     };
     Ok(NativeObjectCopyRecord {
+        tape_log_sequence: None,
+        tape_incarnation: None,
         object_id: row_get(row, 0, "object_copies.object_id")?,
         tape_uuid: row_get(row, 1, "object_copies.tape_uuid")?,
         tape_file_number: row_get::<SqliteU64>(row, 2, "object_copies.tape_file_number")?.get(),
@@ -13026,6 +13083,8 @@ fn native_object_copy_from_join_row(
         _ => None,
     };
     Ok(Some(NativeObjectCopyRecord {
+        tape_log_sequence: None,
+        tape_incarnation: None,
         object_id,
         tape_uuid: row_get(row, offset + 1, "object_copies.tape_uuid")?,
         tape_file_number: row_get::<SqliteU64>(row, offset + 2, "object_copies.tape_file_number")?
@@ -14047,122 +14106,6 @@ fn legacy_catalog_reset_tape_from_row(row: &rusqlite::Row<'_>) -> Result<TapeRec
     })
 }
 
-/// Upgrade released INTEGER geometry without losing rows, indexes, or additive
-/// columns. Each table's original DDL is retained except structural declarations.
-/// The outer schema savepoint makes conversions and schema installation atomic.
-fn migrate_legacy_structural_columns(conn: &Connection) -> Result<(), StateError> {
-    use rusqlite::types::Value;
-    let tables: HashSet<_> = STRUCTURAL_U64_COLUMNS.iter().map(|(t, _)| *t).collect();
-    for table in tables {
-        if !table_exists(conn, table)? {
-            return Err(StateError::IndexMigrationFailed(format!(
-                "legacy catalog is incomplete: missing {table}; restore or rebuild the catalog"
-            )));
-        }
-        let sql: String = conn
-            .query_row(
-                "select sql from sqlite_master where type = 'table' and name = ?1",
-                [table],
-                |r| r.get(0),
-            )
-            .map_err(|e| sqlite_error("read legacy structural table", e))?;
-        let mut create = sql.clone();
-        for &(_, column) in STRUCTURAL_U64_COLUMNS.iter().filter(|(t, _)| *t == table) {
-            if !table_column_exists(conn, table, column)? {
-                continue;
-            }
-            let start = create.find(&format!("{column} ")).ok_or_else(|| {
-                StateError::IndexMigrationFailed(format!(
-                    "missing declaration for {table}.{column}"
-                ))
-            })?;
-            let end = create[start..]
-                .find([',', '\n'])
-                .map(|n| start + n)
-                .unwrap_or(create.len());
-            let old = &create[start..end];
-            if old.to_ascii_lowercase().contains("blob") {
-                continue;
-            }
-            let required = old.to_ascii_lowercase().contains("not null");
-            let new = if required {
-                format!("{column} blob not null default X'0000000000000000' check(typeof({column}) = 'blob' and length({column}) = 8)")
-            } else {
-                format!("{column} blob check({column} is null or (typeof({column}) = 'blob' and length({column}) = 8))")
-            };
-            create.replace_range(start..end, &new);
-        }
-        let temporary = format!("p2_{table}");
-        // Substitute only the table declaration, not references in checks.
-        let open = create
-            .find('(')
-            .ok_or_else(|| StateError::IndexMigrationFailed("invalid legacy table DDL".into()))?;
-        create.replace_range(..open, &format!("create table {temporary}"));
-        conn.execute_batch(&create)
-            .map_err(|e| sqlite_error("create unsigned migration table", e))?;
-        let mut stmt = conn
-            .prepare(&format!("select * from {table}"))
-            .map_err(|e| sqlite_error("read legacy rows", e))?;
-        let columns: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
-        let insert = format!(
-            "insert into {temporary} ({}) values ({})",
-            columns.join(","),
-            vec!["?"; columns.len()].join(",")
-        );
-        let mut rows = stmt
-            .query([])
-            .map_err(|e| sqlite_error("query legacy rows", e))?;
-        while let Some(row) = rows
-            .next()
-            .map_err(|e| sqlite_error("iterate legacy rows", e))?
-        {
-            let mut values = Vec::with_capacity(columns.len());
-            for (i, column) in columns.iter().enumerate() {
-                let mut value: Value = row
-                    .get(i)
-                    .map_err(|e| sqlite_error("read legacy value", e))?;
-                if STRUCTURAL_U64_COLUMNS.contains(&(table, column.as_str())) {
-                    value = match value {
-                        Value::Integer(n) if n >= 0 => {
-                            Value::Blob((n as u64).to_be_bytes().to_vec())
-                        }
-                        Value::Null => Value::Null,
-                        Value::Blob(ref b) if b.len() == 8 => value,
-                        _ => {
-                            return Err(StateError::IndexMigrationFailed(format!(
-                                "invalid unsigned legacy value in {table}.{column}"
-                            )))
-                        }
-                    };
-                }
-                values.push(value);
-            }
-            conn.execute(&insert, rusqlite::params_from_iter(values))
-                .map_err(|e| sqlite_error("copy unsigned legacy row", e))?;
-        }
-        drop(rows);
-        drop(stmt);
-        let indexes = {
-            let mut stmt = conn.prepare("select sql from sqlite_master where tbl_name = ?1 and type in ('index', 'trigger') and sql is not null").map_err(|e| sqlite_error("read legacy indexes", e))?;
-            let result = stmt
-                .query_map([table], |r| r.get::<_, String>(0))
-                .map_err(|e| sqlite_error("query legacy indexes", e))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| sqlite_error("collect legacy indexes", e))?;
-            result
-        };
-        conn.execute_batch(&format!(
-            "drop table {table}; alter table {temporary} rename to {table};"
-        ))
-        .map_err(|e| sqlite_error("install unsigned legacy table", e))?;
-        for sql in indexes {
-            conn.execute_batch(&sql)
-                .map_err(|e| sqlite_error("restore legacy index", e))?;
-        }
-    }
-    Ok(())
-}
-
 fn parse_label_source(value: Option<String>) -> Result<Option<LabelProvenance>, StateError> {
     match value.as_deref() {
         None => Ok(None),
@@ -14346,6 +14289,11 @@ fn validate_schema(conn: &Connection) -> Result<(), StateError> {
     let current = conn
         .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
         .map_err(|err| sqlite_error("read sqlite user_version", err))?;
+    if (1..=22).contains(&current) {
+        return Err(StateError::IndexMigrationFailed(
+            crate::authority_layout::RESET_REQUIRED.into(),
+        ));
+    }
     if current == SCHEMA_VERSION {
         return validate_unsigned_structural_schema(conn);
     }
@@ -14418,53 +14366,38 @@ fn migrate_verification_columns(conn: &Connection) -> Result<(), StateError> {
 }
 
 fn migrate_inner(conn: &Connection) -> Result<(), StateError> {
-    let mut current = conn
+    let current = conn
         .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
         .map_err(|err| sqlite_error("read sqlite user_version", err))?;
+    if (1..=22).contains(&current) {
+        return Err(StateError::IndexMigrationFailed(
+            crate::authority_layout::RESET_REQUIRED.into(),
+        ));
+    }
     if current > SCHEMA_VERSION {
         return Err(StateError::IndexMigrationFailed(format!(
             "sqlite user_version {current} is newer than supported {SCHEMA_VERSION}"
         )));
     }
-    if current == 19 {
-        conn.execute_batch("create index if not exists object_files_by_path_idx on object_files(path); PRAGMA user_version = 20;")
-            .map_err(|e| sqlite_error("install path lookup index", e))?;
-        conn.execute_batch(TAPE_AUDIT_CURSOR_SCHEMA)
-            .map_err(|e| sqlite_error("install replay cursors", e))?;
-        current = 20;
-    }
-    if current == 20 {
-        conn.execute_batch(TAPE_AUDIT_CURSOR_SCHEMA)
-            .map_err(|e| sqlite_error("install replay cursors", e))?;
-        migrate_verification_columns(conn)?;
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
-            .map_err(|e| sqlite_error("update verification schema version", e))?;
-        return validate_unsigned_structural_schema(conn);
-    }
-    if current == 21 {
-        ensure_column(conn, "tapes", "seal_due", "seal_due text")?;
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
-            .map_err(|e| sqlite_error("update seal due schema version", e))?;
-        current = SCHEMA_VERSION;
-    }
     if current == SCHEMA_VERSION {
+        conn.execute_batch(tape_log_projection::SCHEMA)
+            .map_err(|e| sqlite_error("create tape-log projection marks", e))?;
         conn.execute_batch(TAPE_AUDIT_CURSOR_SCHEMA)
             .map_err(|e| sqlite_error("install replay cursors", e))?;
         return validate_unsigned_structural_schema(conn);
     }
-    if (current == 0 && database_has_user_tables(conn)?)
-        || (current != 0 && !(16..SCHEMA_VERSION).contains(&current))
-    {
+    // Every schema from 1 through 22 was refused above, so only an
+    // unversioned database remains: it is either empty or not a catalog.
+    if database_has_user_tables(conn)? {
         return Err(StateError::IndexMigrationFailed(format!(
             "sqlite user_version {current} predates the unsigned structural-index schema {SCHEMA_VERSION}; ordinary startup will not rewrite it in place. To retain the catalog, restore or rebuild it with schema-{SCHEMA_VERSION}-compatible tooling; to intentionally discard a schema-16/17 catalog, use the catalog reset-preflight/reset funnel with an empty preserve list and an exact complete erase allowlist; older shapes require matching older tooling"
         )));
     }
 
-    if matches!(current, 16 | 17) {
-        migrate_legacy_structural_columns(conn)?;
-    }
     conn.execute_batch(MINIMUM_SCHEMA)
         .map_err(|err| sqlite_error("apply sqlite schema", err))?;
+    conn.execute_batch(tape_log_projection::SCHEMA)
+        .map_err(|e| sqlite_error("create tape-log projection marks", e))?;
     ensure_column(
         conn,
         "object_copies",
@@ -15425,6 +15358,37 @@ mod tests {
 
     /// Verification columns migrate while exact erase accepts the prior schema.
     #[test]
+    fn every_predecessor_schema_refuses_without_migration() {
+        for version in 1..=22u32 {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("catalog.sqlite");
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "create table sentinel(value text); insert into sentinel values ('unchanged');",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            drop(conn);
+            let before = std::fs::read(&path).unwrap();
+            for error in [
+                CatalogIndex::open(&path).unwrap_err(),
+                CatalogIndex::open_read_only(&path).unwrap_err(),
+            ] {
+                assert!(
+                    error
+                        .to_string()
+                        .contains(crate::authority_layout::RESET_REQUIRED),
+                    "schema {version}: {error}"
+                );
+            }
+            assert!(
+                std::fs::read(path).unwrap() == before,
+                "refusal must leave catalog bytes unchanged"
+            );
+        }
+    }
+
+    #[test]
     fn verification_schema_migration_and_exact_erase_columns() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("catalog.sqlite");
@@ -15432,20 +15396,14 @@ mod tests {
         index.conn.execute_batch("alter table tapes drop column last_verified_at_utc; alter table tapes drop column last_verification_state; alter table tapes drop column last_verified_edition_digest; PRAGMA user_version = 20;").unwrap();
         drop(index);
         assert!(CatalogIndex::read_legacy_catalog_reset_erase_source(&path).is_ok());
-        let index = CatalogIndex::open(&path).unwrap();
-        assert_eq!(index.schema_version().unwrap(), SCHEMA_VERSION);
-        for column in [
-            "last_verified_at_utc",
-            "last_verification_state",
-            "last_verified_edition_digest",
-        ] {
-            assert!(table_column_exists(&index.conn, "tapes", column).unwrap());
-        }
-        index
-            .conn
-            .execute_batch("PRAGMA user_version = 20; alter table tapes drop column block_size;")
+        assert!(CatalogIndex::open(&path)
+            .unwrap_err()
+            .to_string()
+            .contains(crate::authority_layout::RESET_REQUIRED));
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("alter table tapes drop column block_size;")
             .unwrap();
-        drop(index);
+        drop(conn);
         assert!(CatalogIndex::read_legacy_catalog_reset_erase_source(&path).is_err());
     }
 
@@ -15566,7 +15524,7 @@ mod tests {
 
     /// Schema upgrades preserve tape identity and deferred seals across reopen.
     #[test]
-    fn schema_21_seal_due_upgrade_survives_reopen() {
+    fn schema_21_seal_due_requires_declared_reset() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("index.sqlite");
         let mut index = CatalogIndex::open(&path).unwrap();
@@ -15584,36 +15542,23 @@ mod tests {
             .execute_batch("alter table tapes drop column seal_due; PRAGMA user_version=21;")
             .unwrap();
         drop(index);
-        let index = CatalogIndex::open(&path).unwrap();
-        assert_eq!(index.schema_version().unwrap(), SCHEMA_VERSION);
-        assert!(index
-            .get_tape(&[0x62; 16])
-            .unwrap()
-            .unwrap()
-            .seal_due
-            .is_none());
-        index
-            .conn
-            .execute(
-                "update tapes set seal_due = ?2 where tape_uuid = ?1",
-                params![[0x62u8; 16].as_slice(), "hardware_early_warning"],
-            )
-            .unwrap();
-        drop(index);
-        let index = CatalogIndex::open_read_only(&path).unwrap();
-        assert_eq!(
-            index
-                .get_tape(&[0x62; 16])
-                .unwrap()
-                .unwrap()
-                .seal_due
-                .as_deref(),
-            Some("hardware_early_warning")
+        let before = std::fs::read(&path).unwrap();
+        assert!(CatalogIndex::open(&path)
+            .unwrap_err()
+            .to_string()
+            .contains(crate::authority_layout::RESET_REQUIRED));
+        assert!(CatalogIndex::open_read_only(&path)
+            .unwrap_err()
+            .to_string()
+            .contains(crate::authority_layout::RESET_REQUIRED));
+        assert!(
+            std::fs::read(&path).unwrap() == before,
+            "refusal must leave catalog bytes unchanged"
         );
     }
 
     #[test]
-    fn schema_20_verification_upgrade_does_not_backfill_evidence() {
+    fn schema_20_verification_requires_declared_reset() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("catalog.sqlite");
         let mut index = CatalogIndex::open(&path).unwrap();
@@ -15639,25 +15584,19 @@ mod tests {
             )
             .unwrap();
         drop(index);
-        let index = CatalogIndex::open(&path).unwrap();
-        assert_eq!(index.schema_version().unwrap(), SCHEMA_VERSION);
-        let tape = index.get_tape(&[9; 16]).unwrap().unwrap();
-        assert!(tape.cartridge_generation.is_none());
-        assert!(tape.generation_source.is_none());
-        assert!(tape.last_verified_at_utc.is_none());
-        for table in [
-            "tape_audit_cursors",
-            "tape_assignment_replay_baselines",
-            "tape_pool_assignments",
-        ] {
-            let count: i64 = index
-                .conn
-                .query_row(&format!("select count(*) from {table}"), [], |row| {
-                    row.get(0)
-                })
-                .unwrap();
-            assert_eq!(count, 0, "{table}");
-        }
+        let before = std::fs::read(&path).unwrap();
+        assert!(CatalogIndex::open(&path)
+            .unwrap_err()
+            .to_string()
+            .contains(crate::authority_layout::RESET_REQUIRED));
+        assert!(CatalogIndex::open_read_only(&path)
+            .unwrap_err()
+            .to_string()
+            .contains(crate::authority_layout::RESET_REQUIRED));
+        assert!(
+            std::fs::read(&path).unwrap() == before,
+            "refusal must leave catalog bytes unchanged"
+        );
     }
 
     #[test]
@@ -15719,7 +15658,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_19_without_path_index_migrates_on_open() {
+    fn schema_19_without_path_index_requires_declared_reset() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("catalog.sqlite");
         let index = CatalogIndex::open(&path).unwrap();
@@ -15728,14 +15667,19 @@ mod tests {
             .execute_batch("drop index object_files_by_path_idx; drop table tape_audit_cursors; drop table tape_assignment_replay_baselines; PRAGMA user_version = 19;")
             .unwrap();
         drop(index);
-        let index = CatalogIndex::open(&path).unwrap();
-        assert_eq!(index.schema_version().unwrap(), SCHEMA_VERSION);
-        let present: bool = index.conn.query_row("select exists(select 1 from sqlite_master where type='index' and name='object_files_by_path_idx')", [], |r| r.get(0)).unwrap();
-        assert!(present);
-        assert!(index.table_exists("tape_audit_cursors").unwrap());
-        assert!(index
-            .table_exists("tape_assignment_replay_baselines")
-            .unwrap());
+        let before = std::fs::read(&path).unwrap();
+        assert!(CatalogIndex::open(&path)
+            .unwrap_err()
+            .to_string()
+            .contains(crate::authority_layout::RESET_REQUIRED));
+        assert!(CatalogIndex::open_read_only(&path)
+            .unwrap_err()
+            .to_string()
+            .contains(crate::authority_layout::RESET_REQUIRED));
+        assert!(
+            std::fs::read(&path).unwrap() == before,
+            "refusal must leave catalog bytes unchanged"
+        );
     }
 
     #[test]
@@ -15810,6 +15754,8 @@ mod tests {
     const MINIMUM_TABLES: &[&str] = &[
         "schema_meta",
         "ingested_sources",
+        "tape_log_projection",
+        "tape_log_object_commits",
         "tapes",
         "tape_pools",
         "tape_files",
@@ -16821,7 +16767,8 @@ mod tests {
                     highest_protected_ordinal: 3,
                     total_committed_ordinals: 3,
                 })
-                    .into(),
+                    .try_into()
+                    .unwrap(),
             )
             .expect("project committed object");
 
@@ -18148,8 +18095,7 @@ mod tests {
         let error = CatalogIndex::open(&path).expect_err("v12 catalog must require rebuild");
         assert!(
             matches!(error, StateError::IndexMigrationFailed(ref message)
-                if message.contains("restore or rebuild")
-                    && message.contains(&SCHEMA_VERSION.to_string())),
+                if message.contains(crate::authority_layout::RESET_REQUIRED)),
             "{error}"
         );
     }
@@ -18207,7 +18153,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v16_catalog_migrates_identity_and_idempotency_scope() {
+    fn schema_v16_identity_and_idempotency_require_declared_reset() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-index-stage-two-migration")
             .tempdir()
@@ -18286,20 +18232,19 @@ mod tests {
             .expect("mark stage-one schema");
         drop(conn);
 
-        let index = CatalogIndex::open(&path).expect("migrate v16 catalog");
-        let tape = index.get_tape(&tape_uuid).unwrap().unwrap();
-        assert_eq!(tape.voltag.as_deref(), Some("RMN017L9"));
-        assert_eq!(tape.cartridge_generation.as_deref(), Some("L9"));
-        assert_eq!(tape.generation_source.as_deref(), Some("label"));
-        let operation_kind: String = index
-            .conn
-            .query_row(
-                "select operation_kind from idempotency_keys where idempotency_key = ?1",
-                [idempotency_key.to_string()],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(operation_kind, "close_out");
+        let before = std::fs::read(&path).unwrap();
+        assert!(CatalogIndex::open(&path)
+            .unwrap_err()
+            .to_string()
+            .contains(crate::authority_layout::RESET_REQUIRED));
+        assert!(CatalogIndex::open_read_only(&path)
+            .unwrap_err()
+            .to_string()
+            .contains(crate::authority_layout::RESET_REQUIRED));
+        assert!(
+            std::fs::read(&path).unwrap() == before,
+            "refusal must leave catalog bytes unchanged"
+        );
     }
 
     #[test]
@@ -18319,8 +18264,7 @@ mod tests {
         let error = CatalogIndex::open(&path).expect_err("v8 catalog must require rebuild");
         assert!(
             matches!(error, StateError::IndexMigrationFailed(ref message)
-                if message.contains("restore or rebuild")
-                    && message.contains(&SCHEMA_VERSION.to_string())),
+                if message.contains(crate::authority_layout::RESET_REQUIRED)),
             "{error}"
         );
     }
@@ -19536,7 +19480,7 @@ mod tests {
             panic!("expected migration failure, got {error}");
         };
         assert!(
-            message.contains("legacy catalog is incomplete"),
+            message.contains(crate::authority_layout::RESET_REQUIRED),
             "{message}"
         );
         let conn = Connection::open(&path).expect("reopen raw sqlite");
@@ -19595,7 +19539,10 @@ mod tests {
         assert!(reader.get_tape_pool("must-not-exist").unwrap().is_none());
         drop(reader);
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
-        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert!(
+            std::fs::read(path).unwrap() == before,
+            "refusal must leave catalog bytes unchanged"
+        );
     }
 
     #[test]
@@ -20631,7 +20578,8 @@ mod tests {
                     highest_protected_ordinal: 0,
                     total_committed_ordinals: 3,
                 })
-                    .into(),
+                    .try_into()
+                    .unwrap(),
             )
             .expect("project fresh no-parity append commit");
         assert_eq!(first_report.tape_files_rebuilt, 2);
@@ -20648,7 +20596,8 @@ mod tests {
                     highest_protected_ordinal: 0,
                     total_committed_ordinals: 5,
                 })
-                    .into(),
+                    .try_into()
+                    .unwrap(),
             )
             .expect("project second no-parity append commit");
 
@@ -20836,12 +20785,10 @@ mod tests {
 
         // This is the post-fsync/pre-SQLite cut: replay of the durable record
         // atomically reconstructs the whole batch.
-        let replayed = journal.replay().expect("replay checkpoint journal");
-        for record in &replayed {
-            index
-                .project_checkpoint_record(record)
-                .expect("project replayed checkpoint");
-        }
+        let frozen = journal.freeze().unwrap();
+        index
+            .project_tape_log(&frozen)
+            .expect("project durable tape-log groups");
         assert_eq!(
             index
                 .conn
@@ -20854,7 +20801,10 @@ mod tests {
             .get_tape(&tape_uuid)
             .expect("query tape")
             .expect("checkpoint tape");
-        assert_eq!(tape.last_committed_tape_file, Some(2));
+        assert_eq!(
+            tape.last_committed_tape_file,
+            Some(terminal_record.next_tape_file_number - 1)
+        );
         assert_eq!(tape.total_committed_ordinals, 5);
         assert_eq!(
             tape.state, "sealed",
@@ -20862,11 +20812,9 @@ mod tests {
         );
 
         // The post-SQLite cut is idempotent when startup replays the journal.
-        for record in &replayed {
-            index
-                .project_checkpoint_record(record)
-                .expect("idempotent checkpoint replay");
-        }
+        index
+            .project_tape_log(&frozen)
+            .expect("idempotent tape-log projection");
         assert_eq!(
             index
                 .conn
@@ -20901,9 +20849,9 @@ mod tests {
             rows.collect::<Result<_, _>>().expect("collect spans")
         };
         assert_eq!(
-            spans,
-            vec![(0, Some(0)), (1, Some(2)), (2, Some(6))],
-            "checkpoint replay derives the forward layout backward from the barrier-proved EOD"
+            &spans[..3],
+            &[(0, Some(0)), (1, Some(2)), (2, Some(6))],
+            "native replay preserves ordinary file positions through terminal completion"
         );
         // The per-copy wire span, through the copy→tape-file join.
         let copies = index
@@ -20986,7 +20934,8 @@ mod tests {
                     highest_protected_ordinal: 0,
                     total_committed_ordinals: 3,
                 })
-                    .into(),
+                    .try_into()
+                    .unwrap(),
             )
             .expect("seed pre-hint append prefix");
         let copies = index
@@ -21453,7 +21402,8 @@ mod tests {
                     highest_protected_ordinal: 0,
                     total_committed_ordinals: 3,
                 })
-                    .into(),
+                    .try_into()
+                    .unwrap(),
             )
             .expect("seed append prefix");
 
@@ -21469,7 +21419,8 @@ mod tests {
                     highest_protected_ordinal: 0,
                     total_committed_ordinals: 5,
                 })
-                    .into(),
+                    .try_into()
+                    .unwrap(),
             )
             .expect_err("append projection must reject skipped tape file");
 
@@ -21526,7 +21477,8 @@ mod tests {
                     highest_protected_ordinal: 0,
                     total_committed_ordinals: 3,
                 })
-                    .into(),
+                    .try_into()
+                    .unwrap(),
             )
             .expect_err("append projection must reject overlapping tape file");
 
@@ -21581,7 +21533,8 @@ mod tests {
                     highest_protected_ordinal: 0,
                     total_committed_ordinals: 3,
                 })
-                    .into(),
+                    .try_into()
+                    .unwrap(),
             )
             .expect_err("append projection must reject non-ready tape state");
 
@@ -21641,7 +21594,8 @@ mod tests {
                     highest_protected_ordinal: 0,
                     total_committed_ordinals: 3,
                 })
-                    .into(),
+                    .try_into()
+                    .unwrap(),
             )
             .expect_err("append projection must reject duplicate object id");
 
@@ -21694,7 +21648,8 @@ mod tests {
                     highest_protected_ordinal: 0,
                     total_committed_ordinals: 99,
                 })
-                    .into(),
+                    .try_into()
+                    .unwrap(),
             )
             .expect_err("append projection must reject wrong total");
 
@@ -21747,7 +21702,8 @@ mod tests {
                     highest_protected_ordinal: 0,
                     total_committed_ordinals: 3,
                 })
-                    .into(),
+                    .try_into()
+                    .unwrap(),
             )
             .expect_err("append projection must reject copy/bundle mismatch");
 
@@ -21843,7 +21799,8 @@ mod tests {
                     highest_protected_ordinal: u64::MAX,
                     total_committed_ordinals: u64::MAX,
                 })
-                    .into(),
+                    .try_into()
+                    .unwrap(),
             )
             .expect("full-width bundle projection");
 
@@ -22215,7 +22172,8 @@ mod tests {
                     highest_protected_ordinal: 31,
                     total_committed_ordinals: 4,
                 })
-                    .into(),
+                    .try_into()
+                    .unwrap(),
             )
             .expect("project encrypted object copy");
 

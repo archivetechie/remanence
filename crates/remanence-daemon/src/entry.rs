@@ -122,6 +122,11 @@ pub async fn main_entry_with_registry(
         }
     };
 
+    if let Err(error) = remanence_state::authority_layout::admit_owned_config(&config) {
+        stderr_message!("error: authority layout: {error}");
+        return ExitCode::from(1);
+    }
+
     let socket_path = args
         .socket
         .unwrap_or_else(|| config.daemon.socket_path_or_default());

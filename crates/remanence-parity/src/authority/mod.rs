@@ -551,7 +551,7 @@ mod default_publication_tests {
         }
         let mut publisher = UnboundPublisher(0);
         let mut publication = FilePublication {
-            purpose: FilePurpose::Checkpoint,
+            purpose: FilePurpose::Object,
             files: Vec::new(),
             protected: 0,
             total: 0,

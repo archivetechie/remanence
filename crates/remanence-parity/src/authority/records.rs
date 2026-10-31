@@ -400,10 +400,16 @@ mod neutral_grammar_tests {
                             let old = validate_committed_bundle_shape(&bundle)
                                 .map(|_| ())
                                 .map_err(|e| e.to_string());
-                            let neutral = crate::authority::FilePublication::from(&bundle)
-                                .validate()
-                                .map_err(|e| e.to_string());
-                            assert_eq!(neutral, old, "{bundle:?}");
+                            let physical = crate::authority::FilePublication::try_from(&bundle);
+                            if kind == CommittedBundleKind::CheckpointedThrough {
+                                assert!(
+                                    physical.is_err(),
+                                    "host watermark is not a file publication"
+                                );
+                            } else {
+                                let neutral = physical.unwrap().validate();
+                                assert_eq!(neutral.map_err(|e| e.to_string()), old, "{bundle:?}");
+                            }
                         }
                     }
                 }

@@ -206,9 +206,14 @@ pub(crate) fn write_tape_image_with_init(
             inputs.diagnostic_keys_present,
         )
         .map_err(|error| error.to_string())?;
-    parity
-        .write_bootstrap()
+    let (_, bootstrap_report) = parity
+        .write_bootstrap_report()
         .map_err(|error| format!("write BOT bootstrap: {error}"))?;
+    let mut reports: Vec<CommittedBundle> = bootstrap_report
+        .items
+        .into_iter()
+        .map(|item| (&item.publication).into())
+        .collect();
     let mut object_rows = Vec::with_capacity(inputs.objects.len());
     let mut sidecars = Vec::new();
     for (object_index, object) in inputs.objects.iter().enumerate() {
@@ -270,11 +275,25 @@ pub(crate) fn write_tape_image_with_init(
             ));
         }
         object_rows.push(recovery_row);
+        reports.extend(
+            closed
+                .publication
+                .items
+                .into_iter()
+                .map(|item| (&item.publication).into()),
+        );
         sidecars.extend(closed.sidecars_emitted);
         if inputs.checkpoint_after_objects.contains(&object_index) {
             let checkpoint = parity
                 .close_open_epoch(remanence_parity::CloseReason::Barrier)
                 .map_err(|error| format!("write intermediate checkpoint: {error}"))?;
+            reports.extend(
+                checkpoint
+                    .publication
+                    .items
+                    .into_iter()
+                    .map(|item| (&item.publication).into()),
+            );
             sidecars.extend(checkpoint.sidecars_emitted);
         }
     }
@@ -291,6 +310,7 @@ pub(crate) fn write_tape_image_with_init(
         let _state = parity
             .into_session_state()
             .map_err(|error| error.to_string())?;
+        journal.bundles.extend(reports);
         let entries = journal
             .bundles
             .iter()
@@ -320,6 +340,14 @@ pub(crate) fn write_tape_image_with_init(
     let closed = parity
         .close_for_terminal_index(&prefix_plan, TerminalPrefixReconcileEvidence::Absent)
         .map_err(|error| format!("write terminal prefix: {error}"))?;
+    reports.extend(
+        closed
+            .publication
+            .items
+            .into_iter()
+            .map(|item| (&item.publication).into()),
+    );
+    journal.bundles.extend(reports);
     sidecars.extend(closed.sidecars_emitted);
     let committed = journal
         .load_committed()
@@ -407,11 +435,7 @@ impl TapeReportPublisher for ImageJournal {
     }
 
     fn load_committed(&self) -> Result<CommittedState, JournalError> {
-        let retained_end = self
-            .bundles
-            .iter()
-            .rposition(|bundle| bundle.kind == CommittedBundleKind::CheckpointedThrough)
-            .map_or(0, |index| index + 1);
+        let retained_end = self.bundles.len();
         let retained = &self.bundles[..retained_end];
         let last = retained
             .iter()
@@ -485,7 +509,7 @@ impl TerminalTailAuthority for ImageTerminalAuthority<'_> {
         }
         commit.publication = self
             .journal
-            .publish_terminal_component(&(&commit.journal_bundle).into())
+            .publish_terminal_component(&commit.media_publication().map_err(|e| e.to_string())?)
             .map_err(|error| error.to_string())?;
         self.progress = commit.next_progress;
         Ok(())

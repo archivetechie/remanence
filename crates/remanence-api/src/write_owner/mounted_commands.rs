@@ -233,6 +233,7 @@ pub(super) fn finalize(
         let pending = remanence_state::TapeAuthority::open(
             &terminal.checkpoint_journal_dir,
             request.tape_uuid,
+            index.path(),
         )
         .and_then(|journal| journal.pending_finalization())
         .map_err(crate::status_from_state_error)?;

@@ -111,22 +111,6 @@ pub fn publish_import_authority(publications: &[ImportPublication]) -> io::Resul
     Ok(())
 }
 
-/// Stage this tape's structural member and describe its eventual publication.
-pub fn stage_structural_import(
-    source_directory: &Path,
-    staging_directory: &Path,
-    destination_directory: &Path,
-    tape_uuid: [u8; 16],
-) -> io::Result<ImportPublication> {
-    let source = super::structural_path_in(source_directory, tape_uuid);
-    let staged = super::structural_path_in(staging_directory, tape_uuid);
-    copy_import_authority(&source, &staged)?;
-    Ok(ImportPublication {
-        source: staged,
-        destination: super::structural_path_in(destination_directory, tape_uuid),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

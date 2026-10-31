@@ -782,7 +782,7 @@ mod tests {
     use super::super::tests::{finalization_intent, record, second_record};
     use super::*;
     use crate::authority::TapeAuthorityWriter;
-    use crate::authority::{fixtures::AuthorityBuilder, TapeAuthorityLease};
+    use crate::authority::{legacy::TapeAuthorityLease, legacy_fixtures::AuthorityBuilder};
 
     use crate::authority::contract_tests::{finalization_contract, view_writer_contract};
     #[test]

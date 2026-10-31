@@ -322,6 +322,7 @@ fn rem_debug_only_reason(cmd: &Command) -> Option<&'static str> {
         | Command::GetClient(_)
         | Command::Watch { .. }
         | Command::RebuildCatalogFromJournals { .. }
+        | Command::TapeLog { .. }
         | Command::Catalog { .. }
         | Command::Archive { .. }
         | Command::DaemonClient { .. }
@@ -370,6 +371,7 @@ fn rem_only_reason(cmd: &Command) -> Option<&'static str> {
         | Command::Unlock { .. }
         | Command::Watch { .. }
         | Command::RebuildCatalogFromJournals { .. }
+        | Command::TapeLog { .. }
         | Command::Catalog { .. }
         | Command::Archive { .. }
         | Command::Tape { .. } => None,
@@ -490,12 +492,15 @@ enum RemCommand {
         coalesce_window: String,
     },
 
-    /// Rebuild the local SQLite catalog projection from audit and tape journals.
+    /// Rebuild the local SQLite catalog projection from the audit log and the tape logs.
     RebuildCatalogFromJournals {
         /// Path to `/etc/rem/config.toml`.
         #[arg(long, value_name = "PATH", default_value = "/etc/rem/config.toml")]
         config: PathBuf,
     },
+
+    /// Declare the offline state reset required by an authority-layout change.
+    ResetCatalog(CatalogResetArgs),
 
     /// Query daemon process health and version over Layer 5 gRPC.
     Daemon {
@@ -692,6 +697,9 @@ impl From<RemCommand> for Command {
             RemCommand::RebuildCatalogFromJournals { config } => {
                 Self::RebuildCatalogFromJournals { config }
             }
+            RemCommand::ResetCatalog(args) => Self::Catalog {
+                command: LocalCatalogCommand::Reset(args),
+            },
             RemCommand::Daemon {
                 endpoint,
                 json,
@@ -816,6 +824,7 @@ fn state_changing_target(cmd: &Command) -> Option<&str> {
         | Command::GetClient(_)
         | Command::Watch { .. }
         | Command::RebuildCatalogFromJournals { .. }
+        | Command::TapeLog { .. }
         | Command::Catalog { .. }
         | Command::DaemonClient { .. }
         | Command::OperationClient { .. }
@@ -960,6 +969,12 @@ pub fn parse_binary_byte_count(s: &str, label: &str) -> Result<u64, String> {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Inspect or explicitly repair the per-tape host authority log.
+    TapeLog {
+        #[command(subcommand)]
+        command: TapeLogCommand,
+    },
+
     /// List every library `discover()` found on this host.
     #[command(alias = "libs")]
     Libraries {
@@ -1095,7 +1110,7 @@ enum Command {
         coalesce_window: String,
     },
 
-    /// Rebuild the local SQLite catalog projection from audit and tape journals.
+    /// Rebuild the local SQLite catalog projection from the audit log and the tape logs.
     RebuildCatalogFromJournals {
         /// Path to `/etc/rem/config.toml`.
         #[arg(long, value_name = "PATH", default_value = "/etc/rem/config.toml")]
@@ -1300,6 +1315,103 @@ enum Command {
         locator: String,
         expected_sha256: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum TapeLogCommand {
+    /// Report the last valid closed boundary and any damage without mutation.
+    Inspect {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        tape_uuid: uuid::Uuid,
+    },
+    /// Archive a damaged suffix and retain an exact validated closed sequence.
+    RepairTail {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        tape_uuid: uuid::Uuid,
+        #[arg(long)]
+        through_sequence: u64,
+        #[arg(long)]
+        confirm_discard_corrupt_tail: bool,
+        /// Rebuild this tape's projection atomically after repairing below its mark.
+        #[arg(long)]
+        rebuild_projection: bool,
+    },
+}
+
+fn run_tape_log(command: &TapeLogCommand, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    if let TapeLogCommand::Inspect { config, tape_uuid } = command {
+        let result =
+            remanence_state::authority_layout::load_runtime_config(config).and_then(|cfg| {
+                let store = remanence_state::tape_log::store::Store::open(
+                    cfg.journal.dir.join("tapes"),
+                    *tape_uuid.as_bytes(),
+                    &cfg.index.sqlite_path,
+                )?;
+                Ok(store.inspect_tail()?)
+            });
+        return match result {
+            Ok(report) => {
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    serde_json::json!({"tape_uuid": tape_uuid.to_string(), "tape_incarnation": 1, "through_sequence": report.through_sequence.to_string(), "valid_bytes": report.valid_bytes.to_string(), "original_bytes": report.original_bytes.to_string(), "damage": report.damage})
+                );
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                let _ = writeln!(err, "tape-log inspect: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    let TapeLogCommand::RepairTail {
+        config,
+        tape_uuid,
+        through_sequence,
+        confirm_discard_corrupt_tail,
+        rebuild_projection,
+    } = command
+    else {
+        unreachable!("inspection handled above")
+    };
+    if !confirm_discard_corrupt_tail {
+        let _ = writeln!(err, "repair-tail requires --confirm-discard-corrupt-tail");
+        return ExitCode::FAILURE;
+    }
+    let result =
+        remanence_state::StateHandle::open_from_config_file(config).and_then(|mut state| {
+            state.repair_tape_log_tail(
+                *tape_uuid.as_bytes(),
+                *through_sequence,
+                *rebuild_projection,
+            )
+        });
+    match result {
+        Ok(evidence) => {
+            let _ = writeln!(
+                out,
+                "{}",
+                serde_json::json!({
+                    "tape_uuid": tape_uuid.to_string(), "tape_incarnation": 1,
+                    "through_sequence": evidence.through_sequence.to_string(),
+                    "archive": evidence.archive, "archive_sha256": bytes_to_hex(&evidence.digest),
+                    "reconciliation_record": evidence.reconciliation_record,
+                    "original_bytes": evidence.original_len.to_string(), "retained_bytes": evidence.retained_end.to_string(),
+                    "projection_rebuilt": rebuild_projection,
+                    "physical_tail_reconciliation_required": true,
+                })
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            let _ = writeln!(err, "repair-tail: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -4159,6 +4271,7 @@ fn cli_transport_factory(access: CliTransportAccess) -> Result<CliTransportFacto
 #[cfg(all(test, target_os = "linux"))]
 thread_local! {
     // Inject only the device boundary so CLI regressions run the real init and catalog path.
+    static TEST_CLI_DEVICE_LOCK_ROOT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
     static TEST_CLI_TRANSPORT_FACTORY: std::cell::RefCell<Option<CliTransportFactory>> =
         std::cell::RefCell::new(None);
 }
@@ -4230,6 +4343,36 @@ fn run_cli(cli: ParsedCli, mode: CliMode, registry: ForeignFormatRegistry) -> Ex
 /// `DiscoveryReport` and capture every byte we'd print. Returns the
 /// exit code rather than printing-and-exiting so the test can assert
 /// on it.
+/// Exercise production offline catalog parsing/dispatch with discovery forbidden.
+#[cfg(feature = "fixtures")]
+pub fn run_offline_catalog_for_test(
+    args: &[&str],
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let (command, mode) = if args.first() == Some(&"rem-debug") {
+        let cli = DebugCli::parse_from(args);
+        assert!(matches!(cli.command, Command::TapeLog { .. }));
+        (cli.into(), CliMode::Debug)
+    } else {
+        let cli = Cli::parse_from(args);
+        assert!(matches!(
+            cli.command,
+            RemCommand::ResetCatalog(_) | RemCommand::RebuildCatalogFromJournals { .. }
+        ));
+        (cli.into(), CliMode::Rem)
+    };
+    run_with_mode(
+        command,
+        mode,
+        || panic!("offline catalog command reached discovery"),
+        &mut io::empty(),
+        out,
+        err,
+        &ForeignFormatRegistry::default(),
+    )
+}
+
 #[cfg(test)]
 fn run<F>(cli: Cli, discover_fn: F, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode
 where
@@ -4380,6 +4523,7 @@ where
         | Command::Unlock { .. }
         | Command::Watch { .. }
         | Command::RebuildCatalogFromJournals { .. }
+        | Command::TapeLog { .. }
         | Command::Catalog { .. }
         | Command::Tape { .. }
         | Command::Archive { .. } => {}
@@ -4454,6 +4598,9 @@ where
     if let Command::Watch { coalesce_window } = &cli.command {
         return run_watch(coalesce_window, out, err);
     }
+    if let Command::TapeLog { command } = &cli.command {
+        return run_tape_log(command, out, err);
+    }
     if let Command::RebuildCatalogFromJournals { config } = &cli.command {
         return run_rebuild_catalog_from_journals(config, out, err);
     }
@@ -4502,6 +4649,31 @@ where
                 out,
                 err,
             );
+        }
+    }
+
+    let configured_state = match &cli.command {
+        Command::Tape { command } => match command {
+            TapeCommand::BotProbe(a) => Some(&a.config),
+            TapeCommand::AdoptBootstrap(a) => Some(&a.config),
+            TapeCommand::Alerts(a) => Some(&a.config),
+            TapeCommand::Init(a) => Some(&a.config),
+            TapeCommand::WaitReady(a) => Some(&a.config),
+            _ => None,
+        },
+        Command::Archive { command } => match command.as_ref() {
+            ArchiveCommand::Write(a) => Some(&a.config),
+            ArchiveCommand::Read(a) => Some(&a.config),
+            ArchiveCommand::ExportObject(a) => Some(&a.config),
+            ArchiveCommand::Verify(a) => Some(&a.config),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(path) = configured_state {
+        if let Err(error) = remanence_state::authority_layout::load_runtime_config(path) {
+            let _ = writeln!(err, "error: authority layout: {error}");
+            return ExitCode::FAILURE;
         }
     }
 
@@ -4605,13 +4777,18 @@ where
                 out,
                 err,
                 |handle, policy| {
+                    let lock_root = PathBuf::from(remanence_api::mount_support::DEVICE_LOCK_ROOT);
+                    #[cfg(all(test, target_os = "linux"))]
+                    let lock_root = TEST_CLI_DEVICE_LOCK_ROOT
+                        .with(|slot| slot.borrow().clone())
+                        .unwrap_or(lock_root);
                     remanence_api::mount_support::unload_library_bay(
                         handle,
                         bay,
                         dest,
                         policy,
                         config.as_deref(),
-                        Path::new(remanence_api::mount_support::DEVICE_LOCK_ROOT),
+                        &lock_root,
                     )
                     .map(|outcome| {
                         let where_to = match dest {
@@ -4737,6 +4914,7 @@ where
         // Watch is dispatched before discovery; reaching here means a
         // bug in the early-return logic above.
         Command::Watch { .. } => unreachable!("rem watch dispatched pre-discovery"),
+        Command::TapeLog { .. } => unreachable!("tape-log command dispatched pre-discovery"),
         Command::RebuildCatalogFromJournals { .. } => {
             unreachable!("catalog rebuild dispatched pre-discovery")
         }
@@ -7535,21 +7713,7 @@ fn run_rebuild_catalog_from_journals(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    let mut handle = match remanence_state::StateHandle::open_from_config_file(config) {
-        Ok(handle) => handle,
-        Err(error) => {
-            let _ = writeln!(err, "error: {error}");
-            return ExitCode::from(1);
-        }
-    };
-    let rebuilt = handle
-        .rebuild_index_from_journals()
-        .map_err(|e| e.to_string())
-        .and_then(|report| {
-            remanence_api::reconcile_checkpoint_journal_projections(&mut handle)
-                .map_err(|e| e.to_string())?;
-            Ok(report)
-        });
+    let rebuilt = remanence_state::StateHandle::rebuild_projection_from_config_file(config);
     match rebuilt {
         Ok(report) => {
             let _ = writeln!(out, "rebuild-catalog-from-journals ok");
@@ -7557,7 +7721,7 @@ fn run_rebuild_catalog_from_journals(
             let _ = writeln!(out, "  tape files: {}", report.tape_files_rebuilt);
             let _ = writeln!(out, "  object copies: {}", report.object_copies_rebuilt);
             let _ = writeln!(out, "  audit records: {}", report.audit_records_replayed);
-            let _ = writeln!(out, "  tape journals: {}", report.journal_records_replayed);
+            let _ = writeln!(out, "  tape logs: {}", report.tapes_rebuilt);
             for warning in &report.preserved_fallbacks {
                 let _ = writeln!(err, "WARN preserved-not-replayed: {warning}");
             }
@@ -7723,7 +7887,7 @@ struct TapeRetireReport {
 }
 
 fn run_tape_retire(args: &TapeRetireArgs, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
-    let config = match remanence_state::load_config(&args.config) {
+    let config = match remanence_state::authority_layout::load_runtime_config(&args.config) {
         Ok(config) => config,
         Err(error) => {
             let _ = writeln!(err, "error: {error}");
@@ -8049,7 +8213,7 @@ fn load_state_config(
     config_path: &Path,
     err: &mut dyn Write,
 ) -> Result<(remanence_state::StatePaths, remanence_state::RemConfig), ExitCode> {
-    let config = match remanence_state::load_config(config_path) {
+    let config = match remanence_state::authority_layout::load_runtime_config(config_path) {
         Ok(config) => config,
         Err(error) => {
             let _ = writeln!(err, "error: {error}");
@@ -8980,7 +9144,7 @@ fn run_tape_alerts(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    let config = match remanence_state::load_config(&args.config) {
+    let config = match remanence_state::authority_layout::load_runtime_config(&args.config) {
         Ok(config) => config,
         Err(error) => {
             let _ = writeln!(err, "error: {error}");
@@ -9150,7 +9314,7 @@ fn run_tape_wait_ready(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    let config = match remanence_state::load_config(&args.config) {
+    let config = match remanence_state::authority_layout::load_runtime_config(&args.config) {
         Ok(config) => config,
         Err(error) => {
             let _ = writeln!(err, "error: {error}");
@@ -10660,7 +10824,7 @@ fn run_tape_bot_probe(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    let config = match remanence_state::load_config(&args.config) {
+    let config = match remanence_state::authority_layout::load_runtime_config(&args.config) {
         Ok(config) => config,
         Err(error) => return print_command_error(error.to_string(), report, err),
     };
@@ -10724,7 +10888,7 @@ fn run_tape_adopt_bootstrap(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    let config = match remanence_state::load_config(&args.config) {
+    let config = match remanence_state::authority_layout::load_runtime_config(&args.config) {
         Ok(config) => config,
         Err(error) => return print_command_error(error.to_string(), report, err),
     };
@@ -11060,7 +11224,7 @@ fn run_tape_init(
             return ExitCode::from(1);
         }
     };
-    let config = match remanence_state::load_config(&args.config) {
+    let config = match remanence_state::authority_layout::load_runtime_config(&args.config) {
         Ok(config) => config,
         Err(error) => {
             let _ = writeln!(err, "error: {error}");
@@ -21091,6 +21255,23 @@ pool_id = "init-test"
     }
 
     #[test]
+    fn declared_reset_guidance_command_requires_existing_confirmation_before_discovery() {
+        let cli = Cli::parse_from(["rem", "reset-catalog", "--config", "/no/such/config.toml"]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run(
+            cli,
+            || panic!("reset must bypass discovery"),
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, ExitCode::from(2));
+        assert!(String::from_utf8(err)
+            .unwrap()
+            .contains("--i-understand-this-erases-the-catalog"));
+    }
+
+    #[test]
     fn catalog_reset_requires_confirmation_flag() {
         let cli = DebugCli::parse_from([
             "rem-debug",
@@ -21553,6 +21734,376 @@ tape_catalog_dir = "{0}/cache/tapes"
             .filter(|opcode| matches!(opcode, 0x1e | 0x1b | 0xa5))
             .collect();
         assert_eq!(controls, [0x1b, 0xa5]);
+    }
+
+    #[test]
+    fn unload_stranded_lock_recovers_during_interrupted_reset_without_sqlite() {
+        use remanence_chaos::model::{ModelTransport, VirtualTape, VirtualWorld};
+        use std::sync::Mutex;
+        let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
+            "UNLOAD-LIB",
+            256,
+            "UNLOAD-DRIVE",
+            1024,
+            1,
+        )));
+        let root = tempfile::tempdir().unwrap();
+        let config = write_retire_test_config(root.path());
+        TEST_CLI_DEVICE_LOCK_ROOT.with(|slot| *slot.borrow_mut() = Some(root.path().join("locks")));
+        fs::write(
+            root.path().join("catalog-reset.in-progress"),
+            b"interrupted reset",
+        )
+        .unwrap();
+        // An unusable catalog proves recovery never opens SQLite.
+        fs::create_dir_all(root.path().join("index/rem-state.sqlite")).unwrap();
+        world
+            .lock()
+            .unwrap()
+            .drive_states
+            .entry(256)
+            .or_default()
+            .removal_prevented = true;
+        let library = {
+            let mut world = world.lock().unwrap();
+            world.put_tape_in_drive(256, "TAPE", Some(1024), VirtualTape::default());
+            world.library_snapshot()
+        };
+        let factory_world = world.clone();
+        TEST_CLI_TRANSPORT_FACTORY.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(move |path| {
+                let role = factory_world.lock().unwrap().role_for_path(path).unwrap();
+                Ok(Box::new(ModelTransport::new(factory_world.clone(), role)))
+            }));
+        });
+        let cli = DebugCli::try_parse_from([
+            "rem-debug",
+            "unload",
+            "--config",
+            config.to_str().unwrap(),
+            "--allow",
+            "UNLOAD-LIB",
+            "--bay",
+            "256",
+            "--dest",
+            "1024",
+            "UNLOAD-LIB",
+        ])
+        .unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_debug(
+            cli,
+            || {
+                Ok(DiscoveryReport {
+                    libraries: vec![library],
+                    unattached_drives: vec![],
+                    complete: true,
+                    incomplete_evidence: vec![],
+                    warnings: vec![],
+                })
+            },
+            &mut out,
+            &mut err,
+        );
+        TEST_CLI_TRANSPORT_FACTORY.with(|slot| assert!(slot.borrow_mut().take().is_none()));
+        TEST_CLI_DEVICE_LOCK_ROOT.with(|slot| slot.borrow_mut().take());
+        assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
+        let controls: Vec<_> = world
+            .lock()
+            .unwrap()
+            .command_log
+            .iter()
+            .map(|c| c.opcode)
+            .filter(|opcode| matches!(opcode, 0x1e | 0x1b | 0xa5))
+            .collect();
+        assert_eq!(controls, [0x1b, 0x1e, 0x1b, 0xa5]);
+        assert!(root.path().join("catalog-reset.in-progress").exists());
+    }
+
+    #[test]
+    fn authority_layout_refusals_precede_device_discovery() {
+        for layout in ["unmarked", "schema22", "mixed", "reset-in-progress"] {
+            let root = tempfile::tempdir().unwrap();
+            let config = write_retire_test_config(root.path());
+            drop(remanence_state::StateHandle::open_from_config_file(&config).unwrap());
+            let expected = match layout {
+                "unmarked" => {
+                    fs::remove_file(root.path().join("authority-format")).unwrap();
+                    "This state directory uses the two-journal authority layout."
+                }
+                "schema22" => {
+                    let path = root.path().join("index/rem-state.sqlite");
+                    let mut database = fs::read(&path).unwrap();
+                    // SQLite's application user_version is a big-endian u32
+                    // at header offset 60. The closed handle has checkpointed WAL.
+                    database[60..64].copy_from_slice(&22_u32.to_be_bytes());
+                    fs::write(path, database).unwrap();
+                    "This state directory uses the two-journal authority layout."
+                }
+                "mixed" => {
+                    fs::write(root.path().join("journals/obsolete.remcheckpoint"), b"old").unwrap();
+                    "marked tape-log layout contains old authority files"
+                }
+                "reset-in-progress" => {
+                    fs::write(root.path().join("catalog-reset.in-progress"), b"fenced").unwrap();
+                    "requires an exact reset rerun"
+                }
+                _ => unreachable!(),
+            };
+            let cli = DebugCli::parse_from([
+                "rem-debug",
+                "tape",
+                "alerts",
+                "--bay",
+                "256",
+                "--config",
+                config.to_str().unwrap(),
+            ]);
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let code = run_debug(
+                cli,
+                || panic!("discovery reached for {layout}"),
+                &mut out,
+                &mut err,
+            );
+            assert_eq!(code, ExitCode::from(1));
+            let error = String::from_utf8(err).unwrap();
+            assert!(error.contains(expected), "{layout}: {error}");
+        }
+    }
+
+    #[test]
+    fn tape_log_inspect_does_not_install_authority_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let config = write_retire_test_config(root.path());
+        let cli = DebugCli::parse_from([
+            "rem-debug",
+            "tape-log",
+            "inspect",
+            "--config",
+            config.to_str().unwrap(),
+            "--tape-uuid",
+            "00000000-0000-0000-0000-000000000001",
+        ]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert_ne!(
+            run_debug(
+                cli,
+                || panic!("inspect must not discover media"),
+                &mut out,
+                &mut err
+            ),
+            ExitCode::SUCCESS
+        );
+        assert!(!root.path().join("authority-format").exists());
+        assert!(!root.path().join("journals").exists());
+        assert!(!root.path().join("index").exists());
+        assert!(!root.path().join("state.lock").exists());
+    }
+
+    /// Every file and directory below `path`, sorted.
+    fn state_tree(path: &Path) -> Vec<PathBuf> {
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap().path();
+            if entry.is_dir() {
+                entries.extend(state_tree(&entry));
+            }
+            entries.push(entry);
+        }
+        entries.sort();
+        entries
+    }
+
+    /// Read-only and daemon-delegating commands get past layout validation
+    /// while a daemon holds the state lock and its catalog open, and
+    /// `tape-log inspect` creates nothing.
+    #[test]
+    fn read_only_commands_pass_layout_validation_beside_the_daemon_state_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let config = write_retire_test_config(root.path());
+        drop(remanence_state::StateHandle::open_from_config_file(&config).unwrap());
+        let sqlite = root.path().join("index/rem-state.sqlite");
+        let fence = remanence_state::CatalogIndex::open(&sqlite)
+            .unwrap()
+            .record_tape_io_fence(remanence_state::TapeIoFenceInput {
+                tape_uuid: [0x31; 16],
+                barcode: None,
+                reason: "transfer_error".into(),
+                evidence_json: None,
+            })
+            .unwrap();
+        let log = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/tape-log/parity-off-two-objects.remtape");
+        fs::copy(
+            log,
+            root.path()
+                .join("journals/tapes/a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1.remtape"),
+        )
+        .unwrap();
+
+        // The daemon: lifetime state lock, open catalog, served socket.
+        let _lock = remanence_state::StateLockGuard::acquire(root.path()).unwrap();
+        let _catalog = remanence_state::CatalogIndex::open(&sqlite).unwrap();
+        let listener =
+            std::os::unix::net::UnixListener::bind(root.path().join("rem.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server_sqlite = sqlite.clone();
+        let server = std::thread::spawn(move || {
+            daemon_runtime().unwrap().block_on(async move {
+                let state = remanence_api::ApiState::new(
+                    remanence_state::CatalogIndex::open(&server_sqlite).unwrap(),
+                );
+                let incoming = tokio_stream::wrappers::UnixListenerStream::new(
+                    tokio::net::UnixListener::from_std(listener).unwrap(),
+                );
+                tonic::transport::Server::builder()
+                    .add_service(pb::library_service_server::LibraryServiceServer::new(
+                        state.library_service(),
+                    ))
+                    .serve_with_incoming_shutdown(incoming, async {
+                        let _ = stopped.await;
+                    })
+                    .await
+                    .unwrap();
+            })
+        });
+        let config = config.to_str().unwrap();
+        let rem = |args: &[&str]| {
+            let mut argv = vec!["rem"];
+            argv.extend_from_slice(args);
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let code = run(
+                Cli::try_parse_from(argv).unwrap(),
+                || panic!("catalog command reached discovery"),
+                &mut out,
+                &mut err,
+            );
+            (
+                code,
+                String::from_utf8(out).unwrap(),
+                String::from_utf8(err).unwrap(),
+            )
+        };
+        let debug = |args: &[&str], report: Option<DiscoveryReport>| {
+            let mut argv = vec!["rem-debug"];
+            argv.extend_from_slice(args);
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let code = run_debug(
+                DebugCli::try_parse_from(argv).unwrap(),
+                || {
+                    report.ok_or(DiscoveryError::EnumerationDenied {
+                        cause: remanence_library::IoErrorKind {
+                            kind: "PermissionDenied",
+                            message: "test discovery".into(),
+                            raw_os_error: None,
+                        },
+                    })
+                },
+                &mut out,
+                &mut err,
+            );
+            (
+                code,
+                String::from_utf8(out).unwrap(),
+                String::from_utf8(err).unwrap(),
+            )
+        };
+        let past_layout = |name: &str, err: &str| {
+            assert!(!err.contains("state lock"), "{name}: {err}");
+            assert!(!err.contains("authority layout"), "{name}: {err}");
+        };
+
+        let (code, _, err) = rem(&["tape", "quarantine", "list", "--config", config]);
+        assert_eq!(code, ExitCode::SUCCESS, "list: {err}");
+        let (code, _, err) = rem(&[
+            "tape",
+            "quarantine",
+            "show",
+            "mrq-missing",
+            "--config",
+            config,
+        ]);
+        assert_eq!(code, ExitCode::from(1));
+        past_layout("show", &err);
+        assert!(
+            err.contains("no active media-readiness quarantine"),
+            "{err}"
+        );
+        let (code, out, err) = rem(&[
+            "tape",
+            "quarantine",
+            "release",
+            &fence.quarantine_id,
+            "--after-settled-inventory",
+            "--ack",
+            "verified",
+            "--json",
+            "--config",
+            config,
+        ]);
+        assert_eq!(code, ExitCode::SUCCESS, "release: {err}");
+        assert!(out.contains("released"), "{out}");
+
+        let empty = DiscoveryReport {
+            unattached_drives: vec![],
+            complete: true,
+            incomplete_evidence: vec![],
+            libraries: vec![],
+            warnings: vec![],
+        };
+        let (code, _, err) = debug(
+            &["tape", "alerts", "--bay", "256", "--config", config],
+            Some(empty),
+        );
+        assert_eq!(code, ExitCode::from(1));
+        past_layout("alerts", &err);
+        let (code, _, err) = debug(
+            &[
+                "--allow",
+                "LIB-A",
+                "tape",
+                "bot-probe",
+                "RMT001L9",
+                "--library",
+                "LIB-A",
+                "--expected-home-slot",
+                "1005",
+                "--json",
+                "--config",
+                config,
+            ],
+            None,
+        );
+        assert_ne!(code, ExitCode::SUCCESS);
+        past_layout("bot-probe", &err);
+        assert!(err.contains("test discovery"), "{err}");
+
+        let before = state_tree(root.path());
+        let (code, out, err) = debug(
+            &[
+                "tape-log",
+                "inspect",
+                "--config",
+                config,
+                "--tape-uuid",
+                "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
+            ],
+            None,
+        );
+        assert_eq!(code, ExitCode::SUCCESS, "inspect: {err}");
+        assert!(out.contains("\"through_sequence\":\"7\""), "{out}");
+        assert_eq!(state_tree(root.path()), before, "inspect creates nothing");
+
+        stop.send(()).unwrap();
+        server.join().unwrap();
     }
 
     fn write_retire_test_config(root: &Path) -> PathBuf {
@@ -25656,4 +26207,34 @@ fn proto_fence_json(record: &pb::TapeIoFence) -> serde_json::Value {
     json!({"quarantine_id": record.quarantine_id, "tape_uuid": bytes_to_uuid_text(&record.tape_uuid),
         "barcode": record.barcode, "endpoint_key": record.endpoint_key, "reason": record.reason,
         "state": record.state, "release_ack": record.release_ack, "updated_at_utc": record.updated_at_utc})
+}
+
+#[cfg(test)]
+mod tape_log_cli_tests {
+    use super::*;
+    #[test]
+    fn repair_tail_requires_confirmation_before_opening_state() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("absent.toml");
+        let mut out = Vec::new();
+        let mut error = Vec::new();
+        let result = run_tape_log(
+            &TapeLogCommand::RepairTail {
+                config: config.clone(),
+                tape_uuid: uuid::Uuid::from_bytes([0x77; 16]),
+                through_sequence: 4,
+                confirm_discard_corrupt_tail: false,
+                rebuild_projection: true,
+            },
+            &mut out,
+            &mut error,
+        );
+        assert_eq!(result, ExitCode::FAILURE);
+        assert_eq!(
+            String::from_utf8(error).unwrap(),
+            "repair-tail requires --confirm-discard-corrupt-tail\n"
+        );
+        assert!(out.is_empty());
+        assert!(!config.exists());
+    }
 }

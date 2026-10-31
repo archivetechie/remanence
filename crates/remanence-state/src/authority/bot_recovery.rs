@@ -28,6 +28,7 @@ impl BotRecoveryAuthority {
     /// foreign or catalogless tape.
     pub fn try_open(
         dir: impl AsRef<Path>,
+        index_path: &Path,
         tape_uuid: [u8; 16],
         block_size: u32,
     ) -> Result<Option<Self>, StateError> {
@@ -35,7 +36,7 @@ impl BotRecoveryAuthority {
         if !TapeAuthority::exists(dir, tape_uuid)? {
             return Ok(None);
         }
-        let journal = TapeAuthority::open(dir, tape_uuid)?;
+        let journal = TapeAuthority::open(dir, tape_uuid, index_path)?;
         let lease = match journal.acquire_exclusive() {
             Ok(lease) => lease,
             Err(ordinary_error) => {

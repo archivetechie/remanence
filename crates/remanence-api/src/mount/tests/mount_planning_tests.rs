@@ -118,12 +118,18 @@ fn planning_harness(
     let plan = sink
         .plan_terminal_index_close(identity.capture().unwrap())
         .unwrap();
-    drop(sink);
+    let check = sink.into_session_state().unwrap().commit_check();
     let mut checkpoint = manual_finalize_checkpoint(uuid, block_size);
     checkpoint.scheme = Some(scheme.clone());
     checkpoint.eod_lba = raw.0;
     checkpoint.objects[0].copy.first_body_lba = summary.physical_start_lba.unwrap();
     checkpoint.objects[0].copy.first_parity_data_ordinal = Some(0);
+    checkpoint.objects[0].copy.protected_until_ordinal = Some(
+        summary
+            .committed_bundle()
+            .unwrap()
+            .highest_protected_ordinal,
+    );
     if let CheckpointObjectRecoveryRepresentation::Plaintext {
         manifest_first_chunk_lba,
         ..
@@ -136,43 +142,14 @@ fn planning_harness(
     object.entries[0].object_recovery_row =
         Some(checkpoint.objects[0].object_recovery_row.to_parity_row());
     checkpoint.object_tape_file_bundles = vec![object.clone()];
-    let mut journal = remanence_parity::authority::fixtures::RowAuthorityBuilder::new(
-        h.state.checkpoint_journal_dir.parent().unwrap(),
-        uuid,
-        block_size,
-        scheme.clone(),
-    )
-    .build()
-    .unwrap();
-    journal
-        .publish_fixture(&remanence_parity::authority::ShadowPublication {
-            bundles: vec![(bundles.0[0]).clone()],
-        })
-        .unwrap();
-    journal
-        .publish_fixture(&remanence_parity::authority::ShadowPublication {
-            bundles: vec![(object).clone()],
-        })
-        .unwrap();
-    journal
-        .publish_fixture(&remanence_parity::authority::ShadowPublication {
-            bundles: vec![(CommittedBundle {
-                kind: CommittedBundleKind::CheckpointedThrough,
-                entries: vec![],
-                highest_protected_ordinal: 0,
-                total_committed_ordinals: 3,
-            })
-            .clone()],
-        })
-        .unwrap();
-    drop(journal);
+    let mut report: remanence_state::authority::AuthorityCommit = (&checkpoint).into();
+    report.check = Some(check);
     remanence_state::authority::fixtures::AuthorityBuilder::new(
         h.state.checkpoint_journal_dir.as_ref(),
         uuid,
     )
+    .commit(report)
     .build()
-    .unwrap()
-    .append(&checkpoint)
     .unwrap();
     let mut index = h.state.index_write().unwrap();
     index
@@ -184,19 +161,16 @@ fn planning_harness(
             force: false,
         })
         .unwrap();
+    use remanence_state::authority::TapeAuthorityView;
+    let authority = remanence_state::TapeAuthority::open(
+        h.state.checkpoint_journal_dir.as_ref(),
+        uuid,
+        index.path(),
+    )
+    .unwrap();
     index
-        .project_committed_tape_file_bundle(
-            remanence_state::TapeJournalIndexInput {
-                tape_uuid: uuid,
-                block_size,
-                scheme: Some(scheme),
-                journal_offset_bytes: 0,
-            },
-            &bundles.0[0],
-        )
+        .project_tape_log(&authority.freeze().unwrap())
         .unwrap();
-    checkpoint.objects[0].fresh_tape = false;
-    index.project_checkpoint_record(&checkpoint).unwrap();
     drop(index);
     h.seated.tape_uuid = Some(uuid);
     if in_slot {

@@ -54,6 +54,7 @@ zeroize           = { workspace = true }
 ratatui           = { version = "0.30", optional = true }
 
 [dev-dependencies]
+rusqlite = { workspace = true }
 # Enable the dev binary for ordinary cargo test/clippy target selection only.
 remanence-cli = { path = ".", features = ["fixtures"] }
 remanence-state = { path = "../remanence-state", features = ["fixtures"] }

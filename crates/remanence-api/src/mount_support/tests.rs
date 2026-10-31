@@ -431,6 +431,119 @@ fn uncertain_write_cut_is_durably_fenced_even_after_an_earlier_checkpoint() {
     assert!(finish_error.status.message().contains("fence"));
     drop(reopen_state());
 }
+/// A terminal component whose log record is durable but whose SQLite
+/// projection fails reports the replay retry, and the same request resumes.
+#[test]
+fn durable_terminal_component_projection_failure_asks_for_replay_and_resumes() {
+    let root = tempfile::tempdir().unwrap();
+    let mut state = state_with_audit(root.path(), false);
+    let sqlite = state.paths().sqlite_path.clone();
+    let world = world();
+    let lock = root.path().join("locks");
+    let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
+    let mounted = mount.mount(target()).unwrap();
+    let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
+    actor
+        .write_checkpointed(request(root.path(), "component"))
+        .unwrap();
+    actor.close_session().unwrap();
+    let key = uuid::Uuid::new_v4();
+    let finalize = || StandaloneFinalizeRequest {
+        tape_uuid: UUID,
+        acknowledge_tape: UUID,
+        expected_pool_id: Some("default".into()),
+        reason: "operator finished".into(),
+        idempotency_key: key,
+    };
+    let conn = rusqlite::Connection::open(&sqlite).unwrap();
+    conn.execute_batch("create trigger fail_component_projection before update of finalization_progress on tapes when new.finalization_progress = 'after_replica_a' begin select raise(abort, 'injected component projection failure'); end;").unwrap();
+    let error = actor
+        .finalize_standalone(finalize())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("terminal component is durable; retry after tape-log replay"),
+        "{error}"
+    );
+    assert!(
+        error.contains("injected component projection failure"),
+        "{error}"
+    );
+    conn.execute_batch("drop trigger fail_component_projection")
+        .unwrap();
+    drop(conn);
+    let _ = actor.finish();
+    let mut state = reopen_state();
+    // The standalone owner fences the tape on the failed request; after the
+    // operator's release the same request resumes from the durable log.
+    let fences = state.catalog_index().list_active_tape_io_fences().unwrap();
+    assert!(!fences.is_empty());
+    for fence in fences {
+        state
+            .release_tape_io_fence(&fence.quarantine_id, "projection fault removed")
+            .unwrap();
+    }
+    let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
+    let mounted = mount.mount(target()).unwrap();
+    let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
+    actor.finalize_standalone(finalize()).unwrap();
+    let _ = actor.finish();
+    let mut state = reopen_state();
+    assert_eq!(
+        state
+            .catalog_index()
+            .get_tape(&UUID)
+            .unwrap()
+            .unwrap()
+            .state,
+        "sealed"
+    );
+}
+
+/// Supersede-tail refuses on the log's own seal, even when SQLite has lost it.
+#[test]
+fn supersede_tail_refuses_a_sealed_log_that_sqlite_reports_ready() {
+    let root = tempfile::tempdir().unwrap();
+    let mut state = state_with_audit(root.path(), false);
+    let sqlite = state.paths().sqlite_path.clone();
+    let world = world();
+    let lock = root.path().join("locks");
+    let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
+    let mounted = mount.mount(target()).unwrap();
+    let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
+    actor
+        .write_checkpointed(request(root.path(), "sealed"))
+        .unwrap();
+    actor.close_session().unwrap();
+    actor
+        .finalize_standalone(StandaloneFinalizeRequest {
+            tape_uuid: UUID,
+            acknowledge_tape: UUID,
+            expected_pool_id: Some("default".into()),
+            reason: "operator finished".into(),
+            idempotency_key: uuid::Uuid::new_v4(),
+        })
+        .unwrap();
+    rusqlite::Connection::open(&sqlite)
+        .unwrap()
+        .execute(
+            "update tapes set state = 'ready', finalization_progress = null, finalization_trigger = null, finalization_operation_id = null, finalization_edition_digest = null, finalization_layout_digest = null, finalization_outcome = null, completed_replicas = null where tape_uuid = ?1",
+            [UUID.as_slice()],
+        )
+        .unwrap();
+    let before = dispatched_writes(&world);
+    let refusal = actor
+        .supersede_tail_confirmed("HAND", |_, _| Ok(()))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refusal.contains("tape log is sealed; supersede-tail cannot make a sealed tape writable"),
+        "{refusal}"
+    );
+    assert_eq!(dispatched_writes(&world), before);
+    let _ = actor.finish();
+    drop(reopen_state());
+}
 #[test]
 fn checkpoint_finalize_and_terminal_restore_share_the_production_funnels() {
     let root = tempfile::tempdir().unwrap();
@@ -639,7 +752,7 @@ fn position_overflow_refuses_without_motion_and_reservation_is_opt_in() {
 }
 
 #[test]
-fn parity_import_rejects_a_missing_partner_and_validates_the_complete_pair() {
+fn parity_import_rejects_a_missing_log_and_validates_the_complete_log() {
     let root = tempfile::tempdir().unwrap();
     let parity = crate::ParityConfig::Scheme(remanence_parity::ParityScheme {
         id: remanence_parity::SchemeId::new_static("p4-import"),
@@ -656,7 +769,11 @@ fn parity_import_rejects_a_missing_partner_and_validates_the_complete_pair() {
     world.lock().unwrap().tapes.get_mut("HAND").unwrap().records[0] = Record::Block(block);
     let lock = root.path().join("locks");
     let from = state.paths().journal_dir.clone();
-    let partner = state.paths().journal_path(UUID);
+    let partner = state
+        .paths()
+        .journal_dir
+        .join("tapes")
+        .join(format!("{}.remtape", uuid::Uuid::from_bytes(UUID).simple()));
     let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
     let mounted = mount.mount(target()).unwrap();
     let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
@@ -667,7 +784,7 @@ fn parity_import_rejects_a_missing_partner_and_validates_the_complete_pair() {
     let state = reopen_state();
     drop(state);
     let mut state = adopted_state(&root.path().join("new-host"), parity);
-    let destination = state.paths().journal_dir.join("checkpoints");
+    let destination = state.paths().journal_dir.join("tapes");
     let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
     let mut mounted = mount.mount(target()).unwrap();
     let hidden = remanence_parity::authority::fixtures::hide_authority(&partner).unwrap();
@@ -767,7 +884,7 @@ fn automatic_terminal_close_reproves_after_checkpoint_publication() {
         config.tape_pools[0].watermark_high = 0.25;
         let mut state = StateHandle::open_with_config(paths, config).unwrap();
         let checkpoint = remanence_state::authority::fixtures::AuthorityBuilder::new(
-            state.paths().journal_dir.join("checkpoints"),
+            state.paths().journal_dir.join("tapes"),
             UUID,
         )
         .build()
@@ -1675,11 +1792,7 @@ fn stale_import_publishes_nothing_and_terminal_finalize_preserves_foreign_object
             .to_string();
         assert!(error.contains(&id), "{error}");
         mount.release(mounted);
-        let checkpoint = destination
-            .join("checkpoints")
-            .join(format!("{}.remcheckpoint", uuid::Uuid::from_bytes(UUID)));
-        assert!(!checkpoint.exists());
-        assert!(!new_host.paths().journal_path(UUID).exists());
+        assert!(!remanence_state::TapeAuthority::exists(destination.join("tapes"), UUID).unwrap());
         drop(new_host);
         std::fs::remove_dir_all(&dir).unwrap();
         copy_closed_state(&backup, &dir);
@@ -1871,7 +1984,7 @@ fn zero_dispatch_probe_failure_is_unavailable_and_not_durable() {
     let mut state = state(root.path());
     let cfg = crate::write_owner::TerminalWriteConfig {
         mounted_endpoint: None,
-        checkpoint_journal_dir: state.paths().journal_dir.join("checkpoints"),
+        checkpoint_journal_dir: state.paths().journal_dir.join("tapes"),
         audit_dir: state.paths().audit_dir.clone(),
         audit_fsync: true,
         audit_append_lock: Arc::new(Mutex::new(())),
@@ -1919,7 +2032,7 @@ fn structural_admission_refusals_project_recovery_with_authenticated_actor() {
         let mut state = state(root.path());
         let cfg = crate::write_owner::TerminalWriteConfig {
             mounted_endpoint: None,
-            checkpoint_journal_dir: state.paths().journal_dir.join("checkpoints"),
+            checkpoint_journal_dir: state.paths().journal_dir.join("tapes"),
             audit_dir: state.paths().audit_dir.clone(),
             audit_fsync: true,
             audit_append_lock: Arc::new(Mutex::new(())),

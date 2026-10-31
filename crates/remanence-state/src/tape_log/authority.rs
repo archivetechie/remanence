@@ -1,11 +1,11 @@
-//! Unwired B2 authority implementation over one per-tape log. The exclusive
+//! Production authority implementation over one per-tape log. The exclusive
 //! owner retains the fold and lends weak structural capabilities; snapshots own
-//! immutable inode prefixes. No production alias selects this implementation.
+//! immutable inode prefixes. The actor owns every publication after its barrier.
 use super::{
     fold::TapeSummary,
     rows::{journal, Rows},
     snapshot::Snapshot,
-    store::{GroupWriter, Header, Lease, Store, StoreError},
+    store::{GroupWriter, Header, Lease, StagedGroup, Store, StoreError},
     wire::Wire,
     *,
 };
@@ -37,9 +37,10 @@ fn publication_error(error: StateError) -> JournalError {
             StoreError::Locked(error) => {
                 JournalError::Io(io::Error::from_raw_os_error(error as i32))
             }
-            error @ (StoreError::Ambiguous(_)
-            | StoreError::AfterDurable(_)
-            | StoreError::Fenced) => JournalError::RecoveryRequired(error.to_string()),
+            StoreError::AfterDurable(error) => JournalError::AfterDurable(error.to_string()),
+            error @ (StoreError::Ambiguous(_) | StoreError::Fenced) => {
+                JournalError::RecoveryRequired(error.to_string())
+            }
             error => journal(error),
         },
         error => journal(error),
@@ -68,7 +69,7 @@ fn count(p: Progress) -> u8 {
 fn summary(s: &TapeSummary, uuid: [u8; 16]) -> AuthoritySummary {
     AuthoritySummary {
         tape_uuid: uuid,
-        checkpoint_ordinal: s.last_closed_sequence,
+        checkpoint_ordinal: s.ordinary_count + u64::from(s.sealed),
         object_count: s.object_count,
         cursor: (!s.is_fresh()).then_some(s.cursor),
         protected: s.protected,
@@ -107,12 +108,16 @@ fn bridge<T>(
 /// Frozen validated authority, including only durable physical rows.
 #[derive(Debug, Clone)]
 pub struct AuthoritySnapshot {
-    pub(super) raw: Snapshot,
+    pub(crate) raw: Snapshot,
     summary: AuthoritySummary,
     finalization: Option<AuthorityFinalization>,
 }
 impl AuthoritySnapshot {
-    pub(super) fn new(raw: Snapshot) -> Result<Self, StateError> {
+    /// Validated closing log sequence and incarnation, distinct from barrier count.
+    pub fn log_reference(&self) -> (u64, u64) {
+        (self.raw.summary().last_closed_sequence, 1)
+    }
+    pub(crate) fn new(raw: Snapshot) -> Result<Self, StateError> {
         let finalization = read_plan(&raw)?;
         Ok(Self {
             summary: summary(raw.summary(), raw.header().tape_uuid),
@@ -307,16 +312,20 @@ fn stream_reports(
     }
     Ok(())
 }
-/// Factory for an explicitly selected, unwired per-tape backend.
+/// Factory for the per-tape authority backend.
 #[derive(Debug)]
 pub struct TapeAuthority {
     store: Store,
 }
 impl TapeAuthority {
     /// Open an existing identity, or bind geometry at the first report.
-    pub fn open(directory: impl AsRef<Path>, uuid: [u8; 16]) -> Result<Self, StateError> {
+    pub fn open(
+        directory: impl AsRef<Path>,
+        uuid: [u8; 16],
+        index_path: &Path,
+    ) -> Result<Self, StateError> {
         Ok(Self {
-            store: Store::open(directory, uuid)?,
+            store: Store::open(directory, uuid, index_path)?,
         })
     }
     /// Open on an ordinary temporary filesystem for contract tests.
@@ -326,19 +335,35 @@ impl TapeAuthority {
             store: Store::open_fixture(directory, uuid)?,
         })
     }
+    /// Reconcile host fsync ambiguity at daemon restart under state ownership.
+    /// Physical append admission is still required before the next media write.
+    pub fn reconcile_restart(&self, projected: u64) -> Result<(), StateError> {
+        if self.store.has_ambiguity()? {
+            self.store.clear_ambiguity_above(projected)?;
+        }
+        Ok(())
+    }
     /// Enumerate per-tape entries in stable path order without decoding catalogs.
     pub fn list_entries(
         directory: impl AsRef<Path>,
     ) -> Result<Vec<std::path::PathBuf>, StateError> {
+        if !directory.as_ref().exists() {
+            return Ok(Vec::new());
+        }
         let mut entries = Vec::new();
         for entry in std::fs::read_dir(directory).map_err(StoreError::from)? {
             let path = entry.map_err(StoreError::from)?.path();
-            if path.extension().is_some_and(|e| e == "remtape") {
+            if path
+                .extension()
+                .is_some_and(|e| e == "remtape" || e == "ambiguous")
+            {
+                let path = path.with_extension("remtape");
                 Self::entry_tape_uuid(&path)?;
                 entries.push(path);
             }
         }
         entries.sort();
+        entries.dedup();
         Ok(entries)
     }
     /// Decode an enumerated entry's UUID; file content is checked during capture.
@@ -361,6 +386,10 @@ impl TapeAuthority {
             .map(|id| *id.as_bytes())
             .map_err(|_| invalid("invalid tape-log UUID"))
     }
+    pub(crate) fn path(&self) -> &Path {
+        self.store.path()
+    }
+
     /// Check the active name without creating a log.
     pub fn exists(directory: impl AsRef<Path>, id: [u8; 16]) -> Result<bool, StateError> {
         directory
@@ -386,11 +415,21 @@ impl TapeAuthority {
     pub fn acquire_exclusive_for_terminal_recovery(
         &self,
     ) -> Result<TapeAuthorityLease, StateError> {
+        self.wrap_lease(self.store.acquire(false)?)
+    }
+    /// Explicit physical-tail recovery only; ordinary publication remains
+    /// refused until the retained cursor has been reconciled under this owner.
+    pub fn acquire_for_tail_reconciliation(&self) -> Result<TapeAuthorityLease, StateError> {
+        self.wrap_lease(self.store.acquire_for_tail_reconciliation()?)
+    }
+    fn wrap_lease(&self, lease: Lease) -> Result<TapeAuthorityLease, StateError> {
         Ok(TapeAuthorityLease {
             uuid: self.store.header.tape_uuid,
-            core: Arc::new(Mutex::new(self.store.acquire(false)?)),
+            core: Arc::new(Mutex::new(lease)),
             structural: None,
             scope: Scope::Idle,
+            pending: None,
+            read_cache: Arc::new(Mutex::new(None)),
         })
     }
 }
@@ -407,12 +446,121 @@ pub struct TapeAuthorityLease {
     core: Arc<Mutex<Lease>>,
     structural: Option<StructuralCapability>,
     scope: Scope,
+    pending: Option<(StagedGroup, Committed)>,
+    read_cache: Arc<Mutex<Option<Snapshot>>>,
 }
 impl TapeAuthorityLease {
+    /// Whether explicit physical recovery must retire a repaired-tail fence.
+    pub fn repair_pending(&self) -> Result<bool, StateError> {
+        Ok(self.core()?.repair_pending())
+    }
+    /// Called only by the confirmed physical-tail recovery owner after proving
+    /// this cursor, never by startup projection or ordinary append admission.
+    pub fn reconcile_repaired_tail(&mut self, cursor: CommitCursor) -> Result<(), StateError> {
+        self.core()?
+            .reconcile_repaired_tail(cursor)
+            .map_err(Into::into)
+    }
+    /// Close a prepared manual decision after its catalog transaction commits,
+    /// before any terminal media dispatch. Restart repeats this idempotently.
+    pub fn accept_preparation(&mut self) -> Result<(), StateError> {
+        accept(&mut *self.core()?)
+    }
     fn core(&self) -> Result<MutexGuard<'_, Lease>, StateError> {
         self.core
             .lock()
             .map_err(|_| invalid("authority owner panicked"))
+    }
+    /// Encode and data-sync the batch catalog before entering its media barrier.
+    pub fn stage_report(&mut self, report: &AuthorityCommit) -> Result<(), StateError> {
+        if self.pending.is_some() {
+            return Err(invalid("a tape-log report is already staged"));
+        }
+        let (staged, closer, snapshot) = {
+            let mut core = self.core()?;
+            let (group, closer) = prepare_report(&mut core, report, None)?;
+            let snapshot = core.snapshot()?;
+            (core.stage_detached(group)?, closer, snapshot)
+        };
+        *self
+            .read_cache
+            .lock()
+            .map_err(|_| invalid("snapshot cache poisoned"))? = Some(snapshot);
+        self.pending = Some((staged, closer));
+        Ok(())
+    }
+    /// Refuse physical abandonment if host durability is ambiguous or a group
+    /// is still staged. This check precedes any media command.
+    pub fn ensure_abandonment_allowed(&self) -> Result<(), StateError> {
+        if self.pending.is_some() {
+            return Err(invalid("cannot abandon while a tape-log group is staged"));
+        }
+        self.core()?.check()?;
+        Ok(())
+    }
+    /// A media barrier failed before complete_report was attempted. Remove only
+    /// its provisional host frames and restore the proved prior host boundary.
+    pub fn cancel_staged_report(&mut self) -> Result<(), StateError> {
+        let result = match self.pending.take() {
+            Some(staged) => self
+                .core()
+                .and_then(|mut core| core.cancel_detached(staged.0).map_err(Into::into)),
+            None => Ok(()),
+        };
+        *self
+            .read_cache
+            .lock()
+            .map_err(|_| invalid("snapshot cache poisoned"))? = None;
+        result
+    }
+    /// Add the barrier's sidecar rows and close exactly the staged catalog group.
+    pub fn complete_report(&mut self, report: &AuthorityCommit) -> Result<(), StateError> {
+        let result = self.complete_report_inner(report);
+        *self
+            .read_cache
+            .lock()
+            .map_err(|_| invalid("snapshot cache poisoned"))? = None;
+        result
+    }
+    fn complete_report_inner(&mut self, report: &AuthorityCommit) -> Result<(), StateError> {
+        let (mut staged, mut closer) = self
+            .pending
+            .take()
+            .ok_or_else(|| invalid("no staged tape-log report"))?;
+        if report.tape_uuid != self.uuid
+            || report.operation_id != closer.batch_id
+            || report.object_count != closer.object_count
+        {
+            return Err(invalid("staged report identity changed"));
+        }
+        if let Some(barrier) = &report.barrier {
+            for row in &barrier.files {
+                if let Some(epoch) = row.epoch_id {
+                    closer.next_epoch = epoch
+                        .checked_add(1)
+                        .ok_or_else(|| invalid("epoch overflow"))?;
+                }
+                staged.push_file_row(row.clone())?;
+            }
+        }
+        closer.group = staged.reference(closer.group.member_count);
+        closer.cursor = report.cursor;
+        closer.next_file = report.next_file;
+        closer.protected = report.protected;
+        closer.total = report.total;
+        (closer.check, closer.provenance) = report
+            .check
+            .unwrap_or((CheckValue::EMPTY, CheckProvenance::Empty));
+        closer.unverified_end =
+            (closer.provenance == CheckProvenance::UnverifiedRebuild).then_some(report.total);
+        closer.seal_due = report.seal_due;
+        self.core()?
+            .complete_detached(staged, &Record::Committed(closer))?;
+        *self
+            .read_cache
+            .lock()
+            .map_err(|_| invalid("snapshot cache poisoned"))? = None;
+        Ok(())
     }
     /// Publish a semantic report with a bounded member producer. Uses the same
     /// report-to-frame path and validation as B2's owned adapter, without building
@@ -457,7 +605,25 @@ impl TapeAuthorityLease {
         &mut self,
         operation: impl FnOnce(&mut Lease) -> Result<R, StateError>,
     ) -> Result<R, StateError> {
-        operation(&mut *self.core()?)
+        let mut core = self.core()?;
+        *self
+            .read_cache
+            .lock()
+            .map_err(|_| invalid("snapshot cache poisoned"))? = Some(core.snapshot()?);
+        let result = operation(&mut core);
+        *self
+            .read_cache
+            .lock()
+            .map_err(|_| invalid("snapshot cache poisoned"))? = None;
+        result
+    }
+    /// Install the release seam without exposing the store to media code.
+    pub fn set_publication_observer(
+        &self,
+        observer: super::store::PublicationObserver,
+    ) -> Result<(), StateError> {
+        self.core()?.set_publication_observer(observer);
+        Ok(())
     }
     /// Identity bound to this lease.
     pub fn tape_uuid(&self) -> [u8; 16] {
@@ -479,8 +645,34 @@ impl TapeAuthorityLease {
         .map_err(journal)?;
         Ok(Box::new(Structural {
             core: Arc::downgrade(&self.core),
+            read_cache: Arc::downgrade(&self.read_cache),
             uuid,
         }))
+    }
+    /// Validate a retained structural cursor against this single authority.
+    pub fn validate_resume_rows(
+        &self,
+        rows: &dyn StructuralAuthority,
+        empty: bool,
+        count: u64,
+    ) -> Result<(), crate::authority::AuthorityAgreementError> {
+        if empty && count != 0 {
+            return Err(invalid("structural rows exist without a committed tape-log group").into());
+        }
+        if !empty {
+            self.validate_append_rows(&rows.freeze().map_err(|e| invalid(e.to_string()))?)?;
+        }
+        Ok(())
+    }
+    /// Require the live projection floor before staging any authority mutation.
+    pub fn set_projection_floor(&self, sequence: u64) -> Result<(), StateError> {
+        self.core()?
+            .set_projection_floor(sequence)
+            .map_err(Into::into)
+    }
+    /// Closing sequence and incarnation for a durable append receipt.
+    pub fn log_reference(&self) -> Result<(u64, u64), StateError> {
+        Ok((self.core()?.summary().last_closed_sequence, 1))
     }
     /// Retain a capability for this tape; replacement during a loan is refused.
     pub fn retain_structural_publisher(
@@ -562,6 +754,7 @@ fn visit_reports(
     measured.replay_passes += 1; // the boundary cursor opened above
     let mut start = None;
     let mut previous_protected = 0;
+    let mut ordinal = 0;
     while let Some(frame) = decoder.next_row_frame().map_err(StoreError::from)? {
         let (sequence, offset) = *start.get_or_insert((frame.sequence, frame.offset));
         if matches!(
@@ -570,12 +763,8 @@ fn visit_reports(
         ) {
             continue;
         }
-        if matches!(frame.record, Record::Sealed { .. }) {
-            return Err(unsupported(
-                "legacy sealed semantic projection; use the frozen summary and finalization status",
-            ));
-        }
         if let Record::Committed(c) = frame.record {
+            ordinal += 1;
             let group = raw.group_snapshot(sequence, offset, frame.end);
             measured.replay_passes += 1; // this group's catalog cursor
             let mut payloads = Vec::<ObjectPayload>::new();
@@ -654,7 +843,7 @@ fn visit_reports(
                 measured.peak_live_object_rows.max(payloads.len() as u64);
             previous_protected = c.protected;
             visitor(&AuthorityCommit {
-                ordinal: frame.sequence,
+                ordinal,
                 object_count: c.object_count,
                 protected: c.protected,
                 total: c.total,
@@ -680,18 +869,9 @@ fn visit_reports(
 // B2's compatibility shape is retained, but latest admission needs only the
 // last ordinary closer. Catalogs remain accessible through report/snapshot cursors.
 fn latest_report(s: &TapeSummary, header: &Header) -> Result<Option<AuthorityCommit>, StateError> {
-    if s.sealed {
-        return Err(unsupported(
-            "legacy sealed semantic projection; use the frozen summary and finalization status",
-        ));
-    }
-    Ok(s.last_ordinary_record.as_ref().map(|c| {
-        report_summary(
-            c,
-            s.last_ordinary_commit.expect("record has sequence"),
-            header,
-        )
-    }))
+    Ok(s.last_ordinary_record
+        .as_ref()
+        .map(|c| report_summary(c, s.ordinary_count, header)))
 }
 fn report_summary(c: &Committed, sequence: u64, header: &Header) -> AuthorityCommit {
     AuthorityCommit {
@@ -714,11 +894,26 @@ fn report_summary(c: &Committed, sequence: u64, header: &Header) -> AuthorityCom
         check: (c.provenance != CheckProvenance::Empty).then_some((c.check, c.provenance)),
     }
 }
+fn latest_snapshot_report(raw: &Snapshot) -> Result<Option<AuthorityCommit>, StateError> {
+    let mut report = latest_report(&raw.summary, &raw.header)?;
+    if raw.summary.sealed {
+        if let Some(report) = &mut report {
+            report.sealed = true;
+            report.ordinal += 1;
+            report.cursor = raw.summary.cursor;
+            report.next_file = raw.summary.next_file;
+            report.protected = raw.summary.protected;
+            report.total = raw.summary.total;
+            report.finalization = read_plan(raw)?;
+        }
+    }
+    Ok(report)
+}
 trait Capture {
     fn capture(&self) -> Result<Snapshot, StateError>;
     fn latest_report_summary(&self) -> Result<Option<AuthorityCommit>, StateError> {
         let raw = self.capture()?;
-        latest_report(&raw.summary, &raw.header)
+        latest_snapshot_report(&raw)
     }
     fn small_summary(&self) -> Result<AuthoritySummary, StateError> {
         let raw = self.capture()?;
@@ -733,7 +928,12 @@ impl Capture for TapeAuthority {
 impl Capture for TapeAuthorityLease {
     fn latest_report_summary(&self) -> Result<Option<AuthorityCommit>, StateError> {
         let core = self.core()?;
-        latest_report(core.summary(), core.header())
+        core.check()?;
+        if core.summary().sealed {
+            latest_snapshot_report(&core.snapshot()?)
+        } else {
+            latest_report(core.summary(), core.header())
+        }
     }
     fn capture(&self) -> Result<Snapshot, StateError> {
         Ok(self.core()?.snapshot()?)
@@ -920,23 +1120,22 @@ impl Write for CatalogWriter<'_> {
         Ok(())
     }
 }
-fn publish_report(
+fn prepare_report(
     core: &mut Lease,
     report: &AuthorityCommit,
     mut streamed: Option<&mut ReportMembers<'_>>,
-) -> Result<(), StateError> {
+) -> Result<(GroupWriter, Committed), StateError> {
     if report.sealed || report.finalization.is_some() {
         return Err(unsupported("ordinary report with terminal completion"));
     }
     if report.ordinal == 0 || report.tape_uuid != core.header().tape_uuid {
         return Err(invalid("report identity"));
     }
-    if (streamed.is_none() && report.check.is_some())
-        || report
-            .object_files
-            .iter()
-            .chain(report.barrier.iter())
-            .any(|p| p.cursor.is_some() || p.check.is_some() || p.seal_due.is_some())
+    if report
+        .object_files
+        .iter()
+        .chain(report.barrier.iter())
+        .any(|p| p.cursor.is_some() || p.check.is_some() || p.seal_due.is_some())
     {
         return Err(unsupported(
             "legacy report optional evidence; publish a native streaming group",
@@ -966,8 +1165,8 @@ fn publish_report(
     {
         return Err(unsupported("empty legacy barrier bundle"));
     }
-    if report.payloads.is_empty() {
-        return Err(unsupported("empty legacy checkpoint report"));
+    if report.payloads.is_empty() && s.is_fresh() {
+        return Err(invalid("first barrier requires an Object"));
     }
     let mut group = core.prepare()?;
     let mut lba = if s.is_fresh() { 2 } else { s.cursor.lba };
@@ -984,7 +1183,7 @@ fn publish_report(
             &[],
         )?;
     }
-    if report.scheme.is_some() {
+    if report.scheme.is_some() && (!report.payloads.is_empty() || report.barrier.is_some()) {
         crate::authority::validation::validate_parity_barrier_bundles(report)
             .map_err(|e| invalid(e.to_string()))?;
     } else if !report.object_files.is_empty() || report.barrier.is_some() {
@@ -999,7 +1198,7 @@ fn publish_report(
     let mut next_epoch = s.next_epoch;
     for (index, payload) in report.payloads.iter().enumerate() {
         let rows = report.object_files.get(index);
-        let row = if let Some(rows) = rows {
+        let mut row = if let Some(rows) = rows {
             rows.files
                 .first()
                 .ok_or_else(|| invalid("empty Object files"))?
@@ -1015,6 +1214,8 @@ fn publish_report(
             row.object_recovery_row = Some(payload.object_recovery_row.clone());
             row
         };
+        row.object_recovery_row = Some(payload.object_recovery_row.clone());
+        row.object_id = Some(payload.object.object_id.clone());
         lba = row
             .physical_start_hint
             .ok_or_else(|| invalid("missing physical Object start"))?
@@ -1094,7 +1295,15 @@ fn publish_report(
         session_id: None,
         seal_due: report.seal_due,
     };
-    core.append(group.close(&Record::Committed(c))?)?;
+    Ok((group, c))
+}
+fn publish_report(
+    core: &mut Lease,
+    report: &AuthorityCommit,
+    streamed: Option<&mut ReportMembers<'_>>,
+) -> Result<(), StateError> {
+    let (group, closer) = prepare_report(core, report, streamed)?;
+    core.append(group.close(&Record::Committed(closer))?)?;
     Ok(())
 }
 fn append_plan(
@@ -1380,14 +1589,29 @@ impl TapeAuthorityWriter for TapeAuthorityLease {
     }
     fn publish_sealed_reports<F: FnOnce() -> Result<(), StateError>>(
         &mut self,
-        _reports: &[AuthorityCommit],
-        _after: F,
+        reports: &[AuthorityCommit],
+        after: F,
     ) -> Result<(), StateError> {
-        // Sealed is a terminal decision binding, not another legacy checkpoint.
-        // Its format has no checkpoint batch identity or structural bundle list.
-        Err(unsupported(
-            "legacy sealed checkpoint report; use seal after ComponentWritten",
-        ))
+        let [report] = reports else {
+            return Err(invalid("one Sealed report required"));
+        };
+        let core = self.core()?;
+        let mut plan = read_plan(&core.snapshot()?)?;
+        if let Some(plan) = &mut plan {
+            plan.recovery_required = false;
+        }
+        if !report.sealed
+            || report.tape_uuid != self.uuid
+            || report.cursor != core.summary().cursor
+            || report.next_file != core.summary().next_file
+            || report.finalization.as_ref() != plan.as_ref()
+        {
+            return Err(invalid(
+                "Sealed report differs from completed terminal authority",
+            ));
+        }
+        drop(core);
+        self.seal(after)
     }
     fn lease_tape_uuid(&self) -> [u8; 16] {
         self.tape_uuid()
@@ -1459,6 +1683,11 @@ impl TapeAuthorityWriter for TapeAuthorityLease {
         let mut core = self.core()?;
         if catalog
             || binding
+            || !core
+                .summary()
+                .finalization
+                .as_ref()
+                .is_some_and(|p| p.prepared)
             || expected.manual.is_none()
             || expected.progress != Progress::BeforeReplicaA
             || expected.recovery_required
@@ -1485,9 +1714,6 @@ fn publish_physical(
         FilePurpose::TerminalPrefix | FilePurpose::TerminalComponent => Err(JournalError::Codec(
             "terminal publication requires its explicit operation".into(),
         )),
-        FilePurpose::Checkpoint => Err(JournalError::UnsupportedOperation(
-            "empty Checkpoint watermark; B3b removes sink commits",
-        )),
         _ => Err(JournalError::UnsupportedOperation(
             "separate physical publication without catalog; use a complete report",
         )),
@@ -1496,6 +1722,7 @@ fn publish_physical(
 #[derive(Debug)]
 struct Structural {
     core: Weak<Mutex<Lease>>,
+    read_cache: Weak<Mutex<Option<Snapshot>>>,
     uuid: [u8; 16],
 }
 impl Structural {
@@ -1513,7 +1740,39 @@ impl Structural {
         operation(&mut core)
     }
     fn snapshot(&self) -> Result<Snapshot, JournalError> {
-        self.with(|c| c.snapshot().map_err(journal))
+        // Never wait on the core mutex across a caller's media barrier. If the
+        // writer won the race, it publishes a frozen read view before media.
+        let core = self
+            .core
+            .upgrade()
+            .ok_or_else(|| journal("authority owner released"))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return Err(JournalError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "structural snapshot timed out waiting for authority owner",
+                )));
+            }
+            if let Some(cache) = self.read_cache.upgrade() {
+                if let Some(snapshot) = cache
+                    .lock()
+                    .map_err(|_| journal("snapshot cache poisoned"))?
+                    .as_ref()
+                {
+                    return Ok(snapshot.clone());
+                }
+            }
+            match core.try_lock() {
+                Ok(core) => return core.snapshot().map_err(journal),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(journal("authority owner panicked"))
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        }
     }
 }
 impl TapeReportPublisher for Structural {
@@ -1620,8 +1879,15 @@ impl StructuralAuthority for Structural {
         }
         for (index, publication) in expected.iter().enumerate() {
             if publication
-                != &component(&plan, index, raw.summary.protected, raw.summary.total)
-                    .map_err(publication_error)?
+                != &component(
+                    &plan,
+                    index,
+                    plan.terminal_prefix
+                        .as_ref()
+                        .map_or(raw.summary.protected, |p| p.publication.protected),
+                    raw.summary.total,
+                )
+                .map_err(publication_error)?
             {
                 return Err(journal("component authority differs"));
             }
@@ -1633,7 +1899,7 @@ impl StructuralAuthority for Structural {
     }
     fn discard_suffix(&mut self, next_file: u64) -> Result<(), JournalError> {
         self.with(|c| {
-            if next_file == c.summary().next_file {
+            if next_file == c.summary().next_file || (c.summary().is_fresh() && next_file == 1) {
                 Ok(())
             } else {
                 Err(journal("cannot discard durable authority"))
@@ -1686,11 +1952,7 @@ mod tests {
             &mut writer,
             (&record(id)).into(),
             (&second_record(id)).into(),
-            |sequence| match sequence {
-                4 => 1,
-                7 => 2,
-                other => panic!("unexpected closing sequence: {other}"),
-            },
+            |ordinal| ordinal,
         );
     }
     #[test]
@@ -1728,3 +1990,164 @@ mod tests {
 #[cfg(test)]
 #[path = "authority_tests.rs"]
 mod additional_tests;
+
+// Fixture-only semantic adapters preserve characterization tests while all disk
+// writes use the selected per-tape backend. These are not legacy disk readers.
+#[cfg(any(test, feature = "fixtures"))]
+use crate::{
+    CheckpointJournalRecord, CheckpointTerminalRecoveryAuthority, TerminalFinalizationIntent,
+    TerminalFinalizationProgress,
+};
+#[cfg(any(test, feature = "fixtures"))]
+impl TapeAuthorityLease {
+    /// For each record bounded through the selected authority implementation.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn for_each_record_bounded(
+        &self,
+        mut visitor: impl FnMut(&CheckpointJournalRecord) -> Result<(), StateError>,
+    ) -> Result<CheckpointBoundedReplayMetrics, StateError> {
+        self.visit_commits(&mut |commit| visitor(&commit.into()))
+    }
+    /// Last record bounded through the selected authority implementation.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn last_record_bounded(&self) -> Result<Option<CheckpointJournalRecord>, StateError> {
+        self.latest_commit()
+            .map(|commit| commit.as_ref().map(Into::into))
+    }
+    /// Bounded replay metrics through the selected authority implementation.
+    pub fn bounded_replay_metrics(&self) -> Result<CheckpointBoundedReplayMetrics, StateError> {
+        self.visit_commits(&mut |_| Ok(()))
+    }
+    /// Replay through the selected authority implementation.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn replay(&mut self) -> Result<Vec<CheckpointJournalRecord>, StateError> {
+        let mut records: Vec<CheckpointJournalRecord> =
+            self.replay_commits()?.iter().map(Into::into).collect();
+        if let Some(sealed) = self.latest_commit()?.filter(|c| c.sealed) {
+            records.push((&sealed).into());
+        }
+        Ok(records)
+    }
+    /// Replay for terminal recovery through the selected authority implementation.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn replay_for_terminal_recovery(
+        &mut self,
+    ) -> Result<CheckpointTerminalRecoveryAuthority, StateError> {
+        Ok(CheckpointTerminalRecoveryAuthority {
+            records: self.replay()?,
+            finalization_intent: self.pending_finalization()?.as_ref().map(Into::into),
+        })
+    }
+    /// Begin terminal finalization through the selected authority implementation.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn begin_terminal_finalization(
+        &mut self,
+        intent: &TerminalFinalizationIntent,
+    ) -> Result<TerminalFinalizationIntent, StateError> {
+        self.begin_finalization(&intent.into())
+            .map(|intent| (&intent).into())
+    }
+    /// Retire provisional manual finalization through the selected authority implementation.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn retire_provisional_manual_finalization(
+        &mut self,
+        expected: &TerminalFinalizationIntent,
+        catalog_projection_present: bool,
+        idempotency_binding_present: bool,
+    ) -> Result<(), StateError> {
+        self.retire_preparation(
+            &expected.into(),
+            catalog_projection_present,
+            idempotency_binding_present,
+        )
+    }
+    /// Terminal finalization intent through the selected authority implementation.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn terminal_finalization_intent(
+        &self,
+    ) -> Result<Option<TerminalFinalizationIntent>, StateError> {
+        self.pending_finalization()
+            .map(|intent| intent.as_ref().map(Into::into))
+    }
+    /// Advance terminal finalization through the selected authority implementation.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn advance_terminal_finalization(
+        &mut self,
+        expected: TerminalFinalizationProgress,
+        next: TerminalFinalizationProgress,
+    ) -> Result<TerminalFinalizationIntent, StateError> {
+        self.advance_finalization(expected, next)
+            .map(|intent| (&intent).into())
+    }
+    /// Mark terminal recovery required through the selected authority implementation.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn mark_terminal_recovery_required(
+        &mut self,
+    ) -> Result<TerminalFinalizationIntent, StateError> {
+        self.require_finalization_recovery()
+            .map(|intent| (&intent).into())
+    }
+    /// Append terminal finalization through the selected authority implementation.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn append_terminal_finalization(
+        &mut self,
+        records: &[CheckpointJournalRecord],
+    ) -> Result<(), StateError> {
+        self.publish_sealed_reports(&records.iter().map(Into::into).collect::<Vec<_>>(), || {
+            Ok(())
+        })
+    }
+    /// Append terminal finalization with after fsync through the selected authority implementation.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn append_terminal_finalization_with_after_fsync(
+        &mut self,
+        records: &[CheckpointJournalRecord],
+        after_fsync: impl FnOnce() -> Result<(), StateError>,
+    ) -> Result<(), StateError> {
+        self.publish_sealed_reports(
+            &records.iter().map(Into::into).collect::<Vec<_>>(),
+            after_fsync,
+        )
+    }
+    /// Append through the selected authority implementation.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn append(&mut self, record: &CheckpointJournalRecord) -> Result<(), StateError> {
+        self.publish_report(&record.into())
+    }
+    /// Append batch through the selected authority implementation.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn append_batch(&mut self, records: &[CheckpointJournalRecord]) -> Result<(), StateError> {
+        self.publish_reports(&records.iter().map(Into::into).collect::<Vec<_>>())
+    }
+}
+
+#[cfg(any(test, feature = "fixtures"))]
+impl TapeAuthority {
+    /// Publish a complete semantic fixture through the live backend.
+    pub fn append(&self, record: &CheckpointJournalRecord) -> Result<(), StateError> {
+        self.acquire_exclusive()?.publish_report(&record.into())
+    }
+    /// Materialize fixture history only; production uses bounded cursors.
+    pub fn replay(&self) -> Result<Vec<CheckpointJournalRecord>, StateError> {
+        let mut records = Vec::new();
+        self.visit_commits(&mut |c| {
+            records.push(c.into());
+            Ok(())
+        })?;
+        if let Some(sealed) = self.latest_commit()?.filter(|c| c.sealed) {
+            records.push((&sealed).into());
+        }
+        Ok(records)
+    }
+    /// Complete last fixture report including payloads.
+    pub fn last(&self) -> Result<Option<CheckpointJournalRecord>, StateError> {
+        Ok(self.replay()?.pop())
+    }
+    /// Inspect the selected backend's finalization state.
+    pub fn terminal_finalization_intent(
+        &self,
+    ) -> Result<Option<TerminalFinalizationIntent>, StateError> {
+        self.pending_finalization()
+            .map(|p| p.as_ref().map(Into::into))
+    }
+}

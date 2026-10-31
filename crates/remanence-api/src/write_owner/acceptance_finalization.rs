@@ -266,6 +266,18 @@ fn start(
     files: MemoryDirectory,
 ) -> Result<ApiState, Status> {
     let cfg = rpc_config(root);
+    // Crash images are relocated into an isolated temporary root. Rebind the
+    // fixture marker to that root, exactly as its config paths are rebased.
+    std::fs::create_dir_all(&cfg.journal.dir).unwrap();
+    std::fs::write(
+        root.join("authority-format"),
+        format!(
+            "{}\n{}\n",
+            remanence_state::authority_layout::FORMAT,
+            serde_json::to_string(&cfg.journal.dir.canonicalize().unwrap()).unwrap()
+        ),
+    )
+    .unwrap();
     std::fs::create_dir_all(root.join("spool")).unwrap();
     let report = remanence_library::DiscoveryReport {
         libraries: vec![world.lock().unwrap().library_snapshot()],
@@ -471,7 +483,7 @@ async fn trace_finalization(lose_filemark: Option<(u64, bool)>) -> Session {
             restore_disk(temp.path(), &cut.disk);
             cut.files.materialize(root.path(), temp.path()).unwrap();
             remanence_state::authority::fixtures::AuthorityBuilder::new(
-                temp.path().join("journals/checkpoints"),
+                temp.path().join("journals/tapes"),
                 TAPE,
             )
             .build()

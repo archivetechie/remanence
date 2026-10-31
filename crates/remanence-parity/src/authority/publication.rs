@@ -11,12 +11,23 @@ pub enum FilePurpose {
     Object,
     /// Sidecars, with the origin of the data they protect.
     Sidecars(SidecarProvenance),
-    /// Completion of the caller's ordinary checkpoint barrier.
-    Checkpoint,
     /// The planned prefix before the terminal edition.
     TerminalPrefix,
     /// One planned terminal replica or separation extent.
     TerminalComponent,
+}
+
+impl std::fmt::Debug for FilePurpose {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Bootstrap => "BotBootstrap",
+            Self::Object => "Object",
+            Self::Sidecars(SidecarProvenance::Fresh) => "CheckpointSidecars",
+            Self::Sidecars(SidecarProvenance::Reconstructed) => "ResumeSidecars",
+            Self::TerminalPrefix => "TerminalPrefix",
+            Self::TerminalComponent => "TerminalComponent",
+        })
+    }
 }
 
 /// Origin of sidecar data; independent of how a backend encodes publication.
@@ -51,6 +62,8 @@ pub struct FilePublication {
 /// Outcome for one unit of host durability.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PublicationDisposition {
+    /// Media report awaiting the actor's tape-log publication.
+    Pending,
     /// This call appended and synchronized the unit.
     Appended,
     /// Exact matching authority was already durable.
@@ -76,6 +89,17 @@ pub struct PublicationReceipt {
     pub items: Vec<PublishedItem>,
 }
 impl PublicationReceipt {
+    /// Pending physical evidence; this is never a durable client receipt.
+    pub fn pending(publication: FilePublication) -> Self {
+        Self {
+            items: vec![PublishedItem {
+                publication,
+                disposition: PublicationDisposition::Pending,
+                durability: PublicationDisposition::Pending,
+            }],
+        }
+    }
+
     /// Receipt for an ordinary append.
     pub fn appended(publication: FilePublication) -> Self {
         Self {
@@ -147,20 +171,6 @@ impl StructuralState {
     }
 }
 
-// Preserve diagnostic spellings used by the existing format's typed refusals.
-impl std::fmt::Debug for FilePurpose {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Bootstrap => "BotBootstrap",
-            Self::Object => "Object",
-            Self::Sidecars(SidecarProvenance::Fresh) => "CheckpointSidecars",
-            Self::Sidecars(SidecarProvenance::Reconstructed) => "ResumeSidecars",
-            Self::Checkpoint => "CheckpointedThrough",
-            Self::TerminalPrefix => "TerminalPrefix",
-            Self::TerminalComponent => "TerminalComponent",
-        })
-    }
-}
 impl FilePublication {
     /// Validate the physical file grammar without consulting a host log.
     pub fn validate(&self) -> Result<(), PublicationShapeError> {
@@ -249,15 +259,6 @@ fn validate_file_publication(
                 ));
             }
             validate_sidecar_prefix(bundle.purpose, &bundle.files)?;
-            Ok(None)
-        }
-        FilePurpose::Checkpoint => {
-            if !bundle.files.is_empty() {
-                return Err(PublicationShapeError::new(
-                    bundle.purpose,
-                    "must not contain tape-file entries",
-                ));
-            }
             Ok(None)
         }
     }

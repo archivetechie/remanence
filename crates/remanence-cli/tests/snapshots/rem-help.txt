@@ -10,7 +10,8 @@ Commands:
   doctor                         Check permissions and storage readiness
   drives                         Show discovered tape endpoints and ownership
   watch                          Subscribe to OS hot-plug events touching SCSI tape / changer subsystems
-  rebuild-catalog-from-journals  Rebuild the local SQLite catalog projection from audit and tape journals
+  rebuild-catalog-from-journals  Rebuild the local SQLite catalog projection from the audit log and the tape logs
+  reset-catalog                  Declare the offline state reset required by an authority-layout change
   daemon                         Query daemon process health and version over Layer 5 gRPC
   op                             Query daemon operation status
   catalog                        Query the daemon catalog

@@ -1,17 +1,18 @@
-//! Tape authority entry point. B2 binds only the existing two-journal backend.
+//! Tape authority entry point. Production binds only the per-tape log backend.
 //! Callers retain these handles across media I/O; snapshots own frozen prefixes.
 #[cfg(test)]
 pub(crate) mod contract_tests;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
 mod import_legacy;
-mod legacy;
-pub use import_legacy::{publish_import_authority, stage_structural_import, ImportPublication};
-pub(crate) use legacy::{
-    ingest_structural as legacy_ingest_structural, rebuild_structural as legacy_rebuild_structural,
-    structural_path, structural_path_in,
-};
-pub use legacy::{AuthorityAgreementError, TapeAuthority, TapeAuthorityLease};
+#[allow(dead_code)] // Retained legacy codec for B4 removal and codec characterization tests.
+pub(crate) mod legacy;
+#[cfg(test)]
+pub(crate) mod legacy_fixtures;
+pub use crate::tape_log::authority::{TapeAuthority, TapeAuthorityLease};
+pub use import_legacy::{publish_import_authority, ImportPublication};
+pub use legacy::AuthorityAgreementError;
+pub(crate) use legacy::{structural_path, structural_path_in};
 pub use remanence_parity::authority::{
     AuthoritySummary, TapeAuthoritySnapshot, TapeAuthorityView, TapeAuthorityWriter,
 };

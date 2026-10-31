@@ -1,7 +1,6 @@
 //! Parity-session authority and durable checkpoint barriers.
 
 use remanence_state::authority::TapeAuthorityView;
-use remanence_state::authority::TapeAuthorityWriter as _;
 #[cfg(test)]
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -312,13 +311,7 @@ fn open_parity_actor_session_with_rows(
             })()
         };
         match opened {
-            Ok(state) => {
-                crate::pool_write::project_fresh_parity_bootstrap_bundle(index, selected, &scheme)
-                    .map_err(|err| {
-                        Status::internal(format!("project fresh parity bootstrap: {err}"))
-                    })?;
-                state
-            }
+            Ok(state) => state,
             Err(err) => {
                 let error = err.to_string();
                 let status = status_from_parity_error(&err, error.clone());
@@ -512,13 +505,9 @@ pub(super) fn project_checkpoint_authority_bounded(
     index: &mut CatalogIndex,
     lease: &remanence_state::TapeAuthorityLease,
 ) -> Result<Vec<remanence_state::authority::AuthorityCommit>, remanence_state::StateError> {
-    let mut last = None;
-    lease.visit_commits(&mut |commit| {
-        index.project_authority_commit(commit)?;
-        last = Some(commit.clone());
-        Ok(())
-    })?;
-    Ok(last.into_iter().collect())
+    lease.set_projection_floor(index.projected_through_sequence(lease.tape_uuid())?)?;
+    index.project_tape_log(&lease.freeze()?)?;
+    Ok(lease.latest_commit()?.into_iter().collect())
 }
 
 #[derive(Debug)]
@@ -772,6 +761,59 @@ fn perform_checkpoint_barrier_with_rows(
     } else {
         Vec::new()
     };
+    let base = journal
+        .authority_summary()
+        .map_err(|e| CheckpointBarrierFailure::before_journal(crate::status_from_state_error(e)))?;
+    let pending_state = parity_session.as_ref().and_then(|p| p.sink_state.as_ref());
+    let check = pending_state.map(|s| s.commit_check());
+    let draft_next_file = object_tape_file_bundles
+        .last()
+        .and_then(|b| b.files.last())
+        .map(|r| r.tape_file_number)
+        .or_else(|| objects.last().map(|o| o.copy.tape_file_number))
+        .map(|file| {
+            file.checked_add(1).ok_or_else(|| {
+                CheckpointBarrierFailure::before_journal(Status::internal(
+                    "next tape file overflows u64",
+                ))
+            })
+        })
+        .transpose()?
+        .unwrap_or(base.next_file);
+    let draft = remanence_state::authority::AuthorityCommit {
+        ordinal: next_ordinal,
+        object_count: next_committed_count,
+        tape_uuid,
+        operation_id: *batch.batch_id.as_bytes(),
+        next_file: draft_next_file,
+        block_size: selected.block_size,
+        scheme: parity_session.as_ref().map(|p| p.scheme.clone()),
+        protected: object_tape_file_bundles
+            .last()
+            .map_or(base.protected, |b| b.protected),
+        total: object_tape_file_bundles
+            .last()
+            .map_or(base.total, |b| b.total),
+        cursor: base.cursor.unwrap_or_default(),
+        payloads: objects,
+        object_files: object_tape_file_bundles,
+        barrier: None,
+        finalization: None,
+        sealed: false,
+        seal_due: None,
+        check,
+    };
+    if let Err(error) = journal.stage_report(&draft) {
+        if let Some(session) = parity_session.as_deref_mut() {
+            if let Some(mut state) = session.sink_state.take() {
+                state.poison_publication();
+            }
+            session.retention = None;
+        }
+        return Err(CheckpointBarrierFailure::before_journal(
+            crate::status_from_state_error(error),
+        ));
+    }
     let (
         next_tape_file_number,
         checkpoint_block_size,
@@ -863,7 +905,9 @@ fn perform_checkpoint_barrier_with_rows(
             closed.next_tape_file_number,
             selected.block_size,
             closed.barrier_outcome,
-            closed.sidecar_publication(),
+            closed.sidecar_publication().map_err(|e| {
+                CheckpointBarrierFailure::before_journal(Status::internal(e.to_string()))
+            })?,
             Some(parity_session.scheme.clone()),
             parity_early_warning,
         )
@@ -876,7 +920,7 @@ fn perform_checkpoint_barrier_with_rows(
                 batch.objects.len()
             )))
         })?;
-        let last = objects.last().ok_or_else(|| {
+        let last = draft.payloads.last().ok_or_else(|| {
             CheckpointBarrierFailure::before_journal(Status::internal(
                 "parity-off checkpoint batch has no Object projection",
             ))
@@ -934,9 +978,9 @@ fn perform_checkpoint_barrier_with_rows(
             operation_id: *batch.batch_id.as_bytes(),
             next_file: next_tape_file_number,
             block_size: checkpoint_block_size,
-            payloads: objects,
+            payloads: draft.payloads,
             scheme,
-            object_files: object_tape_file_bundles,
+            object_files: draft.object_files,
             barrier: barrier_bundle,
             finalization: None,
             sealed: false,
@@ -979,40 +1023,69 @@ fn perform_checkpoint_barrier_with_rows(
     } else {
         seal_reason
     };
-    record.seal_due = seal_reason
-        .filter(|_| !allow_finalization)
-        .map(|reason| match reason {
-            crate::pool_write::TapeSealReason::HardwareEarlyWarning => {
-                remanence_state::SealDueReason::HardwareEarlyWarning
-            }
-            _ => remanence_state::SealDueReason::ReachedLowWatermark,
-        });
+    record.check = parity_session
+        .as_ref()
+        .and_then(|session| session.sink_state.as_ref())
+        .map(|state| state.commit_check());
+    record.seal_due = seal_reason.map(|reason| match reason {
+        crate::pool_write::TapeSealReason::HardwareEarlyWarning => {
+            remanence_state::SealDueReason::HardwareEarlyWarning
+        }
+        _ => remanence_state::SealDueReason::ReachedLowWatermark,
+    });
     let filemark_drain = drain_started.elapsed();
     let projection_started = Instant::now();
     #[cfg(test)]
     if cfg.io_memory.epoch_test_action.load(Ordering::Relaxed) == 3 {
+        if let Some(session) = parity_session.as_deref_mut() {
+            if let Some(mut state) = session.sink_state.take() {
+                state.poison_publication();
+            }
+            session.retention = None;
+        }
         return Err(CheckpointBarrierFailure::before_journal(Status::internal(
             "injected checkpoint journal append failure",
         )));
     }
-    if let Err(err) = journal.publish_report(&record) {
-        return Err(if err.is_checkpoint_append_authority_uncertain() {
+    if let Err(err) = journal.complete_report(&record) {
+        if let Some(session) = parity_session.as_deref_mut() {
+            if let Some(mut state) = session.sink_state.take() {
+                state.poison_publication();
+            }
+            session.retention = None;
+        }
+        return Err(if err.is_checkpoint_append_durable() {
+            CheckpointBarrierFailure::after_journal(Status::internal(format!("checkpoint is durable in the tape log but folding or projection failed; retry after journal replay: {err}")))
+        } else if err.is_checkpoint_append_authority_uncertain() {
             CheckpointBarrierFailure::uncertain_journal(Status::internal(format!(
                 "checkpoint batch {} journal append failed with durable authority uncertain; close the session and retry only after journal reconciliation: {err}",
                 batch.batch_id,
             )))
         } else {
             CheckpointBarrierFailure::before_journal(Status::internal(format!(
-                "checkpoint batch {} journal fsync failed with rollback proved; re-send all {} WRITTEN objects: {err}",
+                "checkpoint batch {} tape-log publication failed; physical tail reconciliation is required before retrying {} WRITTEN objects: {err}",
                 batch.batch_id,
                 batch.objects.len(),
             )))
         });
     }
+    if let Some(session) = parity_session.as_deref_mut() {
+        if let Some(state) = session.sink_state.as_mut() {
+            state.acknowledge_publication();
+        }
+    }
     // WOR's adapter-only crash cut: journal append has fsynced, SQLite has not projected.
     if let Some(fault) = cfg.mounted().and_then(|m| m.direct_replay_fault.as_ref()) {
         fault
-            .abort_after_checkpoint_append(&record)
+            .abort_after_tape_log_append(
+                &record,
+                journal
+                    .log_reference()
+                    .map_err(|e| {
+                        CheckpointBarrierFailure::after_journal(crate::status_from_state_error(e))
+                    })?
+                    .0,
+            )
             .map_err(|error| {
                 CheckpointBarrierFailure::after_journal(status_from_selected_write_error(
                     selected,
@@ -1034,7 +1107,9 @@ fn perform_checkpoint_barrier_with_rows(
     } else {
         None
     };
-    let projection = index.project_authority_commit(&record);
+    let projection = journal
+        .freeze()
+        .and_then(|snapshot| index.project_tape_log(&snapshot));
     #[cfg(test)]
     drop(projection_lock);
     projection.map_err(|err| {
@@ -1469,6 +1544,9 @@ pub(super) fn close_committed_epoch(
     ) {
         Ok(outcome) => Ok(outcome),
         Err(mut failure) => {
+            if let Err(error) = lease.cancel_staged_report() {
+                tracing::warn!(%error, "provisional tape-log rollback failed; abandonment remains fenced");
+            }
             if failure.fence_handled && failure.durability_uncertain {
                 if let Err(error) = crate::append_admission::abandon_pending_append(drive, lease) {
                     tracing::error!(%error, "fenced epoch close abandonment marker fails");
@@ -1648,8 +1726,12 @@ pub(super) fn close_retained_before_removal(
                 "fenced removal leaves the epoch open until append recovery");
             return Ok(());
         }
-        let journal = remanence_state::TapeAuthority::open(&cfg.checkpoint_journal_dir, tape_uuid)
-            .map_err(crate::status_from_state_error)?;
+        let journal = remanence_state::TapeAuthority::open(
+            &cfg.checkpoint_journal_dir,
+            tape_uuid,
+            index.path(),
+        )
+        .map_err(crate::status_from_state_error)?;
         let mut lease = if journal
             .pending_finalization()
             .map_err(crate::status_from_state_error)?

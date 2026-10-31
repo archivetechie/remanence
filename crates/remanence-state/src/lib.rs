@@ -6,6 +6,7 @@
 //! are added in later implementation steps.
 
 pub mod authority;
+pub mod authority_layout;
 pub use authority::{TapeAuthority, TapeAuthorityLease, TerminalIndexSource};
 pub mod adapters;
 pub mod audit;
@@ -89,3 +90,6 @@ pub use state::{
 };
 
 pub use authority::{AuthorityCommit, AuthorityFinalization, AuthorityPrefixPlan, ObjectPayload};
+
+#[cfg(any(test, feature = "fixtures"))]
+pub use state::RejectResetHelpers;

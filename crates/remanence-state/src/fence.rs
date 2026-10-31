@@ -115,6 +115,17 @@ fn raise_with_fault(
         .ok_or_else(|| StateError::IndexCorrupt("tape-I/O fence vanished".into()))
 }
 
+/// Startup fence for a tape whose log is absent or ends below its projection mark.
+/// It is the only reason that is released without an operator.
+pub const TAPE_LOG_BELOW_PROJECTION: &str = "tape_log_below_projection";
+/// Startup fence for a tape whose catalog projection mark points inside its
+/// validated log but does not name a closing frame there. Unlike
+/// [`TAPE_LOG_BELOW_PROJECTION`], only an operator can release it.
+pub const TAPE_LOG_PROJECTION_MARK_INVALID: &str = "tape_log_projection_mark_invalid";
+/// Acknowledgment recorded when startup proves that condition has ended.
+pub const RESTORED_PROJECTION_RELEASE_ACK: &str =
+    "automatic: tape log validates at or above its projection mark";
+
 /// Persist and sync a release once, then clear its active catalog row.
 pub fn release(
     index: &mut CatalogIndex,
@@ -123,7 +134,42 @@ pub fn release(
     ack: &str,
     actor: AuditActor,
 ) -> Result<Option<TapeIoFenceRecord>, StateError> {
-    release_with_fault(index, audit_dir, id, ack, actor, || Ok(()))
+    release_with_fault(index, audit_dir, id, ack, actor, BTreeMap::new(), || Ok(()))
+}
+
+/// Release a [`TAPE_LOG_BELOW_PROJECTION`] fence after the caller validated the
+/// tape's log at or above its projection mark. Every other reason is refused.
+pub fn release_restored_projection(
+    index: &mut CatalogIndex,
+    audit_dir: &Path,
+    id: &str,
+    evidence_json: String,
+) -> Result<Option<TapeIoFenceRecord>, StateError> {
+    let reason = index
+        .tape_io_fence_by_quarantine_id(id)?
+        .map(|fence| fence.reason);
+    if reason.as_deref() != Some(TAPE_LOG_BELOW_PROJECTION) {
+        return Err(StateError::ConfigInvalid(format!(
+            "fence {id} is not a {TAPE_LOG_BELOW_PROJECTION} fence; only an operator can release it"
+        )));
+    }
+    let extra = BTreeMap::from([
+        ("automatic_release".into(), Value::Bool(true)),
+        (
+            "reason".into(),
+            Value::Text(TAPE_LOG_BELOW_PROJECTION.into()),
+        ),
+        ("evidence_json".into(), Value::Text(evidence_json)),
+    ]);
+    release_with_fault(
+        index,
+        audit_dir,
+        id,
+        RESTORED_PROJECTION_RELEASE_ACK,
+        AuditActor::System,
+        extra,
+        || Ok(()),
+    )
 }
 
 fn release_with_fault(
@@ -132,6 +178,7 @@ fn release_with_fault(
     id: &str,
     ack: &str,
     actor: AuditActor,
+    extra: BTreeMap<String, Value>,
     after_sync: impl FnOnce() -> Result<(), StateError>,
 ) -> Result<Option<TapeIoFenceRecord>, StateError> {
     if ack.trim().is_empty() {
@@ -157,6 +204,7 @@ fn release_with_fault(
     if let Some(endpoint) = record.endpoint {
         detail.insert("endpoint_key".into(), Value::Text(endpoint.encode()));
     }
+    detail.extend(extra);
     let mut audit = FileAuditLog::open(audit_dir, true)?;
     let (_, evidence) = audit.append_and_return_record(AuditEventRecord {
         actor,
@@ -348,6 +396,7 @@ tape_catalog_dir = "{0}/cache"
                 &fence.quarantine_id,
                 "checked drive",
                 AuditActor::System,
+                BTreeMap::new(),
                 || Err(StateError::IndexCorrupt("injected after audit sync".into())),
             );
             assert!(result.is_err());
@@ -401,5 +450,58 @@ tape_catalog_dir = "{0}/cache"
         )
         .is_err());
         assert_eq!(index.list_active_tape_io_fences().unwrap().len(), 1);
+    }
+
+    /// Only a below-projection fence is released automatically, with evidence.
+    #[test]
+    fn restored_projection_release_refuses_every_other_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = dir.path().join("audit");
+        let mut index = CatalogIndex::open(dir.path().join("index.sqlite")).unwrap();
+        let raise_reason = |index: &mut CatalogIndex, reason: &str| {
+            raise(
+                index,
+                &audit,
+                TapeIoFenceInput {
+                    tape_uuid: [5; 16],
+                    barcode: None,
+                    reason: reason.into(),
+                    evidence_json: None,
+                },
+                None,
+                AuditActor::System,
+            )
+            .unwrap()
+        };
+        let other = raise_reason(&mut index, "checkpoint_barrier_failed");
+        let below = raise_reason(&mut index, TAPE_LOG_BELOW_PROJECTION);
+        assert!(
+            release_restored_projection(&mut index, &audit, &other.quarantine_id, "{}".into())
+                .unwrap_err()
+                .to_string()
+                .contains("only an operator can release it")
+        );
+        let released =
+            release_restored_projection(&mut index, &audit, &below.quarantine_id, "{}".into())
+                .unwrap()
+                .unwrap();
+        assert_eq!(released.state, "released");
+        assert_eq!(
+            released.release_ack.as_deref(),
+            Some(RESTORED_PROJECTION_RELEASE_ACK)
+        );
+        let active = index.list_active_tape_io_fences().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].quarantine_id, other.quarantine_id);
+        let record = FileAuditLog::replay(&audit).unwrap().pop().unwrap();
+        assert_eq!(record.event, AuditEvent::TapeIoFenceReleased);
+        assert_eq!(
+            record.detail.get("automatic_release"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            record.detail.get("reason"),
+            Some(&Value::Text(TAPE_LOG_BELOW_PROJECTION.into()))
+        );
     }
 }

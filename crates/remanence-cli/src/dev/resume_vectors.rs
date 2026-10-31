@@ -537,7 +537,14 @@ pub fn append_object(
     world: &SharedVirtualWorld,
     input: &Value,
     vector: &VectorImage,
-) -> Result<(TapeIndexReplicaObjectRow, Vec<SidecarWriteSummary>), String> {
+) -> Result<
+    (
+        TapeIndexReplicaObjectRow,
+        Vec<SidecarWriteSummary>,
+        Vec<remanence_parity::authority::FilePublication>,
+    ),
+    String,
+> {
     use remanence_format::{
         plan_rem_tar_object, write_rem_tar_object_from_readers, RemTarObjectOptions,
     };
@@ -600,13 +607,16 @@ pub fn append_object(
             manifest_sha256: layout.manifest_sha256,
         },
     };
+    let mut publications = vec![closed.file_publication().map_err(|e| e.to_string())?];
     let mut sidecars = closed.sidecars_emitted;
-    sidecars.extend(
-        sink.close_open_epoch(remanence_parity::CloseReason::Barrier)
-            .map_err(|e| e.to_string())?
-            .sidecars_emitted,
-    );
-    Ok((row, sidecars))
+    let close = sink
+        .close_open_epoch(remanence_parity::CloseReason::Barrier)
+        .map_err(|e| e.to_string())?;
+    if let Some(publication) = close.sidecar_publication().map_err(|e| e.to_string())? {
+        publications.push(publication);
+    }
+    sidecars.extend(close.sidecars_emitted);
+    Ok((row, sidecars, publications))
 }
 
 /// Actual bytes and observations; no expected values enter execution.
@@ -671,8 +681,21 @@ pub fn execute_positive(input: &Value, vector: &VectorImage) -> Result<Resumed, 
         vector.written.inputs.writer_identity.clone(),
     )
     .map_err(|e| e.to_string())?;
-    let (row, sidecars) = append_object(&mut sink, &world, input, vector)?;
+    let (row, sidecars, publications) = append_object(&mut sink, &world, input, vector)?;
     let _state = sink.into_session_state().map_err(|e| e.to_string())?;
+    // The offline reference adapter owns host publication; the sink reports
+    // physical rows only. Preserve the legacy fixture's pinned representation.
+    let mut bundles: Vec<CommittedBundle> = publications.iter().map(Into::into).collect();
+    let last = bundles.last().expect("appended Object report");
+    bundles.push(CommittedBundle {
+        kind: CommittedBundleKind::CheckpointedThrough,
+        entries: Vec::new(),
+        highest_protected_ordinal: last.highest_protected_ordinal,
+        total_committed_ordinals: last.total_committed_ordinals,
+    });
+    journal
+        .publish_fixture(&remanence_parity::authority::ShadowPublication { bundles })
+        .map_err(|e| e.to_string())?;
     let image = world.lock().unwrap().tapes["RESUME001"].export_image();
     let stored_bytes = image.files[row.tape_file_number as usize].bytes.len();
     assert_eq!(

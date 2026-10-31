@@ -1305,208 +1305,78 @@ def verify_selection(root: Path, contexts: dict[str, ProfileContext]) -> int:
 
 
 def verify_interruptions(root: Path) -> int:
+    """Check the single-log crash model independently of the Rust generator."""
     rows = read_tsv(root / "INTERRUPTIONS.tsv")
-    require(len(rows) == 68, "matrix", "complete live interruption boundary count")
-    expected_fields = {
-        "case_id", "phase", "component", "cut",
-        "prefix_parity_map_blocks_accepted", "prefix_parity_map_filemark_accepted",
-        "prefix_media_barrier_proved",
-        "prefix_sink_journal", "prefix_sink_checkpoint",
-        "component_block_streams_accepted", "component_filemark_commands_accepted",
-        "component_media_barriers_proved",
-        "sink_journal_components", "checkpoint_components", "sqlite_components",
-        "sealed_checkpoint", "intent_present", "final_sqlite",
-        "expected_checkpoint_progress", "expected_completed_replicas", "expected_resume",
+    require(len(rows) == 60, "matrix", "complete single-log interruption boundary count")
+    prefix_fields = ["prefix_parity_map_blocks_accepted", "prefix_parity_map_filemark_accepted",
+                     "prefix_media_barrier_proved", "prefix_tape_log_min", "prefix_tape_log_max"]
+    component_fields = ["component_block_streams_accepted", "component_filemark_commands_accepted",
+                        "component_media_barriers_proved", "tape_log_components_min",
+                        "tape_log_components_max", "sqlite_components"]
+    final_fields = ["sealed_min", "sealed_max", "final_sqlite"]
+    fields = set(prefix_fields + component_fields + final_fields + ["case_id", "phase", "component", "cut",
+                 "expected_log_progress_min", "expected_completed_replicas_min", "expected_resume", "record_tag"])
+    require(all(set(row) == fields for row in rows), "matrix", "single-log matrix schema")
+    require(len({row["case_id"] for row in rows}) == len(rows), "matrix", "unique cut identities")
+    prefixes = {
+        "before_terminal_prefix": ((0, 0, 0, 0, 0), "finish-terminal-prefix"),
+        "before_final_parity_map": ((0, 0, 0, 0, 0), "finish-terminal-prefix"),
+        "after_final_parity_map": ((1, 1, 0, 0, 0), "finish-terminal-prefix"),
+        "before_tape_log_fsync": ((1, 1, 1, 0, 1), "replay-or-reconcile"),
+        "after_tape_log_fsync": ((1, 1, 1, 1, 1), "replica_a"),
+        "after_terminal_prefix": ((1, 1, 1, 1, 1), "replica_a"),
     }
-    require(
-        all(set(row) == expected_fields for row in rows),
-        "matrix", "interruption schema",
-    )
-    require(
-        len({row["case_id"] for row in rows}) == len(rows),
-        "matrix", "unique interruption case ids",
-    )
-    prefix_cuts = {
-        "before_terminal_prefix", "before_final_parity_map",
-        "after_final_parity_map", "after_terminal_prefix",
+    components = {
+        "before_footer": (0, 0, 0, 0, 0, 0),
+        "after_footer": (1, 0, 0, 0, 0, 0),
+        "before_filemark": (1, 0, 0, 0, 0, 0),
+        "after_filemark": (1, 1, 0, 0, 0, 0),
+        "before_barrier": (1, 1, 0, 0, 0, 0),
+        "after_barrier": (1, 1, 1, 0, 0, 0),
+        "before_tape_log_fsync": (1, 1, 1, 0, 1, 0),
+        "after_tape_log_fsync": (1, 1, 1, 1, 1, 0),
+        "before_sqlite_projection": (1, 1, 1, 1, 1, 0),
+        "after_sqlite_projection": (1, 1, 1, 1, 1, 1),
     }
-    component_cuts = {
-        "before_footer", "after_footer", "before_filemark", "after_filemark",
-        "before_barrier", "after_barrier", "before_parity_journal_fsync",
-        "after_parity_journal_fsync", "before_checkpoint_journal_fsync",
-        "after_checkpoint_journal_fsync",
+    finals = {
+        "before_tape_log_fsync": ((0, 1, 0), "finish-or-replay-sealed"),
+        "after_tape_log_fsync": ((1, 1, 0), "replay-sealed-completion"),
+        "before_final_sqlite_projection": ((1, 1, 0), "replay-sealed-completion"),
+        "after_final_sqlite_projection": ((1, 1, 1), "none"),
     }
-    sqlite_cuts = {"before_sqlite_projection", "after_sqlite_projection"}
-    final_cuts = {
-        "before_final_checkpoint_fsync", "after_final_checkpoint_fsync",
-        "before_final_sqlite_projection", "after_final_sqlite_projection",
-    }
-    component_names = [
-        "replica_a", "separation_ab", "replica_b", "separation_bc", "replica_c"
-    ]
-    by_phase: dict[str, list[dict[str, str]]] = {}
+    names = ["replica_a", "separation_ab", "replica_b", "separation_bc", "replica_c"]
+    expected_ids = {f"terminal_prefix-{cut}" for cut in prefixes} | {f"{name}-{cut}" for name in names for cut in components} | {f"final_projection-{cut}" for cut in finals}
+    require({r["case_id"] for r in rows} == expected_ids, "matrix", "exact single-log cut set")
     for row in rows:
-        by_phase.setdefault(row["phase"], []).append(row)
-        prefix_counts = [
-            int(row[field]) for field in (
-                "prefix_parity_map_blocks_accepted", "prefix_parity_map_filemark_accepted",
-                "prefix_media_barrier_proved",
-                "prefix_sink_journal", "prefix_sink_checkpoint",
-            )
-        ]
-        counts = [
-            int(row[field]) for field in (
-                "component_block_streams_accepted", "component_filemark_commands_accepted",
-                "component_media_barriers_proved",
-                "sink_journal_components", "checkpoint_components", "sqlite_components",
-            )
-        ]
-        final_flags = [
-            int(row[field]) for field in (
-                "sealed_checkpoint", "intent_present", "final_sqlite",
-            )
-        ]
-        require(
-            all(value in (0, 1) for value in prefix_counts + final_flags),
-            "matrix", f"{row['case_id']}: binary authority fields",
-        )
-        prefix_blocks, prefix_filemark, prefix_barrier, prefix_journal, prefix_checkpoint = prefix_counts
-        require(
-            0 <= prefix_checkpoint <= prefix_journal <= prefix_barrier <= prefix_filemark <= prefix_blocks <= 1,
-            "matrix", f"{row['case_id']}: prefix command/proof/authority ordering",
-        )
-        block_streams, filemark_commands, media_barriers, sink, checkpoint, sqlite = counts
-        require(
-            0 <= sqlite <= checkpoint <= sink <= media_barriers <= filemark_commands <= block_streams <= 5,
-            "matrix", f"{row['case_id']}: command/proof/authority ordering",
-        )
-        require(
-            row["expected_checkpoint_progress"] == PROGRESS[checkpoint],
-            "matrix", f"{row['case_id']}: checkpoint progress",
-        )
-        require(
-            int(row["expected_completed_replicas"]) == (checkpoint + 1) // 2,
-            "matrix", f"{row['case_id']}: completed replica projection",
-        )
-
-    prefix = by_phase.get("prefix", [])
-    require({row["cut"] for row in prefix} == prefix_cuts, "matrix", "prefix cuts")
-    prefix_expected = {
-        "before_terminal_prefix": (0, 0, 0, 0, 0, "finish-terminal-prefix"),
-        "before_final_parity_map": (0, 0, 0, 0, 0, "finish-terminal-prefix"),
-        "after_final_parity_map": (1, 1, 0, 0, 0, "finish-terminal-prefix"),
-        "after_terminal_prefix": (1, 1, 1, 1, 1, "replica_a"),
-    }
-    for row in prefix:
-        expected = prefix_expected[row["cut"]]
-        actual = (
-            int(row["prefix_parity_map_blocks_accepted"]),
-            int(row["prefix_parity_map_filemark_accepted"]),
-            int(row["prefix_media_barrier_proved"]), int(row["prefix_sink_journal"]),
-            int(row["prefix_sink_checkpoint"]), row["expected_resume"],
-        )
-        require(actual == expected, "matrix", f"{row['case_id']}: exact prefix state")
-        require(
-            row["component"] == "parity_closeout"
-            and all(row[field] == "0" for field in (
-                "component_block_streams_accepted", "component_filemark_commands_accepted",
-                "component_media_barriers_proved",
-                "sink_journal_components", "checkpoint_components", "sqlite_components",
-                "sealed_checkpoint", "final_sqlite",
-            ))
-            and row["intent_present"] == "1"
-            and row["expected_checkpoint_progress"] == "BeforeReplicaA"
-            and row["expected_completed_replicas"] == "0",
-            "matrix", f"{row['case_id']}: exact prefix host state",
-        )
-
-    component_rows = by_phase.get("component", [])
-    for index, component in enumerate(component_names):
-        subset = [row for row in component_rows if row["component"] == component]
-        expected_cuts = component_cuts | sqlite_cuts
-        require({row["cut"] for row in subset} == expected_cuts, "matrix", f"{component}: cut set")
-        for row in subset:
-            cut = row["cut"]
-            if cut == "before_footer":
-                component_state = (index, index, index, index, index, index)
-                resume = "reconcile-current"
-            elif cut in {"after_footer", "before_filemark"}:
-                component_state = (index + 1, index, index, index, index, index)
-                resume = "reconcile-current"
-            elif cut in {"after_filemark", "before_barrier"}:
-                component_state = (index + 1, index + 1, index, index, index, index)
-                resume = "reconcile-current"
-            elif cut in {"after_barrier", "before_parity_journal_fsync"}:
-                component_state = (index + 1, index + 1, index + 1, index, index, index)
-                resume = "reconcile-current"
-            elif cut in {"after_parity_journal_fsync", "before_checkpoint_journal_fsync"}:
-                component_state = (index + 1, index + 1, index + 1, index + 1, index, index)
-                resume = "promote-sink-transition"
-            elif cut in {"after_checkpoint_journal_fsync", "before_sqlite_projection"}:
-                component_state = (index + 1, index + 1, index + 1, index + 1, index + 1, index)
-                resume = (
-                    "repair-sqlite-then-finish-final-projection"
-                    if index == 4 else "repair-sqlite-then-continue"
-                )
-            elif cut == "after_sqlite_projection":
-                component_state = (index + 1,) * 6
+        label = row["case_id"]
+        prefix = tuple(int(row[f]) for f in prefix_fields)
+        component = tuple(int(row[f]) for f in component_fields)
+        final = tuple(int(row[f]) for f in final_fields)
+        cut, phase = row["cut"], row["phase"]
+        if phase == "prefix":
+            expected, resume = prefixes[cut]
+            require(row["component"] == "parity_closeout" and row["record_tag"] == "TerminalPrefix", "matrix", label)
+            require(prefix == expected and component == (0,) * 6 and final == (0,) * 3, "matrix", label)
+        elif phase == "component":
+            index = names.index(row["component"])
+            delta = components[cut]
+            require(prefix == (1,) * 5 and component == tuple(index + n for n in delta) and final == (0,) * 3, "matrix", label)
+            require(row["record_tag"] == "ComponentWritten", "matrix", label)
+            if delta[3] != delta[4]:
+                resume = "replay-or-reconcile"
+            elif delta[5]:
                 resume = "finish-final-projection" if index == 4 else "continue"
+            elif delta[3]:
+                resume = "repair-sqlite-then-finish-final-projection" if index == 4 else "repair-sqlite-then-continue"
             else:
-                fail("matrix", f"{row['case_id']}: unclassified component cut")
-            actual_state = tuple(
-                int(row[field]) for field in (
-                    "component_block_streams_accepted", "component_filemark_commands_accepted",
-                    "component_media_barriers_proved",
-                    "sink_journal_components", "checkpoint_components", "sqlite_components",
-                )
-            )
-            require(
-                actual_state == component_state,
-                "matrix", f"{row['case_id']}: exact component authority state",
-            )
-            require(
-                all(row[field] == "1" for field in (
-                    "prefix_parity_map_blocks_accepted", "prefix_parity_map_filemark_accepted",
-                    "prefix_media_barrier_proved",
-                    "prefix_sink_journal", "prefix_sink_checkpoint", "intent_present",
-                ))
-                and row["sealed_checkpoint"] == "0"
-                and row["final_sqlite"] == "0"
-                and row["expected_resume"] == resume,
-                "matrix", f"{row['case_id']}: exact component recovery state",
-            )
-
-    final = by_phase.get("final_projection", [])
-    require({row["cut"] for row in final} == final_cuts, "matrix", "final projection cuts")
-    final_expected = {
-        "before_final_checkpoint_fsync": (0, 1, 0, "finish-final-projection"),
-        "after_final_checkpoint_fsync": (1, 1, 0, "replay-sealed-completion"),
-        "before_final_sqlite_projection": (1, 0, 0, "replay-sealed-completion"),
-        "after_final_sqlite_projection": (1, 0, 1, "none"),
-    }
-    for row in final:
-        expected = final_expected[row["cut"]]
-        actual = (
-            int(row["sealed_checkpoint"]), int(row["intent_present"]),
-            int(row["final_sqlite"]), row["expected_resume"],
-        )
-        require(actual == expected, "matrix", f"{row['case_id']}: exact final state")
-        require(
-            all(row[field] == "1" for field in (
-                "prefix_parity_map_blocks_accepted", "prefix_parity_map_filemark_accepted",
-                "prefix_media_barrier_proved",
-                "prefix_sink_journal", "prefix_sink_checkpoint",
-            ))
-            and all(row[field] == "5" for field in (
-                "component_block_streams_accepted", "component_filemark_commands_accepted",
-                "component_media_barriers_proved",
-                "sink_journal_components", "checkpoint_components", "sqlite_components",
-            ))
-            and row["expected_checkpoint_progress"] == "AfterReplicaC"
-            and row["expected_completed_replicas"] == "3",
-            "matrix", f"{row['case_id']}: exact final authority",
-        )
-    require(set(by_phase) == {"prefix", "component", "final_projection"}, "matrix", "known phases")
+                resume = "reconcile-current"
+        else:
+            require(phase == "final_projection" and row["component"] == phase and row["record_tag"] == "Sealed", "matrix", label)
+            expected, resume = finals[cut]
+            require(prefix == (1,) * 5 and component == (5,) * 6 and final == expected, "matrix", label)
+        require(row["expected_resume"] == resume, "matrix", f"{label}: recovery route")
+        require(row["expected_log_progress_min"] == PROGRESS[component[3]], "matrix", f"{label}: minimum progress")
+        require(int(row["expected_completed_replicas_min"]) == (component[3] + 1) // 2, "matrix", f"{label}: replica minimum")
     return len(rows)
 
 

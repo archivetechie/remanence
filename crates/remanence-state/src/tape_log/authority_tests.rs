@@ -122,7 +122,7 @@ fn old_format_refusals_are_typed_and_leave_authority_unchanged() {
     writer.publish_report(&commit).unwrap();
     let before = writer.authority_summary().unwrap();
     let p = FilePublication {
-        purpose: FilePurpose::Checkpoint,
+        purpose: FilePurpose::Object,
         files: Vec::new(),
         protected: 0,
         total: 3,
@@ -176,8 +176,8 @@ fn automatic_finalization_carries_seal_reason_and_reports_after_durability_failu
     assert!(summary.sealed);
     assert_eq!(summary.seal_due, report.seal_due);
     assert!(
-        writer.latest_commit().is_err(),
-        "legacy projection must not silently return the pre-seal commit"
+        writer.latest_commit().unwrap().unwrap().sealed,
+        "the latest summary must reflect the durable seal"
     );
 }
 
@@ -414,4 +414,147 @@ fn streaming_report_preserves_unverified_check_and_range_end() {
         })
         .unwrap();
     assert_eq!(observed, 1);
+}
+
+/// The writer holds the core across a slow media call; readers use its frozen
+/// pre-barrier snapshot and must finish before the media callback can return.
+#[test]
+fn streaming_media_barrier_does_not_block_structural_readers() {
+    let root = tempfile::tempdir().unwrap();
+    let authority = TapeAuthority::open_fixture(root.path(), [0x81; 16]).unwrap();
+    let mut writer = authority.acquire_exclusive().unwrap();
+    let rows = writer
+        .open_structural(262144, remanence_parity::default_scheme())
+        .unwrap();
+    let (start, started) = std::sync::mpsc::channel();
+    let (done, finished) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        started.recv().unwrap();
+        let snapshot = rows.freeze().unwrap();
+        done.send(snapshot.committed_entry_count()).unwrap();
+    });
+    writer
+        .with_store(|_| {
+            start.send(()).unwrap();
+            assert_eq!(
+                finished
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap(),
+                0
+            );
+            Ok(())
+        })
+        .unwrap();
+    reader.join().unwrap();
+}
+
+#[test]
+fn staged_and_ambiguous_leases_explicitly_refuse_abandonment_and_stale_latest() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = [0x82; 16];
+    let authority = TapeAuthority::open_fixture(dir.path(), id).unwrap();
+    let mut writer = authority.acquire_exclusive().unwrap();
+    let report = (&record(id)).into();
+    writer.stage_report(&report).unwrap();
+    assert!(writer.ensure_abandonment_allowed().is_err());
+    assert!(writer.latest_commit().is_err());
+    writer.cancel_staged_report().unwrap();
+    writer.ensure_abandonment_allowed().unwrap();
+    assert!(writer.latest_commit().unwrap().is_none());
+    writer.stage_report(&report).unwrap();
+    writer
+        .set_publication_observer(crate::tape_log::store::PublicationObserver(Arc::new(
+            |_, _, _| Err(io::Error::other("ambiguous fsync")),
+        )))
+        .unwrap();
+    let error = writer.complete_report(&report).unwrap_err();
+    assert!(error.is_checkpoint_append_authority_uncertain());
+    assert!(!error.is_checkpoint_append_durable());
+    writer.cancel_staged_report().unwrap(); // no still-provisional group to cancel
+    assert!(writer.ensure_abandonment_allowed().is_err());
+    assert!(writer.latest_commit().is_err());
+    assert!(writer.read_cache.lock().unwrap().is_none());
+}
+#[test]
+fn after_durable_report_clears_cached_snapshot_and_has_distinct_error_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = [0x83; 16];
+    let authority = TapeAuthority::open_fixture(dir.path(), id).unwrap();
+    let mut writer = authority.acquire_exclusive().unwrap();
+    let report = (&record(id)).into();
+    writer.stage_report(&report).unwrap();
+    writer
+        .set_publication_observer(crate::tape_log::store::PublicationObserver(Arc::new(
+            |_, _, after| {
+                if after {
+                    Err(io::Error::other("after durable"))
+                } else {
+                    Ok(())
+                }
+            },
+        )))
+        .unwrap();
+    let error = writer.complete_report(&report).unwrap_err();
+    assert!(error.is_checkpoint_append_durable());
+    assert!(!error.is_checkpoint_append_authority_uncertain());
+    assert!(writer.read_cache.lock().unwrap().is_none());
+    assert!(writer.latest_commit().is_err());
+    drop(writer);
+    assert!(authority.freeze().unwrap().log_reference().0 > 0);
+}
+#[test]
+fn every_writer_acquisition_binds_the_current_projection_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = [0x84; 16];
+    let mut index = crate::CatalogIndex::open(dir.path().join("index.sqlite")).unwrap();
+    let authority = TapeAuthority::open(dir.path(), id, index.path()).unwrap();
+    let mut writer = authority.acquire_exclusive().unwrap();
+    writer.publish_report(&(&record(id)).into()).unwrap();
+    let first = writer.freeze().unwrap();
+    writer
+        .publish_report(&(&crate::checkpoint::tests::second_record(id)).into())
+        .unwrap();
+    index.project_tape_log(&writer.freeze().unwrap()).unwrap();
+    drop(writer);
+    let path = authority.path();
+    let bytes = std::fs::read(path).unwrap();
+    std::fs::write(path, &bytes[..first.raw.summary().closed_end as usize]).unwrap();
+    let before = std::fs::read(path).unwrap();
+    assert!(authority.acquire_exclusive().is_err());
+    assert!(authority.acquire_exclusive_for_terminal_recovery().is_err());
+    assert!(authority.acquire_for_tail_reconciliation().is_err());
+    assert!(index
+        .project_tape_log(&authority.freeze().unwrap())
+        .is_err());
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn structural_snapshot_contention_has_a_typed_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = [0x86; 16];
+    let authority = TapeAuthority::open_fixture(dir.path(), id).unwrap();
+    let writer = authority.acquire_exclusive().unwrap();
+    let (record, _, _) = crate::authority::contract_tests::structural_fixture(id);
+    let structural = writer
+        .open_structural(record.block_size, record.scheme.unwrap())
+        .unwrap();
+    let core = writer.core.clone();
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let _guard = core.lock().unwrap();
+        held_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    held_rx.recv().unwrap();
+    let start = std::time::Instant::now();
+    let error = structural.freeze().unwrap_err();
+    assert!(
+        matches!(error, JournalError::Io(ref e) if e.kind() == io::ErrorKind::TimedOut),
+        "{error}"
+    );
+    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    release_tx.send(()).unwrap();
+    thread.join().unwrap();
 }

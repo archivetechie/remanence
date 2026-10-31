@@ -18,6 +18,7 @@ pub(super) type PlanBase = Option<(u64, Arc<TapeSummary>)>;
 type ValidatedPrefix = (TapeSummary, Tail, ReplayMetrics, PlanBase);
 
 /// Unvalidated capture, deliberately not an authority token.
+#[derive(Clone)]
 pub(super) struct Captured {
     file: Option<Arc<File>>,
     end: u64,
@@ -126,12 +127,7 @@ impl Captured {
             Ok((fold.summary().clone(), Tail::Complete, metrics, None))
         }
     }
-    pub(super) fn validate_through(&self, through: u64) -> Result<(TapeSummary, u64), StoreError> {
-        if through == 0 {
-            return Err(StoreError::Refused(
-                "repair must retain a closed initialization",
-            ));
-        }
+    pub(super) fn inspect_tail(&self) -> Result<super::store::TailInspection, StoreError> {
         let file = self
             .file
             .as_ref()
@@ -148,7 +144,7 @@ impl Captured {
             1,
             self.start,
         );
-        let summary = loop {
+        let (summary, damage) = loop {
             match decoder.next_frame() {
                 Ok(Some(frame)) => {
                     if let Record::Initialized(init) = &frame.record {
@@ -159,25 +155,54 @@ impl Captured {
                             return Err(StoreError::Header);
                         }
                     }
-                    if fold.push(&frame).is_err() {
-                        break fold.summary().clone();
+                    if let Err(error) = fold.push(&frame) {
+                        break (fold.summary().clone(), Some(error.to_string()));
                     }
                 }
                 Ok(None) => {
                     let (summary, tail) = fold
                         .finish(decoder.tail())
                         .map_err(CodecError::EncodeSchema)?;
-                    if tail == Tail::Complete {
-                        return Err(StoreError::Refused(
-                            "log has no damaged or provisional suffix",
-                        ));
-                    }
-                    break summary;
+                    break (
+                        summary,
+                        (tail != Tail::Complete).then(|| format!("{tail:?}")),
+                    );
                 }
-                Err(CodecError::Recovery(_)) => break fold.summary().clone(),
+                Err(CodecError::Recovery(error)) => {
+                    break (fold.summary().clone(), Some(error.to_string()))
+                }
                 Err(error) => return Err(error.into()),
             }
         };
+        Ok(super::store::TailInspection {
+            through_sequence: summary.last_closed_sequence,
+            valid_bytes: summary.closed_end,
+            original_bytes: self.end,
+            damage,
+        })
+    }
+    pub(super) fn validate_through(&self, through: u64) -> Result<(TapeSummary, u64), StoreError> {
+        if through == 0 {
+            return Err(StoreError::Refused(
+                "repair must retain a closed initialization",
+            ));
+        }
+        let inspection = self.inspect_tail()?;
+        if inspection.damage.is_none() {
+            return Err(StoreError::Refused(
+                "log has no damaged or provisional suffix",
+            ));
+        }
+        if inspection.through_sequence != through {
+            return Err(StoreError::Refused(
+                "repair must retain the last validated closed sequence",
+            ));
+        }
+        // Validate only the retained, already checked prefix for its summary.
+        let mut prefix = self.clone();
+        prefix.end = inspection.valid_bytes;
+        let snapshot = prefix.validate()?;
+        let summary = snapshot.summary().clone();
         if summary.last_closed_sequence != through {
             return Err(StoreError::Refused(
                 "repair must retain the last validated closed sequence",
@@ -185,6 +210,24 @@ impl Captured {
         }
         let end = summary.closed_end;
         Ok((summary, end))
+    }
+    pub(super) fn repair_prefix(
+        mut self,
+        through: u64,
+        resuming: bool,
+    ) -> Result<Snapshot, StoreError> {
+        if resuming {
+            if let Ok(snapshot) = self.clone().validate() {
+                if snapshot.summary.last_closed_sequence == through
+                    && snapshot.tail == Tail::Complete
+                {
+                    return Ok(snapshot);
+                }
+            }
+        }
+        let (_, end) = self.validate_through(through)?;
+        self.end = end;
+        self.validate()
     }
     /// The exclusive owner has already fully validated and incrementally folded
     /// these bytes. Reuse that proof without a catalog scan under its lock.
@@ -338,7 +381,7 @@ impl Snapshot {
         }
         Ok(())
     }
-    pub(super) fn before(&self, sequence: u64) -> Result<Self, StoreError> {
+    pub(crate) fn before(&self, sequence: u64) -> Result<Self, StoreError> {
         if let Some((first, summary)) = &self.plan_base {
             if *first == sequence {
                 let mut result = self.clone();
@@ -366,14 +409,66 @@ impl Snapshot {
         result.tail = Tail::Complete;
         Ok(result)
     }
-    pub(super) fn group_snapshot(&self, sequence: u64, start: u64, end: u64) -> Self {
+    pub(crate) fn group_snapshot(&self, sequence: u64, start: u64, end: u64) -> Self {
         let mut result = self.clone();
         result.start = start;
         result.first_sequence = sequence;
         result.summary.closed_end = end;
         result
     }
-    pub(super) fn decoder(&self) -> Option<Decoder<PrefixReader>> {
+    /// Seek directly to the projection's closing frame. Full snapshot validation
+    /// already proved the prefix; this checks the mark without replaying it.
+    pub(crate) fn projection_decoder(
+        &self,
+        sequence: u64,
+        offset: u64,
+    ) -> Result<Option<Decoder<PrefixReader>>, StoreError> {
+        if sequence == 0 {
+            return Ok(self.decoder());
+        }
+        let file = self
+            .file
+            .as_ref()
+            .ok_or(StoreError::Refused(super::store::BELOW_PROJECTION_MARK))?;
+        if sequence > self.summary.last_closed_sequence
+            || offset < self.start
+            || offset >= self.summary.closed_end
+        {
+            return Err(StoreError::Refused(super::store::PROJECTION_MARK_MISMATCH));
+        }
+        let mut decoder = Decoder::at(
+            PrefixReader {
+                file: file.clone(),
+                position: offset,
+                end: self.summary.closed_end,
+            },
+            sequence,
+            offset,
+        );
+        // The prefix is validated, so bytes that fail to decode here mean the
+        // mark itself is wrong, not the log. A transport failure is not evidence.
+        let frame = decoder
+            .next_row_frame()
+            .map_err(|error| match error {
+                CodecError::Recovery(_) => StoreError::ProjectionMarkInvalid(format!(
+                    "sequence {sequence} at offset {offset}: {error}"
+                )),
+                other => other.into(),
+            })?
+            .ok_or(StoreError::Refused(
+                super::store::PROJECTION_MARK_NOT_CLOSING,
+            ))?;
+        if matches!(
+            frame.record,
+            Record::Initialized(_) | Record::PayloadContinuation(_)
+        ) {
+            return Err(StoreError::Refused(
+                super::store::PROJECTION_MARK_NOT_CLOSING,
+            ));
+        }
+        Ok(Some(decoder))
+    }
+    pub(crate) fn decoder(&self) -> Option<Decoder<PrefixReader>> {
         self.file.as_ref().map(|file| {
             Decoder::at(
                 PrefixReader {
@@ -389,7 +484,7 @@ impl Snapshot {
 }
 /// Independent positional cursor, bounded before every read and seek.
 #[derive(Debug)]
-pub(super) struct PrefixReader {
+pub(crate) struct PrefixReader {
     file: Arc<File>,
     position: u64,
     end: u64,
@@ -446,6 +541,8 @@ impl Snapshot {
                     bytes: io::Cursor::new(bytes),
                     last,
                 };
+                #[cfg(any(test, feature = "fixtures"))]
+                super::measure::catalog_payload();
                 visitor(&CatalogPayload::Object(Box::new(
                     payload::CommittedObjectProjection::get(&mut stream)?,
                 )))?;
@@ -455,6 +552,8 @@ impl Snapshot {
                         break;
                     }
                     let mut member = io::Cursor::new(first).chain(&mut stream);
+                    #[cfg(any(test, feature = "fixtures"))]
+                    super::measure::catalog_payload();
                     visitor(&CatalogPayload::Member(
                         crate::NativeObjectFileProjectionInput::get(&mut member)?,
                     ))?;

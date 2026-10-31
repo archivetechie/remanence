@@ -3,9 +3,9 @@
 use super::*;
 use crate::pool_write::*;
 use remanence_parity::{
-    CommittedBundle, CommittedBundleKind, ParityScheme, SchemeId, TapeFileEntry, TapeFileKind,
-    TapeReportPublisher, TapeRowAuthority,
+    ParityScheme, SchemeId, TapeFileKind, TapeReportPublisher, TapeRowAuthority,
 };
+use remanence_state::authority::TapeAuthorityView;
 use remanence_state::{TapeAuthority, TerminalFinalizationProgress};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,7 +20,7 @@ fn scheme(stripe: u16) -> crate::ParityConfig {
 }
 fn checkpoint(f: &Fixture) -> TapeAuthority {
     remanence_state::authority::fixtures::AuthorityBuilder::new(
-        f.config.journal.dir.join("checkpoints"),
+        f.config.journal.dir.join("tapes"),
         UUID,
     )
     .build()
@@ -116,12 +116,23 @@ impl SgTransport for FaultTransport {
 }
 fn configured_owner(
     f: &Fixture,
-    mut state: StateHandle,
+    state: StateHandle,
     memory: Option<u64>,
     replicas: Option<Arc<AtomicUsize>>,
     misdirect: bool,
     admissions: crate::write_admission::WriteAdmissionCoordinator,
 ) -> MountedDrive {
+    configured_owner_and_memory(f, state, memory, replicas, misdirect, admissions).0
+}
+
+fn configured_owner_and_memory(
+    f: &Fixture,
+    mut state: StateHandle,
+    memory: Option<u64>,
+    replicas: Option<Arc<AtomicUsize>>,
+    misdirect: bool,
+    admissions: crate::write_admission::WriteAdmissionCoordinator,
+) -> (MountedDrive, Arc<crate::io_memory::IoMemoryReservation>) {
     let mut mount = crate::OperatorMount::with_transport_for_test(
         Path::new(DEVICE),
         &StaticAllowlist::new([SERIAL]),
@@ -160,7 +171,11 @@ fn configured_owner(
     if let Some(memory) = memory {
         cfg.io_memory = crate::io_memory::IoMemoryReservation::new(memory).unwrap();
     }
-    MountedDrive::start_configured(state, mounted, cfg, None).unwrap()
+    let memory = cfg.io_memory.clone();
+    (
+        MountedDrive::start_configured(state, mounted, cfg, None).unwrap(),
+        memory,
+    )
 }
 
 /// Fail both the real checkpoint frame fsync and its rollback fsync, then
@@ -170,90 +185,100 @@ fn uncertain_checkpoint_append_quarantines_identity_until_restart() {
     use remanence_chaos::file_model::{FileEvent, MemoryDirectory};
     use remanence_library::durable_file::test_support::register;
 
-    let admissions = crate::write_admission::WriteAdmissionCoordinator::default();
-    let (f, state) = Fixture::new(false);
-    let files = MemoryDirectory::default();
-    let registration = register(
-        f.config.journal.dir.join("checkpoints"),
-        Arc::new(files.clone()),
-    );
-    let mut actor = configured_owner(&f, state, None, None, false, admissions.clone());
-    actor.open_session("default").unwrap();
-    let publication = remanence_state::authority::fixtures::publication_target(&checkpoint(&f));
-    let failures = Arc::new(AtomicUsize::new(0));
-    let observed = failures.clone();
-    let backend = files.clone();
-    files.observe(Some(Arc::new(move |event| {
-        if let FileEvent::BeforeSync(path) = event {
-            if publication.matches(&path) && observed.load(Ordering::SeqCst) < 2 {
-                backend.fail_next_sync(&path).unwrap();
-                observed.fetch_add(1, Ordering::SeqCst);
+    for parity_enabled in [false, true] {
+        let admissions = crate::write_admission::WriteAdmissionCoordinator::default();
+        let (f, state) = Fixture::new(parity_enabled);
+        let files = MemoryDirectory::default();
+        let registration = register(f.config.journal.dir.join("tapes"), Arc::new(files.clone()));
+        let mut actor = configured_owner(&f, state, None, None, false, admissions.clone());
+        actor.open_session("default").unwrap();
+        let publication = remanence_state::authority::fixtures::publication_target(&checkpoint(&f));
+        let failures = Arc::new(AtomicUsize::new(0));
+        let observed = failures.clone();
+        let backend = files.clone();
+        let failed_at = Arc::new(AtomicUsize::new(usize::MAX));
+        let observed_at = failed_at.clone();
+        let commands = f.commands.clone();
+        let syncs = AtomicUsize::new(0);
+        files.observe(Some(Arc::new(move |event| {
+            if let FileEvent::BeforeSync(path) = event {
+                if publication.matches(&path) && syncs.fetch_add(1, Ordering::SeqCst) == 1 {
+                    observed_at.store(commands.lock().unwrap().len(), Ordering::SeqCst);
+                    backend.fail_next_sync(&path).unwrap();
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
             }
-        }
-    })));
-    let error = actor.append(f.request("uncertain-caller")).unwrap_err();
-    assert_eq!(
-        failures.load(Ordering::SeqCst),
-        2,
-        "frame and rollback fsync failed"
-    );
-    assert!(
-        error
-            .status
-            .message()
-            .contains("durable authority uncertain"),
-        "{error}"
-    );
-    assert!(
-        error.status.message().contains("rollback to offset"),
-        "{error}"
-    );
-    assert!(
-        error.status.message().contains("journal reconciliation"),
-        "{error}"
-    );
-    assert!(f
-        .index()
-        .get_native_object_by_unique_caller_object_id("uncertain-caller")
-        .unwrap()
-        .is_none());
-    files.observe(None);
-    let _ = actor.finish();
-    drop(registration);
+        })));
+        let error = actor.append(f.request("uncertain-caller")).unwrap_err();
+        assert_eq!(
+            failures.load(Ordering::SeqCst),
+            1,
+            "single tape-log fsync failed"
+        );
+        assert!(
+            error
+                .status
+                .message()
+                .contains("durable authority uncertain"),
+            "{error}"
+        );
+        assert!(
+            error.status.message().contains("journal reconciliation"),
+            "{error}"
+        );
+        assert!(f
+            .index()
+            .get_native_object_by_unique_caller_object_id("uncertain-caller")
+            .unwrap()
+            .is_none());
+        let before_retry = command_count(&f);
+        assert!(actor
+            .append(f.request("after-publication-failure"))
+            .is_err());
+        no_modifications(&f, before_retry);
+        files.observe(None);
+        let _ = actor.finish();
+        no_modifications(&f, failed_at.load(Ordering::SeqCst));
+        assert!(f
+            .index()
+            .tape_io_is_fenced(Some(&UUID), None, None)
+            .unwrap());
+        drop(registration);
 
-    // Another drive has no tape fence or failed-session latch. Only the shared
-    // in-process identity claim can refuse its otherwise valid append.
-    let (other, state) = Fixture::new(false);
-    let mut retry = configured_owner(&other, state, None, None, false, admissions.clone());
-    retry.open_session("default").unwrap();
-    let before = command_count(&other);
-    let error = retry.append(other.request("uncertain-caller")).unwrap_err();
-    assert_eq!(error.status.code(), tonic::Code::Aborted, "{error}");
-    assert!(
-        error
-            .status
-            .message()
-            .contains("same pool/caller replay key"),
-        "{error}"
-    );
-    no_modifications(&other, before);
-    retry.finish().unwrap();
-    // Recreating the process-wide coordinator models restart. It does not
-    // release the first tape's durable fence or bypass journal reconciliation.
-    drop(admissions);
-    let mut restarted = configured_owner(
-        &other,
-        other.reopen().unwrap(),
-        None,
-        None,
-        false,
-        Default::default(),
-    );
-    let committed = restarted
-        .write_checkpointed(other.request("uncertain-caller"))
-        .unwrap();
-    assert_eq!(committed.object.caller_object_id, "uncertain-caller");
-    restarted.finish().unwrap();
+        // Another drive has no tape fence or failed-session latch. Only the shared
+        // in-process identity claim can refuse its otherwise valid append.
+        let (other, state) = Fixture::new(false);
+        let mut retry = configured_owner(&other, state, None, None, false, admissions.clone());
+        retry.open_session("default").unwrap();
+        let before = command_count(&other);
+        let error = retry.append(other.request("uncertain-caller")).unwrap_err();
+        assert_eq!(error.status.code(), tonic::Code::Aborted, "{error}");
+        assert!(
+            error
+                .status
+                .message()
+                .contains("same pool/caller replay key"),
+            "{error}"
+        );
+        no_modifications(&other, before);
+        retry.finish().unwrap();
+        // Recreating the process-wide coordinator models restart. It does not
+        // release the first tape's durable fence or bypass journal reconciliation.
+        drop(admissions);
+        let mut restarted = configured_owner(
+            &other,
+            other.reopen().unwrap(),
+            None,
+            None,
+            false,
+            Default::default(),
+        );
+        let committed = restarted
+            .write_checkpointed(other.request("uncertain-caller"))
+            .unwrap();
+        assert_eq!(committed.object.caller_object_id, "uncertain-caller");
+        restarted.finish().unwrap();
+    }
 }
 
 #[test]
@@ -427,7 +452,7 @@ fn batch_of_one_core_journals_tape_for_later_daemon_admission() {
             &f.config.tape_pools[0],
             7,
             &HashSet::new(),
-            &f.config.journal.dir.join("checkpoints")
+            &f.config.journal.dir.join("tapes")
         )
         .unwrap()
         .tape_uuid,
@@ -457,10 +482,7 @@ fn watermark_seal_journals_exact_terminal_authority_and_host_suffix() {
         assert!(terminal.sealed_after_write);
         assert_eq!(terminal.committed_object_count, 1);
         assert_eq!(terminal.ordinal, records[0].ordinal + 1);
-        assert_eq!(
-            terminal.barrier_bundle.as_ref().map(|b| b.kind),
-            Some(CommittedBundleKind::TerminalComponent)
-        );
+        assert_eq!(terminal.barrier_bundle.as_ref().map(|b| b.kind), None);
         let finalization = terminal.terminal_finalization.as_ref().unwrap();
         assert_eq!(
             finalization.progress,
@@ -485,12 +507,17 @@ fn watermark_seal_journals_exact_terminal_authority_and_host_suffix() {
                 panic!()
             };
             assert_eq!(terminal.scheme.as_ref(), Some(&scheme));
-            let committed = parity(&f).load_committed().unwrap();
-            assert!(committed.orphaned_bundles.is_empty());
-            assert_eq!(
-                committed.entries.last().map(|e| e.kind),
-                Some(TapeFileKind::TapeIndexReplica)
-            );
+            let authority = checkpoint(&f).freeze().unwrap();
+            let mut last = None;
+            remanence_state::authority::TapeAuthoritySnapshot::visit_file_rows(
+                &authority,
+                &mut |row| {
+                    last = Some(row.kind);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(last, Some(TapeFileKind::TapeIndexReplica));
         }
         // Re-enter the actor's host-only terminal completion twice: idempotent
         // sealing and the StateHandle audit append cursor must remain intact.
@@ -565,13 +592,7 @@ fn terminal_failure_preserves_object_checkpoint_and_structured_intent() {
     let index = f.index();
     crate::tests::assert_fences_survive_empty_rebuild(&index, &f.config.audit.dir);
     let journal = checkpoint(&f);
-    let error = journal.replay().unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("pending terminal finalization intent"),
-        "{error}"
-    );
+    assert_eq!(journal.replay().unwrap().len(), 1);
     let recovery = journal
         .acquire_exclusive_for_terminal_recovery()
         .and_then(|mut l| l.replay_for_terminal_recovery())
@@ -678,78 +699,38 @@ fn encrypted_first_epoch_journals_parity_state_and_replays() {
 }
 
 #[test]
-fn bootstrap_only_parity_orphan_requires_physical_reconciliation_before_positioning() {
-    let (f, mut state) = Fixture::with_parity(scheme(8));
-    let selected = select_tape_in_pool(
-        state.catalog_index(),
-        &f.config.tape_pools[0],
-        7,
-        &HashSet::new(),
-    )
-    .unwrap();
-    let crate::ParityConfig::Scheme(scheme) = selected.parity_config.clone() else {
-        panic!()
-    };
-    let mut journal = parity(&f);
-    journal
-        .publish_fixture(&remanence_parity::authority::ShadowPublication {
-            bundles: vec![(CommittedBundle {
-                kind: CommittedBundleKind::BotBootstrap,
-                entries: vec![TapeFileEntry {
-                    tape_file_number: 0,
-                    kind: TapeFileKind::Bootstrap,
-                    block_count: 1,
-                    physical_start_hint: Some(0),
-                    object_id: None,
-                    first_parity_data_ordinal: None,
-                    epoch_id: None,
-                    protected_ordinal_start: None,
-                    protected_ordinal_end_exclusive: None,
-                    canonical_metadata_hash: None,
-                    object_recovery_row: None,
-                }],
-                highest_protected_ordinal: 0,
-                total_committed_ordinals: 0,
-            })
-            .clone()],
-        })
-        .unwrap();
-    project_fresh_parity_bootstrap_bundle(state.catalog_index(), &selected, &scheme).unwrap();
-    let committed = journal.load_committed().unwrap();
-    assert!(committed.entries.is_empty());
-    assert_eq!(committed.orphaned_bundles.len(), 1);
-    let tape = state.catalog_index().get_tape(&UUID).unwrap().unwrap();
-    assert_eq!(tape.total_committed_ordinals, 0);
-    assert_eq!(tape.last_committed_tape_file, Some(0));
-    let checkpoint_dir = f.config.journal.dir.join("checkpoints");
-    assert_eq!(
-        select_tape_in_pool_for_write_session(
-            state.catalog_index(),
-            &f.config.tape_pools[0],
-            7,
-            &HashSet::new(),
-            &checkpoint_dir
-        )
-        .unwrap()
-        .tape_uuid,
-        UUID
-    );
-    assert!(matches!(admit_pinned_tape_for_write_session(
-        state.catalog_index(), UUID, "default", &f.config.tape_pools[0], &checkpoint_dir
-    ).unwrap(), PinnedWriteDisposition::Writable(selected) if selected.tape_uuid == UUID));
-    drop(journal);
+fn bootstrap_before_first_barrier_has_no_log_or_projected_bot() {
+    let (f, state) = Fixture::with_parity(scheme(8));
     let mut actor = f.owner(state);
-    let before = command_count(&f);
-    let error = actor.write_checkpointed(f.request("orphan")).unwrap_err();
+    actor.open_session("default").unwrap();
     assert!(
-        error.to_string().contains("journal recovery required"),
-        "{error}"
+        !remanence_state::TapeAuthority::exists(f.config.journal.dir.join("tapes"), UUID).unwrap()
     );
-    no_modifications(&f, before);
-    let _ = actor.finish();
-    let preserved = parity(&f).load_committed().unwrap();
-    assert!(preserved.entries.is_empty());
-    assert_eq!(preserved.orphaned_bundles.len(), 1);
+    let tape = f.index().get_tape(&UUID).unwrap().unwrap();
+    assert_eq!(tape.total_committed_ordinals, 0);
+    assert_eq!(tape.last_committed_tape_file, None);
+    actor.finish().unwrap();
+    assert!(
+        !remanence_state::TapeAuthority::exists(f.config.journal.dir.join("tapes"), UUID).unwrap()
+    );
+    assert!(f.index().list_tape_files(&UUID).unwrap().is_empty());
+    let mut restarted = f.owner(f.reopen().unwrap());
+    restarted
+        .write_checkpointed(f.request("after-abandoned-bootstrap"))
+        .unwrap();
+    restarted.finish().unwrap();
+    assert!(
+        remanence_state::TapeAuthority::exists(f.config.journal.dir.join("tapes"), UUID).unwrap()
+    );
+    assert_eq!(
+        checkpoint(&f)
+            .replay()
+            .unwrap()
+            .iter()
+            .map(|r| r.objects.len())
+            .sum::<usize>(),
+        1
+    );
 }
 
 #[test]
@@ -780,7 +761,7 @@ fn checkpointed_parity_tape_is_admitted_for_daemon_resume() {
     actor.close_session().unwrap();
     let before = command_count(&f);
     let index = f.index();
-    let checkpoint_dir = f.config.journal.dir.join("checkpoints");
+    let checkpoint_dir = f.config.journal.dir.join("tapes");
     let cfg = &f.config.tape_pools[0];
     assert_eq!(
         select_tape_in_pool_for_write_session(&index, cfg, 7, &HashSet::new(), &checkpoint_dir)
@@ -791,83 +772,134 @@ fn checkpointed_parity_tape_is_admitted_for_daemon_resume() {
     assert!(
         matches!(admit_pinned_tape_for_write_session(&index, UUID, "default", cfg, &checkpoint_dir).unwrap(), PinnedWriteDisposition::Writable(selected) if selected.tape_uuid == UUID)
     );
-    let mut journal = parity(&f);
-    let committed = journal.load_committed().unwrap();
-    let next_file = committed.entries.last().unwrap().tape_file_number + 1;
-    journal
-        .publish_fixture(&remanence_parity::authority::ShadowPublication {
-            bundles: vec![(CommittedBundle {
-                kind: CommittedBundleKind::Object,
-                entries: vec![TapeFileEntry {
-                    tape_file_number: next_file,
-                    kind: TapeFileKind::Object,
-                    block_count: 1,
-                    physical_start_hint: Some(100),
-                    object_id: Some("sink-ahead".into()),
-                    first_parity_data_ordinal: Some(committed.total_committed_ordinals),
-                    epoch_id: None,
-                    protected_ordinal_start: None,
-                    protected_ordinal_end_exclusive: None,
-                    canonical_metadata_hash: None,
-                    object_recovery_row: None,
-                }],
-                highest_protected_ordinal: committed.highest_protected_ordinal,
-                total_committed_ordinals: committed.total_committed_ordinals + 1,
-            })
-            .clone()],
-        })
-        .unwrap();
-    journal
-        .publish_fixture(&remanence_parity::authority::ShadowPublication {
-            bundles: vec![(CommittedBundle {
-                kind: CommittedBundleKind::CheckpointedThrough,
-                entries: vec![],
-                highest_protected_ordinal: committed.highest_protected_ordinal,
-                total_committed_ordinals: committed.total_committed_ordinals + 1,
-            })
-            .clone()],
-        })
-        .unwrap();
-    assert!(journal
-        .load_committed()
-        .unwrap()
-        .orphaned_bundles
-        .is_empty());
-    drop(journal);
-    let error = actor
-        .write_checkpointed(f.request("resume-conflict"))
-        .unwrap_err();
+    let path = checkpoint_dir.join(format!("{}.remtape", uuid::Uuid::from_bytes(UUID).simple()));
+    let saved = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert!(select_tape_in_pool_for_write_session(
+        &index,
+        cfg,
+        7,
+        &HashSet::new(),
+        &checkpoint_dir
+    )
+    .is_err());
     assert!(
-        error
-            .to_string()
-            .contains("bounded parity terminal authority mismatch"),
-        "{error}"
+        admit_pinned_tape_for_write_session(&index, UUID, "default", cfg, &checkpoint_dir).is_err()
     );
     no_modifications(&f, before);
-    let sink_ahead_locates = locate_count(&f, before);
-    let path =
-        remanence_state::authority::fixtures::structural_location(&checkpoint_dir, UUID).unwrap();
-    let _hidden = remanence_parity::authority::fixtures::hide_authority(&path).unwrap();
-    let missing_before = command_count(&f);
-    let error = actor
-        .write_checkpointed(f.request("resume-missing"))
-        .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("bounded parity terminal authority mismatch"),
-        "{error}"
-    );
-    no_modifications(&f, before);
-    let missing_locates = locate_count(&f, missing_before);
-    // The deleted direct writer refused both cases before any LOCATE. The drive actor refuses them after its two
-    // read-only BOT identity probes and the append-position LOCATE, still before any modifying command. Validating
-    // parity authority before positioning is deferred to the actor rework; this pins today's count so that change
-    // is deliberate.
+    std::fs::write(&path, saved).unwrap();
+    actor
+        .write_checkpointed(f.request("resume-second"))
+        .unwrap();
+    assert!(command_count(&f) > before);
+    actor.finish().unwrap();
     assert_eq!(
-        (sink_ahead_locates, missing_locates),
-        (3, 3),
-        "both authority refusals follow only the identity probes and the append-position LOCATE"
+        checkpoint(&f)
+            .replay()
+            .unwrap()
+            .iter()
+            .map(|r| r.objects.len())
+            .sum::<usize>(),
+        2
     );
-    let _ = actor.finish();
+}
+
+/// Fail the actual closing-frame sync after each physical barrier. No epoch
+/// action injection is involved; the normal actor publication/fence paths run.
+#[test]
+fn retained_close_prefix_and_component_publication_failures_poison_release_and_fence() {
+    use remanence_chaos::file_model::{FileEvent, MemoryDirectory};
+    use remanence_library::durable_file::test_support::register;
+    use remanence_state::tape_log::{codec::Decoder, store::Header, Record};
+    for target in ["retained_close", "prefix", "component"] {
+        let (mut f, state) = Fixture::with_parity(scheme(128));
+        drop(state);
+        if target != "retained_close" {
+            f.config.tape_pools[0].capacity_cap_bytes = Some(3 * 1024 * 1024 * 1024);
+            f.config.tape_pools[0].watermark_low = 0.000001;
+            f.config.tape_pools[0].watermark_high = 0.25;
+        }
+        let files = MemoryDirectory::default();
+        let registration = register(f.config.journal.dir.join("tapes"), Arc::new(files.clone()));
+        let (mut actor, memory) = configured_owner_and_memory(
+            &f,
+            f.reopen().unwrap(),
+            None,
+            None,
+            false,
+            Default::default(),
+        );
+        let failed_at = Arc::new(AtomicUsize::new(usize::MAX));
+        let observed = failed_at.clone();
+        let commands = f.commands.clone();
+        let backend = files.clone();
+        files.observe(Some(Arc::new(move |event| {
+            if let FileEvent::BeforeSync(path) = event {
+                if observed.load(Ordering::SeqCst) != usize::MAX
+                    || path.extension().is_none_or(|e| e != "remtape")
+                {
+                    return;
+                }
+                let snapshot = backend.snapshot();
+                let Some((_, inode)) = snapshot.files().find(|(p, _)| *p == path) else {
+                    return;
+                };
+                let mut reader = std::io::Cursor::new(&inode.written);
+                if Header::decode(&mut reader, UUID).is_err() {
+                    return;
+                }
+                let offset = reader.position();
+                let mut decoder = Decoder::at(reader, 1, offset);
+                let mut last = None;
+                while let Ok(Some(frame)) = decoder.next_frame() {
+                    last = Some(frame.record);
+                }
+                let selected = match last {
+                    Some(Record::Committed(c)) => {
+                        target == "retained_close" && c.object_count == 1 && c.protected == c.total
+                    }
+                    Some(Record::TerminalPrefix { .. }) => target == "prefix",
+                    Some(Record::ComponentWritten { .. }) => target == "component",
+                    _ => false,
+                };
+                if selected {
+                    observed.store(commands.lock().unwrap().len(), Ordering::SeqCst);
+                    backend.fail_next_sync(&path).unwrap();
+                }
+            }
+        })));
+        if target == "retained_close" {
+            actor
+                .write_checkpointed(f.request("retained-object"))
+                .unwrap();
+            assert!(memory.granted() > 0, "retained accumulator is reserved");
+            let _ = actor.finish();
+        } else {
+            assert!(actor
+                .write_checkpointed(f.request("terminal-object"))
+                .is_err());
+            let before_retry = command_count(&f);
+            assert!(actor.append(f.request("poisoned-retry")).is_err());
+            no_modifications(&f, before_retry);
+            let _ = actor.finish();
+        }
+        let failed = failed_at.load(Ordering::SeqCst);
+        assert_ne!(failed, usize::MAX, "{target} reached its closing fsync");
+        no_modifications(&f, failed);
+        assert_eq!(memory.granted(), 0, "{target} released retained memory");
+        assert!(
+            f.index()
+                .tape_io_is_fenced(Some(&UUID), None, None)
+                .unwrap(),
+            "{target} persisted SQLite fence"
+        );
+        assert!(
+            checkpoint(&f)
+                .acquire_exclusive_for_terminal_recovery()
+                .is_err(),
+            "ambiguous authority refuses further publication"
+        );
+        files.observe(None);
+        drop(registration);
+    }
 }

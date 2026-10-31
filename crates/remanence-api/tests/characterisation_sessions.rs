@@ -101,6 +101,11 @@ tape_catalog_dir = "{path}/cache"
         } else {
             ParityConfig::None
         };
+        {
+            let _owner =
+                remanence_state::StateLockGuard::acquire(&config.daemon.state_dir).unwrap();
+            remanence_state::authority_layout::admit_owned_config(&config).unwrap();
+        }
         let mut index = CatalogIndex::open(&config.index.sqlite_path).unwrap();
         index
             .provision_tape(ProvisionTapeInput {

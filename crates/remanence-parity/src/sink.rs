@@ -478,7 +478,9 @@ pub struct ObjectWriteSummary {
 impl ObjectWriteSummary {
     /// Build the generic v0.7.2 journal bundle for this object close.
     pub fn file_publication(&self) -> Result<crate::authority::FilePublication, ParityError> {
-        self.committed_bundle().map(|bundle| (&bundle).into())
+        self.committed_bundle().and_then(|bundle| {
+            crate::authority::FilePublication::try_from(&bundle).map_err(Into::into)
+        })
     }
     #[doc(hidden)]
     pub fn committed_bundle(&self) -> Result<CommittedBundle, ParityError> {
@@ -561,14 +563,21 @@ pub struct CheckpointResult {
 
 impl CheckpointResult {
     /// Sidecars emitted at this barrier, when the stop closed an epoch.
-    pub fn sidecar_publication(&self) -> Option<crate::authority::FilePublication> {
-        self.committed_bundle.as_ref().map(Into::into)
+    pub fn sidecar_publication(
+        &self,
+    ) -> Result<Option<crate::authority::FilePublication>, crate::JournalError> {
+        self.committed_bundle
+            .as_ref()
+            .map(crate::authority::FilePublication::try_from)
+            .transpose()
     }
 }
 impl TerminalPrefixPlan {
     /// Exact files and counters proved by this planned terminal prefix.
-    pub fn media_publication(&self) -> crate::authority::FilePublication {
-        (&self.committed_bundle).into()
+    pub fn media_publication(
+        &self,
+    ) -> Result<crate::authority::FilePublication, crate::JournalError> {
+        crate::authority::FilePublication::try_from(&self.committed_bundle)
     }
 }
 
@@ -861,6 +870,7 @@ pub struct ParitySinkSessionState {
     data_blocks_in_neighborhood: u64,
     parity_accumulators: Vec<Vec<Vec<u8>>>,
     current_epoch_data_crc64s: Vec<u64>,
+    unverified_rebuild: bool,
     pending_sidecars: Vec<PendingSidecar>,
     highest_protected_ordinal: u64,
     block_size: Option<usize>,
@@ -886,6 +896,29 @@ pub struct ParitySinkSessionState {
 }
 
 impl ParitySinkSessionState {
+    /// Acknowledge the actor's completed log append, never a media-only barrier.
+    pub fn acknowledge_publication(&mut self) {
+        self.has_uncheckpointed_bundles = false;
+    }
+    /// Invalidate detached state after any failed post-media authority publication.
+    pub fn poison_publication(&mut self) {
+        self.poisoned = true;
+    }
+    /// Check of the still-uncovered range, with honest cold-rebuild provenance.
+    pub fn commit_check(&self) -> (crate::CheckValue, crate::CheckProvenance) {
+        if self.current_epoch_data_crc64s.is_empty() {
+            return (crate::CheckValue::EMPTY, crate::CheckProvenance::Empty);
+        }
+        (
+            crate::check_value(self.current_epoch_data_crc64s.iter().copied()),
+            if self.unverified_rebuild {
+                crate::CheckProvenance::UnverifiedRebuild
+            } else {
+                crate::CheckProvenance::OriginalWrite
+            },
+        )
+    }
+
     /// Scheme pinned to this detached logical session.
     pub fn scheme(&self) -> &ParityScheme {
         &self.scheme
@@ -921,6 +954,12 @@ impl ParitySinkSessionState {
     /// replay-backed committed prefix.
     pub fn retained_live_structural_row_count(&self) -> usize {
         self.filemark_map.entries().len()
+    }
+
+    /// Exact live structural rows for characterization against a physical scan.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn retained_live_structural_rows(&self) -> &[TapeFileMapEntry] {
+        self.filemark_map.entries()
     }
 
     /// Return the detached-session inputs for one object-start capacity
@@ -973,7 +1012,6 @@ pub struct BoundedResumeWriterSeed<'a> {
 pub struct ParitySink<'a> {
     identity: WriterIdentity,
     backend: ParitySinkBackend<'a>,
-    journal: Option<&'a mut dyn TapeReportPublisher>,
     scheme: ParityScheme,
     tape_uuid: [u8; 16],
     codec: ReedSolomonCodec,
@@ -1010,6 +1048,7 @@ pub struct ParitySink<'a> {
     /// in `ParityDataOrdinal` order. Logical zero padding used by `finish()`
     /// for RS math is deliberately excluded.
     current_epoch_data_crc64s: Vec<u64>,
+    unverified_rebuild: bool,
 
     /// Completed-epoch sidecars whose parity has been computed but whose tape
     /// files cannot be emitted until the active object is closed, or until
@@ -1191,6 +1230,7 @@ impl<'a> ParitySink<'a> {
             data_blocks_in_neighborhood: self.data_blocks_in_neighborhood,
             parity_accumulators: self.parity_accumulators,
             current_epoch_data_crc64s: self.current_epoch_data_crc64s,
+            unverified_rebuild: self.unverified_rebuild,
             pending_sidecars: self.pending_sidecars,
             highest_protected_ordinal: self.highest_protected_ordinal,
             block_size: self.block_size,
@@ -1214,10 +1254,10 @@ impl<'a> ParitySink<'a> {
         })
     }
 
-    /// Reattach actor-carried state to the transport and durable sink journal.
+    /// Reattach actor-carried state after checking its frozen authority view.
     pub fn from_session_state(
         inner: &'a mut dyn RawTapeSink,
-        journal: &'a mut dyn TapeReportPublisher,
+        journal: &mut dyn TapeReportPublisher,
         state: ParitySinkSessionState,
     ) -> Result<Self, ParityError> {
         Self::try_from_session_state(inner, journal, state).map_err(|(error, _state)| error)
@@ -1227,7 +1267,7 @@ impl<'a> ParitySink<'a> {
     /// The close operation recomputes the complete immutable plan before writing.
     pub fn from_session_state_for_terminal_close(
         inner: &'a mut dyn RawTapeSink,
-        journal: &'a mut dyn TapeReportPublisher,
+        journal: &mut dyn TapeReportPublisher,
         state: ParitySinkSessionState,
         plan: &TerminalPrefixPlan,
         evidence: TerminalPrefixReconcileEvidence,
@@ -1252,7 +1292,7 @@ impl<'a> ParitySink<'a> {
     /// the transport or journal fails before any tape motion.
     pub fn try_from_session_state(
         inner: &'a mut dyn RawTapeSink,
-        journal: &'a mut dyn TapeReportPublisher,
+        journal: &mut dyn TapeReportPublisher,
         state: ParitySinkSessionState,
     ) -> Result<Self, (ParityError, Box<ParitySinkSessionState>)> {
         Self::try_from_session_state_at_position(inner, journal, state, None, None)
@@ -1260,11 +1300,19 @@ impl<'a> ParitySink<'a> {
 
     fn try_from_session_state_at_position(
         inner: &'a mut dyn RawTapeSink,
-        journal: &'a mut dyn TapeReportPublisher,
+        journal: &mut dyn TapeReportPublisher,
         mut state: ParitySinkSessionState,
         terminal_position: Option<u64>,
         terminal_plan: Option<&TerminalPrefixPlan>,
     ) -> Result<Self, (ParityError, Box<ParitySinkSessionState>)> {
+        if state.poisoned {
+            return Err((
+                ParityError::SessionOpen(
+                    "parity state is poisoned after authority publication failure".into(),
+                ),
+                Box::new(state),
+            ));
+        }
         if journal.tape_uuid() != state.tape_uuid {
             return Err((
                 ParityError::SessionOpen(
@@ -1279,9 +1327,9 @@ impl<'a> ParitySink<'a> {
             None
         } else {
             let snapshot = match terminal_plan {
-                Some(plan) => {
-                    journal.session_terminal_resume_snapshot(&(&plan.committed_bundle).into())
-                }
+                Some(plan) => plan
+                    .media_publication()
+                    .and_then(|p| journal.session_terminal_resume_snapshot(&p)),
                 None => journal.session_resume_snapshot(),
             };
             match resume_record_result(snapshot) {
@@ -1343,7 +1391,6 @@ impl<'a> ParitySink<'a> {
         }
         Ok(Self {
             backend: ParitySinkBackend(inner),
-            journal: Some(journal),
             identity: state.identity,
             scheme: state.scheme,
             tape_uuid: state.tape_uuid,
@@ -1354,6 +1401,7 @@ impl<'a> ParitySink<'a> {
             data_blocks_in_neighborhood: state.data_blocks_in_neighborhood,
             parity_accumulators: state.parity_accumulators,
             current_epoch_data_crc64s: state.current_epoch_data_crc64s,
+            unverified_rebuild: state.unverified_rebuild,
             pending_sidecars: state.pending_sidecars,
             highest_protected_ordinal: state.highest_protected_ordinal,
             block_size: state.block_size,
@@ -1407,14 +1455,12 @@ impl<'a> ParitySink<'a> {
         )
     }
 
-    /// Construct a Layer 3c v0.7.2 parity sink with a durable journal.
-    ///
-    /// The journal is the write-side commit record. Object closes, standalone
-    /// control bootstraps, and final close append `CommittedBundle` records
-    /// only after their synchronous tape-file filemarks have completed.
+    /// Construct a Layer 3c v0.7.2 parity sink bound to an authority identity.
+    /// The sink returns pending reports; its owning actor publishes them after
+    /// the media barrier. This constructor retains no journal writer.
     pub fn new_with_journal(
         inner: &'a mut dyn RawTapeSink,
-        journal: &'a mut dyn TapeReportPublisher,
+        journal: &mut dyn TapeReportPublisher,
         scheme: ParityScheme,
         tape_uuid: [u8; 16],
         block_size_bytes: u32,
@@ -1464,7 +1510,7 @@ impl<'a> ParitySink<'a> {
     /// without cloning its data shards.
     pub fn new_sidecar_only_from_bounded_resume(
         inner: &'a mut dyn RawTapeSink,
-        journal: &'a mut dyn TapeReportPublisher,
+        journal: &mut dyn TapeReportPublisher,
         scheme: ParityScheme,
         tape_uuid: [u8; 16],
         block_size_bytes: u32,
@@ -1489,7 +1535,7 @@ impl<'a> ParitySink<'a> {
 
     fn new_sidecar_only_from_bounded_resume_inner(
         inner: &'a mut dyn RawTapeSink,
-        journal: Option<&'a mut dyn TapeReportPublisher>,
+        journal: Option<&mut dyn TapeReportPublisher>,
         scheme: ParityScheme,
         tape_uuid: [u8; 16],
         block_size_bytes: u32,
@@ -1551,7 +1597,7 @@ impl<'a> ParitySink<'a> {
 
     fn new_with_backend(
         backend: ParitySinkBackend<'a>,
-        journal: Option<&'a mut dyn TapeReportPublisher>,
+        _journal: Option<&mut dyn TapeReportPublisher>,
         scheme: ParityScheme,
         tape_uuid: [u8; 16],
         block_size_bytes: u32,
@@ -1572,7 +1618,6 @@ impl<'a> ParitySink<'a> {
         Ok(Self {
             identity,
             backend,
-            journal,
             scheme,
             tape_uuid,
             codec,
@@ -1582,6 +1627,7 @@ impl<'a> ParitySink<'a> {
             data_blocks_in_neighborhood: 0,
             parity_accumulators,
             current_epoch_data_crc64s: Vec::new(),
+            unverified_rebuild: false,
             pending_sidecars: Vec::new(),
             highest_protected_ordinal: 0,
             block_size: None,
@@ -1792,6 +1838,7 @@ impl<'a> ParitySink<'a> {
         self.data_blocks_in_neighborhood = data_blocks_in_epoch;
         self.block_size = Some(block_size);
         self.current_epoch_data_crc64s = data_shard_crc64s;
+        self.unverified_rebuild = true;
         Ok(())
     }
 
@@ -1937,17 +1984,11 @@ impl<'a> ParitySink<'a> {
             .committed_object_count
             .checked_add(1)
             .ok_or(ParityError::Invariant("committed Object count overflows"))?;
-        summary.publication = match self.commit_journal_map_range(
+        summary.publication = self.pending_map_range(
             CommittedBundleKind::Object,
             bundle_start,
             &summary.sidecars_emitted,
-        ) {
-            Ok(report) => report,
-            Err(err) => {
-                self.poisoned = true;
-                return Err(err);
-            }
-        };
+        )?;
         self.committed_object_count = committed_object_count;
         Ok(summary)
     }
@@ -1983,17 +2024,8 @@ impl<'a> ParitySink<'a> {
             false,
         )?;
         let tape_file_number = self.write_prepared_bootstrap(0, self.bootstrap_payload(digest)?)?;
-        let publication = match self.commit_journal_map_range(
-            CommittedBundleKind::BotBootstrap,
-            bundle_start,
-            &[],
-        ) {
-            Ok(report) => report,
-            Err(err) => {
-                self.poisoned = true;
-                return Err(err);
-            }
-        };
+        let publication =
+            self.pending_map_range(CommittedBundleKind::BotBootstrap, bundle_start, &[])?;
         Ok((tape_file_number, publication))
     }
 
@@ -2855,17 +2887,9 @@ impl<'a> ParitySink<'a> {
                 "terminal prefix unexpectedly contains a Bootstrap",
             ));
         }
-        let publication = if let Some(journal) = self.journal.as_mut() {
-            match journal.publish_terminal_prefix(&(&committed_bundle).into()) {
-                Ok(receipt) => receipt,
-                Err(error) => {
-                    self.poisoned = true;
-                    return Err(error.into());
-                }
-            }
-        } else {
-            PublicationReceipt::default()
-        };
+        let publication = PublicationReceipt::pending(crate::authority::FilePublication::try_from(
+            &committed_bundle,
+        )?);
         Ok(TerminalPrefixCloseResult {
             publication,
             sidecars_emitted,
@@ -2931,18 +2955,13 @@ impl<'a> ParitySink<'a> {
             None
         } else {
             let bundle = self.journal_map_range_bundle(kind, bundle_start, &sidecars_emitted)?;
-            match self.commit_journal_bundle(&bundle) {
-                Ok(receipt) => publication.items.extend(receipt.items),
-                Err(err) => {
-                    self.poisoned = true;
-                    return Err(err);
-                }
-            }
+            publication.items.extend(
+                PublicationReceipt::pending(crate::authority::FilePublication::try_from(&bundle)?)
+                    .items,
+            );
             Some(bundle)
         };
-        publication
-            .items
-            .extend(self.commit_checkpointed_through()?.items);
+        self.has_uncheckpointed_bundles = true;
         let next_tape_file_number = self.filemark_map.next_tape_file_number()?;
         Ok(CheckpointResult {
             publication,
@@ -2957,46 +2976,19 @@ impl<'a> ParitySink<'a> {
         })
     }
 
-    fn commit_checkpointed_through(&mut self) -> Result<PublicationReceipt, ParityError> {
-        let total_committed_ordinals = self.filemark_map.total_data_ordinals()?;
-        self.commit_journal_bundle(&CommittedBundle {
-            kind: CommittedBundleKind::CheckpointedThrough,
-            entries: Vec::new(),
-            highest_protected_ordinal: self.highest_protected_ordinal,
-            total_committed_ordinals,
-        })
-    }
-
-    // Every sink-journal bundle commit must go through this helper to keep
-    // has_uncheckpointed_bundles accurate. The terminal-prefix transition is
-    // exempt: close_for_terminal_index consumes the sink, so no later handoff
-    // can observe its flag.
-    fn commit_journal_bundle(
-        &mut self,
-        bundle: &CommittedBundle,
-    ) -> Result<PublicationReceipt, ParityError> {
-        let publication = if let Some(journal) = self.journal.as_mut() {
-            let receipt = journal.publish_commit(&bundle.into())?;
-            self.has_uncheckpointed_bundles =
-                bundle.kind != CommittedBundleKind::CheckpointedThrough;
-            receipt
-        } else {
-            PublicationReceipt::default()
-        };
-        Ok(publication)
-    }
-
-    fn commit_journal_map_range(
+    // Reports carry physical rows only. The actor publishes them together with
+    // catalog payloads after the shared barrier, then acknowledges the state.
+    fn pending_map_range(
         &mut self,
         kind: CommittedBundleKind,
         start_tape_file_number: u64,
         sidecars: &[SidecarWriteSummary],
     ) -> Result<PublicationReceipt, ParityError> {
-        if self.journal.is_none() {
-            return Ok(PublicationReceipt::default());
-        }
         let bundle = self.journal_map_range_bundle(kind, start_tape_file_number, sidecars)?;
-        self.commit_journal_bundle(&bundle)
+        self.has_uncheckpointed_bundles = true;
+        Ok(PublicationReceipt::pending(
+            crate::authority::FilePublication::try_from(&bundle)?,
+        ))
     }
 
     fn journal_map_range_bundle(
@@ -3287,6 +3279,7 @@ impl<'a> ParitySink<'a> {
             .checked_add(real_data as u64)
             .ok_or(ParityError::Invariant("sidecar protected range overflows"))?;
         let data_shard_crc64s = std::mem::take(&mut self.current_epoch_data_crc64s);
+        self.unverified_rebuild = false;
         self.pending_sidecars.push(PendingSidecar {
             epoch_id: self.neighborhood_idx,
             block_size: self.block_size_bytes,

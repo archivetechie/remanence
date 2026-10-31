@@ -180,7 +180,7 @@ fn run_archive_write_with_lock_root(
     // -- Select tape (catalog-only, no hardware) --------------------------
     // No live reservations on a one-shot CLI invocation.
     let reserved: HashSet<TapeUuid> = HashSet::new();
-    let checkpoint_journal_dir = state_handle.config().journal.dir.join("checkpoints");
+    let checkpoint_journal_dir = state_handle.config().journal.dir.join("tapes");
     let selected = {
         let index = state_handle.catalog_index();
         match select_tape_in_pool_for_write_session(
@@ -494,6 +494,8 @@ pub(crate) fn print_locator_json_with_recipients(
             "position_before_lba": serde_json::Value::Null,
             "position_after_lba": serde_json::Value::Null,
             "journal_record_ordinal": serde_json::Value::Null,
+            "tape_log_sequence": copy.tape_log_sequence.map(|value| value.to_string()),
+            "tape_incarnation": copy.tape_incarnation,
             "estimated_remaining_bytes": serde_json::Value::Null,
             "sealed_after_write": serde_json::Value::Null,
         },
@@ -1824,6 +1826,8 @@ mod tests {
 
     fn copy(object_id: &str, tape_file_number: u64, first_body_lba: u64) -> NativeObjectCopyRecord {
         NativeObjectCopyRecord {
+            tape_log_sequence: None,
+            tape_incarnation: None,
             object_id: object_id.to_string(),
             tape_uuid: vec![7u8; 16],
             tape_file_number,
@@ -2056,6 +2060,8 @@ mod tests {
             body_format: "rem-object-v1".to_string(),
             created_at_utc: "2026-05-29T00:00:00Z".to_string(),
             copies: vec![PoolWriteObjectCopyRecord {
+                tape_log_sequence: None,
+                tape_incarnation: None,
                 tape_uuid: tape_uuid_bytes,
                 tape_file_number: 1,
                 first_body_lba: 2,
@@ -2151,6 +2157,8 @@ mod tests {
             body_format: "rem-object-v1".to_string(),
             created_at_utc: "2026-08-11T00:00:00Z".to_string(),
             copies: vec![PoolWriteObjectCopyRecord {
+                tape_log_sequence: None,
+                tape_incarnation: None,
                 tape_uuid: [0x42; 16],
                 tape_file_number: 2,
                 first_body_lba: 3,
@@ -2195,6 +2203,8 @@ mod tests {
             body_format: "rem-object-v1".to_string(),
             created_at_utc: "2026-08-09T00:00:00Z".to_string(),
             copies: vec![PoolWriteObjectCopyRecord {
+                tape_log_sequence: Some(structural_max),
+                tape_incarnation: Some(1),
                 tape_uuid: *Uuid::from_u128(2).as_bytes(),
                 tape_file_number: structural_max,
                 first_body_lba: structural_max,
@@ -2210,6 +2220,12 @@ mod tests {
         let mut out = Vec::new();
         super::print_locator_json(&object, "scenario-a", &mut out);
         let parsed: serde_json::Value = serde_json::from_slice(&out).expect("locator JSON parses");
+        assert_eq!(
+            parsed["append_commit_info"]["tape_log_sequence"],
+            "18446744073709551615"
+        );
+        assert_eq!(parsed["append_commit_info"]["tape_incarnation"], 1);
+        assert!(parsed["append_commit_info"]["journal_record_ordinal"].is_null());
         assert_eq!(
             parsed["tape_file_number"].as_str(),
             Some("18446744073709551615")

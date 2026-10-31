@@ -17,9 +17,11 @@ use remanence_parity::{
 use remanence_state::authority::BotRecoveryAuthority;
 
 /// Run checkpoint-assisted BOT recovery with bounded progress and cancellation.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn recover_terminal_inventory_with_checkpoint_authority_controlled<C, F>(
     source: &mut dyn RawTapeSource,
     checkpoint_journal_dir: &Path,
+    index_path: &Path,
     tape_uuid: &[u8; 16],
     block_size: u32,
     mode: remanence_parity::ScanMode<'_>,
@@ -30,10 +32,11 @@ where
     C: FnMut(&BotStructuralRecoveryEvent) -> ScanWalkControl,
     F: FnMut(&BotRecoveredObject) -> Result<(), String>,
 {
-    let authority = BotRecoveryAuthority::try_open(checkpoint_journal_dir, *tape_uuid, block_size)
-        .map_err(|error| BotStructuralRecoveryError::ObjectAuthority {
-            message: error.to_string(),
-        })?;
+    let authority =
+        BotRecoveryAuthority::try_open(checkpoint_journal_dir, index_path, *tape_uuid, block_size)
+            .map_err(|error| BotStructuralRecoveryError::ObjectAuthority {
+                message: error.to_string(),
+            })?;
     match authority {
         Some(mut authority) => recover_terminal_inventory_from_bot_with_authority_controlled_mode(
             source,
@@ -57,19 +60,22 @@ where
 
 /// Run full terminal verification with checkpoint identity authority for its
 /// all-replicas-invalid recovery outcome when that authority exists.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn verify_terminal_index_with_checkpoint_authority(
     source: &mut dyn RawTapeSource,
     checkpoint_journal_dir: &Path,
+    index_path: &Path,
     tape_uuid: &[u8; 16],
     block_size: u32,
     mode: remanence_parity::ScanMode<'_>,
     route: remanence_parity::VerificationRoute,
     report: impl FnMut(remanence_parity::VerificationRouteStatus),
 ) -> Result<TerminalIndexVerificationOutcome, TerminalIndexVerificationError> {
-    let authority = BotRecoveryAuthority::try_open(checkpoint_journal_dir, *tape_uuid, block_size)
-        .map_err(|error| TerminalIndexVerificationError::RecoveryAuthority {
-            message: error.to_string(),
-        })?;
+    let authority =
+        BotRecoveryAuthority::try_open(checkpoint_journal_dir, index_path, *tape_uuid, block_size)
+            .map_err(|error| TerminalIndexVerificationError::RecoveryAuthority {
+                message: error.to_string(),
+            })?;
     match authority {
         Some(mut authority) => verify_terminal_index_full_with_route(
             source,

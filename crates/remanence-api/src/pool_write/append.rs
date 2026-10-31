@@ -27,56 +27,12 @@ use super::staging::{CountingBlockSink, LiveCounterBlockSink};
 use crate::bytes_to_hex;
 use crate::verify_tape_identity;
 use remanence_library::{BlockSink, DriveHandle, DriveHandleSource};
-use remanence_parity::authority::{FilePublication, FilePurpose};
 use remanence_parity::{
-    ParityConfig, ParityScheme, ParitySink, ParitySinkSessionState, RawTapeSink, TapeFileEntry,
-    TapeFileKind, TapeReportPublisher,
+    ParityConfig, ParitySink, ParitySinkSessionState, RawTapeSink, TapeReportPublisher,
 };
-use remanence_state::{CatalogIndex, TapeJournalIndexInput, TapePoolConfig};
+use remanence_state::{CatalogIndex, TapePoolConfig};
 use remanence_stream::{write_prepared_object_to_parity_from_readers, StreamingObjectWriteReport};
 use std::{cell::Cell, sync::Arc, time::Instant};
-
-pub(crate) fn project_fresh_parity_bootstrap_bundle(
-    state: &mut CatalogIndex,
-    selected: &SelectedTape,
-    scheme: &ParityScheme,
-) -> Result<(), PoolWriteError> {
-    // The caller holds the exclusive journal handle and invokes this only
-    // after `ParitySink::write_bootstrap` returned success at the proved BOT
-    // cursor. Project that exact sole-BOT write without asking ordinary
-    // bounded-resume replay to accept its intentionally uncheckpointed state.
-    let bootstrap_bundle = FilePublication {
-        purpose: FilePurpose::Bootstrap,
-        files: vec![TapeFileEntry {
-            tape_file_number: 0,
-            kind: TapeFileKind::Bootstrap,
-            block_count: 1,
-            physical_start_hint: Some(0),
-            object_id: None,
-            first_parity_data_ordinal: None,
-            epoch_id: None,
-            protected_ordinal_start: None,
-            protected_ordinal_end_exclusive: None,
-            canonical_metadata_hash: None,
-            object_recovery_row: None,
-        }],
-        protected: 0,
-        total: 0,
-        cursor: None,
-        check: None,
-        seal_due: None,
-    };
-    state.project_file_publication(
-        TapeJournalIndexInput {
-            tape_uuid: selected.tape_uuid,
-            block_size: selected.block_size,
-            scheme: Some(scheme.clone()),
-            journal_offset_bytes: 0,
-        },
-        &bootstrap_bundle,
-    )?;
-    Ok(())
-}
 
 /// Write one parity-off object into a server-owned provisional batch.
 #[allow(clippy::too_many_arguments)]

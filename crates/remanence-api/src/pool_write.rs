@@ -51,7 +51,6 @@ mod resume_authority;
 mod test_support;
 
 pub(crate) use append::{
-    project_fresh_parity_bootstrap_bundle,
     write_batched_parity_to_selected_tape_after_replay_check,
     write_batched_to_selected_tape_after_replay_check,
 };
@@ -77,7 +76,7 @@ mod tests;
 fn test_fence_config(root: &std::path::Path) -> crate::write_owner::TerminalWriteConfig {
     crate::write_owner::TerminalWriteConfig {
         mounted_endpoint: None,
-        checkpoint_journal_dir: root.join("checkpoints"),
+        checkpoint_journal_dir: root.join("tapes"),
         audit_dir: root.join("audit"),
         audit_fsync: true,
         audit_append_lock: std::sync::Arc::new(std::sync::Mutex::new(())),

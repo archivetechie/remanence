@@ -2979,6 +2979,8 @@ fn pool_write_record_to_proto_carries_append_commit_info() {
         body_format: FORMAT_ID.to_string(),
         created_at_utc: "2026-07-05T00:00:00Z".to_string(),
         copies: vec![PoolWriteObjectCopyRecord {
+            tape_log_sequence: None,
+            tape_incarnation: None,
             tape_uuid: [0x44; 16],
             tape_file_number: 3,
             first_body_lba: 9,
@@ -3028,6 +3030,8 @@ fn written_ack_never_exposes_provisional_tape_locators() {
         body_format: FORMAT_ID.to_string(),
         created_at_utc: "2026-07-05T00:00:00Z".to_string(),
         copies: vec![PoolWriteObjectCopyRecord {
+            tape_log_sequence: None,
+            tape_incarnation: None,
             tape_uuid: [0x44; 16],
             tape_file_number: 37,
             first_body_lba: 9,

@@ -47,10 +47,13 @@ impl TapeReadRateArgs {
 /// Acquire only the state lock; opening a state handle would also open journals.
 pub(super) fn run(args: &TapeReadRateArgs, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     let result = (|| {
-        let config =
-            remanence_state::load_config(&args.address.config).map_err(|e| e.to_string())?;
+        let config = remanence_state::authority_layout::load_runtime_config(&args.address.config)
+            .map_err(|e| e.to_string())?;
         let paths = remanence_state::StatePaths::from_config(&args.address.config, &config);
         let _lock = remanence_state::StateLockGuard::acquire(&paths.state_dir)
+            .map_err(|e| e.to_string())?;
+        // The first validation is lock-free; repeat it under the lock.
+        remanence_state::authority_layout::validate_owned_config_layout(&config)
             .map_err(|e| e.to_string())?;
         run_locked(args, &config)
     })();

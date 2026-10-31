@@ -53,7 +53,8 @@ fn process_fence_survives_loss_of_best_effort_fence_file() {
     std::fs::remove_file(store.path().with_extension("ambiguous")).unwrap();
     let reopened = Store::open_fixture(dir.path(), UUID).unwrap();
     assert!(matches!(reopened.acquire(false), Err(StoreError::Fenced)));
-    reopened.clear_ambiguity().unwrap();
+    let authority = crate::TapeAuthority::open_fixture(dir.path(), UUID).unwrap();
+    authority.reconcile_restart(0).unwrap();
     assert_eq!(reopened.acquire(false).unwrap().summary().barrier_count, 2);
 }
 

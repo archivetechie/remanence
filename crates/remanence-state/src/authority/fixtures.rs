@@ -48,7 +48,6 @@ impl AuthorityBuilder {
     }
     /// Build one exclusive writer retaining both semantic authority facets.
     pub fn build_lease(self) -> Result<super::TapeAuthorityLease, StateError> {
-        let directory = self.directory.clone();
         let geometry = self.geometry.clone().or_else(|| {
             self.commits.first().and_then(|commit| {
                 commit
@@ -65,35 +64,22 @@ impl AuthorityBuilder {
             authority.acquire_exclusive()?
         };
         if let Some(geometry) = geometry {
-            super::legacy::retain_fixture_rows(&mut writer, &directory, geometry)?;
+            let rows = writer
+                .open_structural(geometry.0, geometry.1)
+                .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?;
+            writer.retain_structural_publisher(rows)?;
         }
         Ok(writer)
     }
     /// Materialize the selected old implementation through the writer contract.
     pub fn build(self) -> Result<TapeAuthority, StateError> {
-        let authority = TapeAuthority::open(&self.directory, self.tape_uuid)?;
-        if !self.rows.is_empty() {
-            let geometry = self
-                .geometry
-                .or_else(|| {
-                    self.commits.first().and_then(|commit| {
-                        commit
-                            .scheme
-                            .clone()
-                            .map(|scheme| (commit.block_size, scheme))
-                    })
-                })
-                .ok_or_else(|| {
-                    StateError::JournalReplayFailed(
-                        "structural fixture rows require parity geometry".into(),
-                    )
-                })?;
-            super::legacy::build_fixture_rows(
-                &self.directory,
-                self.tape_uuid,
-                geometry,
-                &self.rows,
-            )?;
+        std::fs::create_dir_all(&self.directory)
+            .map_err(|e| StateError::io_at("create fixture tape directory", &self.directory, e))?;
+        let authority = TapeAuthority::open_fixture(&self.directory, self.tape_uuid)?;
+        if self.commits.is_empty() && !self.rows.is_empty() {
+            std::fs::write(authority.path(), b"unclosed-structural-authority")
+                .map_err(|e| StateError::io_at("write conflicting fixture", authority.path(), e))?;
+            return Ok(authority);
         }
         if !self.commits.is_empty() || self.plan.is_some() {
             let mut lease = authority.acquire_exclusive()?;
@@ -117,29 +103,45 @@ pub struct DamagedAuthorityEvidence {
 impl DamagedAuthorityEvidence {
     /// Whether a refusing operation left the exact original evidence untouched.
     pub fn is_unchanged(&self) -> Result<bool, StateError> {
-        super::legacy::fixture_evidence_unchanged(&self.authority, &self.bytes)
+        std::fs::read(self.authority.path())
+            .map(|bytes| bytes == self.bytes)
+            .map_err(|e| StateError::io_at("read fixture", self.authority.path(), e))
     }
 }
 
 /// Replace the selected fixture authority with unreadable evidence. This
 /// expresses refusal behavior; the backend chooses the invalid host encoding.
 pub fn damage_authority(authority: TapeAuthority) -> Result<DamagedAuthorityEvidence, StateError> {
-    let bytes = super::legacy::damage_fixture_authority(&authority)?;
+    let bytes = b"corrupt-tape-log".to_vec();
+    std::fs::write(authority.path(), &bytes)
+        .map_err(|e| StateError::io_at("damage fixture", authority.path(), e))?;
     Ok(DamagedAuthorityEvidence { authority, bytes })
 }
 
 /// Shared capability used to exercise contention without exposing lock files.
-pub use super::legacy::SharedFixtureLease;
+pub struct SharedFixtureLease {
+    _lock: nix::fcntl::Flock<remanence_library::durable_file::File>,
+}
 
 /// Hold a shared authority lease for a test's contention interval.
 pub fn hold_shared(authority: &TapeAuthority) -> Result<SharedFixtureLease, StateError> {
-    super::legacy::hold_fixture_shared(authority)
+    use nix::fcntl::{Flock, FlockArg};
+    let path = authority.path().with_extension("lock");
+    let file = remanence_library::durable_file::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&path)
+        .map_err(|e| StateError::io_at("fixture lock", &path, e))?;
+    let lock = Flock::lock(file, FlockArg::LockSharedNonblock)
+        .map_err(|(_, e)| StateError::JournalReplayFailed(e.to_string()))?;
+    Ok(SharedFixtureLease { _lock: lock })
 }
 
 /// Observe a publication from a synchronous test transport callback. This probe
 /// does not acquire a second lock while the test actor owns its writer lease.
 pub fn has_publication(authority: &TapeAuthority) -> bool {
-    super::legacy::fixture_has_publication(authority)
+    authority.path().exists()
 }
 
 /// Locate a structural fixture without duplicating the selected backend's naming rule.
@@ -147,10 +149,10 @@ pub fn structural_location(
     checkpoint_directory: &Path,
     tape_uuid: [u8; 16],
 ) -> Result<PathBuf, StateError> {
-    let directory = checkpoint_directory.parent().ok_or_else(|| {
-        StateError::JournalReplayFailed("checkpoint directory has no parent".into())
-    })?;
-    Ok(super::structural_path_in(directory, tape_uuid))
+    Ok(checkpoint_directory.join(format!(
+        "{}.remtape",
+        uuid::Uuid::from_bytes(tape_uuid).simple()
+    )))
 }
 
 /// Exact saved intent evidence for a stale-companion crash fixture.
@@ -166,25 +168,59 @@ impl SavedFinalization {
 }
 /// Capture the selected backend's pending-intent evidence.
 pub fn save_finalization(authority: &TapeAuthority) -> std::io::Result<SavedFinalization> {
-    let path = super::legacy::fixture_member_path(authority, ".finalizing");
+    let path = authority.path().to_path_buf();
     let bytes = std::fs::read(&path)?;
     Ok(SavedFinalization { path, bytes })
 }
 /// A deliberately blocked intent-publication seam.
 pub struct BlockedFinalization {
-    path: PathBuf,
+    _registration: remanence_library::durable_file::test_support::Registration,
 }
 impl BlockedFinalization {
-    /// Remove the injected obstruction so a retry can publish normally.
+    /// Remove the injected storage failure before retrying publication.
     pub fn unblock(self) -> std::io::Result<()> {
-        std::fs::remove_dir(self.path)
+        drop(self);
+        Ok(())
     }
 }
-/// Refuse intent publication before its first byte is written.
+/// Refuse staging-file creation before any finalization byte is appended.
 pub fn block_finalization(authority: &TapeAuthority) -> std::io::Result<BlockedFinalization> {
-    let path = super::legacy::fixture_member_path(authority, ".finalizing.new");
-    std::fs::create_dir(&path)?;
-    Ok(BlockedFinalization { path })
+    use remanence_library::durable_file::{DurableDirectory, DurableFile, StdDirectory};
+    struct RefuseStaging;
+    impl DurableDirectory for RefuseStaging {
+        fn create(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+            if path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with(".spool-"))
+            {
+                return Err(std::io::Error::other(
+                    "injected finalization staging failure",
+                ));
+            }
+            StdDirectory.create(path)
+        }
+        fn open(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+            StdDirectory.open(path)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            StdDirectory.rename(from, to)
+        }
+        fn rename_noreplace(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            StdDirectory.rename_noreplace(from, to)
+        }
+        fn sync(&self, path: &Path) -> std::io::Result<()> {
+            StdDirectory.sync(path)
+        }
+        fn set_len(&self, path: &Path, len: u64) -> std::io::Result<()> {
+            StdDirectory.set_len(path, len)
+        }
+    }
+    Ok(BlockedFinalization {
+        _registration: remanence_library::durable_file::test_support::register(
+            authority.path().parent().unwrap().to_path_buf(),
+            std::sync::Arc::new(RefuseStaging),
+        ),
+    })
 }
 /// Opaque matcher for storage fault injection at this authority's commit seam.
 pub struct PublicationTarget {
@@ -194,11 +230,18 @@ impl PublicationTarget {
     /// Match a file-model event without exposing the backend's filename to the test.
     pub fn matches(&self, event_path: &Path) -> bool {
         self.path == event_path
+            || (event_path.parent() == self.path.parent()
+                && event_path.file_name().is_some_and(|name| {
+                    name.to_string_lossy().starts_with(&format!(
+                        ".initial-{}-",
+                        self.path.file_stem().unwrap().to_string_lossy()
+                    ))
+                }))
     }
 }
 /// Bind a storage fault injector to this authority's commit member.
 pub fn publication_target(authority: &TapeAuthority) -> PublicationTarget {
     PublicationTarget {
-        path: super::legacy::fixture_member_path(authority, ""),
+        path: authority.path().to_path_buf(),
     }
 }

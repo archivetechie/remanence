@@ -254,7 +254,8 @@ pub fn admit_pinned_tape_for_write_session(
     }
     let checkpoint_journal_tapes = checkpoint_journal_tape_uuids(checkpoint_journal_dir)?;
     let host_only_after_replica_c = if checkpoint_journal_tapes.contains(&tape_uuid) {
-        let journal = remanence_state::TapeAuthority::open(checkpoint_journal_dir, tape_uuid)?;
+        let journal =
+            remanence_state::TapeAuthority::open(checkpoint_journal_dir, tape_uuid, state.path())?;
         if let Some(intent) = journal.pending_finalization()? {
             intent.progress == remanence_state::TerminalFinalizationProgress::AfterReplicaC
                 && intent.manual.is_none()
@@ -305,7 +306,12 @@ pub fn admit_pinned_tape_for_write_session(
     let fresh = tape_is_fresh_for_checkpoint_admission(state, &tape, &tape_uuid)?;
     if !fresh
         && !host_only_after_replica_c
-        && !tape_carries_checkpoint(checkpoint_journal_dir, &checkpoint_journal_tapes, tape_uuid)?
+        && !tape_carries_checkpoint(
+            state,
+            checkpoint_journal_dir,
+            &checkpoint_journal_tapes,
+            tape_uuid,
+        )?
     {
         return Err(PinnedTapeError::NotBatchEligible {
             tape_uuid: uuid_text,
@@ -435,6 +441,7 @@ pub(super) fn select_tape_in_pool_with_policy_and_eligibility(
             let fresh = tape_is_fresh_for_checkpoint_admission(state, &tape, &tape_uuid)?;
             let carries_checkpoint = fresh
                 || tape_carries_checkpoint(
+                    state,
                     checkpoint_journal_dir,
                     checkpoint_journal_tapes,
                     tape_uuid,
@@ -518,6 +525,7 @@ pub(super) fn checkpoint_journal_tape_uuids(
 }
 
 pub(super) fn tape_carries_checkpoint(
+    index: &CatalogIndex,
     checkpoint_journal_dir: &Path,
     checkpoint_journal_tapes: &HashSet<TapeUuid>,
     tape_uuid: TapeUuid,
@@ -525,7 +533,7 @@ pub(super) fn tape_carries_checkpoint(
     if !checkpoint_journal_tapes.contains(&tape_uuid) {
         return Ok(false);
     }
-    remanence_state::TapeAuthority::open(checkpoint_journal_dir, tape_uuid)?
+    remanence_state::TapeAuthority::open(checkpoint_journal_dir, tape_uuid, index.path())?
         .latest_commit()
         .map(|record| record.is_some())
 }

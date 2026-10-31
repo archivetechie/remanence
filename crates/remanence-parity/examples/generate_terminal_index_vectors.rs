@@ -175,7 +175,7 @@ fn generate(output: &Path) -> Result<(), Box<dyn std::error::Error>> {
     emit_selection_vectors(output)?;
     fs::write(
         output.join("README.md"),
-        "# REM-PARITY terminal-index candidate vectors\n\nReview-only generation-2 candidate artifacts; nothing under this directory is a publication artifact. `MANIFEST.tsv` pins the healthy minimal and multi-Object A/gap-AB/B/gap-BC/C byte streams at every legal block size. Filemarks and EOD are structural expectations rather than bytes. `inputs.json` files record the inputs of each pinned artifact for independent re-derivation (the streaming recipe is `streaming-inputs.json`). Run `cargo run -p remanence-parity --example generate_terminal_index_vectors -- --check` to compare generated files and the file set. Compact gaps contain three records (header, one zero interior, footer), while default one-GiB extents remain an integration obligation.\n\n`MAXIMUMS.tsv` pins maximum plaintext/encrypted recovery-row slots and the maximum diagnostic-envelope one-block footer. `STREAMING.tsv` records a million-Object constant-storage source pass and its independently reproducible digests without checking in the conceptual 320 MB payload. `OBJECT_ROW_EXTENSIONS.tsv` pins Rust-generated fixed-slot artifacts under `object-row-extensions/` by encoded length, byte count, and SHA-256. The independent Python verifier consumes those exact bytes to check positive unknown keys (including nested false/true/null values) and fail-closed assigned/noncanonical extensions. `MUTATIONS.tsv` and `SELECTION.tsv` are compact executable hostile matrices. A `second-edition` cell of `SELECTION.tsv` is the replica of that ordinal under `selection/`: it sits at the `multi-256k` position and is locally eligible there, and differs from the profile's replica only in its edition ID and edition sequence, with every digest and CRC recomputed (`selection/inputs.json`). `INTERRUPTIONS.tsv` independently enumerates the 68 live prefix, component, journal, checkpoint, SQLite, and final-projection cut boundaries, including the sealed-checkpoint-to-intent-cleanup window, and pins each exact command-acceptance, media-proof, and durable host-authority state. A field ending in `_accepted` means the command returned successfully; only the corresponding media-barrier proof field (`*_barrier_proved` or `*_barriers_proved`) establishes media durability.\n",
+        "# REM-PARITY terminal-index candidate vectors\n\nReview-only generation-2 candidate artifacts; nothing under this directory is a publication artifact. `MANIFEST.tsv` pins the healthy minimal and multi-Object A/gap-AB/B/gap-BC/C byte streams at every legal block size. Filemarks and EOD are structural expectations rather than bytes. `inputs.json` files record the inputs of each pinned artifact for independent re-derivation (the streaming recipe is `streaming-inputs.json`). Run `cargo run -p remanence-parity --example generate_terminal_index_vectors -- --check` to compare generated files and the file set. Compact gaps contain three records (header, one zero interior, footer), while default one-GiB extents remain an integration obligation.\n\n`MAXIMUMS.tsv` pins maximum plaintext/encrypted recovery-row slots and the maximum diagnostic-envelope one-block footer. `STREAMING.tsv` records a million-Object constant-storage source pass and its independently reproducible digests without checking in the conceptual 320 MB payload. `OBJECT_ROW_EXTENSIONS.tsv` pins Rust-generated fixed-slot artifacts under `object-row-extensions/` by encoded length, byte count, and SHA-256. The independent Python verifier consumes those exact bytes to check positive unknown keys (including nested false/true/null values) and fail-closed assigned/noncanonical extensions. `MUTATIONS.tsv` and `SELECTION.tsv` are compact executable hostile matrices. A `second-edition` cell of `SELECTION.tsv` is the replica of that ordinal under `selection/`: it sits at the `multi-256k` position and is locally eligible there, and differs from the profile's replica only in its edition ID and edition sequence, with every digest and CRC recomputed (`selection/inputs.json`). `INTERRUPTIONS.tsv` independently enumerates the 60 live prefix, component, tape-log, SQLite, and final-projection cut boundaries. Minimum/maximum authority columns allow either the old prefix or the complete new group before fsync; after fsync both bounds coincide. The record tag identifies the single closing operation. A field ending in `_accepted` means the command returned successfully; only the corresponding media-barrier proof field (`*_barrier_proved` or `*_barriers_proved`) establishes media durability.\n",
     )?;
     println!(
         "generated 6 healthy profiles, 3 maximum artifacts, 1 high-count stream, 7 Object-row extension slots, 3 second-edition replicas, and executable hostile matrices in {}",
@@ -1080,18 +1080,6 @@ fn emit_interruption_matrix(root: &Path) -> Result<(), Box<dyn std::error::Error
         "separation_bc",
         "replica_c",
     ];
-    const COMPONENT_CUTS: [&str; 10] = [
-        "before_footer",
-        "after_footer",
-        "before_filemark",
-        "after_filemark",
-        "before_barrier",
-        "after_barrier",
-        "before_parity_journal_fsync",
-        "after_parity_journal_fsync",
-        "before_checkpoint_journal_fsync",
-        "after_checkpoint_journal_fsync",
-    ];
     const PROGRESS: [&str; 6] = [
         "BeforeReplicaA",
         "AfterReplicaA",
@@ -1100,19 +1088,11 @@ fn emit_interruption_matrix(root: &Path) -> Result<(), Box<dyn std::error::Error
         "AfterSeparationBc",
         "AfterReplicaC",
     ];
-    let mut matrix = String::from(
-        "case_id\tphase\tcomponent\tcut\tprefix_parity_map_blocks_accepted\tprefix_parity_map_filemark_accepted\tprefix_media_barrier_proved\tprefix_sink_journal\tprefix_sink_checkpoint\tcomponent_block_streams_accepted\tcomponent_filemark_commands_accepted\tcomponent_media_barriers_proved\tsink_journal_components\tcheckpoint_components\tsqlite_components\tsealed_checkpoint\tintent_present\tfinal_sqlite\texpected_checkpoint_progress\texpected_completed_replicas\texpected_resume\n",
-    );
-    for (
-        cut,
-        prefix_blocks_accepted,
-        prefix_filemark_accepted,
-        prefix_barrier_proved,
-        prefix_journal,
-        resume,
-    ) in [
+    let mut matrix = String::from("case_id\tphase\tcomponent\tcut\tprefix_parity_map_blocks_accepted\tprefix_parity_map_filemark_accepted\tprefix_media_barrier_proved\tprefix_tape_log_min\tprefix_tape_log_max\tcomponent_block_streams_accepted\tcomponent_filemark_commands_accepted\tcomponent_media_barriers_proved\ttape_log_components_min\ttape_log_components_max\tsqlite_components\tsealed_min\tsealed_max\tfinal_sqlite\texpected_log_progress_min\texpected_completed_replicas_min\texpected_resume\trecord_tag\n");
+    for (cut, blocks, fm, barrier, min, max, resume) in [
         (
             "before_terminal_prefix",
+            0,
             0,
             0,
             0,
@@ -1125,6 +1105,7 @@ fn emit_interruption_matrix(root: &Path) -> Result<(), Box<dyn std::error::Error
             0,
             0,
             0,
+            0,
             "finish-terminal-prefix",
         ),
         (
@@ -1133,117 +1114,77 @@ fn emit_interruption_matrix(root: &Path) -> Result<(), Box<dyn std::error::Error
             1,
             0,
             0,
+            0,
             "finish-terminal-prefix",
         ),
-        ("after_terminal_prefix", 1, 1, 1, 1, "replica_a"),
+        (
+            "before_tape_log_fsync",
+            1,
+            1,
+            1,
+            0,
+            1,
+            "replay-or-reconcile",
+        ),
+        ("after_tape_log_fsync", 1, 1, 1, 1, 1, "replica_a"),
+        ("after_terminal_prefix", 1, 1, 1, 1, 1, "replica_a"),
     ] {
-        matrix.push_str(&format!(
-            "terminal_prefix-{cut}\tprefix\tparity_closeout\t{cut}\t{prefix_blocks_accepted}\t{prefix_filemark_accepted}\t{prefix_barrier_proved}\t{prefix_journal}\t{prefix_journal}\t0\t0\t0\t0\t0\t0\t0\t1\t0\tBeforeReplicaA\t0\t{resume}\n"
-        ));
+        matrix.push_str(&format!("terminal_prefix-{cut}\tprefix\tparity_closeout\t{cut}\t{blocks}\t{fm}\t{barrier}\t{min}\t{max}\t0\t0\t0\t0\t0\t0\t0\t0\t0\tBeforeReplicaA\t0\t{resume}\tTerminalPrefix\n"));
     }
     for (index, component) in COMPONENTS.iter().enumerate() {
-        for cut in COMPONENT_CUTS {
-            let complete = index + usize::from(cut != "before_footer");
-            let filemark_commands_accepted = index
-                + usize::from(matches!(
-                    cut,
-                    "after_filemark"
-                        | "before_barrier"
-                        | "after_barrier"
-                        | "before_parity_journal_fsync"
-                        | "after_parity_journal_fsync"
-                        | "before_checkpoint_journal_fsync"
-                        | "after_checkpoint_journal_fsync"
-                ));
-            let media_barriers_proved = index
-                + usize::from(matches!(
-                    cut,
-                    "after_barrier"
-                        | "before_parity_journal_fsync"
-                        | "after_parity_journal_fsync"
-                        | "before_checkpoint_journal_fsync"
-                        | "after_checkpoint_journal_fsync"
-                ));
-            let sink = index
-                + usize::from(matches!(
-                    cut,
-                    "after_parity_journal_fsync"
-                        | "before_checkpoint_journal_fsync"
-                        | "after_checkpoint_journal_fsync"
-                ));
-            let checkpoint = index + usize::from(cut == "after_checkpoint_journal_fsync");
-            let sqlite = index.min(4);
-            let resume = match cut {
-                "after_parity_journal_fsync" | "before_checkpoint_journal_fsync" => {
-                    "promote-sink-transition"
-                }
-                "after_checkpoint_journal_fsync" if index == 4 => {
-                    "repair-sqlite-then-finish-final-projection"
-                }
-                "after_checkpoint_journal_fsync" => "repair-sqlite-then-continue",
-                _ => "reconcile-current",
-            };
-            matrix.push_str(&format!(
-                "{component}-{cut}\tcomponent\t{component}\t{cut}\t1\t1\t1\t1\t1\t{complete}\t{filemark_commands_accepted}\t{media_barriers_proved}\t{sink}\t{checkpoint}\t{sqlite}\t0\t1\t0\t{}\t{}\t{resume}\n",
-                PROGRESS[checkpoint],
-                checkpoint.div_ceil(2),
-            ));
-        }
-        for (cut, sqlite, resume) in [
-            (
-                "before_sqlite_projection",
-                index,
-                if index == 4 {
-                    "repair-sqlite-then-finish-final-projection"
-                } else {
-                    "repair-sqlite-then-continue"
-                },
-            ),
-            (
-                "after_sqlite_projection",
-                index + 1,
+        for (cut, blocks, fm, barrier, min, max, sql) in [
+            ("before_footer", 0, 0, 0, 0, 0, 0),
+            ("after_footer", 1, 0, 0, 0, 0, 0),
+            ("before_filemark", 1, 0, 0, 0, 0, 0),
+            ("after_filemark", 1, 1, 0, 0, 0, 0),
+            ("before_barrier", 1, 1, 0, 0, 0, 0),
+            ("after_barrier", 1, 1, 1, 0, 0, 0),
+            ("before_tape_log_fsync", 1, 1, 1, 0, 1, 0),
+            ("after_tape_log_fsync", 1, 1, 1, 1, 1, 0),
+            ("before_sqlite_projection", 1, 1, 1, 1, 1, 0),
+            ("after_sqlite_projection", 1, 1, 1, 1, 1, 1),
+        ] {
+            let resume = if min != max {
+                "replay-or-reconcile"
+            } else if sql == 1 {
                 if index == 4 {
                     "finish-final-projection"
                 } else {
                     "continue"
-                },
-            ),
-        ] {
-            let count = index + 1;
-            matrix.push_str(&format!(
-                "{component}-{cut}\tcomponent\t{component}\t{cut}\t1\t1\t1\t1\t1\t{count}\t{count}\t{count}\t{count}\t{count}\t{sqlite}\t0\t1\t0\t{}\t{}\t{resume}\n",
-                PROGRESS[count],
-                count.div_ceil(2),
-            ));
+                }
+            } else if min == 1 {
+                if index == 4 {
+                    "repair-sqlite-then-finish-final-projection"
+                } else {
+                    "repair-sqlite-then-continue"
+                }
+            } else {
+                "reconcile-current"
+            };
+            let (blocks, fm, barrier, min, max, sql) = (
+                index + blocks,
+                index + fm,
+                index + barrier,
+                index + min,
+                index + max,
+                index + sql,
+            );
+            matrix.push_str(&format!("{component}-{cut}\tcomponent\t{component}\t{cut}\t1\t1\t1\t1\t1\t{blocks}\t{fm}\t{barrier}\t{min}\t{max}\t{sql}\t0\t0\t0\t{}\t{}\t{resume}\tComponentWritten\n", PROGRESS[min], min.div_ceil(2)));
         }
     }
-    for (cut, sealed, intent, finalized_sqlite, resume) in [
-        (
-            "before_final_checkpoint_fsync",
-            0,
-            1,
-            0,
-            "finish-final-projection",
-        ),
-        (
-            "after_final_checkpoint_fsync",
-            1,
-            1,
-            0,
-            "replay-sealed-completion",
-        ),
+    for (cut, min, max, sql, resume) in [
+        ("before_tape_log_fsync", 0, 1, 0, "finish-or-replay-sealed"),
+        ("after_tape_log_fsync", 1, 1, 0, "replay-sealed-completion"),
         (
             "before_final_sqlite_projection",
             1,
-            0,
+            1,
             0,
             "replay-sealed-completion",
         ),
-        ("after_final_sqlite_projection", 1, 0, 1, "none"),
+        ("after_final_sqlite_projection", 1, 1, 1, "none"),
     ] {
-        matrix.push_str(&format!(
-            "final_projection-{cut}\tfinal_projection\tfinal_projection\t{cut}\t1\t1\t1\t1\t1\t5\t5\t5\t5\t5\t5\t{sealed}\t{intent}\t{finalized_sqlite}\tAfterReplicaC\t3\t{resume}\n"
-        ));
+        matrix.push_str(&format!("final_projection-{cut}\tfinal_projection\tfinal_projection\t{cut}\t1\t1\t1\t1\t1\t5\t5\t5\t5\t5\t5\t{min}\t{max}\t{sql}\tAfterReplicaC\t3\t{resume}\tSealed\n"));
     }
     fs::write(root.join("INTERRUPTIONS.tsv"), matrix)?;
     Ok(())

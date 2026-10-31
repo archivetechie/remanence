@@ -1244,6 +1244,9 @@ fn checkpoints_restore_versions_after_projection_loss_and_full_rebuild() {
                 recovery_path.to_str().unwrap(),
             ]);
         }
+        let config = remanence_state::load_config(f.config()).unwrap();
+        let before_write = f.root.path().join("projection-before-write.sqlite");
+        std::fs::copy(&config.index.sqlite_path, &before_write).unwrap();
         let written = f.ok(&args);
         let id = written["receipts"][0]["object_id"].as_str().unwrap();
         let expected = f.index().get_native_object(id).unwrap().unwrap();
@@ -1274,11 +1277,7 @@ fn checkpoints_restore_versions_after_projection_loss_and_full_rebuild() {
             .unwrap()
             .replace("[journal]\n", "[journal]\nrequire_trusted_volume = false\n");
         std::fs::write(f.config(), text).unwrap();
-        {
-            let mut state =
-                remanence_state::StateHandle::open_from_config_file(f.config()).unwrap();
-            state.rebuild_index_from_journals().unwrap();
-        }
+        std::fs::copy(&before_write, &config.index.sqlite_path).unwrap();
         assert!(f.index().get_native_object(id).unwrap().is_none());
         let before = f.writes();
         for _ in 0..2 {
@@ -2089,28 +2088,32 @@ fn catalog_schema(f: &VersionFixture, set: Option<u32>) -> u32 {
     u32::from_be_bytes(bytes)
 }
 
-/// Ordinary home reads and writes migrate; discovery reports stale state without modifying it.
+/// Home read/write admission refuses predecessor schemas without touching media.
 #[test]
-fn home_put_and_get_migrate_old_catalog_but_doctor_does_not() {
+fn home_put_and_get_refuse_old_catalog_and_doctor_reports_reset_required() {
     let f = VersionFixture::new();
     let source = f.root.path().join("migrate.txt");
     std::fs::write(&source, b"migration payload").unwrap();
     assert_eq!(catalog_schema(&f, Some(19)), 19);
-    let (code, out, errors) = f.run(&["doctor"], true);
-    assert_ne!(code, ExitCode::SUCCESS, "{out} {errors}");
-    let doctor = VersionFixture::envelope(&out)["result"].clone();
-    assert_eq!(doctor["catalog_fence_check"]["ok"], false);
-    assert_eq!(catalog_schema(&f, None), 19);
-    f.ok(&["put", source.to_str().unwrap()]);
-    assert_eq!(catalog_schema(&f, None), remanence_state::SCHEMA_VERSION);
-    assert_eq!(catalog_schema(&f, Some(19)), 19);
+    let config = remanence_state::load_config(f.config()).unwrap();
+    let before = std::fs::read(&config.index.sqlite_path).unwrap();
+    let writes = f.writes();
     let dest = f.root.path().join("restored-migration");
-    f.ok(&["get", "migrate.txt", "--out", dest.to_str().unwrap()]);
-    assert_eq!(catalog_schema(&f, None), remanence_state::SCHEMA_VERSION);
-    assert_eq!(
-        std::fs::read(dest.join("migrate.txt")).unwrap(),
-        b"migration payload"
-    );
+    for args in [
+        vec!["doctor"],
+        vec!["put", source.to_str().unwrap()],
+        vec!["get", "migrate.txt", "--out", dest.to_str().unwrap()],
+    ] {
+        let (code, out, errors) = f.run(&args, true);
+        assert_ne!(code, ExitCode::SUCCESS, "{out} {errors}");
+        assert!(
+            format!("{out} {errors}").contains("declared state reset"),
+            "{out} {errors}"
+        );
+        assert_eq!(catalog_schema(&f, None), 19);
+        assert_eq!(f.writes(), writes);
+        assert_eq!(std::fs::read(&config.index.sqlite_path).unwrap(), before);
+    }
 }
 
 /// Real parser, catalog, tape transport, and filesystem sinks preserve member dates.
@@ -2262,7 +2265,7 @@ fn restore_dates_listing_and_member_selection() {
         .expect("interrupted request was durable");
     let config = remanence_state::load_config(f.config()).unwrap();
     let intent = remanence_state::authority::fixtures::AuthorityBuilder::new(
-        config.journal.dir.join("checkpoints"),
+        config.journal.dir.join("tapes"),
         tape_uuid,
     )
     .build()
@@ -3282,7 +3285,7 @@ fn finalize_stores_literal_defaults_for_fixed_tape() {
     );
     let config = remanence_state::load_config(f.config()).unwrap();
     let intent = remanence_state::authority::fixtures::AuthorityBuilder::new(
-        config.journal.dir.join("checkpoints"),
+        config.journal.dir.join("tapes"),
         tape_uuid,
     )
     .build()
@@ -3393,5 +3396,245 @@ fn rebuild_command_restores_tape_verification_record() {
         );
         assert_eq!(rebuilt.last_verification_state, Some(2));
         assert_eq!(rebuilt.last_verified_edition_digest, Some(vec![0x67; 32]));
+    }
+}
+
+/// Run offline catalog commands through the public CLI spelling; discovery is forbidden.
+fn offline_catalog_cli(args: &[&str]) -> (ExitCode, String, String) {
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = remanence_cli::run_offline_catalog_for_test(args, &mut out, &mut err);
+    (
+        code,
+        String::from_utf8(out).unwrap(),
+        String::from_utf8(err).unwrap(),
+    )
+}
+fn authority_hashes(
+    config: &remanence_state::RemConfig,
+) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    use sha2::{Digest, Sha256};
+    fn visit(path: &Path, hashes: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path, hashes);
+            } else {
+                hashes.insert(
+                    path.clone(),
+                    Sha256::digest(std::fs::read(path).unwrap()).to_vec(),
+                );
+            }
+        }
+    }
+    let mut hashes = Default::default();
+    visit(&config.journal.dir, &mut hashes);
+    visit(&config.audit.dir, &mut hashes);
+    hashes
+}
+#[test]
+fn cli_projection_rebuild_hashes_logs_audit_and_ambiguity_markers_without_reset() {
+    let f = VersionFixture::with_parity(false);
+    let source = f.root.path().join("rebuild.txt");
+    std::fs::write(&source, b"rebuild evidence").unwrap();
+    f.ok(&["put", source.to_str().unwrap()]);
+    let config = remanence_state::load_config(f.config()).unwrap();
+    let _tripwire = remanence_state::RejectResetHelpers::install();
+    let before = authority_hashes(&config);
+    let config_path = f.config();
+    let args = [
+        "rem",
+        "rebuild-catalog-from-journals",
+        "--config",
+        config_path.to_str().unwrap(),
+    ];
+    let (code, out, err) = offline_catalog_cli(&args);
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    assert!(out.contains("tape logs: 1"), "{out}");
+    assert_eq!(authority_hashes(&config), before);
+    // A normal audit-writer open truncates this valid partial trailing prefix.
+    // Protected rebuild must preserve it byte-for-byte as an immutable input.
+    let audit_path = before
+        .keys()
+        .find(|p| p.extension().is_some_and(|e| e == "remaudit"))
+        .unwrap();
+    {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(audit_path)
+            .unwrap()
+            .write_all(&[0, 0])
+            .unwrap();
+    }
+    let torn = authority_hashes(&config);
+    let (code, _, err) = offline_catalog_cli(&args);
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    assert_eq!(authority_hashes(&config), torn);
+    let log = before
+        .keys()
+        .find(|p| p.extension().is_some_and(|e| e == "remtape"))
+        .unwrap();
+    std::fs::write(log.with_extension("ambiguous"), b"must survive rebuild").unwrap();
+    let fenced = authority_hashes(&config);
+    assert_ne!(offline_catalog_cli(&args).0, ExitCode::SUCCESS);
+    assert_eq!(authority_hashes(&config), fenced);
+}
+#[test]
+fn cli_projection_rebuild_does_not_create_an_audit_segment() {
+    let f = VersionFixture::with_parity(false);
+    let config = remanence_state::load_config(f.config()).unwrap();
+    std::fs::remove_dir_all(&config.audit.dir).unwrap();
+    std::fs::create_dir(&config.audit.dir).unwrap();
+    let before = authority_hashes(&config);
+    let _tripwire = remanence_state::RejectResetHelpers::install();
+    let (code, _, err) = offline_catalog_cli(&[
+        "rem",
+        "rebuild-catalog-from-journals",
+        "--config",
+        f.config().to_str().unwrap(),
+    ]);
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    assert_eq!(authority_hashes(&config), before);
+    assert_eq!(std::fs::read_dir(&config.audit.dir).unwrap().count(), 0);
+}
+
+#[test]
+fn harness_reset_schema22_predecessor_then_admit_write_and_read() {
+    let f = VersionFixture::with_parity(false);
+    let config = remanence_state::load_config(f.config()).unwrap();
+    std::fs::remove_file(config.daemon.state_dir.join("authority-format")).unwrap();
+    let db = rusqlite::Connection::open(&config.index.sqlite_path).unwrap();
+    db.execute_batch("drop table tape_log_projection; drop table tape_log_object_commits; pragma user_version=22;").unwrap();
+    drop(db);
+    std::fs::create_dir_all(config.journal.dir.join("checkpoints")).unwrap();
+    for path in [
+        config.journal.dir.join("old.remjournal"),
+        config.journal.dir.join("checkpoints/old.remcheckpoint"),
+        config.journal.dir.join("checkpoints/old.init"),
+    ] {
+        std::fs::write(path, b"predecessor authority").unwrap();
+    }
+    let (code, _, err) = offline_catalog_cli(&[
+        "rem",
+        "reset-catalog",
+        "--config",
+        f.config().to_str().unwrap(),
+        "--i-understand-this-erases-the-catalog",
+    ]);
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    assert!(config.daemon.state_dir.join("authority-format").exists());
+    let mut state = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap();
+    assert_eq!(state.catalog_index().schema_version().unwrap(), 23);
+    drop(state);
+    assert!(!config.journal.dir.join("checkpoints").exists());
+    f.new_tape("AFTERRESET");
+    f.ok(&[
+        "tape",
+        "init",
+        "--label",
+        "AFTERRESET",
+        "--generation",
+        "L9",
+    ]);
+    let source = f.root.path().join("after-reset.txt");
+    std::fs::write(&source, b"after declared reset").unwrap();
+    f.ok(&["put", source.to_str().unwrap()]);
+    let output = f.root.path().join("read-after-reset");
+    f.ok(&["get", "after-reset.txt", "--out", output.to_str().unwrap()]);
+    assert_eq!(
+        std::fs::read(output.join("after-reset.txt")).unwrap(),
+        b"after declared reset"
+    );
+    let audit = remanence_state::FileAuditLog::replay(&config.audit.dir).unwrap();
+    assert!(audit.iter().any(|r| r.detail.get("action")
+        == Some(&ciborium::value::Value::Text("declared_state_reset".into()))));
+}
+
+#[test]
+fn corrupt_seal_or_decision_cannot_be_repaired_or_superseded_to_writable() {
+    use remanence_state::tape_log::{
+        codec::Decoder,
+        store::{Header, Store},
+        Record,
+    };
+    let f = VersionFixture::with_parity(false);
+    let source = f.root.path().join("sealed.txt");
+    std::fs::write(&source, b"seal evidence").unwrap();
+    f.ok(&["put", source.to_str().unwrap()]);
+    f.world
+        .lock()
+        .unwrap()
+        .tapes
+        .get_mut("FIRST")
+        .unwrap()
+        .capacity_bytes = 3 * 1024 * 1024 * 1024;
+    f.ok(&["tape", "finalize", "--acknowledge-tape", "FIRST"]);
+    let config = remanence_state::load_config(f.config()).unwrap();
+    let directory = config.journal.dir.join("tapes");
+    let log = remanence_state::TapeAuthority::list_entries(&directory)
+        .unwrap()
+        .remove(0);
+    let id = remanence_state::TapeAuthority::entry_tape_uuid(&log).unwrap();
+    let original = std::fs::read(&log).unwrap();
+    // Reuse one fully finalized physical tape; each damage case starts with
+    // its original log and the unchanged sealed catalog row.
+    for seal in [false, true] {
+        let mut bytes = original.clone();
+        let mut reader = std::io::Cursor::new(&bytes);
+        Header::decode(&mut reader, id).unwrap();
+        let offset = reader.position();
+        let mut decoder = Decoder::at(reader, 1, offset);
+        let mut cut = None;
+        while let Some(frame) = decoder.next_frame().unwrap() {
+            if (seal && matches!(frame.record, Record::Sealed { .. }))
+                || (!seal && matches!(frame.record, Record::FinalizationDecided(_)))
+            {
+                cut = Some(frame.offset);
+                break;
+            }
+        }
+        drop(decoder);
+        bytes[cut.unwrap() as usize + 28] ^= 0x80;
+        std::fs::write(&log, &bytes).unwrap();
+        let through = Store::open(&directory, id, &config.index.sqlite_path)
+            .unwrap()
+            .inspect_tail()
+            .unwrap()
+            .through_sequence;
+        let uuid = uuid::Uuid::from_bytes(id).to_string();
+        let (code, _, error) = offline_catalog_cli(&[
+            "rem-debug",
+            "tape-log",
+            "repair-tail",
+            "--config",
+            f.config().to_str().unwrap(),
+            "--tape-uuid",
+            &uuid,
+            "--through-sequence",
+            &through.to_string(),
+            "--confirm-discard-corrupt-tail",
+            "--rebuild-projection",
+        ]);
+        assert_ne!(code, ExitCode::SUCCESS);
+        assert!(
+            error.contains("separate explicit forensic recovery path"),
+            "{error}"
+        );
+        let writes = f.writes();
+        let (code, _, _) = f.run(
+            &[
+                "tape",
+                "supersede-tail",
+                "--acknowledge-tape",
+                "FIRST",
+                "--confirm-supersede",
+                "SUPERSEDE FIRST",
+            ],
+            true,
+        );
+        assert_ne!(code, ExitCode::SUCCESS);
+        assert_eq!(f.writes(), writes);
+        assert_eq!(std::fs::read(&log).unwrap(), bytes);
+        assert_eq!(f.index().get_tape(&id).unwrap().unwrap().state, "sealed");
     }
 }

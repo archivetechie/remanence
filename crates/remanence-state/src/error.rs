@@ -145,10 +145,16 @@ impl StateError {
         matches!(self, Self::StateLockHeld(_))
     }
 
+    /// Authority reached stable storage but its fold or SQL projection is pending.
+    pub fn is_checkpoint_append_durable(&self) -> bool {
+        matches!(self, Self::TapeLog(error) if matches!(**error, crate::tape_log::store::StoreError::AfterDurable(_)))
+    }
+
     /// True when a failed checkpoint append may nevertheless have left
     /// replayable durable authority behind.
     pub fn is_checkpoint_append_authority_uncertain(&self) -> bool {
         matches!(self, Self::CheckpointAppendAuthorityUncertain(_))
+            || matches!(self, Self::TapeLog(error) if matches!(**error, crate::tape_log::store::StoreError::Ambiguous(_) | crate::tape_log::store::StoreError::Fenced))
     }
 }
 

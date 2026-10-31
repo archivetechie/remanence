@@ -1,11 +1,12 @@
 //! Already-placed library ownership and the confined WOR checkpoint crash seam.
 use super::*;
+use remanence_state::authority::TapeAuthorityView;
 use std::os::unix::process::ExitStatusExt;
 const LIBRARY: &str = "NOT-A-LIBRARY-ENDPOINT";
 const FAULT_ROOT: &str = "/tmp/system-harness/scenario-wor/direct-replay-faults";
 const ENABLE: &str = "REM_WOR_DIRECT_REPLAY_FAULT_ENABLE";
 const PLAN: &str = "REM_WOR_DIRECT_REPLAY_FAULT_PLAN";
-const ENABLE_VALUE: &str = "direct-replay-after-checkpoint-v1-abort";
+const ENABLE_VALUE: &str = "direct-replay-after-tape-log-v2-abort";
 
 pub(super) fn library_parts(
     fixture: &Fixture,
@@ -243,7 +244,7 @@ fn wor_cut_publishes_durable_single_object_evidence_before_projection_and_abort(
     let plan = root.path().join("plan.json");
     let nonce = Uuid::new_v4();
     std::fs::write(&plan, serde_json::to_vec(&serde_json::json!({
-        "schema":"rem.wor.direct-replay-fault-plan.v1", "tape_uuid":Uuid::from_bytes(UUID).to_string(),
+        "schema":"rem.wor.direct-replay-fault-plan.v2", "tape_uuid":Uuid::from_bytes(UUID).to_string(),
         "caller_object_id":"wor-object", "nonce":nonce.to_string(), "evidence_path":evidence,
     })).unwrap()).unwrap();
     let manifest = root.path().join("manifest.json");
@@ -270,7 +271,7 @@ fn wor_cut_publishes_durable_single_object_evidence_before_projection_and_abort(
     );
     drop(index);
     let journal = remanence_state::authority::fixtures::AuthorityBuilder::new(
-        config.journal.dir.join("checkpoints"),
+        config.journal.dir.join("tapes"),
         UUID,
     )
     .build()
@@ -282,16 +283,20 @@ fn wor_cut_publishes_durable_single_object_evidence_before_projection_and_abort(
     assert_eq!(record.objects.len(), 1);
     let evidence: serde_json::Value =
         serde_json::from_slice(&std::fs::read(evidence).unwrap()).unwrap();
-    assert_eq!(evidence.as_object().unwrap().len(), 8);
+    assert_eq!(evidence.as_object().unwrap().len(), 9);
     assert_eq!(
         evidence["schema"],
-        "rem.wor.direct-replay-fault-evidence.v1"
+        "rem.wor.direct-replay-fault-evidence.v2"
     );
     assert_eq!(evidence["nonce"], nonce.to_string());
     assert_eq!(evidence["object_id"], record.objects[0].object.object_id);
     assert_eq!(evidence["caller_object_id"], "wor-object");
-    assert_eq!(evidence["checkpoint_ordinal"], record.ordinal.to_string());
-    assert_eq!(evidence["checkpoint_eod_lba"], record.eod_lba.to_string());
+    assert_eq!(
+        evidence["tape_log_sequence"],
+        journal.freeze().unwrap().log_reference().0.to_string()
+    );
+    assert_eq!(evidence["tape_incarnation"], 1);
+    assert_eq!(evidence["committed_eod_lba"], record.eod_lba.to_string());
     let mut state = StateHandle::open_with_config(
         remanence_state::StatePaths::from_config(
             config.daemon.state_dir.join("config.toml"),
@@ -353,7 +358,7 @@ fn wor_environment_is_fail_closed_and_inert_for_standalone_and_daemon_sessions()
     let outside = tempfile::tempdir().unwrap();
     std::os::unix::fs::symlink(outside.path(), confined.path().join("escape")).unwrap();
     let valid = serde_json::json!({
-        "schema": "rem.wor.direct-replay-fault-plan.v1",
+        "schema": "rem.wor.direct-replay-fault-plan.v2",
         "tape_uuid": Uuid::from_bytes(UUID).to_string(), "caller_object_id": "wor-object",
         "nonce": Uuid::new_v4().to_string(), "evidence_path": confined.path().join("evidence.json"),
     });
@@ -514,7 +519,7 @@ fn mounted_library_terminal_capacity_refusal_keeps_typed_cause() {
     for mounted in [true, false] {
         let cfg = write_owner::TerminalWriteConfig {
             mounted_endpoint: mounted.then(|| remanence_library::DriveKey::new(LIBRARY, BAY)),
-            checkpoint_journal_dir: fixture.config.journal.dir.join("checkpoints"),
+            checkpoint_journal_dir: fixture.config.journal.dir.join("tapes"),
             audit_dir: fixture.config.audit.dir.clone(),
             audit_fsync: true,
             audit_append_lock: Arc::new(Mutex::new(())),

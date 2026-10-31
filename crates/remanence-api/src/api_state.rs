@@ -135,6 +135,8 @@ impl ApiState {
     /// Call once at daemon startup under state ownership, before admitting any
     /// sessions: prior sessions on configured library bays are marked lost.
     pub fn new_with_config(mut index: CatalogIndex, config: &RemConfig) -> Result<Self, Status> {
+        remanence_state::authority_layout::validate_owned_config_layout(config)
+            .map_err(status_from_state_error)?;
         remanence_state::state::recover_library_sessions_after_restart(&mut index, config)
             .map_err(status_from_state_error)?;
         let audit_append_lock = Arc::new(std::sync::Mutex::new(()));
@@ -143,7 +145,7 @@ impl ApiState {
         reject_active_tape_io_fences_on_startup(&index)?;
         replay_checkpoint_journal_projections_with_audit(
             &mut index,
-            config.journal.dir.join("checkpoints").as_path(),
+            config.journal.dir.join("tapes").as_path(),
             config.audit.dir.as_path(),
             &audit_append_lock,
         )?;
@@ -173,7 +175,7 @@ impl ApiState {
         state.append_overlap_min_bytes = config.daemon.append_overlap_min_bytes();
         state.append_ring_high_pct = config.daemon.append_ring_high_pct;
         state.append_ring_low_pct = config.daemon.append_ring_low_pct;
-        state.checkpoint_journal_dir = Arc::new(config.journal.dir.join("checkpoints"));
+        state.checkpoint_journal_dir = Arc::new(config.journal.dir.join("tapes"));
         state.checkpoint_max_bytes = config.daemon.checkpoint_max_bytes;
         state.checkpoint_max_objects = config.daemon.checkpoint_max_objects;
         state.checkpoint_max_age_seconds = config.daemon.checkpoint_max_age_seconds;
@@ -310,6 +312,8 @@ impl ApiState {
         let index_path = index.path().to_path_buf();
         // The daemon retains state ownership across this constructor and serve.
         // Recover its predecessor before actors or startup tasks can admit work.
+        remanence_state::authority_layout::validate_owned_config_layout(config)
+            .map_err(status_from_state_error)?;
         remanence_state::state::recover_library_sessions_after_restart(&mut index, config)
             .map_err(status_from_state_error)?;
         let pool_configs: HashMap<String, TapePoolConfig> = config
@@ -380,7 +384,7 @@ impl ApiState {
         }
         replay_checkpoint_journal_projections_with_audit(
             &mut index,
-            config.journal.dir.join("checkpoints").as_path(),
+            config.journal.dir.join("tapes").as_path(),
             config.audit.dir.as_path(),
             &audit_append_lock,
         )?;
@@ -426,7 +430,7 @@ impl ApiState {
             verification_route: config.verification.route,
             io_memory: Arc::clone(&io_memory),
             write_admissions: crate::write_owner::WriteAdmissionCoordinator::default(),
-            checkpoint_journal_dir: config.journal.dir.join("checkpoints"),
+            checkpoint_journal_dir: config.journal.dir.join("tapes"),
             checkpoint_max_bytes: config.daemon.checkpoint_max_bytes,
             checkpoint_max_objects: config.daemon.checkpoint_max_objects,
             checkpoint_max_age_seconds: config.daemon.checkpoint_max_age_seconds,
@@ -481,7 +485,7 @@ impl ApiState {
         state.append_overlap_min_bytes = config.daemon.append_overlap_min_bytes();
         state.append_ring_high_pct = config.daemon.append_ring_high_pct;
         state.append_ring_low_pct = config.daemon.append_ring_low_pct;
-        state.checkpoint_journal_dir = Arc::new(config.journal.dir.join("checkpoints"));
+        state.checkpoint_journal_dir = Arc::new(config.journal.dir.join("tapes"));
         state.checkpoint_max_bytes = config.daemon.checkpoint_max_bytes;
         state.checkpoint_max_objects = config.daemon.checkpoint_max_objects;
         state.checkpoint_max_age_seconds = config.daemon.checkpoint_max_age_seconds;

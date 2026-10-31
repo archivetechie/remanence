@@ -255,7 +255,8 @@ fn config(root: &Path, library: &remanence_library::LibraryHandle) -> WriteOwner
         library,
         library_snapshot_cell(library.library().clone()),
     );
-    cfg.checkpoint_journal_dir = root.join("journals/checkpoints");
+    cfg.checkpoint_journal_dir = root.join("journals/tapes");
+    std::fs::create_dir_all(&cfg.checkpoint_journal_dir).unwrap();
     cfg.calibration_store = CalibrationControlStore::open(root.join("calibration")).unwrap();
     cfg.checkpoint_max_objects = 100;
     cfg.checkpoint_max_age_seconds = 3600;
@@ -694,7 +695,7 @@ async fn check_crash(
     let mut index = CatalogIndex::open(temp.path().join("state.sqlite")).unwrap();
     let replay = crate::startup_checkpoint::replay_checkpoint_journal_projections(
         &mut index,
-        &temp.path().join("journals/checkpoints"),
+        &temp.path().join("journals/tapes"),
     );
     if let Err(status) = replay {
         assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status}");
@@ -731,7 +732,7 @@ async fn check_crash(
         return read_receipts(temp.path(), world, &cut.receipts).await;
     }
     let authority = remanence_state::authority::fixtures::AuthorityBuilder::new(
-        temp.path().join("journals/checkpoints"),
+        temp.path().join("journals/tapes"),
         TAPE,
     )
     .build()
@@ -1102,13 +1103,7 @@ async fn property(skip_barrier: bool, full: bool) -> Result<Coverage, String> {
             .keys()
             .map(String::as_str)
             .collect::<BTreeSet<_>>(),
-        BTreeSet::from([
-            "missing bootstrap",
-            "orphan parity bundle",
-            "short audit header",
-            "short parity header",
-            "torn parity frame",
-        ]),
+        BTreeSet::from(["missing bootstrap", "short audit header",]),
         "existing refusal identity defects change; review the findings"
     );
     Ok(coverage)

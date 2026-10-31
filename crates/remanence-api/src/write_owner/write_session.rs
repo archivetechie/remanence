@@ -1252,6 +1252,9 @@ impl WriteSessionState<'_> {
                 }
             }
             Err(failure) => {
+                if let Err(error) = self.checkpoint_lease.cancel_staged_report() {
+                    tracing::warn!(%error, "provisional tape-log rollback failed; abandonment remains fenced");
+                }
                 let quarantine_identities = failure.requires_identity_quarantine();
                 if failure.fence_handled && failure.durability_uncertain {
                     if let Err(error) = crate::append_admission::abandon_pending_append(
@@ -1713,15 +1716,17 @@ pub(super) fn handle_drive_open_write(
     // load, rewind, locate, drive-mode change, or write preparation. Keep both
     // journal leases across the later media work so another writer cannot
     // change the validated prefix in between.
-    let checkpoint_journal =
-        match remanence_state::TapeAuthority::open(cfg.checkpoint_journal_dir.as_path(), tape_uuid)
-        {
-            Ok(journal) => journal,
-            Err(err) => {
-                let _ = reply.send(Err(status_from_state_error(err)));
-                return None;
-            }
-        };
+    let checkpoint_journal = match remanence_state::TapeAuthority::open(
+        cfg.checkpoint_journal_dir.as_path(),
+        tape_uuid,
+        index.path(),
+    ) {
+        Ok(journal) => journal,
+        Err(err) => {
+            let _ = reply.send(Err(status_from_state_error(err)));
+            return None;
+        }
+    };
     let pending_terminal_intent = match checkpoint_journal.pending_finalization() {
         Ok(intent) => intent,
         Err(err) => {

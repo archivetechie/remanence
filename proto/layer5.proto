@@ -1324,6 +1324,9 @@ message AppendCommitInfo {
   bytes batch_id                      = 12;
   // Session-local provisional ordinal; never a tape-file locator.
   optional uint64 provisional_ordinal = 13;
+  // Closing log group; absent when the catalog has no authority join.
+  optional uint64 tape_log_sequence = 14;
+  optional uint64 tape_incarnation = 15;
 }
 
 // One object's catalog-level record. Body-format-agnostic.

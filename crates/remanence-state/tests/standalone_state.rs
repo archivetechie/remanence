@@ -1,5 +1,5 @@
 //! P2 regression coverage for durable endpoint keys, media evidence, and ledger
-//! authority. Legacy migration starts from the frozen released-schema fixture.
+//! authority. Predecessor refusal uses the frozen released-schema fixture.
 use remanence_parity::ParityConfig;
 use remanence_state::{
     tape_generation, CatalogIndex, DriveKey, GenerationSource, LabelProvenance, LtoGen,
@@ -31,7 +31,7 @@ fn pool() -> TapePoolProjectionInput {
 }
 
 #[test]
-fn released_rows_keep_unsigned_geometry_and_bay_zero_endpoint_on_reopen() {
+fn predecessor_geometry_and_bay_zero_rows_require_reset_without_mutation() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("legacy.sqlite");
     let db = Connection::open(&path).unwrap();
@@ -45,52 +45,13 @@ fn released_rows_keep_unsigned_geometry_and_bay_zero_endpoint_on_reopen() {
         insert into sessions(session_id, session_kind, library_serial, drive_bay, state, opened_at_utc, updated_at_utc) values ('00000000-0000-0000-0000-000000000002','read','LIB:0',0,'open','now','now');
         insert into tape_files(tape_uuid, tape_file_number, kind, block_count) values (X'01010101010101010101010101010101',3,'object',23);").unwrap();
     drop(db);
+    let before = std::fs::read(&path).unwrap();
     for _ in 0..2 {
-        let index = CatalogIndex::open(&path).unwrap();
-        let tape = index.get_tape(&[1; 16]).unwrap().unwrap();
-        assert_eq!(tape.total_committed_ordinals, 9);
-        assert_eq!(tape.written_extent_lba, Some(42));
-        assert_eq!(
-            tape_generation(&tape),
-            Some((LtoGen::Lto7, GenerationSource::Label))
-        );
-        let key = DriveKey::new("LIB:0", 0);
-        assert_eq!(
-            index.non_terminal_sessions().unwrap()[0].drive_key,
-            Some(key.clone())
-        );
-        assert_eq!(
-            index
-                .media_readiness_operation(Uuid::from_u128(1))
-                .unwrap()
-                .unwrap()
-                .endpoint,
-            key
-        );
-        let db = Connection::open(&path).unwrap();
-        assert_eq!(
-            db.query_row(
-                "select count(*) from media_readiness_transitions",
-                [],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-            1
-        );
-        assert_eq!(
-            db.query_row("select block_count from tape_files", [], |r| r
-                .get::<_, Vec<u8>>(0))
-                .unwrap(),
-            23u64.to_be_bytes()
-        );
-        assert_eq!(
-            db.query_row("select count(*) from pragma_foreign_key_check", [], |r| r
-                .get::<_, i64>(
-                0
-            ))
-            .unwrap(),
-            0
-        );
+        let error = CatalogIndex::open(&path).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains(remanence_state::authority_layout::RESET_REQUIRED));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 }
 
@@ -679,7 +640,7 @@ fn endpoint_admission_preserves_cartridge_robotics_and_unknown_scope_guards() {
 }
 
 #[test]
-fn migration_seeds_terminal_assignment_without_changing_its_generation() {
+fn predecessor_terminal_assignment_requires_reset_without_mutation() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("legacy.sqlite");
     let db = Connection::open(&path).unwrap();
@@ -694,11 +655,15 @@ fn migration_seeds_terminal_assignment_without_changing_its_generation() {
         values(X'01010101010101010101010101010101','TERM01L7','archive','sealed','now',17);",
     )
     .unwrap();
+    drop(db);
+    let before = std::fs::read(&path).unwrap();
     for _ in 0..2 {
-        drop(CatalogIndex::open(&path).unwrap());
+        let error = CatalogIndex::open(&path).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains(remanence_state::authority_layout::RESET_REQUIRED));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
-    let row:(String,i64,i64,i64)=db.query_row("select t.state,t.assignment_generation,a.assignment_generation,a.seq from tapes t join tape_pool_assignments a on a.tape_uuid=t.tape_uuid",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
-    assert_eq!(row, ("sealed".into(), 17, 17, 1));
 }
 
 #[test]
@@ -739,26 +704,35 @@ fn failed_assignment_replay_rolls_back_event_cursor_and_projection() {
     );
 }
 
-/// Startup may reconcile before its first audit replay; migration is the cut.
+/// Startup may reconcile a current rule binding before its first audit replay.
 #[test]
-fn migration_then_rule_clear_or_change_survives_first_replay_and_rebuild() {
+fn rule_clear_or_change_survives_repeated_replay_and_rebuild() {
     use ciborium::value::Value;
     for target in [None, Some("second")] {
         for rebuild_first in [false, true] {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join("legacy.sqlite");
-            let db = Connection::open(&path).unwrap();
-            db.execute_batch(include_str!(
-                "../../../fixtures/standalone/index-v0.1.0.sql"
-            ))
-            .unwrap();
-            db.execute_batch(
-                "insert into tape_pools(pool_id,created_at_utc) values('archive','now');
-                insert into tapes(tape_uuid,voltag,pool_id,state,updated_at_utc)
-                values(X'01010101010101010101010101010101','AUTO01L7','archive','ready','now');",
-            )
-            .unwrap();
             let mut index = CatalogIndex::open(&path).unwrap();
+            provision(&mut index, 1, "AUTO01L7");
+            let events = [
+                audit(
+                    1,
+                    remanence_state::AuditEvent::TapeProvisioned,
+                    1,
+                    &[
+                        ("voltag", Value::Text("AUTO01L7".into())),
+                        ("pool_id", Value::Text("archive".into())),
+                    ],
+                ),
+                audit(
+                    2,
+                    remanence_state::AuditEvent::TapePoolAssigned,
+                    1,
+                    &[("pool_id", Value::Text("archive".into()))],
+                ),
+            ];
+            index.replay_audit_records(&events).unwrap();
+            let db = Connection::open(&path).unwrap();
             let pools = [
                 pool(),
                 TapePoolProjectionInput {
@@ -787,23 +761,6 @@ fn migration_then_rule_clear_or_change_survives_first_replay_and_rebuild() {
                 })
                 .unwrap();
             assert_eq!(expected_count, if target.is_some() { 3 } else { 2 });
-            let events = [
-                audit(
-                    1,
-                    remanence_state::AuditEvent::TapeProvisioned,
-                    1,
-                    &[
-                        ("voltag", Value::Text("AUTO01L7".into())),
-                        ("pool_id", Value::Text("archive".into())),
-                    ],
-                ),
-                audit(
-                    2,
-                    remanence_state::AuditEvent::TapePoolAssigned,
-                    1,
-                    &[("pool_id", Value::Text("archive".into()))],
-                ),
-            ];
             drop(index);
             let mut index = CatalogIndex::open(&path).unwrap();
             for _ in 0..2 {

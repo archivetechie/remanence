@@ -165,7 +165,17 @@ impl TapeIndexReplicaRecordSource for TerminalSource {
         &mut self,
         v: &mut dyn FnMut(&TapeIndexReplicaMapEntry) -> Result<(), ParityError>,
     ) -> Result<(), ParityError> {
-        self.visit_rows(&mut |row| v(&crate::checkpoint::terminal_map_entry_from_committed(row)?))
+        let mut ordinal = 0u64;
+        self.visit_rows(&mut |row| {
+            let mut entry = crate::checkpoint::terminal_map_entry_from_committed(row)?;
+            if row.kind == TapeFileKind::Object && entry.first_parity_data_ordinal.is_none() {
+                entry.first_parity_data_ordinal = Some(ordinal);
+                ordinal = ordinal
+                    .checked_add(row.block_count)
+                    .ok_or(ParityError::Invariant("terminal data ordinal overflow"))?;
+            }
+            v(&entry)
+        })
     }
     fn visit_object_rows(
         &mut self,
@@ -183,12 +193,21 @@ impl TapeIndexReplicaRecordSource for TerminalSource {
 }
 impl TerminalAuthoritySource<AuthorityFinalization> for TerminalSource {
     type Error = StateError;
-    type ReplayMetrics = super::snapshot::ReplayMetrics;
+    type ReplayMetrics = crate::TerminalIndexAuthorityReplayMetrics;
     fn summary(&self) -> TerminalSourceSummary {
         self.summary
     }
     fn replay_metrics(&self) -> Option<Self::ReplayMetrics> {
-        Some(self.raw.replay_metrics())
+        Some(crate::TerminalIndexAuthorityReplayMetrics {
+            checkpoint: crate::CheckpointBoundedReplayMetrics {
+                replay_passes: self.raw.replay_metrics().validation_passes,
+                frame_count: self.raw.replay_metrics().frames,
+                peak_frame_payload_bytes: self.raw.replay_metrics().peak_frame_buffer as u64,
+                peak_live_record_count: 1,
+                peak_live_object_rows: 1,
+            },
+            parity: None,
+        })
     }
     fn reconstruct_final_plan(
         &mut self,

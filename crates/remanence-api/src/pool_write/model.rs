@@ -358,6 +358,8 @@ impl PoolWriteObjectRecord {
             position_before_lba: None,
             position_after_lba: None,
             journal_record_ordinal: None,
+            tape_log_sequence: None,
+            tape_incarnation: None,
             estimated_remaining_bytes: None,
             sealed_after_write: None,
             durability: pb::AppendDurability::Written as i32,
@@ -371,6 +373,10 @@ impl PoolWriteObjectRecord {
 /// Copy locator returned by the reusable pool-targeted write core.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolWriteObjectCopyRecord {
+    /// Closing sequence joined from the tape-log projection.
+    pub tape_log_sequence: Option<u64>,
+    /// Incarnation joined from the same log reference.
+    pub tape_incarnation: Option<u64>,
     /// Actual tape selected inside the requested pool.
     pub tape_uuid: TapeUuid,
     /// Filemark-delimited object tape-file number.
@@ -429,6 +435,8 @@ pub(super) fn append_commit_info_from_pool_copy(
         position_before_lba: None,
         position_after_lba: None,
         journal_record_ordinal: None,
+        tape_log_sequence: copy.tape_log_sequence,
+        tape_incarnation: copy.tape_incarnation,
         estimated_remaining_bytes: None,
         sealed_after_write: None,
         durability: pb::AppendDurability::Checkpointed as i32,
