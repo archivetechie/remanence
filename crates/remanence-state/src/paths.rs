@@ -43,18 +43,8 @@ impl StatePaths {
 
     /// Return the Layer 3c journal path for a tape UUID.
     pub fn journal_path(&self, tape_uuid: [u8; 16]) -> PathBuf {
-        self.journal_dir
-            .join(format!("{}.remjournal", hex_uuid(tape_uuid)))
+        crate::authority::structural_path_in(&self.journal_dir, tape_uuid)
     }
-}
-
-fn hex_uuid(tape_uuid: [u8; 16]) -> String {
-    let mut out = String::with_capacity(32);
-    for byte in tape_uuid {
-        use std::fmt::Write as _;
-        write!(&mut out, "{byte:02x}").expect("write to string");
-    }
-    out
 }
 
 #[cfg(test)]

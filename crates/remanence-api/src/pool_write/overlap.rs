@@ -28,7 +28,7 @@ use super::staging::{run_counted_fenced_staged_transfer, CountingBlockSink};
 #[cfg(test)]
 use remanence_parity::{
     BlockSinkRawTapeSink, CommittedBundle, CommittedBundleKind, CommittedState, JournalError,
-    ParityScheme, ParitySink, TapeFileJournal,
+    ParityScheme, ParitySink, TapeReportPublisher,
 };
 #[cfg(test)]
 use remanence_state::{CatalogIndex, TapePoolConfig};
@@ -228,14 +228,12 @@ pub(crate) struct PerObjectTestJournal {
 }
 
 #[cfg(test)]
-impl TapeFileJournal for PerObjectTestJournal {
+impl TapeReportPublisher for PerObjectTestJournal {
+    remanence_parity::fixture_publication_methods!();
     // In-memory session journals have no durable resume authority to replay.
     fn session_resume_snapshot(
         &self,
-    ) -> Result<
-        Option<remanence_parity::FileTapeFileJournalCommittedSnapshot>,
-        remanence_parity::JournalError,
-    > {
+    ) -> Result<Option<remanence_parity::FrozenFileRows>, remanence_parity::JournalError> {
         Ok(None)
     }
 
@@ -243,8 +241,13 @@ impl TapeFileJournal for PerObjectTestJournal {
         self.tape_uuid
     }
 
-    fn commit_bundle(&mut self, bundle: &CommittedBundle) -> Result<(), JournalError> {
-        self.bundles.push(bundle.clone());
+    fn publish_fixture(
+        &mut self,
+        report: &remanence_parity::authority::ShadowPublication,
+    ) -> Result<(), JournalError> {
+        for bundle in &report.bundles {
+            self.bundles.push(bundle.clone());
+        }
         Ok(())
     }
 

@@ -1,3 +1,4 @@
+use remanence_parity::authority::StructuralAuthority;
 #[path = "durability_tests.rs"]
 mod durability_tests;
 
@@ -287,8 +288,10 @@ fn automatic_terminal_preflight_accepts_empty_fresh_authority() {
         .expect("an empty fresh checkpoint has no terminal work"),
         "empty fresh authority must continue to ordinary Object admission"
     );
-    let checkpoint = remanence_state::FileCheckpointJournal::open(checkpoint_dir, TAPE_UUID)
-        .expect("reopen empty fresh checkpoint");
+    let checkpoint =
+        remanence_state::authority::fixtures::AuthorityBuilder::new(checkpoint_dir, TAPE_UUID)
+            .build()
+            .expect("reopen empty fresh checkpoint");
     assert!(
         checkpoint
             .last()
@@ -459,6 +462,17 @@ fn unknown_or_zero_replica_tail_remains_recovery_required() {
 
 #[test]
 fn one_transition_ahead_sink_journal_reconciles_before_media_is_available() {
+    terminal_authority_fixture(None);
+}
+
+#[test]
+fn shadow_component_catalog_authority_reports_fresh_orphan_and_checkpointed_units() {
+    for already_present in 0..=2 {
+        terminal_authority_fixture(Some(already_present));
+    }
+}
+
+fn terminal_authority_fixture(receipt_case: Option<usize>) {
     const BLOCK_SIZE: u32 = 256 * 1024;
     const TAPE_UUID: [u8; 16] = [0x8A; 16];
 
@@ -572,9 +586,12 @@ fn one_transition_ahead_sink_journal_reconciles_before_media_is_available() {
             .expect("persist terminal layout"),
     };
     let temp = tempfile::tempdir().expect("tempdir");
-    let checkpoint_journal =
-        remanence_state::FileCheckpointJournal::open(temp.path().join("checkpoints"), TAPE_UUID)
-            .expect("checkpoint journal");
+    let checkpoint_journal = remanence_state::authority::fixtures::AuthorityBuilder::new(
+        temp.path().join("checkpoints"),
+        TAPE_UUID,
+    )
+    .build()
+    .expect("checkpoint journal");
     let object_uuid = Uuid::from_bytes([0x8E; 16]);
     checkpoint_journal
         .append(&remanence_state::CheckpointJournalRecord {
@@ -669,12 +686,13 @@ fn one_transition_ahead_sink_journal_reconciles_before_media_is_available() {
         .expect("project initial finalization");
 
     let scheme = remanence_parity::default_scheme();
-    let mut journal = FileTapeFileJournal::open(
-        temp.path().join("tape.remjournal"),
+    let mut journal = remanence_parity::authority::fixtures::RowAuthorityBuilder::new(
+        temp.path(),
         TAPE_UUID,
         BLOCK_SIZE,
         scheme.clone(),
     )
+    .build()
     .expect("open sink journal");
     let bot_bundle = CommittedBundle {
         kind: CommittedBundleKind::BotBootstrap,
@@ -734,28 +752,140 @@ fn one_transition_ahead_sink_journal_reconciles_before_media_is_available() {
         highest_protected_ordinal: 0,
         total_committed_ordinals: 1,
     };
-    journal.commit_bundle(&bot_bundle).expect("journal BOT");
     journal
-        .commit_bundle(&object_bundle)
+        .publish_fixture(&remanence_parity::authority::ShadowPublication {
+            bundles: vec![(bot_bundle).clone()],
+        })
+        .expect("journal BOT");
+    journal
+        .publish_fixture(&remanence_parity::authority::ShadowPublication {
+            bundles: vec![(object_bundle).clone()],
+        })
         .expect("journal Object");
     journal
-        .commit_bundle(&object_checkpoint)
+        .publish_fixture(&remanence_parity::authority::ShadowPublication {
+            bundles: vec![(object_checkpoint).clone()],
+        })
         .expect("journal Object checkpoint");
     journal
-        .commit_terminal_prefix_transition(
-            &CommittedBundle {
-                kind: CommittedBundleKind::TerminalPrefix,
-                entries: Vec::new(),
-                highest_protected_ordinal: 0,
-                total_committed_ordinals: 1,
-            },
-            &sink_checkpoint,
-        )
+        .publish_fixture(&remanence_parity::authority::ShadowPublication {
+            bundles: vec![
+                (CommittedBundle {
+                    kind: CommittedBundleKind::TerminalPrefix,
+                    entries: Vec::new(),
+                    highest_protected_ordinal: 0,
+                    total_committed_ordinals: 1,
+                })
+                .clone(),
+                (sink_checkpoint).clone(),
+            ],
+        })
         .expect("journal terminal prefix");
+    if let Some(already_present) = receipt_case {
+        use remanence_parity::authority::{PublicationDisposition, PublicationReceipt};
+        use remanence_parity::{
+            TerminalComponentCommit, TerminalTailAuthority, TerminalTailProgress,
+        };
+        let spec = TerminalFinalizeSpec {
+            actor: AuditActor::System,
+            tape_uuid: TAPE_UUID,
+            block_size: BLOCK_SIZE,
+            pool_config: None,
+            trigger: intent.trigger,
+            operation_id: None,
+            manual: None,
+        };
+        let mut authority = super::terminal_types::TerminalTailCatalogAuthority {
+            checkpoint: &mut checkpoint,
+            parity_journal: Some(&mut journal),
+            index: &mut index,
+            spec: &spec,
+            intent: (&intent).into(),
+            tix_fault: None,
+            reconciliation: None,
+        };
+        let mut progress = TerminalTailProgress::BeforeReplicaA;
+        for component in layout.components {
+            let bundle = remanence_parity::terminal_component_bundle(&plan, component).unwrap();
+            if already_present > 0 {
+                let mut bundles = vec![bundle.clone()];
+                if already_present == 2 {
+                    bundles.push(sink_checkpoint.clone());
+                }
+                authority
+                    .parity_journal
+                    .as_mut()
+                    .unwrap()
+                    .publish_fixture(&remanence_parity::authority::ShadowPublication { bundles })
+                    .unwrap();
+            }
+            let before = authority
+                .parity_journal
+                .as_ref()
+                .unwrap()
+                .fixture_publications()
+                .unwrap();
+            let next = progress.successor().unwrap();
+            let mut commit = TerminalComponentCommit {
+                previous_progress: progress,
+                next_progress: next,
+                component,
+                observed_position: remanence_parity::PhysicalPositionHint::new(
+                    component.planned_start_lba + component.record_count + 1,
+                ),
+                reconciled_existing_component: already_present != 0,
+                rewrote_torn_component: false,
+                journal_bundle: bundle,
+                checkpoint_bundle: sink_checkpoint.clone(),
+                publication: PublicationReceipt::default(),
+            };
+            authority.commit_after_barrier(&mut commit).unwrap();
+            assert_eq!(authority.load_progress().unwrap(), next);
+            let after = authority
+                .parity_journal
+                .as_ref()
+                .unwrap()
+                .fixture_publications()
+                .unwrap();
+            assert_eq!(commit.publication.items.len(), 1);
+            let item = &commit.publication.items[0];
+            assert_eq!(
+                item.disposition,
+                if already_present > 0 {
+                    PublicationDisposition::AlreadyPresent
+                } else {
+                    PublicationDisposition::Appended
+                }
+            );
+            assert_eq!(
+                item.durability,
+                if already_present > 1 {
+                    PublicationDisposition::AlreadyPresent
+                } else {
+                    PublicationDisposition::Appended
+                }
+            );
+            let mut expected = before;
+            expected.extend(
+                remanence_parity::authority::fixtures::appended_legacy_units(&commit.publication)
+                    .iter()
+                    .map(Into::into),
+            );
+            assert_eq!(after, expected);
+            assert_eq!(after[after.len() - 2], item.publication);
+            assert!(after.last().unwrap().files.is_empty());
+            assert_eq!(after.last().unwrap().protected, item.publication.protected);
+            assert_eq!(after.last().unwrap().total, item.publication.total);
+            progress = next;
+        }
+        return;
+    }
     let replica_a = remanence_parity::terminal_component_bundle(&plan, layout.components[0])
         .expect("replica A bundle");
     journal
-        .commit_bundle(&replica_a)
+        .publish_fixture(&remanence_parity::authority::ShadowPublication {
+            bundles: vec![(replica_a).clone()],
+        })
         .expect("simulate crash after sink component fsync");
 
     let spec = TerminalFinalizeSpec {
@@ -771,7 +901,7 @@ fn one_transition_ahead_sink_journal_reconciles_before_media_is_available() {
         &mut index,
         &mut checkpoint,
         &spec,
-        intent,
+        (&intent).into(),
         &plan,
         &mut journal,
     )
@@ -791,7 +921,13 @@ fn one_transition_ahead_sink_journal_reconciles_before_media_is_available() {
         .collect::<Vec<_>>();
     assert_eq!(
         journal
-            .terminal_component_authority_relation(1, &transitions)
+            .component_relation(
+                1,
+                &transitions
+                    .iter()
+                    .map(|(unit, _)| unit.into())
+                    .collect::<Vec<_>>()
+            )
             .expect("host authorities aligned after reconciliation"),
         remanence_parity::TerminalComponentAuthorityRelation::Aligned
     );
@@ -816,7 +952,9 @@ fn one_transition_ahead_sink_journal_reconciles_before_media_is_available() {
     // checkpoint fsync but before its SQLite projection. Both durable
     // journals agree; restart must repair the cache before media motion.
     journal
-        .commit_terminal_component_transition(&transitions[1].0, &transitions[1].1)
+        .publish_fixture(&remanence_parity::authority::ShadowPublication {
+            bundles: vec![(transitions[1].0).clone(), (transitions[1].1).clone()],
+        })
         .expect("journal separation AB transition");
     let checkpoint_intent = checkpoint
         .advance_terminal_finalization(
@@ -836,7 +974,7 @@ fn one_transition_ahead_sink_journal_reconciles_before_media_is_available() {
         &mut index,
         &mut checkpoint,
         &spec,
-        checkpoint_intent,
+        (&checkpoint_intent).into(),
         &plan,
         &mut journal,
     )
@@ -866,7 +1004,9 @@ fn one_transition_ahead_sink_journal_reconciles_before_media_is_available() {
         ),
     ] {
         journal
-            .commit_bundle(&transitions[component_index].0)
+            .publish_fixture(&remanence_parity::authority::ShadowPublication {
+                bundles: vec![(transitions[component_index].0).clone()],
+            })
             .expect("simulate the next sink component one transition ahead");
         current = reconcile_terminal_component_host_authority(
             &mut index,
@@ -893,7 +1033,9 @@ fn one_transition_ahead_sink_journal_reconciles_before_media_is_available() {
     // stale pre-C view, so recovery must reconcile first and then observe
     // that no tape capacity remains to authorize.
     journal
-        .commit_terminal_component_transition(&transitions[4].0, &transitions[4].1)
+        .publish_fixture(&remanence_parity::authority::ShadowPublication {
+            bundles: vec![(transitions[4].0).clone(), (transitions[4].1).clone()],
+        })
         .expect("journal replica C transition");
     let lowered_pool = TapePoolConfig {
         scheme: None,
@@ -1022,9 +1164,12 @@ fn one_transition_ahead_sink_journal_reconciles_before_media_is_available() {
         .expect("read finalized projection")
         .expect("finalized projection");
     assert_eq!(finalized.outcome, TerminalFinalizationOutcome::Finalized);
-    let checkpoint_journal =
-        remanence_state::FileCheckpointJournal::open(temp.path().join("checkpoints"), TAPE_UUID)
-            .expect("reopen finalized checkpoint journal");
+    let checkpoint_journal = remanence_state::authority::fixtures::AuthorityBuilder::new(
+        temp.path().join("checkpoints"),
+        TAPE_UUID,
+    )
+    .build()
+    .expect("reopen finalized checkpoint journal");
     assert!(
         checkpoint_journal
             .last()
@@ -2024,10 +2169,13 @@ async fn daemon_rejects_corrupt_checkpoint_authority_before_position_or_config_c
     let mut cfg = test_write_owner_config(index_path, audit_dir, &library, snapshot);
     cfg.checkpoint_journal_dir = temp.path().join("checkpoints");
 
-    let checkpoint =
-        remanence_state::FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, tape_uuid)
-            .expect("open checkpoint handle");
-    std::fs::write(checkpoint.path(), b"legacy-or-torn-checkpoint")
+    let checkpoint = remanence_state::authority::fixtures::AuthorityBuilder::new(
+        &cfg.checkpoint_journal_dir,
+        tape_uuid,
+    )
+    .build()
+    .expect("open checkpoint handle");
+    remanence_state::authority::fixtures::damage_authority(checkpoint)
         .expect("write corrupt checkpoint authority");
 
     let serial = library.library().serial.clone();
@@ -2279,9 +2427,12 @@ async fn daemon_checkpoint_lease_contention_precedes_conditional_load_for_no_par
     std::fs::create_dir_all(&audit_dir).expect("create audit dir");
     let mut cfg = test_write_owner_config(index_path, audit_dir, &library, snapshot);
     cfg.checkpoint_journal_dir = temp.path().join("checkpoints");
-    let checkpoint =
-        remanence_state::FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, tape_uuid)
-            .expect("open checkpoint handle");
+    let checkpoint = remanence_state::authority::fixtures::AuthorityBuilder::new(
+        &cfg.checkpoint_journal_dir,
+        tape_uuid,
+    )
+    .build()
+    .expect("open checkpoint handle");
     let _held_lease = checkpoint
         .acquire_exclusive()
         .expect("hold competing checkpoint lease");
@@ -2435,15 +2586,27 @@ fn fresh_parity_bootstrap_short_completion_fences_without_journal_visibility() {
     let mut drive = library.open_drive(0x0100, &policy).expect("open drive");
     let _admission = crate::admit_initialized_tape(&mut drive, tape_uuid, BLOCK_SIZE).unwrap();
     let status = {
-        let checkpoint_journal =
-            remanence_state::FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, tape_uuid)
-                .expect("open fresh checkpoint journal");
-        let checkpoint_lease = checkpoint_journal
+        let checkpoint_journal = remanence_state::authority::fixtures::AuthorityBuilder::new(
+            &cfg.checkpoint_journal_dir,
+            tape_uuid,
+        )
+        .build()
+        .expect("open fresh checkpoint journal");
+        let mut checkpoint_lease = checkpoint_journal
             .acquire_exclusive()
             .expect("acquire fresh checkpoint lease");
-        let authority = validate_parity_actor_authority(&cfg, &selected, &checkpoint_lease, &[])
-            .expect("validate fresh parity authority");
-        match open_parity_actor_session(&mut index, &mut drive, &cfg, &selected, &[], authority) {
+        let authority =
+            validate_parity_actor_authority(&cfg, &selected, &mut checkpoint_lease, &[])
+                .expect("validate fresh parity authority");
+        match open_parity_actor_session(
+            &mut index,
+            &mut drive,
+            &cfg,
+            &selected,
+            &[],
+            authority,
+            &mut checkpoint_lease,
+        ) {
             Ok(_) => panic!("short bootstrap completion must fail closed"),
             Err(status) => status,
         }
@@ -2472,9 +2635,15 @@ fn fresh_parity_bootstrap_short_completion_fences_without_journal_visibility() {
     );
     drop(world_guard);
 
-    let journal_path = parity_journal_path(&cfg, tape_uuid).expect("parity journal path");
-    let journal = FileTapeFileJournal::open(journal_path, tape_uuid, BLOCK_SIZE, scheme)
-        .expect("reopen parity journal");
+    let journal_path = parity_journal_directory(&cfg, tape_uuid).expect("parity journal path");
+    let journal = remanence_parity::authority::fixtures::RowAuthorityBuilder::new(
+        journal_path,
+        tape_uuid,
+        BLOCK_SIZE,
+        scheme,
+    )
+    .build()
+    .expect("reopen parity journal");
     assert!(
         journal
             .load_committed()
@@ -2576,29 +2745,56 @@ fn automatic_terminal_transition_transfers_the_session_parity_journal_lock() {
         .expect("tempdir");
     let tape_uuid = [0x48; 16];
     let scheme = remanence_parity::default_scheme_for_block_size(256 * 1024);
-    let path = temp.path().join("terminal.remjournal");
-    let journal = FileTapeFileJournal::open(&path, tape_uuid, 256 * 1024, scheme.clone())
-        .expect("open session journal");
-    let mut session = ParityActorSession {
-        scheme: scheme.clone(),
-        sink_state: None,
-        journal: Some(journal),
-        retention: None,
-        close_at_barrier: false,
-    };
+    let path = temp.path().to_path_buf();
+    let journal = remanence_parity::authority::fixtures::RowAuthorityBuilder::new(
+        &path,
+        tape_uuid,
+        256 * 1024,
+        scheme.clone(),
+    )
+    .build()
+    .expect("open session journal");
+    let checkpoint = remanence_state::authority::fixtures::AuthorityBuilder::new(
+        temp.path().join("checkpoints"),
+        tape_uuid,
+    )
+    .build()
+    .unwrap();
+    let mut writer = checkpoint.acquire_exclusive().unwrap();
+    writer.retain_structural_publisher(journal).unwrap();
 
-    let contended = FileTapeFileJournal::open(&path, tape_uuid, 256 * 1024, scheme.clone())
-        .expect_err("a second open must contend with the session-owned journal");
+    let contended = remanence_parity::authority::fixtures::RowAuthorityBuilder::new(
+        &path,
+        tape_uuid,
+        256 * 1024,
+        scheme.clone(),
+    )
+    .build()
+    .expect_err("a second open must contend with the session-owned journal");
     assert!(contended.is_lock_contended(), "{contended}");
 
-    let terminal_journal = session
-        .journal
-        .take()
-        .expect("transfer the session journal to terminal finalization");
-    assert!(session.journal.is_none());
-    drop(terminal_journal);
-    FileTapeFileJournal::open(&path, tape_uuid, 256 * 1024, scheme)
-        .expect("the journal lock is released after terminal ownership ends");
+    writer
+        .with_structural(|owner, terminal_journal| {
+            assert!(
+                terminal_journal.is_some(),
+                "lend the retained publisher to finalization"
+            );
+            assert!(
+                owner.structural().is_none(),
+                "the capability cannot be borrowed twice"
+            );
+            owner.finish_structural_scope();
+        })
+        .unwrap();
+    assert!(writer.structural().is_none());
+    remanence_parity::authority::fixtures::RowAuthorityBuilder::new(
+        &path,
+        tape_uuid,
+        256 * 1024,
+        scheme,
+    )
+    .build()
+    .expect("the journal lock is released after terminal ownership ends");
 }
 
 #[tokio::test]
@@ -2848,7 +3044,8 @@ async fn partial_epoch_checkpoint_projects_replays_and_first_post_checkpoint_sho
         .expect("close checkpointed parity session");
 
     let checkpoint_journal =
-        remanence_state::FileCheckpointJournal::open(&checkpoint_dir, tape_uuid)
+        remanence_state::authority::fixtures::AuthorityBuilder::new(&checkpoint_dir, tape_uuid)
+            .build()
             .expect("open durable parity checkpoint journal");
     let records = checkpoint_journal
         .replay()
@@ -4528,9 +4725,12 @@ async fn checkpoint_actor_deduplicates_in_batch_and_holds_until_checkpoint() {
     assert_eq!(closed.session.committed_copies.len(), 1);
     assert_eq!(closed.session.committed_copies[0].tape_uuid, tape_uuid);
     assert_eq!(closed.session.committed_copies[0].tape_file_number, 4);
-    let journal =
-        remanence_state::FileCheckpointJournal::open(temp.path().join("checkpoints"), tape_uuid)
-            .expect("open checkpoint journal after session lease release");
+    let journal = remanence_state::authority::fixtures::AuthorityBuilder::new(
+        temp.path().join("checkpoints"),
+        tape_uuid,
+    )
+    .build()
+    .expect("open checkpoint journal after session lease release");
     let read_only = CatalogIndex::open_read_only(&index_path).expect("open projection");
     assert!(read_only
         .get_native_object(&fourth_object_id)
@@ -4802,10 +5002,11 @@ async fn daemon_watermark_terminalization_is_atomic_and_terminal_failure_stays_f
             .expect("close reply")
             .expect("close terminal session");
 
-        let checkpoint = remanence_state::FileCheckpointJournal::open(
+        let checkpoint = remanence_state::authority::fixtures::AuthorityBuilder::new(
             temp.path().join("checkpoints"),
             tape_uuid,
         )
+        .build()
         .expect("open checkpoint journal after lease release");
         let read_only = CatalogIndex::open_read_only(&index_path).expect("open catalog");
         let tape = read_only
@@ -5004,9 +5205,12 @@ async fn manual_finalize_closes_below_low_and_same_key_replay_moves_no_tape() {
         .expect("close reply")
         .expect("close below-low write session without finalizing");
 
-    let checkpoint =
-        remanence_state::FileCheckpointJournal::open(temp.path().join("checkpoints"), tape_uuid)
-            .expect("open checkpoint journal");
+    let checkpoint = remanence_state::authority::fixtures::AuthorityBuilder::new(
+        temp.path().join("checkpoints"),
+        tape_uuid,
+    )
+    .build()
+    .expect("open checkpoint journal");
     let records = checkpoint.replay().expect("replay pre-final checkpoint");
     assert_eq!(records.len(), 1);
     assert!(!records[0].sealed_after_write);
@@ -5081,10 +5285,8 @@ async fn manual_finalize_closes_below_low_and_same_key_replay_moves_no_tape() {
     // Failed companion publication must roll back both halves of manual
     // acceptance. No drive command is possible because preflight owns
     // neither a drive nor a changer, and the scoped key remains reusable.
-    let mut blocked_intent_path = checkpoint.path().as_os_str().to_os_string();
-    blocked_intent_path.push(".finalizing.new");
-    let blocked_intent_path = std::path::PathBuf::from(blocked_intent_path);
-    std::fs::create_dir(&blocked_intent_path).expect("block intent temporary file creation");
+    let blocked_intent = remanence_state::authority::fixtures::block_finalization(&checkpoint)
+        .expect("block intent temporary file creation");
     let commands_before_crash_cut = world.lock().expect("world lock").command_log.len();
     let mut crash_index = CatalogIndex::open(&index_path).expect("open crash-cut catalog");
     let crash_error = preflight_manual_finalize_tape(
@@ -5122,7 +5324,9 @@ async fn manual_finalize_closes_below_low_and_same_key_replay_moves_no_tape() {
         .terminal_finalization(&request.tape_uuid)
         .expect("read crash-cut finalization projection")
         .is_none());
-    std::fs::remove_dir(&blocked_intent_path).expect("unblock intent publication");
+    blocked_intent
+        .unblock()
+        .expect("unblock intent publication");
 
     let mut recovered_request = request.clone();
     let recovered_operation_id = Uuid::from_u128(0x7d05);
@@ -5856,7 +6060,7 @@ fn cataloged_payload_fixture(payload: &[u8]) -> RangeCatalogFixture {
                 scheme: None,
                 journal_offset_bytes: 0,
             },
-            &CommittedBundle {
+            &(&CommittedBundle {
                 kind: CommittedBundleKind::Object,
                 entries: vec![TapeFileEntry {
                     tape_file_number: 0,
@@ -5873,7 +6077,8 @@ fn cataloged_payload_fixture(payload: &[u8]) -> RangeCatalogFixture {
                 }],
                 highest_protected_ordinal: 0,
                 total_committed_ordinals: 0,
-            },
+            })
+                .into(),
         )
         .expect("project range fixture");
     RangeCatalogFixture {
@@ -8960,6 +9165,11 @@ fn resume_vectors_cross_record_conflict() {
 }
 
 #[test]
+fn resume_vectors_missing_scheme_preserves_resume_append_error() {
+    resume_vectors_layer5_authorities(Some("scheme"));
+}
+
+#[test]
 fn resume_vectors_empty_checkpoint_authority() {
     resume_vectors_layer5_authorities(Some("empty"));
 }
@@ -8993,7 +9203,7 @@ fn resume_vectors_layer5_authorities(refusal: Option<&str>) {
     let journal = adapt(
         &input,
         &vector,
-        &super::checkpoint::parity_journal_path(&cfg, selected.tape_uuid).unwrap(),
+        &super::checkpoint::parity_journal_directory(&cfg, selected.tape_uuid).unwrap(),
     )
     .unwrap();
     let committed = journal.load_committed().unwrap();
@@ -9084,15 +9294,26 @@ fn resume_vectors_layer5_authorities(refusal: Option<&str>) {
         seal_due: None,
     };
     drop(journal);
-    let checkpoint = remanence_state::FileCheckpointJournal::open(
+    let checkpoint = remanence_state::authority::fixtures::AuthorityBuilder::new(
         &cfg.checkpoint_journal_dir,
         selected.tape_uuid,
     )
+    .build()
     .unwrap();
     if refusal == Some("conflict") {
         checkpoint_record.block_size *= 2;
         for object in &mut checkpoint_record.objects {
             object.block_size = checkpoint_record.block_size;
+        }
+    }
+    if refusal == Some("scheme") {
+        checkpoint_record.scheme = None;
+        checkpoint_record.object_tape_file_bundles.clear();
+        checkpoint_record.next_tape_file_number = 2;
+        checkpoint_record.eod_lba = 7;
+        for object in &mut checkpoint_record.objects {
+            object.copy.first_parity_data_ordinal = None;
+            object.copy.protected_until_ordinal = None;
         }
     }
     if refusal != Some("empty") {
@@ -9102,12 +9323,13 @@ fn resume_vectors_layer5_authorities(refusal: Option<&str>) {
     let checkpoints = lease.replay().unwrap();
     if let Some(kind) = refusal {
         world.lock().unwrap().command_log.clear();
-        let journal = FileTapeFileJournal::open(
-            super::checkpoint::parity_journal_path(&cfg, selected.tape_uuid).unwrap(),
+        let journal = remanence_parity::authority::fixtures::RowAuthorityBuilder::new(
+            super::checkpoint::parity_journal_directory(&cfg, selected.tape_uuid).unwrap(),
             selected.tape_uuid,
             selected.block_size,
             vector.written.inputs.scheme.clone(),
         )
+        .build()
         .unwrap();
         let error = crate::pool_write::validate_parity_resume_checkpoint_authority(
             &lease,
@@ -9126,6 +9348,8 @@ fn resume_vectors_layer5_authorities(refusal: Option<&str>) {
         };
         let expected_detail = if kind == "empty" {
             "parity journal has a committed prefix but checkpoint authority is empty"
+        } else if kind == "scheme" {
+            "checkpoint parity scheme does not match the sink journal"
         } else {
             "does not match sink journal block size"
         };
@@ -9137,8 +9361,8 @@ fn resume_vectors_layer5_authorities(refusal: Option<&str>) {
         let status = match super::checkpoint::validate_parity_actor_authority(
             &cfg,
             &selected,
-            &lease,
-            &checkpoints,
+            &mut lease,
+            &checkpoints.iter().map(Into::into).collect::<Vec<_>>(),
         ) {
             Err(status) => status,
             Ok(_) => panic!("invalid combined authority accepted"),
@@ -9153,9 +9377,13 @@ fn resume_vectors_layer5_authorities(refusal: Option<&str>) {
         println!("PASS resume-cross-records/{kind}: {}; FailedPrecondition; refused by the shared helper, which both open paths call before any drive command", status.message());
         return;
     }
-    let authority =
-        super::checkpoint::validate_parity_actor_authority(&cfg, &selected, &lease, &checkpoints)
-            .unwrap();
+    let authority = super::checkpoint::validate_parity_actor_authority(
+        &cfg,
+        &selected,
+        &mut lease,
+        &checkpoints.iter().map(Into::into).collect::<Vec<_>>(),
+    )
+    .unwrap();
     let mut index = CatalogIndex::open(&cfg.index_path).unwrap();
     let last = checkpoints.last().unwrap();
     // This fixture tests parity journal reconstruction after an explicit discard.
@@ -9174,14 +9402,15 @@ fn resume_vectors_layer5_authorities(refusal: Option<&str>) {
         &mut drive,
         &cfg,
         &selected,
-        &checkpoints,
+        &checkpoints.iter().map(Into::into).collect::<Vec<_>>(),
         authority,
+        &mut lease,
     )
     .unwrap();
     let mut raw = DriveHandleRawSink::new(&mut drive);
     raw.configure_parity_write_session(selected.block_size)
         .unwrap();
-    let mut journal = session.journal.take().unwrap();
+    let mut journal = lease.structural_mut().unwrap();
     let mut sink =
         ParitySink::from_session_state(&mut raw, &mut journal, session.sink_state.take().unwrap())
             .unwrap();
@@ -11804,10 +12033,11 @@ pub(crate) async fn check_overlap_batch_receipts(
     );
     assert!(seen.insert(closed.checkpointed_objects[0].object_id.clone()));
     assert_eq!(seen.len(), 8);
-    let journal = remanence_state::FileCheckpointJournal::open(
+    let journal = remanence_state::authority::fixtures::AuthorityBuilder::new(
         state.paths().journal_dir.join("checkpoints"),
         selected.tape_uuid,
     )
+    .build()
     .unwrap();
     let records = journal.replay().unwrap();
     assert_eq!(
@@ -12009,10 +12239,11 @@ pub(crate) async fn check_context_failure_receipts(
         assert!(stored.copies.iter().any(|copy| copy.status == "committed"));
     }
     actor.await.unwrap();
-    let journal = FileCheckpointJournal::open(
+    let journal = remanence_state::authority::fixtures::AuthorityBuilder::new(
         state.paths().journal_dir.join("checkpoints"),
         selected.tape_uuid,
     )
+    .build()
     .unwrap();
     assert_eq!(journal.replay().unwrap().len(), 2);
 }
@@ -12034,6 +12265,8 @@ pub(crate) enum RetentionInvalidation {
     NoWriteShutdown,
     Finalize,
     FinalizeRebuilt,
+    PlannerRefusesBeforeReplicaA,
+    PlannerRefusesSealed,
     SealDue,
     ShutdownSealDue,
     ShutdownSealDueBusy,
@@ -12392,9 +12625,12 @@ pub(crate) async fn check_seated_parity_sessions(
             .await
             .unwrap();
             received.await.unwrap().unwrap();
-            let journal =
-                FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, selected.tape_uuid)
-                    .unwrap();
+            let journal = remanence_state::authority::fixtures::AuthorityBuilder::new(
+                &cfg.checkpoint_journal_dir,
+                selected.tape_uuid,
+            )
+            .build()
+            .unwrap();
             assert_eq!(
                 journal.last().unwrap().unwrap().seal_due,
                 Some(remanence_state::SealDueReason::HardwareEarlyWarning)
@@ -12430,8 +12666,8 @@ pub(crate) async fn check_seated_parity_sessions(
                 1,
                 "live automatic seal never rebuilds"
             );
-            let journal = FileTapeFileJournal::open(
-                super::checkpoint::parity_journal_path(&cfg, selected.tape_uuid).unwrap(),
+            let journal = remanence_parity::authority::fixtures::RowAuthorityBuilder::new(
+                super::checkpoint::parity_journal_directory(&cfg, selected.tape_uuid).unwrap(),
                 selected.tape_uuid,
                 selected.block_size,
                 match &selected.parity_config {
@@ -12439,6 +12675,7 @@ pub(crate) async fn check_seated_parity_sessions(
                     _ => unreachable!(),
                 },
             )
+            .build()
             .unwrap();
             let committed = journal.load_committed().unwrap();
             let entry = committed
@@ -12491,7 +12728,10 @@ pub(crate) async fn check_seated_parity_sessions(
     }
     if matches!(
         invalidation,
-        RetentionInvalidation::Finalize | RetentionInvalidation::FinalizeRebuilt
+        RetentionInvalidation::Finalize
+            | RetentionInvalidation::FinalizeRebuilt
+            | RetentionInvalidation::PlannerRefusesBeforeReplicaA
+            | RetentionInvalidation::PlannerRefusesSealed
     ) {
         let mut index = CatalogIndex::open(&state.paths().sqlite_path).unwrap();
         let assignment_generation = index
@@ -12548,6 +12788,33 @@ pub(crate) async fn check_seated_parity_sessions(
             Some(&prefix),
         )
         .unwrap();
+        if invalidation == RetentionInvalidation::PlannerRefusesBeforeReplicaA {
+            use remanence_state::authority::{TapeAuthorityView, TapeAuthorityWriter};
+            let authority = remanence_state::TapeAuthority::open(
+                &cfg.checkpoint_journal_dir,
+                selected.tape_uuid,
+            )
+            .unwrap();
+            let mut lease = authority.acquire_exclusive_for_terminal_recovery().unwrap();
+            assert_eq!(
+                lease.pending_finalization().unwrap().unwrap().progress,
+                remanence_state::TerminalFinalizationProgress::BeforeReplicaA
+            );
+            let scheme = match &selected.parity_config {
+                ParityConfig::Scheme(s) => s.clone(),
+                _ => unreachable!(),
+            };
+            let rows = lease.open_structural(selected.block_size, scheme).unwrap();
+            lease.retain_structural_publisher(rows).unwrap();
+            let prefix_plan = remanence_state::authority::AuthorityPrefixPlan::from(&prefix);
+            lease
+                .publish_terminal_prefix(&prefix_plan.publication)
+                .unwrap();
+            drop(lease);
+            assert_epoch_planner_refusal(&tx, &request, &barcode, &world).await;
+            return;
+        }
+        let sealed_request = request.clone();
         read_fault.store(1, Ordering::SeqCst);
         let (reply, received) = oneshot::channel();
         tx.send(DriveCommand::FinalizeTape {
@@ -12574,35 +12841,44 @@ pub(crate) async fn check_seated_parity_sessions(
             .iter()
             .find(|e| e.kind == TapeFileKind::ParityMap)
             .unwrap();
-        let world = world.lock().unwrap();
-        let start = entry.physical_start_hint.unwrap() as usize;
-        let blocks = world.tapes[barcode.as_str()].records
-            [start..start + entry.block_count as usize]
-            .iter()
-            .map(|r| match r {
-                Record::Block(b) => b.clone(),
-                _ => panic!("ParityMap delimiter inside payload"),
-            })
-            .collect::<Vec<_>>();
-        let parsed =
-            remanence_parity::parse_parity_map_tape_file(&blocks, &selected.tape_uuid).unwrap();
-        assert_ne!(
-            parsed.payload.directory.entries.last().unwrap().flags
-                & remanence_parity::SIDECAR_DIRECTORY_FLAG_FINAL_PARTIAL_EPOCH,
-            0
-        );
-        let records = FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, selected.tape_uuid)
+        {
+            let world_guard = world.lock().unwrap();
+            let start = entry.physical_start_hint.unwrap() as usize;
+            let blocks = world_guard.tapes[barcode.as_str()].records
+                [start..start + entry.block_count as usize]
+                .iter()
+                .map(|r| match r {
+                    Record::Block(b) => b.clone(),
+                    _ => panic!("ParityMap delimiter inside payload"),
+                })
+                .collect::<Vec<_>>();
+            let parsed =
+                remanence_parity::parse_parity_map_tape_file(&blocks, &selected.tape_uuid).unwrap();
+            assert_ne!(
+                parsed.payload.directory.entries.last().unwrap().flags
+                    & remanence_parity::SIDECAR_DIRECTORY_FLAG_FINAL_PARTIAL_EPOCH,
+                0
+            );
+            let records = remanence_state::authority::fixtures::AuthorityBuilder::new(
+                &cfg.checkpoint_journal_dir,
+                selected.tape_uuid,
+            )
+            .build()
             .unwrap()
             .replay()
             .unwrap();
-        assert_eq!(
-            records.len(),
-            3,
-            "finalization has no intervening barrier close"
-        );
-        assert!(records.last().unwrap().sealed_after_write);
-        assert_eq!(memory.granted(), 0);
-        drop(world);
+            assert_eq!(
+                records.len(),
+                3,
+                "finalization has no intervening barrier close"
+            );
+            assert!(records.last().unwrap().sealed_after_write);
+            assert_eq!(memory.granted(), 0);
+        }
+        if invalidation == RetentionInvalidation::PlannerRefusesSealed {
+            read_fault.store(0, Ordering::SeqCst);
+            assert_epoch_planner_refusal(&tx, &sealed_request, &barcode, &world).await;
+        }
         assert_rebuild_safety_equivalent(state);
         return;
     }
@@ -12784,10 +13060,11 @@ pub(crate) async fn check_seated_parity_sessions(
         "audit: {:?}",
         FileAuditLog::replay(&state.paths().audit_dir).unwrap()
     );
-    let records = remanence_state::FileCheckpointJournal::open(
+    let records = remanence_state::authority::fixtures::AuthorityBuilder::new(
         state.paths().journal_dir.join("checkpoints"),
         selected.tape_uuid,
     )
+    .build()
     .unwrap()
     .replay()
     .unwrap();
@@ -12914,11 +13191,14 @@ pub(crate) async fn check_seated_parity_sessions(
             error.message().contains("seal") && error.message().contains("retry OpenWriteSession"),
             "{error}"
         );
-        let recovered =
-            FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, selected.tape_uuid)
-                .unwrap()
-                .replay()
-                .unwrap();
+        let recovered = remanence_state::authority::fixtures::AuthorityBuilder::new(
+            &cfg.checkpoint_journal_dir,
+            selected.tape_uuid,
+        )
+        .build()
+        .unwrap()
+        .replay()
+        .unwrap();
         assert_eq!(
             recovered.last().unwrap().committed_object_count,
             object_count
@@ -13138,10 +13418,14 @@ async fn check_session_projection_busy(
         &cfg.audit_append_lock,
     )
     .unwrap();
-    let records = FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, selected.tape_uuid)
-        .unwrap()
-        .replay()
-        .unwrap();
+    let records = remanence_state::authority::fixtures::AuthorityBuilder::new(
+        &cfg.checkpoint_journal_dir,
+        selected.tape_uuid,
+    )
+    .build()
+    .unwrap()
+    .replay()
+    .unwrap();
     assert_eq!(
         records.last().unwrap().eod_lba as usize,
         world.lock().unwrap().tapes["HAND"].records.len(),
@@ -13350,7 +13634,7 @@ pub(crate) async fn unload_adopted_cartridge(
     api.drive_idle_unload_seconds = 1;
     crate::mount::test_remove_seated_epoch(&api, "idle", seated).await;
     assert!(world.lock().unwrap().drive_bays[&0x100].is_none());
-    assert!(!FileCheckpointJournal::exists(&cfg.checkpoint_journal_dir, tape_uuid).unwrap());
+    assert!(!TapeAuthority::exists(&cfg.checkpoint_journal_dir, tape_uuid).unwrap());
     assert!(
         !cfg.checkpoint_journal_dir.exists(),
         "idle removal creates no journal directory"
@@ -13431,10 +13715,14 @@ async fn check_epoch_removal(
     );
     let journal_before = if case == "replay_closed" {
         Some(
-            FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, selected.tape_uuid)
-                .unwrap()
-                .replay()
-                .unwrap(),
+            remanence_state::authority::fixtures::AuthorityBuilder::new(
+                &cfg.checkpoint_journal_dir,
+                selected.tape_uuid,
+            )
+            .build()
+            .unwrap()
+            .replay()
+            .unwrap(),
         )
     } else {
         None
@@ -13458,10 +13746,12 @@ async fn check_epoch_removal(
                 .unwrap();
         }
         "stale_shared_lease" => {
-            use std::os::fd::AsRawFd;
-            let journal =
-                FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, selected.tape_uuid)
-                    .unwrap();
+            let journal = remanence_state::authority::fixtures::AuthorityBuilder::new(
+                &cfg.checkpoint_journal_dir,
+                selected.tape_uuid,
+            )
+            .build()
+            .unwrap();
             let records = journal.replay().unwrap();
             let last = records.last().unwrap();
             let bundle = last.object_tape_file_bundles.last().unwrap();
@@ -13470,20 +13760,19 @@ async fn check_epoch_removal(
                 before.highest_protected_ordinal,
                 before.total_committed_ordinals
             );
-            let lock = std::fs::File::open(format!("{}.lock", journal.path().display())).unwrap();
-            // SAFETY: the file owns this valid descriptor for the lifetime of the shared lease.
-            assert_eq!(
-                unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
-                0
-            );
-            shared_lease = Some(lock);
+            shared_lease =
+                Some(remanence_state::authority::fixtures::hold_shared(&journal).unwrap());
         }
         "lease" => {
             lease = Some(
-                FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, selected.tape_uuid)
-                    .unwrap()
-                    .acquire_exclusive()
-                    .unwrap(),
+                remanence_state::authority::fixtures::AuthorityBuilder::new(
+                    &cfg.checkpoint_journal_dir,
+                    selected.tape_uuid,
+                )
+                .build()
+                .unwrap()
+                .acquire_exclusive()
+                .unwrap(),
             );
         }
         "mode_sense" => {
@@ -13779,9 +14068,13 @@ async fn check_epoch_removal(
             | "journal_corrupt"
             | "barcode_fence"
     ) {
-        let journal =
-            FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, selected.tape_uuid).unwrap();
-        std::fs::write(journal.path(), b"unreadable checkpoint").unwrap();
+        let journal = remanence_state::authority::fixtures::AuthorityBuilder::new(
+            &cfg.checkpoint_journal_dir,
+            selected.tape_uuid,
+        )
+        .build()
+        .unwrap();
+        remanence_state::authority::fixtures::damage_authority(journal).unwrap();
     }
     if matches!(case, "tail" | "identity" | "absent_bootstrap") {
         // Journal replay restores this deliberately stale projection before fencing.
@@ -14252,10 +14545,14 @@ async fn check_epoch_removal(
             &cfg.audit_append_lock,
         )
         .unwrap();
-        let records = FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, selected.tape_uuid)
-            .unwrap()
-            .replay()
-            .unwrap();
+        let records = remanence_state::authority::fixtures::AuthorityBuilder::new(
+            &cfg.checkpoint_journal_dir,
+            selected.tape_uuid,
+        )
+        .build()
+        .unwrap()
+        .replay()
+        .unwrap();
         assert_eq!(
             records.last().unwrap().eod_lba as usize,
             world.tapes["HAND"].records.len(),
@@ -14300,11 +14597,14 @@ async fn check_epoch_removal(
                 "shutdown audits the replayed open range"
             );
         } else {
-            let records =
-                FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, selected.tape_uuid)
-                    .unwrap()
-                    .replay()
-                    .unwrap();
+            let records = remanence_state::authority::fixtures::AuthorityBuilder::new(
+                &cfg.checkpoint_journal_dir,
+                selected.tape_uuid,
+            )
+            .build()
+            .unwrap()
+            .replay()
+            .unwrap();
             assert!(
                 records.last().unwrap().objects.is_empty(),
                 "removal commits a sidecar-only checkpoint"
@@ -14312,10 +14612,14 @@ async fn check_epoch_removal(
         }
     }
     if let Some(before) = journal_before {
-        let after = FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, selected.tape_uuid)
-            .unwrap()
-            .replay()
-            .unwrap();
+        let after = remanence_state::authority::fixtures::AuthorityBuilder::new(
+            &cfg.checkpoint_journal_dir,
+            selected.tape_uuid,
+        )
+        .build()
+        .unwrap()
+        .replay()
+        .unwrap();
         assert_eq!(
             after, before,
             "removal appends no checkpoint after the durable close"
@@ -14697,10 +15001,14 @@ fn check_terminal_fence_precedes_recovery_failure(tail: bool) {
         audit_fsync: true,
         audit_append_lock: Arc::new(Mutex::new(())),
     };
-    let mut lease = FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, uuid)
-        .unwrap()
-        .acquire_exclusive()
-        .unwrap();
+    let mut lease = remanence_state::authority::fixtures::AuthorityBuilder::new(
+        &cfg.checkpoint_journal_dir,
+        uuid,
+    )
+    .build()
+    .unwrap()
+    .acquire_exclusive()
+    .unwrap();
     let selected = SelectedTape {
         standalone_endpoint: None,
         tape_uuid: uuid,
@@ -15079,14 +15387,17 @@ fn checkpoint_batch_fence_survives_empty_catalog_rebuild() {
     };
     let policy = remanence_library::StaticAllowlist::new(["LIB-CHECKPOINT-FENCE"]);
     let mut drive = library.open_drive(0x0100, &policy).unwrap();
-    let journal =
-        FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, selected.tape_uuid).unwrap();
-    let lease = journal.acquire_exclusive().unwrap();
+    let journal = remanence_state::authority::fixtures::AuthorityBuilder::new(
+        &cfg.checkpoint_journal_dir,
+        selected.tape_uuid,
+    )
+    .build()
+    .unwrap();
+    let mut lease = journal.acquire_exclusive().unwrap();
     let batch = super::checkpoint::PendingCheckpointBatch::new(std::time::Duration::from_secs(1));
     super::checkpoint::fence_failed_checkpoint_batch(
         &mut drive,
-        &lease,
-        None,
+        &mut lease,
         &mut index,
         &cfg,
         &selected,
@@ -15164,4 +15475,32 @@ fn daemon_epoch_failure_audit_keeps_legacy_status_text() {
         wrapped.source().is_none(),
         "fence wrapping cannot introduce a local cause on the daemon path"
     );
+}
+
+/// Exercise the actual actor's epoch planner, including media preparation and
+/// replay, and require the base Absent-mode refusal before any terminal write.
+async fn assert_epoch_planner_refusal(
+    tx: &mpsc::Sender<DriveCommand>,
+    request: &ManualFinalizeTapeActorRequest,
+    barcode: &str,
+    world: &Arc<Mutex<VirtualWorld>>,
+) {
+    let before = world.lock().unwrap().command_log.len();
+    let (reply, received) = oneshot::channel();
+    tx.send(DriveCommand::PlanFinalization {
+        ownership: crate::mount::PlanningOwnership::model(),
+        request: request.clone(),
+        needs_drive_load: false,
+        barcode: Some(barcode.into()),
+        source_slot: None,
+        drive_serial: None,
+        reply,
+    })
+    .await
+    .unwrap();
+    let status = received.await.unwrap().into_result().unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status}");
+    assert!(world.lock().unwrap().command_log[before..]
+        .iter()
+        .all(|c| !matches!(c.opcode, 0x0a | 0x10)));
 }

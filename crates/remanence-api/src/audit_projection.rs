@@ -107,7 +107,7 @@ pub(crate) fn ensure_manual_finalize_finished_audit(
     audit_dir: &Path,
     audit_append_lock: &Arc<std::sync::Mutex<()>>,
     tape_uuid: [u8; 16],
-    finalization: &remanence_state::TerminalFinalizationIntent,
+    finalization: &remanence_state::authority::AuthorityFinalization,
 ) -> Result<(), Status> {
     let Some(manual) = finalization.manual.as_ref() else {
         return Ok(());

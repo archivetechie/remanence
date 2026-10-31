@@ -1,5 +1,7 @@
 //! Startup path derivation, calibration loading, and checkpoint-journal replay.
 
+use remanence_state::authority::TapeAuthorityView;
+use remanence_state::authority::TapeAuthorityWriter as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -83,10 +85,10 @@ pub(crate) fn replay_checkpoint_journal_projections_with_audit(
     audit_dir: &Path,
     audit_append_lock: &Arc<std::sync::Mutex<()>>,
 ) -> Result<(), Status> {
-    for path in remanence_state::list_checkpoint_journals(checkpoint_dir)
+    for path in remanence_state::TapeAuthority::list_entries(checkpoint_dir)
         .map_err(status_from_state_error)?
     {
-        let tape_uuid = remanence_state::tape_uuid_from_checkpoint_path(path.as_path())
+        let tape_uuid = remanence_state::TapeAuthority::entry_tape_uuid(path.as_path())
             .map_err(status_from_state_error)?;
         if index
             .tape_io_is_fenced(Some(&tape_uuid), None, None)
@@ -94,10 +96,10 @@ pub(crate) fn replay_checkpoint_journal_projections_with_audit(
         {
             continue;
         }
-        let journal = remanence_state::FileCheckpointJournal::open(checkpoint_dir, tape_uuid)
+        let mut journal = remanence_state::TapeAuthority::open(checkpoint_dir, tape_uuid)
             .map_err(status_from_state_error)?;
         let pending_intent = journal
-            .terminal_finalization_intent()
+            .pending_finalization()
             .map_err(status_from_state_error)?;
         let mut sealed_completion = None;
         let pending_intent = if pending_intent.is_some() {
@@ -105,7 +107,7 @@ pub(crate) fn replay_checkpoint_journal_projections_with_audit(
                 .acquire_exclusive_for_terminal_recovery()
                 .map_err(status_from_state_error)?;
             let retained_intent = if let Some(intent) = lease
-                .terminal_finalization_intent()
+                .pending_finalization()
                 .map_err(status_from_state_error)?
                 .filter(|intent| intent.manual.is_some())
             {
@@ -120,29 +122,29 @@ pub(crate) fn replay_checkpoint_journal_projections_with_audit(
             // routing authority intact; exact replay retires a stale sealed
             // companion only after all projections succeed.
             lease
-                .for_each_record_bounded(|record| {
-                    index.project_checkpoint_record(record)?;
-                    if record.sealed_after_write {
-                        sealed_completion = record.terminal_finalization.clone();
+                .visit_commits(&mut |record| {
+                    index.project_authority_commit(record)?;
+                    if record.sealed {
+                        sealed_completion = record.finalization.clone();
                     }
                     Ok(())
                 })
                 .map_err(status_from_state_error)?;
             if retained_intent {
                 let authority = lease
-                    .replay_for_terminal_recovery()
+                    .recover_finalization()
                     .map_err(status_from_state_error)?;
-                authority.finalization_intent
+                authority.finalization
             } else {
                 None
             }
         } else {
-            for record in journal.replay().map_err(status_from_state_error)? {
+            for record in journal.replay_commits().map_err(status_from_state_error)? {
                 index
-                    .project_checkpoint_record(&record)
+                    .project_authority_commit(&record)
                     .map_err(status_from_state_error)?;
-                if record.sealed_after_write {
-                    sealed_completion = record.terminal_finalization.clone();
+                if record.sealed {
+                    sealed_completion = record.finalization.clone();
                 }
             }
             None

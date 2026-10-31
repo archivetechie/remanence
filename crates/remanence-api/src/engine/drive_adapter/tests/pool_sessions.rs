@@ -3,10 +3,10 @@
 use super::*;
 use crate::pool_write::*;
 use remanence_parity::{
-    CommittedBundle, CommittedBundleKind, FileTapeFileJournal, ParityScheme, SchemeId,
-    TapeFileEntry, TapeFileJournal, TapeFileKind,
+    CommittedBundle, CommittedBundleKind, ParityScheme, SchemeId, TapeFileEntry, TapeFileKind,
+    TapeReportPublisher, TapeRowAuthority,
 };
-use remanence_state::{FileCheckpointJournal, TerminalFinalizationProgress};
+use remanence_state::{TapeAuthority, TerminalFinalizationProgress};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -18,25 +18,28 @@ fn scheme(stripe: u16) -> crate::ParityConfig {
         stripes_per_neighborhood: 1,
     })
 }
-fn checkpoint(f: &Fixture) -> FileCheckpointJournal {
-    FileCheckpointJournal::open(f.config.journal.dir.join("checkpoints"), UUID).unwrap()
+fn checkpoint(f: &Fixture) -> TapeAuthority {
+    remanence_state::authority::fixtures::AuthorityBuilder::new(
+        f.config.journal.dir.join("checkpoints"),
+        UUID,
+    )
+    .build()
+    .unwrap()
 }
-fn parity(f: &Fixture) -> FileTapeFileJournal {
+fn parity(f: &Fixture) -> TapeRowAuthority {
     let tape = f.index().get_tape(&UUID).unwrap().unwrap();
     let (_, crate::ParityConfig::Scheme(scheme)) =
         selected_tape_geometry(&tape, "default").unwrap()
     else {
         panic!("parity tape")
     };
-    FileTapeFileJournal::open(
-        f.config
-            .journal
-            .dir
-            .join(format!("{}.remjournal", crate::bytes_to_hex(&UUID))),
+    remanence_parity::authority::fixtures::RowAuthorityBuilder::new(
+        &f.config.journal.dir,
         UUID,
         BLOCK,
         scheme,
     )
+    .build()
     .unwrap()
 }
 fn command_count(f: &Fixture) -> usize {
@@ -176,13 +179,13 @@ fn uncertain_checkpoint_append_quarantines_identity_until_restart() {
     );
     let mut actor = configured_owner(&f, state, None, None, false, admissions.clone());
     actor.open_session("default").unwrap();
-    let journal_path = checkpoint(&f).path().to_owned();
+    let publication = remanence_state::authority::fixtures::publication_target(&checkpoint(&f));
     let failures = Arc::new(AtomicUsize::new(0));
     let observed = failures.clone();
     let backend = files.clone();
     files.observe(Some(Arc::new(move |event| {
         if let FileEvent::BeforeSync(path) = event {
-            if path == journal_path && observed.load(Ordering::SeqCst) < 2 {
+            if publication.matches(&path) && observed.load(Ordering::SeqCst) < 2 {
                 backend.fail_next_sync(&path).unwrap();
                 observed.fetch_add(1, Ordering::SeqCst);
             }
@@ -689,23 +692,26 @@ fn bootstrap_only_parity_orphan_requires_physical_reconciliation_before_position
     };
     let mut journal = parity(&f);
     journal
-        .commit_bundle(&CommittedBundle {
-            kind: CommittedBundleKind::BotBootstrap,
-            entries: vec![TapeFileEntry {
-                tape_file_number: 0,
-                kind: TapeFileKind::Bootstrap,
-                block_count: 1,
-                physical_start_hint: Some(0),
-                object_id: None,
-                first_parity_data_ordinal: None,
-                epoch_id: None,
-                protected_ordinal_start: None,
-                protected_ordinal_end_exclusive: None,
-                canonical_metadata_hash: None,
-                object_recovery_row: None,
-            }],
-            highest_protected_ordinal: 0,
-            total_committed_ordinals: 0,
+        .publish_fixture(&remanence_parity::authority::ShadowPublication {
+            bundles: vec![(CommittedBundle {
+                kind: CommittedBundleKind::BotBootstrap,
+                entries: vec![TapeFileEntry {
+                    tape_file_number: 0,
+                    kind: TapeFileKind::Bootstrap,
+                    block_count: 1,
+                    physical_start_hint: Some(0),
+                    object_id: None,
+                    first_parity_data_ordinal: None,
+                    epoch_id: None,
+                    protected_ordinal_start: None,
+                    protected_ordinal_end_exclusive: None,
+                    canonical_metadata_hash: None,
+                    object_recovery_row: None,
+                }],
+                highest_protected_ordinal: 0,
+                total_committed_ordinals: 0,
+            })
+            .clone()],
         })
         .unwrap();
     project_fresh_parity_bootstrap_bundle(state.catalog_index(), &selected, &scheme).unwrap();
@@ -789,31 +795,37 @@ fn checkpointed_parity_tape_is_admitted_for_daemon_resume() {
     let committed = journal.load_committed().unwrap();
     let next_file = committed.entries.last().unwrap().tape_file_number + 1;
     journal
-        .commit_bundle(&CommittedBundle {
-            kind: CommittedBundleKind::Object,
-            entries: vec![TapeFileEntry {
-                tape_file_number: next_file,
-                kind: TapeFileKind::Object,
-                block_count: 1,
-                physical_start_hint: Some(100),
-                object_id: Some("sink-ahead".into()),
-                first_parity_data_ordinal: Some(committed.total_committed_ordinals),
-                epoch_id: None,
-                protected_ordinal_start: None,
-                protected_ordinal_end_exclusive: None,
-                canonical_metadata_hash: None,
-                object_recovery_row: None,
-            }],
-            highest_protected_ordinal: committed.highest_protected_ordinal,
-            total_committed_ordinals: committed.total_committed_ordinals + 1,
+        .publish_fixture(&remanence_parity::authority::ShadowPublication {
+            bundles: vec![(CommittedBundle {
+                kind: CommittedBundleKind::Object,
+                entries: vec![TapeFileEntry {
+                    tape_file_number: next_file,
+                    kind: TapeFileKind::Object,
+                    block_count: 1,
+                    physical_start_hint: Some(100),
+                    object_id: Some("sink-ahead".into()),
+                    first_parity_data_ordinal: Some(committed.total_committed_ordinals),
+                    epoch_id: None,
+                    protected_ordinal_start: None,
+                    protected_ordinal_end_exclusive: None,
+                    canonical_metadata_hash: None,
+                    object_recovery_row: None,
+                }],
+                highest_protected_ordinal: committed.highest_protected_ordinal,
+                total_committed_ordinals: committed.total_committed_ordinals + 1,
+            })
+            .clone()],
         })
         .unwrap();
     journal
-        .commit_bundle(&CommittedBundle {
-            kind: CommittedBundleKind::CheckpointedThrough,
-            entries: vec![],
-            highest_protected_ordinal: committed.highest_protected_ordinal,
-            total_committed_ordinals: committed.total_committed_ordinals + 1,
+        .publish_fixture(&remanence_parity::authority::ShadowPublication {
+            bundles: vec![(CommittedBundle {
+                kind: CommittedBundleKind::CheckpointedThrough,
+                entries: vec![],
+                highest_protected_ordinal: committed.highest_protected_ordinal,
+                total_committed_ordinals: committed.total_committed_ordinals + 1,
+            })
+            .clone()],
         })
         .unwrap();
     assert!(journal
@@ -833,12 +845,9 @@ fn checkpointed_parity_tape_is_admitted_for_daemon_resume() {
     );
     no_modifications(&f, before);
     let sink_ahead_locates = locate_count(&f, before);
-    let path = f
-        .config
-        .journal
-        .dir
-        .join(format!("{}.remjournal", crate::bytes_to_hex(&UUID)));
-    std::fs::rename(&path, path.with_extension("saved")).unwrap();
+    let path =
+        remanence_state::authority::fixtures::structural_location(&checkpoint_dir, UUID).unwrap();
+    let _hidden = remanence_parity::authority::fixtures::hide_authority(&path).unwrap();
     let missing_before = command_count(&f);
     let error = actor
         .write_checkpointed(f.request("resume-missing"))

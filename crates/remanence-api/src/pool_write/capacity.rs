@@ -212,7 +212,7 @@ pub(crate) fn ensure_selected_tape_accepts_session_write(
 pub(crate) fn ensure_empty_checkpoint_matches_catalog_freshness(
     state: &CatalogIndex,
     selected: &SelectedTape,
-    checkpoints: &[remanence_state::CheckpointJournalRecord],
+    checkpoints: &[remanence_state::authority::AuthorityCommit],
 ) -> Result<(), PoolWriteError> {
     if !checkpoints.is_empty() {
         return Ok(());
@@ -367,7 +367,7 @@ pub(crate) fn no_parity_append_context(
 pub(crate) fn first_batched_append_context(
     state: &CatalogIndex,
     selected: &SelectedTape,
-    checkpoints: &[remanence_state::CheckpointJournalRecord],
+    checkpoints: &[remanence_state::authority::AuthorityCommit],
 ) -> Result<BatchedNoParityAppendContext, PoolWriteError> {
     let tape = state.get_tape(&selected.tape_uuid)?.ok_or_else(|| {
         PoolWriteError::MissingTapeGeometry("selected tape row is missing".into())
@@ -385,7 +385,7 @@ pub(crate) fn first_batched_append_context(
                 ));
             }
             let previous_total_committed_ordinals = checkpoint
-                .objects
+                .payloads
                 .last()
                 .map(|object| object.total_committed_ordinals)
                 .ok_or_else(|| {
@@ -393,16 +393,16 @@ pub(crate) fn first_batched_append_context(
                         "checkpoint record has no object projection".to_string(),
                     )
                 })?;
-            let tape_file_number = checkpoint.next_tape_file_number;
-            let object_row_count = checkpoint.committed_object_count;
+            let tape_file_number = checkpoint.next_file;
+            let object_row_count = checkpoint.object_count;
             Ok(BatchedNoParityAppendContext {
                 append: NoParityAppendContext {
                     tape_file_number,
                     previous_total_committed_ordinals,
                     fresh_tape: false,
-                    expected_append_lba: Some(checkpoint.eod_lba),
+                    expected_append_lba: Some(checkpoint.cursor.lba),
                 },
-                position: BatchedAppendPosition::JournalEod(checkpoint.eod_lba),
+                position: BatchedAppendPosition::JournalEod(checkpoint.cursor.lba),
                 object_row_count,
             })
         }
@@ -456,10 +456,7 @@ pub(crate) fn next_batched_append_context(
     Ok(BatchedNoParityAppendContext {
         append: NoParityAppendContext {
             tape_file_number,
-            previous_total_committed_ordinals: report
-                .catalog
-                .tape_file_bundle
-                .total_committed_ordinals,
+            previous_total_committed_ordinals: report.catalog.tape_file_bundle.total,
             fresh_tape: false,
             expected_append_lba: Some(expected_lba),
         },
@@ -471,7 +468,7 @@ pub(crate) fn next_batched_append_context(
 /// Re-anchor an accumulated session-local context at a durable checkpoint.
 pub(crate) fn batched_append_context_after_checkpoint(
     previous: &BatchedNoParityAppendContext,
-    record: &remanence_state::CheckpointJournalRecord,
+    record: &remanence_state::authority::AuthorityCommit,
 ) -> Result<BatchedNoParityAppendContext, PoolWriteError> {
     #[cfg(test)]
     if crate::write_owner::tests::fail_append_context_now() {
@@ -480,7 +477,7 @@ pub(crate) fn batched_append_context_after_checkpoint(
         ));
     }
     let previous_total_committed_ordinals = record
-        .objects
+        .payloads
         .last()
         .map(|object| object.total_committed_ordinals)
         .ok_or_else(|| {
@@ -488,15 +485,15 @@ pub(crate) fn batched_append_context_after_checkpoint(
                 "checkpoint record has no final object projection".to_string(),
             )
         })?;
-    let tape_file_number = record.next_tape_file_number;
+    let tape_file_number = record.next_file;
     Ok(BatchedNoParityAppendContext {
         append: NoParityAppendContext {
             tape_file_number,
             previous_total_committed_ordinals,
             fresh_tape: false,
-            expected_append_lba: Some(record.eod_lba),
+            expected_append_lba: Some(record.cursor.lba),
         },
-        position: BatchedAppendPosition::CurrentBoundary(record.eod_lba),
+        position: BatchedAppendPosition::CurrentBoundary(record.cursor.lba),
         object_row_count: previous.object_row_count,
     })
 }

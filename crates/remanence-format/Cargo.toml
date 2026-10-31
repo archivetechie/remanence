@@ -24,7 +24,7 @@ default = []
 fuzzing = []
 
 [dev-dependencies]
-remanence-parity = { path = "../remanence-parity" }
+remanence-parity = { path = "../remanence-parity", features = ["fixtures"] }
 serde_json       = { workspace = true }
 
 [lints.rust]

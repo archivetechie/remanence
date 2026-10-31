@@ -269,9 +269,12 @@ fn wor_cut_publishes_durable_single_object_evidence_before_projection_and_abort(
         "cut is before SQLite projection"
     );
     drop(index);
-    let journal =
-        remanence_state::FileCheckpointJournal::open(config.journal.dir.join("checkpoints"), UUID)
-            .unwrap();
+    let journal = remanence_state::authority::fixtures::AuthorityBuilder::new(
+        config.journal.dir.join("checkpoints"),
+        UUID,
+    )
+    .build()
+    .unwrap();
     let record = journal
         .last()
         .unwrap()

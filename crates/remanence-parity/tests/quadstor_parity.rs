@@ -70,10 +70,10 @@ use remanence_parity::{
     checked_bounded_resume_summary, emit_resume_rebuilt_sidecars_to_raw,
     rebuild_open_epoch_from_bounded_summary, scan_reconstruct_filemark_map,
     BoundedResumeWriterSeed, CommittedBundle, CommittedBundleKind, CommittedState,
-    DriveHandleRawSink, DriveHandleRawSource, FileTapeFileJournal, FilemarkMap, JournalError,
-    ObjectParitySource, OpenTrust, ParityError, ParityScheme, ParitySink, PhysicalPositionHint,
-    RawReadOutcome, RawTapeSource, SchemeId, ScopedFilemarkMap, SpaceFilemarksOutcome,
-    TapeFileJournal, TapeFileKind, TapeFilePosition, TerminalTripleCloseInput,
+    DriveHandleRawSink, DriveHandleRawSource, FilemarkMap, JournalError, ObjectParitySource,
+    OpenTrust, ParityError, ParityScheme, ParitySink, PhysicalPositionHint, RawReadOutcome,
+    RawTapeSource, SchemeId, ScopedFilemarkMap, SpaceFilemarksOutcome, TapeFileKind,
+    TapeFilePosition, TapeReportPublisher, TerminalTripleCloseInput,
     DEFAULT_INDEX_SEPARATION_BYTES, DEFAULT_SCHEME_BLOCK_SIZE_BYTES,
 };
 
@@ -86,13 +86,19 @@ struct FixtureJournal {
     bundles: Vec<CommittedBundle>,
 }
 
-impl TapeFileJournal for FixtureJournal {
+impl TapeReportPublisher for FixtureJournal {
+    remanence_parity::fixture_publication_methods!();
     fn tape_uuid(&self) -> [u8; 16] {
         TAPE_UUID
     }
 
-    fn commit_bundle(&mut self, bundle: &CommittedBundle) -> Result<(), JournalError> {
-        self.bundles.push(bundle.clone());
+    fn publish_fixture(
+        &mut self,
+        report: &remanence_parity::authority::ShadowPublication,
+    ) -> Result<(), JournalError> {
+        for bundle in &report.bundles {
+            self.bundles.push(bundle.clone());
+        }
         Ok(())
     }
 
@@ -570,9 +576,14 @@ fn quadstor_parity_journaled_session() {
     drive.rewind().expect("rewind before destructive write");
 
     {
-        let mut journal =
-            FileTapeFileJournal::open(&journal_path, TAPE_UUID, block_size, scheme.clone())
-                .expect("open trusted local FileTapeFileJournal");
+        let mut journal = remanence_parity::authority::fixtures::RowAuthorityBuilder::new(
+            &journal_path,
+            TAPE_UUID,
+            block_size,
+            scheme.clone(),
+        )
+        .build()
+        .expect("open trusted local TapeRowAuthority");
         {
             let mut raw_sink = DriveHandleRawSink::new(&mut drive);
             let mut sink = ParitySink::new_with_journal(
@@ -617,8 +628,14 @@ fn quadstor_parity_journaled_session() {
         );
     }
 
-    let reopened = FileTapeFileJournal::open(&journal_path, TAPE_UUID, block_size, scheme.clone())
-        .expect("reopen journal for bounded resume planning");
+    let reopened = remanence_parity::authority::fixtures::RowAuthorityBuilder::new(
+        &journal_path,
+        TAPE_UUID,
+        block_size,
+        scheme.clone(),
+    )
+    .build()
+    .expect("reopen journal for bounded resume planning");
     let snapshot = reopened
         .committed_snapshot_bounded()
         .expect("freeze bounded journal checkpoint");
@@ -768,9 +785,14 @@ fn quadstor_parity_bounded_resume_append_roundtrip() {
         configure_parity_write_session(&mut drive, block_size, "bounded resume smoke");
     drive.rewind().expect("rewind before bounded resume write");
 
-    let mut journal =
-        FileTapeFileJournal::open(&journal_path, TAPE_UUID, block_size, scheme.clone())
-            .expect("open bounded resume journal");
+    let mut journal = remanence_parity::authority::fixtures::RowAuthorityBuilder::new(
+        &journal_path,
+        TAPE_UUID,
+        block_size,
+        scheme.clone(),
+    )
+    .build()
+    .expect("open bounded resume journal");
     {
         let mut raw_sink = DriveHandleRawSink::new(&mut drive);
         let mut sink = ParitySink::new_with_journal(

@@ -29,6 +29,7 @@ tempfile = { workspace = true }
 xattr = { workspace = true }
 
 [dev-dependencies]
+remanence-parity = { path = "../remanence-parity", features = ["fixtures"] }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

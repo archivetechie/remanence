@@ -20,6 +20,7 @@ path = "src/rem_debug.rs"
 [[bin]]
 name = "rem-dev"
 path = "src/rem_dev.rs"
+required-features = ["fixtures"]
 
 [dependencies]
 toml_edit = "0.25"
@@ -53,13 +54,18 @@ zeroize           = { workspace = true }
 ratatui           = { version = "0.30", optional = true }
 
 [dev-dependencies]
+# Enable the dev binary for ordinary cargo test/clippy target selection only.
+remanence-cli = { path = ".", features = ["fixtures"] }
+remanence-state = { path = "../remanence-state", features = ["fixtures"] }
 remanence-daemon = { path = "../remanence-daemon" }
 hyper-util = { workspace = true, features = ["tokio"] }
 tower = { workspace = true, features = ["util"] }
-remanence-parity = { path = "../remanence-parity", features = ["test-support"] }
+remanence-parity = { path = "../remanence-parity", features = ["test-support", "fixtures"] }
 tempfile = { workspace = true }
 
 [features]
+# Only rem-dev and test invocations opt into destructive authority fixtures.
+fixtures = ["remanence-parity/fixtures", "remanence-state/fixtures"]
 default = ["tui"]
 tui = ["dep:ratatui", "dep:crossterm"]
 

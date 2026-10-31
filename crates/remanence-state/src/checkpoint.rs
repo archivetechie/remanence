@@ -11,9 +11,12 @@
 //! Opening the backing file directly is not a valid write-admission path and
 //! would bypass the durable Finalizing fence.
 
-mod bot_recovery_authority;
+mod authority_view;
+pub use authority_view::AuthoritySnapshot;
 
-pub use bot_recovery_authority::CheckpointBotRecoveryAuthority;
+pub use remanence_parity::authority::{
+    ManualTerminalFinalizationIdentity, SealDueReason, TerminalFinalizationTrigger,
+};
 
 use remanence_library::durable_file::{File, OpenOptions};
 use std::fs;
@@ -23,8 +26,6 @@ use std::time::{Duration, Instant};
 
 use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
-use time::format_description::well_known::Rfc3339;
-use time::OffsetDateTime;
 
 use crate::{
     NativeObjectCopyProjectionInput, NativeObjectFileProjectionInput, NativeObjectProjectionInput,
@@ -68,196 +69,10 @@ fn rollback_checkpoint_frame(file: &mut File, append_start: u64) -> io::Result<(
     file.set_len(append_start).and_then(|_| file.sync_all())
 }
 
-/// Durable trigger that permanently closes Object admission on a tape.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TerminalFinalizationTrigger {
-    /// A committed Object reached the configured low watermark.
-    ReachedLowWatermark,
-    /// The drive reported early warning at a committed boundary.
-    HardwareEarlyWarning,
-    /// An authenticated operator requested early close-out.
-    OperatorCloseOut,
-    /// An authenticated operator requested pool-wide close-out.
-    PoolCloseOut,
-    /// No queued Object can fit while preserving the terminal reserve.
-    NoPendingObjectFits,
-}
-
-/// Authoritative progress through the five terminal tape files.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TerminalFinalizationProgress {
-    /// No terminal component has been barrier-proved yet.
-    BeforeReplicaA,
-    /// Replica A and its trailing filemark are barrier-proved.
-    AfterReplicaA,
-    /// Separation AB and its trailing filemark are barrier-proved.
-    AfterSeparationAb,
-    /// Replica B and its trailing filemark are barrier-proved.
-    AfterReplicaB,
-    /// Separation BC and its trailing filemark are barrier-proved.
-    AfterSeparationBc,
-    /// Replica C and its trailing filemark are barrier-proved.
-    AfterReplicaC,
-}
-
-impl TerminalFinalizationProgress {
-    /// The only legal next durable state.
-    pub const fn successor(self) -> Option<Self> {
-        match self {
-            Self::BeforeReplicaA => Some(Self::AfterReplicaA),
-            Self::AfterReplicaA => Some(Self::AfterSeparationAb),
-            Self::AfterSeparationAb => Some(Self::AfterReplicaB),
-            Self::AfterReplicaB => Some(Self::AfterSeparationBc),
-            Self::AfterSeparationBc => Some(Self::AfterReplicaC),
-            Self::AfterReplicaC => None,
-        }
-    }
-
-    /// Number of complete replica files proved by this state.
-    pub const fn completed_replicas(self) -> u8 {
-        match self {
-            Self::BeforeReplicaA => 0,
-            Self::AfterReplicaA | Self::AfterSeparationAb => 1,
-            Self::AfterReplicaB | Self::AfterSeparationBc => 2,
-            Self::AfterReplicaC => 3,
-        }
-    }
-}
-
-/// Structural kind persisted in a terminal-finalization plan.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TerminalFinalizationComponentKind {
-    /// Complete final-scope tape-index replica.
-    TapeIndexReplica,
-    /// Typed fixed-record physical separation extent.
-    IndexSeparationExtent,
-}
-
-/// One planned filemark-delimited terminal component.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub struct TerminalFinalizationComponent {
-    /// Structural kind.
-    pub kind: TerminalFinalizationComponentKind,
-    /// One-based ordinal within the kind.
-    pub ordinal: u16,
-    /// Dense tape-file number from BOT.
-    pub tape_file_number: u64,
-    /// Planned component start LBA.
-    pub start_lba: u64,
-    /// Fixed records before the trailing filemark.
-    pub record_count: u64,
-}
-
-/// Complete immutable A/gap/B/gap/C plan captured before tape motion.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub struct TerminalFinalizationLayout {
-    /// SCSI partition; the draft profile permits partition zero only.
-    pub partition: u32,
-    /// Fixed record size shared by all five files.
-    pub block_size: u32,
-    /// A, gap AB, B, gap BC, C.
-    pub components: [TerminalFinalizationComponent; 5],
-    /// Planned EOD after C's trailing filemark.
-    pub expected_eod_lba: u64,
-    /// Digest of the canonical planned layout.
-    pub layout_digest: [u8; 32],
-}
-
-impl TerminalFinalizationLayout {
-    fn to_parity_layout(&self) -> remanence_parity::TerminalTailLayout {
-        let components =
-            self.components
-                .map(|component| remanence_parity::TerminalTailComponentPlan {
-                    kind: match component.kind {
-                        TerminalFinalizationComponentKind::TapeIndexReplica => {
-                            remanence_parity::TerminalTailComponentKind::TapeIndexReplica
-                        }
-                        TerminalFinalizationComponentKind::IndexSeparationExtent => {
-                            remanence_parity::TerminalTailComponentKind::IndexSeparationExtent
-                        }
-                    },
-                    ordinal: component.ordinal,
-                    planned_tape_file_number: component.tape_file_number,
-                    planned_start_lba: component.start_lba,
-                    record_count: component.record_count,
-                });
-        remanence_parity::TerminalTailLayout {
-            partition: self.partition,
-            block_size: self.block_size,
-            components,
-            expected_eod_lba: self.expected_eod_lba,
-        }
-    }
-
-    fn validate(&self) -> Result<(), StateError> {
-        let layout = self.to_parity_layout();
-        layout.validate().map_err(|error| {
-            StateError::JournalReplayFailed(format!(
-                "terminal finalization layout is invalid: {error}"
-            ))
-        })?;
-        let digest = layout.digest().map_err(|error| {
-            StateError::JournalReplayFailed(format!(
-                "terminal finalization layout digest failed: {error}"
-            ))
-        })?;
-        if digest != self.layout_digest {
-            return Err(StateError::JournalReplayFailed(
-                "terminal finalization layout digest mismatch".to_string(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Reconstruct the checked parity-layer layout used by terminal codecs.
-    pub fn try_to_parity_layout(&self) -> Result<remanence_parity::TerminalTailLayout, StateError> {
-        self.validate()?;
-        Ok(self.to_parity_layout())
-    }
-}
-
-impl TryFrom<remanence_parity::TerminalTailLayout> for TerminalFinalizationLayout {
-    type Error = StateError;
-
-    fn try_from(layout: remanence_parity::TerminalTailLayout) -> Result<Self, Self::Error> {
-        layout.validate().map_err(|error| {
-            StateError::JournalReplayFailed(format!(
-                "terminal finalization layout is invalid: {error}"
-            ))
-        })?;
-        let layout_digest = layout.digest().map_err(|error| {
-            StateError::JournalReplayFailed(format!(
-                "terminal finalization layout digest failed: {error}"
-            ))
-        })?;
-        let components = layout
-            .components
-            .map(|component| TerminalFinalizationComponent {
-                kind: match component.kind {
-                    remanence_parity::TerminalTailComponentKind::TapeIndexReplica => {
-                        TerminalFinalizationComponentKind::TapeIndexReplica
-                    }
-                    remanence_parity::TerminalTailComponentKind::IndexSeparationExtent => {
-                        TerminalFinalizationComponentKind::IndexSeparationExtent
-                    }
-                },
-                ordinal: component.ordinal,
-                tape_file_number: component.planned_tape_file_number,
-                start_lba: component.planned_start_lba,
-                record_count: component.record_count,
-            });
-        Ok(Self {
-            partition: layout.partition,
-            block_size: layout.block_size,
-            components,
-            expected_eod_lba: layout.expected_eod_lba,
-            layout_digest,
-        })
-    }
-}
+pub use crate::authority::{
+    TerminalFinalizationComponent, TerminalFinalizationComponentKind, TerminalFinalizationLayout,
+    TerminalFinalizationProgress,
+};
 
 /// Exact parity close plan persisted before any terminal-prefix media motion.
 ///
@@ -345,149 +160,7 @@ impl From<&TerminalFinalizationSidecarDirectoryEntry>
 
 impl TerminalFinalizationPrefixPlan {
     fn validate(&self) -> Result<(), StateError> {
-        self.diagnostics.validate().map_err(|error| {
-            StateError::JournalReplayFailed(format!("invalid terminal prefix diagnostics: {error}"))
-        })?;
-
-        remanence_parity::validate_committed_bundle_shape(&self.committed_bundle).map_err(
-            |error| {
-                StateError::JournalReplayFailed(format!(
-                    "terminal finalization prefix bundle is invalid: {error}"
-                ))
-            },
-        )?;
-        if self.committed_bundle.kind != remanence_parity::CommittedBundleKind::TerminalPrefix {
-            return Err(StateError::JournalReplayFailed(format!(
-                "terminal finalization prefix uses {:?} bundle kind instead of TerminalPrefix",
-                self.committed_bundle.kind
-            )));
-        }
-        if self.committed_bundle.highest_protected_ordinal
-            > self.committed_bundle.total_committed_ordinals
-        {
-            return Err(StateError::JournalReplayFailed(
-                "terminal finalization prefix W exceeds T".to_string(),
-            ));
-        }
-
-        let mut expected_file = self.start_tape_file_number;
-        let mut expected_lba = self.start_lba;
-        let mut observed_parity_map = None;
-        for entry in &self.committed_bundle.entries {
-            if entry.tape_file_number != expected_file
-                || entry.physical_start_hint != Some(expected_lba)
-                || entry.block_count == 0
-            {
-                return Err(StateError::JournalReplayFailed(format!(
-                    "terminal finalization prefix entry at tape file {} does not match planned dense file/LBA geometry {expected_file}/{expected_lba}",
-                    entry.tape_file_number
-                )));
-            }
-            if entry.object_id.is_some()
-                || entry.first_parity_data_ordinal.is_some()
-                || entry.object_recovery_row.is_some()
-                || entry.canonical_metadata_hash.is_none()
-            {
-                return Err(StateError::JournalReplayFailed(format!(
-                    "terminal finalization prefix entry at tape file {} has invalid common metadata",
-                    entry.tape_file_number
-                )));
-            }
-            match entry.kind {
-                remanence_parity::TapeFileKind::ParitySidecar => {
-                    let (Some(_epoch_id), Some(start), Some(end)) = (
-                        entry.epoch_id,
-                        entry.protected_ordinal_start,
-                        entry.protected_ordinal_end_exclusive,
-                    ) else {
-                        return Err(StateError::JournalReplayFailed(format!(
-                            "terminal finalization sidecar at tape file {} is missing its protected range",
-                            entry.tape_file_number
-                        )));
-                    };
-                    if start >= end || end > self.committed_bundle.highest_protected_ordinal {
-                        return Err(StateError::JournalReplayFailed(format!(
-                            "terminal finalization sidecar at tape file {} has invalid protected range [{start}, {end})",
-                            entry.tape_file_number
-                        )));
-                    }
-                }
-                remanence_parity::TapeFileKind::ParityMap => {
-                    if entry.epoch_id.is_some()
-                        || entry.protected_ordinal_start.is_some()
-                        || entry.protected_ordinal_end_exclusive.is_some()
-                    {
-                        return Err(StateError::JournalReplayFailed(format!(
-                            "terminal finalization ParityMap at tape file {} carries sidecar fields",
-                            entry.tape_file_number
-                        )));
-                    }
-                    observed_parity_map = Some(entry.tape_file_number);
-                }
-                other => {
-                    return Err(StateError::JournalReplayFailed(format!(
-                        "terminal finalization prefix contains forbidden {other:?} at tape file {}",
-                        entry.tape_file_number
-                    )));
-                }
-            }
-            expected_file = expected_file.checked_add(1).ok_or_else(|| {
-                StateError::JournalReplayFailed(
-                    "terminal finalization prefix tape-file number overflows u64".to_string(),
-                )
-            })?;
-            expected_lba = expected_lba
-                .checked_add(entry.block_count)
-                .and_then(|lba| lba.checked_add(1))
-                .ok_or_else(|| {
-                    StateError::JournalReplayFailed(
-                        "terminal finalization prefix LBA overflows u64".to_string(),
-                    )
-                })?;
-        }
-        if expected_file != self.tail_start_tape_file_number
-            || expected_lba != self.tail_start_lba
-            || observed_parity_map != self.parity_map_tape_file_number
-        {
-            return Err(StateError::JournalReplayFailed(
-                "terminal finalization prefix tail coordinates or ParityMap identity mismatch"
-                    .to_string(),
-            ));
-        }
-        if self.sidecar_directory_entries.is_empty() != self.parity_map_tape_file_number.is_none() {
-            return Err(StateError::JournalReplayFailed(
-                "terminal finalization prefix ParityMap presence does not match its sidecar directory"
-                    .to_string(),
-            ));
-        }
-        if let Some(parity_map_tape_file_number) = self.parity_map_tape_file_number {
-            let directory = remanence_parity::SidecarEpochDirectory {
-                directory_scope_tape_file_count: parity_map_tape_file_number
-                    .checked_add(1)
-                    .ok_or_else(|| {
-                        StateError::JournalReplayFailed(
-                            "terminal finalization sidecar directory scope overflows u64"
-                                .to_string(),
-                        )
-                    })?,
-                directory_scope_total_data_ordinals: self.committed_bundle.total_committed_ordinals,
-                directory_scope_highest_protected_ordinal: self
-                    .committed_bundle
-                    .highest_protected_ordinal,
-                is_final_directory: true,
-                entries: self
-                    .sidecar_directory_entries
-                    .iter()
-                    .map(remanence_parity::SidecarEpochDirectoryEntry::from)
-                    .collect(),
-            };
-            directory.validate().map_err(|error| {
-                StateError::JournalReplayFailed(format!(
-                    "terminal finalization sidecar directory is invalid: {error}"
-                ))
-            })?;
-        }
-        Ok(())
+        crate::authority::AuthorityPrefixPlan::from(self).validate()
     }
 }
 
@@ -532,29 +205,6 @@ impl TryFrom<&TerminalFinalizationPrefixPlan> for remanence_parity::TerminalPref
     }
 }
 
-/// Durable operation and request identity for manual early finalization.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub struct ManualTerminalFinalizationIdentity {
-    /// Durable operation UUID.
-    pub operation_id: [u8; 16],
-    /// Stable Layer-5 operation kind in the idempotency scope.
-    pub operation_kind: String,
-    /// Authenticated actor fingerprint that scopes the idempotency key.
-    pub actor_fingerprint: String,
-    /// Caller-provided durable idempotency UUID.
-    pub idempotency_key: [u8; 16],
-    /// Hash of the exact state-changing request.
-    pub request_fingerprint: [u8; 32],
-    /// Assignment observed under the per-tape owner.
-    pub assigned_pool_id: Option<String>,
-    /// Wire presence/value supplied by the caller.
-    pub expected_pool_id: Option<String>,
-    /// Assignment generation observed under the per-tape owner.
-    pub assignment_generation: u64,
-    /// Exact operator reason bytes represented as UTF-8.
-    pub reason: String,
-}
-
 /// Single durable authority for terminal admission, plan, and progress.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct TerminalFinalizationIntent {
@@ -588,97 +238,7 @@ pub struct TerminalFinalizationIntent {
 
 impl TerminalFinalizationIntent {
     pub(crate) fn validate_for_tape(&self, tape_uuid: [u8; 16]) -> Result<(), StateError> {
-        if self.tape_uuid != tape_uuid {
-            return Err(StateError::JournalReplayFailed(
-                "terminal finalization intent tape UUID does not match journal".to_string(),
-            ));
-        }
-        if self.edition_id == [0; 16]
-            || self.edition_sequence == 0
-            || self.edition_digest == [0; 32]
-        {
-            return Err(StateError::JournalReplayFailed(
-                "terminal finalization intent has a zero edition identity, sequence, or digest"
-                    .to_string(),
-            ));
-        }
-        if self.writer_version.len() > 128
-            || !self
-                .writer_version
-                .bytes()
-                .all(|byte| (0x20..=0x7e).contains(&byte))
-        {
-            return Err(StateError::JournalReplayFailed(
-                "terminal finalization writer_version must be at most 128 printable ASCII bytes"
-                    .to_string(),
-            ));
-        }
-        if self.write_timestamp.len() > 64
-            || !self
-                .write_timestamp
-                .as_bytes()
-                .get(10)
-                .is_some_and(|byte| matches!(byte, b'T' | b't'))
-            || OffsetDateTime::parse(&self.write_timestamp, &Rfc3339).is_err()
-        {
-            return Err(StateError::JournalReplayFailed(
-                "terminal finalization write_timestamp must be at most 64 bytes of RFC3339"
-                    .to_string(),
-            ));
-        }
-        self.layout.validate()?;
-        if let Some(prefix) = &self.terminal_prefix {
-            prefix.validate()?;
-            if prefix.diagnostics.writer_version != self.writer_version
-                || prefix.diagnostics.write_timestamp != self.write_timestamp
-            {
-                return Err(StateError::JournalReplayFailed(
-                    "terminal edition diagnostics differ from prefix plan".into(),
-                ));
-            }
-            let replica_a = self.layout.components[0];
-            if prefix.tail_start_tape_file_number != replica_a.tape_file_number
-                || prefix.tail_start_lba != replica_a.start_lba
-            {
-                return Err(StateError::JournalReplayFailed(
-                    "terminal finalization prefix tail does not match replica A layout".to_string(),
-                ));
-            }
-        }
-        match (&self.trigger, &self.manual) {
-            (TerminalFinalizationTrigger::OperatorCloseOut, Some(manual)) => {
-                if manual.operation_id == [0; 16]
-                    || manual.idempotency_key == [0; 16]
-                    || manual.request_fingerprint == [0; 32]
-                    || manual.operation_kind.is_empty()
-                    || manual.actor_fingerprint.is_empty()
-                    || manual.reason.is_empty()
-                {
-                    return Err(StateError::JournalReplayFailed(
-                        "manual terminal finalization identity is incomplete".to_string(),
-                    ));
-                }
-                if manual.assigned_pool_id != manual.expected_pool_id {
-                    return Err(StateError::JournalReplayFailed(
-                        "manual terminal finalization pool guard does not match the owned assignment"
-                            .to_string(),
-                    ));
-                }
-            }
-            (TerminalFinalizationTrigger::OperatorCloseOut, None) => {
-                return Err(StateError::JournalReplayFailed(
-                    "operator close-out is missing durable operation identity".to_string(),
-                ));
-            }
-            (_, Some(_)) => {
-                return Err(StateError::JournalReplayFailed(
-                    "automatic terminal finalization unexpectedly carries manual identity"
-                        .to_string(),
-                ));
-            }
-            (_, None) => {}
-        }
-        Ok(())
+        crate::authority::AuthorityFinalization::from(self).validate_for_tape(tape_uuid)
     }
 
     fn validate_for_checkpoint_prefix(
@@ -833,26 +393,6 @@ pub struct CheckpointObjectProjection {
     pub object_recovery_row: CheckpointObjectRecoveryRow,
 }
 
-/// A durable obligation to finalize before another object is appended.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SealDueReason {
-    /// The drive reports its early-warning boundary.
-    HardwareEarlyWarning,
-    /// The measured capacity reaches the pool's low watermark.
-    ReachedLowWatermark,
-}
-
-impl SealDueReason {
-    /// Stable catalog spelling of the journal reason.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::HardwareEarlyWarning => "hardware_early_warning",
-            Self::ReachedLowWatermark => "reached_low_watermark",
-        }
-    }
-}
-
 /// One fsynced checkpoint or terminal-seal authority record.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct CheckpointJournalRecord {
@@ -908,14 +448,7 @@ pub struct CheckpointJournalRecord {
     pub seal_due: Option<SealDueReason>,
 }
 
-/// Checked final-prefix scope/counts streamed into each terminal replica.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TerminalIndexAuthoritySummary {
-    /// Exact prefix scope committed before replica A.
-    pub scope: remanence_parity::TapeIndexReplicaScope,
-    /// Exact structural/Object row counts.
-    pub counts: remanence_parity::TapeIndexReplicaCounts,
-}
+pub use remanence_parity::authority::TerminalSourceSummary as TerminalIndexAuthoritySummary;
 
 /// Deterministic per-pass replay metrics captured while freezing terminal
 /// authority.
@@ -939,7 +472,7 @@ enum TerminalIndexAuthorityRows<'a> {
     NoParity(&'a [CheckpointJournalRecord]),
     ReplayParity {
         checkpoint: CheckpointReplaySnapshot,
-        parity: Box<remanence_parity::FileTapeFileJournalCommittedSnapshot>,
+        parity: Box<remanence_parity::FrozenFileRows>,
         planned_terminal_prefix: Option<Box<TerminalFinalizationPrefixPlan>>,
     },
     ReplayNoParity(CheckpointReplaySnapshot),
@@ -958,6 +491,7 @@ enum ReplayTerminalPrefixMode<'a> {
 /// Object-map/recovery-row relation. Later replica passes stream the same
 /// frozen authority and never consult the rebuildable SQLite cache.
 #[derive(Debug)]
+#[doc(hidden)]
 pub struct CheckpointTerminalIndexRecordSource<'a> {
     rows: TerminalIndexAuthorityRows<'a>,
     summary: TerminalIndexAuthoritySummary,
@@ -972,13 +506,13 @@ impl CheckpointTerminalIndexRecordSource<'static> {
     /// exclusive authorities. The caller must retain those exclusive handles
     /// while terminal progress is appended; every replica pass replays the
     /// selected CRC-validated, length-bounded prefix.
-    pub fn new_replay_backed(
+    pub(crate) fn new_replay_backed(
         checkpoint: &FileCheckpointJournalLease,
-        parity: &remanence_parity::FileTapeFileJournal,
+        parity: &dyn remanence_parity::authority::StructuralAuthority,
     ) -> Result<Self, StateError> {
         let checkpoint = checkpoint.bounded_replay_snapshot()?;
         let parity = parity
-            .committed_snapshot_bounded()
+            .freeze()
             .map_err(|error| StateError::JournalReplayFailed(error.to_string()))?;
         let (summary, tape_uuid) = validate_replay_backed_parity_terminal_rows(
             &checkpoint,
@@ -999,7 +533,7 @@ impl CheckpointTerminalIndexRecordSource<'static> {
     /// Validate retained checkpoint authority for a parity-off tape without
     /// materializing its complete checkpoint history. The returned source owns
     /// its frozen read handle and does not borrow the mutable lease.
-    pub fn new_replay_backed_no_parity(
+    pub(crate) fn new_replay_backed_no_parity(
         checkpoint: &FileCheckpointJournalLease,
     ) -> Result<Self, StateError> {
         let checkpoint = checkpoint.bounded_replay_snapshot()?;
@@ -1014,14 +548,14 @@ impl CheckpointTerminalIndexRecordSource<'static> {
     /// Validate retained authorities after the exact planned TerminalPrefix
     /// and its checkpoint marker have become durable. The returned source owns
     /// its frozen read handles and does not borrow either mutable authority.
-    pub fn new_replay_backed_after_terminal_prefix(
+    pub(crate) fn new_replay_backed_after_terminal_prefix(
         checkpoint: &FileCheckpointJournalLease,
-        parity: &remanence_parity::FileTapeFileJournal,
+        parity: &dyn remanence_parity::authority::StructuralAuthority,
         prefix: &TerminalFinalizationPrefixPlan,
     ) -> Result<Self, StateError> {
         let checkpoint = checkpoint.bounded_replay_snapshot()?;
         let parity = parity
-            .terminal_prefix_snapshot_bounded()
+            .freeze_terminal_prefix()
             .map_err(|error| StateError::JournalReplayFailed(error.to_string()))?;
         let (summary, tape_uuid) = validate_replay_backed_parity_terminal_rows(
             &checkpoint,
@@ -1045,14 +579,14 @@ impl CheckpointTerminalIndexRecordSource<'static> {
     /// Edition/layout planning and all later replica passes therefore use the
     /// same final row set, while the caller remains free to advance the
     /// exclusive checkpoint and parity authorities after construction.
-    pub fn new_replay_backed_with_planned_terminal_prefix(
+    pub(crate) fn new_replay_backed_with_planned_terminal_prefix(
         checkpoint: &FileCheckpointJournalLease,
-        parity: &remanence_parity::FileTapeFileJournal,
+        parity: &dyn remanence_parity::authority::StructuralAuthority,
         prefix: &TerminalFinalizationPrefixPlan,
     ) -> Result<Self, StateError> {
         let checkpoint = checkpoint.bounded_replay_snapshot()?;
         let parity = parity
-            .planned_terminal_prefix_base_snapshot_bounded(&prefix.committed_bundle)
+            .freeze_before_terminal_prefix(&(&prefix.committed_bundle).into())
             .map_err(|error| StateError::JournalReplayFailed(error.to_string()))?;
         let (summary, tape_uuid) = validate_replay_backed_parity_terminal_rows(
             &checkpoint,
@@ -1216,7 +750,7 @@ impl<'a> CheckpointTerminalIndexRecordSource<'a> {
     /// Return the per-pass bounded replay metrics sampled while freezing each
     /// owned journal snapshot. These do not aggregate later construction or
     /// row-emission scans. Legacy slice/flattened-state sources return `None`.
-    pub const fn replay_metrics(&self) -> Option<TerminalIndexAuthorityReplayMetrics> {
+    pub fn replay_metrics(&self) -> Option<TerminalIndexAuthorityReplayMetrics> {
         match &self.rows {
             TerminalIndexAuthorityRows::ReplayParity {
                 checkpoint, parity, ..
@@ -1721,7 +1255,7 @@ fn observe_replayed_parity_terminal_entry(
 
 fn validate_replay_backed_parity_terminal_rows(
     checkpoint: &CheckpointReplaySnapshot,
-    parity: &remanence_parity::FileTapeFileJournalCommittedSnapshot,
+    parity: &remanence_parity::FrozenFileRows,
     terminal_prefix: ReplayTerminalPrefixMode<'_>,
 ) -> Result<(TerminalIndexAuthoritySummary, [u8; 16]), StateError> {
     let mismatch = |detail: String| {
@@ -2031,7 +1565,7 @@ struct CheckpointJournalFrame {
 
 /// Append-only per-tape checkpoint journal.
 #[derive(Debug)]
-pub struct FileCheckpointJournal {
+pub(crate) struct FileCheckpointJournal {
     path: PathBuf,
     tape_uuid: [u8; 16],
 }
@@ -2039,7 +1573,7 @@ pub struct FileCheckpointJournal {
 /// Exclusive per-tape checkpoint authority retained across replay, media I/O,
 /// and the next durable checkpoint append.
 #[derive(Debug)]
-pub struct FileCheckpointJournalLease {
+pub(crate) struct FileCheckpointJournalLease {
     path: PathBuf,
     tape_uuid: [u8; 16],
     file: File,
@@ -2124,6 +1658,24 @@ pub struct CheckpointTerminalRecoveryAuthority {
 }
 
 impl FileCheckpointJournal {
+    pub(crate) fn tape_uuid(&self) -> [u8; 16] {
+        self.tape_uuid
+    }
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn fixture_shared_lock(&self) -> Result<Flock<File>, StateError> {
+        acquire_checkpoint_lock(
+            &self.path,
+            FlockArg::LockSharedNonblock,
+            "hold fixture authority",
+        )
+    }
+
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn fixture_has_publication(&self) -> bool {
+        fs::metadata(&self.path)
+            .is_ok_and(|metadata| metadata.len() > CHECKPOINT_JOURNAL_HEADER_LEN)
+    }
+
     /// Check for an existing journal without creating its directory, file or lease.
     pub fn exists(dir: impl AsRef<Path>, tape_uuid: [u8; 16]) -> Result<bool, StateError> {
         let path = checkpoint_journal_path(dir.as_ref(), tape_uuid);
@@ -2203,13 +1755,6 @@ impl FileCheckpointJournal {
         };
         lease.validate_bounded_acquisition(allow_pending_terminal_intent)?;
         Ok(lease)
-    }
-
-    /// Append and fsync one validated checkpoint record under a short-lived
-    /// exclusive lease. Production write paths should retain a lease across
-    /// their replay and media work instead.
-    pub fn append(&self, record: &CheckpointJournalRecord) -> Result<(), StateError> {
-        self.acquire_exclusive()?.append(record)
     }
 
     /// Replay every record, failing closed on a torn final frame.
@@ -2335,6 +1880,9 @@ fn terminal_completion_intent(
 }
 
 impl FileCheckpointJournalLease {
+    pub(crate) fn authority_path(&self) -> &Path {
+        &self.path
+    }
     /// Tape identity protected by this exclusive journal lease.
     pub fn tape_uuid(&self) -> [u8; 16] {
         self.tape_uuid
@@ -2447,11 +1995,6 @@ impl FileCheckpointJournalLease {
     /// exclusive lease. The complete history is streamed and discarded.
     pub fn last_record_bounded(&self) -> Result<Option<CheckpointJournalRecord>, StateError> {
         Ok(self.visit_records_bounded(|_| Ok(()))?.last)
-    }
-
-    /// Measure one no-all-history checkpoint replay without retaining its rows.
-    pub fn bounded_replay_metrics(&self) -> Result<CheckpointBoundedReplayMetrics, StateError> {
-        Ok(self.visit_records_bounded(|_| Ok(()))?.metrics)
     }
 
     /// Replay the authority while retaining the exclusive lease.
@@ -2654,14 +2197,6 @@ impl FileCheckpointJournalLease {
         intent.validate_for_tape(self.tape_uuid)?;
         write_terminal_finalization_intent(&self.path, &intent, true)?;
         Ok(intent)
-    }
-
-    /// Append final checkpoint authority after all five components are proved.
-    pub fn append_terminal_finalization(
-        &mut self,
-        records: &[CheckpointJournalRecord],
-    ) -> Result<(), StateError> {
-        self.append_terminal_finalization_with_after_fsync(records, || Ok(()))
     }
 
     /// Append final checkpoint authority, run one callback after its fsync,
@@ -3569,7 +3104,7 @@ fn scan_checkpoint_records(
 }
 
 /// Enumerate all per-tape checkpoint journal paths in a configured directory.
-pub fn list_checkpoint_journals(dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, StateError> {
+pub(crate) fn list_checkpoint_journals(dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, StateError> {
     let dir = dir.as_ref();
     if !dir.exists() {
         return Ok(Vec::new());
@@ -3590,7 +3125,7 @@ pub fn list_checkpoint_journals(dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, S
 }
 
 /// Decode the tape UUID embedded in a checkpoint journal filename.
-pub fn tape_uuid_from_checkpoint_path(path: &Path) -> Result<[u8; 16], StateError> {
+pub(crate) fn tape_uuid_from_checkpoint_path(path: &Path) -> Result<[u8; 16], StateError> {
     let filename = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -3870,7 +3405,7 @@ pub(crate) fn validate_parity_barrier_bundles(
 /// leave either authority one fsync ahead of the other. Resuming from the EOD
 /// in one while seeding logical ordinals from the other could overwrite a
 /// newer tape prefix, so disagreement is a fail-closed recovery condition.
-pub fn validate_parity_resume_authority(
+pub(crate) fn validate_parity_resume_authority(
     records: &[CheckpointJournalRecord],
     committed: &remanence_parity::CommittedState,
     tape_uuid: [u8; 16],
@@ -4494,8 +4029,9 @@ fn checkpoint_record_watermarks(record: &CheckpointJournalRecord) -> (u64, u64) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use remanence_parity::authority::StructuralAuthority;
 
-    fn record(tape_uuid: [u8; 16]) -> CheckpointJournalRecord {
+    pub(super) fn record(tape_uuid: [u8; 16]) -> CheckpointJournalRecord {
         let object_uuid = uuid::Uuid::from_bytes([0x51; 16]);
         CheckpointJournalRecord {
             ordinal: 1,
@@ -4556,7 +4092,7 @@ mod tests {
         }
     }
 
-    fn second_record(tape_uuid: [u8; 16]) -> CheckpointJournalRecord {
+    pub(super) fn second_record(tape_uuid: [u8; 16]) -> CheckpointJournalRecord {
         let mut record = record(tape_uuid);
         let object_uuid = uuid::Uuid::from_bytes([0x52; 16]);
         record.ordinal = 2;
@@ -4581,8 +4117,9 @@ mod tests {
         let tape_uuid = [0x31; 16];
         let path = checkpoint_journal_path(dir.path(), tape_uuid);
 
-        let authority = CheckpointBotRecoveryAuthority::try_open(dir.path(), tape_uuid, 256 * 1024)
-            .expect("probe missing checkpoint authority");
+        let authority =
+            crate::authority::BotRecoveryAuthority::try_open(dir.path(), tape_uuid, 256 * 1024)
+                .expect("probe missing checkpoint authority");
 
         assert!(authority.is_none());
         assert!(!path.exists(), "foreign recovery must not invent authority");
@@ -4592,7 +4129,9 @@ mod tests {
     fn bot_recovery_authority_streams_exact_checkpoint_rows_and_scope() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x32; 16];
-        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            .build()
+            .expect("open journal");
         let mut lease = journal.acquire_exclusive().expect("acquire journal lease");
         lease
             .append(&record(tape_uuid))
@@ -4603,7 +4142,7 @@ mod tests {
         drop(lease);
 
         let mut authority =
-            CheckpointBotRecoveryAuthority::try_open(dir.path(), tape_uuid, 256 * 1024)
+            crate::authority::BotRecoveryAuthority::try_open(dir.path(), tape_uuid, 256 * 1024)
                 .expect("open checkpoint recovery authority")
                 .expect("checkpoint authority exists");
         let mut rows = Vec::new();
@@ -4635,7 +4174,9 @@ mod tests {
     fn bot_recovery_authority_reads_the_ordinary_prefix_of_a_sealed_journal() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x33; 16];
-        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            .build()
+            .expect("open journal");
         let prior = record(tape_uuid);
         journal.append(&prior).expect("append ordinary authority");
         let initial = finalization_intent(tape_uuid);
@@ -4649,7 +4190,7 @@ mod tests {
         drop(lease);
 
         let mut authority =
-            CheckpointBotRecoveryAuthority::try_open(dir.path(), tape_uuid, 256 * 1024)
+            crate::authority::BotRecoveryAuthority::try_open(dir.path(), tape_uuid, 256 * 1024)
                 .expect("open sealed checkpoint recovery authority")
                 .expect("checkpoint authority exists");
         let mut rows = Vec::new();
@@ -4731,7 +4272,7 @@ mod tests {
         );
     }
 
-    fn finalization_intent(tape_uuid: [u8; 16]) -> TerminalFinalizationIntent {
+    pub(super) fn finalization_intent(tape_uuid: [u8; 16]) -> TerminalFinalizationIntent {
         let layout = remanence_parity::TerminalTailLayout::new(0, 256 * 1024, 2, 6, 4, 4_096)
             .expect("terminal layout");
         TerminalFinalizationIntent {
@@ -4766,7 +4307,7 @@ mod tests {
         intent
     }
 
-    fn structured_terminal_record(
+    pub(super) fn structured_terminal_record(
         prior: &CheckpointJournalRecord,
         finalization: TerminalFinalizationIntent,
     ) -> CheckpointJournalRecord {
@@ -4814,7 +4355,7 @@ mod tests {
     }
 
     fn advance_test_finalization_to_replica_c(
-        lease: &mut FileCheckpointJournalLease,
+        lease: &mut crate::authority::TapeAuthorityLease,
         intent: &TerminalFinalizationIntent,
     ) {
         lease
@@ -4867,7 +4408,7 @@ mod tests {
         }
     }
 
-    fn partial_epoch_parity_record(tape_uuid: [u8; 16]) -> CheckpointJournalRecord {
+    pub(super) fn partial_epoch_parity_record(tape_uuid: [u8; 16]) -> CheckpointJournalRecord {
         let mut record = record(tape_uuid);
         record.eod_lba = 12;
         record.next_tape_file_number = 3;
@@ -4998,7 +4539,7 @@ mod tests {
         }
     }
 
-    fn terminal_prefix_plan_for_parity_record(
+    pub(super) fn terminal_prefix_plan_for_parity_record(
         record: &CheckpointJournalRecord,
     ) -> TerminalFinalizationPrefixPlan {
         let mut parity_map = parity_entry(3, remanence_parity::TapeFileKind::ParityMap);
@@ -5266,7 +4807,9 @@ mod tests {
         )
         .unwrap();
         intent.terminal_prefix = Some(prefix);
-        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).unwrap();
+        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            .build()
+            .unwrap();
         journal.append(&record).unwrap();
         write_terminal_finalization_intent(journal.path(), &intent, false).unwrap();
         assert_eq!(
@@ -5346,7 +4889,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x25; 16];
         let record = partial_epoch_parity_record(tape_uuid);
-        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            .build()
+            .expect("open journal");
 
         journal.append(&record).expect("append sidecar checkpoint");
         assert_eq!(
@@ -5359,7 +4904,9 @@ mod tests {
     fn append_and_rollback_failure_is_typed_as_uncertain_authority() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x26; 16];
-        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            .build()
+            .expect("open journal");
         let mut lease = journal.acquire_exclusive().expect("acquire journal lease");
         FAIL_NEXT_CHECKPOINT_FRAME_WRITE.with(|fail| fail.set(true));
         FAIL_NEXT_CHECKPOINT_FRAME_ROLLBACK.with(|fail| fail.set(true));
@@ -5377,7 +4924,9 @@ mod tests {
     fn exclusive_checkpoint_lease_waits_for_startup_reader() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x24; 16];
-        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).unwrap();
+        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            .build()
+            .unwrap();
         drop(journal.acquire_exclusive().unwrap());
         let reader = acquire_checkpoint_lock(
             journal.path(),
@@ -5410,7 +4959,9 @@ mod tests {
     #[test]
     fn exclusive_checkpoint_lease_bounds_reader_wait() {
         let dir = tempfile::tempdir().unwrap();
-        let journal = FileCheckpointJournal::open(dir.path(), [0x24; 16]).unwrap();
+        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), [0x24; 16])
+            .build()
+            .unwrap();
         let reader = acquire_checkpoint_lock(
             journal.path(),
             FlockArg::LockSharedNonblock,
@@ -5437,7 +4988,9 @@ mod tests {
     fn exclusive_checkpoint_lease_keeps_writer_conflict() {
         let dir = tempfile::tempdir().unwrap();
         let tape_uuid = [0x24; 16];
-        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).unwrap();
+        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            .build()
+            .unwrap();
         for recovery in [false, true] {
             let mut lease = journal.acquire_exclusive().unwrap();
             if recovery {
@@ -5464,7 +5017,9 @@ mod tests {
     #[test]
     fn exclusive_checkpoint_lease_refuses_writer_after_reader() {
         let dir = tempfile::tempdir().unwrap();
-        let journal = FileCheckpointJournal::open(dir.path(), [0x24; 16]).unwrap();
+        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), [0x24; 16])
+            .build()
+            .unwrap();
         let reader = acquire_checkpoint_lock(
             journal.path(),
             FlockArg::LockSharedNonblock,
@@ -5521,7 +5076,9 @@ mod tests {
     fn exclusive_checkpoint_lease_serializes_replay_through_append() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x24; 16];
-        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            .build()
+            .expect("open journal");
         let mut lease = journal
             .acquire_exclusive()
             .expect("acquire write-session lease");
@@ -5548,7 +5105,9 @@ mod tests {
     fn first_use_contention_never_publishes_a_partial_checkpoint_header() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x23; 16];
-        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            .build()
+            .expect("open journal");
         let creator_lock = acquire_checkpoint_lock(
             journal.path(),
             FlockArg::LockExclusiveNonblock,
@@ -5661,7 +5220,9 @@ mod tests {
     fn torn_final_frame_fails_closed_and_is_not_repaired_by_append() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x11; 16];
-        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            .build()
+            .expect("open journal");
         journal
             .append(&record(tape_uuid))
             .expect("append checkpoint");
@@ -5702,7 +5263,9 @@ mod tests {
     fn headerless_checkpoint_tail_fails_closed_as_legacy_or_incomplete() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x31; 16];
-        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            .build()
+            .expect("open journal");
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -5721,7 +5284,9 @@ mod tests {
     fn checksum_damage_fails_closed_before_any_later_record() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x32; 16];
-        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            .build()
+            .expect("open journal");
         journal
             .append(&record(tape_uuid))
             .expect("append first checkpoint");
@@ -5762,7 +5327,9 @@ mod tests {
     fn hostile_declared_record_length_rejects_before_allocation() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x33; 16];
-        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            .build()
+            .expect("open journal");
         journal
             .append(&record(tape_uuid))
             .expect("create versioned journal");
@@ -5794,7 +5361,9 @@ mod tests {
     fn append_rejects_non_monotonic_count() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x22; 16];
-        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            .build()
+            .expect("open journal");
         journal
             .append(&record(tape_uuid))
             .expect("append checkpoint");
@@ -5811,7 +5380,9 @@ mod tests {
     fn append_rejects_a_checkpoint_after_terminal_seal_authority() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x25; 16];
-        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            .build()
+            .expect("open journal");
         let prior = record(tape_uuid);
         journal
             .append(&prior)
@@ -5846,7 +5417,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x71; 16];
         let base = partial_epoch_parity_record(tape_uuid);
-        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            .build()
+            .expect("open journal");
         journal.append(&base).expect("append ordinary checkpoint");
         let mut intent = finalization_intent(tape_uuid);
         let prefix = terminal_prefix_plan_for_parity_record(&base);
@@ -6005,7 +5578,9 @@ mod tests {
     fn provisional_manual_intent_retires_only_with_both_database_halves_absent() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x73; 16];
-        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            .build()
+            .expect("open journal");
         journal
             .append(&record(tape_uuid))
             .expect("append ordinary checkpoint");
@@ -6039,7 +5614,9 @@ mod tests {
     fn structured_completion_survives_intent_cleanup_and_checkpoint_only_replay() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x74; 16];
-        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            .build()
+            .expect("open journal");
         let prior = record(tape_uuid);
         journal.append(&prior).expect("append ordinary authority");
         let initial = finalization_intent(tape_uuid);
@@ -6082,7 +5659,8 @@ mod tests {
         drop(lease);
 
         assert!(!terminal_finalization_intent_path(journal.path()).exists());
-        let replayed = FileCheckpointJournal::open(dir.path(), tape_uuid)
+        let replayed = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            .build()
             .expect("reopen checkpoint-only authority")
             .replay()
             .expect("replay completed terminal authority");
@@ -6109,7 +5687,9 @@ mod tests {
     fn sealed_fsync_interruption_is_cleared_only_for_the_exact_completion() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x75; 16];
-        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            .build()
+            .expect("open journal");
         let prior = record(tape_uuid);
         let completed = completed_finalization_intent(tape_uuid);
         let terminal = structured_terminal_record(&prior, completed.clone());
@@ -6231,7 +5811,9 @@ mod tests {
     fn checkpoint_record_rejects_versions_one_and_two() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x72; 16];
-        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).unwrap();
+        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            .build()
+            .unwrap();
         journal.append(&record(tape_uuid)).unwrap();
         let mut lease = journal.acquire_exclusive().unwrap();
         let mut bytes = fs::read(journal.path()).unwrap();
@@ -6249,6 +5831,7 @@ mod tests {
                 "{error}"
             );
             let error = lease
+                .checkpoint
                 .bounded_replay_snapshot()
                 .expect_err("bounded replay must reject legacy records");
             assert!(
@@ -6264,7 +5847,9 @@ mod tests {
     fn structured_finalization_rejects_pool_guard_and_corrupt_frame_before_motion() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x72; 16];
-        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            .build()
+            .expect("open journal");
         journal
             .append(&record(tape_uuid))
             .expect("append ordinary checkpoint prefix");
@@ -6370,7 +5955,9 @@ mod tests {
     fn replay_backed_no_parity_terminal_source_replays_each_replica_pass() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x74; 16];
-        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            .build()
+            .expect("open journal");
         let mut lease = journal.acquire_exclusive().expect("acquire journal lease");
         lease
             .append(&record(tape_uuid))
@@ -6379,7 +5966,7 @@ mod tests {
             .append(&second_record(tape_uuid))
             .expect("append second checkpoint");
 
-        let mut source = CheckpointTerminalIndexRecordSource::new_replay_backed_no_parity(&lease)
+        let mut source = crate::authority::TerminalIndexSource::new_replay_backed_no_parity(&lease)
             .expect("validate bounded checkpoint replay");
         assert_eq!(
             source.summary(),
@@ -6424,12 +6011,14 @@ mod tests {
     fn owned_no_parity_snapshot_allows_checkpoint_append_and_keeps_frozen_rows() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x7D; 16];
-        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            .build()
+            .expect("open journal");
         let mut lease = journal.acquire_exclusive().expect("acquire journal lease");
         lease
             .append(&record(tape_uuid))
             .expect("append first checkpoint");
-        let mut source = CheckpointTerminalIndexRecordSource::new_replay_backed_no_parity(&lease)
+        let mut source = crate::authority::TerminalIndexSource::new_replay_backed_no_parity(&lease)
             .expect("freeze bounded checkpoint source");
 
         lease
@@ -6465,7 +6054,9 @@ mod tests {
         record.barrier_bundle.as_mut().unwrap().entries[0].physical_start_hint = Some(6);
         let scheme = record.scheme.clone().expect("parity scheme");
         let checkpoint_journal =
-            FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open checkpoint journal");
+            crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+                .build()
+                .expect("open checkpoint journal");
         let mut checkpoint_lease = checkpoint_journal
             .acquire_exclusive()
             .expect("acquire checkpoint lease");
@@ -6474,12 +6065,13 @@ mod tests {
             .expect("append checkpoint authority");
 
         let parity_path = dir.path().join("owned-planned-prefix.remjournal");
-        let mut parity = remanence_parity::FileTapeFileJournal::open(
+        let mut parity = remanence_parity::authority::fixtures::LegacyCodecFixture::at_path(
             &parity_path,
             tape_uuid,
             record.block_size,
             scheme,
         )
+        .build()
         .expect("open trusted parity journal");
         let bot = remanence_parity::CommittedBundle {
             kind: remanence_parity::CommittedBundleKind::BotBootstrap,
@@ -6487,25 +6079,37 @@ mod tests {
             highest_protected_ordinal: 0,
             total_committed_ordinals: 0,
         };
-        remanence_parity::TapeFileJournal::commit_bundle(&mut parity, &bot)
-            .expect("commit BOT Bootstrap");
+        remanence_parity::TapeReportPublisher::publish_fixture(
+            &mut parity,
+            &remanence_parity::authority::ShadowPublication::one(bot.clone()),
+        )
+        .expect("commit BOT Bootstrap");
         for bundle in &record.object_tape_file_bundles {
-            remanence_parity::TapeFileJournal::commit_bundle(&mut parity, bundle)
-                .expect("commit Object bundle");
+            remanence_parity::TapeReportPublisher::publish_fixture(
+                &mut parity,
+                &remanence_parity::authority::ShadowPublication::one((bundle).clone()),
+            )
+            .expect("commit Object bundle");
         }
         let barrier = record.barrier_bundle.as_ref().expect("checkpoint barrier");
-        remanence_parity::TapeFileJournal::commit_bundle(&mut parity, barrier)
-            .expect("commit checkpoint sidecar bundle");
+        remanence_parity::TapeReportPublisher::publish_fixture(
+            &mut parity,
+            &remanence_parity::authority::ShadowPublication::one((barrier).clone()),
+        )
+        .expect("commit checkpoint sidecar bundle");
         let checkpoint = remanence_parity::CommittedBundle {
             kind: remanence_parity::CommittedBundleKind::CheckpointedThrough,
             entries: Vec::new(),
             highest_protected_ordinal: barrier.highest_protected_ordinal,
             total_committed_ordinals: barrier.total_committed_ordinals,
         };
-        remanence_parity::TapeFileJournal::commit_bundle(&mut parity, &checkpoint)
-            .expect("commit checkpoint watermark");
+        remanence_parity::TapeReportPublisher::publish_fixture(
+            &mut parity,
+            &remanence_parity::authority::ShadowPublication::one(checkpoint.clone()),
+        )
+        .expect("commit checkpoint watermark");
 
-        let snapshot = parity.committed_snapshot_bounded().unwrap();
+        let snapshot = parity.freeze().unwrap();
         let (identity, calls) = clock_fixture::advancing_test_identity();
         let plan = remanence_parity::plan_checkpointed_terminal_index_close(
             &snapshot,
@@ -6535,7 +6139,9 @@ mod tests {
             .unwrap();
         drop(checkpoint_lease);
         drop(checkpoint_journal);
-        let reopened = FileCheckpointJournal::open(dir.path(), tape_uuid).unwrap();
+        let reopened = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            .build()
+            .unwrap();
         let restored = reopened
             .terminal_finalization_intent()
             .unwrap()
@@ -6591,7 +6197,9 @@ mod tests {
         let record = partial_epoch_parity_record(tape_uuid);
         let scheme = record.scheme.clone().expect("parity scheme");
         let checkpoint_journal =
-            FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open checkpoint journal");
+            crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+                .build()
+                .expect("open checkpoint journal");
         let mut checkpoint_lease = checkpoint_journal
             .acquire_exclusive()
             .expect("acquire checkpoint lease");
@@ -6600,12 +6208,13 @@ mod tests {
             .expect("append checkpoint authority");
 
         let parity_path = dir.path().join("owned-planned-prefix.remjournal");
-        let mut parity = remanence_parity::FileTapeFileJournal::open(
+        let mut parity = remanence_parity::authority::fixtures::LegacyCodecFixture::at_path(
             &parity_path,
             tape_uuid,
             record.block_size,
             scheme,
         )
+        .build()
         .expect("open trusted parity journal");
         let bot = remanence_parity::CommittedBundle {
             kind: remanence_parity::CommittedBundleKind::BotBootstrap,
@@ -6613,30 +6222,42 @@ mod tests {
             highest_protected_ordinal: 0,
             total_committed_ordinals: 0,
         };
-        remanence_parity::TapeFileJournal::commit_bundle(&mut parity, &bot)
-            .expect("commit BOT Bootstrap");
+        remanence_parity::TapeReportPublisher::publish_fixture(
+            &mut parity,
+            &remanence_parity::authority::ShadowPublication::one(bot.clone()),
+        )
+        .expect("commit BOT Bootstrap");
         for bundle in &record.object_tape_file_bundles {
-            remanence_parity::TapeFileJournal::commit_bundle(&mut parity, bundle)
-                .expect("commit Object bundle");
+            remanence_parity::TapeReportPublisher::publish_fixture(
+                &mut parity,
+                &remanence_parity::authority::ShadowPublication::one((bundle).clone()),
+            )
+            .expect("commit Object bundle");
         }
         let barrier = record.barrier_bundle.as_ref().expect("checkpoint barrier");
-        remanence_parity::TapeFileJournal::commit_bundle(&mut parity, barrier)
-            .expect("commit checkpoint sidecar bundle");
+        remanence_parity::TapeReportPublisher::publish_fixture(
+            &mut parity,
+            &remanence_parity::authority::ShadowPublication::one((barrier).clone()),
+        )
+        .expect("commit checkpoint sidecar bundle");
         let checkpoint = remanence_parity::CommittedBundle {
             kind: remanence_parity::CommittedBundleKind::CheckpointedThrough,
             entries: Vec::new(),
             highest_protected_ordinal: barrier.highest_protected_ordinal,
             total_committed_ordinals: barrier.total_committed_ordinals,
         };
-        remanence_parity::TapeFileJournal::commit_bundle(&mut parity, &checkpoint)
-            .expect("commit checkpoint watermark");
+        remanence_parity::TapeReportPublisher::publish_fixture(
+            &mut parity,
+            &remanence_parity::authority::ShadowPublication::one(checkpoint.clone()),
+        )
+        .expect("commit checkpoint watermark");
 
         let prefix = terminal_prefix_plan_for_parity_record(&record);
         let mut planned =
-            CheckpointTerminalIndexRecordSource::new_replay_backed_with_planned_terminal_prefix(
+            crate::authority::TerminalIndexSource::new_replay_backed_with_planned_terminal_prefix(
                 &checkpoint_lease,
                 &parity,
-                &prefix,
+                &(&prefix).into(),
             )
             .expect("freeze base plus virtual TerminalPrefix");
         assert_eq!(planned.summary().counts.structural_entry_count, 4);
@@ -6650,13 +6271,16 @@ mod tests {
             1
         );
 
-        remanence_parity::TapeFileJournal::commit_bundle(&mut parity, &prefix.committed_bundle)
-            .expect("simulate crash after the planned TerminalPrefix journal append");
+        remanence_parity::TapeReportPublisher::publish_fixture(
+            &mut parity,
+            &remanence_parity::authority::ShadowPublication::one(prefix.committed_bundle.clone()),
+        )
+        .expect("simulate crash after the planned TerminalPrefix journal append");
         let mut orphan_planned =
-            CheckpointTerminalIndexRecordSource::new_replay_backed_with_planned_terminal_prefix(
+            crate::authority::TerminalIndexSource::new_replay_backed_with_planned_terminal_prefix(
                 &checkpoint_lease,
                 &parity,
-                &prefix,
+                &(&prefix).into(),
             )
             .expect("exact planned TerminalPrefix orphan retains the bounded base authority");
         let mut orphan_planned_files = Vec::new();
@@ -6670,14 +6294,21 @@ mod tests {
         .expect("replay base plus orphaned planned prefix exactly once");
         assert_eq!(orphan_planned_files, vec![0, 1, 2, 3]);
 
-        remanence_parity::TapeFileJournal::commit_terminal_prefix_transition(
+        remanence_parity::TapeReportPublisher::publish_fixture(
             &mut parity,
-            &prefix.committed_bundle,
-            &remanence_parity::CommittedBundle {
-                kind: remanence_parity::CommittedBundleKind::CheckpointedThrough,
-                entries: Vec::new(),
-                highest_protected_ordinal: prefix.committed_bundle.highest_protected_ordinal,
-                total_committed_ordinals: prefix.committed_bundle.total_committed_ordinals,
+            &remanence_parity::authority::ShadowPublication {
+                bundles: vec![
+                    prefix.committed_bundle.clone(),
+                    remanence_parity::CommittedBundle {
+                        kind: remanence_parity::CommittedBundleKind::CheckpointedThrough,
+                        entries: Vec::new(),
+                        highest_protected_ordinal: prefix
+                            .committed_bundle
+                            .highest_protected_ordinal,
+                        total_committed_ordinals: prefix.committed_bundle.total_committed_ordinals,
+                    }
+                    .clone(),
+                ],
             },
         )
         .expect("owned planned source must not borrow mutable parity journal");
@@ -6711,23 +6342,28 @@ mod tests {
             highest_protected_ordinal: prefix.committed_bundle.highest_protected_ordinal,
             total_committed_ordinals: prefix.committed_bundle.total_committed_ordinals,
         };
-        remanence_parity::TapeFileJournal::commit_terminal_component_transition(
+        remanence_parity::TapeReportPublisher::publish_fixture(
             &mut parity,
-            &replica_a,
-            &remanence_parity::CommittedBundle {
-                kind: remanence_parity::CommittedBundleKind::CheckpointedThrough,
-                entries: Vec::new(),
-                highest_protected_ordinal: replica_a.highest_protected_ordinal,
-                total_committed_ordinals: replica_a.total_committed_ordinals,
+            &remanence_parity::authority::ShadowPublication {
+                bundles: vec![
+                    replica_a.clone(),
+                    remanence_parity::CommittedBundle {
+                        kind: remanence_parity::CommittedBundleKind::CheckpointedThrough,
+                        entries: Vec::new(),
+                        highest_protected_ordinal: replica_a.highest_protected_ordinal,
+                        total_committed_ordinals: replica_a.total_committed_ordinals,
+                    }
+                    .clone(),
+                ],
             },
         )
         .expect("append later replica-A progress");
 
         let mut durable =
-            CheckpointTerminalIndexRecordSource::new_replay_backed_after_terminal_prefix(
+            crate::authority::TerminalIndexSource::new_replay_backed_after_terminal_prefix(
                 &checkpoint_lease,
                 &parity,
-                &prefix,
+                &(&prefix).into(),
             )
             .expect("freeze durable prefix while excluding later component progress");
         let mut durable_files = Vec::new();
@@ -6747,7 +6383,9 @@ mod tests {
         const CHECKPOINT_COUNT: u64 = 128;
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x75; 16];
-        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            .build()
+            .expect("open journal");
         let mut lease = journal.acquire_exclusive().expect("acquire journal lease");
         let mut prior = None;
         for index in 0..CHECKPOINT_COUNT {
@@ -6786,7 +6424,7 @@ mod tests {
         assert_eq!(metrics.peak_live_object_rows, 2);
         assert!(metrics.peak_live_object_rows < CHECKPOINT_COUNT);
 
-        let mut source = CheckpointTerminalIndexRecordSource::new_replay_backed_no_parity(&lease)
+        let mut source = crate::authority::TerminalIndexSource::new_replay_backed_no_parity(&lease)
             .expect("validate high-count replay-backed source");
         assert_eq!(
             source.summary().counts,
@@ -6860,11 +6498,13 @@ mod tests {
     fn finalization_resume_reconstructs_persisted_intent_through_shared_assembly() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x7C; 16];
-        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            .build()
+            .expect("open journal");
         let mut lease = journal.acquire_exclusive().expect("acquire lease");
         let checkpoint = record(tape_uuid);
         lease.append(&checkpoint).expect("persist checkpoint");
-        let mut source = CheckpointTerminalIndexRecordSource::new_replay_backed_no_parity(&lease)
+        let mut source = crate::authority::TerminalIndexSource::new_replay_backed_no_parity(&lease)
             .expect("checkpoint authority");
         let summary = source.summary();
         let replica = remanence_parity::checked_tape_index_replica_layout(
@@ -6907,7 +6547,9 @@ mod tests {
         drop(lease);
         drop(journal);
 
-        let reopened = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("reopen journal");
+        let reopened = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            .build()
+            .expect("reopen journal");
         let lease = reopened
             .acquire_exclusive_for_terminal_recovery()
             .expect("resume lease");
@@ -6916,17 +6558,17 @@ mod tests {
             .expect("read intent")
             .expect("existing intent");
         assert_eq!(persisted, intent);
-        let mut source = CheckpointTerminalIndexRecordSource::new_replay_backed_no_parity(&lease)
+        let mut source = crate::authority::TerminalIndexSource::new_replay_backed_no_parity(&lease)
             .expect("replay checkpoint authority");
         let resumed = source
-            .reconstruct_final_edition(&persisted)
+            .reconstruct_final_edition(&(&persisted).into())
             .expect("resume exact edition");
         assert_eq!(resumed, planned.edition);
         assert_eq!(resumed.descriptor.edition_id, persisted.edition_id);
         let mut corrupt = persisted;
         corrupt.edition_digest[0] ^= 1;
         assert!(source
-            .reconstruct_final_edition(&corrupt)
+            .reconstruct_final_edition(&(&corrupt).into())
             .expect_err("digest mismatch must fail closed")
             .to_string()
             .contains("digest"));
@@ -6957,7 +6599,9 @@ mod tests {
     fn checkpoint_batch_is_one_integrity_frame_and_torn_batch_fails_closed() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x27; 16];
-        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let journal = crate::authority::fixtures::AuthorityBuilder::new(dir.path(), tape_uuid)
+            .build()
+            .expect("open journal");
         let first = record(tape_uuid);
         let second = second_record(tape_uuid);
         let mut lease = journal.acquire_exclusive().expect("acquire journal lease");

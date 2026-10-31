@@ -5,6 +5,8 @@
 //! implements the state-directory and config boundary; audit and index modules
 //! are added in later implementation steps.
 
+pub mod authority;
+pub use authority::{TapeAuthority, TapeAuthorityLease, TerminalIndexSource};
 pub mod adapters;
 pub mod audit;
 pub mod calibration;
@@ -37,14 +39,11 @@ pub use calibration::{
     VolumeCalibrationState, VolumeMediaWriteFence, WritePathTrust, CALIBRATION_CONTROL_FILENAME,
 };
 pub use checkpoint::{
-    list_checkpoint_journals, tape_uuid_from_checkpoint_path, validate_parity_resume_authority,
-    CheckpointBotRecoveryAuthority, CheckpointBoundedReplayMetrics, CheckpointJournalRecord,
-    CheckpointObjectProjection, CheckpointObjectRecoveryRepresentation,
-    CheckpointObjectRecoveryRow, CheckpointTerminalIndexRecordSource,
-    CheckpointTerminalRecoveryAuthority, FileCheckpointJournal, FileCheckpointJournalLease,
-    ManualTerminalFinalizationIdentity, SealDueReason, TerminalFinalizationComponent,
-    TerminalFinalizationComponentKind, TerminalFinalizationIntent, TerminalFinalizationLayout,
-    TerminalFinalizationPrefixPlan, TerminalFinalizationProgress,
+    CheckpointBoundedReplayMetrics, CheckpointJournalRecord, CheckpointObjectProjection,
+    CheckpointObjectRecoveryRepresentation, CheckpointObjectRecoveryRow,
+    CheckpointTerminalRecoveryAuthority, ManualTerminalFinalizationIdentity, SealDueReason,
+    TerminalFinalizationComponent, TerminalFinalizationComponentKind, TerminalFinalizationIntent,
+    TerminalFinalizationLayout, TerminalFinalizationPrefixPlan, TerminalFinalizationProgress,
     TerminalFinalizationSidecarDirectoryEntry, TerminalFinalizationTrigger,
     TerminalIndexAuthorityReplayMetrics, TerminalIndexAuthoritySummary,
 };
@@ -88,3 +87,5 @@ pub use state::{
     CatalogResetReport, CatalogResetTapeReport, CatalogResetTapeState, StartupReplayReport,
     StateConfigWarning, StateHandle, TapeJournalIngestionOutcome,
 };
+
+pub use authority::{AuthorityCommit, AuthorityFinalization, AuthorityPrefixPlan, ObjectPayload};

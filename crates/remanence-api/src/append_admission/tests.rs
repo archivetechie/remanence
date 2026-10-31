@@ -811,8 +811,10 @@ fn encrypted_multiblock_cuts_are_torn_and_closed_corrupt_footer_refuses() {
 #[test]
 fn unused_fresh_session_abandonment_dispatches_nothing() {
     let root = tempfile::tempdir().unwrap();
-    let journal = remanence_state::FileCheckpointJournal::open(root.path(), UUID).unwrap();
-    let lease = journal.acquire_exclusive().unwrap();
+    let journal = remanence_state::authority::fixtures::AuthorityBuilder::new(root.path(), UUID)
+        .build()
+        .unwrap();
+    let mut lease = journal.acquire_exclusive().unwrap();
     let mut f = fixture();
     let _admission = admit_append_boundary(
         &mut f.drive,
@@ -820,8 +822,8 @@ fn unused_fresh_session_abandonment_dispatches_nothing() {
         context(UUID, SIZE, 0, 0),
     )
     .unwrap();
-    abandon_pending_append(&mut f.drive, &lease, None).unwrap();
+    abandon_pending_append(&mut f.drive, &mut lease).unwrap();
     assert_eq!(f.drive.media_write_dispatch_count(), 0);
     f.drive.clear_append_admission();
-    assert!(abandon_pending_append(&mut f.drive, &lease, None).is_err());
+    assert!(abandon_pending_append(&mut f.drive, &mut lease).is_err());
 }

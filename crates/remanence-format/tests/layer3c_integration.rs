@@ -16,8 +16,8 @@ use remanence_parity::{
     BlockSinkRawTapeSink, CommittedBundle, CommittedBundleKind, CommittedState, FilemarkMap,
     JournalError, ObjectParitySource, ObjectRecoveryRepresentation, ObjectRecoveryRow, OpenTrust,
     ParityError, ParityScheme, ParitySink, PhysicalPositionHint, RawReadOutcome, RawTapeSource,
-    SchemeId, ScopedFilemarkMap, SpaceFilemarksOutcome, TapeFileJournal, TapeFileMapEntry,
-    TapeFilePosition, TerminalTripleCloseInput, TerminalTripleObjectReservation,
+    SchemeId, ScopedFilemarkMap, SpaceFilemarksOutcome, TapeFileMapEntry, TapeFilePosition,
+    TapeReportPublisher, TerminalTripleCloseInput, TerminalTripleObjectReservation,
     DEFAULT_INDEX_SEPARATION_BYTES,
 };
 use sha2::{Digest, Sha256};
@@ -30,13 +30,19 @@ struct TestJournal {
     bundles: Vec<CommittedBundle>,
 }
 
-impl TapeFileJournal for TestJournal {
+impl TapeReportPublisher for TestJournal {
+    remanence_parity::fixture_publication_methods!();
     fn tape_uuid(&self) -> [u8; 16] {
         TAPE_UUID
     }
 
-    fn commit_bundle(&mut self, bundle: &CommittedBundle) -> Result<(), JournalError> {
-        self.bundles.push(bundle.clone());
+    fn publish_fixture(
+        &mut self,
+        report: &remanence_parity::authority::ShadowPublication,
+    ) -> Result<(), JournalError> {
+        for bundle in &report.bundles {
+            self.bundles.push(bundle.clone());
+        }
         Ok(())
     }
 

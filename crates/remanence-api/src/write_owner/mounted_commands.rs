@@ -6,6 +6,7 @@ use super::{
     WriteOwnerConfig,
 };
 use remanence_library::DriveHandle;
+use remanence_state::authority::TapeAuthorityView;
 use remanence_state::{AuditEvent, CatalogIndex};
 use tonic::Status;
 use uuid::Uuid;
@@ -229,11 +230,11 @@ pub(super) fn finalize(
     )?;
     with_evidence(index, cfg, drive, |index, drive| {
         let terminal = cfg.terminal_config();
-        let pending = remanence_state::FileCheckpointJournal::open(
+        let pending = remanence_state::TapeAuthority::open(
             &terminal.checkpoint_journal_dir,
             request.tape_uuid,
         )
-        .and_then(|journal| journal.terminal_finalization_intent())
+        .and_then(|journal| journal.pending_finalization())
         .map_err(crate::status_from_state_error)?;
         let (prefix, carried) = if pending.is_none()
             && tape.scheme_id.is_some()

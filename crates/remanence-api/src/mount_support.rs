@@ -6,6 +6,7 @@ use remanence_library::{
     AccessPolicy, DriveHandle, DriveHandleSource, DriveKey, LibraryHandle, MediaFamily,
     MediaReadiness, MediaReadinessWaitOptions, SgTransport, StaticAllowlist,
 };
+use remanence_state::authority::TapeAuthorityView;
 use remanence_state::{CatalogIndex, GenerationSource, LabelProvenance, StateHandle};
 use std::{
     fs::{File, OpenOptions},
@@ -1005,19 +1006,16 @@ impl OperatorMount<'_> {
         if !source_dir.is_dir() {
             return Err(refusal("import source has no checkpoints directory"));
         }
-        let source = remanence_state::FileCheckpointJournal::open(source_dir, mounted.tape_uuid)
-            .map_err(refusal)?;
-        if !std::fs::symlink_metadata(source.path())
-            .map_err(refusal)?
-            .is_file()
-        {
+        let source =
+            remanence_state::TapeAuthority::open(source_dir, mounted.tape_uuid).map_err(refusal)?;
+        if !source.is_regular_import_source().map_err(refusal)? {
             return Err(refusal(
                 "import checkpoint must be an existing regular file",
             ));
         }
         let _source_lease = source.acquire_exclusive().map_err(refusal)?;
         if _source_lease
-            .terminal_finalization_intent()
+            .pending_finalization()
             .map_err(refusal)?
             .is_some()
         {
@@ -1027,38 +1025,28 @@ impl OperatorMount<'_> {
         let staging = tempfile::tempdir_in(&journal_dir).map_err(refusal)?;
         let checkpoints = staging.path().join("checkpoints");
         std::fs::create_dir(&checkpoints).map_err(refusal)?;
-        let filename = source
-            .path()
-            .file_name()
-            .ok_or_else(|| refusal("checkpoint path has no filename"))?;
-        let staged_checkpoint = checkpoints.join(filename);
-        copy_authority(source.path(), &staged_checkpoint)?;
-        let staged = remanence_state::FileCheckpointJournal::open(&checkpoints, mounted.tape_uuid)
+        let checkpoint_publication = source
+            .stage_import_member(&checkpoints, &journal_dir.join("checkpoints"))
+            .map_err(refusal)?;
+        let staged = remanence_state::TapeAuthority::open(&checkpoints, mounted.tape_uuid)
             .map_err(refusal)?;
         let lease = staged.acquire_exclusive().map_err(refusal)?;
         let last = lease
-            .last_record_bounded()
+            .latest_commit()
             .map_err(refusal)?
             .ok_or_else(|| refusal("import requires a nonempty checkpoint journal"))?;
         let parity_for_projection = parity.clone();
         let mut publications = Vec::new();
         if let remanence_parity::ParityConfig::Scheme(scheme) = parity {
-            let name = self
-                .state
-                .journal_path(mounted.tape_uuid)
-                .file_name()
-                .unwrap()
-                .to_owned();
-            let path = staging.path().join(&name);
-            copy_authority(&from.join(&name), &path)?;
-            let journal = remanence_parity::FileTapeFileJournal::open(
-                &path,
+            let publication = remanence_state::authority::stage_structural_import(
+                from,
+                staging.path(),
+                &journal_dir,
                 mounted.tape_uuid,
-                block_size,
-                scheme,
             )
             .map_err(refusal)?;
-            let snapshot = journal.committed_snapshot_bounded().map_err(refusal)?;
+            let journal = lease.open_structural(block_size, scheme).map_err(refusal)?;
+            let snapshot = journal.freeze().map_err(refusal)?;
             let summary =
                 remanence_parity::checked_bounded_resume_summary(&snapshot).map_err(refusal)?;
             crate::pool_write::validate_parity_resume_checkpoint_authority(
@@ -1068,18 +1056,16 @@ impl OperatorMount<'_> {
                 summary.committed_tape_file_count,
             )
             .map_err(|e| refusal(format!("import journal authority: {e:?}")))?;
-            publications.push((path, journal_dir.join(name)));
+            publications.push(publication);
         } else {
-            remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_no_parity(
-                &lease,
-            )
-            .map_err(refusal)?;
+            remanence_state::TerminalIndexSource::new_replay_backed_no_parity(&lease)
+                .map_err(refusal)?;
         }
         let ctx = crate::append_admission::context(
             mounted.tape_uuid,
             block_size,
-            last.eod_partition,
-            last.eod_lba,
+            last.cursor.partition,
+            last.cursor.lba,
         );
         let _admission = crate::append_admission::admit_append_boundary(
             &mut mounted.drive,
@@ -1089,41 +1075,22 @@ impl OperatorMount<'_> {
         .map_err(refusal)?;
         let destination = journal_dir.join("checkpoints");
         std::fs::create_dir_all(&destination).map_err(refusal)?;
-        publications.push((staged_checkpoint, destination.join(filename)));
-        // Conflicts are detected before publishing either member of the pair.
-        for (source, dest) in &publications {
-            if dest.exists() && !same_authority(source, dest)? {
-                return Err(refusal(format!(
-                    "local journal {} differs; refusing overwrite",
-                    dest.display()
-                )));
-            }
-        }
-        for (source, dest) in publications {
-            if !dest.exists() {
-                std::fs::hard_link(source, &dest).map_err(refusal)?;
-                File::open(dest.parent().unwrap())
-                    .and_then(|f| f.sync_all())
-                    .map_err(refusal)?;
-            }
-        }
+        publications.push(checkpoint_publication);
+        remanence_state::authority::publish_import_authority(&publications).map_err(refusal)?;
         let parity_journal = match &parity_for_projection {
             remanence_parity::ParityConfig::None => None,
             remanence_parity::ParityConfig::Scheme(scheme) => Some(
-                remanence_parity::FileTapeFileJournal::open(
-                    self.state.journal_path(mounted.tape_uuid),
-                    mounted.tape_uuid,
-                    block_size,
-                    scheme.clone(),
-                )
-                .map_err(refusal)?,
+                remanence_state::TapeAuthority::open(&destination, mounted.tape_uuid)
+                    .map_err(refusal)?
+                    .open_structural(block_size, scheme.clone())
+                    .map_err(refusal)?,
             ),
         };
         self.state
             .catalog_index()
             .recover_imported_append_authority(
                 &lease,
-                parity_journal.as_ref(),
+                parity_journal.as_deref(),
                 mounted.endpoint.durable_key().expect("durable mount"),
             )
             .map_err(refusal)?;
@@ -1144,44 +1111,12 @@ impl OperatorMount<'_> {
         }
         self.state
             .catalog_index()
-            .project_checkpoint_record(&last)
+            .project_authority_commit(&last)
             .map_err(refusal)?;
         self.flush_audit()?;
         Ok(())
     }
 }
-/// Copy a regular authority file without following a final-component symlink.
-fn copy_authority(source: &Path, dest: &Path) -> Result<(), MountError> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut input = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(source)
-        .map_err(refusal)?;
-    if !input.metadata().map_err(refusal)?.is_file() {
-        return Err(refusal("journal authority must be a regular file"));
-    }
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(dest)
-        .map_err(refusal)?;
-    std::io::copy(&mut input, &mut output).map_err(refusal)?;
-    output.sync_all().map_err(refusal)
-}
-fn same_authority(a: &Path, b: &Path) -> Result<bool, MountError> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let digest = |path: &Path| {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
-            .map_err(refusal)?;
-        crate::sha256_reader(&mut file).map_err(refusal)
-    };
-    Ok(digest(a)? == digest(b)?)
-}
-
 /// Sync uncertainty evidence before projecting its tape and endpoint fence.
 pub(crate) fn raise_standalone_fence(
     state: &mut StateHandle,

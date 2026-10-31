@@ -658,14 +658,12 @@ impl RecordingJournal {
     }
 }
 
-impl TapeFileJournal for RecordingJournal {
+impl TapeReportPublisher for RecordingJournal {
+    crate::fixture_publication_methods!();
     // In-memory session journals have no durable resume authority to replay.
     fn session_resume_snapshot(
         &self,
-    ) -> Result<
-        Option<crate::journal::FileTapeFileJournalCommittedSnapshot>,
-        crate::journal::JournalError,
-    > {
+    ) -> Result<Option<crate::journal::FrozenFileRows>, crate::journal::JournalError> {
         Ok(None)
     }
 
@@ -673,11 +671,13 @@ impl TapeFileJournal for RecordingJournal {
         self.tape_uuid
     }
 
-    fn commit_bundle(
+    fn publish_fixture(
         &mut self,
-        bundle: &CommittedBundle,
+        report: &crate::authority::ShadowPublication,
     ) -> Result<(), crate::journal::JournalError> {
-        self.bundles.push(bundle.clone());
+        for bundle in &report.bundles {
+            self.bundles.push(bundle.clone());
+        }
         Ok(())
     }
 
@@ -929,19 +929,24 @@ fn unwritten_object_rollback_restores_detachable_session_state() {
 #[test]
 fn parity_attach_reports_record_failure_before_position() {
     struct BrokenJournal;
-    impl TapeFileJournal for BrokenJournal {
+    impl TapeReportPublisher for BrokenJournal {
+        crate::fixture_publication_methods!();
         fn tape_uuid(&self) -> [u8; 16] {
             sample_uuid()
         }
-        fn commit_bundle(&mut self, _: &CommittedBundle) -> Result<(), crate::JournalError> {
-            panic!("resume refusal must not commit")
+        fn publish_fixture(
+            &mut self,
+            report: &crate::authority::ShadowPublication,
+        ) -> Result<(), crate::JournalError> {
+            assert!(report.bundles.is_empty(), "resume refusal must not commit");
+            Ok(())
         }
         fn load_committed(&self) -> Result<crate::CommittedState, crate::JournalError> {
             panic!("resume must use bounded authority")
         }
         fn committed_snapshot_bounded_authority(
             &self,
-        ) -> Result<crate::FileTapeFileJournalCommittedSnapshot, crate::JournalError> {
+        ) -> Result<crate::FrozenFileRows, crate::JournalError> {
             Err(crate::JournalError::RecoveryRequired(
                 "torn resume record".into(),
             ))
@@ -5629,8 +5634,14 @@ fn checkpoint_handoffs_and_crash_rebuild_preserve_epoch_parity() {
     ] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("parity.journal");
-        let mut journal =
-            crate::FileTapeFileJournal::open(&path, sample_uuid(), BLOCK, scheme.clone()).unwrap();
+        let mut journal = crate::authority::fixtures::RowAuthorityBuilder::new(
+            &path,
+            sample_uuid(),
+            BLOCK,
+            scheme.clone(),
+        )
+        .build()
+        .unwrap();
         let mut raw = RecordingRawTapeSink::default();
         let identity =
             crate::WriterIdentity::fixed("test".into(), std::time::SystemTime::UNIX_EPOCH.into());
@@ -5676,9 +5687,14 @@ fn checkpoint_handoffs_and_crash_rebuild_preserve_epoch_parity() {
             }
             if mode == "reopen" || (mode == "rebuild" && number == 1) {
                 drop(journal);
-                journal =
-                    crate::FileTapeFileJournal::open(&path, sample_uuid(), BLOCK, scheme.clone())
-                        .unwrap();
+                journal = crate::authority::fixtures::RowAuthorityBuilder::new(
+                    &path,
+                    sample_uuid(),
+                    BLOCK,
+                    scheme.clone(),
+                )
+                .build()
+                .unwrap();
             }
             if mode == "rebuild" && number == 1 {
                 drop(state);
@@ -5737,7 +5753,7 @@ fn checkpoint_handoffs_and_crash_rebuild_preserve_epoch_parity() {
             )
             .unwrap();
             let result = rebuilt.plan.complete(Vec::new()).unwrap();
-            let saved = std::fs::read(&path).unwrap();
+            let saved = crate::authority::fixtures::save_authority(&journal).unwrap();
             let other = ParitySink::new_sidecar_only_from_bounded_resume(
                 &mut raw,
                 &mut journal,
@@ -5757,9 +5773,15 @@ fn checkpoint_handoffs_and_crash_rebuild_preserve_epoch_parity() {
                 .close_for_terminal_index(&plan, TerminalPrefixReconcileEvidence::Absent)
                 .unwrap();
             drop(journal);
-            std::fs::write(&path, saved).unwrap();
-            journal = crate::FileTapeFileJournal::open(&path, sample_uuid(), BLOCK, scheme.clone())
-                .unwrap();
+            saved.restore().unwrap();
+            journal = crate::authority::fixtures::RowAuthorityBuilder::new(
+                &path,
+                sample_uuid(),
+                BLOCK,
+                scheme.clone(),
+            )
+            .build()
+            .unwrap();
             if mode == "torn" {
                 let source = RecordingRawTapeSource::from_sink(&raw);
                 let block_index = source.records[..plan.start_lba as usize]
@@ -5803,10 +5825,20 @@ fn checkpoint_handoffs_and_crash_rebuild_preserve_epoch_parity() {
             }
         } else if mode == "orphan" {
             let state = sink.into_session_state().unwrap();
-            journal.commit_bundle(&plan.committed_bundle).unwrap();
-            drop(journal);
-            journal = crate::FileTapeFileJournal::open(&path, sample_uuid(), BLOCK, scheme.clone())
+            journal
+                .publish_fixture(&crate::authority::ShadowPublication::one(
+                    plan.committed_bundle.clone(),
+                ))
                 .unwrap();
+            drop(journal);
+            journal = crate::authority::fixtures::RowAuthorityBuilder::new(
+                &path,
+                sample_uuid(),
+                BLOCK,
+                scheme.clone(),
+            )
+            .build()
+            .unwrap();
             ParitySink::from_session_state_for_terminal_close(
                 &mut raw,
                 &mut journal,
@@ -5855,5 +5887,235 @@ fn checkpoint_handoffs_and_crash_rebuild_preserve_epoch_parity() {
         } else {
             reference = Some(sidecars);
         }
+    }
+}
+
+fn receipt_bundles(receipt: &crate::authority::PublicationReceipt) -> Vec<CommittedBundle> {
+    crate::authority::fixtures::appended_legacy_units(receipt)
+}
+
+#[test]
+fn shadow_reports_match_disk_bootstrap_object_checkpoint_and_prefix_units() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut authority = crate::authority::fixtures::RowAuthorityBuilder::new(
+        directory.path().join("fixture"),
+        sample_uuid(),
+        1024,
+        small_scheme(),
+    )
+    .build()
+    .unwrap();
+    let mut raw = RecordingRawTapeSink::default();
+    let mut reports = Vec::new();
+    {
+        let mut sink = ParitySink::new_with_journal(
+            &mut raw,
+            &mut authority,
+            small_scheme(),
+            sample_uuid(),
+            1024,
+            crate::WriterIdentity::fixed(
+                "shadow-test".into(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            ),
+        )
+        .unwrap();
+        let (number, bootstrap) = sink.write_bootstrap_report().unwrap();
+        assert_eq!(number, 0);
+        reports.extend(receipt_bundles(&bootstrap));
+        start_object(&mut sink, 19, 1024);
+        for value in 0..19 {
+            sink.write_block(&fixed_block(value + 1, 1024)).unwrap();
+        }
+        let object = sink.finish_object().unwrap();
+        assert_eq!(
+            receipt_bundles(&object.publication),
+            vec![object.committed_bundle().unwrap()]
+        );
+        assert!(object.publication.items[0]
+            .publication
+            .files
+            .iter()
+            .any(|file| file.kind == TapeFileKind::ParitySidecar));
+        reports.extend(receipt_bundles(&object.publication));
+        let checkpoint = sink.checkpoint().unwrap();
+        assert_eq!(receipt_bundles(&checkpoint.publication).len(), 1);
+        reports.extend(receipt_bundles(&checkpoint.publication));
+        drop(sink);
+        drop(authority);
+        authority = crate::authority::fixtures::RowAuthorityBuilder::new(
+            directory.path().join("fixture"),
+            sample_uuid(),
+            1024,
+            small_scheme(),
+        )
+        .build()
+        .unwrap();
+        let snapshot = authority.committed_snapshot_bounded().unwrap();
+        let summary = checked_bounded_resume_summary(&snapshot).unwrap();
+        let mut source = RecordingRawTapeSource::from_sink(&raw);
+        let rebuilt = crate::rebuild_open_epoch_from_bounded_summary(
+            &mut source,
+            &summary,
+            &small_scheme(),
+            sample_uuid(),
+            1024,
+        )
+        .unwrap();
+        let result = rebuilt.plan.complete(Vec::new()).unwrap();
+        let mut sink = ParitySink::new_sidecar_only_from_bounded_resume(
+            &mut raw,
+            &mut authority,
+            small_scheme(),
+            sample_uuid(),
+            1024,
+            BoundedResumeWriterSeed {
+                committed_prefix_snapshot: snapshot,
+                committed_prefix_summary: summary,
+                resume_result: &result,
+                live_epoch: rebuilt.live_epoch,
+            },
+            crate::WriterIdentity::fixed(
+                "shadow-test".into(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            ),
+        )
+        .unwrap();
+        start_object(&mut sink, 3, 1024);
+        for value in 0..3 {
+            sink.write_block(&fixed_block(value + 30, 1024)).unwrap();
+        }
+        let second_object = sink.finish_object().unwrap();
+        reports.extend(receipt_bundles(&second_object.publication));
+        reports.extend(receipt_bundles(&sink.checkpoint().unwrap().publication));
+        let closed = sink.close_open_epoch(CloseReason::Finish).unwrap();
+        assert_eq!(
+            receipt_bundles(&closed.publication).len(),
+            2,
+            "sidecar and watermark are separate legacy appends"
+        );
+        reports.extend(receipt_bundles(&closed.publication));
+        let plan = sink
+            .plan_terminal_index_close(crate::ParityMapDiagnostics {
+                writer_version: "shadow-test".into(),
+                write_timestamp: "1970-01-01T00:00:00Z".into(),
+            })
+            .unwrap();
+        let prefix = sink
+            .close_for_terminal_index(&plan, TerminalPrefixReconcileEvidence::Absent)
+            .unwrap();
+        assert_eq!(receipt_bundles(&prefix.publication).len(), 2);
+        reports.extend(receipt_bundles(&prefix.publication));
+    }
+    assert_eq!(reports, authority.published_units_for_test().unwrap());
+    let committed = authority.load_committed().unwrap();
+    assert_eq!(
+        committed.entries,
+        reports
+            .iter()
+            .flat_map(|unit| unit.entries.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        (
+            committed.highest_protected_ordinal,
+            committed.total_committed_ordinals
+        ),
+        (22, 22)
+    );
+}
+
+#[test]
+fn shadow_publication_preserves_bootstrap_object_sidecar_and_watermark_poisoning() {
+    struct RefusingPublisher {
+        inner: RecordingJournal,
+        refuse: CommittedBundleKind,
+    }
+    impl TapeReportPublisher for RefusingPublisher {
+        crate::fixture_publication_methods!();
+        fn tape_uuid(&self) -> [u8; 16] {
+            self.inner.tape_uuid()
+        }
+        fn session_resume_snapshot(
+            &self,
+        ) -> Result<Option<crate::FrozenFileRows>, crate::JournalError> {
+            Ok(None)
+        }
+        fn load_committed(&self) -> Result<crate::CommittedState, crate::JournalError> {
+            self.inner.load_committed()
+        }
+        fn publish_fixture(
+            &mut self,
+            report: &crate::authority::ShadowPublication,
+        ) -> Result<(), crate::JournalError> {
+            if report.bundles.iter().any(|unit| unit.kind == self.refuse) {
+                return Err(crate::JournalError::Codec("publication refusal".into()));
+            }
+            self.inner.publish_fixture(report)
+        }
+    }
+    for refused in [
+        CommittedBundleKind::BotBootstrap,
+        CommittedBundleKind::Object,
+        CommittedBundleKind::CheckpointSidecars,
+        CommittedBundleKind::TerminalPrefix,
+        CommittedBundleKind::CheckpointedThrough,
+    ] {
+        let mut raw = RecordingRawTapeSink::default();
+        let mut publisher = RefusingPublisher {
+            inner: RecordingJournal::new(sample_uuid()),
+            refuse: refused,
+        };
+        let mut sink = ParitySink::new_with_journal(
+            &mut raw,
+            &mut publisher,
+            small_scheme(),
+            sample_uuid(),
+            1024,
+            crate::WriterIdentity::fixed(
+                "shadow-poison".into(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            ),
+        )
+        .unwrap();
+        if refused == CommittedBundleKind::BotBootstrap {
+            assert!(sink.write_bootstrap_report().is_err());
+        } else {
+            sink.write_bootstrap_report().unwrap();
+            start_object(&mut sink, 3, 1024);
+            for value in 0..3 {
+                sink.write_block(&fixed_block(value + 1, 1024)).unwrap();
+            }
+            if refused == CommittedBundleKind::Object {
+                assert!(sink.finish_object().is_err());
+            } else {
+                sink.finish_object().unwrap();
+                if refused == CommittedBundleKind::TerminalPrefix {
+                    let plan = sink
+                        .plan_terminal_index_close(crate::ParityMapDiagnostics {
+                            writer_version: "shadow-poison".into(),
+                            write_timestamp: "1970-01-01T00:00:00Z".into(),
+                        })
+                        .unwrap();
+                    assert!(sink
+                        .close_for_terminal_index(&plan, TerminalPrefixReconcileEvidence::Absent)
+                        .is_err());
+                    // Terminal close consumes the sink, so failure returns no reusable
+                    // state. The original in-sink poison branch remains unchanged.
+                    assert_eq!(
+                        publisher.inner.bundles.len(),
+                        2,
+                        "failed prefix returns no publication and leaves only BOT/Object units"
+                    );
+                    continue;
+                }
+                assert!(sink.close_open_epoch(CloseReason::Finish).is_err());
+            }
+        }
+        assert_eq!(
+            sink.poisoned,
+            refused != CommittedBundleKind::CheckpointedThrough,
+            "B2 must preserve the old publication poison point for {refused:?}"
+        );
     }
 }

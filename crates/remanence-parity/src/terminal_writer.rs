@@ -531,6 +531,23 @@ pub struct TerminalComponentCommit {
     /// Canonical empty watermark record the callback appends immediately after
     /// [`Self::journal_bundle`] and before advancing checkpoint progress.
     pub checkpoint_bundle: CommittedBundle,
+    /// Actual durable publication outcomes returned by the authority callback.
+    pub publication: crate::authority::PublicationReceipt,
+}
+
+impl TerminalComponentCommit {
+    /// Files and counters proved by this component's media barrier.
+    pub fn media_publication(&self) -> crate::authority::FilePublication {
+        (&self.journal_bundle).into()
+    }
+}
+
+/// Describe a planned component without exposing a host-log record.
+pub fn terminal_component_publication(
+    plan: &TerminalTripleWritePlan,
+    component: TerminalTailComponentPlan,
+) -> Result<crate::authority::FilePublication, TerminalTailWriteError> {
+    terminal_component_bundle(plan, component).map(|bundle| (&bundle).into())
 }
 
 /// Durable progress and physical-reconciliation seam.
@@ -555,7 +572,7 @@ pub trait TerminalTailAuthority {
     /// supplied component bundle and following canonical checkpoint bundle
     /// durable, in that order, before advancing progress. The method returns
     /// only after the new progress is durable.
-    fn commit_after_barrier(&mut self, commit: &TerminalComponentCommit) -> Result<(), String>;
+    fn commit_after_barrier(&mut self, commit: &mut TerminalComponentCommit) -> Result<(), String>;
 }
 
 /// Successful one-step result or a typed no-motion recovery outcome.
@@ -797,7 +814,7 @@ where
         highest_protected_ordinal: journal_bundle.highest_protected_ordinal,
         total_committed_ordinals: journal_bundle.total_committed_ordinals,
     };
-    let commit = TerminalComponentCommit {
+    let mut commit = TerminalComponentCommit {
         previous_progress: progress,
         next_progress,
         component,
@@ -806,9 +823,10 @@ where
         rewrote_torn_component,
         journal_bundle,
         checkpoint_bundle,
+        publication: crate::authority::PublicationReceipt::default(),
     };
     authority
-        .commit_after_barrier(&commit)
+        .commit_after_barrier(&mut commit)
         .map_err(TerminalTailWriteError::Authority)?;
     let durable = authority
         .load_progress()
@@ -1431,7 +1449,10 @@ mod tests {
             Ok(self.evidence)
         }
 
-        fn commit_after_barrier(&mut self, commit: &TerminalComponentCommit) -> Result<(), String> {
+        fn commit_after_barrier(
+            &mut self,
+            commit: &mut TerminalComponentCommit,
+        ) -> Result<(), String> {
             if self.fail_commit_once {
                 self.fail_commit_once = false;
                 return Err("injected durable authority failure".to_string());

@@ -9,6 +9,9 @@ license = "Apache-2.0"
 publish.workspace = true
 repository  .workspace = true
 
+[features]
+fixtures = ["remanence-parity/fixtures"]
+
 [dependencies]
 remanence-library = { path = "../remanence-library" }
 remanence-parity = { path = "../remanence-parity" }
@@ -27,6 +30,8 @@ tracing   = { workspace = true }
 uuid      = { workspace = true, features = ["v5"] }
 
 [dev-dependencies]
+remanence-state = { path = ".", features = ["fixtures"] }
+remanence-parity = { path = "../remanence-parity", features = ["fixtures"] }
 tempfile = { workspace = true }
 
 [lints.rust]

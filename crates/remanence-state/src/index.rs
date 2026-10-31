@@ -22,14 +22,17 @@
 //! | `tape_audit_cursors.audit_sequence` | assignment/label replay | replay and rebuild | Audit order prevents an older request from becoming new intent. |
 //! | `tape_audit_cursors.record_uuid` | assignment/label replay | replay integrity checks | The durable event identity distinguishes a repeated event from conflicting authority. |
 
+use crate::authority::TapeAuthorityView as _;
+use remanence_parity::authority::{
+    FilePublication, FilePurpose, SidecarProvenance, StructuralState,
+};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 
 use remanence_parity::{
-    CommittedBundle, CommittedBundleKind, CommittedState, ObjectRecoveryRepresentation,
-    ParityConfig, ParityScheme, TapeFileEntry, TapeFileKind,
+    ObjectRecoveryRepresentation, ParityConfig, ParityScheme, TapeFileEntry, TapeFileKind,
 };
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
@@ -476,7 +479,7 @@ pub struct RebuildTapeJournalInput {
     /// Journal metadata needed by the SQLite projection.
     pub input: TapeJournalIndexInput,
     /// Committed state loaded from the journal by Layer 3c.
-    pub state: CommittedState,
+    pub state: StructuralState,
 }
 
 /// Report from rebuilding SQLite from authoritative audit and journal sources.
@@ -2150,10 +2153,10 @@ impl CatalogIndex {
     }
 
     /// Index one fully replayed 3c committed state.
-    pub fn index_committed_tape_journal(
+    pub fn index_structural_authority(
         &mut self,
         input: TapeJournalIndexInput,
-        state: &CommittedState,
+        state: &StructuralState,
     ) -> Result<TapeJournalIndexReport, StateError> {
         let updated_at = now_utc()?;
         let tx = self
@@ -2172,10 +2175,10 @@ impl CatalogIndex {
     /// at the commit boundary. This method updates the same rebuildable tables
     /// used by full tape-journal replay, without clearing earlier rows for the
     /// tape.
-    pub fn project_committed_tape_file_bundle(
+    pub fn project_file_publication(
         &mut self,
         input: TapeJournalIndexInput,
-        bundle: &CommittedBundle,
+        bundle: &FilePublication,
     ) -> Result<TapeJournalIndexReport, StateError> {
         let updated_at = now_utc()?;
         let tx = self
@@ -4190,7 +4193,7 @@ impl CatalogIndex {
         files: &[NativeObjectFileProjectionInput],
         copies: &[NativeObjectCopyProjectionInput],
         tape_input: TapeJournalIndexInput,
-        bundle: &CommittedBundle,
+        bundle: &FilePublication,
     ) -> Result<TapeJournalIndexReport, StateError> {
         let created_at_utc = match object.created_at_utc.as_deref() {
             Some(value) => value.to_string(),
@@ -4231,7 +4234,7 @@ impl CatalogIndex {
         files: &[NativeObjectFileProjectionInput],
         copies: &[NativeObjectCopyProjectionInput],
         tape_input: TapeJournalIndexInput,
-        bundle: &CommittedBundle,
+        bundle: &FilePublication,
     ) -> Result<TapeJournalIndexReport, StateError> {
         let created_at_utc = match object.created_at_utc.as_deref() {
             Some(value) => value.to_string(),
@@ -4263,22 +4266,22 @@ impl CatalogIndex {
     /// A fully projected record is idempotent. A compatible partial projection
     /// is repaired from the fsynced journal; only a contradictory SQLite view
     /// is corruption.
-    pub fn project_checkpoint_record(
+    pub fn project_authority_commit(
         &mut self,
-        record: &crate::checkpoint::CheckpointJournalRecord,
+        record: &crate::authority::AuthorityCommit,
     ) -> Result<(), StateError> {
-        let projections = &record.objects;
+        let projections = &record.payloads;
         if projections.is_empty() {
-            if record.sealed_after_write {
+            if record.sealed {
                 return self.project_terminal_checkpoint_record(record);
             }
-            if record.scheme.is_none() || record.barrier_bundle.is_none() {
+            if record.scheme.is_none() || record.barrier.is_none() {
                 return Err(StateError::IndexCorrupt(
                     "checkpoint record has no object projections or parity sidecars".into(),
                 ));
             }
         }
-        if record.scheme.is_some() && record.object_tape_file_bundles.len() != projections.len() {
+        if record.scheme.is_some() && record.object_files.len() != projections.len() {
             return Err(StateError::IndexCorrupt(
                 "parity checkpoint bundle count does not match object projection count".to_string(),
             ));
@@ -4320,7 +4323,7 @@ impl CatalogIndex {
                 checkpoint_object_bundle(record, projection_index, projection)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let barrier_bundle = record.barrier_bundle.as_ref();
+        let barrier_bundle = record.barrier.as_ref();
         validate_checkpoint_record_bundle_shape(record, &object_bundles, barrier_bundle)?;
 
         let updated_at = now_utc()?;
@@ -4335,11 +4338,11 @@ impl CatalogIndex {
             // written-extent column is monotonic-max over barrier-proved
             // EOD measurements and must still cover this record (a rebuilt
             // or migrated row may not carry it yet).
-            project_tape_written_extent_tx(&tx, record.tape_uuid, record.eod_lba)?;
+            project_tape_written_extent_tx(&tx, record.tape_uuid, record.cursor.lba)?;
             project_checkpoint_tape_seal_tx(
                 &tx,
                 record.tape_uuid,
-                record.sealed_after_write,
+                record.sealed,
                 record.seal_due,
                 updated_at.as_str(),
             )?;
@@ -4424,11 +4427,11 @@ impl CatalogIndex {
         // barrier, so trailing sidecars, parity maps and checkpoint files
         // are inside it by construction. It is updated after the bundle
         // projection has upserted the tape row.
-        project_tape_written_extent_tx(&tx, record.tape_uuid, record.eod_lba)?;
+        project_tape_written_extent_tx(&tx, record.tape_uuid, record.cursor.lba)?;
         project_checkpoint_tape_seal_tx(
             &tx,
             record.tape_uuid,
-            record.sealed_after_write,
+            record.sealed,
             record.seal_due,
             updated_at.as_str(),
         )?;
@@ -4447,16 +4450,16 @@ impl CatalogIndex {
 
     fn project_terminal_checkpoint_record(
         &mut self,
-        record: &crate::checkpoint::CheckpointJournalRecord,
+        record: &crate::authority::AuthorityCommit,
     ) -> Result<(), StateError> {
         self.project_structured_terminal_checkpoint_record(record)
     }
 
     fn project_structured_terminal_checkpoint_record(
         &mut self,
-        record: &crate::checkpoint::CheckpointJournalRecord,
+        record: &crate::authority::AuthorityCommit,
     ) -> Result<(), StateError> {
-        let finalization = record.terminal_finalization.as_ref().ok_or_else(|| {
+        let finalization = record.finalization.as_ref().ok_or_else(|| {
             StateError::IndexCorrupt(
                 "structured terminal checkpoint has no finalization authority".to_string(),
             )
@@ -4474,32 +4477,32 @@ impl CatalogIndex {
                 )
             })?;
         if finalization.progress != TerminalFinalizationProgress::AfterReplicaC
-            || finalization.layout.partition != record.eod_partition
+            || finalization.layout.partition != record.cursor.partition
             || finalization.layout.block_size != record.block_size
-            || finalization.layout.expected_eod_lba != record.eod_lba
+            || finalization.layout.expected_eod_lba != record.cursor.lba
             || record.scheme.is_some() != finalization.terminal_prefix.is_some()
         {
             return Err(StateError::IndexCorrupt(
                 "structured terminal checkpoint completion geometry is inconsistent".to_string(),
             ));
         }
-        let bundle = record.barrier_bundle.as_ref().ok_or_else(|| {
+        let bundle = record.barrier.as_ref().ok_or_else(|| {
             StateError::IndexCorrupt(
                 "structured terminal checkpoint has no replica-C bundle".to_string(),
             )
         })?;
-        remanence_parity::validate_committed_bundle_shape(bundle).map_err(|error| {
+        bundle.validate().map_err(|error| {
             StateError::IndexCorrupt(format!(
                 "structured terminal checkpoint has invalid replica-C bundle: {error}"
             ))
         })?;
-        if bundle.kind != CommittedBundleKind::TerminalComponent {
+        if bundle.purpose != FilePurpose::TerminalComponent {
             return Err(StateError::IndexCorrupt(format!(
                 "structured terminal checkpoint uses {:?} bundle kind",
-                bundle.kind
+                bundle.purpose
             )));
         }
-        let [entry] = bundle.entries.as_slice() else {
+        let [entry] = bundle.files.as_slice() else {
             return Err(StateError::IndexCorrupt(
                 "structured terminal checkpoint must name exactly replica C".to_string(),
             ));
@@ -4512,7 +4515,7 @@ impl CatalogIndex {
             || entry.block_count != replica_c.record_count
             || entry.physical_start_hint != Some(replica_c.start_lba)
             || entry.canonical_metadata_hash != Some(finalization.edition_digest)
-            || record.next_tape_file_number != expected_next_tape_file_number
+            || record.next_file != expected_next_tape_file_number
         {
             return Err(StateError::IndexCorrupt(
                 "structured terminal checkpoint does not bind final replica C".to_string(),
@@ -4530,7 +4533,7 @@ impl CatalogIndex {
             .map(|scheme| scheme.id.as_str().to_string());
         if tape.block_size != Some(u64::from(record.block_size))
             || tape.scheme_id != expected_scheme_id
-            || tape.total_committed_ordinals != bundle.total_committed_ordinals
+            || tape.total_committed_ordinals != bundle.total
         {
             return Err(StateError::IndexCorrupt(format!(
                 "structured terminal checkpoint geometry or scope conflicts with tape {}",
@@ -4557,12 +4560,12 @@ impl CatalogIndex {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| sqlite_error("begin structured terminal projection", error))?;
-        project_tape_written_extent_tx(&tx, record.tape_uuid, record.eod_lba)?;
+        project_tape_written_extent_tx(&tx, record.tape_uuid, record.cursor.lba)?;
         // The terminal checkpoint proves the final partial epoch as well as C.
         // Live projection and replay therefore advance the same safety watermark.
         tx.execute(
             "update tapes set highest_protected_ordinal = max(highest_protected_ordinal, ?2) where tape_uuid = ?1",
-            params![record.tape_uuid.as_slice(), SqliteU64::new(bundle.highest_protected_ordinal)],
+            params![record.tape_uuid.as_slice(), SqliteU64::new(bundle.protected)],
         ).map_err(|error| sqlite_error("project terminal protected watermark", error))?;
         project_terminal_finalization_tx(&tx, &input, updated_at.as_str())?;
         tx.commit()
@@ -4574,25 +4577,21 @@ impl CatalogIndex {
     /// An active quarantine or any terminal-finalization state remains a refusal.
     pub fn recover_imported_append_authority(
         &mut self,
-        checkpoint: &crate::FileCheckpointJournalLease,
-        parity: Option<&remanence_parity::FileTapeFileJournal>,
+        checkpoint: &crate::TapeAuthorityLease,
+        parity: Option<&dyn remanence_parity::authority::StructuralAuthority>,
         endpoint: &DriveKey,
     ) -> Result<(), StateError> {
         let source = match parity {
-            Some(parity) => {
-                crate::CheckpointTerminalIndexRecordSource::new_replay_backed(checkpoint, parity)?
-            }
-            None => {
-                crate::CheckpointTerminalIndexRecordSource::new_replay_backed_no_parity(checkpoint)?
-            }
+            Some(parity) => crate::TerminalIndexSource::new_replay_backed(checkpoint, parity)?,
+            None => crate::TerminalIndexSource::new_replay_backed_no_parity(checkpoint)?,
         };
         drop(source);
-        let last = checkpoint.last_record_bounded()?.ok_or_else(|| {
+        let last = checkpoint.latest_commit()?.ok_or_else(|| {
             StateError::TapeProvisionConflict("import requires checkpoint authority".into())
         })?;
-        if last.sealed_after_write
-            || last.terminal_finalization.is_some()
-            || checkpoint.terminal_finalization_intent()?.is_some()
+        if last.sealed
+            || last.finalization.is_some()
+            || checkpoint.pending_finalization()?.is_some()
         {
             return Err(StateError::TapeProvisionConflict(
                 "import cannot authorize a terminal tape".into(),
@@ -7986,15 +7985,11 @@ fn merge_preserved_tape_operator_columns_tx(
 fn index_committed_tape_journal_tx(
     tx: &rusqlite::Transaction<'_>,
     input: &TapeJournalIndexInput,
-    state: &CommittedState,
+    state: &StructuralState,
     updated_at: &str,
 ) -> Result<TapeJournalIndexReport, StateError> {
     let scheme = input.scheme.as_ref();
-    let last_committed_tape_file = state
-        .entries
-        .iter()
-        .map(|entry| entry.tape_file_number)
-        .max();
+    let last_committed_tape_file = state.files.iter().map(|entry| entry.tape_file_number).max();
     let last_committed_tape_file = last_committed_tape_file.map(SqliteU64::new);
     tx.execute(
         "insert into tapes(
@@ -8030,8 +8025,8 @@ fn index_committed_tape_journal_tx(
             scheme.map(|scheme| i64::from(scheme.data_blocks_per_stripe)),
             scheme.map(|scheme| i64::from(scheme.parity_blocks_per_stripe)),
             scheme.map(|scheme| i64::from(scheme.stripes_per_neighborhood)),
-            SqliteU64::new(state.highest_protected_ordinal),
-            SqliteU64::new(state.total_committed_ordinals),
+            SqliteU64::new(state.protected),
+            SqliteU64::new(state.total),
             last_committed_tape_file,
             updated_at,
         ],
@@ -8055,7 +8050,7 @@ fn index_committed_tape_journal_tx(
     .map_err(|err| sqlite_error("clear native catalog unit projection", err))?;
 
     let mut object_copies = 0u64;
-    for entry in &state.entries {
+    for entry in &state.files {
         insert_tape_file(tx, input.tape_uuid, entry)?;
         if entry.kind == TapeFileKind::Object {
             if let Some(object_id) = entry.object_id.as_ref() {
@@ -8070,7 +8065,7 @@ fn index_committed_tape_journal_tx(
                         first_parity_data_ordinal: entry.first_parity_data_ordinal,
                         protected_until_ordinal: entry
                             .first_parity_data_ordinal
-                            .map(|_| state.highest_protected_ordinal),
+                            .map(|_| state.protected),
                         status: "committed",
                         representation: envelope.representation,
                         recipient_epoch_ids: envelope.recipient_epoch_ids.as_deref(),
@@ -8112,7 +8107,7 @@ fn index_committed_tape_journal_tx(
 
     Ok(TapeJournalIndexReport {
         ingestion_pending: false,
-        tape_files_rebuilt: state.entries.len() as u64,
+        tape_files_rebuilt: state.files.len() as u64,
         object_copies_rebuilt: object_copies,
     })
 }
@@ -8374,13 +8369,13 @@ struct CheckpointTapeView {
 }
 
 fn checkpoint_object_bundle(
-    record: &crate::checkpoint::CheckpointJournalRecord,
+    record: &crate::authority::AuthorityCommit,
     projection_index: usize,
-    projection: &crate::checkpoint::CheckpointObjectProjection,
-) -> Result<CommittedBundle, StateError> {
+    projection: &crate::authority::ObjectPayload,
+) -> Result<FilePublication, StateError> {
     if record.scheme.is_some() {
         return record
-            .object_tape_file_bundles
+            .object_files
             .get(projection_index)
             .cloned()
             .ok_or_else(|| {
@@ -8422,11 +8417,14 @@ fn checkpoint_object_bundle(
         canonical_metadata_hash: None,
         object_recovery_row: None,
     });
-    Ok(CommittedBundle {
-        kind: CommittedBundleKind::Object,
-        entries,
-        highest_protected_ordinal: 0,
-        total_committed_ordinals: projection.total_committed_ordinals,
+    Ok(FilePublication {
+        purpose: FilePurpose::Object,
+        files: entries,
+        protected: 0,
+        total: projection.total_committed_ordinals,
+        cursor: None,
+        check: None,
+        seal_due: None,
     })
 }
 
@@ -8440,11 +8438,11 @@ fn checkpoint_object_bundle(
 /// write path captured forward — the same barrier proves both — so a
 /// checkpoint replay agrees with the live projection by construction.
 fn no_parity_checkpoint_object_start(
-    record: &crate::checkpoint::CheckpointJournalRecord,
+    record: &crate::authority::AuthorityCommit,
     projection_index: usize,
 ) -> Result<u64, StateError> {
-    let mut cursor = record.eod_lba;
-    for projection in record.objects[projection_index..].iter().rev() {
+    let mut cursor = record.cursor.lba;
+    for projection in record.payloads[projection_index..].iter().rev() {
         let file_records = projection.block_count.checked_add(1).ok_or_else(|| {
             StateError::IndexCorrupt(format!(
                 "checkpoint record tape={} ordinal={} object block span overflows u64",
@@ -8457,7 +8455,7 @@ fn no_parity_checkpoint_object_start(
                 "checkpoint record tape={} ordinal={} eod_lba {} does not cover its object spans",
                 hex_uuid(record.tape_uuid),
                 record.ordinal,
-                record.eod_lba
+                record.cursor.lba
             ))
         })?;
     }
@@ -8465,26 +8463,28 @@ fn no_parity_checkpoint_object_start(
 }
 
 fn validate_checkpoint_record_bundle_shape(
-    record: &crate::checkpoint::CheckpointJournalRecord,
-    object_bundles: &[CommittedBundle],
-    barrier_bundle: Option<&CommittedBundle>,
+    record: &crate::authority::AuthorityCommit,
+    object_bundles: &[FilePublication],
+    barrier_bundle: Option<&FilePublication>,
 ) -> Result<(), StateError> {
     let parity_layout = if record.scheme.is_some() {
         Some(
-            crate::checkpoint::validate_parity_barrier_bundles(record).map_err(|err| {
-                StateError::IndexCorrupt(format!(
-                    "checkpoint record tape={} ordinal={} has invalid parity bundles: {err}",
-                    hex_uuid(record.tape_uuid),
-                    record.ordinal
-                ))
-            })?,
+            crate::authority::validation::validate_parity_barrier_bundles(record).map_err(
+                |err| {
+                    StateError::IndexCorrupt(format!(
+                        "checkpoint record tape={} ordinal={} has invalid parity bundles: {err}",
+                        hex_uuid(record.tape_uuid),
+                        record.ordinal
+                    ))
+                },
+            )?,
         )
     } else {
         None
     };
     let mut last_new_tape_file: Option<u64> = None;
     let mut prior_total_committed_ordinals: Option<u64> = None;
-    for (projection, bundle) in record.objects.iter().zip(object_bundles) {
+    for (projection, bundle) in record.payloads.iter().zip(object_bundles) {
         if projection.block_size != record.block_size {
             return Err(StateError::IndexCorrupt(format!(
                 "checkpoint record tape={} ordinal={} object={} block size {} does not match record block size {}",
@@ -8504,17 +8504,17 @@ fn validate_checkpoint_record_bundle_shape(
                 projection.copy.status
             )));
         }
-        if bundle.kind != CommittedBundleKind::Object {
+        if bundle.purpose != FilePurpose::Object {
             return Err(StateError::IndexCorrupt(format!(
                 "checkpoint record tape={} ordinal={} object={} has non-Object bundle {:?}",
                 hex_uuid(record.tape_uuid),
                 record.ordinal,
                 projection.object.object_id,
-                bundle.kind
+                bundle.purpose
             )));
         }
-        let bundle_last = validate_dense_bundle_entries(&bundle.entries, record.tape_uuid)?;
-        let bundle_first = bundle.entries.first().ok_or_else(|| {
+        let bundle_last = validate_dense_bundle_entries(&bundle.files, record.tape_uuid)?;
+        let bundle_first = bundle.files.first().ok_or_else(|| {
             StateError::IndexCorrupt("checkpoint object bundle is empty".to_string())
         })?;
         if let Some(last) = last_new_tape_file {
@@ -8532,7 +8532,7 @@ fn validate_checkpoint_record_bundle_shape(
         }
         last_new_tape_file = Some(bundle_last.tape_file_number);
         let object_entries = bundle
-            .entries
+            .files
             .iter()
             .filter(|entry| entry.kind == TapeFileKind::Object)
             .collect::<Vec<_>>();
@@ -8562,13 +8562,13 @@ fn validate_checkpoint_record_bundle_shape(
                 format!("{object_entry:?}"),
             ));
         }
-        if bundle.total_committed_ordinals != projection.total_committed_ordinals {
+        if bundle.total != projection.total_committed_ordinals {
             return Err(StateError::IndexCorrupt(format!(
                 "checkpoint record tape={} ordinal={} object={} bundle watermark {} does not match projection watermark {}",
                 hex_uuid(record.tape_uuid),
                 record.ordinal,
                 projection.object.object_id,
-                bundle.total_committed_ordinals,
+                bundle.total,
                 projection.total_committed_ordinals
             )));
         }
@@ -8589,7 +8589,8 @@ fn validate_checkpoint_record_bundle_shape(
         prior_total_committed_ordinals = Some(projection.total_committed_ordinals);
         if projection.object_recovery_row.tape_file_number != projection.copy.tape_file_number
             || projection.object_recovery_row.stored_block_count != projection.block_count
-            || projection.object_recovery_row.object_id != projection.object.object_id.as_bytes()
+            || projection.object_recovery_row.object_id.as_deref()
+                != Some(projection.object.object_id.as_bytes())
         {
             return Err(checkpoint_projection_conflict(
                 record,
@@ -8639,13 +8640,13 @@ fn validate_checkpoint_record_bundle_shape(
             })?,
         None => expected_next_tape_file_number,
     };
-    if actual_next_tape_file_number != record.next_tape_file_number {
+    if actual_next_tape_file_number != record.next_file {
         return Err(StateError::IndexCorrupt(format!(
             "checkpoint record tape={} ordinal={} expected next tape file {}, got {}",
             hex_uuid(record.tape_uuid),
             record.ordinal,
             actual_next_tape_file_number,
-            record.next_tape_file_number
+            record.next_file
         )));
     }
     if parity_layout.is_none() && barrier_bundle.is_some() {
@@ -8660,9 +8661,9 @@ fn validate_checkpoint_record_bundle_shape(
 
 fn inspect_checkpoint_projection_tx(
     tx: &rusqlite::Transaction<'_>,
-    record: &crate::checkpoint::CheckpointJournalRecord,
-    object_bundles: &[CommittedBundle],
-    barrier_bundle: Option<&CommittedBundle>,
+    record: &crate::authority::AuthorityCommit,
+    object_bundles: &[FilePublication],
+    barrier_bundle: Option<&FilePublication>,
 ) -> Result<CheckpointReplayPlan, StateError> {
     let mut missing = false;
     let mut record_component_visible = false;
@@ -8673,10 +8674,9 @@ fn inspect_checkpoint_projection_tx(
     let authority_bundle = barrier_bundle
         .or_else(|| object_bundles.last())
         .ok_or_else(|| StateError::IndexCorrupt("checkpoint has no committed authority".into()))?;
-    let expected_last_committed_tape_file =
-        record.next_tape_file_number.checked_sub(1).ok_or_else(|| {
-            StateError::IndexCorrupt("checkpoint next tape-file number cannot be zero".into())
-        })?;
+    let expected_last_committed_tape_file = record.next_file.checked_sub(1).ok_or_else(|| {
+        StateError::IndexCorrupt("checkpoint next tape-file number cannot be zero".into())
+    })?;
     let expected_tape = CheckpointTapeView {
         block_size: Some(i64::from(record.block_size)),
         scheme_id: record
@@ -8695,8 +8695,8 @@ fn inspect_checkpoint_projection_tx(
             .scheme
             .as_ref()
             .map(|scheme| i64::from(scheme.stripes_per_neighborhood)),
-        highest_protected_ordinal: SqliteU64::new(authority_bundle.highest_protected_ordinal),
-        total_committed_ordinals: SqliteU64::new(authority_bundle.total_committed_ordinals),
+        highest_protected_ordinal: SqliteU64::new(authority_bundle.protected),
+        total_committed_ordinals: SqliteU64::new(authority_bundle.total),
         last_committed_tape_file: Some(SqliteU64::new(expected_last_committed_tape_file)),
         state: "ready".to_string(),
     };
@@ -8773,7 +8773,7 @@ fn inspect_checkpoint_projection_tx(
         None => missing = true,
     }
 
-    for projection in &record.objects {
+    for projection in &record.payloads {
         let expected_object = checkpoint_object_view(&projection.object)?;
         let actual_object = tx
             .query_row(
@@ -8995,11 +8995,11 @@ fn inspect_checkpoint_projection_tx(
 
     for entry in object_bundles
         .iter()
-        .flat_map(|bundle| bundle.entries.iter())
+        .flat_map(|bundle| bundle.files.iter())
         .chain(
             barrier_bundle
                 .into_iter()
-                .flat_map(|bundle| bundle.entries.iter()),
+                .flat_map(|bundle| bundle.files.iter()),
         )
     {
         let expected = checkpoint_tape_file_view(record.tape_uuid, entry)?;
@@ -9299,7 +9299,7 @@ fn optional_projection_conflicts<T: PartialEq>(expected: &Option<T>, actual: &Op
 }
 
 fn checkpoint_projection_conflict(
-    record: &crate::checkpoint::CheckpointJournalRecord,
+    record: &crate::authority::AuthorityCommit,
     component: &str,
     journal_view: String,
     sqlite_view: String,
@@ -9308,19 +9308,19 @@ fn checkpoint_projection_conflict(
         "checkpoint record tape={} ordinal={} batch={} component={component} conflicts with SQLite: journal={journal_view}; sqlite={sqlite_view}",
         hex_uuid(record.tape_uuid),
         record.ordinal,
-        hex_uuid(record.batch_id)
+        hex_uuid(record.operation_id)
     ))
 }
 
 fn project_committed_tape_file_bundle_tx(
     tx: &rusqlite::Transaction<'_>,
     input: &TapeJournalIndexInput,
-    bundle: &CommittedBundle,
+    bundle: &FilePublication,
     updated_at: &str,
 ) -> Result<TapeJournalIndexReport, StateError> {
     let scheme = input.scheme.as_ref();
     let last_committed_tape_file = bundle
-        .entries
+        .files
         .iter()
         .map(|entry| entry.tape_file_number)
         .max();
@@ -9379,8 +9379,8 @@ fn project_committed_tape_file_bundle_tx(
             scheme.map(|scheme| i64::from(scheme.data_blocks_per_stripe)),
             scheme.map(|scheme| i64::from(scheme.parity_blocks_per_stripe)),
             scheme.map(|scheme| i64::from(scheme.stripes_per_neighborhood)),
-            SqliteU64::new(bundle.highest_protected_ordinal),
-            SqliteU64::new(bundle.total_committed_ordinals),
+            SqliteU64::new(bundle.protected),
+            SqliteU64::new(bundle.total),
             last_committed_tape_file,
             updated_at,
         ],
@@ -9388,7 +9388,7 @@ fn project_committed_tape_file_bundle_tx(
     .map_err(|err| sqlite_error("upsert incremental tape projection", err))?;
 
     let mut object_copies = 0u64;
-    for entry in &bundle.entries {
+    for entry in &bundle.files {
         insert_tape_file(tx, input.tape_uuid, entry)?;
         if entry.kind == TapeFileKind::Object {
             if let Some(object_id) = entry.object_id.as_ref() {
@@ -9403,7 +9403,7 @@ fn project_committed_tape_file_bundle_tx(
                         first_parity_data_ordinal: entry.first_parity_data_ordinal,
                         protected_until_ordinal: entry
                             .first_parity_data_ordinal
-                            .map(|_| bundle.highest_protected_ordinal),
+                            .map(|_| bundle.protected),
                         status: "committed",
                         representation: envelope.representation,
                         recipient_epoch_ids: envelope.recipient_epoch_ids.as_deref(),
@@ -9428,7 +9428,7 @@ fn project_committed_tape_file_bundle_tx(
 
     Ok(TapeJournalIndexReport {
         ingestion_pending: false,
-        tape_files_rebuilt: bundle.entries.len() as u64,
+        tape_files_rebuilt: bundle.files.len() as u64,
         object_copies_rebuilt: object_copies,
     })
 }
@@ -9436,21 +9436,21 @@ fn project_committed_tape_file_bundle_tx(
 fn validate_append_bundle_extension_tx(
     tx: &rusqlite::Transaction<'_>,
     input: &TapeJournalIndexInput,
-    bundle: &CommittedBundle,
+    bundle: &FilePublication,
 ) -> Result<(), StateError> {
-    if bundle.kind != CommittedBundleKind::Object {
+    if bundle.purpose != FilePurpose::Object {
         return Err(StateError::IndexCorrupt(format!(
             "native object append projection for tape {} requires an Object bundle, got {:?}",
             hex_uuid(input.tape_uuid),
-            bundle.kind
+            bundle.purpose
         )));
     }
-    let first_entry = bundle.entries.first().ok_or_else(|| {
+    let first_entry = bundle.files.first().ok_or_else(|| {
         StateError::IndexMigrationFailed(
             "append commit bundle must contain at least one tape-file entry".to_string(),
         )
     })?;
-    let last_entry = validate_dense_bundle_entries(&bundle.entries, input.tape_uuid)?;
+    let last_entry = validate_dense_bundle_entries(&bundle.files, input.tape_uuid)?;
     let prefix = load_append_projection_prefix_tx(tx, input)?;
     validate_append_geometry(input, &prefix)?;
     if prefix.state != "ready" {
@@ -9477,20 +9477,20 @@ fn validate_append_bundle_extension_tx(
             first_entry.tape_file_number
         )));
     }
-    if bundle.highest_protected_ordinal < prefix.highest_protected_ordinal {
+    if bundle.protected < prefix.highest_protected_ordinal {
         return Err(StateError::IndexCorrupt(format!(
             "append projection for tape {} regressed highest_protected_ordinal from {} to {}",
             hex_uuid(input.tape_uuid),
             prefix.highest_protected_ordinal,
-            bundle.highest_protected_ordinal
+            bundle.protected
         )));
     }
-    if bundle.total_committed_ordinals < prefix.total_committed_ordinals {
+    if bundle.total < prefix.total_committed_ordinals {
         return Err(StateError::IndexCorrupt(format!(
             "append projection for tape {} regressed total_committed_ordinals from {} to {}",
             hex_uuid(input.tape_uuid),
             prefix.total_committed_ordinals,
-            bundle.total_committed_ordinals
+            bundle.total
         )));
     }
     let appended_object_ordinals = bundle_object_ordinals(bundle, input.tape_uuid)?;
@@ -9508,11 +9508,11 @@ fn validate_append_bundle_extension_tx(
                 "append projection total_committed_ordinals overflows u64".to_string(),
             )
         })?;
-    if bundle.total_committed_ordinals != expected_total_committed_ordinals {
+    if bundle.total != expected_total_committed_ordinals {
         return Err(StateError::IndexCorrupt(format!(
             "append projection for tape {} has total_committed_ordinals {}, expected {}",
             hex_uuid(input.tape_uuid),
-            bundle.total_committed_ordinals,
+            bundle.total,
             expected_total_committed_ordinals
         )));
     }
@@ -9545,28 +9545,28 @@ fn validate_append_bundle_extension_tx(
 fn validate_checkpoint_sidecar_extension_tx(
     tx: &rusqlite::Transaction<'_>,
     input: &TapeJournalIndexInput,
-    bundle: &CommittedBundle,
+    bundle: &FilePublication,
 ) -> Result<(), StateError> {
-    if bundle.kind != CommittedBundleKind::CheckpointSidecars {
+    if bundle.purpose != FilePurpose::Sidecars(SidecarProvenance::Fresh) {
         return Err(StateError::IndexCorrupt(format!(
             "checkpoint projection for tape {} requires a CheckpointSidecars bundle, got {:?}",
             hex_uuid(input.tape_uuid),
-            bundle.kind
+            bundle.purpose
         )));
     }
-    remanence_parity::validate_committed_bundle_shape(bundle).map_err(|err| {
+    bundle.validate().map_err(|err| {
         StateError::IndexCorrupt(format!(
             "checkpoint projection for tape {} has an invalid sidecar bundle: {err}",
             hex_uuid(input.tape_uuid)
         ))
     })?;
-    let first_entry = bundle.entries.first().ok_or_else(|| {
+    let first_entry = bundle.files.first().ok_or_else(|| {
         StateError::IndexCorrupt(format!(
             "checkpoint projection for tape {} has an empty sidecar bundle",
             hex_uuid(input.tape_uuid)
         ))
     })?;
-    let last_entry = validate_dense_bundle_entries(&bundle.entries, input.tape_uuid)?;
+    let last_entry = validate_dense_bundle_entries(&bundle.files, input.tape_uuid)?;
     let prefix = load_append_projection_prefix_tx(tx, input)?;
     validate_append_geometry(input, &prefix)?;
     if prefix.state != "ready" {
@@ -9592,14 +9592,14 @@ fn validate_checkpoint_sidecar_extension_tx(
             first_entry.tape_file_number
         )));
     }
-    if bundle.total_committed_ordinals != prefix.total_committed_ordinals {
+    if bundle.total != prefix.total_committed_ordinals {
         return Err(StateError::IndexCorrupt(format!(
             "checkpoint sidecar bundle for tape {} changed total committed ordinals",
             hex_uuid(input.tape_uuid)
         )));
     }
     if input.scheme.is_some() {
-        let expected_highest = crate::checkpoint::validate_sidecar_watermark_transition(
+        let expected_highest = crate::authority::validation::validate_sidecar_watermark_transition(
             prefix.highest_protected_ordinal,
             prefix.total_committed_ordinals,
             bundle,
@@ -9610,15 +9610,15 @@ fn validate_checkpoint_sidecar_extension_tx(
                 hex_uuid(input.tape_uuid)
             ))
         })?;
-        if bundle.highest_protected_ordinal != expected_highest {
+        if bundle.protected != expected_highest {
             return Err(StateError::IndexCorrupt(format!(
                 "checkpoint sidecar bundle for tape {} reports W={}, expected {expected_highest} from W={} and its sidecars",
                 hex_uuid(input.tape_uuid),
-                bundle.highest_protected_ordinal,
+                bundle.protected,
                 prefix.highest_protected_ordinal
             )));
         }
-    } else if bundle.highest_protected_ordinal != prefix.highest_protected_ordinal {
+    } else if bundle.protected != prefix.highest_protected_ordinal {
         return Err(StateError::IndexCorrupt(format!(
             "parity-off checkpoint sidecar bundle for tape {} changed its highest-protected ordinal",
             hex_uuid(input.tape_uuid)
@@ -9651,11 +9651,11 @@ fn validate_checkpoint_sidecar_extension_tx(
 }
 
 fn bundle_object_ordinals(
-    bundle: &CommittedBundle,
+    bundle: &FilePublication,
     tape_uuid: [u8; 16],
 ) -> Result<u64, StateError> {
     bundle
-        .entries
+        .files
         .iter()
         .filter(|entry| entry.kind == TapeFileKind::Object)
         .try_fold(0u64, |acc, entry| {
@@ -9791,12 +9791,12 @@ fn validate_append_geometry(
 fn validate_append_object_conflicts_tx(
     tx: &rusqlite::Transaction<'_>,
     input: &TapeJournalIndexInput,
-    bundle: &CommittedBundle,
+    bundle: &FilePublication,
     object: &NativeObjectProjectionInput,
     copies: &[NativeObjectCopyProjectionInput],
 ) -> Result<(), StateError> {
     let object_entries = bundle
-        .entries
+        .files
         .iter()
         .filter(|entry| entry.kind == TapeFileKind::Object)
         .collect::<Vec<_>>();
@@ -15393,6 +15393,7 @@ mod tests {
     };
 
     use super::*;
+    use remanence_parity::CommittedBundle;
 
     /// A competing writer is awaited before a transaction reads its update inputs.
     #[test]
@@ -16802,7 +16803,7 @@ mod tests {
                     scheme: Some(scheme),
                     journal_offset_bytes: 0,
                 },
-                &CommittedBundle {
+                &(&CommittedBundle {
                     kind: CommittedBundleKind::Object,
                     entries: vec![TapeFileEntry {
                         tape_file_number: 1,
@@ -16819,7 +16820,8 @@ mod tests {
                     }],
                     highest_protected_ordinal: 3,
                     total_committed_ordinals: 3,
-                },
+                })
+                    .into(),
             )
             .expect("project committed object");
 
@@ -20199,7 +20201,7 @@ mod tests {
                 &[],
                 &[RebuildTapeJournalInput {
                     input: input.clone(),
-                    state: state.clone(),
+                    state: (&state.clone()).into(),
                 }],
             )
             .expect("rebuild with retired tape journal");
@@ -20620,7 +20622,7 @@ mod tests {
                 &[],
                 &[append_copy_projection("append-object-1", tape_uuid, 1)],
                 input.clone(),
-                &CommittedBundle {
+                &(&CommittedBundle {
                     kind: CommittedBundleKind::Object,
                     entries: vec![
                         append_bootstrap_entry(),
@@ -20628,7 +20630,8 @@ mod tests {
                     ],
                     highest_protected_ordinal: 0,
                     total_committed_ordinals: 3,
-                },
+                })
+                    .into(),
             )
             .expect("project fresh no-parity append commit");
         assert_eq!(first_report.tape_files_rebuilt, 2);
@@ -20639,12 +20642,13 @@ mod tests {
                 &[],
                 &[append_copy_projection("append-object-2", tape_uuid, 2)],
                 input,
-                &CommittedBundle {
+                &(&CommittedBundle {
                     kind: CommittedBundleKind::Object,
                     entries: vec![append_object_entry("append-object-2", 2, 2)],
                     highest_protected_ordinal: 0,
                     total_committed_ordinals: 5,
-                },
+                })
+                    .into(),
             )
             .expect("project second no-parity append commit");
 
@@ -20736,10 +20740,11 @@ mod tests {
                 },
             },
         ];
-        let journal = crate::checkpoint::FileCheckpointJournal::open(
+        let journal = crate::authority::fixtures::AuthorityBuilder::new(
             temp.path().join("checkpoints"),
             tape_uuid,
         )
+        .build()
         .expect("open checkpoint journal");
 
         // Pre-first-barrier and mid-batch crashes have no journal record, so
@@ -20773,12 +20778,14 @@ mod tests {
             .objects
             .iter()
             .enumerate()
-            .map(|(i, object)| checkpoint_object_bundle(&record, i, object).unwrap())
+            .map(|(i, object)| {
+                checkpoint_object_bundle(&(&record).into(), i, &(object).into()).unwrap()
+            })
             .collect::<Vec<_>>();
         {
             let tx = index.conn.transaction().unwrap();
             assert_eq!(
-                inspect_checkpoint_projection_tx(&tx, &record, &bundles, None).unwrap(),
+                inspect_checkpoint_projection_tx(&tx, &(&record).into(), &bundles, None).unwrap(),
                 CheckpointReplayPlan::StrictAppend
             );
         }
@@ -20970,7 +20977,7 @@ mod tests {
                 &[],
                 &[append_copy_projection("span-object", tape_uuid, 1)],
                 no_parity_append_input(tape_uuid),
-                &CommittedBundle {
+                &(&CommittedBundle {
                     kind: CommittedBundleKind::Object,
                     entries: vec![
                         append_bootstrap_entry(),
@@ -20978,7 +20985,8 @@ mod tests {
                     ],
                     highest_protected_ordinal: 0,
                     total_committed_ordinals: 3,
-                },
+                })
+                    .into(),
             )
             .expect("seed pre-hint append prefix");
         let copies = index
@@ -21042,13 +21050,17 @@ mod tests {
         };
         // The old journal shape (no span hints) remains replayable at the exact
         // watermark even when all object rows have been lost during rebuild.
-        let bundles = vec![checkpoint_object_bundle(&record, 0, &record.objects[0]).unwrap()];
+        let bundles =
+            vec![
+                checkpoint_object_bundle(&(&record).into(), 0, &(&record.objects[0]).into())
+                    .unwrap(),
+            ];
         let original = index.get_native_object("span-object").unwrap().unwrap();
         index.conn.execute_batch("delete from object_copies; delete from objects; delete from tape_files; delete from catalog_units;").unwrap();
         {
             let tx = index.conn.transaction().unwrap();
             assert_eq!(
-                inspect_checkpoint_projection_tx(&tx, &record, &bundles, None).unwrap(),
+                inspect_checkpoint_projection_tx(&tx, &(&record).into(), &bundles, None).unwrap(),
                 CheckpointReplayPlan::Repair
             );
         }
@@ -21432,7 +21444,7 @@ mod tests {
                 &[],
                 &[append_copy_projection("append-seed", tape_uuid, 1)],
                 input.clone(),
-                &CommittedBundle {
+                &(&CommittedBundle {
                     kind: CommittedBundleKind::Object,
                     entries: vec![
                         append_bootstrap_entry(),
@@ -21440,7 +21452,8 @@ mod tests {
                     ],
                     highest_protected_ordinal: 0,
                     total_committed_ordinals: 3,
-                },
+                })
+                    .into(),
             )
             .expect("seed append prefix");
 
@@ -21450,12 +21463,13 @@ mod tests {
                 &[],
                 &[append_copy_projection("append-gap", tape_uuid, 3)],
                 input,
-                &CommittedBundle {
+                &(&CommittedBundle {
                     kind: CommittedBundleKind::Object,
                     entries: vec![append_object_entry("append-gap", 3, 2)],
                     highest_protected_ordinal: 0,
                     total_committed_ordinals: 5,
-                },
+                })
+                    .into(),
             )
             .expect_err("append projection must reject skipped tape file");
 
@@ -21503,7 +21517,7 @@ mod tests {
                 &[],
                 &[append_copy_projection("append-overlap", tape_uuid, 1)],
                 no_parity_append_input(tape_uuid),
-                &CommittedBundle {
+                &(&CommittedBundle {
                     kind: CommittedBundleKind::Object,
                     entries: vec![
                         append_bootstrap_entry(),
@@ -21511,7 +21525,8 @@ mod tests {
                     ],
                     highest_protected_ordinal: 0,
                     total_committed_ordinals: 3,
-                },
+                })
+                    .into(),
             )
             .expect_err("append projection must reject overlapping tape file");
 
@@ -21557,7 +21572,7 @@ mod tests {
                 &[],
                 &[append_copy_projection("append-ingested", tape_uuid, 1)],
                 no_parity_append_input(tape_uuid),
-                &CommittedBundle {
+                &(&CommittedBundle {
                     kind: CommittedBundleKind::Object,
                     entries: vec![
                         append_bootstrap_entry(),
@@ -21565,7 +21580,8 @@ mod tests {
                     ],
                     highest_protected_ordinal: 0,
                     total_committed_ordinals: 3,
-                },
+                })
+                    .into(),
             )
             .expect_err("append projection must reject non-ready tape state");
 
@@ -21616,7 +21632,7 @@ mod tests {
                 &[],
                 &[append_copy_projection("append-duplicate", tape_uuid, 1)],
                 no_parity_append_input(tape_uuid),
-                &CommittedBundle {
+                &(&CommittedBundle {
                     kind: CommittedBundleKind::Object,
                     entries: vec![
                         append_bootstrap_entry(),
@@ -21624,7 +21640,8 @@ mod tests {
                     ],
                     highest_protected_ordinal: 0,
                     total_committed_ordinals: 3,
-                },
+                })
+                    .into(),
             )
             .expect_err("append projection must reject duplicate object id");
 
@@ -21668,7 +21685,7 @@ mod tests {
                 &[],
                 &[append_copy_projection("append-bad-total", tape_uuid, 1)],
                 no_parity_append_input(tape_uuid),
-                &CommittedBundle {
+                &(&CommittedBundle {
                     kind: CommittedBundleKind::Object,
                     entries: vec![
                         append_bootstrap_entry(),
@@ -21676,7 +21693,8 @@ mod tests {
                     ],
                     highest_protected_ordinal: 0,
                     total_committed_ordinals: 99,
-                },
+                })
+                    .into(),
             )
             .expect_err("append projection must reject wrong total");
 
@@ -21720,7 +21738,7 @@ mod tests {
                 &[],
                 &[append_copy_projection("append-copy-mismatch", tape_uuid, 9)],
                 no_parity_append_input(tape_uuid),
-                &CommittedBundle {
+                &(&CommittedBundle {
                     kind: CommittedBundleKind::Object,
                     entries: vec![
                         append_bootstrap_entry(),
@@ -21728,7 +21746,8 @@ mod tests {
                     ],
                     highest_protected_ordinal: 0,
                     total_committed_ordinals: 3,
-                },
+                })
+                    .into(),
             )
             .expect_err("append projection must reject copy/bundle mismatch");
 
@@ -21806,7 +21825,7 @@ mod tests {
                     scheme: Some(scheme),
                     journal_offset_bytes: 0,
                 },
-                &CommittedBundle {
+                &(&CommittedBundle {
                     kind: CommittedBundleKind::Object,
                     entries: vec![TapeFileEntry {
                         tape_file_number: u64::MAX,
@@ -21823,7 +21842,8 @@ mod tests {
                     }],
                     highest_protected_ordinal: u64::MAX,
                     total_committed_ordinals: u64::MAX,
-                },
+                })
+                    .into(),
             )
             .expect("full-width bundle projection");
 
@@ -22177,7 +22197,7 @@ mod tests {
                     scheme: Some(scheme),
                     journal_offset_bytes: 0,
                 },
-                &CommittedBundle {
+                &(&CommittedBundle {
                     kind: CommittedBundleKind::Object,
                     entries: vec![TapeFileEntry {
                         tape_file_number: 2,
@@ -22194,7 +22214,8 @@ mod tests {
                     }],
                     highest_protected_ordinal: 31,
                     total_committed_ordinals: 4,
-                },
+                })
+                    .into(),
             )
             .expect("project encrypted object copy");
 
@@ -22548,7 +22569,7 @@ mod tests {
                 &[],
                 &[RebuildTapeJournalInput {
                     input,
-                    state: state.clone(),
+                    state: (&state.clone()).into(),
                 }],
             )
             .expect("rebuild");
@@ -22602,7 +22623,7 @@ mod tests {
                 &[],
                 &[RebuildTapeJournalInput {
                     input,
-                    state: state.clone(),
+                    state: (&state.clone()).into(),
                 }],
             )
             .expect("rebuild with preserved provisioning");
@@ -23078,7 +23099,7 @@ mod tests {
                 &[],
                 &[RebuildTapeJournalInput {
                     input,
-                    state: state.clone(),
+                    state: (&state.clone()).into(),
                 }],
             )
             .expect("initial rebuild");

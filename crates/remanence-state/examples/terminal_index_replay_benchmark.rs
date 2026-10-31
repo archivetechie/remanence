@@ -10,10 +10,9 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use remanence_parity::TapeIndexReplicaRecordSource;
+use remanence_state::authority::TapeAuthorityWriter;
 use remanence_state::{
-    CheckpointJournalRecord, CheckpointObjectProjection, CheckpointObjectRecoveryRepresentation,
-    CheckpointObjectRecoveryRow, CheckpointTerminalIndexRecordSource, FileCheckpointJournal,
-    NativeObjectCopyProjectionInput, NativeObjectProjectionInput,
+    NativeObjectCopyProjectionInput, NativeObjectProjectionInput, TerminalIndexSource,
 };
 use serde_json::json;
 
@@ -39,7 +38,7 @@ fn checked_arg(args: &[String], index: usize, default: u64, name: &str) -> Resul
 fn checkpoint_record(
     tape_uuid: [u8; 16],
     zero_based_index: u64,
-) -> Result<CheckpointJournalRecord, String> {
+) -> Result<remanence_state::authority::AuthorityCommit, String> {
     let ordinal = zero_based_index
         .checked_add(1)
         .ok_or_else(|| "checkpoint ordinal overflow".to_string())?;
@@ -57,63 +56,72 @@ fn checkpoint_record(
     let object_uuid = uuid::Uuid::from_u128(u128::from(ordinal));
     let object_id = object_uuid.to_string();
 
-    Ok(CheckpointJournalRecord {
-        ordinal,
-        committed_object_count: ordinal,
-        eod_partition: 0,
-        eod_lba,
-        tape_uuid,
-        batch_id: u128::from(ordinal).to_be_bytes(),
-        next_tape_file_number,
-        block_size: BLOCK_SIZE,
-        objects: vec![CheckpointObjectProjection {
-            object: NativeObjectProjectionInput {
-                object_id: object_id.clone(),
-                caller_object_id: Some(format!("terminal-benchmark-{ordinal}")),
-                body_format: "rem-object-v1".to_string(),
-                logical_size_bytes: Some(1),
-                content_hash: Some(vec![0x11; 32]),
-                metadata_hash: Some(vec![0x22; 32]),
-                created_at_utc: Some("2026-08-09T00:00:00Z".to_string()),
-            },
-            files: Vec::new(),
-            copy: NativeObjectCopyProjectionInput {
-                object_id: object_id.clone(),
-                tape_uuid,
-                tape_file_number: object_tape_file_number,
-                first_body_lba: 0,
-                first_parity_data_ordinal: None,
-                protected_until_ordinal: None,
-                status: "committed".to_string(),
-                representation: "plaintext".to_string(),
-                recipient_epoch_ids: None,
-                metadata_frame_len: None,
-                plaintext_digest: Some(vec![0x33; 32]),
-                stored_digest: Some(vec![0x33; 32]),
-            },
+    Ok(remanence_state::authority::complete_commit(
+        remanence_state::authority::AuthorityCommit {
+            ordinal,
+            object_count: ordinal,
+            tape_uuid,
+            operation_id: u128::from(ordinal).to_be_bytes(),
+            next_file: next_tape_file_number,
             block_size: BLOCK_SIZE,
-            block_count: OBJECT_BLOCKS,
-            fresh_tape: ordinal == 1,
-            total_committed_ordinals,
-            object_recovery_row: CheckpointObjectRecoveryRow {
-                tape_file_number: object_tape_file_number,
-                stored_block_count: OBJECT_BLOCKS,
-                object_id: object_id.into_bytes(),
-                representation: CheckpointObjectRecoveryRepresentation::Plaintext {
-                    manifest_first_chunk_lba: 1,
-                    manifest_size_bytes: 1,
-                    manifest_chunk_count: 1,
-                    manifest_sha256: [0x44; 32],
+            payloads: vec![remanence_state::authority::ObjectPayload {
+                files: Vec::new(),
+                projection: remanence_state::tape_log::payload::CommittedObjectProjection {
+                    object: NativeObjectProjectionInput {
+                        object_id: object_id.clone(),
+                        caller_object_id: Some(format!("terminal-benchmark-{ordinal}")),
+                        body_format: "rem-object-v1".to_string(),
+                        logical_size_bytes: Some(1),
+                        content_hash: Some(vec![0x11; 32]),
+                        metadata_hash: Some(vec![0x22; 32]),
+                        created_at_utc: Some("2026-08-09T00:00:00Z".to_string()),
+                    },
+                    copy: NativeObjectCopyProjectionInput {
+                        object_id: object_id.clone(),
+                        tape_uuid,
+                        tape_file_number: object_tape_file_number,
+                        first_body_lba: 0,
+                        first_parity_data_ordinal: None,
+                        protected_until_ordinal: None,
+                        status: "committed".to_string(),
+                        representation: "plaintext".to_string(),
+                        recipient_epoch_ids: None,
+                        metadata_frame_len: None,
+                        plaintext_digest: Some(vec![0x33; 32]),
+                        stored_digest: Some(vec![0x33; 32]),
+                    },
+                    block_size: BLOCK_SIZE,
+                    block_count: OBJECT_BLOCKS,
+                    fresh_tape: ordinal == 1,
+                    total_committed_ordinals,
+                    object_recovery_row: remanence_parity::ObjectRecoveryRow {
+                        tape_file_number: object_tape_file_number,
+                        stored_block_count: OBJECT_BLOCKS,
+                        object_id: Some(object_id.into_bytes()),
+                        representation: remanence_parity::ObjectRecoveryRepresentation::Plaintext {
+                            manifest_first_chunk_lba: 1,
+                            manifest_size_bytes: 1,
+                            manifest_chunk_count: 1,
+                            manifest_sha256: [0x44; 32],
+                        },
+                    },
                 },
+            }],
+            scheme: None,
+            object_files: (Vec::new()).iter().map(Into::into).collect(),
+            barrier: (None).as_ref().map(Into::into),
+            finalization: None,
+            sealed: false,
+            seal_due: None,
+            cursor: remanence_parity::CommitCursor {
+                partition: 0,
+                lba: eod_lba,
             },
-        }],
-        scheme: None,
-        object_tape_file_bundles: Vec::new(),
-        barrier_bundle: None,
-        terminal_finalization: None,
-        sealed_after_write: false,
-        seal_due: None,
-    })
+            protected: 0,
+            total: 0,
+            check: None,
+        },
+    ))
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -126,7 +134,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let directory = tempfile::tempdir()?;
     let tape_uuid = [0xB7; 16];
-    let journal = FileCheckpointJournal::open(directory.path(), tape_uuid)?;
+    let journal =
+        remanence_state::authority::fixtures::AuthorityBuilder::new(directory.path(), tape_uuid)
+            .build()?;
     let mut lease = journal.acquire_exclusive()?;
     let mut next_index = 0u64;
     while next_index < object_count {
@@ -138,12 +148,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         for zero_based_index in next_index..batch_end {
             batch.push(checkpoint_record(tape_uuid, zero_based_index)?);
         }
-        lease.append_batch(&batch)?;
+        lease.publish_reports(&batch)?;
         next_index = batch_end;
     }
 
     let setup_started = Instant::now();
-    let mut source = CheckpointTerminalIndexRecordSource::new_replay_backed_no_parity(&lease)?;
+    let mut source = TerminalIndexSource::new_replay_backed_no_parity(&lease)?;
     let setup_elapsed = setup_started.elapsed();
     let summary = source.summary();
     let metrics = source

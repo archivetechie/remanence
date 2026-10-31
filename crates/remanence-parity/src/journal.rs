@@ -17,19 +17,22 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+pub use crate::authority::FrozenFileRows;
+use crate::authority::PublicationDisposition::{self, AlreadyPresent, Appended};
+use crate::authority::{CommittedFileRows, FileRowCursor};
 use ciborium::value::Value as CborValue;
 use nix::fcntl::{Flock, FlockArg};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::cbor::IntegerMapKeyTracker;
+#[cfg(test)]
 use crate::error::ParityError;
-use crate::filemark_map::{FilemarkMap, TapeFileKind, TapeFileMapEntry};
-use crate::mapping::data_shards_per_epoch;
+use crate::filemark_map::TapeFileKind;
+#[cfg(test)]
+use crate::filemark_map::{FilemarkMap, TapeFileMapEntry};
 use crate::model::ParityScheme;
 use crate::object_recovery::{
     decode_object_recovery_row_cbor, encode_object_recovery_row_cbor, validate_object_recovery_row,
-    ObjectRecoveryRow,
 };
 use crate::sidecar::crc64_xz;
 
@@ -76,349 +79,10 @@ impl JournalError {
     }
 }
 
-/// One journaled tape-file row inside a committed bundle.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub struct TapeFileEntry {
-    /// Dense filemark-delimited tape-file number.
-    pub tape_file_number: u64,
-    /// Structural file kind.
-    pub kind: TapeFileKind,
-    /// Fixed-block count before the trailing filemark.
-    pub block_count: u64,
-    /// Advisory physical LOCATE hint. Map validation never trusts this alone.
-    pub physical_start_hint: Option<u64>,
-    /// Optional higher-layer object identifier. Layer 3c does not interpret it.
-    pub object_id: Option<String>,
-    /// First parity data ordinal for object tape files.
-    pub first_parity_data_ordinal: Option<u64>,
-    /// Epoch ID for parity-sidecar rows.
-    pub epoch_id: Option<u64>,
-    /// First protected ordinal for parity-sidecar rows.
-    pub protected_ordinal_start: Option<u64>,
-    /// End-exclusive protected ordinal for parity-sidecar rows.
-    pub protected_ordinal_end_exclusive: Option<u64>,
-    /// Canonical metadata hash for sidecar or parity_map control files.
-    pub canonical_metadata_hash: Option<[u8; 32]>,
-    /// Optional higher-layer recovery row for object tape files.
-    pub object_recovery_row: Option<ObjectRecoveryRow>,
-}
-
-impl TapeFileEntry {
-    /// Convert the structural part of a filemark-map row into a journal row.
-    pub fn from_map_entry(entry: TapeFileMapEntry) -> Self {
-        Self {
-            tape_file_number: entry.tape_file_number,
-            kind: entry.kind,
-            block_count: entry.block_count,
-            physical_start_hint: None,
-            object_id: None,
-            first_parity_data_ordinal: entry.first_parity_data_ordinal,
-            epoch_id: entry.epoch_id,
-            protected_ordinal_start: entry.protected_ordinal_start,
-            protected_ordinal_end_exclusive: entry.protected_ordinal_end_exclusive,
-            canonical_metadata_hash: None,
-            object_recovery_row: None,
-        }
-    }
-
-    /// Return the structural filemark-map row represented by this journal row.
-    pub fn to_map_entry(&self) -> TapeFileMapEntry {
-        TapeFileMapEntry {
-            tape_file_number: self.tape_file_number,
-            kind: self.kind,
-            block_count: self.block_count,
-            first_parity_data_ordinal: self.first_parity_data_ordinal,
-            protected_ordinal_start: self.protected_ordinal_start,
-            protected_ordinal_end_exclusive: self.protected_ordinal_end_exclusive,
-            epoch_id: self.epoch_id,
-        }
-    }
-}
-
-impl From<TapeFileMapEntry> for TapeFileEntry {
-    fn from(entry: TapeFileMapEntry) -> Self {
-        Self::from_map_entry(entry)
-    }
-}
-
-/// Operational kind for one atomic committed bundle.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub enum CommittedBundleKind {
-    /// Object tape file plus the sidecars it completed.
-    Object,
-    /// The sole tape-file-0 BOT Bootstrap.
-    BotBootstrap,
-    /// Sidecars emitted while closing a checkpoint epoch.
-    CheckpointSidecars,
-    /// Sidecars generated during restart append recovery.
-    ResumeSidecars,
-    /// Final partial sidecars and optional external ParityMap immediately
-    /// before terminal replica A. This replacement grammar never includes a
-    /// legacy final Bootstrap.
-    TerminalPrefix,
-    /// Exactly one barrier-proved A/gap-AB/B/gap-BC/C component.
-    TerminalComponent,
-    /// Watermark proving that all preceding bundles were projected by the
-    /// shared checkpoint barrier.
-    CheckpointedThrough,
-}
-
-/// One atomic journal commit unit.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub struct CommittedBundle {
-    /// Operational bundle kind.
-    pub kind: CommittedBundleKind,
-    /// Tape-file rows made durable by this commit, in ascending tape-file
-    /// order.
-    pub entries: Vec<TapeFileEntry>,
-    /// Protection watermark after this bundle.
-    pub highest_protected_ordinal: u64,
-    /// Total committed object-data ordinals after this bundle.
-    pub total_committed_ordinals: u64,
-}
-
-/// Structural grammar violation in one committed tape-file bundle.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("invalid {kind:?} committed bundle: {detail}")]
-pub struct CommittedBundleShapeError {
-    kind: CommittedBundleKind,
-    detail: String,
-}
-
-impl CommittedBundleShapeError {
-    fn new(kind: CommittedBundleKind, detail: impl Into<String>) -> Self {
-        Self {
-            kind,
-            detail: detail.into(),
-        }
-    }
-}
-
-/// Validate the current-wire entry grammar for one committed bundle.
-///
-/// Object bundles contain their Object first followed only by completed
-/// sidecars. The sole BOT Bootstrap, checkpoint sidecars, restart sidecars,
-/// and terminal components each use distinct exact grammars.
-pub fn validate_committed_bundle_shape(
-    bundle: &CommittedBundle,
-) -> Result<Option<&TapeFileEntry>, CommittedBundleShapeError> {
-    validate_dense_entry_numbers(bundle)?;
-    match bundle.kind {
-        CommittedBundleKind::Object => {
-            let Some((object, tail)) = bundle.entries.split_first() else {
-                return Err(CommittedBundleShapeError::new(
-                    bundle.kind,
-                    "must contain an Object entry",
-                ));
-            };
-            if object.kind != TapeFileKind::Object {
-                return Err(CommittedBundleShapeError::new(
-                    bundle.kind,
-                    format!("must start with Object, got {:?}", object.kind),
-                ));
-            }
-            validate_sidecar_prefix(bundle.kind, tail)?;
-            Ok(None)
-        }
-        CommittedBundleKind::BotBootstrap => {
-            let [entry] = bundle.entries.as_slice() else {
-                return Err(CommittedBundleShapeError::new(
-                    bundle.kind,
-                    "must contain exactly one Bootstrap",
-                ));
-            };
-            if entry.tape_file_number != 0
-                || entry.kind != TapeFileKind::Bootstrap
-                || entry.block_count != 1
-            {
-                return Err(CommittedBundleShapeError::new(
-                    bundle.kind,
-                    "must contain the one-block tape-file-0 BOT Bootstrap",
-                ));
-            }
-            Ok(Some(entry))
-        }
-        CommittedBundleKind::TerminalPrefix => {
-            validate_terminal_prefix(bundle.kind, &bundle.entries)?;
-            Ok(None)
-        }
-        CommittedBundleKind::TerminalComponent => {
-            if !validate_terminal_control_component(bundle.kind, &bundle.entries)? {
-                return Err(CommittedBundleShapeError::new(
-                    bundle.kind,
-                    "must contain exactly one terminal index or separation component",
-                ));
-            }
-            Ok(None)
-        }
-        CommittedBundleKind::CheckpointSidecars | CommittedBundleKind::ResumeSidecars => {
-            if bundle.entries.is_empty() {
-                return Err(CommittedBundleShapeError::new(
-                    bundle.kind,
-                    "must contain at least one ParitySidecar",
-                ));
-            }
-            validate_sidecar_prefix(bundle.kind, &bundle.entries)?;
-            Ok(None)
-        }
-        CommittedBundleKind::CheckpointedThrough => {
-            if !bundle.entries.is_empty() {
-                return Err(CommittedBundleShapeError::new(
-                    bundle.kind,
-                    "must not contain tape-file entries",
-                ));
-            }
-            Ok(None)
-        }
-    }
-}
-
-fn validate_terminal_prefix(
-    kind: CommittedBundleKind,
-    entries: &[TapeFileEntry],
-) -> Result<(), CommittedBundleShapeError> {
-    let sidecars = match entries.split_last() {
-        Some((last, sidecars)) if last.kind == TapeFileKind::ParityMap => sidecars,
-        _ => entries,
-    };
-    validate_sidecar_prefix(kind, sidecars)
-}
-
-fn validate_terminal_control_component(
-    kind: CommittedBundleKind,
-    entries: &[TapeFileEntry],
-) -> Result<bool, CommittedBundleShapeError> {
-    let [entry] = entries else {
-        return Ok(false);
-    };
-    if !matches!(
-        entry.kind,
-        TapeFileKind::TapeIndexReplica | TapeFileKind::IndexSeparationExtent
-    ) {
-        return Ok(false);
-    }
-    if entry.block_count == 0 {
-        return Err(CommittedBundleShapeError::new(
-            kind,
-            format!(
-                "terminal {:?} at tape file {} has zero blocks",
-                entry.kind, entry.tape_file_number
-            ),
-        ));
-    }
-    if entry.object_id.is_some()
-        || entry.first_parity_data_ordinal.is_some()
-        || entry.epoch_id.is_some()
-        || entry.protected_ordinal_start.is_some()
-        || entry.protected_ordinal_end_exclusive.is_some()
-        || entry.object_recovery_row.is_some()
-    {
-        return Err(CommittedBundleShapeError::new(
-            kind,
-            format!(
-                "terminal {:?} at tape file {} has invalid kind-specific fields",
-                entry.kind, entry.tape_file_number
-            ),
-        ));
-    }
-    Ok(true)
-}
-
-fn validate_dense_entry_numbers(bundle: &CommittedBundle) -> Result<(), CommittedBundleShapeError> {
-    for pair in bundle.entries.windows(2) {
-        let expected = pair[0].tape_file_number.checked_add(1).ok_or_else(|| {
-            CommittedBundleShapeError::new(bundle.kind, "tape-file number overflows u64")
-        })?;
-        if pair[1].tape_file_number != expected {
-            return Err(CommittedBundleShapeError::new(
-                bundle.kind,
-                format!(
-                    "entries are not dense: expected tape file {expected}, got {}",
-                    pair[1].tape_file_number
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_sidecar_prefix(
-    kind: CommittedBundleKind,
-    entries: &[TapeFileEntry],
-) -> Result<(), CommittedBundleShapeError> {
-    if let Some(entry) = entries
-        .iter()
-        .find(|entry| entry.kind != TapeFileKind::ParitySidecar)
-    {
-        return Err(CommittedBundleShapeError::new(
-            kind,
-            format!(
-                "unexpected {:?} entry at tape file {}",
-                entry.kind, entry.tape_file_number
-            ),
-        ));
-    }
-    Ok(())
-}
-
-/// Replay result for the committed prefix stored in a journal.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CommittedState {
-    /// Committed tape-file rows in ascending tape-file order.
-    pub entries: Vec<TapeFileEntry>,
-    /// Highest protected ordinal `W`.
-    pub highest_protected_ordinal: u64,
-    /// Total committed object-data ordinals `T`.
-    pub total_committed_ordinals: u64,
-    /// Valid bundles after the last checkpoint watermark. These records are
-    /// excluded from `entries` and the committed watermarks.
-    pub orphaned_bundles: Vec<CommittedBundle>,
-}
-
-impl CommittedState {
-    /// Build the structural filemark map for this committed prefix.
-    pub fn filemark_map(&self) -> Result<FilemarkMap, ParityError> {
-        FilemarkMap::new(
-            self.entries
-                .iter()
-                .map(TapeFileEntry::to_map_entry)
-                .collect(),
-        )
-    }
-
-    /// Validate the v0.7.2 restart invariant for a committed prefix.
-    ///
-    /// A full epoch auto-closes, so restart only has to rebuild the one open
-    /// explicit range after `W`. This bound does not imply that `W` is aligned
-    /// to `S*k`: a prior barrier may have closed a short epoch at any ordinal.
-    /// If `T - W` reaches a full epoch, the auto-close invariant was violated
-    /// and the journal must not be resumed in production mode.
-    pub fn validate_v1_restart_bound(&self, scheme: &ParityScheme) -> Result<(), ParityError> {
-        if self.highest_protected_ordinal > self.total_committed_ordinals {
-            return Err(ParityError::ResumeAppend(format!(
-                "journal committed state is incoherent: W={} exceeds T={}",
-                self.highest_protected_ordinal, self.total_committed_ordinals
-            )));
-        }
-        let live_ordinals = self
-            .total_committed_ordinals
-            .checked_sub(self.highest_protected_ordinal)
-            .ok_or(ParityError::Invariant(
-                "committed-state W/T arithmetic underflows",
-            ))?;
-        let epoch_data_shards = data_shards_per_epoch(scheme)?;
-        if live_ordinals >= epoch_data_shards {
-            return Err(ParityError::ResumeAppend(format!(
-                "journal committed prefix has {live_ordinals} unprotected ordinals, \
-                 exceeding the v1 restart bound of one partial epoch ({epoch_data_shards})"
-            )));
-        }
-        Ok(())
-    }
-}
+pub use crate::authority::records::*;
 
 /// Durable append surface for Layer 3c committed tape-file bundles.
-pub trait TapeFileJournal {
+pub(crate) trait TapeFileJournal {
     /// Tape UUID this journal belongs to.
     fn tape_uuid(&self) -> [u8; 16];
 
@@ -436,9 +100,9 @@ pub trait TapeFileJournal {
         &mut self,
         prefix: &CommittedBundle,
         checkpoint: &CommittedBundle,
-    ) -> Result<(), JournalError> {
+    ) -> Result<[PublicationDisposition; 2], JournalError> {
         self.commit_bundle(prefix)?;
-        self.commit_bundle(checkpoint)
+        self.commit_bundle(checkpoint).map(|_| [Appended, Appended])
     }
 
     /// Idempotently make one terminal component and its following checkpoint
@@ -447,9 +111,9 @@ pub trait TapeFileJournal {
         &mut self,
         component: &CommittedBundle,
         checkpoint: &CommittedBundle,
-    ) -> Result<(), JournalError> {
+    ) -> Result<[PublicationDisposition; 2], JournalError> {
         self.commit_bundle(component)?;
-        self.commit_bundle(checkpoint)
+        self.commit_bundle(checkpoint).map(|_| [Appended, Appended])
     }
 
     /// Replay committed entries.
@@ -457,6 +121,7 @@ pub trait TapeFileJournal {
     /// Replay is non-destructive. File-backed journals return
     /// [`JournalError::RecoveryRequired`] for a torn or corrupt tail and never
     /// erase evidence merely because an append or replay handle was opened.
+    #[cfg(any(test, feature = "fixtures"))]
     fn load_committed(&self) -> Result<CommittedState, JournalError>;
 
     /// Optional durable authority when reattaching an in-process session.
@@ -464,9 +129,7 @@ pub trait TapeFileJournal {
     /// In-memory journals have no off-tape records to replay. File-backed
     /// journals must return their snapshot or its error, never hide a failed
     /// replay as an absent capability. Restarted bounded sessions require Some.
-    fn session_resume_snapshot(
-        &self,
-    ) -> Result<Option<FileTapeFileJournalCommittedSnapshot>, JournalError> {
+    fn session_resume_snapshot(&self) -> Result<Option<FrozenFileRows>, JournalError> {
         self.committed_snapshot_bounded_authority().map(Some)
     }
 
@@ -474,7 +137,7 @@ pub trait TapeFileJournal {
     fn session_terminal_resume_snapshot(
         &self,
         _prefix: &CommittedBundle,
-    ) -> Result<Option<FileTapeFileJournalCommittedSnapshot>, JournalError> {
+    ) -> Result<Option<FrozenFileRows>, JournalError> {
         self.session_resume_snapshot()
     }
 
@@ -484,9 +147,7 @@ pub trait TapeFileJournal {
     /// whole-prefix materialization. File-backed journals override this;
     /// compatibility journals must explicitly implement an equivalent bounded
     /// authority if they enter that production path.
-    fn committed_snapshot_bounded_authority(
-        &self,
-    ) -> Result<FileTapeFileJournalCommittedSnapshot, JournalError> {
+    fn committed_snapshot_bounded_authority(&self) -> Result<FrozenFileRows, JournalError> {
         Err(JournalError::Codec(
             "journal does not provide bounded committed-prefix authority".into(),
         ))
@@ -495,7 +156,7 @@ pub trait TapeFileJournal {
 
 /// Append-only file-backed implementation of [`TapeFileJournal`].
 #[derive(Debug)]
-pub struct FileTapeFileJournal {
+pub(crate) struct FileTapeFileJournal {
     file: Flock<File>,
     path: PathBuf,
     tape_uuid: [u8; 16],
@@ -644,7 +305,7 @@ fn terminal_component_kind(component_index: u8) -> Result<TapeFileKind, JournalE
 /// 3c-owned framing and validation code without acquiring the exclusive append
 /// lock or reparsing `.remjournal` bytes directly.
 #[derive(Debug)]
-pub struct FileTapeFileJournalReader {
+pub(crate) struct FileTapeFileJournalReader {
     file: Flock<File>,
     path: PathBuf,
     tape_uuid: [u8; 16],
@@ -658,7 +319,7 @@ pub struct FileTapeFileJournalReader {
 /// The replay owns an independent read-only cursor over a frozen checkpoint
 /// boundary. At most one length-bounded journal bundle is decoded at a time.
 #[derive(Debug)]
-pub struct FileTapeFileJournalCommittedReplay {
+pub(crate) struct FileTapeFileJournalCommittedReplay {
     file: File,
     committed_end: u64,
     current_entries: std::vec::IntoIter<TapeFileEntry>,
@@ -675,7 +336,7 @@ pub struct FileTapeFileJournalCommittedReplay {
 /// frozen checkpoint boundary. Later append-only terminal journal transitions
 /// do not change the rows replayed from this authority snapshot.
 #[derive(Debug)]
-pub struct FileTapeFileJournalCommittedSnapshot {
+pub(crate) struct LegacyFileRows {
     path: PathBuf,
     _file: File,
     header: JournalHeader,
@@ -749,7 +410,7 @@ impl FileTapeFileJournalCommittedReplay {
     }
 }
 
-impl FileTapeFileJournalCommittedSnapshot {
+impl LegacyFileRows {
     /// Retain the same frozen authority for a terminal planner and its sink.
     pub fn try_clone(&self) -> Result<Self, JournalError> {
         Ok(Self {
@@ -837,6 +498,138 @@ impl FileTapeFileJournalCommittedSnapshot {
 }
 
 impl FileTapeFileJournal {
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn open_shared_fixture(
+        path: &Path,
+        tape_uuid: [u8; 16],
+        block_size: u32,
+        scheme: ParityScheme,
+    ) -> Result<FileTapeFileJournalReader, JournalError> {
+        FileTapeFileJournalReader::open_inner(path.to_path_buf(), tape_uuid, block_size, scheme)
+    }
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn open_fixture(
+        path: &Path,
+        tape_uuid: [u8; 16],
+        block_size: u32,
+        scheme: ParityScheme,
+    ) -> Result<Self, JournalError> {
+        Self::open_inner(path.to_path_buf(), tape_uuid, block_size, scheme)
+    }
+
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn append_fixture_claims(
+        &mut self,
+        claims: &[CommittedBundle],
+        absent_block_counts: &[(usize, usize)],
+    ) -> Result<(), JournalError> {
+        self.file.seek(SeekFrom::End(0))?;
+        for (claim_index, claim) in claims.iter().enumerate() {
+            let mut bytes = encode_bundle(claim)?;
+            if absent_block_counts
+                .iter()
+                .any(|(index, _)| *index == claim_index)
+            {
+                let mut value: CborValue = ciborium::from_reader(bytes.as_slice())
+                    .map_err(|error| JournalError::Codec(error.to_string()))?;
+                if let CborValue::Map(fields) = &mut value {
+                    if let Some((_, CborValue::Array(entries))) = fields
+                        .iter_mut()
+                        .find(|(key, _)| *key == CborValue::Integer(2.into()))
+                    {
+                        for (_, entry_index) in absent_block_counts
+                            .iter()
+                            .filter(|(index, _)| *index == claim_index)
+                        {
+                            if let Some(CborValue::Map(entry)) = entries.get_mut(*entry_index) {
+                                if let Some((_, count)) = entry
+                                    .iter_mut()
+                                    .find(|(key, _)| *key == CborValue::Integer(3.into()))
+                                {
+                                    *count = CborValue::Null;
+                                }
+                            }
+                        }
+                    }
+                }
+                bytes.clear();
+                ciborium::into_writer(&value, &mut bytes)
+                    .map_err(|error| JournalError::Codec(error.to_string()))?;
+            }
+            self.file
+                .write_all(&validate_record_len(bytes.len())?.to_le_bytes())?;
+            self.file.write_all(&bytes)?;
+            self.file.write_all(&crc64_xz(&bytes).to_le_bytes())?;
+        }
+        self.file.sync_all()?;
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn inject_fixture_fault(
+        &self,
+        fault: crate::authority::fixtures::RowFixtureFault,
+    ) -> Result<(), JournalError> {
+        use crate::authority::fixtures::RowFixtureFault;
+        let mut file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        let end = file.metadata()?.len();
+        read_header(&mut file)?;
+        let header_end = file.stream_position()?;
+        let mut units = Vec::new();
+        while let Some(frame) = read_validated_journal_bundle(&mut file, end)? {
+            units.push(frame.bundle);
+        }
+        if units.len() != 4 {
+            return Err(JournalError::Codec(
+                "fixture requires Bootstrap, Object, sidecar, checkpoint".into(),
+            ));
+        }
+        match fault {
+            RowFixtureFault::MissingFirst => {
+                units.remove(0);
+            }
+            RowFixtureFault::DuplicateObject => units.insert(2, units[1].clone()),
+            RowFixtureFault::ConflictingObject => {
+                let mut conflicting = units[1].clone();
+                conflicting.entries[0].block_count = 3;
+                units.insert(2, conflicting);
+            }
+            RowFixtureFault::ProtectedWatermark => {
+                units.last_mut().unwrap().highest_protected_ordinal = 3
+            }
+            RowFixtureFault::TotalWatermark => {
+                units.last_mut().unwrap().total_committed_ordinals = 5
+            }
+            RowFixtureFault::IncompleteFinal => {}
+        }
+        file.set_len(header_end)?;
+        file.seek(SeekFrom::Start(header_end))?;
+        for unit in units {
+            let bytes = encode_bundle(&unit)?;
+            file.write_all(&validate_record_len(bytes.len())?.to_le_bytes())?;
+            file.write_all(&bytes)?;
+            file.write_all(&crc64_xz(&bytes).to_le_bytes())?;
+        }
+        if matches!(fault, RowFixtureFault::IncompleteFinal) {
+            let len = file.stream_position()?;
+            file.set_len(len - 1)?;
+        }
+        file.sync_all()?;
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) fn published_units_for_test(&self) -> Result<Vec<CommittedBundle>, JournalError> {
+        let mut file = File::open(&self.path)?;
+        let end = file.metadata()?.len();
+        read_header(&mut file)?;
+        let mut units = Vec::new();
+        while let Some(frame) = read_validated_journal_bundle(&mut file, end)? {
+            units.push(frame.bundle);
+        }
+        Ok(units)
+    }
+
     /// Open or create a local journal file, rejecting untrusted filesystem
     /// classes before any header or record is written.
     pub fn open(
@@ -1151,9 +944,7 @@ impl FileTapeFileJournal {
     /// terminal grammar, and the absence of an uncheckpointed orphan suffix.
     /// The returned replay then decodes at most one 64-MiB-bounded bundle at a
     /// time from its frozen checkpoint boundary without borrowing this handle.
-    pub fn replay_committed_entries_bounded(
-        &self,
-    ) -> Result<FileTapeFileJournalCommittedReplay, JournalError> {
+    pub fn replay_committed_entries_bounded(&self) -> Result<Box<dyn FileRowCursor>, JournalError> {
         self.committed_snapshot_bounded()?.replay()
     }
 
@@ -1163,9 +954,7 @@ impl FileTapeFileJournal {
     /// handle. The returned snapshot has no Rust borrow of that handle, so the
     /// caller may append terminal progress while all edition passes continue
     /// to replay the exact preselected prefix.
-    pub fn committed_snapshot_bounded(
-        &self,
-    ) -> Result<FileTapeFileJournalCommittedSnapshot, JournalError> {
+    pub fn committed_snapshot_bounded(&self) -> Result<FrozenFileRows, JournalError> {
         self.snapshot_bounded_at(false, None)
     }
 
@@ -1180,7 +969,7 @@ impl FileTapeFileJournal {
     pub fn planned_terminal_prefix_base_snapshot_bounded(
         &self,
         prefix: &CommittedBundle,
-    ) -> Result<FileTapeFileJournalCommittedSnapshot, JournalError> {
+    ) -> Result<FrozenFileRows, JournalError> {
         if prefix.kind != CommittedBundleKind::TerminalPrefix {
             return Err(JournalError::Codec(
                 "planned bounded snapshot requires a TerminalPrefix bundle".into(),
@@ -1195,9 +984,7 @@ impl FileTapeFileJournal {
     ///
     /// This restart surface validates the complete current journal first, so
     /// damage or orphan evidence in the later tail still fails closed.
-    pub fn terminal_prefix_snapshot_bounded(
-        &self,
-    ) -> Result<FileTapeFileJournalCommittedSnapshot, JournalError> {
+    pub fn terminal_prefix_snapshot_bounded(&self) -> Result<FrozenFileRows, JournalError> {
         self.snapshot_bounded_at(true, None)
     }
 
@@ -1205,67 +992,16 @@ impl FileTapeFileJournal {
         &self,
         through_terminal_prefix: bool,
         planned_terminal_prefix_sha256: Option<[u8; 32]>,
-    ) -> Result<FileTapeFileJournalCommittedSnapshot, JournalError> {
-        let mut validation_file = File::open(&self.path)?;
-        let file_len = validation_file.metadata()?.len();
-        let header = read_header(&mut validation_file)?;
-        if header.tape_uuid != self.tape_uuid
-            || header.block_size != self.block_size
-            || header.drive_compression != self.drive_compression
-            || header.scheme != self.scheme
-        {
-            return Err(JournalError::HeaderMismatch);
-        }
-        let metadata = scan_bounded_committed_metadata(&mut validation_file, file_len)?;
-        if let Some(expected_prefix_sha256) = planned_terminal_prefix_sha256 {
-            match metadata.terminal_grammar.phase {
-                TerminalJournalPhase::Open if metadata.orphan_bundle_count == 0 => {}
-                TerminalJournalPhase::PrefixAwaitingCheckpoint
-                    if metadata.orphan_bundle_count == 1
-                        && metadata.terminal_prefix_payload_sha256
-                            == Some(expected_prefix_sha256) => {}
-                _ => {
-                    return Err(JournalError::RecoveryRequired(
-                        "journal is not an open base or the exact planned TerminalPrefix orphan"
-                            .into(),
-                    ));
-                }
-            }
-        } else if metadata.orphan_bundle_count != 0 {
-            return Err(JournalError::RecoveryRequired(format!(
-                "journal exposes {} valid bundle(s) beyond its last checkpoint marker",
-                metadata.orphan_bundle_count
-            )));
-        }
-
-        let boundary = if through_terminal_prefix {
-            metadata.terminal_prefix_boundary.ok_or_else(|| {
-                JournalError::Codec("journal has no checkpointed TerminalPrefix authority".into())
-            })?
-        } else {
-            BoundedPrefixBoundary {
-                committed_end: metadata.committed_end,
-                highest_protected_ordinal: metadata.highest_protected_ordinal,
-                total_committed_ordinals: metadata.total_committed_ordinals,
-                committed_entry_count: metadata.committed_entry_count,
-            }
-        };
-
-        let mut file = File::open(&self.path)?;
-        let replay_header = read_header(&mut file)?;
-        if replay_header != header {
-            return Err(JournalError::HeaderMismatch);
-        }
-        Ok(FileTapeFileJournalCommittedSnapshot {
-            path: self.path.clone(),
-            _file: file,
-            header,
-            committed_end: boundary.committed_end,
-            highest_protected_ordinal: boundary.highest_protected_ordinal,
-            total_committed_ordinals: boundary.total_committed_ordinals,
-            committed_entry_count: boundary.committed_entry_count,
-            metrics: metadata.metrics,
-        })
+    ) -> Result<FrozenFileRows, JournalError> {
+        freeze_legacy_rows(
+            &self.path,
+            self.tape_uuid,
+            self.block_size,
+            self.drive_compression,
+            &self.scheme,
+            through_terminal_prefix,
+            planned_terminal_prefix_sha256,
+        )
     }
 
     /// Retain the checkpoint prefix whose next physical file number was proved
@@ -1377,19 +1113,22 @@ impl FileTapeFileJournal {
         state.orphaned_bundles.clear();
         Ok(state)
     }
-
-    #[cfg(test)]
-    fn open_without_volume_check_for_tests(
-        path: impl AsRef<Path>,
-        tape_uuid: [u8; 16],
-        block_size: u32,
-        scheme: ParityScheme,
-    ) -> Result<Self, JournalError> {
-        Self::open_inner(path.as_ref().to_path_buf(), tape_uuid, block_size, scheme)
-    }
 }
 
 impl FileTapeFileJournalReader {
+    /// Freeze the shared reader's validated structural prefix without retaining its lock.
+    pub fn frozen_rows(&self) -> Result<FrozenFileRows, JournalError> {
+        freeze_legacy_rows(
+            &self.path,
+            self.tape_uuid,
+            self.block_size,
+            self.drive_compression,
+            &self.scheme,
+            false,
+            None,
+        )
+    }
+
     fn open_existing_inner(path: PathBuf) -> Result<Self, JournalError> {
         let file = OpenOptions::new().read(true).open(&path)?;
         let mut file = Flock::lock(file, FlockArg::LockSharedNonblock)
@@ -1488,16 +1227,6 @@ impl FileTapeFileJournalReader {
         }
         load_committed_from_reader(&mut file, file_len)
     }
-
-    #[cfg(test)]
-    fn open_without_volume_check_for_tests(
-        path: impl AsRef<Path>,
-        tape_uuid: [u8; 16],
-        block_size: u32,
-        scheme: ParityScheme,
-    ) -> Result<Self, JournalError> {
-        Self::open_inner(path.as_ref().to_path_buf(), tape_uuid, block_size, scheme)
-    }
 }
 
 impl TapeFileJournal for FileTapeFileJournal {
@@ -1538,7 +1267,7 @@ impl TapeFileJournal for FileTapeFileJournal {
         &mut self,
         prefix: &CommittedBundle,
         checkpoint: &CommittedBundle,
-    ) -> Result<(), JournalError> {
+    ) -> Result<[PublicationDisposition; 2], JournalError> {
         if prefix.kind != CommittedBundleKind::TerminalPrefix
             || checkpoint.kind != CommittedBundleKind::CheckpointedThrough
             || !checkpoint.entries.is_empty()
@@ -1561,7 +1290,7 @@ impl TapeFileJournal for FileTapeFileJournal {
                     ));
                 }
                 self.commit_bundle(prefix)?;
-                self.commit_bundle(checkpoint)
+                self.commit_bundle(checkpoint).map(|_| [Appended, Appended])
             }
             TerminalJournalPhase::PrefixAwaitingCheckpoint => {
                 if replay.last_bundle.as_ref() != Some(prefix) {
@@ -1587,7 +1316,7 @@ impl TapeFileJournal for FileTapeFileJournal {
                         self.last_total_committed_ordinals,
                     ) = previous_watermarks;
                 }
-                result
+                result.map(|_| [AlreadyPresent, Appended])
             }
             TerminalJournalPhase::Ready { component_count: 0 } => {
                 let exact = replay.penultimate_bundle.as_ref() == Some(prefix)
@@ -1598,7 +1327,7 @@ impl TapeFileJournal for FileTapeFileJournal {
                     ));
                 }
                 self.orphaned_bundles_preserved_on_open = 0;
-                Ok(())
+                Ok([AlreadyPresent, AlreadyPresent])
             }
             phase => Err(JournalError::Codec(format!(
                 "terminal prefix transition is illegal in journal phase {phase:?}"
@@ -1610,7 +1339,7 @@ impl TapeFileJournal for FileTapeFileJournal {
         &mut self,
         component: &CommittedBundle,
         checkpoint: &CommittedBundle,
-    ) -> Result<(), JournalError> {
+    ) -> Result<[PublicationDisposition; 2], JournalError> {
         if component.kind != CommittedBundleKind::TerminalComponent
             || checkpoint.kind != CommittedBundleKind::CheckpointedThrough
             || !checkpoint.entries.is_empty()
@@ -1636,7 +1365,7 @@ impl TapeFileJournal for FileTapeFileJournal {
             )
         {
             self.orphaned_bundles_preserved_on_open = 0;
-            return Ok(());
+            return Ok([AlreadyPresent, AlreadyPresent]);
         }
         match replay.terminal_grammar.phase {
             TerminalJournalPhase::Ready { .. } => {
@@ -1646,7 +1375,7 @@ impl TapeFileJournal for FileTapeFileJournal {
                     ));
                 }
                 self.commit_bundle(component)?;
-                self.commit_bundle(checkpoint)
+                self.commit_bundle(checkpoint).map(|_| [Appended, Appended])
             }
             TerminalJournalPhase::ComponentAwaitingCheckpoint { .. } => {
                 if replay.last_bundle.as_ref() != Some(component) {
@@ -1660,7 +1389,7 @@ impl TapeFileJournal for FileTapeFileJournal {
                 if result.is_err() {
                     self.orphaned_bundles_preserved_on_open = preserved;
                 }
-                result
+                result.map(|_| [AlreadyPresent, Appended])
             }
             phase => Err(JournalError::Codec(format!(
                 "terminal component transition is illegal in journal phase {phase:?}"
@@ -1668,6 +1397,7 @@ impl TapeFileJournal for FileTapeFileJournal {
         }
     }
 
+    #[cfg(any(test, feature = "fixtures"))]
     fn load_committed(&self) -> Result<CommittedState, JournalError> {
         // Replay is non-destructive. Torn or corrupt tails require explicit
         // reconciliation and are never erased merely by opening an append
@@ -1688,14 +1418,12 @@ impl TapeFileJournal for FileTapeFileJournal {
     fn session_terminal_resume_snapshot(
         &self,
         prefix: &CommittedBundle,
-    ) -> Result<Option<FileTapeFileJournalCommittedSnapshot>, JournalError> {
+    ) -> Result<Option<FrozenFileRows>, JournalError> {
         self.planned_terminal_prefix_base_snapshot_bounded(prefix)
             .map(Some)
     }
 
-    fn committed_snapshot_bounded_authority(
-        &self,
-    ) -> Result<FileTapeFileJournalCommittedSnapshot, JournalError> {
+    fn committed_snapshot_bounded_authority(&self) -> Result<FrozenFileRows, JournalError> {
         self.committed_snapshot_bounded()
     }
 }
@@ -2753,24 +2481,147 @@ fn cbor_u64(value: ciborium::value::Integer, field: &str) -> Result<u64, Journal
         .map_err(|_| JournalError::Codec(format!("{field}: value {value} out of u64 range")))
 }
 
+impl CommittedFileRows for LegacyFileRows {
+    fn metrics(&self) -> crate::BoundedJournalReplayMetrics {
+        LegacyFileRows::metrics(self)
+    }
+    fn committed_entry_count(&self) -> u64 {
+        LegacyFileRows::committed_entry_count(self)
+    }
+    fn highest_protected_ordinal(&self) -> u64 {
+        LegacyFileRows::highest_protected_ordinal(self)
+    }
+    fn total_committed_ordinals(&self) -> u64 {
+        LegacyFileRows::total_committed_ordinals(self)
+    }
+    fn tape_uuid(&self) -> [u8; 16] {
+        LegacyFileRows::tape_uuid(self)
+    }
+    fn block_size(&self) -> u32 {
+        LegacyFileRows::block_size(self)
+    }
+    fn scheme(&self) -> &crate::ParityScheme {
+        LegacyFileRows::scheme(self)
+    }
+    fn try_clone_rows(&self) -> Result<Box<dyn CommittedFileRows>, JournalError> {
+        Ok(Box::new(self.try_clone()?))
+    }
+    fn open_cursor(&self) -> Result<Box<dyn FileRowCursor>, JournalError> {
+        Ok(Box::new(self.replay()?))
+    }
+}
+impl FileRowCursor for FileTapeFileJournalCommittedReplay {
+    fn committed_entry_count(&self) -> u64 {
+        self.committed_entry_count()
+    }
+
+    fn highest_protected_ordinal(&self) -> u64 {
+        self.highest_protected_ordinal()
+    }
+
+    fn total_committed_ordinals(&self) -> u64 {
+        self.total_committed_ordinals()
+    }
+
+    fn next_entry(&mut self) -> Result<Option<TapeFileEntry>, JournalError> {
+        self.next_entry()
+    }
+    fn metrics(&self) -> BoundedJournalReplayMetrics {
+        self.metrics()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn freeze_legacy_rows(
+    path: &Path,
+    tape_uuid: [u8; 16],
+    block_size: u32,
+    drive_compression: bool,
+    scheme: &ParityScheme,
+    through_terminal_prefix: bool,
+    planned_terminal_prefix_sha256: Option<[u8; 32]>,
+) -> Result<FrozenFileRows, JournalError> {
+    let mut validation_file = File::open(path)?;
+    let file_len = validation_file.metadata()?.len();
+    let header = read_header(&mut validation_file)?;
+    if header.tape_uuid != tape_uuid
+        || header.block_size != block_size
+        || header.drive_compression != drive_compression
+        || header.scheme != *scheme
+    {
+        return Err(JournalError::HeaderMismatch);
+    }
+    let metadata = scan_bounded_committed_metadata(&mut validation_file, file_len)?;
+    if let Some(expected_prefix_sha256) = planned_terminal_prefix_sha256 {
+        match metadata.terminal_grammar.phase {
+            TerminalJournalPhase::Open if metadata.orphan_bundle_count == 0 => {}
+            TerminalJournalPhase::PrefixAwaitingCheckpoint
+                if metadata.orphan_bundle_count == 1
+                    && metadata.terminal_prefix_payload_sha256 == Some(expected_prefix_sha256) => {}
+            _ => {
+                return Err(JournalError::RecoveryRequired(
+                    "journal is not an open base or the exact planned TerminalPrefix orphan".into(),
+                ));
+            }
+        }
+    } else if metadata.orphan_bundle_count != 0 {
+        return Err(JournalError::RecoveryRequired(format!(
+            "journal exposes {} valid bundle(s) beyond its last checkpoint marker",
+            metadata.orphan_bundle_count
+        )));
+    }
+
+    let boundary = if through_terminal_prefix {
+        metadata.terminal_prefix_boundary.ok_or_else(|| {
+            JournalError::Codec("journal has no checkpointed TerminalPrefix authority".into())
+        })?
+    } else {
+        BoundedPrefixBoundary {
+            committed_end: metadata.committed_end,
+            highest_protected_ordinal: metadata.highest_protected_ordinal,
+            total_committed_ordinals: metadata.total_committed_ordinals,
+            committed_entry_count: metadata.committed_entry_count,
+        }
+    };
+
+    let mut file = File::open(path)?;
+    let replay_header = read_header(&mut file)?;
+    if replay_header != header {
+        return Err(JournalError::HeaderMismatch);
+    }
+    Ok(FrozenFileRows::new(LegacyFileRows {
+        path: path.to_path_buf(),
+        _file: file,
+        header,
+        committed_end: boundary.committed_end,
+        highest_protected_ordinal: boundary.highest_protected_ordinal,
+        total_committed_ordinals: boundary.total_committed_ordinals,
+        committed_entry_count: boundary.committed_entry_count,
+        metrics: metadata.metrics,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::authority::{ShadowPublication, TapeReportPublisher, TapeRowAuthority};
     use crate::default_scheme;
     use crate::model::SchemeId;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct UnboundedTestJournal;
 
-    impl TapeFileJournal for UnboundedTestJournal {
+    impl TapeReportPublisher for UnboundedTestJournal {
+        crate::fixture_publication_methods!();
         fn tape_uuid(&self) -> [u8; 16] {
             [0; 16]
         }
 
-        fn commit_bundle(&mut self, _bundle: &CommittedBundle) -> Result<(), JournalError> {
+        fn publish_fixture(&mut self, _report: &ShadowPublication) -> Result<(), JournalError> {
             Ok(())
         }
 
+        #[cfg(any(test, feature = "fixtures"))]
         fn load_committed(&self) -> Result<CommittedState, JournalError> {
             Ok(CommittedState {
                 entries: Vec::new(),
@@ -2797,8 +2648,14 @@ mod tests {
                     let mut entry =
                         TapeFileEntry::from_map_entry(TapeFileMapEntry::object(0, 3, 0));
                     entry.object_recovery_row = Some(
-                        ObjectRecoveryRow::encrypted(0, 3, vec![[0x24; 16], [0x25; 16]], 66, 2377)
-                            .with_object_id([0x44; 16]),
+                        crate::ObjectRecoveryRow::encrypted(
+                            0,
+                            3,
+                            vec![[0x24; 16], [0x25; 16]],
+                            66,
+                            2377,
+                        )
+                        .with_object_id([0x44; 16]),
                     );
                     entry
                 },
@@ -2998,12 +2855,12 @@ mod tests {
         );
     }
 
-    fn commit_sample_checkpoint(journal: &mut FileTapeFileJournal) {
+    fn commit_sample_checkpoint(journal: &mut TapeRowAuthority) {
         journal
-            .commit_bundle(&sample_bundle())
+            .publish_fixture(&ShadowPublication::one((sample_bundle()).clone()))
             .expect("commit sample bundle");
         journal
-            .commit_bundle(&sample_checkpoint())
+            .publish_fixture(&ShadowPublication::one((sample_checkpoint()).clone()))
             .expect("commit checkpoint watermark");
     }
 
@@ -3011,12 +2868,13 @@ mod tests {
     fn physically_abandoned_barrier_retains_the_exact_preceding_checkpoint() {
         let temp = tempfile::tempdir().expect("journal fixture");
         let path = temp.path().join("tape.remjournal");
-        let mut journal = FileTapeFileJournal::open_without_volume_check_for_tests(
+        let mut journal = crate::authority::fixtures::LegacyCodecFixture::at_path(
             &path,
             [0x71; 16],
             256 * 1024,
             default_scheme(),
         )
+        .build()
         .expect("open journal");
         commit_sample_checkpoint(&mut journal);
         let original = fs::read(&path).unwrap();
@@ -3024,8 +2882,12 @@ mod tests {
         next.kind = CommittedBundleKind::CheckpointSidecars;
         next.entries = vec![next.entries.pop().unwrap()];
         next.entries[0].tape_file_number = 2;
-        journal.commit_bundle(&next).unwrap();
-        journal.commit_bundle(&sample_checkpoint()).unwrap();
+        journal
+            .publish_fixture(&ShadowPublication::one((next).clone()))
+            .unwrap();
+        journal
+            .publish_fixture(&ShadowPublication::one((sample_checkpoint()).clone()))
+            .unwrap();
         let advanced = fs::read(&path).unwrap();
         assert!(advanced.len() > original.len());
         assert!(journal.truncate_physically_discarded_suffix(4).is_err());
@@ -3035,8 +2897,12 @@ mod tests {
         let retained = journal.load_committed().unwrap();
         assert_eq!(retained.entries, sample_bundle().entries);
         assert!(retained.orphaned_bundles.is_empty());
-        journal.commit_bundle(&next).unwrap();
-        journal.commit_bundle(&sample_checkpoint()).unwrap();
+        journal
+            .publish_fixture(&ShadowPublication::one((next).clone()))
+            .unwrap();
+        journal
+            .publish_fixture(&ShadowPublication::one((sample_checkpoint()).clone()))
+            .unwrap();
         assert_eq!(fs::read(&path).unwrap(), advanced);
     }
 
@@ -3261,21 +3127,25 @@ mod tests {
         let tape_uuid = [0x42; 16];
         let scheme = default_scheme();
         {
-            let mut journal = FileTapeFileJournal::open_without_volume_check_for_tests(
+            let mut journal = crate::authority::fixtures::LegacyCodecFixture::at_path(
                 &path,
                 tape_uuid,
                 256 * 1024,
                 scheme.clone(),
             )
+            .build()
             .expect("open journal");
             assert!(
                 !journal.drive_compression(),
                 "parity journal header must record compression disabled"
             );
             journal
-                .commit_bundle(&structural_bundle(
-                    CommittedBundleKind::BotBootstrap,
-                    &[TapeFileKind::Bootstrap],
+                .publish_fixture(&ShadowPublication::one(
+                    (structural_bundle(
+                        CommittedBundleKind::BotBootstrap,
+                        &[TapeFileKind::Bootstrap],
+                    ))
+                    .clone(),
                 ))
                 .expect("commit BOT Bootstrap");
             let mut body = sample_bundle();
@@ -3285,18 +3155,21 @@ mod tests {
                     row.tape_file_number += 1;
                 }
             }
-            journal.commit_bundle(&body).expect("commit sample body");
             journal
-                .commit_bundle(&sample_checkpoint())
+                .publish_fixture(&ShadowPublication::one((body).clone()))
+                .expect("commit sample body");
+            journal
+                .publish_fixture(&ShadowPublication::one((sample_checkpoint()).clone()))
                 .expect("commit sample checkpoint");
         }
 
-        let reopened = FileTapeFileJournal::open_without_volume_check_for_tests(
+        let reopened = crate::authority::fixtures::LegacyCodecFixture::at_path(
             &path,
             tape_uuid,
             256 * 1024,
             scheme,
         )
+        .build()
         .expect("reopen journal");
         assert!(
             !reopened.drive_compression(),
@@ -3327,64 +3200,81 @@ mod tests {
             TapeFileKind::TapeIndexReplica,
         ];
         {
-            let mut journal = FileTapeFileJournal::open_without_volume_check_for_tests(
+            let mut journal = crate::authority::fixtures::LegacyCodecFixture::at_path(
                 &path,
                 tape_uuid,
                 256 * 1024,
                 scheme.clone(),
             )
+            .build()
             .expect("open journal");
             journal
-                .commit_bundle(&structural_bundle(
-                    CommittedBundleKind::BotBootstrap,
-                    &[TapeFileKind::Bootstrap],
+                .publish_fixture(&ShadowPublication::one(
+                    (structural_bundle(
+                        CommittedBundleKind::BotBootstrap,
+                        &[TapeFileKind::Bootstrap],
+                    ))
+                    .clone(),
                 ))
                 .expect("commit BOT Bootstrap");
             journal
-                .commit_bundle(&CommittedBundle {
-                    kind: CommittedBundleKind::TerminalPrefix,
-                    entries: Vec::new(),
-                    highest_protected_ordinal: 0,
-                    total_committed_ordinals: 0,
-                })
-                .expect("commit terminal prefix");
-            journal
-                .commit_bundle(&CommittedBundle {
-                    kind: CommittedBundleKind::CheckpointedThrough,
-                    entries: Vec::new(),
-                    highest_protected_ordinal: 0,
-                    total_committed_ordinals: 0,
-                })
-                .expect("checkpoint terminal prefix");
-            for (number, entry_kind) in kinds.into_iter().enumerate() {
-                journal
-                    .commit_bundle(&CommittedBundle {
-                        kind: CommittedBundleKind::TerminalComponent,
-                        entries: vec![structural_entry(
-                            u64::try_from(number + 1).expect("test index fits u64"),
-                            entry_kind,
-                        )],
+                .publish_fixture(&ShadowPublication::one(
+                    (CommittedBundle {
+                        kind: CommittedBundleKind::TerminalPrefix,
+                        entries: Vec::new(),
                         highest_protected_ordinal: 0,
                         total_committed_ordinals: 0,
                     })
-                    .expect("commit terminal component");
-                journal
-                    .commit_bundle(&CommittedBundle {
+                    .clone(),
+                ))
+                .expect("commit terminal prefix");
+            journal
+                .publish_fixture(&ShadowPublication::one(
+                    (CommittedBundle {
                         kind: CommittedBundleKind::CheckpointedThrough,
                         entries: Vec::new(),
                         highest_protected_ordinal: 0,
                         total_committed_ordinals: 0,
                     })
+                    .clone(),
+                ))
+                .expect("checkpoint terminal prefix");
+            for (number, entry_kind) in kinds.into_iter().enumerate() {
+                journal
+                    .publish_fixture(&ShadowPublication::one(
+                        (CommittedBundle {
+                            kind: CommittedBundleKind::TerminalComponent,
+                            entries: vec![structural_entry(
+                                u64::try_from(number + 1).expect("test index fits u64"),
+                                entry_kind,
+                            )],
+                            highest_protected_ordinal: 0,
+                            total_committed_ordinals: 0,
+                        })
+                        .clone(),
+                    ))
+                    .expect("commit terminal component");
+                journal
+                    .publish_fixture(&ShadowPublication::one(
+                        (CommittedBundle {
+                            kind: CommittedBundleKind::CheckpointedThrough,
+                            entries: Vec::new(),
+                            highest_protected_ordinal: 0,
+                            total_committed_ordinals: 0,
+                        })
+                        .clone(),
+                    ))
                     .expect("commit checkpoint watermark");
             }
         }
 
-        let state = FileTapeFileJournal::open_without_volume_check_for_tests(
+        let state = crate::authority::fixtures::LegacyCodecFixture::at_path(
             &path,
             tape_uuid,
             256 * 1024,
             scheme,
         )
+        .build()
         .expect("reopen journal")
         .load_committed()
         .expect("replay terminal components");
@@ -3423,47 +3313,74 @@ mod tests {
             &[TapeFileKind::TapeIndexReplica],
         );
         {
-            let mut journal = FileTapeFileJournal::open_without_volume_check_for_tests(
+            let mut journal = crate::authority::fixtures::LegacyCodecFixture::at_path(
                 &path,
                 tape_uuid,
                 256 * 1024,
                 scheme.clone(),
             )
+            .build()
             .expect("open journal");
             assert!(!journal
                 .terminal_prefix_transition_is_durable(&prefix, &checkpoint)
                 .expect("open-phase probe"));
             journal
-                .commit_bundle(&prefix)
+                .publish_fixture(&ShadowPublication::one((prefix).clone()))
                 .expect("prefix orphan fsyncs");
         }
         {
-            let mut reopened = FileTapeFileJournal::open_without_volume_check_for_tests(
+            let mut reopened = crate::authority::fixtures::LegacyCodecFixture::at_path(
                 &path,
                 tape_uuid,
                 256 * 1024,
                 scheme.clone(),
             )
+            .build()
             .expect("reopen prefix orphan");
             assert_eq!(reopened.orphaned_bundles_preserved_on_open(), 1);
             assert!(!reopened
                 .terminal_prefix_transition_is_durable(&prefix, &checkpoint)
                 .expect("orphan-prefix probe"));
-            reopened
-                .commit_terminal_prefix_transition(&prefix, &checkpoint)
+            let before = reopened.published_units_for_test().unwrap();
+            let receipt = reopened
+                .publish_terminal_prefix(&(&prefix).into())
                 .expect("exact orphan gains checkpoint");
+            assert_eq!(
+                receipt
+                    .items
+                    .iter()
+                    .flat_map(|unit| [unit.disposition, unit.durability])
+                    .collect::<Vec<_>>(),
+                [AlreadyPresent, Appended]
+            );
+            let mut expected = before;
+            expected.extend(crate::authority::fixtures::appended_legacy_units(&receipt));
+            assert_eq!(reopened.published_units_for_test().unwrap(), expected);
         }
         {
-            let mut reopened = FileTapeFileJournal::open_without_volume_check_for_tests(
+            let mut reopened = crate::authority::fixtures::LegacyCodecFixture::at_path(
                 &path,
                 tape_uuid,
                 256 * 1024,
                 scheme.clone(),
             )
+            .build()
             .expect("reopen checkpointed prefix");
-            reopened
-                .commit_terminal_prefix_transition(&prefix, &checkpoint)
+            let before = reopened.published_units_for_test().unwrap();
+            let receipt = reopened
+                .publish_terminal_prefix(&(&prefix).into())
                 .expect("checkpointed prefix is idempotent");
+            assert_eq!(
+                receipt
+                    .items
+                    .iter()
+                    .flat_map(|unit| [unit.disposition, unit.durability])
+                    .collect::<Vec<_>>(),
+                [AlreadyPresent, AlreadyPresent]
+            );
+            let mut expected = before;
+            expected.extend(crate::authority::fixtures::appended_legacy_units(&receipt));
+            assert_eq!(reopened.published_units_for_test().unwrap(), expected);
             assert!(reopened
                 .terminal_prefix_transition_is_durable(&prefix, &checkpoint)
                 .expect("checkpointed-prefix probe"));
@@ -3471,32 +3388,58 @@ mod tests {
             assert!(state.orphaned_bundles.is_empty());
             assert!(state.entries.is_empty());
             reopened
-                .commit_bundle(&component)
+                .publish_fixture(&ShadowPublication::one((component).clone()))
                 .expect("component orphan fsyncs");
         }
         {
-            let mut reopened = FileTapeFileJournal::open_without_volume_check_for_tests(
+            let mut reopened = crate::authority::fixtures::LegacyCodecFixture::at_path(
                 &path,
                 tape_uuid,
                 256 * 1024,
                 scheme.clone(),
             )
+            .build()
             .expect("reopen component orphan");
-            reopened
-                .commit_terminal_component_transition(&component, &checkpoint)
+            let before = reopened.published_units_for_test().unwrap();
+            let receipt = reopened
+                .publish_terminal_component(&(&component).into())
                 .expect("exact component orphan gains checkpoint");
+            assert_eq!(
+                receipt
+                    .items
+                    .iter()
+                    .flat_map(|unit| [unit.disposition, unit.durability])
+                    .collect::<Vec<_>>(),
+                [AlreadyPresent, Appended]
+            );
+            let mut expected = before;
+            expected.extend(crate::authority::fixtures::appended_legacy_units(&receipt));
+            assert_eq!(reopened.published_units_for_test().unwrap(), expected);
         }
         {
-            let mut reopened = FileTapeFileJournal::open_without_volume_check_for_tests(
+            let mut reopened = crate::authority::fixtures::LegacyCodecFixture::at_path(
                 &path,
                 tape_uuid,
                 256 * 1024,
                 scheme,
             )
+            .build()
             .expect("reopen checkpointed component");
-            reopened
-                .commit_terminal_component_transition(&component, &checkpoint)
+            let before = reopened.published_units_for_test().unwrap();
+            let receipt = reopened
+                .publish_terminal_component(&(&component).into())
                 .expect("checkpointed component is idempotent");
+            assert_eq!(
+                receipt
+                    .items
+                    .iter()
+                    .flat_map(|unit| [unit.disposition, unit.durability])
+                    .collect::<Vec<_>>(),
+                [AlreadyPresent, AlreadyPresent]
+            );
+            let mut expected = before;
+            expected.extend(crate::authority::fixtures::appended_legacy_units(&receipt));
+            assert_eq!(reopened.published_units_for_test().unwrap(), expected);
             assert!(reopened
                 .terminal_prefix_transition_is_durable(&prefix, &checkpoint)
                 .expect("prefix remains durable after component"));
@@ -3539,15 +3482,18 @@ mod tests {
         })
         .collect::<Vec<_>>();
         {
-            let mut journal = FileTapeFileJournal::open_without_volume_check_for_tests(
+            let mut journal = crate::authority::fixtures::LegacyCodecFixture::at_path(
                 &path,
                 tape_uuid,
                 256 * 1024,
                 scheme.clone(),
             )
+            .build()
             .expect("open journal");
             journal
-                .commit_terminal_prefix_transition(&prefix, &transitions[0].1)
+                .publish_fixture(&ShadowPublication {
+                    bundles: vec![(prefix).clone(), (transitions[0].1).clone()],
+                })
                 .expect("commit empty prefix");
             assert_eq!(
                 journal
@@ -3556,7 +3502,7 @@ mod tests {
                 TerminalComponentAuthorityRelation::Aligned
             );
             journal
-                .commit_bundle(&transitions[0].0)
+                .publish_fixture(&ShadowPublication::one((transitions[0].0).clone()))
                 .expect("fsync barrier-proved component orphan");
             assert_eq!(
                 journal
@@ -3568,12 +3514,13 @@ mod tests {
             );
         }
         {
-            let mut journal = FileTapeFileJournal::open_without_volume_check_for_tests(
+            let mut journal = crate::authority::fixtures::LegacyCodecFixture::at_path(
                 &path,
                 tape_uuid,
                 256 * 1024,
                 scheme,
             )
+            .build()
             .expect("reopen component orphan");
             assert_eq!(
                 journal
@@ -3584,7 +3531,9 @@ mod tests {
                 }
             );
             journal
-                .commit_terminal_component_transition(&transitions[0].0, &transitions[0].1)
+                .publish_fixture(&ShadowPublication {
+                    bundles: vec![(transitions[0].0).clone(), (transitions[0].1).clone()],
+                })
                 .expect("finish exact sink transition");
             assert_eq!(
                 journal
@@ -3616,7 +3565,9 @@ mod tests {
 
             for (component, checkpoint) in &transitions[1..3] {
                 journal
-                    .commit_terminal_component_transition(component, checkpoint)
+                    .publish_fixture(&ShadowPublication {
+                        bundles: vec![(component).clone(), (checkpoint).clone()],
+                    })
                     .expect("advance sink journal without external checkpoint");
             }
             assert!(journal
@@ -3675,27 +3626,29 @@ mod tests {
         bundle.entries[0].physical_start_hint = Some(0);
         bundle.entries[1].physical_start_hint = Some(4);
         {
-            let mut journal = FileTapeFileJournal::open_without_volume_check_for_tests(
+            let mut journal = crate::authority::fixtures::LegacyCodecFixture::at_path(
                 &path,
                 tape_uuid,
                 256 * 1024,
                 scheme.clone(),
             )
+            .build()
             .expect("open journal");
             journal
-                .commit_bundle(&bundle)
+                .publish_fixture(&ShadowPublication::one((bundle).clone()))
                 .expect("commit hinted bundle");
             journal
-                .commit_bundle(&sample_checkpoint())
+                .publish_fixture(&ShadowPublication::one((sample_checkpoint()).clone()))
                 .expect("commit checkpoint watermark");
         }
 
-        let state = FileTapeFileJournal::open_without_volume_check_for_tests(
+        let state = crate::authority::fixtures::LegacyCodecFixture::at_path(
             &path,
             tape_uuid,
             256 * 1024,
             scheme,
         )
+        .build()
         .expect("reopen journal")
         .load_committed()
         .expect("load committed");
@@ -3805,12 +3758,13 @@ mod tests {
         bytes[crc_start..].copy_from_slice(&crc.to_le_bytes());
         fs::write(&path, bytes).expect("rewrite mutated header");
 
-        let err = FileTapeFileJournal::open_without_volume_check_for_tests(
+        let err = crate::authority::fixtures::LegacyCodecFixture::at_path(
             &path,
             tape_uuid,
             256 * 1024,
             scheme,
         )
+        .build()
         .expect_err("compression-enabled journal header must be rejected");
 
         assert!(matches!(err, JournalError::HeaderMismatch));
@@ -3838,12 +3792,13 @@ mod tests {
         bytes[crc_start..].copy_from_slice(&crc.to_le_bytes());
         fs::write(&path, bytes).expect("rewrite legacy-version header");
 
-        let error = FileTapeFileJournal::open_without_volume_check_for_tests(
+        let error = crate::authority::fixtures::LegacyCodecFixture::at_path(
             &path,
             tape_uuid,
             256 * 1024,
             scheme,
         )
+        .build()
         .expect_err("v3 u32 journal must fail closed");
         assert!(matches!(error, JournalError::HeaderMismatch));
 
@@ -3856,26 +3811,28 @@ mod tests {
         let tape_uuid = [0x43; 16];
         let scheme = default_scheme();
         {
-            let mut journal = FileTapeFileJournal::open_without_volume_check_for_tests(
+            let mut journal = crate::authority::fixtures::LegacyCodecFixture::at_path(
                 &path,
                 tape_uuid,
                 256 * 1024,
                 scheme.clone(),
             )
+            .build()
             .expect("open journal");
             commit_sample_checkpoint(&mut journal);
-            journal.file.write_all(&99u32.to_le_bytes()).unwrap();
-            journal.file.write_all(&[0xAA, 0xBB]).unwrap();
-            journal.file.sync_all().unwrap();
+            journal.0.file.write_all(&99u32.to_le_bytes()).unwrap();
+            journal.0.file.write_all(&[0xAA, 0xBB]).unwrap();
+            journal.0.file.sync_all().unwrap();
         }
 
         let len_with_torn_tail = fs::metadata(&path).expect("stat torn journal").len();
-        let err = FileTapeFileJournal::open_without_volume_check_for_tests(
+        let err = crate::authority::fixtures::LegacyCodecFixture::at_path(
             &path,
             tape_uuid,
             256 * 1024,
             scheme,
         )
+        .build()
         .expect_err("torn journal must require reconciliation");
         assert!(matches!(err, JournalError::RecoveryRequired(_)), "{err}");
         assert_eq!(fs::metadata(&path).unwrap().len(), len_with_torn_tail);
@@ -3890,17 +3847,18 @@ mod tests {
         let scheme = default_scheme();
         let valid_len;
         {
-            let mut journal = FileTapeFileJournal::open_without_volume_check_for_tests(
+            let mut journal = crate::authority::fixtures::LegacyCodecFixture::at_path(
                 &path,
                 tape_uuid,
                 256 * 1024,
                 scheme.clone(),
             )
+            .build()
             .expect("open journal");
             commit_sample_checkpoint(&mut journal);
-            valid_len = journal.file.stream_position().expect("journal offset");
-            journal.file.write_all(&u32::MAX.to_le_bytes()).unwrap();
-            journal.file.sync_all().unwrap();
+            valid_len = journal.0.file.stream_position().expect("journal offset");
+            journal.0.file.write_all(&u32::MAX.to_le_bytes()).unwrap();
+            journal.0.file.sync_all().unwrap();
         }
         assert!(
             fs::metadata(&path).unwrap().len() > valid_len,
@@ -3908,12 +3866,13 @@ mod tests {
         );
 
         let corrupt_len = fs::metadata(&path).unwrap().len();
-        let err = FileTapeFileJournal::open_without_volume_check_for_tests(
+        let err = crate::authority::fixtures::LegacyCodecFixture::at_path(
             &path,
             tape_uuid,
             256 * 1024,
             scheme,
         )
+        .build()
         .expect_err("hostile length must require reconciliation");
         assert!(matches!(err, JournalError::RecoveryRequired(_)), "{err}");
         assert_eq!(fs::metadata(&path).unwrap().len(), corrupt_len);
@@ -3943,21 +3902,23 @@ mod tests {
         let tape_uuid = [0x44; 16];
         let scheme = default_scheme();
         {
-            let _journal = FileTapeFileJournal::open_without_volume_check_for_tests(
+            let _journal = crate::authority::fixtures::LegacyCodecFixture::at_path(
                 &path,
                 tape_uuid,
                 256 * 1024,
                 scheme.clone(),
             )
+            .build()
             .expect("create journal");
         }
 
-        let err = FileTapeFileJournal::open_without_volume_check_for_tests(
+        let err = crate::authority::fixtures::LegacyCodecFixture::at_path(
             &path,
             [0x45; 16],
             256 * 1024,
             scheme,
         )
+        .build()
         .expect_err("uuid mismatch should reject");
 
         assert!(matches!(err, JournalError::HeaderMismatch));
@@ -3969,20 +3930,22 @@ mod tests {
         let path = temp_journal_path("lock");
         let tape_uuid = [0x47; 16];
         let scheme = default_scheme();
-        let _first = FileTapeFileJournal::open_without_volume_check_for_tests(
+        let _first = crate::authority::fixtures::LegacyCodecFixture::at_path(
             &path,
             tape_uuid,
             256 * 1024,
             scheme.clone(),
         )
+        .build()
         .expect("first writer opens");
 
-        let err = FileTapeFileJournal::open_without_volume_check_for_tests(
+        let err = crate::authority::fixtures::LegacyCodecFixture::at_path(
             &path,
             tape_uuid,
             256 * 1024,
             scheme,
         )
+        .build()
         .expect_err("second writer should fail to lock the journal");
 
         assert!(err.is_lock_contended());
@@ -3996,28 +3959,24 @@ mod tests {
         let scheme = default_scheme();
         let valid_len;
         {
-            let mut journal = FileTapeFileJournal::open_without_volume_check_for_tests(
+            let mut journal = crate::authority::fixtures::LegacyCodecFixture::at_path(
                 &path,
                 tape_uuid,
                 256 * 1024,
                 scheme.clone(),
             )
+            .build()
             .expect("open journal");
             commit_sample_checkpoint(&mut journal);
-            valid_len = journal.file.stream_position().expect("journal offset");
-            journal.file.write_all(&u32::MAX.to_le_bytes()).unwrap();
-            journal.file.sync_all().unwrap();
+            valid_len = journal.0.file.stream_position().expect("journal offset");
+            journal.0.file.write_all(&u32::MAX.to_le_bytes()).unwrap();
+            journal.0.file.sync_all().unwrap();
         }
         let len_with_torn_tail = fs::metadata(&path).unwrap().len();
         assert!(len_with_torn_tail > valid_len);
 
-        let reader = FileTapeFileJournalReader::open_without_volume_check_for_tests(
-            &path,
-            tape_uuid,
-            256 * 1024,
-            scheme,
-        )
-        .expect("open shared reader");
+        let reader = crate::authority::fixtures::open_shared(&path, tape_uuid, 256 * 1024, scheme)
+            .expect("open shared reader");
         let err = reader
             .load_committed()
             .expect_err("shared replay must report the torn tail");
@@ -4036,12 +3995,13 @@ mod tests {
         let path = temp_journal_path("bounded-committed-replay");
         let tape_uuid = [0x6B; 16];
         let scheme = default_scheme();
-        let mut journal = FileTapeFileJournal::open_without_volume_check_for_tests(
+        let mut journal = crate::authority::fixtures::LegacyCodecFixture::at_path(
             &path,
             tape_uuid,
             256 * 1024,
             scheme,
         )
+        .build()
         .expect("open journal");
         commit_sample_checkpoint(&mut journal);
         let expected = journal.load_committed().expect("flatten committed state");
@@ -4077,7 +4037,7 @@ mod tests {
             total_committed_ordinals: 5,
         };
         journal
-            .commit_bundle(&orphan)
+            .publish_fixture(&ShadowPublication::one((orphan).clone()))
             .expect("append orphan fixture");
         let error = journal
             .replay_committed_entries_bounded()
@@ -4100,15 +4060,16 @@ mod tests {
         );
 
         let path = temp_journal_path("bounded-authority-trait");
-        let mut journal = FileTapeFileJournal::open_without_volume_check_for_tests(
+        let mut journal = crate::authority::fixtures::LegacyCodecFixture::at_path(
             &path,
             [0x6D; 16],
             256 * 1024,
             default_scheme(),
         )
+        .build()
         .expect("open file journal");
         commit_sample_checkpoint(&mut journal);
-        let snapshot = (&journal as &dyn TapeFileJournal)
+        let snapshot = (&journal as &dyn TapeReportPublisher)
             .committed_snapshot_bounded_authority()
             .expect("file journal trait override freezes bounded authority");
         assert_eq!(snapshot.committed_entry_count(), 2);
@@ -4123,17 +4084,21 @@ mod tests {
         const ROWS_PER_BUNDLE: u64 = 128;
         let path = temp_journal_path("bounded-high-count");
         let tape_uuid = [0x6C; 16];
-        let mut journal = FileTapeFileJournal::open_without_volume_check_for_tests(
+        let mut journal = crate::authority::fixtures::LegacyCodecFixture::at_path(
             &path,
             tape_uuid,
             256 * 1024,
             default_scheme(),
         )
+        .build()
         .expect("open high-count journal");
         journal
-            .commit_bundle(&structural_bundle(
-                CommittedBundleKind::BotBootstrap,
-                &[TapeFileKind::Bootstrap],
+            .publish_fixture(&ShadowPublication::one(
+                (structural_bundle(
+                    CommittedBundleKind::BotBootstrap,
+                    &[TapeFileKind::Bootstrap],
+                ))
+                .clone(),
             ))
             .expect("append sole BOT Bootstrap bundle");
         for bundle_index in 0..BUNDLE_COUNT {
@@ -4150,21 +4115,27 @@ mod tests {
                 })
                 .collect();
             journal
-                .commit_bundle(&CommittedBundle {
-                    kind: CommittedBundleKind::CheckpointSidecars,
-                    entries,
-                    highest_protected_ordinal: 0,
-                    total_committed_ordinals: 0,
-                })
+                .publish_fixture(&ShadowPublication::one(
+                    (CommittedBundle {
+                        kind: CommittedBundleKind::CheckpointSidecars,
+                        entries,
+                        highest_protected_ordinal: 0,
+                        total_committed_ordinals: 0,
+                    })
+                    .clone(),
+                ))
                 .expect("append bounded checkpoint-sidecar bundle");
         }
         journal
-            .commit_bundle(&CommittedBundle {
-                kind: CommittedBundleKind::CheckpointedThrough,
-                entries: Vec::new(),
-                highest_protected_ordinal: 0,
-                total_committed_ordinals: 0,
-            })
+            .publish_fixture(&ShadowPublication::one(
+                (CommittedBundle {
+                    kind: CommittedBundleKind::CheckpointedThrough,
+                    entries: Vec::new(),
+                    highest_protected_ordinal: 0,
+                    total_committed_ordinals: 0,
+                })
+                .clone(),
+            ))
             .expect("checkpoint high-count authority");
 
         let mut replay = journal
@@ -4209,41 +4180,39 @@ mod tests {
             total_committed_ordinals: 5,
         };
         {
-            let mut journal = FileTapeFileJournal::open_without_volume_check_for_tests(
+            let mut journal = crate::authority::fixtures::LegacyCodecFixture::at_path(
                 &path,
                 tape_uuid,
                 256 * 1024,
                 scheme.clone(),
             )
+            .build()
             .expect("open journal");
             commit_sample_checkpoint(&mut journal);
-            checkpoint_len = journal.file.stream_position().expect("checkpoint offset");
+            checkpoint_len = journal.0.file.stream_position().expect("checkpoint offset");
             journal
-                .commit_bundle(&orphan)
+                .publish_fixture(&ShadowPublication::one((orphan).clone()))
                 .expect("commit orphan fixture");
         }
         let orphaned_len = fs::metadata(&path).expect("stat orphaned journal").len();
         assert!(orphaned_len > checkpoint_len);
 
-        let reader = FileTapeFileJournalReader::open_without_volume_check_for_tests(
-            &path,
-            tape_uuid,
-            256 * 1024,
-            scheme.clone(),
-        )
-        .expect("open shared reader");
+        let reader =
+            crate::authority::fixtures::open_shared(&path, tape_uuid, 256 * 1024, scheme.clone())
+                .expect("open shared reader");
         let state = reader.load_committed().expect("shared replay");
         assert_eq!(state.entries, sample_bundle().entries);
         assert_eq!(state.total_committed_ordinals, 3);
         assert_eq!(state.orphaned_bundles, vec![orphan.clone()]);
         assert_eq!(fs::metadata(&path).unwrap().len(), orphaned_len);
 
-        let mut reopened = FileTapeFileJournal::open_without_volume_check_for_tests(
+        let mut reopened = crate::authority::fixtures::LegacyCodecFixture::at_path(
             &path,
             tape_uuid,
             256 * 1024,
             scheme,
         )
+        .build()
         .expect("exclusive reopen preserves orphans");
         assert_eq!(reopened.orphaned_bundles_preserved_on_open(), 1);
         assert_eq!(fs::metadata(&path).unwrap().len(), orphaned_len);
@@ -4267,12 +4236,13 @@ mod tests {
         assert_eq!(reopened.orphaned_bundles_preserved_on_open(), 0);
         drop(reopened);
 
-        let reopened = FileTapeFileJournal::open_without_volume_check_for_tests(
+        let reopened = crate::authority::fixtures::LegacyCodecFixture::at_path(
             &path,
             tape_uuid,
             256 * 1024,
             default_scheme(),
         )
+        .build()
         .expect("restart after durable orphan truncation");
         let state = reopened.load_committed().expect("replay reconciled prefix");
         assert!(state.orphaned_bundles.is_empty());
@@ -4287,42 +4257,40 @@ mod tests {
         let tape_uuid = [0x5B; 16];
         let scheme = default_scheme();
         {
-            let mut journal = FileTapeFileJournal::open_without_volume_check_for_tests(
+            let mut journal = crate::authority::fixtures::LegacyCodecFixture::at_path(
                 &path,
                 tape_uuid,
                 256 * 1024,
                 scheme.clone(),
             )
+            .build()
             .expect("open journal");
             journal
-                .commit_bundle(&sample_bundle())
+                .publish_fixture(&ShadowPublication::one((sample_bundle()).clone()))
                 .expect("commit pre-watermark crash fixture");
         }
 
-        let reader = FileTapeFileJournalReader::open_without_volume_check_for_tests(
-            &path,
-            tape_uuid,
-            256 * 1024,
-            scheme.clone(),
-        )
-        .expect("open shared reader");
+        let reader =
+            crate::authority::fixtures::open_shared(&path, tape_uuid, 256 * 1024, scheme.clone())
+                .expect("open shared reader");
         let state = reader.load_committed().expect("shared replay");
         assert!(state.entries.is_empty());
         assert_eq!(state.orphaned_bundles, vec![sample_bundle()]);
 
-        let mut reopened = FileTapeFileJournal::open_without_volume_check_for_tests(
+        let mut reopened = crate::authority::fixtures::LegacyCodecFixture::at_path(
             &path,
             tape_uuid,
             256 * 1024,
             scheme,
         )
+        .build()
         .expect("exclusive reopen preserves pre-watermark bundles");
         assert_eq!(reopened.orphaned_bundles_preserved_on_open(), 1);
         let preserved = reopened.load_committed().expect("replay preserved journal");
         assert!(preserved.entries.is_empty());
         assert_eq!(preserved.orphaned_bundles, vec![sample_bundle()]);
         let err = reopened
-            .commit_bundle(&sample_bundle())
+            .publish_fixture(&ShadowPublication::one((sample_bundle()).clone()))
             .expect_err("preserved orphan evidence fences append");
         assert!(err.to_string().contains("reconcile physical tail"), "{err}");
 
@@ -4334,45 +4302,35 @@ mod tests {
         let path = temp_journal_path("shared-lock");
         let tape_uuid = [0x4A; 16];
         let scheme = default_scheme();
-        let writer = FileTapeFileJournal::open_without_volume_check_for_tests(
+        let writer = crate::authority::fixtures::LegacyCodecFixture::at_path(
             &path,
             tape_uuid,
             256 * 1024,
             scheme.clone(),
         )
+        .build()
         .expect("writer opens");
 
-        let err = FileTapeFileJournalReader::open_without_volume_check_for_tests(
-            &path,
-            tape_uuid,
-            256 * 1024,
-            scheme.clone(),
-        )
-        .expect_err("shared replay must not run while an append writer owns the journal");
+        let err =
+            crate::authority::fixtures::open_shared(&path, tape_uuid, 256 * 1024, scheme.clone())
+                .expect_err("shared replay must not run while an append writer owns the journal");
         assert!(err.is_lock_contended());
         drop(writer);
 
-        let reader = FileTapeFileJournalReader::open_without_volume_check_for_tests(
-            &path,
-            tape_uuid,
-            256 * 1024,
-            scheme.clone(),
-        )
-        .expect("shared reader opens after writer releases");
-        let second_reader = FileTapeFileJournalReader::open_without_volume_check_for_tests(
-            &path,
-            tape_uuid,
-            256 * 1024,
-            scheme.clone(),
-        )
-        .expect("multiple shared readers can coexist");
+        let reader =
+            crate::authority::fixtures::open_shared(&path, tape_uuid, 256 * 1024, scheme.clone())
+                .expect("shared reader opens after writer releases");
+        let second_reader =
+            crate::authority::fixtures::open_shared(&path, tape_uuid, 256 * 1024, scheme.clone())
+                .expect("multiple shared readers can coexist");
 
-        let err = FileTapeFileJournal::open_without_volume_check_for_tests(
+        let err = crate::authority::fixtures::LegacyCodecFixture::at_path(
             &path,
             tape_uuid,
             256 * 1024,
             scheme,
         )
+        .build()
         .expect_err("append writer must wait for shared replay handles to close");
         assert!(err.is_lock_contended());
 
@@ -4387,34 +4345,36 @@ mod tests {
         let tape_uuid = [0x48; 16];
         let scheme = default_scheme();
         {
-            let mut journal = FileTapeFileJournal::open_without_volume_check_for_tests(
+            let mut journal = crate::authority::fixtures::LegacyCodecFixture::at_path(
                 &path,
                 tape_uuid,
                 256 * 1024,
                 scheme.clone(),
             )
+            .build()
             .expect("open journal");
             journal
-                .commit_bundle(&sample_bundle())
+                .publish_fixture(&ShadowPublication::one((sample_bundle()).clone()))
                 .expect("commit first bundle");
             journal
-                .commit_bundle(&sample_checkpoint())
+                .publish_fixture(&ShadowPublication::one((sample_checkpoint()).clone()))
                 .expect("commit checkpoint watermark");
             let mut regressed = sample_bundle();
             regressed.highest_protected_ordinal = 2;
             regressed.total_committed_ordinals = 2;
             let err = journal
-                .commit_bundle(&regressed)
+                .publish_fixture(&ShadowPublication::one((regressed).clone()))
                 .expect_err("regressed W/T watermarks should be rejected before append");
             assert!(matches!(err, JournalError::Codec(_)));
         }
 
-        let reopened = FileTapeFileJournal::open_without_volume_check_for_tests(
+        let reopened = crate::authority::fixtures::LegacyCodecFixture::at_path(
             &path,
             tape_uuid,
             256 * 1024,
             scheme,
         )
+        .build()
         .expect("reopen journal");
         let state = reopened.load_committed().expect("load committed prefix");
 

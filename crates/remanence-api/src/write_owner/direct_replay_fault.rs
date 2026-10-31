@@ -9,7 +9,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
-use remanence_state::CheckpointJournalRecord;
+use remanence_state::authority::AuthorityCommit;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -132,14 +132,14 @@ impl DirectReplayFaultPlan {
         })
     }
 
-    fn publish(&self, record: &CheckpointJournalRecord) -> Result<(), String> {
-        if record.tape_uuid != self.tape_uuid || record.objects.len() != 1 {
+    fn publish(&self, record: &AuthorityCommit) -> Result<(), String> {
+        if record.tape_uuid != self.tape_uuid || record.payloads.len() != 1 {
             return Err(
                 "direct-replay checkpoint record does not match the planned tape/object"
                     .to_string(),
             );
         }
-        let projection = &record.objects[0];
+        let projection = &record.payloads[0];
         if projection.object.caller_object_id.as_deref() != Some(self.caller_object_id.as_str()) {
             return Err("direct-replay checkpoint caller object id changed before the cut".into());
         }
@@ -150,15 +150,15 @@ impl DirectReplayFaultPlan {
             "object_id": projection.object.object_id,
             "nonce": self.nonce.to_string(),
             "checkpoint_ordinal": record.ordinal.to_string(),
-            "checkpoint_eod_partition": record.eod_partition,
-            "checkpoint_eod_lba": record.eod_lba.to_string(),
+            "checkpoint_eod_partition": record.cursor.partition,
+            "checkpoint_eod_lba": record.cursor.lba.to_string(),
         });
         write_durable_new_json(&self.evidence_path, &evidence)
     }
 
     pub(crate) fn abort_after_checkpoint_append(
         &self,
-        record: &CheckpointJournalRecord,
+        record: &AuthorityCommit,
     ) -> Result<(), String> {
         self.publish(record)?;
         std::process::abort()
@@ -300,6 +300,7 @@ fn write_durable_new_json(path: &Path, value: &Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use remanence_state::CheckpointJournalRecord;
     use remanence_state::{
         CheckpointObjectProjection, CheckpointObjectRecoveryRepresentation,
         CheckpointObjectRecoveryRow, NativeObjectCopyProjectionInput,
@@ -391,22 +392,22 @@ mod tests {
 
         let mut invalid = record.clone();
         invalid.tape_uuid = [0x99; 16];
-        assert!(plan.publish(&invalid).is_err());
+        assert!(plan.publish(&(&invalid).into()).is_err());
         invalid = record.clone();
         invalid.objects.push(record.objects[0].clone());
         assert!(
-            plan.publish(&invalid).is_err(),
+            plan.publish(&(&invalid).into()).is_err(),
             "the cut requires exactly one object"
         );
         invalid = record.clone();
         invalid.objects[0].object.caller_object_id = Some("other-caller".into());
-        assert!(plan.publish(&invalid).is_err());
+        assert!(plan.publish(&(&invalid).into()).is_err());
         assert!(
             !plan.evidence_path.exists(),
             "mismatches publish no evidence"
         );
         assert!(plan.require_object(tape_uuid, "other-caller").is_err());
-        plan.publish(&record).expect("publish evidence");
+        plan.publish(&(&record).into()).expect("publish evidence");
         let evidence: Value =
             serde_json::from_slice(&fs::read(&plan.evidence_path).expect("read evidence"))
                 .expect("decode evidence");

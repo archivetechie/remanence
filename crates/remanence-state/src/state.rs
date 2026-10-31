@@ -8,7 +8,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use ciborium::value::Value as CborValue;
-use remanence_parity::{FileTapeFileJournal, ParityScheme};
+use remanence_parity::ParityScheme;
 use sha2::{Digest, Sha256};
 use time::Duration;
 
@@ -25,8 +25,7 @@ use crate::index::{
     AdoptBootstrapIdentityInput, AdoptBootstrapIdentityOutcome, AdoptedTapeState,
     AuditReplayReport, CatalogIndex, CatalogResetPreservedTape, ProvisionTapeInput, RebuildReport,
     RebuildTapeJournalInput, RetireTapeInput, RetireTapeOutcome, TapeIoFenceRecord,
-    TapeJournalIndexInput, TapeJournalIndexReport, TapeKindFilter, TapePoolProjectionInput,
-    TapeRecord,
+    TapeJournalIndexReport, TapeKindFilter, TapePoolProjectionInput, TapeRecord,
 };
 use crate::lock::StateLockGuard;
 use crate::paths::StatePaths;
@@ -1340,11 +1339,6 @@ impl StateHandle {
         result
     }
 
-    /// Return the Layer 3c journal path for a tape UUID.
-    pub fn journal_path(&self, tape_uuid: [u8; 16]) -> PathBuf {
-        self.paths.journal_path(tape_uuid)
-    }
-
     /// Replay one Layer 3c journal through the 3c shared reader and index it.
     pub fn ingest_tape_journal(
         &mut self,
@@ -1352,113 +1346,17 @@ impl StateHandle {
         block_size: u32,
         scheme: ParityScheme,
     ) -> Result<TapeJournalIngestionOutcome, StateError> {
-        let path = self.journal_path(tape_uuid);
-        let reader = match FileTapeFileJournal::open_shared_for_replay(
-            &path,
+        crate::authority::legacy_ingest_structural(
+            &mut self.index,
+            &self.paths.journal_dir,
             tape_uuid,
             block_size,
-            scheme.clone(),
-        ) {
-            Ok(reader) => reader,
-            Err(err) if err.is_lock_contended() => {
-                let report = self
-                    .index
-                    .mark_tape_journal_ingestion_pending(tape_uuid, block_size, &scheme)?;
-                return Ok(TapeJournalIngestionOutcome::Pending(report));
-            }
-            Err(err) => {
-                return Err(StateError::JournalReplayFailed(format!(
-                    "open shared journal replay {}: {err}",
-                    path.display()
-                )));
-            }
-        };
-
-        let state = reader.load_committed().map_err(|err| {
-            StateError::JournalReplayFailed(format!(
-                "load committed journal {}: {err}",
-                path.display()
-            ))
-        })?;
-        if !state.orphaned_bundles.is_empty() {
-            tracing::warn!(
-                tape_uuid = %uuid::Uuid::from_bytes(tape_uuid),
-                orphaned_bundle_count = state.orphaned_bundles.len(),
-                "ignored sink-journal bundles beyond the last checkpoint watermark"
-            );
-        }
-        let journal_offset_bytes = fs::metadata(&path)
-            .map_err(|err| StateError::io_at("stat ingested journal", &path, err))?
-            .len();
-        let report = self.index.index_committed_tape_journal(
-            TapeJournalIndexInput {
-                tape_uuid,
-                block_size,
-                scheme: Some(scheme),
-                journal_offset_bytes,
-            },
-            &state,
-        )?;
-        Ok(TapeJournalIngestionOutcome::Indexed(report))
+            scheme,
+        )
     }
 
     fn load_tape_journal_rebuild_inputs(&self) -> Result<Vec<RebuildTapeJournalInput>, StateError> {
-        if !self.paths.journal_dir.exists() {
-            return Ok(Vec::new());
-        }
-        let mut paths = Vec::new();
-        for entry in fs::read_dir(&self.paths.journal_dir).map_err(|err| {
-            StateError::io_at("read journal directory", &self.paths.journal_dir, err)
-        })? {
-            let entry = entry.map_err(|err| {
-                StateError::io_at("read journal directory entry", &self.paths.journal_dir, err)
-            })?;
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) == Some("remjournal") {
-                paths.push(path);
-            }
-        }
-        paths.sort();
-
-        let mut inputs = Vec::with_capacity(paths.len());
-        for path in paths {
-            let reader = match FileTapeFileJournal::open_shared_existing_for_replay(&path) {
-                Ok(reader) => reader,
-                Err(err) if err.is_lock_contended() => {
-                    return Err(StateError::IndexRebuildInProgress);
-                }
-                Err(err) => {
-                    return Err(StateError::JournalReplayFailed(format!(
-                        "open shared journal replay {}: {err}",
-                        path.display()
-                    )));
-                }
-            };
-            let journal_offset_bytes = fs::metadata(&path)
-                .map_err(|err| StateError::io_at("stat ingested journal", &path, err))?
-                .len();
-            let input = TapeJournalIndexInput {
-                tape_uuid: reader.tape_uuid(),
-                block_size: reader.block_size(),
-                scheme: Some(reader.scheme().clone()),
-                journal_offset_bytes,
-            };
-            let state = reader.load_committed().map_err(|err| {
-                StateError::JournalReplayFailed(format!(
-                    "load committed journal {}: {err}",
-                    path.display()
-                ))
-            })?;
-            if !state.orphaned_bundles.is_empty() {
-                tracing::warn!(
-                    tape_uuid = %uuid::Uuid::from_bytes(input.tape_uuid),
-                    orphaned_bundle_count = state.orphaned_bundles.len(),
-                    "ignored sink-journal bundles beyond the last checkpoint watermark during rebuild"
-                );
-            }
-            inputs.push(RebuildTapeJournalInput { input, state });
-        }
-        Ok(inputs)
+        crate::authority::legacy_rebuild_structural(&self.paths.journal_dir)
     }
 
     fn mark_lost_operations_by_restart(&mut self) -> Result<u64, StateError> {

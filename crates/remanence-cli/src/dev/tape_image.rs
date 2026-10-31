@@ -14,12 +14,12 @@ use remanence_parity::{
     assemble_terminal_plan, checked_tape_index_replica_layout, index_separation_records,
     write_terminal_tail, CommittedBundle, CommittedBundleKind, CommittedState, DriveHandleRawSink,
     FilemarkMap, JournalError, ObjectRecoveryRepresentation, ParityError, ParityMapDiagnostics,
-    ParityScheme, ParitySink, RawTapeSink, SidecarWriteSummary, TapeFileEntry, TapeFileJournal,
-    TapeFileKind, TapeIndexReplicaCounts, TapeIndexReplicaFileKind, TapeIndexReplicaMapEntry,
+    ParityScheme, ParitySink, RawTapeSink, SidecarWriteSummary, TapeFileEntry, TapeFileKind,
+    TapeIndexReplicaCounts, TapeIndexReplicaFileKind, TapeIndexReplicaMapEntry,
     TapeIndexReplicaObjectRow, TapeIndexReplicaRecordSource, TapeIndexReplicaScope,
-    TerminalComponentCommit, TerminalComponentReconcileEvidence, TerminalPrefixPlan,
-    TerminalPrefixReconcileEvidence, TerminalTailAuthority, TerminalTailComponentPlan,
-    TerminalTailLayout, TerminalTailProgress, TerminalTailRunOutcome,
+    TapeReportPublisher, TerminalComponentCommit, TerminalComponentReconcileEvidence,
+    TerminalPrefixPlan, TerminalPrefixReconcileEvidence, TerminalTailAuthority,
+    TerminalTailComponentPlan, TerminalTailLayout, TerminalTailProgress, TerminalTailRunOutcome,
     TerminalTripleCapacityRuntimeState, TerminalTripleCloseInput, TerminalTripleWritePlan,
     WriterIdentity,
 };
@@ -383,14 +383,12 @@ impl ImageJournal {
     }
 }
 
-impl TapeFileJournal for ImageJournal {
+impl TapeReportPublisher for ImageJournal {
+    remanence_parity::fixture_publication_methods!();
     // In-memory session journals have no durable resume authority to replay.
     fn session_resume_snapshot(
         &self,
-    ) -> Result<
-        Option<remanence_parity::FileTapeFileJournalCommittedSnapshot>,
-        remanence_parity::JournalError,
-    > {
+    ) -> Result<Option<remanence_parity::FrozenFileRows>, remanence_parity::JournalError> {
         Ok(None)
     }
 
@@ -398,8 +396,13 @@ impl TapeFileJournal for ImageJournal {
         self.tape_uuid
     }
 
-    fn commit_bundle(&mut self, bundle: &CommittedBundle) -> Result<(), JournalError> {
-        self.bundles.push(bundle.clone());
+    fn publish_fixture(
+        &mut self,
+        report: &remanence_parity::authority::ShadowPublication,
+    ) -> Result<(), JournalError> {
+        for bundle in &report.bundles {
+            self.bundles.push(bundle.clone());
+        }
         Ok(())
     }
 
@@ -476,12 +479,13 @@ impl TerminalTailAuthority for ImageTerminalAuthority<'_> {
         Ok(TerminalComponentReconcileEvidence::Absent)
     }
 
-    fn commit_after_barrier(&mut self, commit: &TerminalComponentCommit) -> Result<(), String> {
+    fn commit_after_barrier(&mut self, commit: &mut TerminalComponentCommit) -> Result<(), String> {
         if commit.previous_progress != self.progress {
             return Err("tape-image terminal commit used stale progress".to_string());
         }
-        self.journal
-            .commit_terminal_component_transition(&commit.journal_bundle, &commit.checkpoint_bundle)
+        commit.publication = self
+            .journal
+            .publish_terminal_component(&(&commit.journal_bundle).into())
             .map_err(|error| error.to_string())?;
         self.progress = commit.next_progress;
         Ok(())

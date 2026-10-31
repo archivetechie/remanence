@@ -3,6 +3,7 @@
 use remanence_library::{
     resolve_load_target, AccessPolicy, DriveHandle, Library, LibraryHandle, LoadError, LoadPlan,
 };
+use remanence_state::authority::TapeAuthorityView;
 use remanence_state::{CatalogIndex, StateError};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -811,11 +812,11 @@ async fn manual_finalize_tape_critical(
         .map_err(|error| Status::internal(error.to_string()))?;
     let (tape, mut actor_request) =
         prepare_manual_finalize_request(&index, admission, |pool_id| state.pool_config(pool_id))?;
-    let pending_intent = remanence_state::FileCheckpointJournal::open(
+    let pending_intent = remanence_state::TapeAuthority::open(
         state.checkpoint_journal_dir.as_path(),
         actor_request.tape_uuid,
     )
-    .and_then(|j| j.terminal_finalization_intent())
+    .and_then(|j| j.pending_finalization())
     .map_err(crate::status_from_state_error)?;
     let prefix = if pending_intent.is_none()
         && tape.scheme_id.is_some()
@@ -1195,17 +1196,17 @@ async fn manual_finalize_attempt(
 /// stopped, including accepted manual operations whose callers disconnected.
 pub(crate) fn spawn_startup_terminal_recoveries(state: ApiState) {
     tokio::spawn(async move {
-        let paths =
-            match remanence_state::list_checkpoint_journals(state.checkpoint_journal_dir.as_path())
-            {
-                Ok(paths) => paths,
-                Err(error) => {
-                    tracing::error!(%error, "cannot enumerate startup terminal recoveries");
-                    return;
-                }
-            };
+        let paths = match remanence_state::TapeAuthority::list_entries(
+            state.checkpoint_journal_dir.as_path(),
+        ) {
+            Ok(paths) => paths,
+            Err(error) => {
+                tracing::error!(%error, "cannot enumerate startup terminal recoveries");
+                return;
+            }
+        };
         for path in paths {
-            let tape_uuid = match remanence_state::tape_uuid_from_checkpoint_path(&path) {
+            let tape_uuid = match remanence_state::TapeAuthority::entry_tape_uuid(&path) {
                 Ok(tape_uuid) => tape_uuid,
                 Err(error) => {
                     tracing::error!(path = %path.display(), %error, "invalid checkpoint journal path during startup recovery");
@@ -1223,7 +1224,7 @@ pub(crate) fn spawn_startup_terminal_recoveries(state: ApiState) {
             {
                 continue;
             }
-            let journal = match remanence_state::FileCheckpointJournal::open(
+            let journal = match remanence_state::TapeAuthority::open(
                 state.checkpoint_journal_dir.as_path(),
                 tape_uuid,
             ) {
@@ -1233,7 +1234,7 @@ pub(crate) fn spawn_startup_terminal_recoveries(state: ApiState) {
                     continue;
                 }
             };
-            let intent = match journal.terminal_finalization_intent() {
+            let intent = match journal.pending_finalization() {
                 Ok(intent) => intent,
                 Err(error) => {
                     tracing::error!(tape_uuid = %Uuid::from_bytes(tape_uuid), %error, "cannot inspect terminal intent during startup recovery");
@@ -1284,7 +1285,7 @@ pub(crate) fn spawn_startup_terminal_recoveries(state: ApiState) {
 /// and current guarded catalog/config data, then resume its physical tail.
 async fn recover_manual_terminal_tape(
     state: &ApiState,
-    intent: &remanence_state::TerminalFinalizationIntent,
+    intent: &remanence_state::authority::AuthorityFinalization,
 ) -> Result<(), Status> {
     let pool = state.drive_pool()?.clone();
     let tape_reservation = pool.reserve_tape(intent.tape_uuid)?;
@@ -1302,7 +1303,7 @@ async fn recover_manual_terminal_tape(
 /// memory or synthesizing a new operation identity.
 fn manual_finalize_request_from_intent(
     state: &ApiState,
-    intent: &remanence_state::TerminalFinalizationIntent,
+    intent: &remanence_state::authority::AuthorityFinalization,
 ) -> Result<crate::write_owner::ManualFinalizeTapeActorRequest, Status> {
     let manual = intent.manual.as_ref().ok_or_else(|| {
         Status::failed_precondition("startup manual recovery intent has no operation identity")
@@ -5063,8 +5064,10 @@ mod tests {
             .parent()
             .expect("catalog parent")
             .join("checkpoints");
-        let journal = remanence_state::FileCheckpointJournal::open(&checkpoint_dir, tape_uuid)
-            .expect("open host-only route checkpoint");
+        let journal =
+            remanence_state::authority::fixtures::AuthorityBuilder::new(&checkpoint_dir, tape_uuid)
+                .build()
+                .expect("open host-only route checkpoint");
         journal
             .append(&checkpoint)
             .expect("append host-only route checkpoint");
@@ -5075,10 +5078,7 @@ mod tests {
         let mut lease = journal
             .acquire_exclusive()
             .expect("acquire host-only route checkpoint");
-        let mut source =
-            remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_no_parity(
-                &lease,
-            )
+        let mut source = remanence_state::TerminalIndexSource::new_replay_backed_no_parity(&lease)
             .expect("reconstruct host-only route rows");
         let summary = source.summary();
         let replica =
@@ -5243,12 +5243,16 @@ mod tests {
         .expect_err("pinned open must lose to the existing exact-tape owner");
         assert_eq!(busy.code(), tonic::Code::FailedPrecondition);
         assert!(
-            remanence_state::FileCheckpointJournal::open(
+            remanence_state::authority::fixtures::AuthorityBuilder::new(
                 state.checkpoint_journal_dir.as_path(),
                 OWNED_TAPE,
             )
+            .build()
             .expect("open owned-tape checkpoint")
-            .terminal_finalization_intent()
+            .pending_finalization()
+            .map(|intent| intent
+                .as_ref()
+                .map(remanence_state::TerminalFinalizationIntent::from))
             .expect("read owned-tape intent")
             .is_some(),
             "busy refusal must happen before host preflight changes authority"
@@ -5281,22 +5285,23 @@ mod tests {
             "open route reached changer actor"
         );
 
-        let stale_journal = remanence_state::FileCheckpointJournal::open(
+        let stale_journal = remanence_state::authority::fixtures::AuthorityBuilder::new(
             state.checkpoint_journal_dir.as_path(),
             STALE_COMPANION_TAPE,
         )
+        .build()
         .expect("open stale-companion checkpoint");
-        let mut companion_path = stale_journal.path().as_os_str().to_os_string();
-        companion_path.push(".finalizing");
-        let companion_path = PathBuf::from(companion_path);
-        let companion_bytes = std::fs::read(&companion_path).expect("save exact companion bytes");
+        let saved_companion =
+            remanence_state::authority::fixtures::save_finalization(&stale_journal)
+                .expect("save exact companion bytes");
         recover_automatic_terminal_tape(&state, STALE_COMPANION_TAPE)
             .await
             .expect("first automatic completion seals the checkpoint");
         let sealed_before_retry = stale_journal
             .replay()
             .expect("read sealed authority before retained-companion retry");
-        std::fs::write(&companion_path, companion_bytes)
+        saved_companion
+            .restore()
             .expect("restore exact post-fsync stale companion");
         let selected_stale = crate::SelectedTape {
             standalone_endpoint: None,
@@ -5324,7 +5329,12 @@ mod tests {
         )
         .expect_err("failed sealed projection must not consume retry authority");
         let pending = stale_journal
-            .terminal_finalization_intent()
+            .pending_finalization()
+            .map(|intent| {
+                intent
+                    .as_ref()
+                    .map(remanence_state::TerminalFinalizationIntent::from)
+            })
             .expect("read companion after projection failure")
             .expect("projection failure retains the exact companion");
 
@@ -5388,7 +5398,10 @@ mod tests {
         assert_eq!(stale_error.code(), tonic::Code::FailedPrecondition);
         assert!(
             stale_journal
-                .terminal_finalization_intent()
+                .pending_finalization()
+                .map(|intent| intent
+                    .as_ref()
+                    .map(remanence_state::TerminalFinalizationIntent::from))
                 .expect("read companion after retry")
                 .is_none(),
             "exact sealed replay must retire the stale companion"
@@ -5426,14 +5439,19 @@ mod tests {
         recover_automatic_terminal_tape(&state, SEALED_NO_COMPANION_TAPE)
             .await
             .expect("seed sealed automatic authority without a companion");
-        let sealed_no_companion_journal = remanence_state::FileCheckpointJournal::open(
-            state.checkpoint_journal_dir.as_path(),
-            SEALED_NO_COMPANION_TAPE,
-        )
-        .expect("open sealed no-companion checkpoint");
+        let sealed_no_companion_journal =
+            remanence_state::authority::fixtures::AuthorityBuilder::new(
+                state.checkpoint_journal_dir.as_path(),
+                SEALED_NO_COMPANION_TAPE,
+            )
+            .build()
+            .expect("open sealed no-companion checkpoint");
         assert!(
             sealed_no_companion_journal
-                .terminal_finalization_intent()
+                .pending_finalization()
+                .map(|intent| intent
+                    .as_ref()
+                    .map(remanence_state::TerminalFinalizationIntent::from))
                 .expect("read retired no-companion intent")
                 .is_none(),
             "sealed completion must have retired its companion"
@@ -5602,7 +5620,8 @@ mod tests {
             .project_tape_pool_membership(tape_uuid, pool_id)
             .expect("assign pool");
         let checkpoint = manual_finalize_checkpoint(tape_uuid, BLOCK_SIZE);
-        remanence_state::FileCheckpointJournal::open(&checkpoint_dir, tape_uuid)
+        remanence_state::authority::fixtures::AuthorityBuilder::new(&checkpoint_dir, tape_uuid)
+            .build()
             .expect("open checkpoint journal")
             .append(&checkpoint)
             .expect("append checkpoint");
@@ -6057,7 +6076,7 @@ mod tests {
             })
             .unwrap();
         let before = std::fs::read(
-            remanence_state::list_checkpoint_journals(&checkpoint_dir)
+            remanence_state::TapeAuthority::list_entries(&checkpoint_dir)
                 .unwrap()
                 .pop()
                 .unwrap(),
@@ -6071,7 +6090,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read(
-                remanence_state::list_checkpoint_journals(&checkpoint_dir)
+                remanence_state::TapeAuthority::list_entries(&checkpoint_dir)
                     .unwrap()
                     .pop()
                     .unwrap()
@@ -6131,15 +6150,22 @@ mod tests {
         })
         .await
         .expect("startup worker releases exact-tape ownership");
-        let journal = remanence_state::FileCheckpointJournal::open(&checkpoint_dir, tape_uuid)
-            .expect("reopen manual terminal checkpoint");
+        let journal =
+            remanence_state::authority::fixtures::AuthorityBuilder::new(&checkpoint_dir, tape_uuid)
+                .build()
+                .expect("reopen manual terminal checkpoint");
         let mut lease = journal
             .acquire_exclusive_for_terminal_recovery()
             .expect("acquire manual terminal recovery");
         let mut recovery_index =
             CatalogIndex::open(&index_path).expect("open manual progress projection");
         let current = lease
-            .terminal_finalization_intent()
+            .pending_finalization()
+            .map(|intent| {
+                intent
+                    .as_ref()
+                    .map(remanence_state::TerminalFinalizationIntent::from)
+            })
             .expect("read manual finalization intent")
             .expect("manual finalization intent");
         assert_eq!(
@@ -6467,7 +6493,8 @@ mod tests {
             .project_tape_pool_membership(tape_uuid, pool_id)
             .expect("assign pool");
         let checkpoint = manual_finalize_checkpoint(tape_uuid, BLOCK_SIZE);
-        remanence_state::FileCheckpointJournal::open(&checkpoint_dir, tape_uuid)
+        remanence_state::authority::fixtures::AuthorityBuilder::new(&checkpoint_dir, tape_uuid)
+            .build()
             .expect("open checkpoint journal")
             .append(&checkpoint)
             .expect("append checkpoint");

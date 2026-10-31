@@ -15,6 +15,13 @@ const BLOCK: u32 = 262144;
 const BAY: u16 = 0x100;
 const DEVICE: &str = "/dev/sg-model-p4";
 const SERIAL: &str = "P4-MODEL";
+// Checkpoint publication triggers either a readiness fault or a media swap.
+type PublicationBoundary = (
+    Arc<remanence_state::TapeAuthority>,
+    SharedVirtualWorld,
+    bool,
+    Arc<Mutex<bool>>,
+);
 struct Transport {
     inner: ModelTransport,
     fault: Arc<Mutex<Option<u8>>>,
@@ -22,18 +29,16 @@ struct Transport {
     hide_serial: bool,
     commands: Option<Arc<Mutex<Vec<Vec<u8>>>>>,
     cut_after_prevent: bool,
-    boundary: Option<(PathBuf, SharedVirtualWorld, bool, Arc<Mutex<bool>>)>,
+    boundary: Option<PublicationBoundary>,
 }
 impl Transport {
     fn fail(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
         if let Some(commands) = &self.commands {
             commands.lock().unwrap().push(cdb.to_vec());
         }
-        if self
-            .boundary
-            .as_ref()
-            .is_some_and(|(p, _, _, _)| std::fs::metadata(p).is_ok_and(|m| m.len() > 32))
-        {
+        if self.boundary.as_ref().is_some_and(|(authority, _, _, _)| {
+            remanence_state::authority::fixtures::has_publication(authority)
+        }) {
             let (_, world, ua, seen) = self.boundary.take().unwrap();
             *seen.lock().unwrap() = true;
             assert_eq!(
@@ -651,7 +656,7 @@ fn parity_import_rejects_a_missing_partner_and_validates_the_complete_pair() {
     world.lock().unwrap().tapes.get_mut("HAND").unwrap().records[0] = Record::Block(block);
     let lock = root.path().join("locks");
     let from = state.paths().journal_dir.clone();
-    let partner = state.journal_path(UUID);
+    let partner = state.paths().journal_path(UUID);
     let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
     let mounted = mount.mount(target()).unwrap();
     let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
@@ -665,13 +670,10 @@ fn parity_import_rejects_a_missing_partner_and_validates_the_complete_pair() {
     let destination = state.paths().journal_dir.join("checkpoints");
     let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
     let mut mounted = mount.mount(target()).unwrap();
-    let hidden = partner.with_extension("saved");
-    std::fs::rename(&partner, &hidden).unwrap();
+    let hidden = remanence_parity::authority::fixtures::hide_authority(&partner).unwrap();
     assert!(mount.import_journals(&mut mounted, &from).is_err());
-    assert!(!destination
-        .join(format!("{}.remcheckpoint", uuid::Uuid::from_bytes(UUID)))
-        .exists());
-    std::fs::rename(hidden, &partner).unwrap();
+    assert!(!remanence_state::TapeAuthority::exists(&destination, UUID).unwrap());
+    hidden.restore().unwrap();
     mount.import_journals(&mut mounted, &from).unwrap();
     mount.release(mounted);
     let paths = state.paths().clone();
@@ -764,11 +766,13 @@ fn automatic_terminal_close_reproves_after_checkpoint_publication() {
         config.tape_pools[0].watermark_low = 0.000001;
         config.tape_pools[0].watermark_high = 0.25;
         let mut state = StateHandle::open_with_config(paths, config).unwrap();
-        let checkpoint = remanence_state::FileCheckpointJournal::open(
+        let checkpoint = remanence_state::authority::fixtures::AuthorityBuilder::new(
             state.paths().journal_dir.join("checkpoints"),
             UUID,
         )
+        .build()
         .unwrap();
+        let checkpoint = Arc::new(checkpoint);
         let world = world();
         let seen = Arc::new(Mutex::new(false));
         let mut backend = OperatorMount::with_transport_for_test(
@@ -782,7 +786,7 @@ fn automatic_terminal_close_reproves_after_checkpoint_publication() {
                 commands: None,
                 cut_after_prevent: false,
                 boundary: Some((
-                    checkpoint.path().into(),
+                    Arc::clone(&checkpoint),
                     Arc::clone(&world),
                     ua,
                     Arc::clone(&seen),
@@ -1284,21 +1288,6 @@ fn library_automatic_sealing_releases_owned_removal_guard() {
 }
 
 #[test]
-fn authority_hashing_keeps_no_follow_open_policy() {
-    let root = tempfile::tempdir().unwrap();
-    let a = root.path().join("a");
-    let b = root.path().join("b");
-    let link = root.path().join("link");
-    std::fs::write(&a, b"authority").unwrap();
-    std::fs::write(&b, b"authority").unwrap();
-    assert!(same_authority(&a, &b).unwrap());
-    std::os::unix::fs::symlink(&a, &link).unwrap();
-    assert!(same_authority(&a, &link).is_err());
-    std::fs::write(&b, b"changed").unwrap();
-    assert!(!same_authority(&a, &b).unwrap());
-}
-
-#[test]
 fn mounted_positioning_reuses_only_current_bootstrap_evidence_and_releases_once() {
     let root = tempfile::tempdir().unwrap();
     let mut state = state(root.path());
@@ -1690,7 +1679,7 @@ fn stale_import_publishes_nothing_and_terminal_finalize_preserves_foreign_object
             .join("checkpoints")
             .join(format!("{}.remcheckpoint", uuid::Uuid::from_bytes(UUID)));
         assert!(!checkpoint.exists());
-        assert!(!new_host.journal_path(UUID).exists());
+        assert!(!new_host.paths().journal_path(UUID).exists());
         drop(new_host);
         std::fs::remove_dir_all(&dir).unwrap();
         copy_closed_state(&backup, &dir);
@@ -2742,4 +2731,40 @@ fn supersede_tail_failure_fence_survives_empty_catalog_rebuild() {
     assert_eq!(fences.len(), 1);
     assert_eq!(fences[0].reason, "supersede_tail_failed");
     crate::tests::assert_fences_survive_empty_rebuild(state.catalog_index(), &audit_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn epoch_finalization_planner_refuses_sealed_and_before_replica_a_authority() {
+    use crate::write_owner::tests::RetentionInvalidation::{
+        PlannerRefusesBeforeReplicaA, PlannerRefusesSealed,
+    };
+    for invalidation in [PlannerRefusesBeforeReplicaA, PlannerRefusesSealed] {
+        let root = tempfile::tempdir().unwrap();
+        let parity = crate::ParityConfig::Scheme(remanence_parity::ParityScheme {
+            id: remanence_parity::SchemeId::new_static("seated"),
+            data_blocks_per_stripe: 128,
+            parity_blocks_per_stripe: 1,
+            stripes_per_neighborhood: 1,
+        });
+        let world = world();
+        set_rollback_bootstrap(&world, parity.clone());
+        let mut state = state_with_parity(root.path(), true, parity.clone());
+        crate::write_owner::tests::check_seated_parity_sessions(
+            &mut state,
+            world,
+            crate::SelectedTape {
+                standalone_endpoint: None,
+                pool_id: "default".into(),
+                tape_uuid: UUID,
+                block_size: BLOCK,
+                parity_config: parity,
+            },
+            false,
+            false,
+            false,
+            invalidation,
+            false,
+        )
+        .await;
+    }
 }

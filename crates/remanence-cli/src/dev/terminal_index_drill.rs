@@ -727,7 +727,10 @@ impl<S: RawTapeSource> TerminalTailAuthority for ReconcileDrillAuthority<'_, S> 
         Ok(evidence)
     }
 
-    fn commit_after_barrier(&mut self, _commit: &TerminalComponentCommit) -> Result<(), String> {
+    fn commit_after_barrier(
+        &mut self,
+        _commit: &mut TerminalComponentCommit,
+    ) -> Result<(), String> {
         self.commit_attempted = true;
         Err("reconciliation drill must not commit terminal progress".to_string())
     }

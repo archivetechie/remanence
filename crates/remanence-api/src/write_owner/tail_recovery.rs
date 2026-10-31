@@ -1,5 +1,6 @@
 //! Explicit tail recovery shared by the mounted and library drive actors.
 use remanence_library::{DriveHandle, DriveHandleSource};
+use remanence_state::authority::TapeAuthorityView;
 use remanence_state::{AuditActor, AuditEvent, SourceLayer};
 use std::collections::BTreeMap;
 
@@ -60,12 +61,11 @@ pub(crate) fn supersede_mounted_tail(
         tape.pool_id.as_deref().unwrap_or("(unpooled)"),
     )
     .map_err(|e| failure(e.to_string()))?;
-    let journal =
-        remanence_state::FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, tape_uuid)
-            .map_err(crate::status_from_state_error)?;
+    let journal = remanence_state::TapeAuthority::open(&cfg.checkpoint_journal_dir, tape_uuid)
+        .map_err(crate::status_from_state_error)?;
     let terminal_guidance = "retry FinalizeTape with its original idempotency key. If rolled-back state cannot resume that intent, restore a newer copy of the state directory; supersede-tail cannot clear a stale terminal intent";
     if journal
-        .terminal_finalization_intent()
+        .pending_finalization()
         .map_err(|e| {
             failure(format!(
                 "cannot establish terminal authority: {e}; {terminal_guidance}"
@@ -77,11 +77,11 @@ pub(crate) fn supersede_mounted_tail(
             "terminal finalization intent prevents tail discard; {terminal_guidance}"
         )));
     }
-    let lease = journal
+    let mut lease = journal
         .acquire_exclusive()
         .map_err(crate::status_from_state_error)?;
     if lease
-        .terminal_finalization_intent()
+        .pending_finalization()
         .map_err(crate::status_from_state_error)?
         .is_some()
     {
@@ -90,14 +90,14 @@ pub(crate) fn supersede_mounted_tail(
         ));
     }
     let last = lease
-        .last_record_bounded()
+        .latest_commit()
         .map_err(crate::status_from_state_error)?;
     let make_context = || {
         let mut ctx = context(
             tape_uuid,
             size,
-            last.as_ref().map_or(0, |r| r.eod_partition),
-            last.as_ref().map_or(0, |r| r.eod_lba),
+            last.as_ref().map_or(0, |r| r.cursor.partition),
+            last.as_ref().map_or(0, |r| r.cursor.lba),
         );
         ctx.inspect_all = true;
         ctx
@@ -194,15 +194,21 @@ pub(crate) fn supersede_mounted_tail(
                 .map_err(|e| e.to_string())?;
         }
         if let remanence_parity::ParityConfig::Scheme(scheme) = &parity {
-            let dir = cfg
-                .checkpoint_journal_dir
-                .parent()
-                .ok_or("missing parity journal directory")?;
-            let path = dir.join(format!("{}.remjournal", crate::bytes_to_hex(&tape_uuid)));
-            let mut journal =
-                remanence_parity::FileTapeFileJournal::open(path, tape_uuid, size, scheme.clone())
-                    .map_err(|e| e.to_string())?;
-            crate::append_admission::discard_reconciled_parity_suffix(&mut journal, &lease)?;
+            let journal = lease
+                .open_structural(size, scheme.clone())
+                .map_err(|e| e.to_string())?;
+            lease
+                .retain_structural_publisher(journal)
+                .map_err(|error| error.to_string())?;
+            lease
+                .with_structural(|lease, rows| {
+                    lease.finish_structural_scope();
+                    crate::append_admission::discard_reconciled_parity_suffix(
+                        rows.ok_or_else(|| "missing retained structural capability".to_string())?,
+                        lease,
+                    )
+                })
+                .map_err(|error| error.to_string())??;
         }
         Ok::<_, String>(())
     })();

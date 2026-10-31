@@ -18,6 +18,10 @@
 //! rejects external calls so a body format cannot silently introduce an
 //! untracked tape-file boundary.
 
+use crate::authority::TapeReportPublisher;
+
+use crate::authority::PublicationReceipt;
+
 use crate::{ParityMapDiagnostics, WriterIdentity};
 use std::collections::BTreeMap;
 
@@ -37,10 +41,7 @@ use crate::error::ParityError;
 #[cfg(test)]
 use crate::filemark_map::FilemarkMap;
 use crate::filemark_map::{FilemarkMapBuilder, FilemarkMapDigest, TapeFileKind, TapeFileMapEntry};
-use crate::journal::{
-    CommittedBundle, CommittedBundleKind, FileTapeFileJournalCommittedSnapshot, TapeFileEntry,
-    TapeFileJournal,
-};
+use crate::journal::{CommittedBundle, CommittedBundleKind, FrozenFileRows, TapeFileEntry};
 use crate::model::{FinalGeometry, ParityScheme};
 use crate::parity_map::{
     encode_parity_map_tape_file, parse_parity_map_tape_file, ParityMapPayload,
@@ -447,6 +448,8 @@ pub struct SidecarWriteSummary {
 /// Result of closing the currently active object tape file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectWriteSummary {
+    /// Exact old-format publication units, empty when no publisher is attached.
+    pub publication: PublicationReceipt,
     /// Tape-file number assigned by
     /// [`ParitySink::begin_object_with_terminal_triple_reservation`].
     pub tape_file_number: u64,
@@ -474,6 +477,10 @@ pub struct ObjectWriteSummary {
 
 impl ObjectWriteSummary {
     /// Build the generic v0.7.2 journal bundle for this object close.
+    pub fn file_publication(&self) -> Result<crate::authority::FilePublication, ParityError> {
+        self.committed_bundle().map(|bundle| (&bundle).into())
+    }
+    #[doc(hidden)]
     pub fn committed_bundle(&self) -> Result<CommittedBundle, ParityError> {
         let total_committed_ordinals_after = self
             .first_parity_data_ordinal
@@ -531,6 +538,8 @@ pub type SidecarTapeFile = SidecarWriteSummary;
 /// Result of writing a resumable clean-session checkpoint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointResult {
+    /// Exact old-format publication units, empty when no publisher is attached.
+    pub publication: PublicationReceipt,
     /// First tape-file number available after the checkpoint watermark.
     pub next_tape_file_number: u64,
     /// Protection watermark after the checkpoint bundle.
@@ -550,9 +559,24 @@ pub struct CheckpointResult {
     pub committed_bundle: Option<CommittedBundle>,
 }
 
+impl CheckpointResult {
+    /// Sidecars emitted at this barrier, when the stop closed an epoch.
+    pub fn sidecar_publication(&self) -> Option<crate::authority::FilePublication> {
+        self.committed_bundle.as_ref().map(Into::into)
+    }
+}
+impl TerminalPrefixPlan {
+    /// Exact files and counters proved by this planned terminal prefix.
+    pub fn media_publication(&self) -> crate::authority::FilePublication {
+        (&self.committed_bundle).into()
+    }
+}
+
 /// Barrier-proved final parity prefix immediately before replica A.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalPrefixCloseResult {
+    /// Exact old-format publication units, empty when no publisher is attached.
+    pub publication: PublicationReceipt,
     /// Final partial sidecars emitted by this close, if any.
     pub sidecars_emitted: Vec<SidecarWriteSummary>,
     /// External final ParityMap emitted when sidecar metadata exists.
@@ -843,7 +867,7 @@ pub struct ParitySinkSessionState {
     poisoned: bool,
     last_data_lba: u64,
     filemark_map: FilemarkMapBuilder,
-    committed_prefix_snapshot: Option<FileTapeFileJournalCommittedSnapshot>,
+    committed_prefix_snapshot: Option<FrozenFileRows>,
     /// Live actor handoffs retain writes beyond the last checkpoint in memory;
     /// only checkpoint-boundary handoffs replay off-tape resume authority.
     has_uncheckpointed_bundles: bool,
@@ -929,7 +953,7 @@ impl ParitySinkSessionState {
 #[derive(Debug)]
 pub struct BoundedResumeWriterSeed<'a> {
     /// Frozen file-backed journal authority.
-    pub committed_prefix_snapshot: FileTapeFileJournalCommittedSnapshot,
+    pub committed_prefix_snapshot: FrozenFileRows,
     /// Validated bounded resume summary.
     pub committed_prefix_summary: BoundedResumeSummary,
     /// Completed resume plan.
@@ -949,7 +973,7 @@ pub struct BoundedResumeWriterSeed<'a> {
 pub struct ParitySink<'a> {
     identity: WriterIdentity,
     backend: ParitySinkBackend<'a>,
-    journal: Option<&'a mut dyn TapeFileJournal>,
+    journal: Option<&'a mut dyn TapeReportPublisher>,
     scheme: ParityScheme,
     tape_uuid: [u8; 16],
     codec: ReedSolomonCodec,
@@ -1033,7 +1057,7 @@ pub struct ParitySink<'a> {
 
     /// Structural map of tape files emitted by this sink.
     filemark_map: FilemarkMapBuilder,
-    committed_prefix_snapshot: Option<FileTapeFileJournalCommittedSnapshot>,
+    committed_prefix_snapshot: Option<FrozenFileRows>,
     /// Live actor handoffs retain writes beyond the last checkpoint in memory;
     /// only checkpoint-boundary handoffs replay off-tape resume authority.
     has_uncheckpointed_bundles: bool,
@@ -1193,7 +1217,7 @@ impl<'a> ParitySink<'a> {
     /// Reattach actor-carried state to the transport and durable sink journal.
     pub fn from_session_state(
         inner: &'a mut dyn RawTapeSink,
-        journal: &'a mut dyn TapeFileJournal,
+        journal: &'a mut dyn TapeReportPublisher,
         state: ParitySinkSessionState,
     ) -> Result<Self, ParityError> {
         Self::try_from_session_state(inner, journal, state).map_err(|(error, _state)| error)
@@ -1203,7 +1227,7 @@ impl<'a> ParitySink<'a> {
     /// The close operation recomputes the complete immutable plan before writing.
     pub fn from_session_state_for_terminal_close(
         inner: &'a mut dyn RawTapeSink,
-        journal: &'a mut dyn TapeFileJournal,
+        journal: &'a mut dyn TapeReportPublisher,
         state: ParitySinkSessionState,
         plan: &TerminalPrefixPlan,
         evidence: TerminalPrefixReconcileEvidence,
@@ -1228,7 +1252,7 @@ impl<'a> ParitySink<'a> {
     /// the transport or journal fails before any tape motion.
     pub fn try_from_session_state(
         inner: &'a mut dyn RawTapeSink,
-        journal: &'a mut dyn TapeFileJournal,
+        journal: &'a mut dyn TapeReportPublisher,
         state: ParitySinkSessionState,
     ) -> Result<Self, (ParityError, Box<ParitySinkSessionState>)> {
         Self::try_from_session_state_at_position(inner, journal, state, None, None)
@@ -1236,7 +1260,7 @@ impl<'a> ParitySink<'a> {
 
     fn try_from_session_state_at_position(
         inner: &'a mut dyn RawTapeSink,
-        journal: &'a mut dyn TapeFileJournal,
+        journal: &'a mut dyn TapeReportPublisher,
         mut state: ParitySinkSessionState,
         terminal_position: Option<u64>,
         terminal_plan: Option<&TerminalPrefixPlan>,
@@ -1255,7 +1279,9 @@ impl<'a> ParitySink<'a> {
             None
         } else {
             let snapshot = match terminal_plan {
-                Some(plan) => journal.session_terminal_resume_snapshot(&plan.committed_bundle),
+                Some(plan) => {
+                    journal.session_terminal_resume_snapshot(&(&plan.committed_bundle).into())
+                }
                 None => journal.session_resume_snapshot(),
             };
             match resume_record_result(snapshot) {
@@ -1388,7 +1414,7 @@ impl<'a> ParitySink<'a> {
     /// only after their synchronous tape-file filemarks have completed.
     pub fn new_with_journal(
         inner: &'a mut dyn RawTapeSink,
-        journal: &'a mut dyn TapeFileJournal,
+        journal: &'a mut dyn TapeReportPublisher,
         scheme: ParityScheme,
         tape_uuid: [u8; 16],
         block_size_bytes: u32,
@@ -1438,7 +1464,7 @@ impl<'a> ParitySink<'a> {
     /// without cloning its data shards.
     pub fn new_sidecar_only_from_bounded_resume(
         inner: &'a mut dyn RawTapeSink,
-        journal: &'a mut dyn TapeFileJournal,
+        journal: &'a mut dyn TapeReportPublisher,
         scheme: ParityScheme,
         tape_uuid: [u8; 16],
         block_size_bytes: u32,
@@ -1463,7 +1489,7 @@ impl<'a> ParitySink<'a> {
 
     fn new_sidecar_only_from_bounded_resume_inner(
         inner: &'a mut dyn RawTapeSink,
-        journal: Option<&'a mut dyn TapeFileJournal>,
+        journal: Option<&'a mut dyn TapeReportPublisher>,
         scheme: ParityScheme,
         tape_uuid: [u8; 16],
         block_size_bytes: u32,
@@ -1525,7 +1551,7 @@ impl<'a> ParitySink<'a> {
 
     fn new_with_backend(
         backend: ParitySinkBackend<'a>,
-        journal: Option<&'a mut dyn TapeFileJournal>,
+        journal: Option<&'a mut dyn TapeReportPublisher>,
         scheme: ParityScheme,
         tape_uuid: [u8; 16],
         block_size_bytes: u32,
@@ -1896,7 +1922,8 @@ impl<'a> ParitySink<'a> {
             self.poisoned = true;
             return Err(err);
         }
-        let summary = ObjectWriteSummary {
+        let mut summary = ObjectWriteSummary {
+            publication: PublicationReceipt::default(),
             tape_file_number: object.tape_file_number,
             first_parity_data_ordinal,
             projected_size_blocks: object.projected_size_blocks,
@@ -1910,14 +1937,17 @@ impl<'a> ParitySink<'a> {
             .committed_object_count
             .checked_add(1)
             .ok_or(ParityError::Invariant("committed Object count overflows"))?;
-        if let Err(err) = self.commit_journal_map_range(
+        summary.publication = match self.commit_journal_map_range(
             CommittedBundleKind::Object,
             bundle_start,
             &summary.sidecars_emitted,
         ) {
-            self.poisoned = true;
-            return Err(err);
-        }
+            Ok(report) => report,
+            Err(err) => {
+                self.poisoned = true;
+                return Err(err);
+            }
+        };
         self.committed_object_count = committed_object_count;
         Ok(summary)
     }
@@ -1934,6 +1964,11 @@ impl<'a> ParitySink<'a> {
 
     /// Emit the sole schema-major 2 Bootstrap at BOT.
     pub fn write_bootstrap(&mut self) -> Result<u64, ParityError> {
+        self.write_bootstrap_report().map(|report| report.0)
+    }
+
+    /// Emit BOT and return the exact legacy publication, without adding a barrier.
+    pub fn write_bootstrap_report(&mut self) -> Result<(u64, PublicationReceipt), ParityError> {
         let bundle_start = self.filemark_map.next_tape_file_number()?;
         if bundle_start != 0 || self.bot_bootstrap_committed {
             return Err(ParityError::Invariant(
@@ -1948,13 +1983,18 @@ impl<'a> ParitySink<'a> {
             false,
         )?;
         let tape_file_number = self.write_prepared_bootstrap(0, self.bootstrap_payload(digest)?)?;
-        if let Err(err) =
-            self.commit_journal_map_range(CommittedBundleKind::BotBootstrap, bundle_start, &[])
-        {
-            self.poisoned = true;
-            return Err(err);
-        }
-        Ok(tape_file_number)
+        let publication = match self.commit_journal_map_range(
+            CommittedBundleKind::BotBootstrap,
+            bundle_start,
+            &[],
+        ) {
+            Ok(report) => report,
+            Err(err) => {
+                self.poisoned = true;
+                return Err(err);
+            }
+        };
+        Ok((tape_file_number, publication))
     }
 
     /// Commit a resumable checkpoint while keeping the short epoch open.
@@ -2815,21 +2855,19 @@ impl<'a> ParitySink<'a> {
                 "terminal prefix unexpectedly contains a Bootstrap",
             ));
         }
-        let checkpoint_bundle = CommittedBundle {
-            kind: CommittedBundleKind::CheckpointedThrough,
-            entries: Vec::new(),
-            highest_protected_ordinal: committed_bundle.highest_protected_ordinal,
-            total_committed_ordinals: committed_bundle.total_committed_ordinals,
-        };
-        if let Some(journal) = self.journal.as_mut() {
-            if let Err(error) =
-                journal.commit_terminal_prefix_transition(&committed_bundle, &checkpoint_bundle)
-            {
-                self.poisoned = true;
-                return Err(error.into());
+        let publication = if let Some(journal) = self.journal.as_mut() {
+            match journal.publish_terminal_prefix(&(&committed_bundle).into()) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    self.poisoned = true;
+                    return Err(error.into());
+                }
             }
-        }
+        } else {
+            PublicationReceipt::default()
+        };
         Ok(TerminalPrefixCloseResult {
+            publication,
             sidecars_emitted,
             parity_map_tape_file_number,
             barrier_outcome,
@@ -2888,19 +2926,26 @@ impl<'a> ParitySink<'a> {
             }));
         }
         let kind = CommittedBundleKind::CheckpointSidecars;
+        let mut publication = PublicationReceipt::default();
         let committed_bundle = if sidecars_emitted.is_empty() {
             None
         } else {
             let bundle = self.journal_map_range_bundle(kind, bundle_start, &sidecars_emitted)?;
-            if let Err(err) = self.commit_journal_bundle(&bundle) {
-                self.poisoned = true;
-                return Err(err);
+            match self.commit_journal_bundle(&bundle) {
+                Ok(receipt) => publication.items.extend(receipt.items),
+                Err(err) => {
+                    self.poisoned = true;
+                    return Err(err);
+                }
             }
             Some(bundle)
         };
-        self.commit_checkpointed_through()?;
+        publication
+            .items
+            .extend(self.commit_checkpointed_through()?.items);
         let next_tape_file_number = self.filemark_map.next_tape_file_number()?;
         Ok(CheckpointResult {
+            publication,
             next_tape_file_number,
             highest_protected_ordinal: self.highest_protected_ordinal,
             total_committed_ordinals: self.filemark_map.total_data_ordinals()?,
@@ -2912,7 +2957,7 @@ impl<'a> ParitySink<'a> {
         })
     }
 
-    fn commit_checkpointed_through(&mut self) -> Result<(), ParityError> {
+    fn commit_checkpointed_through(&mut self) -> Result<PublicationReceipt, ParityError> {
         let total_committed_ordinals = self.filemark_map.total_data_ordinals()?;
         self.commit_journal_bundle(&CommittedBundle {
             kind: CommittedBundleKind::CheckpointedThrough,
@@ -2926,13 +2971,19 @@ impl<'a> ParitySink<'a> {
     // has_uncheckpointed_bundles accurate. The terminal-prefix transition is
     // exempt: close_for_terminal_index consumes the sink, so no later handoff
     // can observe its flag.
-    fn commit_journal_bundle(&mut self, bundle: &CommittedBundle) -> Result<(), ParityError> {
-        if let Some(journal) = self.journal.as_mut() {
-            journal.commit_bundle(bundle)?;
+    fn commit_journal_bundle(
+        &mut self,
+        bundle: &CommittedBundle,
+    ) -> Result<PublicationReceipt, ParityError> {
+        let publication = if let Some(journal) = self.journal.as_mut() {
+            let receipt = journal.publish_commit(&bundle.into())?;
             self.has_uncheckpointed_bundles =
                 bundle.kind != CommittedBundleKind::CheckpointedThrough;
-        }
-        Ok(())
+            receipt
+        } else {
+            PublicationReceipt::default()
+        };
+        Ok(publication)
     }
 
     fn commit_journal_map_range(
@@ -2940,9 +2991,9 @@ impl<'a> ParitySink<'a> {
         kind: CommittedBundleKind,
         start_tape_file_number: u64,
         sidecars: &[SidecarWriteSummary],
-    ) -> Result<(), ParityError> {
+    ) -> Result<PublicationReceipt, ParityError> {
         if self.journal.is_none() {
-            return Ok(());
+            return Ok(PublicationReceipt::default());
         }
         let bundle = self.journal_map_range_bundle(kind, start_tape_file_number, sidecars)?;
         self.commit_journal_bundle(&bundle)

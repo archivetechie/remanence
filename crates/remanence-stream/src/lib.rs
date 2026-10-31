@@ -9,6 +9,7 @@
 //! - return catalog/audit projection rows for Layer 4/5 to commit atomically;
 //! - stream an object-local block source back to a filesystem destination.
 
+use remanence_parity::authority::FilePublication;
 mod recovery;
 
 use std::collections::BTreeMap;
@@ -29,7 +30,7 @@ use remanence_library::{
     BlockSink, BlockSource, TapeIoError, TapePosition, WriteFilemarksOutcome, WriteOutcome,
 };
 use remanence_parity::{
-    CommittedBundle, ObjectParityState, ObjectWriteSummary, ParityError, ParitySink, TapeFileKind,
+    ObjectParityState, ObjectWriteSummary, ParityError, ParitySink, TapeFileKind,
     TerminalTripleObjectReservation,
 };
 use sha2::{Digest, Sha256};
@@ -172,7 +173,7 @@ pub struct StreamingCatalogProjection {
     /// Object-copy row for this tape.
     pub object_copy: ObjectCopyProjection,
     /// 3c tape-file rows for the object-close commit bundle.
-    pub tape_file_bundle: CommittedBundle,
+    pub tape_file_bundle: FilePublication,
 }
 
 /// Minimal audit event emitted by this orchestration surface.
@@ -841,7 +842,7 @@ fn build_catalog_projection(
         plaintext_digest: object_digest,
         stored_digest: object_digest,
     };
-    let mut tape_file_bundle = object_close.committed_bundle()?;
+    let mut tape_file_bundle = object_close.file_publication()?;
     attach_object_id_to_bundle(
         &mut tape_file_bundle,
         object_close.tape_file_number,
@@ -1125,11 +1126,11 @@ fn xattrs_unsupported(error: &io::Error) -> bool {
 }
 
 fn attach_object_id_to_bundle(
-    bundle: &mut CommittedBundle,
+    bundle: &mut FilePublication,
     object_tape_file_number: u64,
     options: &RemTarObjectOptions,
 ) {
-    for entry in &mut bundle.entries {
+    for entry in &mut bundle.files {
         if entry.kind == TapeFileKind::Object && entry.tape_file_number == object_tape_file_number {
             entry.object_id = Some(options.object_id.clone());
         }
@@ -2097,7 +2098,7 @@ mod tests {
         BlockSinkRawTapeSink, CommittedBundle, CommittedBundleKind, CommittedState, FilemarkMap,
         JournalError, ObjectParitySource, OpenTrust, ParityScheme, PhysicalPositionHint,
         RawReadOutcome, RawTapeSource, SchemeId, ScopedFilemarkMap, SpaceFilemarksOutcome,
-        TapeFileJournal, TapeFileMapEntry, TerminalTripleCloseInput,
+        TapeFileMapEntry, TapeReportPublisher, TerminalTripleCloseInput,
         DEFAULT_INDEX_SEPARATION_BYTES,
     };
 
@@ -2147,13 +2148,19 @@ mod tests {
         bundles: Vec<CommittedBundle>,
     }
 
-    impl TapeFileJournal for TestJournal {
+    impl TapeReportPublisher for TestJournal {
+        remanence_parity::fixture_publication_methods!();
         fn tape_uuid(&self) -> [u8; 16] {
             TAPE_UUID
         }
 
-        fn commit_bundle(&mut self, bundle: &CommittedBundle) -> Result<(), JournalError> {
-            self.bundles.push(bundle.clone());
+        fn publish_fixture(
+            &mut self,
+            report: &remanence_parity::authority::ShadowPublication,
+        ) -> Result<(), JournalError> {
+            for bundle in &report.bundles {
+                self.bundles.push(bundle.clone());
+            }
             Ok(())
         }
 
@@ -2328,7 +2335,7 @@ mod tests {
         let object_entry = report
             .catalog
             .tape_file_bundle
-            .entries
+            .files
             .iter()
             .find(|entry| entry.kind == TapeFileKind::Object)
             .unwrap();
