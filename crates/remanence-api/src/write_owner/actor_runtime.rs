@@ -842,7 +842,7 @@ pub(super) fn drive_loop(
                 let _ = reply.send(ownership.complete(result));
             }
             DriveCommand::PrepareRemoval { reply, progress } => {
-                let result = super::checkpoint::close_retained_before_removal(
+                let result = super::checkpoint::close_retained_reporting(
                     &mut index,
                     drive,
                     &cfg,

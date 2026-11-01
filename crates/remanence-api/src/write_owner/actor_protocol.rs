@@ -198,7 +198,8 @@ pub(crate) enum DriveCommand {
     },
     PrepareRemoval {
         progress: Option<crate::operations::OperationHandle>,
-        reply: oneshot::Sender<Result<(), Status>>,
+        /// `Err`: no close ran. `Ok` says what the close did.
+        reply: oneshot::Sender<Result<super::checkpoint::RemovalClose, Status>>,
     },
     Unload {
         reply: oneshot::Sender<Result<DriveUnloadOutcome, Status>>,
