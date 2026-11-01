@@ -108,7 +108,7 @@ One row for each concept that crosses a boundary. The columns are what the forma
 | Tape pools | The specifications do not mention pools. REM-PARITY says it does not define placement policy (REM-PARITY §1.4, Non-Goals). Preparing. | No chapter. This one names pools so that they can be found. Published. | A pool is an operator-defined group of tapes. A write session names a pool, and Remanence picks the tape ([configuration reference](https://github.com/archivetechie/remanence/blob/main/docs/reference-configuration.md#tape_pools-and-tape_pool_rules)). Implemented. | Which pools exist, what each is for, and which pool receives each copy. Published here. |
 | The tape lifecycle: finalize, close to writes, retire, recycle | Finalization only: what is written, that nothing is appended after it, and what may be claimed (REM-PARITY §11.6, Finalization (W6); REM-PARITY §3.4, The Durable Boundary). Closing to writes, retiring and recycling are not defined. Preparing. | "Finalizing a tape and recovering from a crash"; "Retiring and recycling media". Published. | Remanence finalizes tapes, can close a tape to new writes (state `sealed`), and retires a tape identity in its catalog, which erases nothing ([lifecycle explainer](https://github.com/archivetechie/remanence/blob/main/docs/tape-identity-lifecycle-explainer.md)). Implemented. Recycling is not implemented. | When to finalize, when to stop writing to a tape, and when a medium may be released. Published here. |
 | Writer parameters | The legal values and their encodings: block sizes, `chunk_size`, parity scheme parameters (REM-PARITY §6.6, Scheme Parameters and Profiles; REM-OBJECT §4.2, Chunks and `chunk_size`). Choosing among them is not specified. Preparing. | "Ingest" (chunk size) and "Capacity admission" (separation extent, safety allowance). Published. | Defaults and keys are in the [configuration reference](https://github.com/archivetechie/remanence/blob/main/docs/reference-configuration.md) (block size, watermarks, minimum object size) and the [sizing guide](https://github.com/archivetechie/remanence/blob/main/docs/guide-object-sizing.md). Implemented. | Which values suit which content, and the object size it promises. Published here. |
-| Catalog, locators and commit records | No catalog: every copy can be read without one. A durable off-tape commit record is required, in a form the implementation chooses (REM-PARITY §3.4, The Durable Boundary). Preparing. | "Catalogs and indexes"; "Writing tapes: sessions, commit and resume". Published. | Per-tape journals are the durable truth, and the SQLite index is a rebuildable projection. A locator is emitted after each write ([glossary](https://github.com/archivetechie/remanence/blob/main/docs/reference-glossary.md), "catalog"). Implemented. | Its own catalog of assets and copies, reconciled with the implementation's. Published here. |
+| Catalog, locators and commit records | No catalog: every copy can be read without one. A durable off-tape commit record is required, in a form the implementation chooses (REM-PARITY §3.4, The Durable Boundary). Preparing. | "Catalogs and indexes"; "Writing tapes: sessions, commit and resume". Published. | A per-tape log is the durable truth, and the SQLite index is a rebuildable projection. A locator is emitted after each write ([glossary](https://github.com/archivetechie/remanence/blob/main/docs/reference-glossary.md), "catalog"). Implemented. | Its own catalog of assets and copies, reconciled with the implementation's. Published here. |
 | Object identity and `caller_object_id` | `object_id` and the four digests (REM-OBJECT §3.3, Identities and Digests). `REMANENCE.caller_object_id` is an opaque identifier assigned by the archiving system (REM-OBJECT §4.5.1, Keywords). Preparing. | "Catalogs and indexes", section 6.2. Published. | A repeat of the same pool, `caller_object_id` and content is idempotent, and different content under a reused id is a conflict ([glossary](https://github.com/archivetechie/remanence/blob/main/docs/reference-glossary.md), "caller object id"). Implemented. | Assigns the id, and decides what a logical asset is. Published here. |
 | Keys | The encoding of a recipient epoch and the key frame (REM-ENCRYPT §5.3, The Key Frame and HPKE Wrapping), and the longevity of epochs (REM-ENCRYPT §12.8, Key Rotation and Epoch Longevity). No key registry and no custody. Preparing. | "Keys and secrets". Published. | Remanence is handed a key when it opens an object, unwraps, and stores nothing ([encryption explained](https://github.com/archivetechie/remanence/blob/main/docs/encryption-explained.md#6-key-custody-a-component-you-provide)). Implemented as a seam, with no key store. | The key store, who holds each key, and the rotation schedule (section 2.3). Published here. |
 | Fences, quarantine and copy health | Nothing; no revision in preparation says anything. | "Writing tapes: sessions, commit and resume" (stop the session when an outcome is unknown); "Verification, scrub and repair". Published. | A fence is a durable refusal record after an unproven outcome. A copy shows `OK` when its catalog status is `committed` and `SUSPECT` otherwise, and `OK` is not verification ([troubleshooting](https://github.com/archivetechie/remanence/blob/main/docs/guide-troubleshooting.md#media-readiness-fences-and-quarantine)). Implemented. | What to do about a suspect copy, and when to trust a copy. It decides from measured digests, and not from the projection. Published here. |
@@ -153,7 +153,7 @@ Some words appear in more than one document with different meanings, and some ca
 | suspect | In Remanence, the health `SUSPECT` of a copy whose catalog status is anything but `committed`. It says that nothing has been proved, and does not say that anything is wrong. An orchestrator may also use the word of an asset whose content it doubts, which is a different claim. |
 | session | In this guide, a period of tape writing; we recommend keeping its drive settings fixed from the start (chapter 9). In Remanence, the daemon's write or read transaction, with an identifier that never survives a restart. |
 | finalize | To write a tape's terminal replicas and separation extents, after which nothing is appended (REM-PARITY §11.6, Finalization (W6)). It differs from closing a tape to new writes, and an orchestrator may use "finalized" of an asset whose archiving is complete. |
-| catalog | Any record of what exists, kept outside an object. In Remanence, journals with a rebuildable SQLite projection. An orchestrator keeps its own, of assets and copies, and the two are reconciled. |
+| catalog | Any record of what exists, kept outside an object. In Remanence, per-tape logs with a rebuildable SQLite projection. An orchestrator keeps its own, of assets and copies, and the two are reconciled. |
 | policy | In the specifications, the change policy that governs revisions. In Remanence, an operator's policy for extensions, a pool's selection policy and a medium's rewrite policy. For an archive, a decision about what is stored, how many copies, where, for how long, who may restore it and what may be disclosed. |
 | bundle | An orchestrator's bundle is files packed into one archive object, and REM-OBJECT uses the word in the same sense for the payloads that one object holds. REM-PARITY permits one barrier and one commit record to cover several tape files (REM-PARITY §11.2, Commit (W2)). |
 
@@ -667,7 +667,7 @@ inventory. The specification fixes the part that concerns claims: "A record the
 implementation does not treat as commit authority, such as a rebuildable
 catalog or cache, does not commit a tape file." (REM-PARITY §3.4), and "An
 off-tape catalog is a cache." (REM-PARITY §12.1). Remanence, for example, can rebuild its SQLite catalog from
-its journals with `rem rebuild-catalog-from-journals`.
+its per-tape logs and audit log with `rem rebuild-catalog-from-journals`.
 
 Serves REM-PARITY §3.4, The Durable Boundary, and REM-PARITY §12.1, Inputs and
 Authority.
@@ -1124,11 +1124,11 @@ tape, are the authority for the open prefix and the append position. The
 specification fixes the outcome: "Before a Resumer positions to an append point
 or writes, the validated combination of the records it relies on MUST determine
 exactly one committed prefix and its append point." (REM-PARITY §3.4); a resume that
-cannot establish one fails as `ResumeAppend`. Remanence, for example, keeps a
-tape-file journal and a checkpoint journal for each tape and compares their
-histories entry by entry before it appends; the
+cannot establish one fails as `ResumeAppend`. Remanence, for example, keeps the
+committed prefix and its append point in one append-only log for each tape and
+replays its validated closed records to establish them before it appends; the
 [on-tape layout reference](https://github.com/archivetechie/remanence/blob/main/docs/reference-tape-layout.md#on-disk-durable-records-and-rebuildable-state)
-describes them.
+describes it.
 
 Serves REM-PARITY §3.4, The Durable Boundary, and REM-PARITY §12.1, Inputs and
 Authority.
@@ -1421,11 +1421,11 @@ On restart, a tool in that state should finish its host records without further
 media motion: no terminal component is repeated, and nothing is written after
 C. If a completed record and a stale intent to finalize both survive and
 agree, the completed record should take precedence. If they disagree, the tool
-should stop rather than choose. Remanence, for example, keeps a sealed
-checkpoint and a companion intent. On the uninterrupted path it fsyncs the sealed
-checkpoint. It then retires the companion. The final catalog projection
-follows. When a crash leaves both behind, startup recovery projects the sealed
-checkpoint first. It retires the companion only after that projection succeeds. The
+should stop rather than choose. Remanence, for example, records the
+completed finalization as a sealed record in the tape's one append-only log
+and then projects it into its catalog. When a crash interrupts these host
+steps, startup recovery replays the durable component or sealed record and
+finishes the projection before any media motion. The
 [on-tape layout reference](https://github.com/archivetechie/remanence/blob/main/docs/reference-tape-layout.md#finalization-and-catalog-less-recovery)
 describes the sequence.
 
@@ -2281,6 +2281,10 @@ identity at random.
   mismatch. New section 10.9 records acceptance of an uncovered range before
   planning finalization. Sections 9.1, 9.9 and 10.9 quote and cite W5 and W6
   where they state those rules.
+
+  On 1 November 2026 the Remanence examples in sections 2.2, 2.4, 6.6, 9.2 and
+  10.3 follow its move from two host journals per tape to one append-only log.
+  No practice changes.
 
 - **30 September 2026.** Sixth revision. Section 7.3 gains the practice of a
   full verification: a check of structure alone is not one, and each failed

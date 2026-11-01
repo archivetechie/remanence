@@ -1489,12 +1489,12 @@ The walk reconstructs tape-file boundaries, validates recognisable
 ParitySidecar and control structure, and measures complete Object candidates
 by elimination. It reports each candidate's identity as unknown unless a
 separate exact Object-recovery authority succeeds. Such authority MAY be a
-surviving fsynced host checkpoint journal or a representation-aware REM-OBJECT
-recovery pass. A rebuildable catalog projection alone is insufficient. The
-walk does not invent a terminal replica. The Scanner MUST report that terminal
-authority was not recovered. A terminal replica that the walk finds intact is
-a tape file of the walk and is not Object authority: it supplies no Object
-identity.
+surviving durable off-tape commit record (Section 3.4) or a
+representation-aware REM-OBJECT recovery pass. A rebuildable catalog
+projection alone is insufficient. The walk does not invent a terminal replica.
+The Scanner MUST report that terminal authority was not recovered. A terminal
+replica that the walk finds intact is a tape file of the walk and is not
+Object authority: it supplies no Object identity.
 
 - **Optional Object authority.** Before emitting a recovered identifier, the
   Scanner MUST bind the authority to the expected tape UUID and block size,
@@ -3625,12 +3625,12 @@ the final ParityMap are all lost, the terminal index's record of the sidecar
 still locates the tail copy (Section 13.3), which is then trusted on its own
 checksums.
 
-### B.12. The Reference Off-Tape Journals Are Not a Media Format
+### B.12. The Reference Off-Tape Log Is Not a Media Format
 
-The reference implementation keeps its commit records in two append-only host
-journals per tape, which are not a media format: neither is recorded on tape,
-and neither changes any REM-PARITY media byte. The implementation's
-documentation describes them
+The reference implementation keeps its commit records in one append-only host
+log per tape, which is not a media format: it is not recorded on tape,
+and it changes no REM-PARITY media byte. The implementation's
+documentation describes it
 (<https://github.com/archivetechie/remanence/blob/main/docs/reference-tape-layout.md#on-disk-durable-records-and-rebuildable-state>).
 
 ## Appendix C. Revision History (Informative)
