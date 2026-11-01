@@ -2,8 +2,8 @@
 //!
 //! Layer 3c v0.7.2 decouples restart persistence from any database. The
 //! write path records each filemark-durable commit unit as a
-//! [`CommittedBundle`] through a [`TapeFileJournal`]. The default
-//! [`FileTapeFileJournal`] is a local append-only file: a fixed header followed
+//! [`CommittedBundle`] through a `TapeFileJournal`. The default
+//! `FileTapeFileJournal` is a local append-only file: a fixed header followed
 //! by length-prefixed canonical CBOR bundle records with CRC-64/XZ checksums.
 //! Replay fails closed at the first torn or corrupt record. Complete records
 //! are filtered through the last `CheckpointedThrough` marker; later valid
