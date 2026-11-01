@@ -409,6 +409,9 @@ impl<'a> InjectReadFaultOnce<'a> {
 }
 
 impl RawTapeSource for InjectReadFaultOnce<'_> {
+    fn prove_cursor(&mut self, cursor: PhysicalPositionHint, size: u32) -> Result<(), ParityError> {
+        self.inner.prove_cursor(cursor, size)
+    }
     fn configure_fixed_block_size(&mut self, block_size: u32) -> Result<(), ParityError> {
         self.inner.configure_fixed_block_size(block_size)
     }

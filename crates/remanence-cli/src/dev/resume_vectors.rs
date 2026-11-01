@@ -416,6 +416,17 @@ impl<'a> ReadTrace<'a> {
     }
 }
 impl RawTapeSource for ReadTrace<'_> {
+    fn prove_cursor(&mut self, cursor: PhysicalPositionHint, size: u32) -> Result<(), ParityError> {
+        let predecessor = cursor.lba.checked_sub(1);
+        if let Some(predecessor) = predecessor {
+            self.locates.push(predecessor);
+        }
+        self.raw.prove_cursor(cursor, size)?;
+        if let Some(predecessor) = predecessor {
+            self.lbas.push(predecessor);
+        }
+        Ok(())
+    }
     fn verification_context(&self) -> remanence_library::verification_io::VerificationContext {
         self.raw.verification_context()
     }
@@ -1170,6 +1181,17 @@ mod tests {
         error: fn() -> ParityError,
     }
     impl RawTapeSource for LocateFault<'_> {
+        fn prove_cursor(
+            &mut self,
+            cursor: PhysicalPositionHint,
+            size: u32,
+        ) -> Result<(), ParityError> {
+            if cursor.lba.checked_sub(1) == Some(self.fail_at) {
+                self.trace.locates.push(self.fail_at);
+                return Err((self.error)());
+            }
+            self.trace.prove_cursor(cursor, size)
+        }
         fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
             self.trace.locate_end_of_data()
         }

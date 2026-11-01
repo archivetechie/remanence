@@ -74,6 +74,9 @@ impl<S: RawTapeSource> Counter<S> {
     }
 }
 impl<S: RawTapeSource> RawTapeSource for Counter<S> {
+    fn prove_cursor(&mut self, cursor: PhysicalPositionHint, size: u32) -> Result<(), ParityError> {
+        self.inner.prove_cursor(cursor, size)
+    }
     fn verification_context(&self) -> remanence_library::verification_io::VerificationContext {
         self.inner.verification_context()
     }

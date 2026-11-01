@@ -22,6 +22,13 @@ pub struct CursorProof {
     pub(crate) identity_generation: u64,
 }
 
+impl CursorProof {
+    /// Consume the physical evidence when installing an append admission.
+    pub fn into_position(self) -> (TapePosition, u64) {
+        (self.position, self.identity_generation)
+    }
+}
+
 /// Prove a non-origin cursor by reading exactly its predecessor filemark, then
 /// independently asking READ POSITION. EOD, data and short records never pass.
 /// Origin must use the owner's existing fresh-media/bootstrap proof instead.
@@ -41,10 +48,7 @@ pub fn prove_cursor<S: CursorSource + ?Sized>(
     }
     source.locate(expected.partition, predecessor)?;
     if !source.read_filemark(&mut vec![0; block_size as usize])? {
-        return Err(TapeIoError::OperationFailed(
-            "commit cursor predecessor is not exactly a filemark".into(),
-        )
-        .into());
+        return Err(TapeIoError::CursorPredecessorNotFilemark.into());
     }
     let actual = source.position()?;
     if actual.partition != expected.partition || actual.lba != expected.lba {
@@ -83,6 +87,9 @@ impl CursorSource for crate::DriveHandle {
     fn read_filemark(&mut self, block: &mut [u8]) -> Result<bool, TapeIoError> {
         match self.read_block(block) {
             Err(TapeIoError::FilemarkEncountered) => Ok(true),
+            Err(TapeIoError::ReadBufferTooSmall { .. }) => {
+                Err(TapeIoError::CursorPredecessorNotFilemark)
+            }
             Ok(_) => Ok(false),
             Err(error) => Err(error),
         }

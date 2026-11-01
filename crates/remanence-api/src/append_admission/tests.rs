@@ -20,6 +20,7 @@ struct ProbeTransport {
     response_skip: Arc<Mutex<usize>>,
     omit_kernel_residual: Arc<Mutex<bool>>,
     position_fault: Arc<Mutex<Option<(u64, u32)>>>,
+    reported_partition: Arc<Mutex<u32>>,
     commands: Arc<Mutex<Vec<u8>>>,
 }
 impl SgTransport for ProbeTransport {
@@ -70,6 +71,7 @@ impl SgTransport for ProbeTransport {
             }
         }
         if cdb[0] == 0x34 && result.is_ok() {
+            buf[4..8].copy_from_slice(&self.reported_partition.lock().unwrap().to_be_bytes());
             let commands = self.commands.lock().unwrap();
             if commands.len() >= 2 && commands[commands.len() - 2] == 0x08 {
                 if let Some((lba, partition)) = *self.position_fault.lock().unwrap() {
@@ -97,6 +99,7 @@ struct Fixture {
     response_skip: Arc<Mutex<usize>>,
     omit_kernel_residual: Arc<Mutex<bool>>,
     position_fault: Arc<Mutex<Option<(u64, u32)>>>,
+    reported_partition: Arc<Mutex<u32>>,
     commands: Arc<Mutex<Vec<u8>>>,
 }
 fn fixture() -> Fixture {
@@ -120,6 +123,7 @@ fn fixture() -> Fixture {
     let response_skip = Arc::new(Mutex::new(0));
     let omit_kernel_residual = Arc::new(Mutex::new(false));
     let position_fault = Arc::new(Mutex::new(None));
+    let reported_partition = Arc::new(Mutex::new(0));
     let drive = DriveHandle::open_standalone_with_transport(
         Path::new("/dev/sg-append-test"),
         Box::new(ProbeTransport {
@@ -129,6 +133,7 @@ fn fixture() -> Fixture {
             response_skip: response_skip.clone(),
             omit_kernel_residual: omit_kernel_residual.clone(),
             position_fault: position_fault.clone(),
+            reported_partition: reported_partition.clone(),
             commands: commands.clone(),
         }),
         &StaticAllowlist::new(["APPEND-DRIVE"]),
@@ -142,6 +147,7 @@ fn fixture() -> Fixture {
         response_skip,
         omit_kernel_residual,
         position_fault,
+        reported_partition,
         commands,
     }
 }
@@ -1024,6 +1030,9 @@ fn cursor_capability_is_revoked_by_later_locate_and_read() {
             .write_block(&[0x55; SIZE as usize])
             .unwrap();
         DriveHandleSink(&mut f.drive).write_filemarks(1).unwrap();
+        f.drive
+            .advance_append_commit(context(UUID, SIZE, 0, 4).boundary)
+            .unwrap();
         let before = writes(&f.commands.lock().unwrap());
         f.drive.locate(4).unwrap();
         assert!(DriveHandleSink(&mut f.drive).write_filemarks(1).is_err());
@@ -1043,5 +1052,119 @@ fn cursor_capability_is_revoked_by_later_locate_and_read() {
             .unwrap();
         DriveHandleSink(&mut f.drive).write_filemarks(1).unwrap();
         assert_eq!(writes(&f.commands.lock().unwrap()), before + 1);
+    }
+}
+
+/// Publication advances C for every commit; old and future filemark boundaries
+/// cannot re-arm either entry point, even after the first write was dispatched.
+#[test]
+fn cursor_rearming_tracks_each_committed_position() {
+    let mut f = fixture();
+    let _admission = checkpoint(&mut f.drive).unwrap();
+    let mut config = f.drive.read_config().unwrap();
+    config.block_size = remanence_library::BlockSize::Fixed { size_bytes: SIZE };
+    f.drive.write_config(config).unwrap();
+    for c in [4, 6, 8] {
+        DriveHandleSink(&mut f.drive)
+            .write_block(&[0x55; SIZE as usize])
+            .unwrap();
+        DriveHandleSink(&mut f.drive).write_filemarks(1).unwrap();
+        let boundary = context(UUID, SIZE, 0, c).boundary;
+        f.drive.advance_append_commit(boundary).unwrap();
+        let commands = f.commands.lock().unwrap().len();
+        for stale in [2, c - 2, c + 2] {
+            assert!(f.drive.locate_admitted_append(stale).is_err());
+            assert!(f
+                .drive
+                .prove_cursor(
+                    context(UUID, SIZE, 0, stale).boundary,
+                    SIZE,
+                    f.drive.identity_generation(),
+                )
+                .is_err());
+            assert!(DriveHandleSink(&mut f.drive).write_filemarks(1).is_err());
+        }
+        assert_eq!(f.commands.lock().unwrap().len(), commands);
+        assert!(f
+            .drive
+            .advance_append_commit(context(UUID, SIZE, 0, c - 2).boundary)
+            .is_err());
+        assert_eq!(f.drive.locate_admitted_append(c).unwrap().lba, c);
+        f.drive.locate(c).unwrap();
+        f.drive
+            .prove_cursor(boundary, SIZE, f.drive.identity_generation())
+            .unwrap();
+        f.drive.check_append_admission().unwrap();
+    }
+}
+
+/// A synthetic nonzero partition report exercises the admitted locate arguments
+/// without any physical device or partition-changing commands.
+#[test]
+fn admitted_locate_uses_the_admitted_partition() {
+    let mut f = fixture();
+    *f.reported_partition.lock().unwrap() = 3;
+    let ctx = context(UUID, SIZE, 3, 2);
+    let _admission = admit_append_boundary(
+        &mut f.drive,
+        AppendAuthority::Checkpoint { eod: ctx.boundary },
+        ctx,
+    )
+    .unwrap();
+    let mut config = f.drive.read_config().unwrap();
+    config.block_size = remanence_library::BlockSize::Fixed { size_bytes: SIZE };
+    f.drive.write_config(config).unwrap();
+    f.drive.locate(0).unwrap();
+    assert_eq!(f.drive.locate_admitted_append(2).unwrap().partition, 3);
+    f.drive.check_append_admission().unwrap();
+}
+
+/// Resume wrappers must re-arm the owning drive, rather than performing an
+/// independent head-moving proof that leaves its adapter gate revoked.
+#[test]
+fn resume_source_wrappers_rearm_the_owning_drive() {
+    use remanence_parity::{
+        raw::CancellableRawSource, BlockSourceRawTapeSource, DriveHandleRawSource,
+        PhysicalPositionHint, RawTapeSource,
+    };
+    let mut f = fixture();
+    let _admission = checkpoint(&mut f.drive).unwrap();
+    f.drive.locate(0).unwrap();
+    CancellableRawSource(DriveHandleRawSource::new(&mut f.drive))
+        .prove_cursor(PhysicalPositionHint::new(2), SIZE)
+        .unwrap();
+    f.drive.check_append_admission().unwrap();
+    f.drive.locate(0).unwrap();
+    BlockSourceRawTapeSource::new(&mut DriveHandleSource(&mut f.drive))
+        .prove_cursor(PhysicalPositionHint::new(2), SIZE)
+        .unwrap();
+    f.drive.check_append_admission().unwrap();
+    assert_eq!(writes(&f.commands.lock().unwrap()), 0);
+}
+
+/// A filemark needs no valid residual when the actual read transfers zero bytes.
+/// Every other key, ILI and any data transfer must remain an error.
+#[test]
+fn filemark_read_sense_and_transfer_matrix() {
+    for valid in [false, true] {
+        for key in 0..16 {
+            for ili in [false, true] {
+                for bytes in [0, 1] {
+                    let mut f = fixture();
+                    let mut sense = vec![0; 18];
+                    sense[0] = 0x70 | if valid { 0x80 } else { 0 };
+                    sense[2] = 0x80 | key | if ili { 0x20 } else { 0 };
+                    sense[7] = 10;
+                    sense[13] = 1;
+                    *f.response.lock().unwrap() = Some((sense, bytes));
+                    let result = f.drive.read_block(&mut [0; SIZE as usize]);
+                    assert_eq!(
+                        matches!(result, Err(TapeIoError::FilemarkEncountered)),
+                        matches!(key, 0 | 1) && !ili && bytes == 0,
+                        "valid={valid}, key={key}, ili={ili}, bytes={bytes}: {result:?}"
+                    );
+                }
+            }
+        }
     }
 }

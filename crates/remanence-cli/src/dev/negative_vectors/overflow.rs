@@ -633,6 +633,9 @@ struct StalledSpace {
     stall_lba: Option<u64>,
 }
 impl RawTapeSource for StalledSpace {
+    fn prove_cursor(&mut self, cursor: PhysicalPositionHint, size: u32) -> Result<(), ParityError> {
+        self.inner.prove_cursor(cursor, size)
+    }
     fn configure_fixed_block_size(&mut self, size: u32) -> Result<(), ParityError> {
         self.inner.configure_fixed_block_size(size)
     }

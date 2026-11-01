@@ -394,6 +394,61 @@ pub struct RawPositionReport {
     pub mark_position_unknown: bool,
 }
 
+/// Prove a cursor for portable image storage, which has no drive admission or
+/// transport generation. Physical-drive adapters must forward to their owner.
+fn prove_portable_cursor<S: RawTapeSource + ?Sized>(
+    source: &mut S,
+    cursor: PhysicalPositionHint,
+    block_size: u32,
+) -> Result<(), ParityError> {
+    struct Source<'a, S: ?Sized>(&'a mut S);
+    impl<S: RawTapeSource + ?Sized> remanence_library::cursor::CursorSource for Source<'_, S> {
+        type Error = ParityError;
+        fn locate(&mut self, partition: u32, lba: u64) -> Result<(), ParityError> {
+            self.0
+                .locate_physical(PhysicalPositionHint { partition, lba })
+        }
+        fn read_filemark(&mut self, block: &mut [u8]) -> Result<bool, ParityError> {
+            Ok(matches!(
+                self.0.read_record(block)?,
+                RawReadOutcome::Filemark { .. }
+            ))
+        }
+        fn position(&mut self) -> Result<TapePosition, ParityError> {
+            let p = self.0.position()?;
+            Ok(TapePosition {
+                partition: p.partition,
+                lba: p.lba,
+                beginning_of_partition: false,
+                end_of_partition: false,
+                block_position_end_of_warning: false,
+            })
+        }
+    }
+    remanence_library::cursor::prove_cursor(
+        &mut Source(source),
+        TapePosition {
+            partition: cursor.partition,
+            lba: cursor.lba,
+            beginning_of_partition: false,
+            end_of_partition: false,
+            block_position_end_of_warning: false,
+        },
+        block_size,
+    )?;
+    Ok(())
+}
+
+/// Explicit cursor proof for semantic in-memory fixtures, never physical drives.
+#[cfg(feature = "fixtures")]
+pub fn prove_fixture_cursor<S: RawTapeSource + ?Sized>(
+    source: &mut S,
+    cursor: PhysicalPositionHint,
+    block_size: u32,
+) -> Result<(), ParityError> {
+    prove_portable_cursor(source, cursor, block_size)
+}
+
 /// Raw physical-tape READ access used by Layer 3c.
 pub trait RawTapeSource {
     /// Passive drive context; non-drive sources have no transport to observe.
@@ -401,50 +456,17 @@ pub trait RawTapeSource {
         Default::default()
     }
 
-    /// Restore the recorded append cursor through the shared predecessor proof.
-    /// Drive adapters additionally bind the result to the live identity generation.
+    /// Restore the recorded append cursor through an explicitly supported proof.
+    /// The default refuses without motion; wrappers must forward to their owner.
     #[doc(hidden)]
     fn prove_cursor(
         &mut self,
-        cursor: PhysicalPositionHint,
-        block_size: u32,
+        _cursor: PhysicalPositionHint,
+        _block_size: u32,
     ) -> Result<(), ParityError> {
-        struct Source<'a, S: ?Sized>(&'a mut S);
-        impl<S: RawTapeSource + ?Sized> remanence_library::cursor::CursorSource for Source<'_, S> {
-            type Error = ParityError;
-            fn locate(&mut self, partition: u32, lba: u64) -> Result<(), ParityError> {
-                self.0
-                    .locate_physical(PhysicalPositionHint { partition, lba })
-            }
-            fn read_filemark(&mut self, block: &mut [u8]) -> Result<bool, ParityError> {
-                Ok(matches!(
-                    self.0.read_record(block)?,
-                    RawReadOutcome::Filemark { .. }
-                ))
-            }
-            fn position(&mut self) -> Result<TapePosition, ParityError> {
-                let p = self.0.position()?;
-                Ok(TapePosition {
-                    partition: p.partition,
-                    lba: p.lba,
-                    beginning_of_partition: false,
-                    end_of_partition: false,
-                    block_position_end_of_warning: false,
-                })
-            }
-        }
-        remanence_library::cursor::prove_cursor(
-            &mut Source(self),
-            TapePosition {
-                partition: cursor.partition,
-                lba: cursor.lba,
-                beginning_of_partition: false,
-                end_of_partition: false,
-                block_position_end_of_warning: false,
-            },
-            block_size,
-        )?;
-        Ok(())
+        Err(ParityError::Invariant(
+            "raw source does not support cursor proof",
+        ))
     }
 
     /// Configure the drive for fixed-block reads at `block_size` bytes.
@@ -642,6 +664,22 @@ impl<'a> ReadRun<'a> {
 }
 
 impl RawTapeSource for ReadRun<'_> {
+    fn prove_cursor(
+        &mut self,
+        cursor: PhysicalPositionHint,
+        block_size: u32,
+    ) -> Result<(), ParityError> {
+        self.valid = 0;
+        self.consumed = 0;
+        self.pending_end = None;
+        self.pending_data.clear();
+        self.next = None;
+        self.located = false;
+        self.source.prove_cursor(cursor, block_size)?;
+        self.next = Some(cursor);
+        self.located = true;
+        Ok(())
+    }
     fn verification_context(&self) -> remanence_library::verification_io::VerificationContext {
         self.source.verification_context()
     }
@@ -1045,6 +1083,13 @@ impl ImageDirectoryRawSource {
 }
 
 impl RawTapeSource for ImageDirectoryRawSource {
+    fn prove_cursor(
+        &mut self,
+        cursor: PhysicalPositionHint,
+        block_size: u32,
+    ) -> Result<(), ParityError> {
+        prove_portable_cursor(self, cursor, block_size)
+    }
     fn configure_fixed_block_size(&mut self, block_size: u32) -> Result<(), ParityError> {
         if block_size == 0 {
             return Err(ParityError::Invariant("fixed block size is zero"));
@@ -1317,6 +1362,24 @@ impl<'a> BlockSourceRawTapeSource<'a> {
 }
 
 impl RawTapeSource for BlockSourceRawTapeSource<'_> {
+    fn prove_cursor(
+        &mut self,
+        cursor: PhysicalPositionHint,
+        block_size: u32,
+    ) -> Result<(), ParityError> {
+        self.inner.prove_cursor(
+            TapePosition {
+                partition: cursor.partition,
+                lba: cursor.lba,
+                beginning_of_partition: false,
+                end_of_partition: false,
+                block_position_end_of_warning: false,
+            },
+            block_size,
+        )?;
+        self.cursor_hint = cursor;
+        Ok(())
+    }
     fn configure_fixed_block_size(&mut self, block_size: u32) -> Result<(), ParityError> {
         if block_size == 0 {
             return Err(ParityError::Invariant("fixed block size is zero"));
@@ -1899,18 +1962,16 @@ fn classify_read_boundary(err: &TapeIoError) -> Option<RawReadBoundary> {
 
     #[cfg(target_os = "linux")]
     {
-        let (sense, _) = err.check_condition_transfer()?;
+        let (sense, bytes) = err.check_condition_transfer()?;
         let decoded = decode_sense(sense)?;
 
-        // IBM LTO SCSI Reference GA32-0928-08 §4.12.1: a READ that
-        // encounters a filemark returns CHECK CONDITION with FILEMARK +
-        // VALID set and associated sense 0/0001. The position is after the
-        // filemark, so the raw adapter reports a consumed boundary.
-        if decoded.filemark
-            && decoded.valid
-            && decoded.key == 0x00
-            && decoded.asc == 0x00
-            && decoded.ascq == 0x01
+        // A zero-transfer filemark needs no residual. Preserve the library's
+        // refusal of deferred sense, ILI and any accompanying data transfer.
+        if bytes == 0
+            && !decoded.is_deferred()
+            && decoded.filemark
+            && !decoded.ili
+            && matches!(decoded.key, 0 | 1)
         {
             return Some(RawReadBoundary::Filemark);
         }
@@ -3988,6 +4049,71 @@ mod compat_tests {
 mod tests {
     use super::*;
 
+    /// Raw classification must preserve the same filemark refusal rules as the
+    /// drive reader, including when it receives an uncollapsed sense error.
+    #[test]
+    fn raw_filemark_boundary_sense_and_transfer_matrix() {
+        for valid in [false, true] {
+            for key in 0..16 {
+                for ili in [false, true] {
+                    for bytes in [0, 1] {
+                        let mut sense = vec![0; 18];
+                        sense[0] = 0x70 | if valid { 0x80 } else { 0 };
+                        sense[2] = 0x80 | key | if ili { 0x20 } else { 0 };
+                        sense[7] = 10;
+                        sense[13] = 1;
+                        let error = TapeIoError::CheckCondition(
+                            remanence_library::ScsiError::CheckCondition {
+                                sense,
+                                bytes_transferred: bytes,
+                            },
+                        );
+                        assert_eq!(
+                            classify_read_boundary(&error),
+                            (matches!(key, 0 | 1) && !ili && bytes == 0)
+                                .then_some(RawReadBoundary::Filemark),
+                            "valid={valid}, key={key}, ili={ili}, bytes={bytes}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Omitting proof forwarding must fail without calling any positioning or
+    /// read method, even when the wrapped source supports physical motion.
+    #[test]
+    fn non_forwarding_wrapper_refuses_cursor_proof_without_commands() {
+        struct NonForwarding<'a>(&'a mut dyn RawTapeSource);
+        impl RawTapeSource for NonForwarding<'_> {
+            fn configure_fixed_block_size(&mut self, size: u32) -> Result<(), ParityError> {
+                self.0.configure_fixed_block_size(size)
+            }
+            fn locate_physical(&mut self, p: PhysicalPositionHint) -> Result<(), ParityError> {
+                self.0.locate_physical(p)
+            }
+            fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+                self.0.locate_end_of_data()
+            }
+            fn space_filemarks(&mut self, n: i64) -> Result<SpaceFilemarksOutcome, ParityError> {
+                self.0.space_filemarks(n)
+            }
+            fn read_record(&mut self, b: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
+                self.0.read_record(b)
+            }
+            fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+                self.0.position()
+            }
+        }
+        let mut blocks = remanence_library::VecBlockSource::new(vec![vec![0; 4]; 3]);
+        let mut inner = BlockSourceRawTapeSource::new(&mut blocks);
+        let mut wrapper = NonForwarding(&mut inner);
+        assert!(wrapper
+            .prove_cursor(PhysicalPositionHint::new(2), 4)
+            .is_err());
+        assert!(blocks.calls.is_empty());
+    }
+
     /// A short terminal record after a full fill must not expose the retained suffix.
     #[test]
     fn reused_fill_delivers_only_confirmed_prefix_and_terminal_bytes() {
@@ -4475,6 +4601,14 @@ unsafe impl remanence_library::AppendBoundaryProof for FixtureAppendProof {
 /// Neither guard interprets cancellation as tape damage or adds verifier findings.
 pub struct CancellableRawSource<S>(pub S);
 impl<S: crate::RawTapeSource> crate::RawTapeSource for CancellableRawSource<S> {
+    fn prove_cursor(
+        &mut self,
+        cursor: PhysicalPositionHint,
+        block_size: u32,
+    ) -> Result<(), ParityError> {
+        self.check()?;
+        self.0.prove_cursor(cursor, block_size)
+    }
     fn verification_context(&self) -> remanence_library::verification_io::VerificationContext {
         self.0.verification_context()
     }

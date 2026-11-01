@@ -238,15 +238,50 @@ impl super::DriveHandle {
     ) -> Result<crate::cursor::CursorProof, TapeIoError> {
         self.invalidate_append_position();
         self.transport.check_identity_generation(generation)?;
+        if let Some((admission, _, session)) = &self.append_admission {
+            if session.upgrade().is_none()
+                || admission.identity_generation != generation
+                || admission.partition != expected.partition
+                || admission.lba != expected.lba
+            {
+                return Err(TapeIoError::OperationFailed(
+                    "append cursor must equal the session's current committed position".into(),
+                ));
+            }
+        }
         let proof = crate::cursor::prove_cursor(self, expected, block_size)?;
         self.transport
             .check_identity_generation(proof.identity_generation)?;
         if let Some((admission, _, _)) = &mut self.append_admission {
-            if admission.identity_generation == generation {
+            if admission.identity_generation == proof.identity_generation
+                && admission.partition == proof.position.partition
+                && admission.lba == proof.position.lba
+            {
                 admission.position_proved = true;
             }
         }
         Ok(proof)
+    }
+
+    /// Advance C only after durable commit publication or acceptance of a
+    /// complete terminal component. This records authority, never re-arms writes.
+    #[doc(hidden)]
+    pub fn advance_append_commit(&mut self, position: TapePosition) -> Result<(), TapeIoError> {
+        let (admission, _, session) = self.append_admission.as_mut().ok_or_else(|| {
+            TapeIoError::OperationFailed("commit requires a live append admission".into())
+        })?;
+        self.transport
+            .check_identity_generation(admission.identity_generation)?;
+        if session.upgrade().is_none()
+            || position.partition != admission.partition
+            || position.lba < admission.lba
+        {
+            return Err(TapeIoError::OperationFailed(
+                "commit cannot move the admitted cursor backwards or across partitions".into(),
+            ));
+        }
+        admission.lba = position.lba;
+        Ok(())
     }
 
     fn invalidate_append_position(&mut self) {
@@ -266,6 +301,15 @@ impl super::DriveHandle {
     /// Reuse the unchanged initial proof, or locate and re-prove the predecessor
     /// before any append/recovery repositioning. Raw LOCATE never grants writes.
     pub fn locate_admitted_append(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
+        let partition = match &self.append_admission {
+            Some((admission, _, _)) if admission.lba == lba => admission.partition,
+            _ => {
+                self.invalidate_append_position();
+                return Err(TapeIoError::OperationFailed(
+                    "append locate must equal the session's current committed position".into(),
+                ));
+            }
+        };
         if let Some((admission, dispatches, _)) = self.append_admission.as_ref() {
             if *dispatches == self.media_write_dispatch_count()
                 && admission.lba == lba
@@ -284,7 +328,7 @@ impl super::DriveHandle {
             ));
         };
         let expected = TapePosition {
-            partition: 0,
+            partition,
             lba,
             beginning_of_partition: false,
             end_of_partition: false,
@@ -356,6 +400,9 @@ fn format_residue_check_condition(source: &ScsiError, corrected: u32) -> String 
 /// clean (physical state is known).
 #[derive(Debug, Error)]
 pub enum TapeIoError {
+    /// A record at C-1 contradicts the committed cursor's required filemark.
+    #[error("commit cursor predecessor is not exactly a filemark")]
+    CursorPredecessorNotFilemark,
     /// Cooperative cancellation; no command dispatch and no medium damage.
     #[error("tape verification cancelled")]
     Cancelled,
@@ -2534,7 +2581,9 @@ impl super::DriveHandle {
                     if is_reset_unit_attention(sense) {
                         self.invalidate_for_reset_unit_attention();
                     }
-                    if read_filemark_signal(sense) {
+                    if read_filemark_signal(sense)
+                        && transfer_bytes_from_sense(sense, bytes_transferred, len_u32, None) == 0
+                    {
                         self.forget_position();
                         let mapped = TapeIoError::FilemarkEncountered;
                         self.finish_tape_error(op, &mapped);
@@ -4190,13 +4239,7 @@ fn read_filemark_signal(sense: &[u8]) -> bool {
     let Some(decoded) = decode_sense(sense) else {
         return false;
     };
-    !decoded.is_deferred()
-        && decoded.valid
-        && decoded.filemark
-        && !decoded.ili
-        && decoded.key == 0x00
-        && decoded.asc == 0x00
-        && decoded.ascq == 0x01
+    !decoded.is_deferred() && decoded.filemark && !decoded.ili && matches!(decoded.key, 0x00 | 0x01)
 }
 
 /// Extract the signed INFORMATION field from a CHECK CONDITION

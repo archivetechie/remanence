@@ -2150,6 +2150,11 @@ pub(super) fn finish_terminal_tail(
             break;
         };
         let component = plan.edition.descriptor.terminal_layout.components[component_index];
+        let component_end_lba = component
+            .planned_start_lba
+            .checked_add(component.record_count)
+            .and_then(|lba| lba.checked_add(1))
+            .ok_or_else(|| Status::failed_precondition("terminal cursor overflow"))?;
         let evidence = {
             let mut raw = DriveHandleRawSource::new(drive);
             reconcile_terminal_tail_next(&mut raw, &plan, progress, rewritable)
@@ -2185,26 +2190,24 @@ pub(super) fn finish_terminal_tail(
         {
             let lba = if evidence == remanence_parity::TerminalComponentReconcileEvidence::Complete
             {
-                component
-                    .planned_start_lba
-                    .checked_add(component.record_count)
-                    .and_then(|lba| lba.checked_add(1))
-                    .ok_or_else(|| Status::failed_precondition("terminal cursor overflow"))?
+                component_end_lba
             } else {
                 component.planned_start_lba
             };
+            let cursor = crate::append_admission::context(
+                selected.tape_uuid,
+                selected.block_size,
+                plan.edition.descriptor.terminal_layout.partition,
+                lba,
+            )
+            .boundary;
+            if evidence == remanence_parity::TerminalComponentReconcileEvidence::Complete {
+                drive
+                    .advance_append_commit(cursor)
+                    .map_err(|e| Status::unavailable(e.to_string()))?;
+            }
             drive
-                .prove_cursor(
-                    crate::append_admission::context(
-                        selected.tape_uuid,
-                        selected.block_size,
-                        plan.edition.descriptor.terminal_layout.partition,
-                        lba,
-                    )
-                    .boundary,
-                    selected.block_size,
-                    drive.identity_generation(),
-                )
+                .prove_cursor(cursor, selected.block_size, drive.identity_generation())
                 .map_err(|e| {
                     Status::unavailable(format!("prove terminal cursor after reconciliation: {e}"))
                 })?;
@@ -2229,6 +2232,19 @@ pub(super) fn finish_terminal_tail(
             Ok(step) => step,
             Err(error) => {
                 if authority.durable_projection_pending {
+                    // The authority already accepted this component even if
+                    // folding or SQLite projection failed afterwards.
+                    drive
+                        .advance_append_commit(
+                            crate::append_admission::context(
+                                selected.tape_uuid,
+                                selected.block_size,
+                                plan.edition.descriptor.terminal_layout.partition,
+                                component_end_lba,
+                            )
+                            .boundary,
+                        )
+                        .map_err(|e| Status::unavailable(e.to_string()))?;
                     return Err(Status::internal(format!(
                         "terminal component is durable; retry after tape-log replay: {error}"
                     )));
@@ -2248,7 +2264,19 @@ pub(super) fn finish_terminal_tail(
             }
         };
         match step {
-            TerminalTailStepOutcome::Advanced(_) => {}
+            TerminalTailStepOutcome::Advanced(commit) => {
+                drive
+                    .advance_append_commit(
+                        crate::append_admission::context(
+                            selected.tape_uuid,
+                            selected.block_size,
+                            commit.observed_position.partition,
+                            commit.observed_position.lba,
+                        )
+                        .boundary,
+                    )
+                    .map_err(|e| Status::unavailable(e.to_string()))?;
+            }
             TerminalTailStepOutcome::AlreadyComplete => break,
             TerminalTailStepOutcome::RecoveryRequired {
                 progress,

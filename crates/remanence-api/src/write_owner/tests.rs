@@ -14111,6 +14111,71 @@ pub(crate) async fn unload_adopted_cartridge(
     api.shutdown_drive_pool().await.unwrap();
 }
 
+/// Data, short and oversize records at C-1 persist the same fence as EOD.
+#[test]
+fn cursor_predecessor_records_and_eod_are_durably_fenced() {
+    let size = 4096;
+    for length in [None, Some(size), Some(7), Some(size * 2)] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.sqlite");
+        let mut index = CatalogIndex::open(&path).unwrap();
+        let mut world = VirtualWorld::single_drive("LIB-CURSOR", 0x100, "DRV-CURSOR", 0x400, 0);
+        let mut tape = VirtualTape::empty(16 * 1024 * 1024, size as u32);
+        tape.records.push(Record::Block(vec![0; size]));
+        if let Some(length) = length {
+            tape.records.push(Record::Block(vec![0; length]));
+        }
+        world.put_tape_in_drive(0x100, "CURSOR", None, tape);
+        let world = Arc::new(Mutex::new(world));
+        let mut library = open_model_library(world.clone());
+        let cfg = test_write_owner_config(
+            path,
+            temp.path().join("audit"),
+            &library,
+            library_snapshot_cell(library.library().clone()),
+        );
+        let uuid = [0x42; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: uuid,
+                voltag: "CURSOR".into(),
+                block_size: size as u32,
+                parity: remanence_parity::ParityConfig::None,
+                force: false,
+            })
+            .unwrap();
+        let mut drive = library.open_drive(0x100, &cfg.policy).unwrap();
+        let error = drive
+            .prove_cursor(
+                crate::append_admission::context(uuid, size as u32, 0, 2).boundary,
+                size as u32,
+                drive.identity_generation(),
+            )
+            .unwrap_err();
+        if length.is_some() {
+            assert!(matches!(error, TapeIoError::CursorPredecessorNotFilemark));
+        }
+        assert!(super::checkpoint::fence_admission_contradiction(
+            &mut index,
+            &cfg,
+            uuid,
+            size as u32,
+            Some((1, 2)),
+            &crate::append_admission::AdmissionError::Io(error),
+        ));
+        let fences = index.list_active_tape_io_fences().unwrap();
+        assert_eq!(fences.len(), 1, "predecessor length={length:?}");
+        assert_eq!(fences[0].reason, "admission_contradiction");
+        crate::tests::assert_fences_survive_empty_rebuild(&index, &cfg.audit_dir);
+        assert!(world
+            .lock()
+            .unwrap()
+            .command_log
+            .iter()
+            .all(|c| !matches!(c.opcode, 0x0a | 0x10)));
+    }
+}
+
 /// Admission fences carry a reason, phase and only a nonempty known epoch range.
 #[test]
 fn admission_fence_evidence_omits_closed_and_unknown_ranges() {
