@@ -69,9 +69,17 @@ fi
 printf '%s\n' "$$" >"$pidfile"
 
 stamp="$(fieldtest_timestamp_id)"
-log="$(fieldtest_log_dir)/run-${PLAN_NAME}-${stamp}.log"
+# The log and the table live in evidence/, so the pack carries them.
+log="$(fieldtest_evidence_dir)/run-${PLAN_NAME}-${stamp}.log"
 table="$(fieldtest_evidence_dir)/run-${PLAN_NAME}-${stamp}.tsv"
-exec > >(tee -a "$log") 2>&1
+result_file="$(fieldtest_evidence_dir)/run-${PLAN_NAME}-${stamp}.result"
+FIELD_EVIDENCE_PACK="$(fieldtest_home)/evidence-pack-${PLAN_NAME}-${stamp}.tar.gz"
+export FIELD_EVIDENCE_PACK
+# Ctrl-c, a closed tmux window or a shutdown signals the whole process group. The
+# logger must survive that, and keep writing the log if the terminal goes away, or
+# run.sh would die on a broken pipe before its teardown.
+trap '' PIPE
+exec > >(trap '' INT TERM HUP PIPE; exec tee --output-error=warn -a "$log") 2>&1
 printf 'leg\tpolicy\texit\tseconds\n' >"$table"
 echo "run.sh: plan $PLAN_NAME on $PLAN_LIBRARY, kit $(cat "$pkg/KIT-COMMIT" 2>/dev/null || echo unknown), log $log"
 
@@ -80,7 +88,9 @@ interrupted=""
 on_signal() {
   interrupted="$1"
   echo "run.sh: $1 received; stopping the current leg and tearing down"
-  [[ -n "$child" ]] && kill "-$1" "$child" 2>/dev/null
+  # A leg started in the background ignores INT, so it always gets TERM.
+  [[ -n "$child" ]] && kill -TERM "$child" 2>/dev/null
+  return 0
 }
 trap 'on_signal TERM' TERM
 trap 'on_signal INT' INT
@@ -106,10 +116,11 @@ current=""
 for entry in "${PLAN_LEGS[@]}"; do
   [[ -n "$interrupted" ]] && break
   read -r policy leg args <<<"$entry"
+  argv=()
+  read -r -a argv <<<"${args:-}"
   echo "run.sh: === $leg ${args:-}"
   start=$SECONDS
-  # shellcheck disable=SC2086 # plan arguments are split on purpose
-  run_step "$scripts/$leg" ${args:-}
+  run_step "$scripts/$leg" "${argv[@]}"
   rc=$?
   printf '%s\t%s\t%s\t%s\n' "$leg${args:+ $args}" "$policy" "$rc" "$(( SECONDS - start ))" >>"$table"
   echo "run.sh: === $leg exit $rc after $(( SECONDS - start ))s"
@@ -135,22 +146,31 @@ if [[ -n "$failed" || -n "$interrupted" ]]; then
 fi
 echo "run.sh: === returning cartridges and stopping the daemon"
 "$scripts/03-bringup.sh" --stop || echo "run.sh: 03-bringup.sh --stop failed; check the library and the daemon by hand"
-echo "run.sh: === packing evidence"
-"$scripts/90-collect-evidence.sh" || echo "run.sh: evidence collection failed; the raw evidence is in $(fieldtest_evidence_dir)"
-rm -f -- "$pidfile"
-
+if [[ -n "$interrupted" ]]; then
+  result="INTERRUPTED ($interrupted)"
+elif [[ -n "$failed" ]]; then
+  result="FAIL ($failed)"
+else
+  result="PASS"
+fi
+printf 'result: %s\nplan: %s\nlibrary: %s\nkit: %s\n' "$result" "$PLAN_NAME" "$PLAN_LIBRARY" \
+  "$(cat "$pkg/KIT-COMMIT" 2>/dev/null || echo unknown)" >"$result_file"
 echo
 column -t -s $'\t' "$table" 2>/dev/null || cat "$table"
-pack="$(ls -t "$(fieldtest_home)"/evidence-pack-*.tar.gz 2>/dev/null | head -1)"
-if [[ -n "$pack" ]]; then
-  echo "evidence pack: $pack"
-  sha256sum -- "$pack"
+echo "result: $result"
+echo "run.sh: === packing evidence"
+rm -f -- "$FIELD_EVIDENCE_PACK"
+"$scripts/90-collect-evidence.sh" || echo "run.sh: evidence collection failed"
+rm -f -- "$pidfile"
+if [[ -f "$FIELD_EVIDENCE_PACK" ]]; then
+  echo "evidence pack: $FIELD_EVIDENCE_PACK"
+  sha256sum -- "$FIELD_EVIDENCE_PACK"
+else
+  echo "no evidence pack was written; the raw evidence is in $(fieldtest_evidence_dir)"
 fi
-if [[ -n "$interrupted" ]]; then
-  echo "result: INTERRUPTED ($interrupted)"
-  exit 130
-elif [[ -n "$failed" ]]; then
-  echo "result: FAIL ($failed)"
-  exit 1
-fi
-echo "result: PASS"
+echo "result: $result"
+case "$result" in
+  PASS) exit 0 ;;
+  FAIL*) exit 1 ;;
+  *) exit 130 ;;
+esac

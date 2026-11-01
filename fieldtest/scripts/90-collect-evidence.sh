@@ -24,7 +24,7 @@ main() {
   local evidence_dir summary pack_path
   evidence_dir="$(fieldtest_evidence_dir)"
   summary="$evidence_dir/SUMMARY.md"
-  pack_path="$(fieldtest_home)/evidence-pack-$(date -u +%Y%m%d).tar.gz"
+  pack_path="${FIELD_EVIDENCE_PACK:-$(fieldtest_home)/evidence-pack-$(date -u +%Y%m%d).tar.gz}"
   python3 - "$evidence_dir" "$summary" <<'PY'
 import csv
 import json

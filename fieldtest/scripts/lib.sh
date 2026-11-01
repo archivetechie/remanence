@@ -1276,6 +1276,13 @@ PY
   done
 }
 
+fieldtest_forward_term() {
+  local pid="$1"
+  pkill -TERM -P "$pid" 2>/dev/null
+  kill -TERM "$pid" 2>/dev/null
+  return 0
+}
+
 fieldtest_run_with_lock() {
   local lockfile counters rc
   if [[ "${2:-}" == --selftest ]]; then
@@ -1311,9 +1318,10 @@ fieldtest_run_with_lock() {
   ) <&"$stdin_fd" &
   child=$!
   exec {stdin_fd}<&-
-  trap 'kill -TERM "$child" 2>/dev/null' TERM
-  trap 'kill -INT "$child" 2>/dev/null' INT
-  trap 'kill -HUP "$child" 2>/dev/null' HUP
+  # An asynchronous subshell ignores INT, so whatever arrives is forwarded as
+  # TERM, which the cleanup traps handle; its foreground command (a long rem
+  # call, say) gets TERM too, so main reacts now rather than when it returns.
+  trap 'fieldtest_forward_term "$child"' TERM INT HUP
   # A trapped signal interrupts wait; wait again until the child has finished.
   while :; do
     wait "$child"
@@ -1417,10 +1425,10 @@ PY
 
 fieldtest_sudo_surface_lines() {
   local bin
-  bin="$(fieldtest_home)/bin/rem"
+  bin="$(fieldtest_bin_dir)/rem"
   printf 'sudo setcap cap_sys_rawio+ep %s\n' "$bin"
-  printf 'sudo setcap cap_sys_rawio+ep %s\n' "$(fieldtest_home)/bin/rem-daemon"
-  printf 'sudo setcap cap_sys_rawio+ep %s\n' "$(fieldtest_home)/bin/rem-debug"
+  printf 'sudo setcap cap_sys_rawio+ep %s\n' "$(fieldtest_bin_dir)/rem-daemon"
+  printf 'sudo setcap cap_sys_rawio+ep %s\n' "$(fieldtest_bin_dir)/rem-debug"
   printf 'sudo setfacl -m u:%s:rw /dev/sg*\n' "$(id -un)"
 }
 
