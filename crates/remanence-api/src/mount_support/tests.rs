@@ -2096,6 +2096,22 @@ fn clearing_append_recovery_on_sealed_tape_is_a_precise_precondition() {
     );
 }
 
+#[test]
+fn tape_log_lease_contention_is_unavailable_and_other_lock_faults_are_not() {
+    use remanence_state::tape_log::store::StoreError;
+    let busy =
+        remanence_state::StateError::from(StoreError::Locked(nix::errno::Errno::EWOULDBLOCK));
+    assert_eq!(
+        crate::status_from_state_error(busy).code(),
+        tonic::Code::Unavailable
+    );
+    let fault = remanence_state::StateError::from(StoreError::Header);
+    assert_eq!(
+        crate::status_from_state_error(fault).code(),
+        tonic::Code::FailedPrecondition
+    );
+}
+
 /// A historical tape identity never acquires today's endpoint; both explicit
 /// identity dimensions independently block mutations, while reads remain usable.
 #[test]

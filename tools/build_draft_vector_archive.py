@@ -170,8 +170,8 @@ def build_repository(root: Path, images: Path | None, output: Path, replace: boo
     with tempfile.TemporaryDirectory(prefix="draft-images-") as tmp:
         if images is None:
             images = Path(tmp) / "streams"
-            subprocess.run(["cargo", "run", "--offline", "-q", "-p", "remanence-cli", "--bin",
-                            "rem-dev", "--", "generate-tape-images", "--export-images", str(images)], cwd=root, check=True)
+            subprocess.run(["cargo", "run", "--offline", "-q", "-p", "remanence-cli", "--features",
+                            "fixtures", "--bin", "rem-dev", "--", "generate-tape-images", "--export-images", str(images)], cwd=root, check=True)
         payload = source_members(root, images)
         check_specification_exclusion(payload, specification_sources(root))
         # Check pins, including ALL concatenations, before installing the archive.

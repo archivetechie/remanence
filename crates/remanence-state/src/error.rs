@@ -145,6 +145,11 @@ impl StateError {
         matches!(self, Self::StateLockHeld(_))
     }
 
+    /// True when another owner holds the tape-log lease, so a later retry can succeed.
+    pub fn is_tape_log_busy(&self) -> bool {
+        matches!(self, Self::TapeLog(error) if matches!(**error, crate::tape_log::store::StoreError::Locked(nix::errno::Errno::EWOULDBLOCK)))
+    }
+
     /// Authority reached stable storage but its fold or SQL projection is pending.
     pub fn is_checkpoint_append_durable(&self) -> bool {
         matches!(self, Self::TapeLog(error) if matches!(**error, crate::tape_log::store::StoreError::AfterDurable(_)))
@@ -187,5 +192,15 @@ mod tests {
         let error = StateError::io("append audit", io::Error::other("disk stalled"));
 
         assert_eq!(error.to_string(), "append audit: disk stalled");
+    }
+
+    #[test]
+    fn only_lease_contention_is_tape_log_busy() {
+        use crate::tape_log::store::StoreError;
+        let busy = StateError::from(StoreError::Locked(nix::errno::Errno::EWOULDBLOCK));
+        assert!(busy.is_tape_log_busy());
+        let fault = StateError::from(StoreError::Locked(nix::errno::Errno::ENOLCK));
+        assert!(!fault.is_tape_log_busy());
+        assert!(!StateError::from(StoreError::Header).is_tape_log_busy());
     }
 }
