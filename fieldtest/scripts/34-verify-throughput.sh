@@ -221,7 +221,9 @@ else:
 PY
 )" || fail readiness 'no object on selected tape for readiness read' "$objects"
     length="$(printf '%s\n' "$locator" | fieldtest_json_get read_length)"
-    spool="$(mktemp "$(fieldtest_spool_dir)/verify-ready.XXXXXX")"
+    # Kit scratch, which the preflight sweep clears if a signal skips the rm below.
+    mkdir -p "$(fieldtest_home)/tmp"
+    spool="$(mktemp "$(fieldtest_home)/tmp/verify-ready.XXXXXX")"
     if ! fieldtest_capture_io_json "$dir/$stamp-ready-read.json" "$io" --endpoint "$endpoint" read --object "$locator" --length "$length" --out "$spool"; then
       rm -f -- "$spool"
       fail readiness 'readiness read fails' "$dir/$stamp-ready-read.json"

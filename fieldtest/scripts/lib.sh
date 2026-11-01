@@ -141,11 +141,19 @@ FIELDTEST_WORKDIRS=()
 
 fieldtest_space_report() {
   # Prints: total_bytes avail_bytes kit_bytes for the spool filesystem.
-  local dir total avail kit
+  local dir total avail kit home spool spool_kit
   dir="$(fieldtest_spool_dir)"
   mkdir -p "$dir"
   read -r total avail < <(df -PB1 -- "$dir" | awk 'NR==2 {print $2, $4}')
-  kit="$(du -sxB1 -- "$(fieldtest_home)" 2>/dev/null | awk '{print $1}')"
+  # Resolve symlinks first: du measures a symlinked home as the link itself and
+  # skips a symlinked or separately mounted spool.
+  home="$(readlink -f -- "$(fieldtest_home)")"
+  spool="$(readlink -f -- "$dir")"
+  kit="$(du -sxB1 -- "$home" 2>/dev/null | awk '{print $1}')"
+  if [[ "$spool" != "$home"/* ]] || [[ "$(stat -c %d -- "$spool")" != "$(stat -c %d -- "$home")" ]]; then
+    spool_kit="$(du -sxB1 -- "$spool" 2>/dev/null | awk '{print $1}')"
+    kit=$(( ${kit:-0} + ${spool_kit:-0} ))
+  fi
   printf '%s %s %s\n' "${total:-0}" "${avail:-0}" "${kit:-0}"
 }
 
@@ -157,10 +165,15 @@ fieldtest_spool_dedicated() {
     1) return 0 ;;
     0) return 1 ;;
   esac
-  local target home
+  # Only a tmpfs or a loop-backed image counts: an NFS or autofs home, or a bind
+  # mount of shared storage, also mounts at $HOME but is production space.
+  local target home source fstype
   target="$(findmnt -no TARGET --target "$(fieldtest_spool_dir)" 2>/dev/null)" || return 1
+  source="$(findmnt -no SOURCE --target "$(fieldtest_spool_dir)" 2>/dev/null)" || return 1
+  fstype="$(fieldtest_spool_fstype)"
   home="$(cd -- "$HOME" && pwd -P)"
-  [[ -n "$target" && ( "$target" == "$home" || "$target" == "$home"/* ) ]]
+  [[ -n "$target" && ( "$target" == "$home" || "$target" == "$home"/* ) ]] || return 1
+  [[ "$fstype" == tmpfs ]] || [[ "$source" == /dev/loop* && "$source" != *\[* ]]
 }
 
 fieldtest_spool_fstype() {
@@ -251,11 +264,11 @@ fieldtest_sweep_stale_runs() {
     rm -rf -- "$dir"
     removed=$((removed + 1))
     printf 'swept stale kit run dir %s\n' "$dir" >&2
-  done < <(find "$spool" -mindepth 1 -maxdepth 1 -type d -mmin "+$(( hours * 60 ))" \
+  done < <(find -H "$spool" -mindepth 1 -maxdepth 1 -type d -mmin "+$(( hours * 60 ))" \
     \( -name 'append-*' -o -name 'bench-*' -o -name 'fault-*' -o -name 'happy-*' \
        -o -name 'multi-*' -o -name 'soak-*' -o -name 'preflight-*' \) -print0)
   if [[ -d "$(fieldtest_home)/tmp" ]]; then
-    find "$(fieldtest_home)/tmp" -mindepth 1 -maxdepth 1 -mmin "+$(( hours * 60 ))" \
+    find -H "$(fieldtest_home)/tmp" -mindepth 1 -maxdepth 1 -mmin "+$(( hours * 60 ))" \
       -exec rm -rf -- {} +
   fi
   printf '%s\n' "$removed"
@@ -1283,12 +1296,29 @@ fieldtest_run_with_lock() {
   counters="$(mktemp "$(fieldtest_state_dir)/fence-counters.XXXXXX")"
   fieldtest_init_fence_counters "$counters"
   set +e
+  # main runs in a background subshell so a signal sent to this script's PID
+  # (kill, timeout) reaches it and its cleanup traps run; a foreground subshell
+  # would keep writing after this shell died. Keep the caller's stdin, which an
+  # asynchronous command would otherwise get as /dev/null.
+  local stdin_fd child
+  exec {stdin_fd}<&0
   (
     export FIELDTEST_LOCK_HELD=1
     export FIELDTEST_FENCE_COUNTERS_FILE="$counters"
     "$@"
-  )
-  rc=$?
+  ) <&"$stdin_fd" &
+  child=$!
+  exec {stdin_fd}<&-
+  trap 'kill -TERM "$child" 2>/dev/null' TERM
+  trap 'kill -INT "$child" 2>/dev/null' INT
+  trap 'kill -HUP "$child" 2>/dev/null' HUP
+  # A trapped signal interrupts wait; wait again until the child has finished.
+  while :; do
+    wait "$child"
+    rc=$?
+    kill -0 "$child" 2>/dev/null || break
+  done
+  trap - TERM INT HUP
   set -e
   FIELDTEST_FENCE_COUNTERS_FILE="$counters" fieldtest_emit_fence_summary || true
   rm -f -- "$counters"

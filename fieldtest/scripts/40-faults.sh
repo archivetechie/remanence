@@ -75,7 +75,7 @@ kill_mid_write() {
   prefix_bytes="${FIELD_FAULT_PREFIX_BYTES:-268435456}"
   fieldtest_require_pool_appendable_tapes fieldtest-a 1 "kill-mid-write fixture write"
   fieldtest_require_pool_appendable_tapes fieldtest-b 1 "kill-mid-write committed-prefix and interrupted writes"
-  fieldtest_make_workdir workdir "fault-kill-${RANDOM}" "$(( (payload_bytes + prefix_bytes) * 3 ))" "kill-mid-write fixtures"
+  fieldtest_make_workdir workdir "fault-kill-${RANDOM}" "$(( (payload_bytes + prefix_bytes) * 4 ))" "kill-mid-write fixtures"
   IFS='|' read -r source object locator < <(write_fixture_object "$workdir/fieldtest-a-prefix" "$payload_bytes" fieldtest-a)
   IFS='|' read -r b_source b_object b_locator < <(write_fixture_object "$workdir/fieldtest-b-prefix" "$prefix_bytes" fieldtest-b)
   (fieldtest_capture_json "$workdir/write.json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$serial" --file "$object" --pool fieldtest-b; echo $? >"$workdir/write.rc") &
@@ -111,7 +111,10 @@ rebuild_catalog() {
   local serial workdir
   serial="$(fieldtest_selected_library_serial)"
   fieldtest_require_pool_appendable_tapes fieldtest-a 1 "rebuild fault fixture write"
-  fieldtest_make_workdir workdir "fault-rebuild-${RANDOM}" "$(( ${FIELD_FAULT_REBUILD_BYTES:-268435456} * 3 ))" "rebuild fixture"
+  # The fixture write, its restore and spool copy, plus a copy of the state dir.
+  local state_bytes
+  state_bytes="$(du -sB1 -- "$(fieldtest_state_dir)" 2>/dev/null | awk '{print $1}')"
+  fieldtest_make_workdir workdir "fault-rebuild-${RANDOM}" "$(( ${FIELD_FAULT_REBUILD_BYTES:-268435456} * 3 + ${state_bytes:-0} ))" "rebuild fixture"
   IFS='|' read -r _ fixture locator < <(write_fixture_object "$workdir" "${FIELD_FAULT_REBUILD_BYTES:-268435456}")
   "$(fieldtest_script_dir)/03-bringup.sh" --stop >/dev/null 2>&1 || true
   cp -a -- "$(fieldtest_state_dir)" "$workdir/state-snapshot"

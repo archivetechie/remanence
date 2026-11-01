@@ -17,12 +17,13 @@ echo "stubfs $STUB_TOTAL 0 $STUB_AVAIL 0% /stub"
 EOF
 cat >"$stubs/du" <<'EOF'
 #!/bin/sh
-printf '%s\t%s\n' "$STUB_KIT" "stub"
+if [ -n "${STUB_KIT:-}" ]; then printf '%s\t%s\n' "$STUB_KIT" "stub"; else exec /usr/bin/du "$@"; fi
 EOF
 cat >"$stubs/findmnt" <<'EOF'
 #!/bin/sh
 case "$*" in
   *FSTYPE*) printf '%s\n' "${STUB_FSTYPE:-xfs}" ;;
+  *SOURCE*) printf '%s\n' "${STUB_SOURCE:-/dev/loop0}" ;;
   *) printf '%s\n' "$STUB_TARGET" ;;
 esac
 EOF
@@ -74,6 +75,9 @@ expect "dedicated home: 2 GiB floor" "below the 2 GiB floor" "$(refusal 50 45 1 
 expect "dedicated home: names the mode" "on the dedicated spool filesystem" "$(refusal 50 45 1 @HOME@ 44)"
 expect "dedicated tmpfs under home" EMPTY "$(refusal 320 300 1 @HOME@/remfield/spool 100)"
 expect "dedicated: no kit cap" EMPTY "$(refusal 50 45 39 @HOME@ 5)"
+expect "detection: NFS home is shared" "150 GiB floor" "$(refusal 618 200 1 @HOME@ 60 STUB_SOURCE=nas:/export/home STUB_FSTYPE=nfs4)"
+expect "detection: bind mount is shared" "150 GiB floor" "$(refusal 618 200 1 @HOME@ 60 'STUB_SOURCE=/dev/loop0[/srv/share]')"
+expect "detection: plain disk at home is shared" "150 GiB floor" "$(refusal 618 200 1 @HOME@ 60 STUB_SOURCE=/dev/sdb1)"
 expect "detection: sibling of home is shared" "150 GiB floor" "$(refusal 618 200 1 @HOME@-other 60)"
 expect "override: forced shared" "150 GiB floor" "$(refusal 50 45 1 @HOME@ 30 FIELD_SPOOL_DEDICATED=0)"
 expect "override: forced dedicated" EMPTY "$(refusal 618 200 1 /home 60 FIELD_SPOOL_DEDICATED=1)"
@@ -128,6 +132,48 @@ done
 
 # Layout init points TMPDIR inside the kit.
 expect "init_layout: TMPDIR in the kit" "/remfield/tmp" "$(run_guard 618 363 1 /home 'fieldtest_init_layout; echo "$TMPDIR"; mktemp')"
+
+# Symlinked spool: the kit size counts what the link points at, and the sweep follows it.
+home="$(mktemp -d "$root/case.XXXXXX")"
+mkdir -p "$home/remfield/state" "$home/elsewhere/happy-old"
+ln -s "$home/elsewhere" "$home/remfield/spool"
+head -c $((3 * 1024 * 1024)) /dev/zero >"$home/elsewhere/payload"
+touch -d '10 hours ago' "$home/elsewhere/happy-old"
+report="$(env -i PATH="$stubs:/usr/bin:/bin" HOME="$home" REMFIELD_HOME="$home/remfield" STUB_TOTAL=1 STUB_AVAIL=1 \
+  bash -c "source '$scripts/lib.sh'; fieldtest_space_report")"
+kit_bytes="${report##* }"
+if (( kit_bytes >= 3 * 1024 * 1024 )); then echo "ok   symlinked spool: kit counts its payload"; else echo "FAIL symlinked spool: kit=$kit_bytes"; failures=$((failures + 1)); fi
+count="$(env -i PATH="$stubs:/usr/bin:/bin" HOME="$home" REMFIELD_HOME="$home/remfield" \
+  bash -c "source '$scripts/lib.sh'; fieldtest_sweep_stale_runs" 2>/dev/null)"
+expect "symlinked spool: sweep follows the link" "1" "$count"
+if [[ ! -e "$home/elsewhere/happy-old" ]]; then echo "ok   symlinked spool: removed happy-old"; else echo "FAIL symlinked spool kept happy-old"; failures=$((failures + 1)); fi
+
+# TERM sent to a locked script's own PID stops main and removes its run dir.
+home="$(mktemp -d "$root/case.XXXXXX")"
+mkdir -p "$home/remfield/spool"
+cat >"$home/locked.sh" <<LOCKED
+source '$scripts/lib.sh'
+main() {
+  fieldtest_make_workdir wd happy 1024 "a locked run"
+  printf '%s\n' "\$wd" >"\$HOME/wd"
+  while :; do date +%s%N >>"\$HOME/progress"; sleep 0.1; done
+}
+fieldtest_run_with_lock main
+LOCKED
+env -i PATH="$stubs:/usr/bin:/bin" HOME="$home" REMFIELD_HOME="$home/remfield" \
+  STUB_TOTAL=$((618 * GIB)) STUB_AVAIL=$((363 * GIB)) STUB_KIT=$GIB STUB_TARGET=/home \
+  bash "$home/locked.sh" >/dev/null 2>&1 &
+locked=$!
+for _ in $(seq 100); do [[ -s "$home/progress" ]] && break; sleep 0.1; done
+kill -TERM "$locked"
+rc=0
+wait "$locked" || rc=$?
+lines="$(wc -l <"$home/progress")"
+sleep 0.5
+expect "locked TERM: exit status" "143" "$rc"
+expect "locked TERM: main stopped" "$lines" "$(wc -l <"$home/progress")"
+wd="$(cat "$home/wd")"
+if [[ -n "$wd" && ! -e "$wd" ]]; then echo "ok   locked TERM: run dir removed"; else echo "FAIL locked TERM left $wd"; failures=$((failures + 1)); fi
 
 if (( failures )); then
   printf '%d disk-guard check(s) failed\n' "$failures"

@@ -126,11 +126,11 @@ if the write would break a floor:
 | Spool filesystem | Floors |
 |---|---|
 | shared (for example `/home`) | `FIELD_MIN_FREE_GB` (150) free and `FIELD_MIN_FREE_PCT` (25) free after the write; the kit stays under `FIELD_MAX_KIT_GB` (40) |
-| dedicated: mounted at or below `$HOME`, like a capped home image or a tmpfs the owner sized | `FIELD_MIN_FREE_GB` (2) free; the filesystem is its own cap |
+| dedicated: a loop-backed image (the capped home) or a tmpfs, mounted at or below `$HOME`. An NFS, autofs or bind mount there counts as shared | `FIELD_MIN_FREE_GB` (2) free; the filesystem is its own cap |
 | tmpfs, in addition | `FIELD_MIN_FREE_RAM_GB` (64) of `MemAvailable` left after the write |
 
 `FIELD_SPOOL_DEDICATED=1` or `0` overrides the detection. Run directories are
-removed on every exit path, including HUP, INT and TERM. `00-preflight.sh` sweeps run
+removed on every exit path, including HUP, INT and TERM sent to the script's PID. `00-preflight.sh` sweeps run
 directories and kit scratch files older than `FIELD_STALE_RUN_HOURS` (6),
 keeping a live soak's, and records the footprint as `disk-footprint` evidence.
 Scratch files go to `~/remfield/tmp`, not the shared `/tmp`.

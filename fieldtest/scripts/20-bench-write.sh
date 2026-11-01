@@ -208,7 +208,8 @@ main() {
   original_write_batch="${FIELD_TAPE_IO_WRITE_BATCH_BLOCKS:-16}"
   original_read_batch="${FIELD_TAPE_IO_READ_BATCH_BLOCKS:-$original_write_batch}"
   if [[ "${FIELD_BENCH_BATCH_SWEEP:-0}" == 1 ]]; then
-    trap 'restore_daemon_batch_config "$original_write_batch" "$original_read_batch"; fieldtest_cleanup_workdirs' EXIT
+    # Remove payloads first: a failing restore must not leave them behind.
+    trap 'fieldtest_cleanup_workdirs; restore_daemon_batch_config "$original_write_batch" "$original_read_batch"' EXIT
   fi
   while IFS= read -r batch; do
     if [[ "$batch" == current ]]; then
