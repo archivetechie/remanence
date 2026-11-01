@@ -3073,7 +3073,10 @@ impl<'a> ParitySink<'a> {
         allow_partial_epoch: bool,
         is_terminal: bool,
     ) -> Result<(), ParityError> {
-        let parity_shards = self.accumulator.take_parity_shards(block_size)?;
+        let parity_shards = self
+            .accumulator
+            .take_parity_shards(block_size)
+            .inspect_err(|_| self.poisoned = true)?;
         self.queue_epoch_sidecar_with_parity_shards(
             parity_shards,
             block_size,

@@ -52,22 +52,44 @@ impl SgTransport for CorruptRebuildRead {
 
 #[test]
 fn checked_closeout_actor_retry_fence_legacy_and_reservation() {
-    check_closeout_route(false);
+    check_closeout_route(false, None);
 }
 
 #[test]
 fn checked_closeout_terminal_retry_fence_legacy_and_reservation() {
-    check_closeout_route(true);
+    check_closeout_route(true, None);
 }
 
-fn check_closeout_route(terminal: bool) {
-    for (corrupt, refuse_memory, legacy) in [
-        (0, false, false),
-        (1, false, false),
-        (2, false, false),
-        (0, true, false),
-        (2, false, true),
-    ] {
+/// Exercise real catalog and audit failures after both readback passes disagree.
+#[derive(Clone, Copy)]
+enum FenceFailure {
+    BarcodeLookup,
+    FenceWrite,
+}
+
+#[test]
+fn checked_closeout_barcode_lookup_failure_still_fences_mismatch() {
+    check_closeout_route(false, Some(FenceFailure::BarcodeLookup));
+}
+
+#[test]
+fn checked_closeout_fence_write_failure_preserves_mismatch_and_detail() {
+    check_closeout_route(false, Some(FenceFailure::FenceWrite));
+}
+
+fn check_closeout_route(terminal: bool, fence_failure: Option<FenceFailure>) {
+    let cases = if fence_failure.is_some() {
+        &[(2, false, false)][..]
+    } else {
+        &[
+            (0, false, false),
+            (1, false, false),
+            (2, false, false),
+            (0, true, false),
+            (2, false, true),
+        ][..]
+    };
+    for &(corrupt, refuse_memory, legacy) in cases {
         let vector = crate::tape_image_vectors::generate("unfinalized-open").unwrap();
         let input = crate::resume_vectors::recorded_input("resume-open");
         let root = tempfile::tempdir().unwrap();
@@ -179,6 +201,16 @@ fn check_closeout_route(terminal: bool) {
             snapshot,
             summary,
         };
+        if matches!(fence_failure, Some(FenceFailure::BarcodeLookup)) {
+            rusqlite::Connection::open(&cfg.index_path)
+                .unwrap()
+                .execute_batch("ALTER TABLE objects RENAME TO closeout_hidden_objects")
+                .unwrap();
+            assert!(index.get_tape(&selected.tape_uuid).is_err());
+        }
+        if matches!(fence_failure, Some(FenceFailure::FenceWrite)) {
+            std::fs::write(&cfg.audit_dir, b"not an audit directory").unwrap();
+        }
         let result = if terminal {
             let mut permit = None;
             super::super::terminal_finalize::terminal_epoch_state(
@@ -234,6 +266,19 @@ fn check_closeout_route(terminal: bool) {
             if !refuse_memory {
                 assert!(status.message().contains("closeout check mismatch"));
             }
+            if matches!(fence_failure, Some(FenceFailure::FenceWrite)) {
+                assert!(
+                    status
+                        .message()
+                        .contains("additionally failed to persist the required tape fence:"),
+                    "{status}"
+                );
+                assert!(status.message().contains("create audit dir"), "{status}");
+                assert!(
+                    status.message().contains(cfg.audit_dir.to_str().unwrap()),
+                    "{status}"
+                );
+            }
         }
         assert_eq!(cfg.io_memory.granted(), 0);
         assert_eq!(
@@ -256,14 +301,23 @@ fn check_closeout_route(terminal: bool) {
         }
         assert_eq!(world.tapes["RESUME001"].records, before);
         drop(world);
+        if matches!(fence_failure, Some(FenceFailure::BarcodeLookup)) {
+            rusqlite::Connection::open(&cfg.index_path)
+                .unwrap()
+                .execute_batch("ALTER TABLE closeout_hidden_objects RENAME TO objects")
+                .unwrap();
+        }
         drop(index);
         let reopened = CatalogIndex::open(&cfg.index_path).unwrap();
         let fences = reopened
             .tape_io_admission_conflicts(&selected.tape_uuid, Some("RESUME001"))
             .unwrap();
-        if corrupt == 2 && !legacy {
+        if corrupt == 2 && !legacy && !matches!(fence_failure, Some(FenceFailure::FenceWrite)) {
             assert_eq!(fences.len(), 1);
             assert_eq!(fences[0].reason, "CloseoutCheckMismatch");
+            if matches!(fence_failure, Some(FenceFailure::BarcodeLookup)) {
+                assert!(fences[0].barcode.is_none());
+            }
             assert!(fences[0]
                 .evidence_json
                 .as_ref()

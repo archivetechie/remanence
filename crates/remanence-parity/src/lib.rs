@@ -141,14 +141,15 @@ pub use raw::{
 pub use recovery::{
     recover_object_block_from_sidecar, recover_ordinal_from_sidecar, SidecarRecoveryResult,
 };
+#[cfg(any(test, feature = "fixtures"))]
+pub use resume::rebuild_open_epoch_from_bounded_summary;
 pub use resume::{
     checked_bounded_resume_summary, checked_checkpointed_terminal_close_summary,
     close_checkpointed_terminal_index_prefix, emit_resume_rebuilt_sidecars_to_raw,
-    plan_checkpointed_terminal_index_close, rebuild_open_epoch_from_bounded_summary,
-    rebuild_open_epoch_from_bounded_summary_checked, resume_record_result, BoundedResumeSummary,
-    CheckpointedTerminalCloseSummary, CheckpointedTerminalPrefixCloseResult, ResumeAppendPlan,
-    ResumeAppendResult, ResumeLiveEpochState, ResumeOpenEpochRebuild, ResumeRebuiltSidecar,
-    ResumeSidecarPlan,
+    plan_checkpointed_terminal_index_close, rebuild_open_epoch_from_bounded_summary_checked,
+    resume_record_result, BoundedResumeSummary, CheckpointedTerminalCloseSummary,
+    CheckpointedTerminalPrefixCloseResult, ResumeAppendPlan, ResumeAppendResult,
+    ResumeLiveEpochState, ResumeOpenEpochRebuild, ResumeRebuiltSidecar, ResumeSidecarPlan,
 };
 pub use scan::{
     acquire_filemark_map, acquire_filemark_map_with_report, scan_reconstruct_filemark_map,
