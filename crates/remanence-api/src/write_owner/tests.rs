@@ -14747,6 +14747,11 @@ async fn check_epoch_removal(
         pool.park_cartridge(seated.clone());
     }
     api.drive_pool = Some(pool);
+    if case == "summary_mismatch" && path == "shutdown" {
+        // Permit identity, cursor-filemark and EOD probes, but assert in the
+        // transport that shutdown never reads committed Object blocks.
+        read_fault.store(31, Ordering::SeqCst);
+    }
     let command_start = world.lock().unwrap().command_log.len();
     match path {
         "shutdown" => {
@@ -15033,12 +15038,9 @@ async fn check_epoch_removal(
         );
     }
     if case == "summary_mismatch" && path == "shutdown" {
-        assert!(
-            world.command_log[command_start..]
-                .iter()
-                .filter(|c| c.opcode == 0x08)
-                .count()
-                <= 1,
+        assert_eq!(
+            read_fault.load(Ordering::SeqCst),
+            31,
             "shutdown never rebuilds a mismatching retained summary"
         );
     }
@@ -15175,6 +15177,19 @@ impl SgTransport for EpochRemovalTransport {
         cdb: &[u8],
         data: &mut [u8],
     ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError> {
+        if cdb[0] == 0x08 && self.fault.load(Ordering::SeqCst) == 31 {
+            assert!(
+                self.located < 2
+                    || matches!(
+                        self.world.lock().unwrap().tapes["HAND"]
+                            .records
+                            .get(self.located as usize),
+                        None | Some(Record::Filemark)
+                    ),
+                "shutdown reread committed Object data at LBA {}",
+                self.located
+            );
+        }
         if matches!(cdb[0], 0x1a | 0x5a) && self.fault.load(Ordering::SeqCst) == 4 {
             self.fault.store(0, Ordering::SeqCst);
             return Err(remanence_library::ScsiError::Io(std::io::Error::other(
@@ -15187,7 +15202,18 @@ impl SgTransport for EpochRemovalTransport {
                 "injected READ POSITION failure",
             )));
         }
-        if cdb[0] == 0x08 && self.located > 2 {
+        if cdb[0] == 0x08
+            && self.located > 2
+            && !matches!(
+                self.world
+                    .lock()
+                    .unwrap()
+                    .tapes
+                    .get("HAND")
+                    .and_then(|tape| tape.records.get(self.located as usize)),
+                Some(Record::Filemark)
+            )
+        {
             let pending = self.fault.load(Ordering::SeqCst);
             if pending == 30 {
                 self.fault.store(0, Ordering::SeqCst);
@@ -15211,7 +15237,7 @@ impl SgTransport for EpochRemovalTransport {
         }
         let pending = self.fault.load(Ordering::SeqCst);
         if cdb[0] == 0x08
-            && ((self.located == 2 && pending != 9)
+            && ((self.located == 2 && !matches!(pending, 9 | 31))
                 || (self.located == 0 && matches!(pending, 17..=19)))
         {
             let fault = self.fault.swap(0, Ordering::SeqCst);
@@ -15262,7 +15288,16 @@ impl SgTransport for EpochRemovalTransport {
                 });
             }
         }
-        self.inner.execute_in(cdb, data)
+        let result = self.inner.execute_in(cdb, data);
+        if cdb[0] == 0x08
+            && (result.is_ok()
+                || matches!(&result,
+            Err(remanence_library::ScsiError::CheckCondition { sense, .. })
+                if sense.get(2).is_some_and(|flags| flags & 0x80 != 0)))
+        {
+            self.located += 1;
+        }
+        result
     }
     fn execute_out(
         &mut self,

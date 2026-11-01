@@ -117,11 +117,11 @@ pub(crate) fn admit_append_boundary(
                 position
             }
             AppendAuthority::Checkpoint { eod } => {
-                prove_position(drive, *eod)?;
+                prove_position(drive, *eod, ctx.block_size, generation)?;
                 *eod
             }
             AppendAuthority::Terminal { .. } => {
-                prove_position(drive, ctx.boundary)?;
+                prove_position(drive, ctx.boundary, ctx.block_size, generation)?;
                 ctx.boundary
             }
         };
@@ -136,7 +136,7 @@ pub(crate) fn admit_append_boundary(
                 })
             }
         };
-        prove_position(drive, boundary)?;
+        prove_position(drive, boundary, ctx.block_size, generation)?;
         let plan = match &authority {
             AppendAuthority::Terminal { plan } => Some(*plan),
             _ => None,
@@ -174,7 +174,22 @@ pub(crate) fn admit_append_boundary(
         }
         Ok(suffix)
     })();
-    let restored = prove_position(drive, ctx.write_position);
+    let restored = if matches!(authority, AppendAuthority::Fresh) && ctx.write_position.lba == 0 {
+        drive
+            .locate(0)
+            .and_then(|actual| {
+                if actual.partition != ctx.write_position.partition || actual.lba != 0 {
+                    return Err(TapeIoError::OperationFailed(format!(
+                        "position mismatch: expected {:?}, got {actual:?}",
+                        ctx.write_position
+                    )));
+                }
+                Ok(None)
+            })
+            .map_err(AdmissionError::Io)
+    } else {
+        prove_position(drive, ctx.write_position, ctx.block_size, generation).map(Some)
+    };
     // A suffix read failure refuses admission even when it also invalidates the
     // handle. Preserve its location after attempting cursor restoration.
     if let Err(error @ AdmissionError::SuffixIo { .. }) = probe {
@@ -186,14 +201,21 @@ pub(crate) fn admit_append_boundary(
             current: drive.identity_generation(),
         }));
     }
-    restored?;
+    let cursor_proof = restored?;
     probe?;
     // SAFETY: this private, non-cloneable type can only be constructed here,
     // after successful classification, cursor restoration and generation proof.
     // Installation immediately consumes it on the same exclusively held drive.
-    struct ProvedBoundary([u8; 16], u32, u64, u64);
+    struct ProvedBoundary(
+        [u8; 16],
+        u32,
+        u64,
+        u64,
+        Option<remanence_library::cursor::CursorProof>,
+    );
     unsafe impl remanence_library::AppendBoundaryProof for ProvedBoundary {
         fn into_boundary(self) -> ([u8; 16], u32, u64, u64) {
+            let _cursor_proof = self.4;
             (self.0, self.1, self.2, self.3)
         }
     }
@@ -203,19 +225,21 @@ pub(crate) fn admit_append_boundary(
             ctx.write_position.partition,
             ctx.write_position.lba,
             generation,
+            cursor_proof,
         ))
         .map(|session| AppendAdmission { session })
         .map_err(AdmissionError::Io)
 }
 
-fn prove_position(drive: &mut DriveHandle, expected: TapePosition) -> Result<(), AdmissionError> {
-    let actual = drive.locate(expected.lba)?;
-    if actual.partition != expected.partition || actual.lba != expected.lba {
-        return Err(AdmissionError::Unproved(format!(
-            "position mismatch: expected {expected:?}, got {actual:?}"
-        )));
-    }
-    Ok(())
+fn prove_position(
+    drive: &mut DriveHandle,
+    expected: TapePosition,
+    block_size: u32,
+    generation: u64,
+) -> Result<remanence_library::cursor::CursorProof, AdmissionError> {
+    drive
+        .prove_cursor(expected, block_size, generation)
+        .map_err(AdmissionError::Io)
 }
 
 pub(crate) fn context(
@@ -320,7 +344,9 @@ fn abandon_pending_append_with_rows(
     // both; the marker replaces only its first uncheckpointed object.
     let lba = last.as_ref().map_or(2, |r| r.cursor.lba);
     let partition = last.as_ref().map_or(0, |r| r.cursor.partition);
-    let actual = drive.locate(lba).map_err(|e| e.to_string())?;
+    let actual = drive
+        .locate_admitted_append(lba)
+        .map_err(|e| e.to_string())?;
     if actual.partition != partition || actual.lba != lba {
         return Err("abandonment checkpoint position mismatch".into());
     }

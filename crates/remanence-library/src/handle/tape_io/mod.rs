@@ -125,6 +125,7 @@ impl AppendSession {
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct AppendProof {
+    position_proved: bool,
     tape_uuid: [u8; 16],
     partition: u32,
     lba: u64,
@@ -208,6 +209,7 @@ impl super::DriveHandle {
         let session = std::sync::Arc::new(());
         self.append_admission = Some((
             AppendProof {
+                position_proved: true,
                 tape_uuid,
                 partition,
                 lba,
@@ -225,6 +227,34 @@ impl super::DriveHandle {
         })
     }
 
+    /// Re-prove C after read-back or recovery motion, retaining the session's
+    /// lifetime but never retaining its permission to write across a locate.
+    #[doc(hidden)]
+    pub fn prove_cursor(
+        &mut self,
+        expected: TapePosition,
+        block_size: u32,
+        generation: u64,
+    ) -> Result<crate::cursor::CursorProof, TapeIoError> {
+        self.invalidate_append_position();
+        self.transport.check_identity_generation(generation)?;
+        let proof = crate::cursor::prove_cursor(self, expected, block_size)?;
+        self.transport
+            .check_identity_generation(proof.identity_generation)?;
+        if let Some((admission, _, _)) = &mut self.append_admission {
+            if admission.identity_generation == generation {
+                admission.position_proved = true;
+            }
+        }
+        Ok(proof)
+    }
+
+    fn invalidate_append_position(&mut self) {
+        if let Some((admission, _, _)) = &mut self.append_admission {
+            admission.position_proved = false;
+        }
+    }
+
     /// Whether this admitted session dispatched any media writes.
     pub fn append_session_has_dispatched_writes(&self) -> Result<bool, TapeIoError> {
         let (_, initial, _) = self.append_admission.as_ref().ok_or_else(|| {
@@ -233,8 +263,8 @@ impl super::DriveHandle {
         Ok(self.media_write_dispatch_count() != *initial)
     }
 
-    /// Reuse the exact cursor just proved by admission for the writer's existing
-    /// initial LOCATE. Once a write has dispatched, ordinary LOCATE semantics apply.
+    /// Reuse the unchanged initial proof, or locate and re-prove the predecessor
+    /// before any append/recovery repositioning. Raw LOCATE never grants writes.
     pub fn locate_admitted_append(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
         if let Some((admission, dispatches, _)) = self.append_admission.as_ref() {
             if *dispatches == self.media_write_dispatch_count()
@@ -246,7 +276,23 @@ impl super::DriveHandle {
                     .expect("admission checked the exact cursor"));
             }
         }
-        self.locate(lba)
+        let generation = self.identity_generation();
+        let config = self.read_config()?;
+        let crate::BlockSize::Fixed { size_bytes } = config.block_size else {
+            return Err(TapeIoError::OperationFailed(
+                "append cursor requires fixed block mode".into(),
+            ));
+        };
+        let expected = TapePosition {
+            partition: 0,
+            lba,
+            beginning_of_partition: false,
+            end_of_partition: false,
+            block_position_end_of_warning: false,
+        };
+        Ok(self
+            .prove_cursor(expected, size_bytes, generation)?
+            .position)
     }
 
     /// Return the identity of the currently live admitted write session.
@@ -260,13 +306,18 @@ impl super::DriveHandle {
             .tape_uuid)
     }
 
-    /// Shared adapter gate: no first media write without exact physical proof.
-    /// The dispatch count keeps failed, undispatched attempts from consuming it.
+    /// Shared adapter gate: every motion/read revokes the cursor proof, including
+    /// after earlier writes. The first write also checks the admitted position.
     pub fn check_append_admission(&self) -> Result<(), TapeIoError> {
         let (admission, initial_dispatches, session) =
             self.append_admission.as_ref().ok_or_else(|| {
                 TapeIoError::OperationFailed("media write refused: missing append admission".into())
             })?;
+        if !admission.position_proved {
+            return Err(TapeIoError::OperationFailed(
+                "media write refused: cursor proof invalidated by motion or read".into(),
+            ));
+        }
         if session.upgrade().is_none() {
             return Err(TapeIoError::OperationFailed(
                 "media write refused: expired append session".into(),
@@ -915,6 +966,7 @@ impl super::DriveHandle {
     /// the [`TapeIoError::NoMedium`] mapping) leaves the snapshot
     /// clean because the physical state is known.
     pub fn rewind(&mut self) -> Result<(), TapeIoError> {
+        self.invalidate_append_position();
         let op = AuditOp::TapeRewind {
             bay: self.bay_address(),
         };
@@ -1339,6 +1391,7 @@ impl super::DriveHandle {
     /// the parent dirty bit with cause
     /// [`DirtyCause::CompletionUnknown`].
     pub fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
+        self.invalidate_append_position();
         let op = AuditOp::TapeLocate {
             bay: self.bay_address(),
             lba,
@@ -1386,6 +1439,7 @@ impl super::DriveHandle {
     /// [`DirtyCause::CompletionUnknown`], same as the other Layer 3a
     /// methods.
     pub fn space(&mut self, count: i64, kind: SpaceKind) -> Result<SpaceResult, TapeIoError> {
+        self.invalidate_append_position();
         self.space_with_error_audit(count, kind, false)
     }
 
@@ -1405,6 +1459,7 @@ impl super::DriveHandle {
         kind: SpaceKind,
         defer_error_audit: bool,
     ) -> Result<SpaceResult, TapeIoError> {
+        self.invalidate_append_position();
         use remanence_scsi::space::{self as sp, SpaceCode};
 
         // IBM LTO drives only implement CODE 0 (Blocks), 1
@@ -2071,6 +2126,7 @@ impl super::DriveHandle {
         remaining_records_in_file: u32,
         periodic_position_check: bool,
     ) -> (u32, Result<ReadBatchOutcome, TapeIoError>) {
+        self.invalidate_append_position();
         let mut issued = 0;
         let result = (|| {
             self.ensure_data_command_state_valid(true)?;
@@ -2182,6 +2238,7 @@ impl super::DriveHandle {
         requested_records: u32,
         remaining_records_in_file: u32,
     ) -> Result<ReadBatchOutcome, TapeIoError> {
+        self.invalidate_append_position();
         self.ensure_data_command_state_valid(true)?;
         if requested_records == 0 || remaining_records_in_file == 0 {
             return Err(TapeIoError::InvalidRequest(ScsiError::InvalidInput(
@@ -2417,6 +2474,7 @@ impl super::DriveHandle {
     /// Transport errors flip the parent dirty bit; CHECK CONDITION
     /// without ILI (NOT READY, etc.) maps via the usual `map_scsi`.
     pub fn read_block(&mut self, buf: &mut [u8]) -> Result<usize, TapeIoError> {
+        self.invalidate_append_position();
         self.ensure_data_command_state_valid(false)?;
         // Drive's 24-bit READ(6) transfer-length field caps at
         // MAX_TRANSFER_LEN (16 MiB - 1). Bail before the CDB build's

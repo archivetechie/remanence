@@ -401,6 +401,52 @@ pub trait RawTapeSource {
         Default::default()
     }
 
+    /// Restore the recorded append cursor through the shared predecessor proof.
+    /// Drive adapters additionally bind the result to the live identity generation.
+    #[doc(hidden)]
+    fn prove_cursor(
+        &mut self,
+        cursor: PhysicalPositionHint,
+        block_size: u32,
+    ) -> Result<(), ParityError> {
+        struct Source<'a, S: ?Sized>(&'a mut S);
+        impl<S: RawTapeSource + ?Sized> remanence_library::cursor::CursorSource for Source<'_, S> {
+            type Error = ParityError;
+            fn locate(&mut self, partition: u32, lba: u64) -> Result<(), ParityError> {
+                self.0
+                    .locate_physical(PhysicalPositionHint { partition, lba })
+            }
+            fn read_filemark(&mut self, block: &mut [u8]) -> Result<bool, ParityError> {
+                Ok(matches!(
+                    self.0.read_record(block)?,
+                    RawReadOutcome::Filemark { .. }
+                ))
+            }
+            fn position(&mut self) -> Result<TapePosition, ParityError> {
+                let p = self.0.position()?;
+                Ok(TapePosition {
+                    partition: p.partition,
+                    lba: p.lba,
+                    beginning_of_partition: false,
+                    end_of_partition: false,
+                    block_position_end_of_warning: false,
+                })
+            }
+        }
+        remanence_library::cursor::prove_cursor(
+            &mut Source(self),
+            TapePosition {
+                partition: cursor.partition,
+                lba: cursor.lba,
+                beginning_of_partition: false,
+                end_of_partition: false,
+                block_position_end_of_warning: false,
+            },
+            block_size,
+        )?;
+        Ok(())
+    }
+
     /// Configure the drive for fixed-block reads at `block_size` bytes.
     fn configure_fixed_block_size(&mut self, block_size: u32) -> Result<(), ParityError>;
 
@@ -1435,7 +1481,7 @@ impl<'a> DriveHandleRawSink<'a> {
 
 impl RawTapeSink for DriveHandleRawSink<'_> {
     fn locate_for_overwrite(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
-        let observed: PhysicalPositionHint = self.drive.locate(hint.lba)?.into();
+        let observed: PhysicalPositionHint = self.drive.locate_admitted_append(hint.lba)?.into();
         if observed.partition != hint.partition || observed.lba != hint.lba {
             self.cursor_hint = Some(observed);
             return Err(ParityError::SessionOpen(format!(
@@ -1509,6 +1555,26 @@ impl RawTapeSink for DriveHandleRawSink<'_> {
 }
 
 impl RawTapeSource for DriveHandleRawSource<'_> {
+    fn prove_cursor(
+        &mut self,
+        cursor: PhysicalPositionHint,
+        block_size: u32,
+    ) -> Result<(), ParityError> {
+        self.drive.prove_cursor(
+            TapePosition {
+                partition: cursor.partition,
+                lba: cursor.lba,
+                beginning_of_partition: false,
+                end_of_partition: false,
+                block_position_end_of_warning: false,
+            },
+            block_size,
+            self.drive.identity_generation(),
+        )?;
+        self.cursor_hint = Some(cursor);
+        Ok(())
+    }
+
     fn verification_context(&self) -> remanence_library::verification_io::VerificationContext {
         self.drive.verification_context()
     }

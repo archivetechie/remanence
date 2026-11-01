@@ -516,6 +516,7 @@ struct Injection {
     move_failures: usize,
     kernel_omits_residual: bool,
     corrected_eod: usize,
+    corrected_filemark: usize,
     lose_write_reply: bool,
     lost_write_replies: usize,
 }
@@ -562,6 +563,16 @@ impl SgTransport for Transport {
         let result = self.inner.execute_in(cdb, buf);
         if let Err(ScsiError::CheckCondition { sense, .. }) = &result {
             let mut injection = self.injection.lock().unwrap();
+            if injection.kernel_omits_residual
+                && cdb[0] == 8
+                && sense.get(2).is_some_and(|key| key & 0x80 != 0)
+            {
+                injection.corrected_filemark += 1;
+                return Err(ScsiError::CheckCondition {
+                    sense: sense.clone(),
+                    bytes_transferred: buf.len() as u32,
+                });
+            }
             if injection.kernel_omits_residual
                 && cdb[0] == 8
                 && sense.get(2).is_some_and(|key| key & 15 == 8)
@@ -1261,4 +1272,32 @@ async fn oversized_append_is_refused_without_damaging_committed_data() {
     client.close(&session).await;
     client.assert_object(&object, b"safe bytes").await;
     client.state.shutdown_drive_pool().await.unwrap();
+}
+
+/// Reopen the recorded cursor under both host residual conventions.
+#[tokio::test]
+async fn committed_cursor_reopen_with_and_without_kernel_residual() {
+    for omitted in [false, true] {
+        let fixture = Harness::new(true);
+        fixture.injection.lock().unwrap().kernel_omits_residual = omitted;
+        let client = fixture.start().await;
+        let session = client.open().await;
+        let first = client
+            .append(&session, "cursor-first", b"committed prefix")
+            .await;
+        client.close(&session).await;
+        let session = client.open().await;
+        let second = client
+            .append(&session, "cursor-second", b"after cursor proof")
+            .await;
+        client.close(&session).await;
+        if omitted {
+            let injection = fixture.injection.lock().unwrap();
+            assert!(injection.corrected_filemark > 0);
+            assert!(injection.corrected_eod > 0);
+        }
+        client.assert_object(&first, b"committed prefix").await;
+        client.assert_object(&second, b"after cursor proof").await;
+        client.state.shutdown_drive_pool().await.unwrap();
+    }
 }

@@ -7,6 +7,11 @@ struct CorruptRebuildRead {
     at_target: bool,
     remaining: usize,
     corruptions: Arc<AtomicU64>,
+    world: Arc<Mutex<VirtualWorld>>,
+    cursor: u64,
+    located: u64,
+    cursor_fault: Option<&'static str>,
+    fault_armed: bool,
 }
 impl SgTransport for CorruptRebuildRead {
     fn execute_in(
@@ -14,7 +19,41 @@ impl SgTransport for CorruptRebuildRead {
         cdb: &[u8],
         buf: &mut [u8],
     ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError> {
+        if cdb[0] == 0x08
+            && self.fault_armed
+            && self.located == self.cursor - 1
+            && self.cursor_fault == Some("io")
+        {
+            return Err(remanence_library::ScsiError::Io(std::io::Error::other(
+                "cursor predecessor read failure",
+            )));
+        }
         let outcome = self.inner.execute_in(cdb, buf)?;
+        if cdb[0] == 0x08 && self.at_target && self.cursor_fault.is_some() {
+            self.fault_armed = true;
+            let mut world = self.world.lock().unwrap();
+            let records = &mut world.tapes.get_mut("RESUME001").unwrap().records;
+            match self.cursor_fault {
+                Some("data") => {
+                    records[self.cursor as usize - 1] =
+                        Record::Block(vec![0; crate::tape_image_vectors::BLOCK as usize])
+                }
+                Some("short") => records[self.cursor as usize - 1] = Record::Block(vec![0; 7]),
+                Some("missing") => records.truncate(self.cursor as usize - 1),
+                _ => {}
+            }
+        }
+        if cdb[0] == 0x34
+            && self.fault_armed
+            && self.located == self.cursor - 1
+            && u64::from_be_bytes(buf[8..16].try_into().unwrap()) == self.cursor
+        {
+            match self.cursor_fault {
+                Some("lba") => buf[8..16].copy_from_slice(&(self.cursor + 1).to_be_bytes()),
+                Some("partition") => buf[4..8].copy_from_slice(&1u32.to_be_bytes()),
+                _ => {}
+            }
+        }
         if cdb.first() == Some(&0x08) && self.at_target && self.remaining > 0 {
             assert!(outcome.bytes_transferred > 0);
             buf[0] ^= 1;
@@ -28,7 +67,8 @@ impl SgTransport for CorruptRebuildRead {
         self.inner.execute_none(cdb)?;
         match cdb[0] {
             0x92 => {
-                self.at_target = u64::from_be_bytes(cdb[4..12].try_into().unwrap()) == self.target
+                self.located = u64::from_be_bytes(cdb[4..12].try_into().unwrap());
+                self.at_target = self.located == self.target;
             }
             0x2b => {
                 self.at_target =
@@ -78,7 +118,27 @@ fn checked_closeout_fence_write_failure_preserves_mismatch_and_detail() {
 }
 
 fn check_closeout_route(terminal: bool, fence_failure: Option<FenceFailure>) {
-    let cases = if fence_failure.is_some() {
+    check_closeout_route_case(terminal, fence_failure, None);
+}
+
+/// Inject only after committed data has been read: initial admission is good.
+#[test]
+fn checked_rebuild_routes_refuse_bad_cursor_before_write() {
+    for terminal in [false, true] {
+        for fault in ["data", "short", "missing", "io", "lba", "partition"] {
+            check_closeout_route_case(terminal, None, Some(fault));
+        }
+    }
+}
+
+fn check_closeout_route_case(
+    terminal: bool,
+    fence_failure: Option<FenceFailure>,
+    cursor_fault: Option<&'static str>,
+) {
+    let cases = if cursor_fault.is_some() {
+        &[(0, false, false)][..]
+    } else if fence_failure.is_some() {
         &[(2, false, false)][..]
     } else {
         &[
@@ -171,6 +231,11 @@ fn check_closeout_route(terminal: bool, fence_failure: Option<FenceFailure>) {
             at_target: false,
             remaining: corrupt,
             corruptions: Arc::clone(&corruptions),
+            world: Arc::clone(&world),
+            cursor: original.cursor.lba,
+            located: 0,
+            cursor_fault,
+            fault_armed: false,
         };
         let mut drive = DriveHandle::open_standalone_with_transport(
             Path::new("/virtual/closeout-drive"),
@@ -243,8 +308,23 @@ fn check_closeout_route(terminal: bool, fence_failure: Option<FenceFailure>) {
             )
         };
         let successful = !refuse_memory && (corrupt < 2 || legacy);
-        if successful {
+        if cursor_fault.is_some() {
+            assert!(
+                result.is_err(),
+                "{cursor_fault:?}, terminal={terminal}: bad C admitted after read-back"
+            );
+            assert!(drive.check_append_admission().is_err());
+        } else if successful {
             let session = result.unwrap();
+            let position = drive.position().unwrap();
+            assert_eq!(
+                (position.partition, position.lba),
+                (original.cursor.partition, original.cursor.lba),
+                "checked read-back must return to C before its caller can write"
+            );
+            drive
+                .check_append_admission()
+                .expect("checked read-back must renew the cursor proof");
             let check = session.sink_state.as_ref().unwrap().commit_check();
             if legacy {
                 assert_eq!(check.1, CheckProvenance::UnverifiedRebuild);
@@ -299,7 +379,9 @@ fn check_closeout_route(terminal: bool, fence_failure: Option<FenceFailure>) {
                 "allocation refusal dispatched a drive command"
             );
         }
-        assert_eq!(world.tapes["RESUME001"].records, before);
+        if !matches!(cursor_fault, Some("data" | "short" | "missing")) {
+            assert_eq!(world.tapes["RESUME001"].records, before);
+        }
         drop(world);
         if matches!(fence_failure, Some(FenceFailure::BarcodeLookup)) {
             rusqlite::Connection::open(&cfg.index_path)
@@ -323,7 +405,7 @@ fn check_closeout_route(terminal: bool, fence_failure: Option<FenceFailure>) {
                 .as_ref()
                 .unwrap()
                 .contains("\"attempts\":2"));
-        } else {
+        } else if cursor_fault.is_none() {
             assert!(fences.is_empty());
         }
     }

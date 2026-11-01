@@ -1266,8 +1266,8 @@ mod tests {
         assert!(!wrote);
         assert_eq!(
             locates.last(),
-            Some(&append),
-            "step 4 locates the append point"
+            Some(&(append - 1)),
+            "step 4 locates the append predecessor"
         );
         let reread = locates[0];
         assert_ne!(reread, append, "resume-open re-reads committed blocks");
@@ -1289,12 +1289,12 @@ mod tests {
         assert_eq!(locates, vec![reread]);
         assert!(reads.is_empty() && !wrote);
 
-        let (result, locates, _, append, wrote) = run(Some((append, locate_timeout)));
+        let (result, locates, _, append, wrote) = run(Some((append - 1, locate_timeout)));
         assert!(
             matches!(result, Err(ParityError::TapeIo(_))),
             "a LOCATE timeout at the append point is a device failure: {result:?}"
         );
-        assert_eq!(locates.last(), Some(&append));
+        assert_eq!(locates.last(), Some(&(append - 1)));
         assert!(!wrote);
     }
 

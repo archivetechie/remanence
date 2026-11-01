@@ -5,7 +5,7 @@
 //! enter through the daemon or the in-process mounted-drive adapter.
 
 mod media;
-mod overlap;
+pub(crate) mod overlap;
 mod prepare;
 pub(crate) use capacity::uuid_text;
 pub(crate) use prepare::{write_fixed_blocks, ValidateCanonicalEntrySink};

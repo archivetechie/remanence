@@ -477,7 +477,13 @@ mod tests {
                         // Model a stop whose cost is inside the terminal READ.
                         std::thread::sleep(std::time::Duration::from_millis(10));
                     }
-                    if self.omit_kernel_residual && cdb[1] & 1 != 0 {
+                    if self.omit_kernel_residual {
+                        if cdb[1] & 1 == 0 && (sense[2] & 0x80 != 0 || sense[2] & 15 == 8) {
+                            sense[0] |= 0x80;
+                            sense[3..7].copy_from_slice(
+                                &(buf.len() as u32 - *bytes_transferred).to_be_bytes(),
+                            );
+                        }
                         *bytes_transferred = buf.len() as u32;
                     }
                 }
@@ -757,6 +763,30 @@ mod tests {
                     .count(),
                 2
             );
+        }
+    }
+
+    /// The cursor proof uses variable READ; the rate scanner uses fixed READ.
+    /// Both must classify the same sense-only boundaries on the field transport.
+    #[test]
+    fn cursor_proof_and_eod_with_and_without_kernel_residual() {
+        for omitted in [false, true] {
+            let (mut drive, world) = drive_with_policy(None, false, omitted, false, false);
+            let lba = world.lock().unwrap().tapes["TESTL9"].records.len() as u64;
+            let expected = remanence_library::TapePosition {
+                partition: 0,
+                lba,
+                beginning_of_partition: false,
+                end_of_partition: false,
+                block_position_end_of_warning: false,
+            };
+            drive
+                .prove_cursor(expected, 262144, drive.identity_generation())
+                .unwrap();
+            assert!(drive
+                .read_block(&mut vec![0; 262144])
+                .unwrap_err()
+                .is_physical_eod());
         }
     }
 
