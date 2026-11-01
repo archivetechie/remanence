@@ -151,7 +151,8 @@ pub struct DaemonConfig {
     #[serde(default = "default_append_ingress_idle_secs")]
     pub append_ingress_idle_secs: u64,
     /// Delay before a seated cartridge in an idle drive is returned home.
-    /// Zero keeps idle cartridges seated until eviction or daemon shutdown.
+    /// Zero keeps idle cartridges seated until eviction or explicit unload.
+    /// Graceful shutdown leaves cartridges seated; startup restarts the idle timer.
     #[serde(default = "default_drive_idle_unload_seconds")]
     pub drive_idle_unload_seconds: u64,
     /// Longest wait for a changer MOVE MEDIUM that failed because the library

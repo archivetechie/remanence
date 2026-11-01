@@ -541,7 +541,7 @@ impl ApiState {
         Ok(state)
     }
 
-    /// Stop readiness admission and polling before gRPC drains.
+    /// Stop drive admission, new idle dismounts, and readiness polling before gRPC drains.
     pub fn begin_shutdown(&self) {
         let _guard = self
             .operations
@@ -551,11 +551,12 @@ impl ApiState {
         self.readiness_shutdown
             .store(true, std::sync::atomic::Ordering::Release);
         if let Some(pool) = &self.drive_pool {
+            pool.begin_shutdown();
             pool.readiness_wake.notify.notify_one();
         }
     }
 
-    /// Rewind, unload, and return idle seated cartridges before daemon exit.
+    /// Close sessions and settle in-flight motion, leaving cartridges seated.
     pub async fn shutdown_drive_pool(&self) -> Result<(), Status> {
         self.begin_shutdown();
         crate::mount::shutdown_drive_pool(self).await

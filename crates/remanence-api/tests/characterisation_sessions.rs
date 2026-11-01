@@ -424,6 +424,234 @@ async fn checkpoint_and_close_report_objects_that_remain_readable_after_restart(
     }
 }
 
+/// Bind the durable close audit to the exact session, independently of RPC lookup.
+fn assert_session_closed(fixture: &Harness, session_id: &[u8]) {
+    let id = uuid::Uuid::from_slice(session_id).unwrap();
+    assert!(
+        remanence_state::FileAuditLog::replay(&fixture.config.audit.dir)
+            .unwrap()
+            .iter()
+            .any(
+                |event| event.event == remanence_state::AuditEvent::SessionClosed
+                    && event.session_id == Some(id)
+            ),
+        "session {id} has a clean-close audit"
+    );
+}
+
+/// A graceful stop checkpoints pending data without motion; a fresh owner proves
+/// the seated tape and rebuilds its partial epoch before accepting another write.
+#[tokio::test]
+async fn graceful_shutdown_restart_proves_seated_open_epoch_and_idle_unloads() {
+    for other_drive in [false, true] {
+        check_graceful_shutdown_restart(other_drive).await;
+    }
+}
+
+/// Repeat the cold-open proof on the original drive and after an offline transfer
+/// to another virtual drive, preserving the earlier OtherDrive restart coverage.
+async fn check_graceful_shutdown_restart(other_drive: bool) {
+    let mut fixture = Harness::new(true);
+    fixture.config.daemon.drive_idle_unload_seconds = 0;
+    let client = fixture.start().await;
+    let session = client.open().await;
+    let first = client
+        .append(&session, "before-stop", b"committed by shutdown")
+        .await;
+    let before = fixture.world.lock().unwrap().command_log.len();
+    client.state.shutdown_drive_pool().await.unwrap();
+    {
+        let world = fixture.world.lock().unwrap();
+        assert!(world.drive_bays[&BAY].is_some());
+        let commands = &world.command_log[before..];
+        assert!(
+            commands.iter().any(|c| c.opcode == 0x10),
+            "shutdown checkpoints the open batch"
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|c| matches!(c.opcode, 0x01 | 0x1b | 0xa5))
+                .count(),
+            0
+        );
+    }
+    let closed = client
+        .writer()
+        .get_write_session(pb::GetWriteSessionRequest {
+            session_id: session.session_id.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        closed.code(),
+        tonic::Code::NotFound,
+        "shutdown releases the session"
+    );
+    assert_session_closed(&fixture, &session.session_id);
+    let index = CatalogIndex::open(&fixture.config.index.sqlite_path).unwrap();
+    let tape = index.get_tape(&UUID).unwrap().unwrap();
+    assert!(
+        tape.highest_protected_ordinal < tape.total_committed_ordinals,
+        "shutdown leaves the partial epoch open"
+    );
+    let cursor = tape.written_extent_lba.unwrap();
+    drop(client);
+
+    let restart_bay = if other_drive {
+        // Simulate an operator transfer while the daemon is stopped. Keep the
+        // actual post-shutdown tape bytes and its recorded home slot.
+        let mut world = fixture.world.lock().unwrap();
+        let cartridge = world.drive_bays.get_mut(&BAY).unwrap().take();
+        world.drive_bays.insert(BAY + 1, cartridge);
+        world.drive_serials.insert(BAY + 1, "SECOND-DRIVE".into());
+        world.drive_source_slots.insert(BAY, None);
+        world.drive_source_slots.insert(BAY + 1, Some(0x400));
+        world.drive_states.insert(BAY + 1, Default::default());
+        world.drive_alert_flags.insert(BAY + 1, Default::default());
+        world.element_layout.drive_count = 2;
+        BAY + 1
+    } else {
+        BAY
+    };
+
+    let client = fixture.start().await;
+    fixture.injection.lock().unwrap().commands.clear();
+    let session = client.open().await;
+    {
+        let injection = fixture.injection.lock().unwrap();
+        let commands = &injection.commands;
+        let locates: Vec<_> = commands
+            .iter()
+            .filter(|c| c[0] == 0x92)
+            .map(|c| u64::from_be_bytes(c[4..12].try_into().unwrap()))
+            .collect();
+        assert!(
+            commands.iter().any(|c| c[0] == 0x01) || locates.contains(&0),
+            "BOT identity positioning"
+        );
+        assert!(
+            commands.iter().any(|c| c[0] == 0x08),
+            "identity and committed epoch readback"
+        );
+        assert!(
+            locates.contains(&(cursor - 1)),
+            "predecessor filemark proof at C-1: {locates:?}"
+        );
+        assert!(commands.iter().any(|c| c[0] == 0x34), "READ POSITION proof");
+        assert!(
+            locates.contains(&2),
+            "cold open reads the committed Object range"
+        );
+        assert_eq!(locates.last(), Some(&(cursor - 1)));
+        let last_locate = commands.iter().rposition(|c| c[0] == 0x92).unwrap();
+        assert_eq!(
+            commands[last_locate..]
+                .iter()
+                .map(|c| c[0])
+                .take(4)
+                .collect::<Vec<_>>(),
+            vec![0x92, 0x34, 0x08, 0x34],
+            "after rebuild, read the predecessor filemark and prove position C before append"
+        );
+        assert!(
+            !commands.iter().any(|c| matches!(c[0], 0x0a | 0x10)),
+            "open rebuild writes no media"
+        );
+    }
+    let second = client
+        .append(&session, "after-stop", b"after checked rebuild")
+        .await;
+    client.close(&session).await;
+    client.assert_object(&first, b"committed by shutdown").await;
+    client
+        .assert_object(&second, b"after checked rebuild")
+        .await;
+    let before = fixture.world.lock().unwrap().command_log.len();
+    client.state.shutdown_drive_pool().await.unwrap();
+    assert_eq!(
+        fixture.world.lock().unwrap().command_log.len(),
+        before,
+        "idle shutdown sends no commands"
+    );
+    drop(client);
+
+    // Startup itself schedules the normal idle timer for the still-seated tape.
+    fixture.config.daemon.drive_idle_unload_seconds = 1;
+    let started = Instant::now();
+    let client = fixture.start().await;
+    assert!(fixture.world.lock().unwrap().drive_bays[&restart_bay].is_some());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fixture.world.lock().unwrap().drive_bays[&restart_bay].is_some() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("startup seated cartridge returns home on the idle schedule");
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    assert_eq!(
+        fixture
+            .world
+            .lock()
+            .unwrap()
+            .slots
+            .iter()
+            .find(|s| s.address == 0x400)
+            .unwrap()
+            .barcode
+            .as_deref(),
+        Some(BARCODE)
+    );
+    client.state.shutdown_drive_pool().await.unwrap();
+}
+
+/// Read sessions also close cleanly at shutdown and leave their cartridge seated.
+#[tokio::test]
+async fn graceful_shutdown_closes_read_session_without_motion() {
+    let fixture = Harness::new(false);
+    let client = fixture.start().await;
+    let session = client.open().await;
+    client
+        .append(&session, "readable", b"read session shutdown")
+        .await;
+    client.close(&session).await;
+    let mut reader =
+        pb::read_session_service_client::ReadSessionServiceClient::new(client.channel.clone());
+    let read = reader
+        .open_read_session(pb::OpenReadSessionRequest {
+            target: Some(pb::open_read_session_request::Target::TapeTarget(
+                tape_target("archive"),
+            )),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let before = fixture.world.lock().unwrap().command_log.len();
+    client.state.shutdown_drive_pool().await.unwrap();
+    let closed = reader
+        .get_read_session(pb::GetReadSessionRequest {
+            session_id: read.session_id.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        closed.code(),
+        tonic::Code::NotFound,
+        "shutdown releases the read session"
+    );
+    assert_session_closed(&fixture, &read.session_id);
+    let world = fixture.world.lock().unwrap();
+    assert!(world.drive_bays[&BAY].is_some());
+    assert_eq!(
+        world.command_log[before..]
+            .iter()
+            .filter(|c| matches!(c.opcode, 0x01 | 0x1b | 0xa5))
+            .count(),
+        0
+    );
+}
+
 #[tokio::test]
 async fn later_session_preserves_earlier_objects() {
     let fixture = Harness::new(true);
@@ -519,6 +747,7 @@ struct Injection {
     corrected_filemark: usize,
     lose_write_reply: bool,
     lost_write_replies: usize,
+    commands: Vec<Vec<u8>>,
 }
 struct Transport {
     inner: ModelTransport,
@@ -528,6 +757,9 @@ struct Transport {
 impl Transport {
     fn before(&self, cdb: &[u8]) -> Result<(), ScsiError> {
         let mut injection = self.injection.lock().unwrap();
+        if matches!(self.role, DeviceRole::Drive { .. }) {
+            injection.commands.push(cdb.to_vec());
+        }
         if matches!(self.role, DeviceRole::Drive { .. })
             && injection
                 .waiting_until
@@ -717,6 +949,11 @@ async fn first_load_optimisation_and_subsequent_load_wait_without_data_commands(
         }
         client.close(&session).await;
         client.state.shutdown_drive_pool().await.unwrap();
+        drop(client);
+        fixture
+            .library_handle()
+            .unload(BAY, Some(0x400), &StaticAllowlist::new([LIBRARY]))
+            .unwrap();
     }
 }
 

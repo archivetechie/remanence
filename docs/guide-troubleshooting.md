@@ -341,17 +341,25 @@ Readiness waits (daemon readiness operations, startup reconciliation, `rem
 tape wait-ready --wait`) send one SSC LOAD when changer inventory shows the
 cartridge in the drive. They record the attempt in the operation before the
 LOAD and send no second one until the drive has reported ready, also across
-a restart. The daemon finishes every dismount it starts before it exits on
-SIGTERM, SIGINT or SIGHUP, so give a stopping daemon time for a rewind, an
-unload and a move before any hard kill. Epoch closing never prevents removal.
-When shutdown finds the head away from the last write EOD, it dismounts and
-logs and audits `epoch_left_open` with the committed range `[W,T)`. The next
-append rebuilds that range before writing. A close fences the tape only when
-the tape contradicts committed state or an append has uncertain durability.
-Transient failures log and audit `epoch_left_open` without a fence, and removal
-proceeds. A durable journal commit stays closed when SQLite projection fails;
-startup replay projects it. A tape outside write admission skips the close with
-a log entry.
+a restart. On SIGTERM, SIGINT or SIGHUP, the daemon stops admission, checkpoints
+and closes open sessions, and leaves cartridges seated. It initiates no rewind,
+unload or changer move, but finishes an UNLOAD/MOVE already in flight. The service
+manager's stop timeout must cover this work and closing every open session, plus
+a margin. Migration B6 will add `daemon.shutdown_close_deadline_secs`; the timeout
+must then exceed that configured deadline plus a margin and allow existing motion
+to settle. The deadline setting is not yet available.
+
+A seated cartridge can retain an open parity epoch across shutdown. At first use
+after startup, the daemon proves identity and the committed append cursor and
+rebuilds the epoch with the checked kernel. `drive_idle_unload_seconds` returns
+idle cartridges to their recorded source slots on its normal schedule; `0`
+disables that timer. Use `rem drive unload --library <serial> --bay <bay>` before
+stopping the daemon when cartridges must be returned home.
+
+Ordinary removal still attempts epoch closing. Contradictions with committed state
+or uncertain append durability fence the tape. Transient close failures record
+`epoch_left_open` without a fence, and removal proceeds. A durable journal commit
+stays closed when SQLite projection fails; startup replay projects it.
 
 When that LOAD fails, was already spent, or is never sent because changer
 inventory does not show the cartridge in the drive, the fence stays. The

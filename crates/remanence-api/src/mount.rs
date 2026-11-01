@@ -2210,7 +2210,6 @@ async fn drive_unload(
 enum DismountReason {
     Evicted,
     IdleTimeout,
-    Shutdown,
 }
 
 const SHUTDOWN_RESERVATION_WAIT: Duration = Duration::from_secs(600);
@@ -2220,14 +2219,13 @@ impl DismountReason {
         match self {
             Self::Evicted => "evicted",
             Self::IdleTimeout => "idle_timeout",
-            Self::Shutdown => "shutdown",
         }
     }
 }
 
 /// Perform the one canonical rewind/unload/move-home tail while the caller
-/// holds the bay reservation. Session close only parks the cartridge; eviction,
-/// idle expiry, and shutdown all converge here.
+/// holds the bay reservation. Session close only parks the cartridge; eviction
+/// and idle expiry converge here. Shutdown starts no new dismounts.
 ///
 /// The SSC UNLOAD and the changer move form one unit with respect to
 /// shutdown. A cartridge unloaded but never moved stays unthreaded in the
@@ -2240,13 +2238,8 @@ impl DismountReason {
 ///   disconnects) cannot separate the UNLOAD from the move, and no other
 ///   operation can reserve the bay until the move has finished.
 /// - An idle or eviction dismount does not start its UNLOAD once shutdown
-///   has begun; the shutdown pass dismounts that cartridge instead. The check
-///   runs under the reservation: either the UNLOAD starts before shutdown
-///   begins, and the shutdown pass waits for the reservation the task
-///   releases only after the move, or the UNLOAD never starts.
-/// - The shutdown pass takes each bay reservation before its own UNLOAD and
-///   awaits the move before it moves on, and the daemon serves until that
-///   pass returns, so a graceful stop never exits between the two commands.
+///   has begun. Shutdown waits for the reservation the task releases only
+///   after the move, so a graceful stop never exits between the two commands.
 ///
 /// A hard kill between commands can leave a cartridge unthreaded. After a failed
 /// move, fresh element status determines whether it remains in the drive.
@@ -2262,7 +2255,6 @@ async fn dismount_reserved_cartridge(
 ) -> Result<crate::write_owner::DriveReservation, Status> {
     let holder_kind = match reason {
         DismountReason::Evicted => "eviction_dismount",
-        DismountReason::Shutdown => "shutdown_dismount",
         DismountReason::IdleTimeout => "parked_dismount",
     };
     pool.set_internal_holder(&seated.drive_key(), None, holder_kind);
@@ -2287,9 +2279,9 @@ async fn dismount_pair(
     seated: &crate::write_owner::SeatedCartridge,
     reason: DismountReason,
 ) -> Result<(), Status> {
-    if reason != DismountReason::Shutdown && pool.is_shutting_down() {
+    if pool.is_shutting_down() {
         return Err(Status::unavailable(format!(
-            "daemon shutdown began before the {} dismount of drive bay 0x{:04x} started its unload; the shutdown pass dismounts it",
+            "daemon shutdown began before the {} dismount of drive bay 0x{:04x} started its unload; the cartridge stays seated",
             reason.as_str(),
             seated.bay
         )));
@@ -2602,6 +2594,7 @@ pub(crate) fn register_startup_seated_cartridges(
     }
 }
 
+/// Stop admission, close sessions, and settle existing motion while leaving media seated.
 pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> {
     state.begin_shutdown();
     let Ok(pool) = state.drive_pool() else {
@@ -2665,8 +2658,26 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
                 if err.code() == tonic::Code::FailedPrecondition
                     && err.message() == "active session is a read session" =>
             {
-                // Read sessions have no checkpoint barrier and remain handled by
-                // the existing open-session shutdown diagnostic below.
+                let (reply, received) = oneshot::channel();
+                if drive
+                    .send(crate::write_owner::DriveCommand::CloseRead { session_id, reply })
+                    .await
+                    .is_err()
+                {
+                    failures.push(format!(
+                        "session {session_id}: drive actor unavailable for shutdown read close"
+                    ));
+                    continue;
+                }
+                match received.await {
+                    Ok(Ok(_)) => finish_mounted_session(state, pool, session_id, mounted),
+                    Ok(Err(err)) => failures.push(format!(
+                        "session {session_id}: shutdown read close failed: {err}"
+                    )),
+                    Err(_) => failures.push(format!(
+                        "session {session_id}: drive actor dropped shutdown read close reply"
+                    )),
+                }
             }
             Ok(Err(err)) => failures.push(format!(
                 "session {session_id}: shutdown checkpoint failed: {err}"
@@ -2682,7 +2693,7 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
             bay,
         } = &drive_key
         else {
-            continue; // Daemon changer actors only dismount library endpoints.
+            continue; // Standalone endpoints have no daemon changer motion to settle.
         };
         let reservation_wait_started = Instant::now();
         let reservation = loop {
@@ -2709,83 +2720,16 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
         let Some(reservation) = reservation else {
             continue;
         };
-        let current = state.current_library_snapshot().and_then(|snapshot| {
-            snapshot
-                .report
-                .libraries
-                .iter()
-                .find(|library| library.serial == *library_serial)
-                .and_then(|library| {
-                    library
-                        .drive_bays
-                        .iter()
-                        .find(|candidate| candidate.element_address == *bay)
-                        .cloned()
-                })
-        });
-        let Some(current) = current else {
-            failures.push(format!(
-                "{} bay 0x{:04x}: missing from shutdown inventory",
-                *library_serial, *bay
-            ));
-            drop(reservation);
-            continue;
-        };
-        let Some(home_slot) = current.source_slot.filter(|_| current.loaded) else {
-            drop(reservation);
-            continue;
-        };
-        let parked = pool.parked_at(&drive_key);
-        let seated = crate::write_owner::SeatedCartridge {
-            bay: *bay,
-            library_serial: library_serial.clone(),
-            barcode: current.loaded_tape,
-            home_slot,
-            tape_uuid: parked.as_ref().and_then(|parked| parked.seated.tape_uuid),
-            prior_session_id: parked
-                .as_ref()
-                .and_then(|parked| parked.seated.prior_session_id),
-        };
-        // A fenced cartridge is left alone: it stays seated, and the fence names it.
-        let fenced = state.index().and_then(|index| {
-            index
-                .tape_io_is_fenced(
-                    seated.tape_uuid.as_ref(),
-                    seated.barcode.as_deref(),
-                    Some(&drive_key),
-                )
-                .map_err(crate::status_from_state_error)
-        });
-        match fenced {
-            Ok(false) => {}
-            Ok(true) => {
-                tracing::warn!(
-                    library = %library_serial,
-                    bay = *bay,
-                    barcode = ?seated.barcode,
-                    "fenced cartridge stays seated at shutdown; release the fence to unload it"
-                );
-                drop(reservation);
-                continue;
-            }
-            Err(err) => {
-                failures.push(format!("{} bay 0x{:04x}: {err}", *library_serial, *bay));
-                drop(reservation);
-                continue;
-            }
-        }
-        if let Err(err) =
-            dismount_reserved_cartridge(state, pool, &seated, DismountReason::Shutdown, reservation)
-                .await
-        {
-            failures.push(format!("{} bay 0x{:04x}: {err}", *library_serial, *bay));
-        }
+        // Wait for existing work (including UNLOAD then MOVE) to release its
+        // reservation. Acquiring it here issues no drive or changer commands.
+        drop(reservation);
     }
+
     if failures.is_empty() {
         Ok(())
     } else {
         Err(Status::internal(format!(
-            "daemon shutdown could not unload every seated cartridge: {}",
+            "daemon shutdown could not close every session or settle in-flight work: {}",
             failures.join("; ")
         )))
     }
@@ -4664,18 +4608,18 @@ mod tests {
 
     /// A physical unload failure prevents unsafe changer motion.
     #[tokio::test]
-    async fn shutdown_physical_unload_failure_keeps_cartridge_out_of_the_changer_queue() {
+    async fn physical_unload_failure_keeps_cartridge_out_of_the_changer_queue() {
         let mut harness = dismount_harness(0);
         let pool = harness.pool.clone();
         let seated = harness.seated.clone();
         let task =
             tokio::spawn(
-                async move { dismount_pair(&pool, &seated, DismountReason::Shutdown).await },
+                async move { dismount_pair(&pool, &seated, DismountReason::Evicted).await },
             );
         let Some(crate::write_owner::DriveCommand::Unload { reply }) =
             harness.drive_rx.recv().await
         else {
-            panic!("shutdown starts at the drive actor");
+            panic!("dismount starts at the drive actor");
         };
         reply
             .send(Err(Status::unavailable("physical unload fails")))
@@ -4730,20 +4674,18 @@ mod tests {
         .expect("renewed timer dispatches once");
     }
 
+    /// Shutdown leaves an idle cartridge and dispatches no actor command.
     #[tokio::test]
-    async fn daemon_shutdown_dispatches_the_canonical_dismount_tail() {
-        let harness = dismount_harness(0);
+    async fn daemon_shutdown_leaves_idle_cartridge_seated_without_motion() {
+        let mut harness = dismount_harness(0);
         let parked = harness.pool.park_cartridge(harness.seated.clone());
-        let responder = tokio::spawn(reply_to_dismount_commands(
-            harness.drive_rx,
-            harness.changer_rx,
-        ));
         tokio::time::timeout(Duration::from_secs(2), shutdown_drive_pool(&harness.state))
             .await
             .expect("shutdown must not hang")
-            .expect("shutdown dismount succeeds");
-        responder.await.expect("mock actors join");
-        assert!(!harness.pool.parked_is_current(&parked));
+            .expect("shutdown succeeds");
+        assert!(harness.pool.parked_is_current(&parked));
+        assert!(harness.drive_rx.try_recv().is_err());
+        assert!(harness.changer_rx.try_recv().is_err());
     }
 
     /// A refused changer move names the tape without claiming its location.
@@ -4762,7 +4704,7 @@ mod tests {
                 &state,
                 &pool,
                 &seated,
-                DismountReason::Shutdown,
+                DismountReason::Evicted,
                 reservation,
             )
             .await
@@ -4832,7 +4774,7 @@ mod tests {
                 .pool
                 .reserve_drive(&drive_key)
                 .expect("reserve idle bay");
-            harness.pool.begin_shutdown();
+            harness.state.begin_shutdown();
 
             let err = tokio::time::timeout(
                 Duration::from_secs(1),
@@ -6362,8 +6304,18 @@ mod tests {
         else {
             panic!("retry finalize open");
         };
-        state.begin_shutdown();
-        // Let discovery observe shutdown before the test starts another attempt.
+        // Stop only the readiness discovery worker; this fixture continues
+        // admitting manual-finalization retries and has not shut down the pool.
+        state
+            .readiness_shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        state
+            .drive_pool()
+            .unwrap()
+            .readiness_wake
+            .notify
+            .notify_one();
+        // Let discovery observe its stop signal before another attempt.
         for _ in 0..10 {
             tokio::task::yield_now().await;
         }

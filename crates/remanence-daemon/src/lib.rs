@@ -222,9 +222,9 @@ pub async fn serve(
 
     if let Err(err) = state.shutdown_drive_pool().await {
         let message = match result {
-            Ok(()) => format!("drive-pool shutdown dismount failed: {err}"),
+            Ok(()) => format!("drive-pool shutdown failed: {err}"),
             Err(server_err) => {
-                format!("server failed: {server_err}; drive-pool shutdown dismount failed: {err}")
+                format!("server failed: {server_err}; drive-pool shutdown failed: {err}")
             }
         };
         result = Err(Box::new(io::Error::other(message)));

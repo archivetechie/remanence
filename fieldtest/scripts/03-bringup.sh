@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="03-bringup"
-# Allow a far-positioned cartridge to unthread and return to its slot.
+# Allow in-flight work and every session checkpoint/close to finish after SIGTERM.
 DAEMON_STOP_TIMEOUT_SECONDS="${REMFIELD_STOP_TIMEOUT_SECONDS:-360}"
 # shellcheck disable=SC1091
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
@@ -66,6 +66,52 @@ is_socket_live() {
   [[ $rc -eq 0 ]]
 }
 
+# Return only allowlisted media in the selected library while the daemon owns it.
+# Each CLI unload waits for the operation and uses its recorded source slot.
+unload_allowlisted_before_stop() {
+  local serial inventory loaded bay barcode evidence
+  if ! serial="$(fieldtest_selected_library_serial)" || [[ -z "$serial" ]]; then
+    fieldtest_evidence_record "$SCRIPT_NAME" stop-inventory WARN "cannot return cartridges: selected library is unavailable"
+    return
+  fi
+  inventory="$(fieldtest_artifact_path "$SCRIPT_NAME" stop-inventory "$(fieldtest_timestamp_id)")"
+  if ! fieldtest_capture_json "$inventory" "$(fieldtest_rem_bin)" top --endpoint "$(fieldtest_rem_endpoint)" --once --json; then
+    fieldtest_evidence_record "$SCRIPT_NAME" stop-inventory WARN "cannot inspect seated cartridges in library $serial before stopping" "$inventory"
+    return
+  fi
+  if ! loaded="$(python3 - "$inventory" "$serial" <<'PYLOAD'
+import json, sys
+from pathlib import Path
+payload = json.loads(Path(sys.argv[1]).read_text())
+libraries = [lib for lib in payload["libraries"]
+             if (lib.get("library") or {}).get("library_serial") == sys.argv[2]]
+if len(libraries) != 1:
+    raise SystemExit("selected library absent or ambiguous in live status")
+for drive in libraries[0]["drives"]:
+    barcode = drive.get("loaded_tape_barcode")
+    if not barcode:
+        continue  # An unidentified cartridge cannot pass the allowlist.
+    bay = drive["element_address"]
+    if not isinstance(bay, int) or not 0 < bay <= 65535 or any(c.isspace() for c in barcode):
+        raise SystemExit("invalid bay or barcode in live status")
+    print(f"{bay}\t{barcode}")
+PYLOAD
+)"; then
+    fieldtest_evidence_record "$SCRIPT_NAME" stop-inventory WARN "cannot parse seated cartridges in library $serial; no unload attempted" "$inventory"
+    return
+  fi
+  while IFS=$'\t' read -r bay barcode; do
+    [[ -n "$bay" ]] || continue
+    fieldtest_require_allowlisted "$barcode" || continue
+    evidence="$(fieldtest_artifact_path "$SCRIPT_NAME" "stop-unload-$bay" "$(fieldtest_timestamp_id)")"
+    if fieldtest_capture_text "$evidence" "$(fieldtest_rem_bin)" drive unload --endpoint "$(fieldtest_rem_endpoint)" --library "$serial" --bay "$bay"; then
+      fieldtest_evidence_record "$SCRIPT_NAME" "stop-unload-$bay" PASS "returned $barcode from library $serial bay $bay to its recorded source slot" "$evidence"
+    else
+      fieldtest_evidence_record "$SCRIPT_NAME" "stop-unload-$bay" WARN "unload failed for $barcode in library $serial bay $bay; inspect its placement" "$evidence"
+    fi
+  done <<<"$loaded"
+}
+
 main() {
   case "${1:-}" in
     --help|-h)
@@ -80,10 +126,15 @@ main() {
         printf '%s\n' "REMFIELD_STOP_TIMEOUT_SECONDS must be a non-negative integer" >&2
         exit 1
       fi
-      started=$SECONDS
-      # Send SIGTERM once, then allow up to 360 seconds for SSC UNLOAD and
-      # the changer move. Keep tmux alive so shutdown diagnostics reach the log.
+      # Unload through the live daemon before SIGTERM. The daemon itself leaves
+      # seated cartridges alone. Keep tmux alive for all operation diagnostics.
       pid="$(pgrep -f "rem-daemon --config $(fieldtest_config_path)" | head -1 || true)"
+      if [[ -n "$pid" ]]; then
+        unload_allowlisted_before_stop
+      fi
+      # An unload can take minutes; resolve the process again before signalling.
+      pid="$(pgrep -f "rem-daemon --config $(fieldtest_config_path)" | head -1 || true)"
+      started=$SECONDS
       if [[ -n "$pid" ]]; then
         kill "$pid" 2>/dev/null || true
       fi

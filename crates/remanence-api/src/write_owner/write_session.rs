@@ -2286,9 +2286,6 @@ pub(super) fn handle_drive_open_write(
                     })
                     .unwrap_or(0);
                 *retained = Some(super::checkpoint::RetainedParityEpoch {
-                    head_at_eod: drive
-                        .known_position()
-                        .is_some_and(|p| p.partition == 0 && p.lba == state.used_tape_blocks()),
                     identity_generation: drive.identity_generation(),
                     parked_generation,
                     state,
@@ -2355,10 +2352,6 @@ pub(super) fn handle_drive_open_write(
                     (parity.sink_state.take(), parity.retention.take())
                 {
                     *retained = Some(super::checkpoint::RetainedParityEpoch {
-                        head_at_eod: session_state
-                            .drive
-                            .known_position()
-                            .is_some_and(|p| p.partition == 0 && p.lba == state.used_tape_blocks()),
                         state,
                         permit,
                         selected: session_state.selected.clone(),
@@ -2408,10 +2401,6 @@ pub(super) fn handle_drive_open_write(
                         );
                     }
                 }
-                let head_at_eod = session_state
-                    .durable_checkpoint_records
-                    .last()
-                    .is_some_and(|checkpoint| checkpoint.cursor.lba == state.used_tape_blocks());
                 *retained = Some(super::checkpoint::RetainedParityEpoch {
                     state,
                     permit,
@@ -2421,7 +2410,6 @@ pub(super) fn handle_drive_open_write(
                         .get(&key)
                         .map_or(0, |parked| parked.generation),
                     identity_generation: session_state.drive.identity_generation(),
-                    head_at_eod,
                 });
             }
         }

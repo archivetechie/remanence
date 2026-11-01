@@ -386,21 +386,6 @@ pub(super) fn drive_loop(
             }
             _ => {}
         }
-        if matches!(
-            &cmd,
-            DriveCommand::OpenWrite { .. }
-                | DriveCommand::OpenRead { .. }
-                | DriveCommand::TapeInventory { .. }
-                | DriveCommand::VerifyTapeIndex { .. }
-                | DriveCommand::WaitReady { .. }
-                | DriveCommand::FinalizeTape { .. }
-                | DriveCommand::SupersedeTail { .. }
-                | DriveCommand::PlanFinalization { .. }
-        ) {
-            if let Some(epoch) = retained.as_mut() {
-                epoch.head_at_eod = false;
-            }
-        }
         match cmd {
             DriveCommand::OpenMountedWrite {
                 host_only_recovery,

@@ -3072,7 +3072,6 @@ pub(super) fn plan_mounted_epoch_finalization(
                 selected,
                 parked_generation,
                 identity_generation: drive.identity_generation(),
-                head_at_eod: false,
             });
         }
         Ok(plan)

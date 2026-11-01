@@ -79,7 +79,6 @@ pub(super) struct RetainedParityEpoch {
     /// Zero denotes a seated cartridge without a known home slot.
     pub(super) parked_generation: u64,
     pub(super) identity_generation: u64,
-    pub(super) head_at_eod: bool,
 }
 
 /// Reserve parity shards, their vector headers, the codec matrix and a full epoch's CRCs.
@@ -1804,10 +1803,6 @@ pub(super) fn close_retained_reporting(
     let mut outcome = RemovalClose::Done;
     // No failure can use the catalog's epoch range until authority projection succeeds.
     let mut projection_failed = true;
-    let shutdown = cfg
-        .lifecycle
-        .as_ref()
-        .is_some_and(|l| l.shutting_down.load(Ordering::SeqCst));
     let result = (|| -> Result<(), Status> {
         let tape = if let Some(mounted) = cfg.mounted() {
             index
@@ -1980,33 +1975,6 @@ pub(super) fn close_retained_reporting(
                         })
                 })
             });
-        if shutdown
-            && !epoch.as_ref().is_some_and(|e| {
-                parked_matches
-                    && e.head_at_eod
-                    && e.identity_generation == drive.identity_generation()
-                    && drive
-                        .known_position()
-                        .is_some_and(|p| p.partition == 0 && p.lba == e.state.used_tape_blocks())
-            })
-        {
-            let (w, t) = open_range.expect("open tape range");
-            tracing::warn!(tape_uuid = %Uuid::from_bytes(tape_uuid), open_epoch_start = w, open_epoch_end = t,
-                "epoch_left_open: shutdown dismounts after positioning; the next append rebuilds the epoch");
-            audit_removal_epoch(
-                index,
-                cfg,
-                bay,
-                Some(tape_uuid),
-                "epoch_left_open",
-                format!("shutdown cannot prove the head is at EOD; [{w},{t})"),
-                Some((w, t)),
-            );
-            outcome = RemovalClose::NotAttempted(format!(
-                "shutdown cannot prove the head is at EOD; [{w},{t})"
-            ));
-            return Ok(());
-        }
         let config = drive
             .read_config()
             .map_err(|e| Status::unavailable(e.to_string()))?;
@@ -2027,33 +1995,31 @@ pub(super) fn close_retained_reporting(
                 );
                 error
             })?;
-            if !shutdown {
-                super::write_session::prepare_drive_for_write_observing_identity(
-                    drive,
-                    &tape_uuid,
-                    block_size,
-                    Uuid::new_v4(),
-                    super::write_session::WriteMediaPolicy::RewritableObject,
-                    |error| {
-                        let contradiction = match error {
-                            crate::pool_write::TapeIdentityError::Mismatch { .. }
-                            | crate::pool_write::TapeIdentityError::AbsentBootstrap(_) => true,
-                            crate::pool_write::TapeIdentityError::Io(error) => {
-                                committed_io_contradiction(error, block_size, 1)
-                            }
-                        };
-                        if contradiction {
-                            fence_open_epoch(
-                                index,
-                                cfg,
-                                tape_uuid,
-                                open_range.expect("open tape range"),
-                                &Status::failed_precondition(error.to_string()),
-                            );
+            super::write_session::prepare_drive_for_write_observing_identity(
+                drive,
+                &tape_uuid,
+                block_size,
+                Uuid::new_v4(),
+                super::write_session::WriteMediaPolicy::RewritableObject,
+                |error| {
+                    let contradiction = match error {
+                        crate::pool_write::TapeIdentityError::Mismatch { .. }
+                        | crate::pool_write::TapeIdentityError::AbsentBootstrap(_) => true,
+                        crate::pool_write::TapeIdentityError::Io(error) => {
+                            committed_io_contradiction(error, block_size, 1)
                         }
-                    },
-                )?;
-            }
+                    };
+                    if contradiction {
+                        fence_open_epoch(
+                            index,
+                            cfg,
+                            tape_uuid,
+                            open_range.expect("open tape range"),
+                            &Status::failed_precondition(error.to_string()),
+                        );
+                    }
+                },
+            )?;
             let context = crate::append_admission::context(
                 tape_uuid,
                 block_size,
@@ -2090,11 +2056,6 @@ pub(super) fn close_retained_reporting(
                     && e.state.matches_committed_summary(&authority.summary)
                     && e.state.used_tape_blocks() == last.cursor.lba
             });
-            if shutdown && carried.is_none() {
-                return Err(Status::failed_precondition(
-                    "shutdown retained epoch does not match checkpoint summary",
-                ));
-            }
             if let Some(progress) = progress {
                 progress.publish_state(pb::OperationState::Running, &[("phase", "epoch_close")]);
             }

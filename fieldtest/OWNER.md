@@ -60,8 +60,11 @@ The window stays open after the run, so you can read the result. The run log is
 
 To stop early, press `Ctrl-c` in the tmux window, or send TERM to the `run.sh` process.
 Either way the current leg stops. If something failed, run.sh captures read-only
-diagnostics. It then returns the allowlisted cartridges to their slots, stops the
-daemon and packs the evidence. A finished run prints a PASS/FAIL table, the evidence
+diagnostics. Its `03-bringup.sh --stop` teardown asks the live daemon to unload
+each allowlisted cartridge seated in the selected library to its recorded source
+slot, then stops the daemon and packs the evidence. Each unload has an evidence
+record; a failed unload is a WARN naming the bay. Cartridges outside the allowlist
+are left alone. Graceful daemon shutdown itself leaves cartridges seated. A finished run prints a PASS/FAIL table, the evidence
 pack's path and its sha256.
 
 ### The magazine plan (you at the library)
