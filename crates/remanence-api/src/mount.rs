@@ -3678,13 +3678,13 @@ mod tests {
         DriveBay, ElementLayout, IdentitySource, IePort, InstalledDrive, Slot,
     };
     use remanence_parity::{
-        CommittedBundle, CommittedBundleKind, ParityConfig, TapeFileEntry, TapeFileKind,
+        FileRowsKind, FileRowsReport, ParityConfig, TapeFileEntry, TapeFileKind,
     };
     use remanence_state::{
-        CheckpointJournalRecord, CheckpointObjectProjection,
-        CheckpointObjectRecoveryRepresentation, CheckpointObjectRecoveryRow,
-        NativeObjectCopyProjectionInput, NativeObjectProjectionInput, PoolSelectionPolicyName,
-        ProvisionTapeInput, TapeJournalIndexInput, TapePoolConfig, TapePoolProjectionInput,
+        CommitFixture, NativeObjectCopyProjectionInput, NativeObjectProjectionInput,
+        ObjectProjectionFixture, ObjectRecoveryFixture, ObjectRecoveryFixtureRepresentation,
+        PoolSelectionPolicyName, ProvisionTapeInput, TapeJournalIndexInput, TapePoolConfig,
+        TapePoolProjectionInput,
     };
     use std::path::{Path, PathBuf};
 
@@ -3735,8 +3735,8 @@ mod tests {
                     scheme: None,
                     journal_offset_bytes: 0,
                 },
-                &CommittedBundle {
-                    kind: CommittedBundleKind::Object,
+                &FileRowsReport {
+                    kind: FileRowsKind::Object,
                     entries: vec![TapeFileEntry {
                         tape_file_number: 1,
                         kind: TapeFileKind::Object,
@@ -5183,9 +5183,9 @@ mod tests {
 
     /// Build the smallest ordinary checkpoint authority that can be closed by
     /// the asynchronous manual-finalization admission path.
-    fn manual_finalize_checkpoint(tape_uuid: TapeUuid, block_size: u32) -> CheckpointJournalRecord {
+    fn manual_finalize_checkpoint(tape_uuid: TapeUuid, block_size: u32) -> CommitFixture {
         let object_id = Uuid::from_u128(0xA501).to_string();
-        CheckpointJournalRecord {
+        CommitFixture {
             ordinal: 1,
             committed_object_count: 1,
             eod_partition: 0,
@@ -5194,7 +5194,7 @@ mod tests {
             batch_id: *Uuid::from_u128(0xA502).as_bytes(),
             next_tape_file_number: 2,
             block_size,
-            objects: vec![CheckpointObjectProjection {
+            objects: vec![ObjectProjectionFixture {
                 object: NativeObjectProjectionInput {
                     object_id: object_id.clone(),
                     caller_object_id: Some("async-finalize-object".to_string()),
@@ -5223,11 +5223,11 @@ mod tests {
                 block_count: 3,
                 fresh_tape: true,
                 total_committed_ordinals: 3,
-                object_recovery_row: CheckpointObjectRecoveryRow {
+                object_recovery_row: ObjectRecoveryFixture {
                     tape_file_number: 1,
                     stored_block_count: 3,
                     object_id: object_id.into_bytes(),
-                    representation: CheckpointObjectRecoveryRepresentation::Plaintext {
+                    representation: ObjectRecoveryFixtureRepresentation::Plaintext {
                         manifest_first_chunk_lba: 1,
                         manifest_size_bytes: 1,
                         manifest_chunk_count: 1,

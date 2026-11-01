@@ -1052,13 +1052,9 @@ impl OperatorMount<'_> {
             let snapshot = journal.freeze().map_err(refusal)?;
             let summary =
                 remanence_parity::checked_bounded_resume_summary(&snapshot).map_err(refusal)?;
-            crate::pool_write::validate_parity_resume_checkpoint_authority(
-                &lease,
-                &journal,
-                false,
-                summary.committed_tape_file_count,
-            )
-            .map_err(|e| refusal(format!("import journal authority: {e:?}")))?;
+            lease
+                .validate_resume_rows(&journal, false, summary.committed_tape_file_count)
+                .map_err(|e| refusal(format!("import journal authority: {e:?}")))?;
         } else {
             remanence_state::TerminalIndexSource::new_replay_backed_no_parity(&lease)
                 .map_err(refusal)?;

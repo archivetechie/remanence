@@ -649,6 +649,15 @@ impl TapeAuthorityLease {
             uuid,
         }))
     }
+    /// Borrow native structural proof for a fixture with already bound geometry.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn fixture_structural(&self) -> StructuralCapability {
+        Box::new(Structural {
+            core: Arc::downgrade(&self.core),
+            read_cache: Arc::downgrade(&self.read_cache),
+            uuid: self.uuid,
+        })
+    }
     /// Validate a retained structural cursor against this single authority.
     pub fn validate_resume_rows(
         &self,
@@ -1995,8 +2004,8 @@ mod additional_tests;
 // writes use the selected per-tape backend. These are not legacy disk readers.
 #[cfg(any(test, feature = "fixtures"))]
 use crate::{
-    CheckpointJournalRecord, CheckpointTerminalRecoveryAuthority, TerminalFinalizationIntent,
-    TerminalFinalizationProgress,
+    CommitFixture, TerminalFinalizationIntent, TerminalFinalizationProgress,
+    TerminalRecoveryFixture,
 };
 #[cfg(any(test, feature = "fixtures"))]
 impl TapeAuthorityLease {
@@ -2004,13 +2013,13 @@ impl TapeAuthorityLease {
     #[cfg(any(test, feature = "fixtures"))]
     pub fn for_each_record_bounded(
         &self,
-        mut visitor: impl FnMut(&CheckpointJournalRecord) -> Result<(), StateError>,
+        mut visitor: impl FnMut(&CommitFixture) -> Result<(), StateError>,
     ) -> Result<CheckpointBoundedReplayMetrics, StateError> {
         self.visit_commits(&mut |commit| visitor(&commit.into()))
     }
     /// Last record bounded through the selected authority implementation.
     #[cfg(any(test, feature = "fixtures"))]
-    pub fn last_record_bounded(&self) -> Result<Option<CheckpointJournalRecord>, StateError> {
+    pub fn last_record_bounded(&self) -> Result<Option<CommitFixture>, StateError> {
         self.latest_commit()
             .map(|commit| commit.as_ref().map(Into::into))
     }
@@ -2020,8 +2029,8 @@ impl TapeAuthorityLease {
     }
     /// Replay through the selected authority implementation.
     #[cfg(any(test, feature = "fixtures"))]
-    pub fn replay(&mut self) -> Result<Vec<CheckpointJournalRecord>, StateError> {
-        let mut records: Vec<CheckpointJournalRecord> =
+    pub fn replay(&mut self) -> Result<Vec<CommitFixture>, StateError> {
+        let mut records: Vec<CommitFixture> =
             self.replay_commits()?.iter().map(Into::into).collect();
         if let Some(sealed) = self.latest_commit()?.filter(|c| c.sealed) {
             records.push((&sealed).into());
@@ -2030,10 +2039,8 @@ impl TapeAuthorityLease {
     }
     /// Replay for terminal recovery through the selected authority implementation.
     #[cfg(any(test, feature = "fixtures"))]
-    pub fn replay_for_terminal_recovery(
-        &mut self,
-    ) -> Result<CheckpointTerminalRecoveryAuthority, StateError> {
-        Ok(CheckpointTerminalRecoveryAuthority {
+    pub fn replay_for_terminal_recovery(&mut self) -> Result<TerminalRecoveryFixture, StateError> {
+        Ok(TerminalRecoveryFixture {
             records: self.replay()?,
             finalization_intent: self.pending_finalization()?.as_ref().map(Into::into),
         })
@@ -2091,7 +2098,7 @@ impl TapeAuthorityLease {
     #[cfg(any(test, feature = "fixtures"))]
     pub fn append_terminal_finalization(
         &mut self,
-        records: &[CheckpointJournalRecord],
+        records: &[CommitFixture],
     ) -> Result<(), StateError> {
         self.publish_sealed_reports(&records.iter().map(Into::into).collect::<Vec<_>>(), || {
             Ok(())
@@ -2101,7 +2108,7 @@ impl TapeAuthorityLease {
     #[cfg(any(test, feature = "fixtures"))]
     pub fn append_terminal_finalization_with_after_fsync(
         &mut self,
-        records: &[CheckpointJournalRecord],
+        records: &[CommitFixture],
         after_fsync: impl FnOnce() -> Result<(), StateError>,
     ) -> Result<(), StateError> {
         self.publish_sealed_reports(
@@ -2111,12 +2118,12 @@ impl TapeAuthorityLease {
     }
     /// Append through the selected authority implementation.
     #[cfg(any(test, feature = "fixtures"))]
-    pub fn append(&mut self, record: &CheckpointJournalRecord) -> Result<(), StateError> {
+    pub fn append(&mut self, record: &CommitFixture) -> Result<(), StateError> {
         self.publish_report(&record.into())
     }
     /// Append batch through the selected authority implementation.
     #[cfg(any(test, feature = "fixtures"))]
-    pub fn append_batch(&mut self, records: &[CheckpointJournalRecord]) -> Result<(), StateError> {
+    pub fn append_batch(&mut self, records: &[CommitFixture]) -> Result<(), StateError> {
         self.publish_reports(&records.iter().map(Into::into).collect::<Vec<_>>())
     }
 }
@@ -2124,11 +2131,11 @@ impl TapeAuthorityLease {
 #[cfg(any(test, feature = "fixtures"))]
 impl TapeAuthority {
     /// Publish a complete semantic fixture through the live backend.
-    pub fn append(&self, record: &CheckpointJournalRecord) -> Result<(), StateError> {
+    pub fn append(&self, record: &CommitFixture) -> Result<(), StateError> {
         self.acquire_exclusive()?.publish_report(&record.into())
     }
     /// Materialize fixture history only; production uses bounded cursors.
-    pub fn replay(&self) -> Result<Vec<CheckpointJournalRecord>, StateError> {
+    pub fn replay(&self) -> Result<Vec<CommitFixture>, StateError> {
         let mut records = Vec::new();
         self.visit_commits(&mut |c| {
             records.push(c.into());
@@ -2140,7 +2147,7 @@ impl TapeAuthority {
         Ok(records)
     }
     /// Complete last fixture report including payloads.
-    pub fn last(&self) -> Result<Option<CheckpointJournalRecord>, StateError> {
+    pub fn last(&self) -> Result<Option<CommitFixture>, StateError> {
         Ok(self.replay()?.pop())
     }
     /// Inspect the selected backend's finalization state.

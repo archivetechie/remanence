@@ -683,6 +683,56 @@ pub(super) fn walk_scanner(v: &Resolved, _: usize, _: usize) -> Result<(), Obser
     Ok(())
 }
 
+/// Publish the healthy control, then inject the overflowing claim into native
+/// frames. The native replay validator must observe the claim; constructing a
+/// catalog payload from an impossible extent would fail in fixture code first.
+pub(super) fn append_point_claims(
+    input: &Value,
+    base: &crate::tape_image_vectors::VectorImage,
+    path: &std::path::Path,
+) -> Result<remanence_state::authority::row_fixtures::RowAuthority, ParityError> {
+    use remanence_state::authority::row_fixtures::{inject_row_fault, RowFixtureFault};
+    let Some(row) = input["committed_prefix"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["block_count"].as_u64() == Some(u64::MAX))
+    else {
+        return crate::resume_vectors::adapt(input, base, path);
+    };
+    let file = row["tape_file_number"].as_u64().unwrap();
+    let mut control = input.clone();
+    let control_row = control["committed_prefix"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|row| row["tape_file_number"].as_u64() == Some(file))
+        .unwrap();
+    control_row["block_count"] =
+        json!(base.image.files[file as usize].bytes.len() as u64 / u64::from(BLOCK));
+    control["T"] = json!(control["committed_prefix"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(
+            |row| row["first_parity_data_ordinal"].as_u64().map(|first| first
+                .checked_add(row["block_count"].as_u64().unwrap())
+                .unwrap())
+        )
+        .max()
+        .unwrap_or(0));
+    let mut authority = crate::resume_vectors::adapt(&control, base, path)?;
+    resume_record_result(inject_row_fault(
+        &mut authority,
+        RowFixtureFault::FileExtent {
+            tape_file_number: row["tape_file_number"].as_u64().unwrap(),
+            block_count: row["block_count"].as_u64().unwrap(),
+            total: input["T"].as_u64().unwrap(),
+        },
+    ))?;
+    Ok(authority)
+}
+
 /// The Resumer from commit records: journal replay, the bounded summary and
 /// the open-epoch re-read over the unchanged tape. With the claim present the
 /// Resumer must refuse before any read; the healthy prefix resumes.
@@ -698,7 +748,7 @@ pub(super) fn resumer(v: &Resolved, _: usize, _: usize) -> Result<(), ObservedEr
     let temp = tempfile::tempdir().expect("journal temp directory");
     let (mut drive, world, _) = crate::resume_vectors::model(&base, &input);
     let result = (|| -> Result<(), ParityError> {
-        let journal = crate::resume_vectors::adapt(&input, &base, &temp.path().join("claims"))?;
+        let journal = append_point_claims(&input, &base, &temp.path().join("claims"))?;
         let snapshot = resume_record_result(journal.committed_snapshot_bounded())?;
         let summary = checked_bounded_resume_summary(&snapshot)?;
         rebuild_open_epoch_from_bounded_summary(

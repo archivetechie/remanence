@@ -2,9 +2,8 @@
 //! uses the owned actor; raw faults are confined to the virtual transport.
 use super::*;
 use crate::pool_write::*;
-use remanence_parity::{
-    ParityScheme, SchemeId, TapeFileKind, TapeReportPublisher, TapeRowAuthority,
-};
+use remanence_parity::{ParityScheme, SchemeId, TapeFileKind, TapeReportPublisher};
+use remanence_state::authority::row_fixtures::RowAuthority as TapeRowAuthority;
 use remanence_state::authority::TapeAuthorityView;
 use remanence_state::{TapeAuthority, TerminalFinalizationProgress};
 use std::collections::HashSet;
@@ -33,8 +32,8 @@ fn parity(f: &Fixture) -> TapeRowAuthority {
     else {
         panic!("parity tape")
     };
-    remanence_parity::authority::fixtures::RowAuthorityBuilder::new(
-        &f.config.journal.dir,
+    remanence_state::authority::row_fixtures::RowAuthorityBuilder::new(
+        f.config.journal.dir.join("tapes"),
         UUID,
         BLOCK,
         scheme,
@@ -692,7 +691,11 @@ fn encrypted_first_epoch_journals_parity_state_and_replays() {
         let mut index = f.index();
         let id = uuid::Uuid::from_bytes(result.object.object_id).to_string();
         let expected = index.get_native_object(&id).unwrap().unwrap();
-        index.project_checkpoint_record(&records[0]).unwrap();
+        index
+            .project_tape_log(
+                &remanence_state::authority::TapeAuthorityView::freeze(&checkpoint(&f)).unwrap(),
+            )
+            .unwrap();
         assert_eq!(index.get_native_object(&id).unwrap().unwrap(), expected);
         actor.finish().unwrap();
     }

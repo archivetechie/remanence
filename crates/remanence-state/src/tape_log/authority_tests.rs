@@ -558,3 +558,21 @@ fn structural_snapshot_contention_has_a_typed_deadline() {
     release_tx.send(()).unwrap();
     thread.join().unwrap();
 }
+
+/// Native catalog headers preserve wide file numbers without narrowing.
+#[test]
+fn checkpoint_carriers_preserve_tape_file_numbers_beyond_u32() {
+    use crate::tape_log::wire::Wire;
+    let mut source = crate::checkpoint::tests::record([0x7a; 16]);
+    let number = u64::from(u32::MAX) + 17;
+    source.objects[0].copy.tape_file_number = number;
+    source.objects[0].object_recovery_row.tape_file_number = number;
+    let header = crate::tape_log::payload::CommittedObjectProjection::from(&source.objects[0]);
+    let mut bytes = Vec::new();
+    crate::tape_log::payload::encode_header(&mut bytes, &header).unwrap();
+    let decoded =
+        crate::tape_log::payload::CommittedObjectProjection::get(&mut bytes.as_slice()).unwrap();
+    assert_eq!(decoded, header);
+    assert_eq!(decoded.copy.tape_file_number, number);
+    assert_eq!(decoded.object_recovery_row.tape_file_number, number);
+}

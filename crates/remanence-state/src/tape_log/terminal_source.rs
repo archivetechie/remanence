@@ -167,7 +167,7 @@ impl TapeIndexReplicaRecordSource for TerminalSource {
     ) -> Result<(), ParityError> {
         let mut ordinal = 0u64;
         self.visit_rows(&mut |row| {
-            let mut entry = crate::checkpoint::terminal_map_entry_from_committed(row)?;
+            let mut entry = terminal_map_entry_from_committed(row)?;
             if row.kind == TapeFileKind::Object && entry.first_parity_data_ordinal.is_none() {
                 entry.first_parity_data_ordinal = Some(ordinal);
                 ordinal = ordinal
@@ -183,9 +183,7 @@ impl TapeIndexReplicaRecordSource for TerminalSource {
     ) -> Result<(), ParityError> {
         self.visit_rows(&mut |row| {
             if let Some(object) = &row.object_recovery_row {
-                v(&crate::checkpoint::terminal_object_row_from_recovery(
-                    object,
-                )?)?;
+                v(&terminal_object_row_from_recovery(object)?)?;
             }
             Ok(())
         })
@@ -238,4 +236,60 @@ impl TerminalAuthoritySource<AuthorityFinalization> for TerminalSource {
         }
         Ok(plan)
     }
+}
+
+pub(crate) fn terminal_map_entry_from_committed(
+    entry: &remanence_parity::TapeFileEntry,
+) -> Result<remanence_parity::TapeIndexReplicaMapEntry, remanence_parity::ParityError> {
+    let kind = match entry.kind {
+        remanence_parity::TapeFileKind::Object => {
+            remanence_parity::TapeIndexReplicaFileKind::Object
+        }
+        remanence_parity::TapeFileKind::ParitySidecar => {
+            remanence_parity::TapeIndexReplicaFileKind::ParitySidecar
+        }
+        remanence_parity::TapeFileKind::Bootstrap => {
+            remanence_parity::TapeIndexReplicaFileKind::Bootstrap
+        }
+        remanence_parity::TapeFileKind::ParityMap => {
+            remanence_parity::TapeIndexReplicaFileKind::ParityMap
+        }
+        remanence_parity::TapeFileKind::TapeIndexReplica
+        | remanence_parity::TapeFileKind::IndexSeparationExtent => {
+            return Err(remanence_parity::ParityError::Invariant(
+                "terminal component appears inside the pre-tail authority",
+            ));
+        }
+    };
+    Ok(remanence_parity::TapeIndexReplicaMapEntry {
+        tape_file_number: entry.tape_file_number,
+        kind,
+        block_count: entry.block_count,
+        first_parity_data_ordinal: entry.first_parity_data_ordinal,
+        protected_ordinal_start: entry.protected_ordinal_start,
+        protected_ordinal_end_exclusive: entry.protected_ordinal_end_exclusive,
+        epoch_id: entry.epoch_id,
+    })
+}
+
+pub(crate) fn terminal_object_row_from_recovery(
+    row: &remanence_parity::ObjectRecoveryRow,
+) -> Result<remanence_parity::TapeIndexReplicaObjectRow, remanence_parity::ParityError> {
+    let object_id = row
+        .object_id
+        .clone()
+        .ok_or(remanence_parity::ParityError::Invariant(
+            "terminal Object recovery row is missing its Object identifier",
+        ))?;
+    if object_id.is_empty() || object_id.len() > 64 {
+        return Err(remanence_parity::ParityError::Invariant(
+            "terminal Object recovery identifier is outside 1..=64 bytes",
+        ));
+    }
+    Ok(remanence_parity::TapeIndexReplicaObjectRow {
+        tape_file_number: row.tape_file_number,
+        stored_block_count: row.stored_block_count,
+        object_id,
+        representation: row.representation.clone(),
+    })
 }

@@ -1,5 +1,6 @@
 use remanence_parity::authority::StructuralAuthority;
 use remanence_state::authority::TapeAuthorityView;
+use remanence_state::authority::TapeAuthorityWriter;
 #[path = "durability_tests.rs"]
 mod durability_tests;
 
@@ -40,8 +41,7 @@ use remanence_library::{
 use remanence_parity::bootstrap::{parse_bootstrap_block, write_bootstrap_block};
 use remanence_parity::*;
 use remanence_parity::{
-    BootstrapPayload, CommittedBundle, CommittedBundleKind, ParityConfig, TapeFileEntry,
-    TapeFileKind,
+    BootstrapPayload, FileRowsKind, FileRowsReport, ParityConfig, TapeFileEntry, TapeFileKind,
 };
 use remanence_state::*;
 use remanence_state::{
@@ -463,12 +463,12 @@ fn unknown_or_zero_replica_tail_remains_recovery_required() {
 }
 
 #[test]
-fn one_transition_ahead_sink_journal_reconciles_before_media_is_available() {
+fn native_component_repairs_stale_catalog_before_media_is_available() {
     terminal_authority_fixture(None);
 }
 
 #[test]
-fn shadow_component_catalog_authority_reports_fresh_orphan_and_checkpointed_units() {
+fn native_component_catalog_authority_preserves_publication_receipts() {
     for already_present in 0..=2 {
         terminal_authority_fixture(Some(already_present));
     }
@@ -596,7 +596,7 @@ fn terminal_authority_fixture(receipt_case: Option<usize>) {
     .expect("checkpoint journal");
     let object_uuid = Uuid::from_bytes([0x8E; 16]);
     checkpoint_journal
-        .append(&remanence_state::CheckpointJournalRecord {
+        .append(&remanence_state::CommitFixture {
             ordinal: 1,
             committed_object_count: 1,
             eod_partition: 0,
@@ -605,7 +605,7 @@ fn terminal_authority_fixture(receipt_case: Option<usize>) {
             batch_id: [0x8C; 16],
             next_tape_file_number: 2,
             block_size: BLOCK_SIZE,
-            objects: vec![remanence_state::CheckpointObjectProjection {
+            objects: vec![remanence_state::ObjectProjectionFixture {
                 object: NativeObjectProjectionInput {
                     object_id: object_uuid.to_string(),
                     caller_object_id: Some("host-authority-object".to_string()),
@@ -634,12 +634,12 @@ fn terminal_authority_fixture(receipt_case: Option<usize>) {
                 block_count: 1,
                 fresh_tape: true,
                 total_committed_ordinals: 1,
-                object_recovery_row: remanence_state::CheckpointObjectRecoveryRow {
+                object_recovery_row: remanence_state::ObjectRecoveryFixture {
                     tape_file_number: 1,
                     stored_block_count: 1,
                     object_id: b"8e8e8e8e-8e8e-8e8e-8e8e-8e8e8e8e8e8e".to_vec(),
                     representation:
-                        remanence_state::CheckpointObjectRecoveryRepresentation::Plaintext {
+                        remanence_state::ObjectRecoveryFixtureRepresentation::Plaintext {
                             manifest_first_chunk_lba: 0,
                             manifest_size_bytes: 1,
                             manifest_chunk_count: 1,
@@ -688,101 +688,7 @@ fn terminal_authority_fixture(receipt_case: Option<usize>) {
         .expect("project initial finalization");
 
     let scheme = remanence_parity::default_scheme();
-    let mut journal = remanence_parity::authority::fixtures::RowAuthorityBuilder::new(
-        temp.path(),
-        TAPE_UUID,
-        BLOCK_SIZE,
-        scheme.clone(),
-    )
-    .build()
-    .expect("open sink journal");
-    let bot_bundle = CommittedBundle {
-        kind: CommittedBundleKind::BotBootstrap,
-        entries: vec![TapeFileEntry {
-            tape_file_number: 0,
-            kind: TapeFileKind::Bootstrap,
-            block_count: 1,
-            physical_start_hint: Some(0),
-            object_id: None,
-            first_parity_data_ordinal: None,
-            epoch_id: None,
-            protected_ordinal_start: None,
-            protected_ordinal_end_exclusive: None,
-            canonical_metadata_hash: None,
-            object_recovery_row: None,
-        }],
-        highest_protected_ordinal: 0,
-        total_committed_ordinals: 0,
-    };
-    let object_bundle = CommittedBundle {
-        kind: CommittedBundleKind::Object,
-        entries: vec![TapeFileEntry {
-            tape_file_number: 1,
-            kind: TapeFileKind::Object,
-            block_count: 1,
-            physical_start_hint: Some(2),
-            object_id: Some(object_uuid.to_string()),
-            first_parity_data_ordinal: Some(0),
-            epoch_id: None,
-            protected_ordinal_start: None,
-            protected_ordinal_end_exclusive: None,
-            canonical_metadata_hash: None,
-            object_recovery_row: Some(remanence_parity::ObjectRecoveryRow {
-                tape_file_number: 1,
-                stored_block_count: 1,
-                object_id: Some(b"8e8e8e8e-8e8e-8e8e-8e8e-8e8e8e8e8e8e".to_vec()),
-                representation: remanence_parity::ObjectRecoveryRepresentation::Plaintext {
-                    manifest_first_chunk_lba: 0,
-                    manifest_size_bytes: 1,
-                    manifest_chunk_count: 1,
-                    manifest_sha256: [0x8D; 32],
-                },
-            }),
-        }],
-        highest_protected_ordinal: 0,
-        total_committed_ordinals: 1,
-    };
-    let object_checkpoint = CommittedBundle {
-        kind: CommittedBundleKind::CheckpointedThrough,
-        entries: Vec::new(),
-        highest_protected_ordinal: 0,
-        total_committed_ordinals: 1,
-    };
-    let sink_checkpoint = CommittedBundle {
-        kind: CommittedBundleKind::CheckpointedThrough,
-        entries: Vec::new(),
-        highest_protected_ordinal: 0,
-        total_committed_ordinals: 1,
-    };
-    journal
-        .publish_fixture(&remanence_parity::authority::ShadowPublication {
-            bundles: vec![(bot_bundle).clone()],
-        })
-        .expect("journal BOT");
-    journal
-        .publish_fixture(&remanence_parity::authority::ShadowPublication {
-            bundles: vec![(object_bundle).clone()],
-        })
-        .expect("journal Object");
-    journal
-        .publish_fixture(&remanence_parity::authority::ShadowPublication {
-            bundles: vec![(object_checkpoint).clone()],
-        })
-        .expect("journal Object checkpoint");
-    journal
-        .publish_fixture(&remanence_parity::authority::ShadowPublication {
-            bundles: vec![
-                (CommittedBundle {
-                    kind: CommittedBundleKind::TerminalPrefix,
-                    entries: Vec::new(),
-                    highest_protected_ordinal: 0,
-                    total_committed_ordinals: 1,
-                })
-                .clone(),
-                (sink_checkpoint).clone(),
-            ],
-        })
-        .expect("journal terminal prefix");
+    let mut journal = checkpoint.fixture_structural();
     if let Some(already_present) = receipt_case {
         use remanence_parity::authority::PublicationReceipt;
         use remanence_parity::{
@@ -821,7 +727,6 @@ fn terminal_authority_fixture(receipt_case: Option<usize>) {
                 reconciled_existing_component: already_present != 0,
                 rewrote_torn_component: false,
                 journal_bundle: bundle,
-                checkpoint_bundle: sink_checkpoint.clone(),
                 publication: PublicationReceipt::default(),
             };
             authority.commit_after_barrier(&mut commit).unwrap();
@@ -843,13 +748,12 @@ fn terminal_authority_fixture(receipt_case: Option<usize>) {
         }
         return;
     }
-    let replica_a = remanence_parity::terminal_component_bundle(&plan, layout.components[0])
-        .expect("replica A bundle");
-    journal
-        .publish_fixture(&remanence_parity::authority::ShadowPublication {
-            bundles: vec![(replica_a).clone()],
-        })
-        .expect("simulate crash after sink component fsync");
+    let replica_a =
+        remanence_parity::terminal_component_bundle(&plan, layout.components[0]).unwrap();
+    checkpoint
+        .publish_terminal_component(&(&replica_a).try_into().unwrap())
+        .unwrap();
+    let durable_intent = checkpoint.pending_finalization().unwrap().unwrap();
 
     let spec = TerminalFinalizeSpec {
         actor: AuditActor::System,
@@ -862,9 +766,8 @@ fn terminal_authority_fixture(receipt_case: Option<usize>) {
     };
     let reconciled = reconcile_terminal_component_host_authority(
         &mut index,
-        &mut checkpoint,
         &spec,
-        (&intent).into(),
+        durable_intent,
         &plan,
         &mut journal,
     )
@@ -876,11 +779,7 @@ fn terminal_authority_fixture(receipt_case: Option<usize>) {
     let transitions = layout
         .components
         .iter()
-        .map(|component| {
-            let bundle = remanence_parity::terminal_component_bundle(&plan, *component)
-                .expect("component bundle");
-            (bundle, sink_checkpoint.clone())
-        })
+        .map(|component| remanence_parity::terminal_component_bundle(&plan, *component).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(
         journal
@@ -889,7 +788,7 @@ fn terminal_authority_fixture(receipt_case: Option<usize>) {
                 &transitions
                     .iter()
                     .map(
-                        |(unit, _)| remanence_parity::authority::FilePublication::try_from(unit)
+                        |unit| remanence_parity::authority::FilePublication::try_from(unit)
                             .unwrap()
                     )
                     .collect::<Vec<_>>()
@@ -914,14 +813,7 @@ fn terminal_authority_fixture(receipt_case: Option<usize>) {
         remanence_state::TerminalFinalizationProgress::AfterReplicaA
     );
 
-    // Simulate the separate crash window after the next external
-    // checkpoint fsync but before its SQLite projection. Both durable
-    // journals agree; restart must repair the cache before media motion.
-    journal
-        .publish_fixture(&remanence_parity::authority::ShadowPublication {
-            bundles: vec![(transitions[1].0).clone(), (transitions[1].1).clone()],
-        })
-        .expect("journal separation AB transition");
+    // The native component is durable while its SQLite projection is stale.
     let checkpoint_intent = checkpoint
         .advance_terminal_finalization(
             remanence_state::TerminalFinalizationProgress::AfterReplicaA,
@@ -938,7 +830,6 @@ fn terminal_authority_fixture(receipt_case: Option<usize>) {
     );
     let reconciled = reconcile_terminal_component_host_authority(
         &mut index,
-        &mut checkpoint,
         &spec,
         (&checkpoint_intent).into(),
         &plan,
@@ -969,14 +860,12 @@ fn terminal_authority_fixture(receipt_case: Option<usize>) {
             remanence_state::TerminalFinalizationProgress::AfterSeparationBc,
         ),
     ] {
-        journal
-            .publish_fixture(&remanence_parity::authority::ShadowPublication {
-                bundles: vec![(transitions[component_index].0).clone()],
-            })
-            .expect("simulate the next sink component one transition ahead");
+        checkpoint
+            .publish_terminal_component(&(&transitions[component_index]).try_into().unwrap())
+            .unwrap();
+        current = checkpoint.pending_finalization().unwrap().unwrap();
         current = reconcile_terminal_component_host_authority(
             &mut index,
-            &mut checkpoint,
             &spec,
             current,
             &plan,
@@ -994,15 +883,10 @@ fn terminal_authority_fixture(receipt_case: Option<usize>) {
         );
     }
 
-    // Replica C may be barrier-proved in the sink journal one host fsync
-    // before checkpoint progress. A newly lowered cap would reject the
-    // stale pre-C view, so recovery must reconcile first and then observe
-    // that no tape capacity remains to authorize.
-    journal
-        .publish_fixture(&remanence_parity::authority::ShadowPublication {
-            bundles: vec![(transitions[4].0).clone(), (transitions[4].1).clone()],
-        })
-        .expect("journal replica C transition");
+    // C is durable before SQLite. A lowered cap must not undo its proof.
+    checkpoint
+        .publish_terminal_component(&(&transitions[4]).try_into().unwrap())
+        .unwrap();
     let lowered_pool = TapePoolConfig {
         scheme: None,
         id: "host-authority-test".to_string(),
@@ -1051,9 +935,9 @@ fn terminal_authority_fixture(receipt_case: Option<usize>) {
             .progress,
         remanence_state::TerminalFinalizationProgress::AfterSeparationBc
     );
+    let current = checkpoint.pending_finalization().unwrap().unwrap();
     let completed = reconcile_and_authorize_parity_resume(
         &mut index,
-        &mut checkpoint,
         &lowered_spec,
         &selected,
         current,
@@ -2320,8 +2204,8 @@ async fn bootstrap_projection_never_authorizes_writing_physically_blank_media() 
                     scheme: projected_scheme,
                     journal_offset_bytes: 0,
                 },
-                &CommittedBundle {
-                    kind: CommittedBundleKind::BotBootstrap,
+                &FileRowsReport {
+                    kind: FileRowsKind::BotBootstrap,
                     entries: vec![TapeFileEntry {
                         tape_file_number: 0,
                         kind: TapeFileKind::Bootstrap,
@@ -2679,7 +2563,7 @@ fn fresh_parity_bootstrap_short_completion_fences_without_journal_visibility() {
     drop(world_guard);
 
     let journal_path = parity_journal_directory(&cfg, tape_uuid).expect("parity journal path");
-    let journal = remanence_parity::authority::fixtures::RowAuthorityBuilder::new(
+    let journal = remanence_state::authority::row_fixtures::RowAuthorityBuilder::new(
         journal_path,
         tape_uuid,
         BLOCK_SIZE,
@@ -2789,7 +2673,7 @@ fn automatic_terminal_transition_transfers_the_session_parity_journal_lock() {
     let tape_uuid = [0x48; 16];
     let scheme = remanence_parity::default_scheme_for_block_size(256 * 1024);
     let path = temp.path().to_path_buf();
-    let journal = remanence_parity::authority::fixtures::RowAuthorityBuilder::new(
+    let journal = remanence_state::authority::row_fixtures::RowAuthorityBuilder::new(
         &path,
         tape_uuid,
         256 * 1024,
@@ -2806,7 +2690,7 @@ fn automatic_terminal_transition_transfers_the_session_parity_journal_lock() {
     let mut writer = checkpoint.acquire_exclusive().unwrap();
     writer.retain_structural_publisher(journal).unwrap();
 
-    let contended = remanence_parity::authority::fixtures::RowAuthorityBuilder::new(
+    let contended = remanence_state::authority::row_fixtures::RowAuthorityBuilder::new(
         &path,
         tape_uuid,
         256 * 1024,
@@ -2830,7 +2714,7 @@ fn automatic_terminal_transition_transfers_the_session_parity_journal_lock() {
         })
         .unwrap();
     assert!(writer.structural().is_none());
-    remanence_parity::authority::fixtures::RowAuthorityBuilder::new(
+    remanence_state::authority::row_fixtures::RowAuthorityBuilder::new(
         &path,
         tape_uuid,
         256 * 1024,
@@ -3111,7 +2995,7 @@ async fn partial_epoch_checkpoint_projects_replays_and_first_post_checkpoint_sho
     );
     let mut replay_index = CatalogIndex::open(&index_path).expect("open replay projection");
     replay_index
-        .project_checkpoint_record(record)
+        .project_tape_log(&checkpoint_journal.freeze().unwrap())
         .expect("idempotently replay the durable partial-epoch checkpoint into SQLite");
     drop(replay_index);
 
@@ -6103,8 +5987,8 @@ fn cataloged_payload_fixture(payload: &[u8]) -> RangeCatalogFixture {
                 scheme: None,
                 journal_offset_bytes: 0,
             },
-            &(&CommittedBundle {
-                kind: CommittedBundleKind::Object,
+            &(&FileRowsReport {
+                kind: FileRowsKind::Object,
                 entries: vec![TapeFileEntry {
                     tape_file_number: 0,
                     kind: TapeFileKind::Object,
@@ -9279,11 +9163,11 @@ fn resume_vectors_layer5_authorities(refusal: Option<&str>) {
     else {
         panic!("plaintext fixture required")
     };
-    let recovery_row = remanence_state::CheckpointObjectRecoveryRow {
+    let recovery_row = remanence_state::ObjectRecoveryFixture {
         tape_file_number: row.tape_file_number,
         stored_block_count: row.stored_block_count,
         object_id: row.object_id.clone(),
-        representation: remanence_state::CheckpointObjectRecoveryRepresentation::Plaintext {
+        representation: remanence_state::ObjectRecoveryFixtureRepresentation::Plaintext {
             manifest_first_chunk_lba: *manifest_first_chunk_lba,
             manifest_size_bytes: *manifest_size_bytes,
             manifest_chunk_count: *manifest_chunk_count,
@@ -9291,7 +9175,7 @@ fn resume_vectors_layer5_authorities(refusal: Option<&str>) {
         },
     };
     let digest = sha2::Sha256::digest(&vector.image.files[1].bytes).to_vec();
-    let mut checkpoint_record = remanence_state::CheckpointJournalRecord {
+    let mut checkpoint_record = remanence_state::CommitFixture {
         ordinal: 1,
         committed_object_count: 1,
         eod_partition: 0,
@@ -9300,7 +9184,7 @@ fn resume_vectors_layer5_authorities(refusal: Option<&str>) {
         batch_id: [0x61; 16],
         next_tape_file_number: committed.entries.len() as u64,
         block_size: selected.block_size,
-        objects: vec![remanence_state::CheckpointObjectProjection {
+        objects: vec![remanence_state::ObjectProjectionFixture {
             object: NativeObjectProjectionInput {
                 object_id: object_id.clone(),
                 caller_object_id: Some(source_object.options.caller_object_id.clone()),
@@ -9334,8 +9218,8 @@ fn resume_vectors_layer5_authorities(refusal: Option<&str>) {
             object_recovery_row: recovery_row,
         }],
         scheme: Some(vector.written.inputs.scheme.clone()),
-        object_tape_file_bundles: vec![CommittedBundle {
-            kind: CommittedBundleKind::Object,
+        object_tape_file_bundles: vec![FileRowsReport {
+            kind: FileRowsKind::Object,
             entries: vec![entry, committed.entries[2].clone()],
             highest_protected_ordinal: 4,
             total_committed_ordinals: 4,
@@ -9375,7 +9259,7 @@ fn resume_vectors_layer5_authorities(refusal: Option<&str>) {
     let checkpoints = lease.replay().unwrap();
     if let Some(kind) = refusal {
         world.lock().unwrap().command_log.clear();
-        let journal = remanence_parity::authority::fixtures::RowAuthorityBuilder::new(
+        let journal = remanence_state::authority::row_fixtures::RowAuthorityBuilder::new(
             super::checkpoint::parity_journal_directory(&cfg, selected.tape_uuid).unwrap(),
             selected.tape_uuid,
             selected.block_size,
@@ -9383,13 +9267,13 @@ fn resume_vectors_layer5_authorities(refusal: Option<&str>) {
         )
         .build()
         .unwrap();
-        let error = crate::pool_write::validate_parity_resume_checkpoint_authority(
-            &lease,
-            &journal,
-            checkpoints.is_empty(),
-            committed.entries.len() as u64,
-        )
-        .unwrap_err();
+        let error = lease
+            .validate_resume_rows(
+                &journal,
+                checkpoints.is_empty(),
+                committed.entries.len() as u64,
+            )
+            .unwrap_err();
         let error = match error {
             crate::pool_write::ResumeAuthorityRefusal::Records(error) => error,
             other => panic!("expected a commit-record refusal, got {other:?}"),

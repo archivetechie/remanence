@@ -553,7 +553,7 @@ fn validate_projected_history(
                 }
                 CatalogPayload::Member(member) => {
                     let expected = checkpoint_object_file_view(member)?;
-                    let actual = tx.query_row("select object_id, file_id, path, size_bytes, file_sha256, file_digest_algorithm, first_chunk_lba, chunk_count, mtime, executable from object_files where object_id = ?1 and file_id = ?2", params![member.object_id, member.file_id], |r| Ok(CheckpointObjectFileView { object_id:r.get(0)?, file_id:r.get(1)?, path:r.get(2)?, size_bytes:r.get(3)?, file_sha256:r.get(4)?, file_digest_algorithm:r.get(5)?, first_chunk_lba:r.get(6)?, chunk_count:r.get(7)?, mtime:r.get(8)?, executable:r.get(9)? })).optional().map_err(|e| sqlite_error("compare rebuild member", e))?;
+                    let actual = tx.query_row("select object_id, file_id, path, size_bytes, file_sha256, file_digest_algorithm, first_chunk_lba, chunk_count, mtime, executable from object_files where object_id = ?1 and file_id = ?2", params![member.object_id, member.file_id], |r| Ok(CatalogObjectFileView { object_id:r.get(0)?, file_id:r.get(1)?, path:r.get(2)?, size_bytes:r.get(3)?, file_sha256:r.get(4)?, file_digest_algorithm:r.get(5)?, first_chunk_lba:r.get(6)?, chunk_count:r.get(7)?, mtime:r.get(8)?, executable:r.get(9)? })).optional().map_err(|e| sqlite_error("compare rebuild member", e))?;
                     if actual.is_some_and(|a| a != expected) { return Err(conflict("Object member")); }
                     tx.execute("insert or ignore into rebuild_members values (?1, ?2)", params![member.object_id, member.file_id]).map_err(|e| sqlite_error("retain rebuild member key", e))?;
                 }
@@ -581,9 +581,9 @@ fn validate_object_metadata(
     sequence: u64,
     batch: [u8; 16],
 ) -> Result<(), StateError> {
-    let actual: Option<CheckpointObjectView> = tx.query_row(
+    let actual: Option<CatalogObjectView> = tx.query_row(
         "select caller_object_id, body_format, logical_size_bytes, content_hash, content_hash_algorithm, metadata_hash, metadata_hash_algorithm, created_at_utc from objects where object_id = ?1", params![object.object_id],
-        |r| Ok(CheckpointObjectView { caller_object_id: r.get(0)?, body_format: r.get(1)?, logical_size_bytes: r.get(2)?, content_hash: r.get(3)?, content_hash_algorithm: r.get(4)?, metadata_hash: r.get(5)?, metadata_hash_algorithm: r.get(6)?, created_at_utc: Some(r.get(7)?) })).optional().map_err(|e| sqlite_error("validate projected object metadata", e))?;
+        |r| Ok(CatalogObjectView { caller_object_id: r.get(0)?, body_format: r.get(1)?, logical_size_bytes: r.get(2)?, content_hash: r.get(3)?, content_hash_algorithm: r.get(4)?, metadata_hash: r.get(5)?, metadata_hash_algorithm: r.get(6)?, created_at_utc: Some(r.get(7)?) })).optional().map_err(|e| sqlite_error("validate projected object metadata", e))?;
     if let Some(actual) = actual {
         let mut expected = checkpoint_object_view(object)?;
         if expected.created_at_utc.is_none() {
@@ -631,6 +631,92 @@ fn project_terminal_log_progress(
         }
     }
     project_terminal_finalization_tx(tx, input, updated)
+}
+
+/// Fixture projection uses actual closed native groups and the same comparison
+/// and projection functions as a full rebuild. Only this tape's acceleration
+/// mark is discarded, allowing tests to model a lost or partial SQLite cache.
+#[cfg(any(test, feature = "fixtures"))]
+impl CatalogIndex {
+    /// Publish a semantic fixture to a native log, then reconstruct its catalog.
+    pub fn project_checkpoint_record(
+        &mut self,
+        record: &crate::CommitFixture,
+    ) -> Result<(), StateError> {
+        use crate::authority::{TapeAuthority, TapeAuthorityView, TapeAuthorityWriter};
+        let directory = self.path().with_extension("fixture-logs");
+        std::fs::create_dir_all(&directory).map_err(StoreError::Io)?;
+        let authority = TapeAuthority::open_fixture(directory, record.tape_uuid)?;
+        let mut writer = if authority.pending_finalization()?.is_some() {
+            authority.acquire_exclusive_for_terminal_recovery()?
+        } else {
+            authority.acquire_exclusive()?
+        };
+        if writer
+            .latest_commit()?
+            .is_none_or(|c| c.ordinal < record.ordinal)
+        {
+            if record.sealed_after_write {
+                let mut intent = record.terminal_finalization.clone().ok_or_else(|| {
+                    StateError::JournalReplayFailed(
+                        "fixture seal requires finalization plan".into(),
+                    )
+                })?;
+                intent.progress = TerminalFinalizationProgress::BeforeReplicaA;
+                writer.begin_finalization(&(&intent).into())?;
+                if let Some(prefix) = &intent.terminal_prefix {
+                    writer
+                        .publish_terminal_prefix(&(&prefix.committed_bundle).try_into().map_err(
+                            |e: remanence_parity::JournalError| {
+                                StateError::JournalReplayFailed(e.to_string())
+                            },
+                        )?)
+                        .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?;
+                }
+                for (before, after) in [
+                    (
+                        TerminalFinalizationProgress::BeforeReplicaA,
+                        TerminalFinalizationProgress::AfterReplicaA,
+                    ),
+                    (
+                        TerminalFinalizationProgress::AfterReplicaA,
+                        TerminalFinalizationProgress::AfterSeparationAb,
+                    ),
+                    (
+                        TerminalFinalizationProgress::AfterSeparationAb,
+                        TerminalFinalizationProgress::AfterReplicaB,
+                    ),
+                    (
+                        TerminalFinalizationProgress::AfterReplicaB,
+                        TerminalFinalizationProgress::AfterSeparationBc,
+                    ),
+                    (
+                        TerminalFinalizationProgress::AfterSeparationBc,
+                        TerminalFinalizationProgress::AfterReplicaC,
+                    ),
+                ] {
+                    writer.advance_finalization(before, after)?;
+                }
+                writer.publish_sealed_reports(&[record.into()], || Ok(()))?;
+            } else {
+                writer.publish_report(&record.into())?;
+            }
+        }
+        let snapshot = writer.freeze()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| sqlite_error("begin native fixture reconstruction", e))?;
+        validate_projected_history(&tx, &snapshot)?;
+        tx.execute(
+            "delete from tape_log_projection where tape_uuid = ?1",
+            params![record.tape_uuid.as_slice()],
+        )
+        .map_err(|e| sqlite_error("discard fixture projection mark", e))?;
+        project_snapshot(&tx, &snapshot)?;
+        tx.commit()
+            .map_err(|e| sqlite_error("commit native fixture reconstruction", e))
+    }
 }
 
 #[cfg(test)]

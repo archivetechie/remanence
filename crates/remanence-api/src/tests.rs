@@ -23,7 +23,7 @@ use remanence_library::{
 };
 use remanence_parity::bootstrap::{parse_bootstrap_block, write_bootstrap_block, BootstrapPayload};
 use remanence_parity::{
-    CommittedBundle, CommittedBundleKind, CommittedState, ParityConfig, ParityScheme, SchemeId,
+    FileRowsKind, FileRowsReport, FileRowsState, ParityConfig, ParityScheme, SchemeId,
     TapeFileEntry, TapeFileKind,
 };
 use remanence_state::{
@@ -1851,8 +1851,8 @@ fn project_no_parity_tape_usage(
                 scheme: None,
                 journal_offset_bytes: 0,
             },
-            &CommittedBundle {
-                kind: CommittedBundleKind::Object,
+            &FileRowsReport {
+                kind: FileRowsKind::Object,
                 entries: vec![TapeFileEntry {
                     tape_file_number: 1,
                     kind: TapeFileKind::Object,
@@ -2114,11 +2114,11 @@ fn append_checkpoint_record(checkpoint_dir: &Path, tape_uuid: [u8; 16]) {
         .expect("append checkpoint record");
 }
 
-fn selection_checkpoint_record(tape_uuid: [u8; 16]) -> remanence_state::CheckpointJournalRecord {
+fn selection_checkpoint_record(tape_uuid: [u8; 16]) -> remanence_state::CommitFixture {
     const PAYLOAD: &[u8] = b"checkpoint selection test payload";
     let object_uuid = Uuid::from_bytes([0x51; 16]);
     let content_sha256 = Sha256::digest(PAYLOAD).to_vec();
-    remanence_state::CheckpointJournalRecord {
+    remanence_state::CommitFixture {
         ordinal: 1,
         committed_object_count: 1,
         eod_partition: 0,
@@ -2127,7 +2127,7 @@ fn selection_checkpoint_record(tape_uuid: [u8; 16]) -> remanence_state::Checkpoi
         batch_id: [0x42; 16],
         next_tape_file_number: 2,
         block_size: API_SESSION_BLOCK_SIZE,
-        objects: vec![remanence_state::CheckpointObjectProjection {
+        objects: vec![remanence_state::ObjectProjectionFixture {
             object: NativeObjectProjectionInput {
                 object_id: object_uuid.to_string(),
                 caller_object_id: Some("checkpoint-selection-test".to_string()),
@@ -2166,17 +2166,16 @@ fn selection_checkpoint_record(tape_uuid: [u8; 16]) -> remanence_state::Checkpoi
             block_count: 3,
             fresh_tape: true,
             total_committed_ordinals: 3,
-            object_recovery_row: remanence_state::CheckpointObjectRecoveryRow {
+            object_recovery_row: remanence_state::ObjectRecoveryFixture {
                 tape_file_number: 1,
                 stored_block_count: 3,
                 object_id: object_uuid.to_string().into_bytes(),
-                representation:
-                    remanence_state::CheckpointObjectRecoveryRepresentation::Plaintext {
-                        manifest_first_chunk_lba: 1,
-                        manifest_size_bytes: 1,
-                        manifest_chunk_count: 1,
-                        manifest_sha256: [0x44; 32],
-                    },
+                representation: remanence_state::ObjectRecoveryFixtureRepresentation::Plaintext {
+                    manifest_first_chunk_lba: 1,
+                    manifest_size_bytes: 1,
+                    manifest_chunk_count: 1,
+                    manifest_sha256: [0x44; 32],
+                },
             },
         }],
         scheme: None,
@@ -2333,9 +2332,9 @@ fn restart_cycle_checkpoint_record(
     object_tape_file: u64,
     block_count: u64,
     total_committed_ordinals: u64,
-) -> remanence_state::CheckpointJournalRecord {
+) -> remanence_state::CommitFixture {
     let object_uuid = Uuid::from_bytes([object_byte; 16]);
-    remanence_state::CheckpointJournalRecord {
+    remanence_state::CommitFixture {
         ordinal,
         committed_object_count: ordinal,
         eod_partition: 0,
@@ -2344,7 +2343,7 @@ fn restart_cycle_checkpoint_record(
         batch_id: [0x60 + ordinal as u8; 16],
         next_tape_file_number: object_tape_file + 1,
         block_size: API_SESSION_BLOCK_SIZE,
-        objects: vec![remanence_state::CheckpointObjectProjection {
+        objects: vec![remanence_state::ObjectProjectionFixture {
             object: NativeObjectProjectionInput {
                 object_id: object_uuid.to_string(),
                 caller_object_id: Some(format!("restart-object-{ordinal}")),
@@ -2373,17 +2372,16 @@ fn restart_cycle_checkpoint_record(
             block_count,
             fresh_tape: ordinal == 1,
             total_committed_ordinals,
-            object_recovery_row: remanence_state::CheckpointObjectRecoveryRow {
+            object_recovery_row: remanence_state::ObjectRecoveryFixture {
                 tape_file_number: object_tape_file,
                 stored_block_count: block_count,
                 object_id: object_uuid.to_string().into_bytes(),
-                representation:
-                    remanence_state::CheckpointObjectRecoveryRepresentation::Plaintext {
-                        manifest_first_chunk_lba: 1,
-                        manifest_size_bytes: 1,
-                        manifest_chunk_count: 1,
-                        manifest_sha256: [object_byte.wrapping_add(1); 32],
-                    },
+                representation: remanence_state::ObjectRecoveryFixtureRepresentation::Plaintext {
+                    manifest_first_chunk_lba: 1,
+                    manifest_size_bytes: 1,
+                    manifest_chunk_count: 1,
+                    manifest_sha256: [object_byte.wrapping_add(1); 32],
+                },
             },
         }],
         scheme: None,
@@ -2808,7 +2806,7 @@ fn startup_replay_restores_pending_automatic_finalization_through_replica_c() {
     let replica_c = intent.layout.components[4];
     let mut completed_intent = intent.clone();
     completed_intent.recovery_required = false;
-    let terminal = remanence_state::CheckpointJournalRecord {
+    let terminal = remanence_state::CommitFixture {
         ordinal: checkpoint.ordinal + 1,
         committed_object_count: checkpoint.committed_object_count,
         eod_partition: intent.layout.partition,
@@ -2823,8 +2821,8 @@ fn startup_replay_restores_pending_automatic_finalization_through_replica_c() {
         objects: Vec::new(),
         scheme: checkpoint.scheme.clone(),
         object_tape_file_bundles: Vec::new(),
-        barrier_bundle: Some(remanence_parity::CommittedBundle {
-            kind: remanence_parity::CommittedBundleKind::TerminalComponent,
+        barrier_bundle: Some(remanence_parity::FileRowsReport {
+            kind: remanence_parity::FileRowsKind::TerminalComponent,
             entries: vec![remanence_parity::TapeFileEntry {
                 tape_file_number: replica_c.tape_file_number,
                 kind: remanence_parity::TapeFileKind::TapeIndexReplica,
@@ -3255,7 +3253,7 @@ fn populated_state() -> ApiState {
                 scheme: Some(scheme),
                 journal_offset_bytes: 99,
             },
-            &CommittedState {
+            &FileRowsState {
                 entries: vec![
                     TapeFileEntry {
                         tape_file_number: 4,
@@ -3397,8 +3395,8 @@ fn populated_state_with_file_catalog() -> ApiState {
                 scheme: Some(scheme),
                 journal_offset_bytes: 99,
             },
-            &(&CommittedBundle {
-                kind: CommittedBundleKind::Object,
+            &(&FileRowsReport {
+                kind: FileRowsKind::Object,
                 entries: vec![TapeFileEntry {
                     tape_file_number: 4,
                     kind: TapeFileKind::Object,

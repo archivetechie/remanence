@@ -7,6 +7,7 @@
 //! filemark, zero-count barrier, and observed position.
 
 use crate::error::ParityError;
+use crate::file_rows::{FileRowsKind, FileRowsReport, TapeFileEntry};
 use crate::filemark_map::TapeFileKind;
 use crate::index_separation::{
     parse_index_separation_footer, parse_index_separation_header, plan_index_separation,
@@ -14,7 +15,6 @@ use crate::index_separation::{
     IndexSeparationError, IndexSeparationInteriorBlockSource, IndexSeparationObservation,
     IndexSeparationPlan, DEFAULT_INDEX_SEPARATION_BYTES,
 };
-use crate::journal::{CommittedBundle, CommittedBundleKind, TapeFileEntry};
 use crate::raw::{
     locate_physical_exact, raw_read_error_proves_damage, PhysicalPositionHint, RawReadOutcome,
     RawTapeSink, RawTapeSource, RawWriteOutcome,
@@ -527,10 +527,7 @@ pub struct TerminalComponentCommit {
     /// start on rewritable media.
     pub rewrote_torn_component: bool,
     /// Exact sink-journal record the callback must durably reconcile/append.
-    pub journal_bundle: CommittedBundle,
-    /// Canonical empty watermark record the callback appends immediately after
-    /// [`Self::journal_bundle`] and before advancing checkpoint progress.
-    pub checkpoint_bundle: CommittedBundle,
+    pub journal_bundle: FileRowsReport,
     /// Actual durable publication outcomes returned by the authority callback.
     pub publication: crate::authority::PublicationReceipt,
 }
@@ -812,12 +809,6 @@ where
             "complete progress unexpectedly has a next component",
         ))?;
     let journal_bundle = terminal_component_bundle(plan, component)?;
-    let checkpoint_bundle = CommittedBundle {
-        kind: CommittedBundleKind::CheckpointedThrough,
-        entries: Vec::new(),
-        highest_protected_ordinal: journal_bundle.highest_protected_ordinal,
-        total_committed_ordinals: journal_bundle.total_committed_ordinals,
-    };
     let mut commit = TerminalComponentCommit {
         previous_progress: progress,
         next_progress,
@@ -826,7 +817,6 @@ where
         reconciled_existing_component,
         rewrote_torn_component,
         journal_bundle,
-        checkpoint_bundle,
         publication: crate::authority::PublicationReceipt::default(),
     };
     authority
@@ -959,7 +949,7 @@ fn validate_position(
 pub fn terminal_component_bundle(
     plan: &TerminalTripleWritePlan,
     component: TerminalTailComponentPlan,
-) -> Result<CommittedBundle, TerminalTailWriteError> {
+) -> Result<FileRowsReport, TerminalTailWriteError> {
     plan.validate()?;
     if !plan
         .edition
@@ -982,8 +972,8 @@ pub fn terminal_component_bundle(
             plan.separations[usize::from(component.ordinal - 1)].descriptor_digest
         }
     };
-    Ok(CommittedBundle {
-        kind: CommittedBundleKind::TerminalComponent,
+    Ok(FileRowsReport {
+        kind: FileRowsKind::TerminalComponent,
         entries: vec![TapeFileEntry {
             tape_file_number: component.planned_tape_file_number,
             kind,
@@ -1493,17 +1483,10 @@ mod tests {
         for expected_index in 0..TERMINAL_TAIL_COMPONENT_COUNT {
             let commit = advance_one(&mut sink, &mut authority, &plan);
             assert_eq!(commit.component, plan.component(expected_index));
-            assert_eq!(
-                commit.journal_bundle.kind,
-                CommittedBundleKind::TerminalComponent
-            );
+            assert_eq!(commit.journal_bundle.kind, FileRowsKind::TerminalComponent);
             assert_eq!(
                 commit.journal_bundle,
                 terminal_component_bundle(&plan, commit.component).unwrap()
-            );
-            assert_eq!(
-                commit.checkpoint_bundle.kind,
-                CommittedBundleKind::CheckpointedThrough
             );
         }
         assert_eq!(authority.progress, TerminalTailProgress::AfterReplicaC);

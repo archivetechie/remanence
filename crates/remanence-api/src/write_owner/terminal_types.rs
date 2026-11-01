@@ -360,9 +360,8 @@ pub(super) const fn completed_terminal_component_count(
 
 pub(super) fn reconcile_terminal_component_host_authority(
     index: &mut CatalogIndex,
-    checkpoint: &mut remanence_state::TapeAuthorityLease,
     spec: &TerminalFinalizeSpec,
-    mut intent: remanence_state::authority::AuthorityFinalization,
+    intent: remanence_state::authority::AuthorityFinalization,
     plan: &TerminalTripleWritePlan,
     journal: &mut dyn remanence_parity::authority::StructuralAuthority,
 ) -> Result<remanence_state::authority::AuthorityFinalization, Status> {
@@ -382,72 +381,27 @@ pub(super) fn reconcile_terminal_component_host_authority(
             Ok(component)
         })
         .collect::<Result<Vec<_>, Status>>()?;
-    let relation = journal
+    journal
         .component_relation(completed_terminal_component_count(intent.progress), &transitions)
         .map_err(|error| {
             Status::failed_precondition(format!(
                 "terminal checkpoint/sink-journal authority disagreement before media motion: {error}"
             ))
         })?;
-    if relation == remanence_parity::TerminalComponentAuthorityRelation::Aligned {
-        // The checkpoint journal is commit authority; SQLite may be one step
-        // behind after a crash between its fsync and the projection update.
-        // Repair that cache before selecting or moving to another component.
-        index
-            .project_terminal_finalization(TerminalFinalizationProjectionInput {
-                tape_uuid: spec.tape_uuid,
-                trigger: spec.trigger,
-                operation_id: spec.operation_id,
-                progress: intent.progress,
-                edition_digest: intent.edition_digest,
-                layout_digest: intent.layout.layout_digest,
-                outcome: if intent.recovery_required {
-                    TerminalFinalizationOutcome::RecoveryRequired
-                } else {
-                    TerminalFinalizationOutcome::InProgress
-                },
-                updated_at_utc: None,
-            })
-            .map_err(crate::status_from_state_error)?;
-        return Ok(intent);
-    }
-
-    let previous = parity_progress_from_state(intent.progress);
-    let component_index = previous.next_component_index().ok_or_else(|| {
-        Status::failed_precondition(
-            "sink journal is ahead of already-complete terminal checkpoint progress",
-        )
-    })?;
-    let component = transitions.get(component_index).ok_or_else(|| {
-        Status::internal("terminal authority relation selected an impossible component")
-    })?;
-    journal
-        .publish_terminal_component(component)
-        .map_err(|error| {
-            Status::failed_precondition(format!(
-                "reconcile one-transition-ahead terminal sink journal: {error}"
-            ))
-        })?;
-    let next = previous.successor().ok_or_else(|| {
-        Status::internal("one-transition-ahead terminal authority has no successor")
-    })?;
-    let next_state = state_progress_from_parity(next);
-    intent = checkpoint
-        .advance_finalization(intent.progress, next_state)
-        .map_err(|error| {
-            Status::failed_precondition(format!(
-                "reconcile terminal checkpoint progress from sink journal: {error}"
-            ))
-        })?;
+    // Repair SQLite from the validated native component prefix before media motion.
     index
         .project_terminal_finalization(TerminalFinalizationProjectionInput {
             tape_uuid: spec.tape_uuid,
             trigger: spec.trigger,
             operation_id: spec.operation_id,
-            progress: next_state,
+            progress: intent.progress,
             edition_digest: intent.edition_digest,
             layout_digest: intent.layout.layout_digest,
-            outcome: TerminalFinalizationOutcome::InProgress,
+            outcome: if intent.recovery_required {
+                TerminalFinalizationOutcome::RecoveryRequired
+            } else {
+                TerminalFinalizationOutcome::InProgress
+            },
             updated_at_utc: None,
         })
         .map_err(crate::status_from_state_error)?;
@@ -456,16 +410,13 @@ pub(super) fn reconcile_terminal_component_host_authority(
 
 pub(super) fn reconcile_and_authorize_parity_resume(
     index: &mut CatalogIndex,
-    checkpoint: &mut remanence_state::TapeAuthorityLease,
     spec: &TerminalFinalizeSpec,
     selected: &SelectedTape,
     intent: remanence_state::authority::AuthorityFinalization,
     plan: &TerminalTripleWritePlan,
     journal: &mut dyn remanence_parity::authority::StructuralAuthority,
 ) -> Result<remanence_state::authority::AuthorityFinalization, Status> {
-    let intent = reconcile_terminal_component_host_authority(
-        index, checkpoint, spec, intent, plan, journal,
-    )?;
+    let intent = reconcile_terminal_component_host_authority(index, spec, intent, plan, journal)?;
     authorize_terminal_intent_capacity(
         index,
         spec,

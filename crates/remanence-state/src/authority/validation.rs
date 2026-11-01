@@ -5,14 +5,6 @@ use remanence_parity::authority::{FilePublication, FilePurpose, SidecarProvenanc
 #[error("{0}")]
 pub(crate) struct CommitShapeError(String);
 
-#[derive(Debug)]
-pub(crate) struct ValidatedCommitLayout<'a> {
-    // Retained for the full-record legacy fixture projector; production only
-    // needs successful layout validation. Remove with the B4 codec fixtures.
-    #[cfg_attr(not(any(test, feature = "fixtures")), allow(dead_code))]
-    pub(crate) last_tape_file: &'a remanence_parity::TapeFileEntry,
-}
-
 fn barrier_bundle_shape_error(detail: impl Into<String>) -> CommitShapeError {
     CommitShapeError(detail.into())
 }
@@ -21,7 +13,7 @@ fn barrier_bundle_shape_error(detail: impl Into<String>) -> CommitShapeError {
 /// The host encoder does not participate in catalog projection.
 pub(crate) fn validate_parity_barrier_bundles(
     record: &super::AuthorityCommit,
-) -> Result<ValidatedCommitLayout<'_>, CommitShapeError> {
+) -> Result<(), CommitShapeError> {
     if record.scheme.is_none() {
         return Err(barrier_bundle_shape_error(
             "parity bundle validation requires a parity scheme",
@@ -215,7 +207,7 @@ pub(crate) fn validate_parity_barrier_bundles(
         )));
     }
 
-    Ok(ValidatedCommitLayout { last_tape_file })
+    Ok(())
 }
 
 fn validate_next_bundle_file(

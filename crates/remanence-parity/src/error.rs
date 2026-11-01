@@ -7,7 +7,7 @@
 use remanence_library::TapeIoError;
 
 use crate::capacity::CapacityReserveCause;
-use crate::journal::JournalError;
+use crate::file_rows::JournalError;
 use crate::model::StripeAddress;
 use crate::raw::PhysicalPositionHint;
 

@@ -27,8 +27,8 @@ use super::prepare::{
 use super::staging::{run_counted_fenced_staged_transfer, CountingBlockSink};
 #[cfg(test)]
 use remanence_parity::{
-    BlockSinkRawTapeSink, CommittedBundle, CommittedBundleKind, CommittedState, JournalError,
-    ParityScheme, ParitySink, TapeReportPublisher,
+    BlockSinkRawTapeSink, FileRowsKind, FileRowsReport, FileRowsState, JournalError, ParityScheme,
+    ParitySink, TapeReportPublisher,
 };
 #[cfg(test)]
 use remanence_state::{CatalogIndex, TapePoolConfig};
@@ -224,7 +224,7 @@ pub(crate) fn with_overlap_sink<R>(
 #[cfg(test)]
 pub(crate) struct PerObjectTestJournal {
     pub(crate) tape_uuid: [u8; 16],
-    pub(crate) bundles: Vec<CommittedBundle>,
+    pub(crate) bundles: Vec<FileRowsReport>,
 }
 
 #[cfg(test)]
@@ -251,21 +251,21 @@ impl TapeReportPublisher for PerObjectTestJournal {
         Ok(())
     }
 
-    fn load_committed(&self) -> Result<CommittedState, JournalError> {
+    fn load_committed(&self) -> Result<FileRowsState, JournalError> {
         let retained_end = self
             .bundles
             .iter()
-            .rposition(|bundle| bundle.kind == CommittedBundleKind::CheckpointedThrough)
+            .rposition(|bundle| bundle.kind == FileRowsKind::FixtureBoundary)
             .map_or(0, |index| index + 1);
         let retained = &self.bundles[..retained_end];
         let last = retained
             .iter()
             .rev()
-            .find(|bundle| bundle.kind != CommittedBundleKind::CheckpointedThrough);
-        Ok(CommittedState {
+            .find(|bundle| bundle.kind != FileRowsKind::FixtureBoundary);
+        Ok(FileRowsState {
             entries: retained
                 .iter()
-                .filter(|bundle| bundle.kind != CommittedBundleKind::CheckpointedThrough)
+                .filter(|bundle| bundle.kind != FileRowsKind::FixtureBoundary)
                 .flat_map(|bundle| bundle.entries.iter().cloned())
                 .collect(),
             highest_protected_ordinal: last.map_or(0, |bundle| bundle.highest_protected_ordinal),

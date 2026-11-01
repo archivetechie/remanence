@@ -309,11 +309,11 @@ fn write_durable_new_json(path: &Path, value: &Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use remanence_state::CheckpointJournalRecord;
+    use remanence_state::CommitFixture;
     use remanence_state::{
-        CheckpointObjectProjection, CheckpointObjectRecoveryRepresentation,
-        CheckpointObjectRecoveryRow, NativeObjectCopyProjectionInput,
-        NativeObjectFileProjectionInput, NativeObjectProjectionInput,
+        NativeObjectCopyProjectionInput, NativeObjectFileProjectionInput,
+        NativeObjectProjectionInput, ObjectProjectionFixture, ObjectRecoveryFixture,
+        ObjectRecoveryFixtureRepresentation,
     };
 
     #[test]
@@ -331,7 +331,7 @@ mod tests {
             nonce: Uuid::new_v4(),
             evidence_path: temp.path().join("evidence.json"),
         };
-        let record = CheckpointJournalRecord {
+        let record = CommitFixture {
             ordinal: 7,
             committed_object_count: 1,
             eod_partition: 0,
@@ -340,7 +340,7 @@ mod tests {
             batch_id: [0x33; 16],
             next_tape_file_number: 2,
             block_size: 256 * 1024,
-            objects: vec![CheckpointObjectProjection {
+            objects: vec![ObjectProjectionFixture {
                 object: NativeObjectProjectionInput {
                     object_id: object_id.clone(),
                     caller_object_id: Some(plan.caller_object_id.clone()),
@@ -379,11 +379,11 @@ mod tests {
                 block_count: 1,
                 fresh_tape: true,
                 total_committed_ordinals: 1,
-                object_recovery_row: CheckpointObjectRecoveryRow {
+                object_recovery_row: ObjectRecoveryFixture {
                     tape_file_number: 1,
                     stored_block_count: 1,
                     object_id: object_id.clone().into_bytes(),
-                    representation: CheckpointObjectRecoveryRepresentation::Plaintext {
+                    representation: ObjectRecoveryFixtureRepresentation::Plaintext {
                         manifest_first_chunk_lba: 1,
                         manifest_size_bytes: 1,
                         manifest_chunk_count: 1,

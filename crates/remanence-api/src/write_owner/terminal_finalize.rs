@@ -910,7 +910,6 @@ pub(crate) fn preflight_manual_finalize_cancellable(
                             checkpoint.finish_structural_scope();
                             reconcile_and_authorize_parity_resume(
                                 index,
-                                checkpoint,
                                 &spec,
                                 &selected,
                                 intent,
@@ -1256,7 +1255,6 @@ pub(crate) fn preflight_automatic_terminal_completion(
                     checkpoint.finish_structural_scope();
                     reconcile_and_authorize_parity_resume(
                         index,
-                        checkpoint,
                         &spec,
                         selected,
                         intent,
@@ -1663,18 +1661,12 @@ pub(super) fn finalize_terminal_with_parity_journal(
             )
         }
     };
-    // Before any terminal-prefix/component positioning or write, require the
-    // checkpoint intent and sink journal to name the same canonical component
-    // history. The only admissible crash skew is one exact barrier-proved sink
-    // transition ahead, which is reconciled entirely in host durability first.
+    // Prove the native component prefix against the immutable plan and repair
+    // its SQLite projection before terminal positioning or capacity admission.
     let intent = if resuming_existing_intent {
-        reconcile_and_authorize_parity_resume(
-            index, checkpoint, spec, selected, intent, &plan, journal,
-        )?
+        reconcile_and_authorize_parity_resume(index, spec, selected, intent, &plan, journal)?
     } else {
-        reconcile_terminal_component_host_authority(
-            index, checkpoint, spec, intent, &plan, journal,
-        )?
+        reconcile_terminal_component_host_authority(index, spec, intent, &plan, journal)?
     };
     if let Some(request) = manual_request {
         record_manual_finalize_request(index, cfg, request)?;

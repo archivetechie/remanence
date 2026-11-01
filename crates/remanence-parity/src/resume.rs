@@ -15,11 +15,11 @@ use sha2::{Digest, Sha256};
 use crate::codec::ReedSolomonCodec;
 use crate::durable::DurableBoundaryState;
 use crate::error::ParityError;
-use crate::filemark_map::{FilemarkMap, TapeFileKind, TapeFileMapEntry};
-use crate::journal::{
-    validate_committed_bundle_shape, BoundedJournalReplayMetrics, CommittedBundle,
-    CommittedBundleKind, FrozenFileRows, JournalError, TapeFileEntry,
+use crate::file_rows::{
+    validate_committed_bundle_shape, BoundedJournalReplayMetrics, FileRowsKind, FileRowsReport,
+    FrozenFileRows, JournalError, TapeFileEntry,
 };
+use crate::filemark_map::{FilemarkMap, TapeFileKind, TapeFileMapEntry};
 use crate::model::ParityScheme;
 use crate::parity_map::{
     encode_parity_map_tape_file, ParityMapPayload, SidecarEpochDirectory,
@@ -727,8 +727,8 @@ pub fn plan_checkpointed_terminal_index_close(
             tail_start_lba: start_lba,
             parity_map_tape_file_number: None,
             sidecar_directory_entries: Vec::new(),
-            committed_bundle: CommittedBundle {
-                kind: CommittedBundleKind::TerminalPrefix,
+            committed_bundle: FileRowsReport {
+                kind: FileRowsKind::TerminalPrefix,
                 entries: Vec::new(),
                 highest_protected_ordinal: summary.highest_protected_ordinal,
                 total_committed_ordinals: summary.total_committed_ordinals,
@@ -805,8 +805,8 @@ pub fn plan_checkpointed_terminal_index_close(
         canonical_metadata_hash: Some(encoded.header.payload_sha256),
         object_recovery_row: None,
     };
-    let committed_bundle = CommittedBundle {
-        kind: CommittedBundleKind::TerminalPrefix,
+    let committed_bundle = FileRowsReport {
+        kind: FileRowsKind::TerminalPrefix,
         entries: vec![entry],
         highest_protected_ordinal: summary.highest_protected_ordinal,
         total_committed_ordinals: summary.total_committed_ordinals,
@@ -2778,8 +2778,8 @@ mod tests {
     /// Every content class keeps its complete journal diagnostic at resume.
     #[test]
     fn resume_record_mapping_content_classes() {
-        let invalid_shape = validate_committed_bundle_shape(&CommittedBundle {
-            kind: CommittedBundleKind::Object,
+        let invalid_shape = validate_committed_bundle_shape(&FileRowsReport {
+            kind: FileRowsKind::Object,
             entries: Vec::new(),
             highest_protected_ordinal: 0,
             total_committed_ordinals: 0,
@@ -2845,8 +2845,9 @@ mod tests {
         assert_eq!(resume_record_result(Ok(42)).unwrap(), 42);
     }
 
+    use crate::authority::StructuralAuthority;
+    use crate::file_rows::{FileRowsReport, TapeFileEntry};
     use crate::filemark_map::TapeFileMapEntry;
-    use crate::journal::{CommittedBundle, TapeFileEntry};
     use crate::model::SchemeId;
     use crate::raw::SpaceFilemarksOutcome;
     use remanence_library::{TapePosition, WriteFilemarksOutcome};
@@ -2855,13 +2856,16 @@ mod tests {
     use std::rc::Rc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    const RESUME_TEST_BLOCK_SIZE: u32 = 256;
+    const RESUME_TEST_BLOCK_SIZE: u32 = 256 * 1024;
     static TERMINAL_JOURNAL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     fn terminal_journal_directory(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "remanence-resume-{label}-{}-{}",
-            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
             TERMINAL_JOURNAL_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ))
     }
@@ -4668,14 +4672,14 @@ mod tests {
     }
 
     fn append_checkpointed_terminal_fixture(
-        journal: &mut crate::authority::TapeRowAuthority,
+        journal: &mut crate::authority::native_fixture_tests::RowAuthority,
         object_count: u64,
     ) {
         assert_eq!(object_count % 12, 0, "fixture ends at an epoch boundary");
         journal
             .publish_fixture(&crate::authority::ShadowPublication::one(
-                CommittedBundle {
-                    kind: CommittedBundleKind::BotBootstrap,
+                FileRowsReport {
+                    kind: FileRowsKind::BotBootstrap,
                     entries: vec![journal_entry(0, TapeFileKind::Bootstrap, 1, None, None)],
                     highest_protected_ordinal: 0,
                     total_committed_ordinals: 0,
@@ -4708,8 +4712,8 @@ mod tests {
             }
             journal
                 .publish_fixture(&crate::authority::ShadowPublication::one(
-                    CommittedBundle {
-                        kind: CommittedBundleKind::Object,
+                    FileRowsReport {
+                        kind: FileRowsKind::Object,
                         entries,
                         highest_protected_ordinal: if closes_epoch {
                             total
@@ -4724,8 +4728,8 @@ mod tests {
         }
         journal
             .publish_fixture(&crate::authority::ShadowPublication::one(
-                CommittedBundle {
-                    kind: CommittedBundleKind::CheckpointedThrough,
+                FileRowsReport {
+                    kind: FileRowsKind::FixtureBoundary,
                     entries: Vec::new(),
                     highest_protected_ordinal: object_count,
                     total_committed_ordinals: object_count,
@@ -4783,7 +4787,7 @@ mod tests {
         let (identity, clock_calls) = crate::writer_identity::advancing_test_identity();
         let tape_uuid = [0x91; 16];
         let path = terminal_journal_directory("bounded-terminal-exact");
-        let mut journal = crate::authority::fixtures::RowAuthorityBuilder::new(
+        let mut journal = crate::authority::native_fixture_tests::RowAuthorityBuilder::new(
             &path,
             tape_uuid,
             RESUME_TEST_BLOCK_SIZE,
@@ -4830,7 +4834,7 @@ mod tests {
                 crate::authority::PublicationDisposition::Pending
             );
         }
-        expected_units.extend(crate::authority::fixtures::appended_legacy_units(
+        expected_units.extend(crate::authority::fixtures::published_fixture_reports(
             &result.publication,
         ));
         assert_eq!(result.publication.items.len(), 1);
@@ -4882,14 +4886,8 @@ mod tests {
             clock_calls.load(std::sync::atomic::Ordering::SeqCst),
             calls_before
         );
-        let checkpoint = CommittedBundle {
-            kind: CommittedBundleKind::CheckpointedThrough,
-            entries: Vec::new(),
-            highest_protected_ordinal: bounded.committed_bundle.highest_protected_ordinal,
-            total_committed_ordinals: bounded.committed_bundle.total_committed_ordinals,
-        };
         assert!(!journal
-            .terminal_prefix_transition_is_durable(&bounded.committed_bundle, &checkpoint)
+            .prefix_is_durable(&(&bounded.committed_bundle).try_into().unwrap())
             .expect("inspect durable bounded transition"));
     }
 
@@ -4898,7 +4896,7 @@ mod tests {
         const OBJECT_COUNT: u64 = 384;
         let tape_uuid = [0x92; 16];
         let path = terminal_journal_directory("bounded-terminal-high-count");
-        let mut journal = crate::authority::fixtures::RowAuthorityBuilder::new(
+        let mut journal = crate::authority::native_fixture_tests::RowAuthorityBuilder::new(
             &path,
             tape_uuid,
             RESUME_TEST_BLOCK_SIZE,
@@ -4913,7 +4911,8 @@ mod tests {
         let summary = checked_checkpointed_terminal_close_summary(&snapshot)
             .expect("derive high-count terminal summary");
 
-        assert_eq!(summary.row_replay_passes, 1);
+        // Native snapshots traverse rows twice (validation fold and summary).
+        assert_eq!(summary.row_replay_passes, 2);
         assert_eq!(summary.total_committed_ordinals, OBJECT_COUNT);
         assert_eq!(summary.highest_protected_ordinal, OBJECT_COUNT);
         assert_eq!(
@@ -4945,7 +4944,7 @@ mod tests {
     fn high_object_count_resume_summary_and_sink_stay_bounded() {
         const OBJECT_COUNT: u64 = 1_200;
         let tape_uuid = [0x95; 16];
-        let mut journal = crate::authority::fixtures::RowAuthorityBuilder::new(
+        let mut journal = crate::authority::native_fixture_tests::RowAuthorityBuilder::new(
             terminal_journal_directory("bounded-resume-high-count"),
             tape_uuid,
             RESUME_TEST_BLOCK_SIZE,
@@ -4965,8 +4964,9 @@ mod tests {
         assert!(summary.bot_bootstrap_committed);
         assert_eq!(summary.next_parity_map_sequence, 0);
         assert!(summary.open_epoch_object_extents.is_empty());
-        assert_eq!(summary.replay_metrics.validation_passes, 1);
-        assert_eq!(summary.replay_metrics.row_replay_passes, 1);
+        // A writer-owned native snapshot already carries the validated fold.
+        assert_eq!(summary.replay_metrics.validation_passes, 0);
+        assert_eq!(summary.replay_metrics.row_replay_passes, 2);
         assert!(summary.replay_metrics.peak_live_entry_count <= 4);
         assert!(summary.replay_metrics.peak_live_entry_count < OBJECT_COUNT);
         assert_eq!(
@@ -5021,11 +5021,11 @@ mod tests {
         );
     }
 
-    /// Framed commit-record contents can overflow the append sum without a codec failure.
+    /// The native publication boundary refuses overflowing physical extents.
     #[test]
     fn bounded_resume_commit_record_append_overflow_is_resume_append() {
         let path = terminal_journal_directory("append-overflow");
-        let mut journal = crate::authority::fixtures::RowAuthorityBuilder::new(
+        let mut journal = crate::authority::native_fixture_tests::RowAuthorityBuilder::new(
             &path,
             [0x96; 16],
             RESUME_TEST_BLOCK_SIZE,
@@ -5035,8 +5035,8 @@ mod tests {
         .unwrap();
         journal
             .publish_fixture(&crate::authority::ShadowPublication::one(
-                CommittedBundle {
-                    kind: CommittedBundleKind::BotBootstrap,
+                FileRowsReport {
+                    kind: FileRowsKind::BotBootstrap,
                     entries: vec![journal_entry(0, TapeFileKind::Bootstrap, 1, None, None)],
                     highest_protected_ordinal: 0,
                     total_committed_ordinals: 0,
@@ -5046,8 +5046,8 @@ mod tests {
             .unwrap();
         journal
             .publish_fixture(&crate::authority::ShadowPublication::one(
-                CommittedBundle {
-                    kind: CommittedBundleKind::Object,
+                FileRowsReport {
+                    kind: FileRowsKind::Object,
                     entries: vec![
                         journal_entry(1, TapeFileKind::Object, 1, Some(0), None),
                         journal_entry(
@@ -5064,25 +5064,19 @@ mod tests {
                 .clone(),
             ))
             .unwrap();
-        journal
+        let error = journal
             .publish_fixture(&crate::authority::ShadowPublication::one(
-                CommittedBundle {
-                    kind: CommittedBundleKind::CheckpointedThrough,
+                FileRowsReport {
+                    kind: FileRowsKind::FixtureBoundary,
                     entries: Vec::new(),
                     highest_protected_ordinal: 1,
                     total_committed_ordinals: 1,
                 }
                 .clone(),
             ))
-            .unwrap();
-        let snapshot = journal.committed_snapshot_bounded().unwrap();
-        let error = checked_bounded_resume_summary(&snapshot).unwrap_err();
-        assert!(
-            matches!(error, ParityError::ResumeAppend(ref detail)
-            if detail == &JournalError::Codec("bounded resume append position overflows".into()).to_string()),
-            "{error:?}"
-        );
-        drop(snapshot);
+            .expect_err("native publication must reject an overflowing extent");
+        assert!(error.to_string().contains("extent overflow"), "{error}");
+        assert!(journal.committed_snapshot_bounded().is_err());
         drop(journal);
         std::fs::remove_dir_all(path).unwrap();
     }
@@ -5139,29 +5133,29 @@ mod tests {
         }
         let scheme = crate::default_scheme();
         let dir = tempfile::tempdir().unwrap();
-        let mut journal = crate::authority::fixtures::RowAuthorityBuilder::new(
+        let mut journal = crate::authority::native_fixture_tests::RowAuthorityBuilder::new(
             dir.path().join("counts"),
             [7; 16],
-            256,
+            256 * 1024,
             scheme.clone(),
         )
         .build()
         .unwrap();
         for bundle in [
-            CommittedBundle {
-                kind: CommittedBundleKind::BotBootstrap,
+            FileRowsReport {
+                kind: FileRowsKind::BotBootstrap,
                 entries: vec![journal_entry(0, TapeFileKind::Bootstrap, 1, None, None)],
                 highest_protected_ordinal: 0,
                 total_committed_ordinals: 0,
             },
-            CommittedBundle {
-                kind: CommittedBundleKind::Object,
+            FileRowsReport {
+                kind: FileRowsKind::Object,
                 entries: vec![journal_entry(1, TapeFileKind::Object, 65535, Some(0), None)],
                 highest_protected_ordinal: 0,
                 total_committed_ordinals: 65535,
             },
-            CommittedBundle {
-                kind: CommittedBundleKind::CheckpointedThrough,
+            FileRowsReport {
+                kind: FileRowsKind::FixtureBoundary,
                 entries: vec![],
                 highest_protected_ordinal: 0,
                 total_committed_ordinals: 65535,
@@ -5193,7 +5187,7 @@ mod tests {
     #[test]
     fn bounded_resume_retains_and_rereads_only_the_open_epoch() {
         let tape_uuid = [0x96; 16];
-        let mut journal = crate::authority::fixtures::RowAuthorityBuilder::new(
+        let mut journal = crate::authority::native_fixture_tests::RowAuthorityBuilder::new(
             terminal_journal_directory("bounded-resume-open-epoch"),
             tape_uuid,
             RESUME_TEST_BLOCK_SIZE,
@@ -5203,8 +5197,8 @@ mod tests {
         .expect("open bounded open-epoch journal");
         journal
             .publish_fixture(&crate::authority::ShadowPublication::one(
-                CommittedBundle {
-                    kind: CommittedBundleKind::BotBootstrap,
+                FileRowsReport {
+                    kind: FileRowsKind::BotBootstrap,
                     entries: vec![journal_entry(0, TapeFileKind::Bootstrap, 1, None, None)],
                     highest_protected_ordinal: 0,
                     total_committed_ordinals: 0,
@@ -5214,8 +5208,8 @@ mod tests {
             .expect("commit BOT Bootstrap");
         journal
             .publish_fixture(&crate::authority::ShadowPublication::one(
-                CommittedBundle {
-                    kind: CommittedBundleKind::Object,
+                FileRowsReport {
+                    kind: FileRowsKind::Object,
                     entries: vec![
                         journal_entry(1, TapeFileKind::Object, 12, Some(0), None),
                         journal_entry(2, TapeFileKind::ParitySidecar, 11, None, Some((0, 0, 12))),
@@ -5228,8 +5222,8 @@ mod tests {
             .expect("commit protected Object");
         journal
             .publish_fixture(&crate::authority::ShadowPublication::one(
-                CommittedBundle {
-                    kind: CommittedBundleKind::Object,
+                FileRowsReport {
+                    kind: FileRowsKind::Object,
                     entries: vec![journal_entry(3, TapeFileKind::Object, 3, Some(12), None)],
                     highest_protected_ordinal: 12,
                     total_committed_ordinals: 15,
@@ -5239,8 +5233,8 @@ mod tests {
             .expect("commit open-epoch Object");
         journal
             .publish_fixture(&crate::authority::ShadowPublication::one(
-                CommittedBundle {
-                    kind: CommittedBundleKind::CheckpointedThrough,
+                FileRowsReport {
+                    kind: FileRowsKind::FixtureBoundary,
                     entries: Vec::new(),
                     highest_protected_ordinal: 12,
                     total_committed_ordinals: 15,
@@ -5268,7 +5262,10 @@ mod tests {
 
         let mut bounded_source = RecordingResumeRawSource::default();
         for offset in 0..3u64 {
-            let block = vec![u8::try_from(offset + 1).expect("small test byte"); 256];
+            let block = vec![
+                u8::try_from(offset + 1).expect("small test byte");
+                RESUME_TEST_BLOCK_SIZE as usize
+            ];
             bounded_source = bounded_source.with_block(27 + offset, block);
         }
         let bounded_rebuild = rebuild_open_epoch_from_bounded_summary(
@@ -5296,7 +5293,7 @@ mod tests {
     #[test]
     fn bounded_resume_fails_closed_on_bot_orphan_and_epoch_discontinuity() {
         let tape_uuid = [0x97; 16];
-        let mut orphan = crate::authority::fixtures::RowAuthorityBuilder::new(
+        let mut orphan = crate::authority::native_fixture_tests::RowAuthorityBuilder::new(
             terminal_journal_directory("bounded-resume-bot-orphan"),
             tape_uuid,
             RESUME_TEST_BLOCK_SIZE,
@@ -5306,8 +5303,8 @@ mod tests {
         .expect("open BOT-orphan journal");
         orphan
             .publish_fixture(&crate::authority::ShadowPublication::one(
-                CommittedBundle {
-                    kind: CommittedBundleKind::BotBootstrap,
+                FileRowsReport {
+                    kind: FileRowsKind::BotBootstrap,
                     entries: vec![journal_entry(0, TapeFileKind::Bootstrap, 1, None, None)],
                     highest_protected_ordinal: 0,
                     total_committed_ordinals: 0,
@@ -5324,11 +5321,11 @@ mod tests {
         assert!(
             orphan_error
                 .to_string()
-                .contains("beyond its last checkpoint"),
+                .contains("unclosed structural fixture claims"),
             "{orphan_error}"
         );
 
-        let mut discontinuous = crate::authority::fixtures::RowAuthorityBuilder::new(
+        let mut discontinuous = crate::authority::native_fixture_tests::RowAuthorityBuilder::new(
             terminal_journal_directory("bounded-resume-epoch-gap"),
             [0x98; 16],
             RESUME_TEST_BLOCK_SIZE,
@@ -5338,8 +5335,8 @@ mod tests {
         .expect("open epoch-gap journal");
         discontinuous
             .publish_fixture(&crate::authority::ShadowPublication::one(
-                CommittedBundle {
-                    kind: CommittedBundleKind::BotBootstrap,
+                FileRowsReport {
+                    kind: FileRowsKind::BotBootstrap,
                     entries: vec![journal_entry(0, TapeFileKind::Bootstrap, 1, None, None)],
                     highest_protected_ordinal: 0,
                     total_committed_ordinals: 0,
@@ -5349,8 +5346,8 @@ mod tests {
             .expect("commit epoch-gap BOT");
         discontinuous
             .publish_fixture(&crate::authority::ShadowPublication::one(
-                CommittedBundle {
-                    kind: CommittedBundleKind::Object,
+                FileRowsReport {
+                    kind: FileRowsKind::Object,
                     entries: vec![
                         journal_entry(1, TapeFileKind::Object, 1, Some(0), None),
                         journal_entry(2, TapeFileKind::ParitySidecar, 11, None, Some((1, 0, 1))),
@@ -5361,40 +5358,36 @@ mod tests {
                 .clone(),
             ))
             .expect("commit discontinuous epoch label");
-        discontinuous
+        let error = discontinuous
             .publish_fixture(&crate::authority::ShadowPublication::one(
-                CommittedBundle {
-                    kind: CommittedBundleKind::CheckpointedThrough,
+                FileRowsReport {
+                    kind: FileRowsKind::FixtureBoundary,
                     entries: Vec::new(),
                     highest_protected_ordinal: 1,
                     total_committed_ordinals: 1,
                 }
                 .clone(),
             ))
-            .expect("commit epoch-gap watermark");
-        let snapshot = discontinuous
-            .committed_snapshot_bounded()
-            .expect("freeze discontinuous journal framing");
-        let error = checked_bounded_resume_summary(&snapshot)
-            .expect_err("discontinuous epoch labels must fail bounded resume");
+            .expect_err("native writer rejects discontinuous epoch labels");
         assert!(
-            error.to_string().contains("expected monotonic id 0"),
+            error.to_string().contains("sidecar coverage/epoch"),
             "{error}"
         );
+        assert!(discontinuous.committed_snapshot_bounded().is_err());
     }
 
     #[test]
     fn bounded_terminal_summary_rejects_open_epoch_and_structural_gap() {
         for (label, object_file, highest, expected) in [
             ("open-epoch", 1, 0, "open epoch"),
-            ("structural-gap", 2, 1, "not dense"),
+            ("structural-gap", 2, 0, "dense"),
         ] {
             let tape_uuid = if object_file == 1 {
                 [0x93; 16]
             } else {
                 [0x94; 16]
             };
-            let mut journal = crate::authority::fixtures::RowAuthorityBuilder::new(
+            let mut journal = crate::authority::native_fixture_tests::RowAuthorityBuilder::new(
                 terminal_journal_directory(label),
                 tape_uuid,
                 RESUME_TEST_BLOCK_SIZE,
@@ -5404,8 +5397,8 @@ mod tests {
             .expect("open rejection fixture journal");
             journal
                 .publish_fixture(&crate::authority::ShadowPublication::one(
-                    CommittedBundle {
-                        kind: CommittedBundleKind::BotBootstrap,
+                    FileRowsReport {
+                        kind: FileRowsKind::BotBootstrap,
                         entries: vec![journal_entry(0, TapeFileKind::Bootstrap, 1, None, None)],
                         highest_protected_ordinal: 0,
                         total_committed_ordinals: 0,
@@ -5415,8 +5408,8 @@ mod tests {
                 .expect("commit rejection BOT");
             journal
                 .publish_fixture(&crate::authority::ShadowPublication::one(
-                    CommittedBundle {
-                        kind: CommittedBundleKind::Object,
+                    FileRowsReport {
+                        kind: FileRowsKind::Object,
                         entries: vec![journal_entry(
                             object_file,
                             TapeFileKind::Object,
@@ -5430,17 +5423,22 @@ mod tests {
                     .clone(),
                 ))
                 .expect("commit rejection Object");
-            journal
-                .publish_fixture(&crate::authority::ShadowPublication::one(
-                    CommittedBundle {
-                        kind: CommittedBundleKind::CheckpointedThrough,
-                        entries: Vec::new(),
-                        highest_protected_ordinal: highest,
-                        total_committed_ordinals: 1,
-                    }
-                    .clone(),
-                ))
-                .expect("commit rejection checkpoint");
+            let closed = journal.publish_fixture(&crate::authority::ShadowPublication::one(
+                FileRowsReport {
+                    kind: FileRowsKind::FixtureBoundary,
+                    entries: Vec::new(),
+                    highest_protected_ordinal: highest,
+                    total_committed_ordinals: 1,
+                }
+                .clone(),
+            ));
+            if object_file != 1 {
+                let error = closed.expect_err("native publication rejects a structural gap");
+                assert!(error.to_string().contains(expected), "{error}");
+                assert!(journal.committed_snapshot_bounded().is_err());
+                continue;
+            }
+            closed.expect("commit open epoch");
             let snapshot = journal
                 .committed_snapshot_bounded()
                 .expect("freeze rejection authority");

@@ -17,6 +17,7 @@ pub use remanence_scsi as scsi;
 
 pub mod block_io;
 pub mod discovery;
+pub mod durability;
 pub mod endpoint;
 pub mod error;
 pub use endpoint::{DriveKey, MountEndpoint};

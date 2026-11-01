@@ -203,7 +203,8 @@ impl Store {
         index_path: &Path,
     ) -> Result<Self, StoreError> {
         let store = Self::paths(directory.as_ref(), header)?.bind_projection(index_path);
-        remanence_parity::validate_trusted_journal_volume(&store.path)?;
+        remanence_library::durability::validate_trusted_journal_volume(&store.path)
+            .map_err(remanence_parity::JournalError::from)?;
         Ok(store)
     }
     /// Hermetic fixtures alone may bypass local-volume policy.

@@ -38,10 +38,10 @@ use crate::capacity::{
 use crate::codec::ReedSolomonCodec;
 use crate::durable::DurableBoundaryState;
 use crate::error::ParityError;
+use crate::file_rows::{FileRowsKind, FileRowsReport, FrozenFileRows, TapeFileEntry};
 #[cfg(test)]
 use crate::filemark_map::FilemarkMap;
 use crate::filemark_map::{FilemarkMapBuilder, FilemarkMapDigest, TapeFileKind, TapeFileMapEntry};
-use crate::journal::{CommittedBundle, CommittedBundleKind, FrozenFileRows, TapeFileEntry};
 use crate::model::{FinalGeometry, ParityScheme};
 use crate::parity_map::{
     encode_parity_map_tape_file, parse_parity_map_tape_file, ParityMapPayload,
@@ -483,7 +483,7 @@ impl ObjectWriteSummary {
         })
     }
     #[doc(hidden)]
-    pub fn committed_bundle(&self) -> Result<CommittedBundle, ParityError> {
+    pub fn committed_bundle(&self) -> Result<FileRowsReport, ParityError> {
         let total_committed_ordinals_after = self
             .first_parity_data_ordinal
             .checked_add(self.data_block_count)
@@ -503,8 +503,8 @@ impl ObjectWriteSummary {
                 .iter()
                 .map(SidecarWriteSummary::tape_file_entry),
         );
-        Ok(CommittedBundle {
-            kind: CommittedBundleKind::Object,
+        Ok(FileRowsReport {
+            kind: FileRowsKind::Object,
             entries,
             highest_protected_ordinal: self.highest_protected_ordinal,
             total_committed_ordinals: total_committed_ordinals_after,
@@ -558,7 +558,7 @@ pub struct CheckpointResult {
     pub is_terminal: bool,
     /// Sidecar-only control/finish bundle made durable by this stop, if the
     /// barrier emitted a partial-epoch sidecar.
-    pub committed_bundle: Option<CommittedBundle>,
+    pub committed_bundle: Option<FileRowsReport>,
 }
 
 impl CheckpointResult {
@@ -595,7 +595,7 @@ pub struct TerminalPrefixCloseResult {
     /// Exact post-barrier physical cursor.
     pub used_tape_blocks: u64,
     /// Terminal-prefix journal bundle, containing no Bootstrap.
-    pub committed_bundle: CommittedBundle,
+    pub committed_bundle: FileRowsReport,
 }
 
 /// Pure deterministic terminal-prefix plan persisted before close motion.
@@ -616,7 +616,7 @@ pub struct TerminalPrefixPlan {
     /// Exact sidecar directory state after the planned prefix.
     pub sidecar_directory_entries: Vec<SidecarEpochDirectoryEntry>,
     /// Exact final-prefix rows and W/T values to persist as immutable intent.
-    pub committed_bundle: CommittedBundle,
+    pub committed_bundle: FileRowsReport,
 }
 
 /// Physical classification of a persisted terminal-prefix plan.
@@ -754,8 +754,8 @@ pub fn reconcile_terminal_prefix(
 }
 
 fn terminal_prefix_plan_is_well_formed(plan: &TerminalPrefixPlan) -> bool {
-    if plan.committed_bundle.kind != CommittedBundleKind::TerminalPrefix
-        || crate::journal::validate_committed_bundle_shape(&plan.committed_bundle).is_err()
+    if plan.committed_bundle.kind != FileRowsKind::TerminalPrefix
+        || crate::file_rows::validate_committed_bundle_shape(&plan.committed_bundle).is_err()
     {
         return false;
     }
@@ -1985,7 +1985,7 @@ impl<'a> ParitySink<'a> {
             .checked_add(1)
             .ok_or(ParityError::Invariant("committed Object count overflows"))?;
         summary.publication = self.pending_map_range(
-            CommittedBundleKind::Object,
+            FileRowsKind::Object,
             bundle_start,
             &summary.sidecars_emitted,
         )?;
@@ -2024,8 +2024,7 @@ impl<'a> ParitySink<'a> {
             false,
         )?;
         let tape_file_number = self.write_prepared_bootstrap(0, self.bootstrap_payload(digest)?)?;
-        let publication =
-            self.pending_map_range(CommittedBundleKind::BotBootstrap, bundle_start, &[])?;
+        let publication = self.pending_map_range(FileRowsKind::BotBootstrap, bundle_start, &[])?;
         Ok((tape_file_number, publication))
     }
 
@@ -2619,13 +2618,13 @@ impl<'a> ParitySink<'a> {
             Some(tape_file_number)
         };
         let tail_start_tape_file_number = projected_map.next_tape_file_number()?;
-        let committed_bundle = CommittedBundle {
-            kind: CommittedBundleKind::TerminalPrefix,
+        let committed_bundle = FileRowsReport {
+            kind: FileRowsKind::TerminalPrefix,
             entries,
             highest_protected_ordinal: projected_highest_protected,
             total_committed_ordinals: projected_map.total_data_ordinals()?,
         };
-        crate::journal::validate_committed_bundle_shape(&committed_bundle).map_err(|_| {
+        crate::file_rows::validate_committed_bundle_shape(&committed_bundle).map_err(|_| {
             ParityError::Invariant("planned terminal prefix violates sink-journal grammar")
         })?;
         Ok(TerminalPrefixPlan {
@@ -2863,7 +2862,7 @@ impl<'a> ParitySink<'a> {
             expected_plan.committed_bundle.clone()
         } else {
             self.journal_map_range_bundle(
-                CommittedBundleKind::TerminalPrefix,
+                FileRowsKind::TerminalPrefix,
                 bundle_start,
                 &sidecars_emitted,
             )?
@@ -2949,7 +2948,7 @@ impl<'a> ParitySink<'a> {
                 sense: Vec::new(),
             }));
         }
-        let kind = CommittedBundleKind::CheckpointSidecars;
+        let kind = FileRowsKind::CheckpointSidecars;
         let mut publication = PublicationReceipt::default();
         let committed_bundle = if sidecars_emitted.is_empty() {
             None
@@ -2980,7 +2979,7 @@ impl<'a> ParitySink<'a> {
     // catalog payloads after the shared barrier, then acknowledges the state.
     fn pending_map_range(
         &mut self,
-        kind: CommittedBundleKind,
+        kind: FileRowsKind,
         start_tape_file_number: u64,
         sidecars: &[SidecarWriteSummary],
     ) -> Result<PublicationReceipt, ParityError> {
@@ -2993,10 +2992,10 @@ impl<'a> ParitySink<'a> {
 
     fn journal_map_range_bundle(
         &self,
-        kind: CommittedBundleKind,
+        kind: FileRowsKind,
         start_tape_file_number: u64,
         sidecars: &[SidecarWriteSummary],
-    ) -> Result<CommittedBundle, ParityError> {
+    ) -> Result<FileRowsReport, ParityError> {
         let entries = self
             .filemark_map
             .session_entries_from(start_tape_file_number)?
@@ -3013,7 +3012,7 @@ impl<'a> ParitySink<'a> {
                 }
             })
             .collect::<Result<Vec<_>, ParityError>>()?;
-        let bundle = CommittedBundle {
+        let bundle = FileRowsReport {
             kind,
             entries,
             highest_protected_ordinal: self.highest_protected_ordinal,

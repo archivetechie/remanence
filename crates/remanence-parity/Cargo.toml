@@ -47,6 +47,7 @@ unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "warn"
 
 [dev-dependencies]
+remanence-state = { path = "../remanence-state", features = ["fixtures"] }
 remanence-parity = { path = ".", features = ["fixtures"] }
 remanence-chaos = { path = "../remanence-chaos" }
 serde_json = { workspace = true }

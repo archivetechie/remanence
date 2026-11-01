@@ -234,11 +234,11 @@ pub(crate) fn structural_writer_contract<W: TapeAuthorityWriter>(
 pub(crate) fn structural_fixture(
     id: [u8; 16],
 ) -> (
-    crate::CheckpointJournalRecord,
+    crate::CommitFixture,
     crate::TerminalFinalizationIntent,
     remanence_parity::authority::ShadowPublication,
 ) {
-    use remanence_parity::{CommittedBundle, CommittedBundleKind, TapeFileEntry, TapeFileMapEntry};
+    use remanence_parity::{FileRowsKind, FileRowsReport, TapeFileEntry, TapeFileMapEntry};
     let mut record = crate::checkpoint::tests::partial_epoch_parity_record(id);
     record.object_tape_file_bundles[0].entries[0].physical_start_hint = Some(2);
     record.barrier_bundle.as_mut().unwrap().entries[0].physical_start_hint = Some(6);
@@ -259,16 +259,16 @@ pub(crate) fn structural_fixture(
     plan.terminal_prefix = Some(prefix);
     let mut bot = TapeFileEntry::from_map_entry(TapeFileMapEntry::bootstrap(0, 1));
     bot.physical_start_hint = Some(0);
-    let mut bundles = vec![CommittedBundle {
-        kind: CommittedBundleKind::BotBootstrap,
+    let mut bundles = vec![FileRowsReport {
+        kind: FileRowsKind::BotBootstrap,
         entries: vec![bot],
         highest_protected_ordinal: 0,
         total_committed_ordinals: 0,
     }];
     bundles.extend(record.object_tape_file_bundles.clone());
     bundles.push(record.barrier_bundle.clone().unwrap());
-    bundles.push(CommittedBundle {
-        kind: CommittedBundleKind::CheckpointedThrough,
+    bundles.push(FileRowsReport {
+        kind: FileRowsKind::FixtureBoundary,
         entries: Vec::new(),
         highest_protected_ordinal: 3,
         total_committed_ordinals: 3,

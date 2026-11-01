@@ -787,7 +787,7 @@ fn parity_import_rejects_a_missing_log_and_validates_the_complete_log() {
     let destination = state.paths().journal_dir.join("tapes");
     let mut mount = backend(&mut state, &world, &lock, fault()).unwrap();
     let mut mounted = mount.mount(target()).unwrap();
-    let hidden = remanence_parity::authority::fixtures::hide_authority(&partner).unwrap();
+    let hidden = remanence_state::authority::row_fixtures::hide_authority(&partner).unwrap();
     assert!(mount.import_journals(&mut mounted, &from).is_err());
     assert!(!remanence_state::TapeAuthority::exists(&destination, UUID).unwrap());
     hidden.restore().unwrap();

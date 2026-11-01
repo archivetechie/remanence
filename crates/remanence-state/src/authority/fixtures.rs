@@ -71,7 +71,7 @@ impl AuthorityBuilder {
         }
         Ok(writer)
     }
-    /// Materialize the selected old implementation through the writer contract.
+    /// Publish fixtures through the native tape-log writer contract.
     pub fn build(self) -> Result<TapeAuthority, StateError> {
         std::fs::create_dir_all(&self.directory)
             .map_err(|e| StateError::io_at("create fixture tape directory", &self.directory, e))?;

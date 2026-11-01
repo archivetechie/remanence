@@ -40,32 +40,4 @@ impl StatePaths {
             calibration_dir: config.daemon.state_dir.join("calibration"),
         }
     }
-
-    /// Return the Layer 3c journal path for a tape UUID.
-    pub fn journal_path(&self, tape_uuid: [u8; 16]) -> PathBuf {
-        crate::authority::structural_path_in(&self.journal_dir, tape_uuid)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn journal_path_uses_lowercase_hex_uuid() {
-        let paths = StatePaths {
-            config_path: "/tmp/rem/config.toml".into(),
-            state_dir: "/tmp/rem".into(),
-            audit_dir: "/tmp/rem/audit".into(),
-            journal_dir: "/tmp/rem/journals".into(),
-            sqlite_path: "/tmp/rem/index/rem-state.sqlite".into(),
-            tape_cache_dir: "/tmp/rem/cache/tapes".into(),
-            calibration_dir: "/tmp/rem/calibration".into(),
-        };
-
-        assert_eq!(
-            paths.journal_path([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
-            PathBuf::from("/tmp/rem/journals/000102030405060708090a0b0c0d0e0f.remjournal")
-        );
-    }
 }
