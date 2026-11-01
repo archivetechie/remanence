@@ -5021,6 +5021,147 @@ mod tests {
         );
     }
 
+    /// Unvalidated rows let Resumer checks run without the native store rejecting them first.
+    #[derive(Debug, Clone)]
+    struct DirectResumeRows {
+        entries: Vec<TapeFileEntry>,
+        highest_protected_ordinal: u64,
+        total_committed_ordinals: u64,
+        scheme: ParityScheme,
+    }
+
+    impl crate::authority::CommittedFileRows for DirectResumeRows {
+        fn metrics(&self) -> crate::BoundedJournalReplayMetrics {
+            crate::BoundedJournalReplayMetrics::default()
+        }
+        fn committed_entry_count(&self) -> u64 {
+            self.entries.len() as u64
+        }
+        fn highest_protected_ordinal(&self) -> u64 {
+            self.highest_protected_ordinal
+        }
+        fn total_committed_ordinals(&self) -> u64 {
+            self.total_committed_ordinals
+        }
+        fn tape_uuid(&self) -> [u8; 16] {
+            [0x96; 16]
+        }
+        fn block_size(&self) -> u32 {
+            RESUME_TEST_BLOCK_SIZE
+        }
+        fn scheme(&self) -> &ParityScheme {
+            &self.scheme
+        }
+        fn try_clone_rows(
+            &self,
+        ) -> Result<Box<dyn crate::authority::CommittedFileRows>, JournalError> {
+            Ok(Box::new(self.clone()))
+        }
+        fn open_cursor(&self) -> Result<Box<dyn crate::authority::FileRowCursor>, JournalError> {
+            Ok(Box::new(DirectResumeCursor {
+                rows: self.clone(),
+                next: 0,
+            }))
+        }
+    }
+
+    /// Independent cursor over the hostile rows, with matching frozen metadata.
+    #[derive(Debug)]
+    struct DirectResumeCursor {
+        rows: DirectResumeRows,
+        next: usize,
+    }
+
+    impl crate::authority::FileRowCursor for DirectResumeCursor {
+        fn committed_entry_count(&self) -> u64 {
+            self.rows.entries.len() as u64
+        }
+        fn highest_protected_ordinal(&self) -> u64 {
+            self.rows.highest_protected_ordinal
+        }
+        fn total_committed_ordinals(&self) -> u64 {
+            self.rows.total_committed_ordinals
+        }
+        fn next_entry(&mut self) -> Result<Option<TapeFileEntry>, JournalError> {
+            let entry = self.rows.entries.get(self.next).cloned();
+            if entry.is_some() {
+                self.next += 1;
+            }
+            Ok(entry)
+        }
+        fn metrics(&self) -> crate::BoundedJournalReplayMetrics {
+            crate::BoundedJournalReplayMetrics::default()
+        }
+    }
+
+    /// A gap in otherwise coherent committed rows must reach the Resumer's density check.
+    #[test]
+    fn bounded_resume_direct_rows_reject_structural_gap() {
+        let rows = FrozenFileRows::new(DirectResumeRows {
+            entries: vec![
+                journal_entry(0, TapeFileKind::Bootstrap, 1, None, None),
+                journal_entry(2, TapeFileKind::Object, 1, Some(0), None),
+            ],
+            highest_protected_ordinal: 0,
+            total_committed_ordinals: 1,
+            scheme: scheme(),
+        });
+        let error = checked_bounded_resume_summary(&rows).unwrap_err();
+        assert!(
+            matches!(error, ParityError::ResumeAppend(ref detail)
+                if detail == "resume structural map is not dense at 1: found 2"),
+            "{error:?}"
+        );
+    }
+
+    /// A valid sidecar range with the wrong epoch id must reach the monotonic-id check.
+    #[test]
+    fn bounded_resume_direct_rows_reject_nonmonotonic_epoch_id() {
+        let rows = FrozenFileRows::new(DirectResumeRows {
+            entries: vec![
+                journal_entry(0, TapeFileKind::Bootstrap, 1, None, None),
+                journal_entry(1, TapeFileKind::Object, 1, Some(0), None),
+                journal_entry(2, TapeFileKind::ParitySidecar, 11, None, Some((1, 0, 1))),
+            ],
+            highest_protected_ordinal: 1,
+            total_committed_ordinals: 1,
+            scheme: scheme(),
+        });
+        let error = checked_bounded_resume_summary(&rows).unwrap_err();
+        assert!(
+            matches!(error, ParityError::ResumeAppend(ref detail)
+                if detail == "sidecar epoch id 1 is not the expected monotonic id 0"),
+            "{error:?}"
+        );
+    }
+
+    /// A structurally valid sidecar can still overflow the Resumer's physical append position.
+    #[test]
+    fn bounded_resume_direct_rows_reject_append_position_overflow() {
+        let rows = FrozenFileRows::new(DirectResumeRows {
+            entries: vec![
+                journal_entry(0, TapeFileKind::Bootstrap, 1, None, None),
+                journal_entry(1, TapeFileKind::Object, 1, Some(0), None),
+                journal_entry(
+                    2,
+                    TapeFileKind::ParitySidecar,
+                    u64::MAX,
+                    None,
+                    Some((0, 0, 1)),
+                ),
+            ],
+            highest_protected_ordinal: 1,
+            total_committed_ordinals: 1,
+            scheme: scheme(),
+        });
+        let error = checked_bounded_resume_summary(&rows).unwrap_err();
+        assert!(
+            matches!(error, ParityError::ResumeAppend(ref detail)
+                if detail == &JournalError::Codec("bounded resume append position overflows".into()).to_string()),
+            "{error:?}"
+        );
+    }
+
     /// The native publication boundary refuses overflowing physical extents.
     #[test]
     fn bounded_resume_commit_record_append_overflow_is_resume_append() {
