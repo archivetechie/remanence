@@ -15,6 +15,8 @@ pub const DEFAULT_TAPE_BLOCK_SIZE_BYTES: u64 = 256 * 1024;
 pub const DEFAULT_IO_MEMORY_CEILING_BYTES: u64 = 24 * 1024 * 1024 * 1024;
 /// Default target size of one overlap append's receive ring.
 pub const DEFAULT_APPEND_RING_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Default limit on client inactivity while receiving an append stream.
+pub const DEFAULT_APPEND_INGRESS_IDLE_SECS: u64 = 300;
 /// Default target size of one restore stream's read reservoir.
 pub const DEFAULT_READ_RESERVOIR_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// Default ranged-read device-position proof cadence.
@@ -145,6 +147,9 @@ pub struct DaemonConfig {
     pub checkpoint_max_age_seconds: u64,
     /// Default idle timeout for sessions.
     pub default_idle_timeout_seconds: u64,
+    /// Client inactivity limit; counts only waits for append messages, excluding backpressure.
+    #[serde(default = "default_append_ingress_idle_secs")]
+    pub append_ingress_idle_secs: u64,
     /// Delay before a seated cartridge in an idle drive is returned home.
     /// Zero keeps idle cartridges seated until eviction or daemon shutdown.
     #[serde(default = "default_drive_idle_unload_seconds")]
@@ -466,6 +471,10 @@ const fn default_append_ring_bytes() -> u64 {
     DEFAULT_APPEND_RING_BYTES
 }
 
+const fn default_append_ingress_idle_secs() -> u64 {
+    DEFAULT_APPEND_INGRESS_IDLE_SECS
+}
+
 const fn default_append_ring_high_pct() -> u8 {
     90
 }
@@ -630,6 +639,11 @@ pub fn validate_config(config: &RemConfig) -> Result<(), StateError> {
     if config.daemon.default_idle_timeout_seconds == 0 {
         return Err(StateError::ConfigInvalid(
             "daemon.default_idle_timeout_seconds must be non-zero".to_string(),
+        ));
+    }
+    if config.daemon.append_ingress_idle_secs == 0 {
+        return Err(StateError::ConfigInvalid(
+            "daemon.append_ingress_idle_secs must be non-zero".to_string(),
         ));
     }
     if config.daemon.changer_not_ready_wait_seconds > MAX_CHANGER_NOT_READY_WAIT_SECONDS {
@@ -1201,6 +1215,23 @@ tape_catalog_dir = "{0}/cache/tapes"
             "read_only = false\n",
             &format!("read_only = false\n{extra}"),
         )
+    }
+
+    /// Append ingress has its own nonzero client-idle budget, independent of session idle.
+    #[test]
+    fn append_ingress_idle_default_explicit_and_zero_refusal() {
+        let config = parse_config_toml(&valid_config()).unwrap();
+        assert_eq!(config.daemon.append_ingress_idle_secs, 300);
+        let config =
+            parse_config_toml(&with_daemon_lines("append_ingress_idle_secs = 17\n")).unwrap();
+        assert_eq!(config.daemon.append_ingress_idle_secs, 17);
+        assert_eq!(config.daemon.default_idle_timeout_seconds, 1800);
+        let error =
+            parse_config_toml(&with_daemon_lines("append_ingress_idle_secs = 0\n")).unwrap_err();
+        let StateError::ConfigInvalid(message) = error else {
+            panic!("expected configuration validation refusal");
+        };
+        assert_eq!(message, "daemon.append_ingress_idle_secs must be non-zero");
     }
 
     /// Serialization retains a fully populated typed configuration and loader validation.

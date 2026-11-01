@@ -4,6 +4,9 @@
 #[path = "acceptance_finalization.rs"]
 mod acceptance_finalization;
 
+#[path = "ingress_deadline_media_tests.rs"]
+mod ingress_deadline_media_tests;
+
 use super::*;
 use remanence_chaos::file_model::{FileEvent, FileSnapshot, MemoryDirectory};
 use remanence_library::durable_file::test_support::register;
@@ -267,7 +270,20 @@ fn config(root: &Path, library: &remanence_library::LibraryHandle) -> WriteOwner
 /// Run one session handler, joining its thread after close or refusal.
 async fn open_writer(
     root: &Path,
+    library: remanence_library::LibraryHandle,
+) -> (
+    mpsc::Sender<DriveCommand>,
+    Result<Uuid, Status>,
+    std::thread::JoinHandle<()>,
+) {
+    open_writer_with_selection(root, library, selected()).await
+}
+
+/// Select fixture geometry without changing the normal durability scenario.
+async fn open_writer_with_selection(
+    root: &Path,
     mut library: remanence_library::LibraryHandle,
+    selection: SelectedTape,
 ) -> (
     mpsc::Sender<DriveCommand>,
     Result<Uuid, Status>,
@@ -281,7 +297,7 @@ async fn open_writer(
     let request = super::super::actor_runtime::OpenWriteActorRequest {
         actor: AuditActor::System,
         pool_cfg: pool(),
-        selected: selected(),
+        selected: selection,
         target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
         needs_drive_load: false,
         library_serial: Some(LIBRARY.into()),

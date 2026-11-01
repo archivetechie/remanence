@@ -232,7 +232,8 @@ impl WriteSessionApi {
     where
         S: Stream<Item = Result<pb::AppendObjectMessage, Status>> + Unpin + Send + 'static,
     {
-        let first = next_append_message(&mut stream)
+        let mut ingress = AppendIngressDeadline::new(self.state.append_ingress_idle_secs);
+        let first = next_append_message(&mut stream, &mut ingress, None)
             .await?
             .ok_or_else(|| Status::invalid_argument("append stream is empty"))?;
         let (
@@ -354,6 +355,7 @@ impl WriteSessionApi {
                         session_id,
                         start_digest.expect("overlap requires a start digest"),
                         ring,
+                        ingress,
                     )
                     .await;
             }
@@ -366,7 +368,9 @@ impl WriteSessionApi {
         let spool_started = Instant::now();
         let mut spool_bytes = 0u64;
         let mut spool_chunks = 0u64;
-        while let Some(message) = next_append_message(&mut stream).await? {
+        while let Some(message) =
+            next_append_message(&mut stream, &mut ingress, Some(session_id)).await?
+        {
             match message.payload.ok_or_else(|| {
                 Status::invalid_argument("append stream message is missing payload")
             })? {
@@ -507,6 +511,7 @@ impl WriteSessionApi {
         session_id: Uuid,
         start_digest: [u8; 32],
         ring: crate::append_ring::AppendRing,
+        ingress: AppendIngressDeadline,
     ) -> Result<Response<pb::ObjectRecord>, Status>
     where
         S: Stream<Item = Result<pb::AppendObjectMessage, Status>> + Unpin + Send + 'static,
@@ -525,6 +530,7 @@ impl WriteSessionApi {
             declared_size_bytes,
             start_digest,
             receive_control,
+            ingress,
         ));
         if let Err(status) = control.wait_for_prefill().await {
             let receive = receive_task.await.map_err(|err| {
@@ -622,7 +628,10 @@ impl WriteSessionApi {
                 Ok(Response::new(outcome.record))
             }
             Err(actor_status) => {
-                if receive_task.is_finished() {
+                if receive_task.is_finished() || control.failure_message().is_some() {
+                    // Ring failure wakes the actor before the receive task may
+                    // finish returning its status. Join it to retain the ingress
+                    // cause, including DeadlineExceeded, across that race.
                     if let Ok(Err(receive_status)) = receive_task.await {
                         // A closed ring is a consequence of the consumer failure.
                         // Preserve the actor's cause; retain independently detected
@@ -679,14 +688,67 @@ impl WriteSessionApi {
     }
 }
 
+/// Client-idle budget carried across receives, including empty messages.
+/// Only `next_append_message` charges time; daemon work and backpressure do not.
+pub(crate) struct AppendIngressDeadline {
+    idle: Duration,
+    remaining: Duration,
+}
+
+impl AppendIngressDeadline {
+    pub(crate) fn new(seconds: u64) -> Self {
+        let idle = Duration::from_secs(seconds);
+        Self {
+            idle,
+            remaining: idle,
+        }
+    }
+
+    fn expired(&self, session_id: Option<Uuid>) -> Status {
+        let seconds = self.idle.as_secs();
+        Status::deadline_exceeded(match session_id {
+            Some(session_id) => format!(
+                "AppendIngressDeadline: session {session_id} received no append data for {seconds} seconds; the incomplete object was abandoned."
+            ),
+            None => format!(
+                "AppendIngressDeadline: no append message received for {seconds} seconds."
+            ),
+        })
+    }
+}
+
+/// Receive with a client-only idle deadline; empty chunks consume the remaining budget.
 pub(crate) async fn next_append_message<S>(
     stream: &mut S,
+    ingress: &mut AppendIngressDeadline,
+    session_id: Option<Uuid>,
 ) -> Result<Option<pb::AppendObjectMessage>, Status>
 where
     S: Stream<Item = Result<pb::AppendObjectMessage, Status>> + Unpin,
 {
-    match stream.next().await {
-        Some(Ok(message)) => Ok(Some(message)),
+    if ingress.remaining.is_zero() {
+        return Err(ingress.expired(session_id));
+    }
+    let started = tokio::time::Instant::now();
+    let received = tokio::time::timeout(ingress.remaining, stream.next())
+        .await
+        .map_err(|_| ingress.expired(session_id))?;
+    ingress.remaining = ingress.remaining.saturating_sub(started.elapsed());
+    match received {
+        Some(Ok(message)) => {
+            if matches!(
+                &message.payload,
+                Some(pb::append_object_message::Payload::Start(_))
+                    | Some(pb::append_object_message::Payload::CanonicalStart(_))
+                    | Some(pb::append_object_message::Payload::Finish(_))
+            ) || matches!(
+                &message.payload,
+                Some(pb::append_object_message::Payload::Chunk(chunk)) if !chunk.data.is_empty()
+            ) {
+                ingress.remaining = ingress.idle;
+            }
+            Ok(Some(message))
+        }
         Some(Err(err)) => Err(Status::invalid_argument(format!(
             "append stream failed: {err}"
         ))),
@@ -709,6 +771,7 @@ pub(crate) async fn receive_overlap_messages<S>(
     declared_size_bytes: u64,
     start_digest: [u8; 32],
     control: Arc<AppendRingControl>,
+    mut ingress: AppendIngressDeadline,
 ) -> Result<OverlapReceiveReport, Status>
 where
     S: Stream<Item = Result<pb::AppendObjectMessage, Status>> + Unpin,
@@ -720,7 +783,9 @@ where
     let mut hasher = Sha256::new();
     let mut finish = None;
     let receive_result = async {
-        while let Some(message) = next_append_message(&mut stream).await? {
+        while let Some(message) =
+            next_append_message(&mut stream, &mut ingress, Some(session_id)).await?
+        {
             match message.payload.ok_or_else(|| {
                 Status::invalid_argument("append stream message is missing payload")
             })? {
