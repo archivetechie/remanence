@@ -78,7 +78,7 @@ main() {
   local size_bytes workdir stamp source object locator restored
   size_bytes="$(default_bench_bytes)"
   stamp="$(fieldtest_timestamp_id)"
-  workdir="$(mktemp -d "$(fieldtest_spool_dir)/bench-read-${stamp}.XXXXXX")"
+  fieldtest_make_workdir workdir "bench-read-${stamp}" "$(( size_bytes * 4 ))" "read-benchmark payloads"
   source="$workdir/read-source.bin"
   object="$workdir/read-object.rem-object"
   locator="$workdir/locator.json"

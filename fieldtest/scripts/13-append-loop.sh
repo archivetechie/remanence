@@ -470,9 +470,8 @@ main() {
 
   local stamp workdir payload_bytes summary validation_log sha_results latency_results
   stamp="$(fieldtest_timestamp_id)"
-  workdir="$(mktemp -d "$(fieldtest_spool_dir)/append-${stamp}.XXXXXX")"
-  trap '[[ -n "${workdir:-}" && -d "$workdir" ]] && rm -rf -- "$workdir"' EXIT
   payload_bytes=$(( payload_mb * 1024 * 1024 ))
+  fieldtest_make_workdir workdir "append-${stamp}" "$(( payload_bytes * 4 * count ))" "append-loop payloads"
   summary="$(fieldtest_artifact_path "$SCRIPT_NAME" summary "$stamp")"
   validation_log="$(fieldtest_artifact_path "$SCRIPT_NAME" validation "$stamp")"
   sha_results="$workdir/sha-results.jsonl"

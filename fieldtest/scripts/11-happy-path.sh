@@ -97,7 +97,7 @@ main() {
   local size_gb="${FIELD_HAPPY_GB:-2}"
   [[ "${REMFIELD_ENV:-unknown}" == vtl ]] && size_gb="${FIELD_HAPPY_GB_VTL:-0.25}"
   stamp="$(fieldtest_timestamp_id)"
-  workdir="$(mktemp -d "$(fieldtest_spool_dir)/happy-${stamp}.XXXXXX")"
+  fieldtest_make_workdir workdir "happy-${stamp}" "$(awk -v g="$size_gb" 'BEGIN {printf "%d", g * 8 * 1073741824}')" "happy-path payloads"
   object_plain="$workdir/plain.rem-object"
   manifest_plain="$workdir/plain-manifest.json"
   restored_plain="$workdir/restored.rem-object"

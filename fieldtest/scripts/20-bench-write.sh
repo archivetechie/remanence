@@ -192,8 +192,8 @@ main() {
 
   local stamp workdir payload_bytes random_file zeros_file
   stamp="$(fieldtest_timestamp_id)"
-  workdir="$(mktemp -d "$(fieldtest_spool_dir)/bench-write-${stamp}.XXXXXX")"
   payload_bytes="$(default_bench_bytes)"
+  fieldtest_make_workdir workdir "bench-write-${stamp}" "$(( payload_bytes * 4 ))" "write-benchmark payloads"
   if [[ -n "$source_dir" ]]; then
     random_file="$source_dir/random.bin"
     zeros_file="$source_dir/zeros.bin"
@@ -208,7 +208,7 @@ main() {
   original_write_batch="${FIELD_TAPE_IO_WRITE_BATCH_BLOCKS:-16}"
   original_read_batch="${FIELD_TAPE_IO_READ_BATCH_BLOCKS:-$original_write_batch}"
   if [[ "${FIELD_BENCH_BATCH_SWEEP:-0}" == 1 ]]; then
-    trap 'restore_daemon_batch_config "$original_write_batch" "$original_read_batch"' EXIT
+    trap 'restore_daemon_batch_config "$original_write_batch" "$original_read_batch"; fieldtest_cleanup_workdirs' EXIT
   fi
   while IFS= read -r batch; do
     if [[ "$batch" == current ]]; then
@@ -225,7 +225,7 @@ main() {
   done < <(bench_write_batch_list)
   if [[ "${FIELD_BENCH_BATCH_SWEEP:-0}" == 1 ]]; then
     restore_daemon_batch_config "$original_write_batch" "$original_read_batch"
-    trap - EXIT
+    fieldtest_install_cleanup_traps
   fi
   fieldtest_evidence_record "$SCRIPT_NAME" summary PASS "bench-write completed for incompressible and compressible payloads"
   rm -rf -- "$workdir"

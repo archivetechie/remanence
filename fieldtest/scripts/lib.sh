@@ -50,7 +50,11 @@ fieldtest_init_layout() {
     "$home/state/cache/tapes" \
     "$home/spool" \
     "$home/log" \
-    "$home/evidence"
+    "$home/evidence" \
+    "$home/tmp"
+  # Scratch files land inside the kit, so the disk guard counts them and a capped
+  # home bounds them; /tmp is shared with production.
+  export TMPDIR="$home/tmp"
 }
 
 fieldtest_bin_dir() {
@@ -124,6 +128,149 @@ fieldtest_state_dir() {
 
 fieldtest_spool_dir() {
   printf '%s\n' "$(fieldtest_home)/spool"
+}
+
+# Disk guard. The field host is production: the kit must never fill its disks.
+# Every payload the kit creates first passes fieldtest_require_space, which refuses
+# unless the spool filesystem keeps FIELD_MIN_FREE_GB (default 150) GiB and
+# FIELD_MIN_FREE_PCT (default 25) percent free after the write, and the kit's whole
+# footprint (REMFIELD_HOME) stays within FIELD_MAX_KIT_GB (default 40) GiB.
+# Callers pass a generous byte estimate that includes the daemon's spool copy.
+FIELDTEST_GIB=$((1024 * 1024 * 1024))
+FIELDTEST_WORKDIRS=()
+
+fieldtest_space_report() {
+  # Prints: total_bytes avail_bytes kit_bytes for the spool filesystem.
+  local dir total avail kit
+  dir="$(fieldtest_spool_dir)"
+  mkdir -p "$dir"
+  read -r total avail < <(df -PB1 -- "$dir" | awk 'NR==2 {print $2, $4}')
+  kit="$(du -sxB1 -- "$(fieldtest_home)" 2>/dev/null | awk '{print $1}')"
+  printf '%s %s %s\n' "${total:-0}" "${avail:-0}" "${kit:-0}"
+}
+
+fieldtest_spool_dedicated() {
+  # True when the spool sits on a filesystem mounted at or below $HOME (a capped
+  # home image, or a tmpfs the owner sized): filling it can only hurt the kit.
+  # FIELD_SPOOL_DEDICATED=1 or 0 overrides the detection.
+  case "${FIELD_SPOOL_DEDICATED:-auto}" in
+    1) return 0 ;;
+    0) return 1 ;;
+  esac
+  local target home
+  target="$(findmnt -no TARGET --target "$(fieldtest_spool_dir)" 2>/dev/null)" || return 1
+  home="$(cd -- "$HOME" && pwd -P)"
+  [[ -n "$target" && ( "$target" == "$home" || "$target" == "$home"/* ) ]]
+}
+
+fieldtest_spool_fstype() {
+  findmnt -no FSTYPE --target "$(fieldtest_spool_dir)" 2>/dev/null || true
+}
+
+fieldtest_mem_available() {
+  # MemAvailable in bytes.
+  awk '/^MemAvailable:/ {print $2 * 1024; exit}' "${FIELD_MEMINFO:-/proc/meminfo}"
+}
+
+fieldtest_space_floors() {
+  # Prints: min_free_gb min_free_pct mode. A shared filesystem keeps production
+  # headroom (150 GiB and 25%) and the kit cap; a dedicated one is its own cap and
+  # only needs room to finish cleanly.
+  if fieldtest_spool_dedicated; then
+    printf '%s %s dedicated\n' "${FIELD_MIN_FREE_GB:-2}" "${FIELD_MIN_FREE_PCT:-0}"
+  else
+    printf '%s %s shared\n' "${FIELD_MIN_FREE_GB:-150}" "${FIELD_MIN_FREE_PCT:-25}"
+  fi
+}
+
+fieldtest_space_refusal() {
+  # Prints the refusal reason for writing <bytes> more, or nothing when it fits.
+  local needed="$1" total avail kit min_gb min_pct mode floor pct_floor cap after
+  read -r total avail kit < <(fieldtest_space_report)
+  read -r min_gb min_pct mode < <(fieldtest_space_floors)
+  floor=$(( min_gb * FIELDTEST_GIB ))
+  pct_floor=$(( total / 100 * min_pct ))
+  cap=$(( ${FIELD_MAX_KIT_GB:-40} * FIELDTEST_GIB ))
+  after=$(( avail - needed ))
+  if (( after < floor )); then
+    printf 'would leave %s GiB free on the %s spool filesystem, below the %s GiB floor (FIELD_MIN_FREE_GB)\n' \
+      "$(( after / FIELDTEST_GIB ))" "$mode" "$min_gb"
+  elif (( after < pct_floor )); then
+    printf 'would leave %s GiB free on the %s spool filesystem, below %s%% of it (FIELD_MIN_FREE_PCT)\n' \
+      "$(( after / FIELDTEST_GIB ))" "$mode" "$min_pct"
+  elif [[ "$(fieldtest_spool_fstype)" == tmpfs ]] && (( $(fieldtest_mem_available) - needed < ${FIELD_MIN_FREE_RAM_GB:-64} * FIELDTEST_GIB )); then
+    # tmpfs pages are RAM the production services share.
+    printf 'would leave %s GiB of RAM available, below the %s GiB floor (FIELD_MIN_FREE_RAM_GB); the spool is tmpfs\n' \
+      "$(( ($(fieldtest_mem_available) - needed) / FIELDTEST_GIB ))" "${FIELD_MIN_FREE_RAM_GB:-64}"
+  elif [[ "$mode" == shared ]] && (( kit + needed > cap )); then
+    printf 'the kit would use %s GiB, above its %s GiB cap (FIELD_MAX_KIT_GB); run 91-cleanup.sh or remove old run dirs under %s\n' \
+      "$(( (kit + needed) / FIELDTEST_GIB ))" "${FIELD_MAX_KIT_GB:-40}" "$(fieldtest_spool_dir)"
+  fi
+}
+
+fieldtest_require_space() {
+  # fieldtest_require_space <bytes> <purpose>: refuse (exit 1) before writing.
+  local needed="$1" purpose="$2" reason
+  reason="$(fieldtest_space_refusal "$needed")"
+  if [[ -n "$reason" ]]; then
+    fieldtest_evidence_record "${SCRIPT_NAME:-fieldtest}" disk-guard FAIL "refused ${purpose} (needs ~$(( needed / 1048576 )) MiB): ${reason}"
+    printf 'disk guard: refused %s: %s\n' "$purpose" "$reason" >&2
+    exit 1
+  fi
+}
+
+fieldtest_cleanup_workdirs() {
+  local dir
+  for dir in "${FIELDTEST_WORKDIRS[@]}"; do
+    [[ -n "$dir" && -d "$dir" && "$dir" == "$(fieldtest_spool_dir)"/* ]] && rm -rf -- "$dir"
+  done
+  FIELDTEST_WORKDIRS=()
+}
+
+fieldtest_install_cleanup_traps() {
+  # Scripts that need their own EXIT trap must call fieldtest_cleanup_workdirs in it.
+  trap 'fieldtest_cleanup_workdirs' EXIT
+  trap 'fieldtest_cleanup_workdirs; exit 129' HUP
+  trap 'fieldtest_cleanup_workdirs; exit 130' INT
+  trap 'fieldtest_cleanup_workdirs; exit 143' TERM
+}
+
+fieldtest_sweep_stale_runs() {
+  # Remove kit run dirs untouched for FIELD_STALE_RUN_HOURS (default 6): leftovers of
+  # runs killed before their traps ran. A live soak's dir is kept whatever its age.
+  local spool hours soak_pid live_soak="" dir removed=0
+  spool="$(fieldtest_spool_dir)"
+  hours="${FIELD_STALE_RUN_HOURS:-6}"
+  [[ -d "$spool" ]] || return 0
+  soak_pid="$(cat "$(fieldtest_soak_pidfile)" 2>/dev/null || true)"
+  if [[ -n "$soak_pid" ]] && kill -0 "$soak_pid" 2>/dev/null; then
+    live_soak=1
+  fi
+  while IFS= read -r -d '' dir; do
+    [[ -n "$live_soak" && "$(basename -- "$dir")" == soak-* ]] && continue
+    rm -rf -- "$dir"
+    removed=$((removed + 1))
+    printf 'swept stale kit run dir %s\n' "$dir" >&2
+  done < <(find "$spool" -mindepth 1 -maxdepth 1 -type d -mmin "+$(( hours * 60 ))" \
+    \( -name 'append-*' -o -name 'bench-*' -o -name 'fault-*' -o -name 'happy-*' \
+       -o -name 'multi-*' -o -name 'soak-*' -o -name 'preflight-*' \) -print0)
+  if [[ -d "$(fieldtest_home)/tmp" ]]; then
+    find "$(fieldtest_home)/tmp" -mindepth 1 -maxdepth 1 -mmin "+$(( hours * 60 ))" \
+      -exec rm -rf -- {} +
+  fi
+  printf '%s\n' "$removed"
+}
+
+fieldtest_make_workdir() {
+  # fieldtest_make_workdir <var> <prefix> <bytes> <purpose>: guard the space, create a
+  # spool run dir, and remove it on every exit path. Assigns by name; never call it
+  # inside $(...), which would lose the registration.
+  local var="$1" prefix="$2" needed="$3" purpose="$4" dir
+  fieldtest_require_space "$needed" "$purpose"
+  dir="$(mktemp -d "$(fieldtest_spool_dir)/${prefix}.XXXXXX")"
+  FIELDTEST_WORKDIRS+=("$dir")
+  fieldtest_install_cleanup_traps
+  printf -v "$var" '%s' "$dir"
 }
 
 fieldtest_log_dir() {

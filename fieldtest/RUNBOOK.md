@@ -118,6 +118,23 @@ swap or the root disk turn this into a tape benchmark. Startup removes and
 evidences owned `spool-<uuid>.bin` crash orphans before re-accounting this
 budget; any reconciliation failure prevents writes from being accepted.
 
+**Disk guard (every payload-creating script).** The field host is production,
+so before writing a payload each script estimates what it will write,
+counting the daemon's spool copy too, and refuses with a `disk-guard` FAIL record
+if the write would break a floor:
+
+| Spool filesystem | Floors |
+|---|---|
+| shared (for example `/home`) | `FIELD_MIN_FREE_GB` (150) free and `FIELD_MIN_FREE_PCT` (25) free after the write; the kit stays under `FIELD_MAX_KIT_GB` (40) |
+| dedicated: mounted at or below `$HOME`, like a capped home image or a tmpfs the owner sized | `FIELD_MIN_FREE_GB` (2) free; the filesystem is its own cap |
+| tmpfs, in addition | `FIELD_MIN_FREE_RAM_GB` (64) of `MemAvailable` left after the write |
+
+`FIELD_SPOOL_DEDICATED=1` or `0` overrides the detection. Run directories are
+removed on every exit path, including HUP, INT and TERM. `00-preflight.sh` sweeps run
+directories and kit scratch files older than `FIELD_STALE_RUN_HOURS` (6),
+keeping a live soak's, and records the footprint as `disk-footprint` evidence.
+Scratch files go to `~/remfield/tmp`, not the shared `/tmp`.
+
 ### Host I/O setup for batched tape commands
 
 Before Phase 2, raise and verify the SCSI generic single-I/O ceiling. The

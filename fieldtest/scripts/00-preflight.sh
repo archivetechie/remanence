@@ -151,25 +151,24 @@ PY
   fi
   record_artifact library-slots "$selected_library_json"
 
-  local spool_dir required_gb free_bytes
-  spool_dir="$(fieldtest_spool_dir)"
-  required_gb="${FIELD_PRELIGHT_REQUIRED_GB:-8}"
-  free_bytes="$(df -Pk "$spool_dir" | awk 'NR==2 {print $4 * 1024}')"
-  if [[ "${free_bytes:-0}" -lt $((required_gb * 1024 * 1024 * 1024)) ]]; then
-    fieldtest_evidence_record "$SCRIPT_NAME" spool-free FAIL "spool filesystem has less than ${required_gb}GiB free"
-    printf '%s\n' "hard blocker: spool volume does not have ${required_gb}GiB free" >&2
-    exit 1
-  fi
+  local swept total avail kit min_gb min_pct mode
+  swept="$(fieldtest_sweep_stale_runs)"
+  read -r total avail kit < <(fieldtest_space_report)
+  read -r min_gb min_pct mode < <(fieldtest_space_floors)
+  fieldtest_evidence_record "$SCRIPT_NAME" disk-footprint INFO "${mode} spool filesystem $(( avail / FIELDTEST_GIB )) GiB free of $(( total / FIELDTEST_GIB )) GiB (floor ${min_gb} GiB, ${min_pct}%); kit uses $(( kit / FIELDTEST_GIB )) GiB (cap ${FIELD_MAX_KIT_GB:-40}); swept ${swept} stale run dirs" "" \
+    "{\"spool_filesystem\":\"${mode}\",\"total_bytes\":${total},\"avail_bytes\":${avail},\"kit_bytes\":${kit},\"swept_run_dirs\":${swept},\"min_free_gb\":${min_gb},\"min_free_pct\":${min_pct},\"max_kit_gb\":${FIELD_MAX_KIT_GB:-40}}"
 
   local sample_gb sample_file read_start read_end read_seconds read_mbps sample_bytes disk_speed_json
   sample_gb="${FIELD_PRELIGHT_SAMPLE_GB:-4}"
-  sample_file="$spool_dir/preflight-${stamp}.bin"
   sample_bytes="$(python3 - "$sample_gb" <<'PY'
 import sys
 gb=float(sys.argv[1])
 print(int(gb * 1024 * 1024 * 1024))
 PY
 )"
+  local sample_dir
+  fieldtest_make_workdir sample_dir "preflight-${stamp}" "$sample_bytes" "preflight disk-speed sample"
+  sample_file="$sample_dir/sample.bin"
   read_start="$(python3 -c 'import time; print(f"{time.monotonic():.9f}")')"
   python3 - "$sample_file" "$sample_bytes" <<'PY'
 import os
