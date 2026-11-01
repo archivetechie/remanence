@@ -57,6 +57,18 @@ the published revision 1.0.0-draft.2 (2026-09-06, SHA-256
 `1e4ad796bd77291f731d8d2611231984ba778f3650c1597f80eebdc7ba359fd2`), which is
 an errata revision of draft.1.
 
+- **2026-11-01 — 1.0.0-draft.5 — draft milestone (reference host storage).**
+  Section 8.4.1 names a surviving durable off-tape commit record (Section 3.4),
+  rather than a host checkpoint journal, as one permitted exact Object-recovery
+  authority, so the permission no longer names one implementation's storage.
+  This is a minor change of the draft: the permitted class is now the commit
+  record that Section 3.4 defines, which Appendix B.8 already treats as the
+  checkpoint authority, and a checkpoint journal that is such a record still
+  qualifies. Every requirement of the Optional Object authority bullet is
+  unchanged. Appendix B.12 describes the reference implementation's one
+  append-only host log per tape in place of its former two journals. No tape
+  byte or vector outcome changes.
+
 - **2026-10-30 — 1.0.0-draft.5 — draft milestone (vectors).**
   `resume-open` becomes informative and pins one conforming result; a resumed
   Writer can end or continue the open epoch under Section 11.4 (W4) and the
