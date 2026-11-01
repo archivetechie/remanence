@@ -64,6 +64,33 @@ diagnostics. It then returns the allowlisted cartridges to their slots, stops th
 daemon and packs the evidence. A finished run prints a PASS/FAIL table, the evidence
 pack's path and its sha256.
 
+### The magazine plan (you at the library)
+
+`plan/magazine.env` checks that the daemon waits out an open magazine instead of
+failing a move. It needs you at the library and at the tmux window together, so
+reach the window from a laptop or phone next to the library. Before you start, make
+sure all four allowlisted tapes are in storage slots and one LL01 drive is empty.
+
+```
+sudo -iu remfield tmux new -s run '/opt/remfield/current/run.sh plan/magazine.env; exec bash'
+```
+
+When the magazine leg starts, it names the tape, its slot and the drive it will use.
+Then:
+
+1. Pull out ONE magazine that holds none of the four allowlisted tapes. Opening a
+   magazine pauses the robot for every partition, so do it when the other
+   partitions are not moving tapes. Touch nothing inside it.
+2. Type `open` and press Enter. Within two minutes the window shows
+   `live status: waiting for library: medium magazine removed …`.
+3. When the window asks, push the magazine back in, type `closed` and press Enter.
+4. Wait. The library re-inventories, the daemon re-checks the slot and the drive
+   and retries the move, and the leg reports PASS. It then unloads the tape back
+   to its slot. The plan ends as any plan does, with the table and the evidence pack.
+
+If you stop the plan with `Ctrl-c` while the magazine is out, push the magazine
+back in first. Teardown can only return the tape once the library is ready again.
+
 ## 5. Return the evidence
 
 Copy `~/remfield/evidence-pack-<plan>-<stamp>.tar.gz` (the path run.sh printed)

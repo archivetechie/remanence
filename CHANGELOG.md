@@ -7,6 +7,11 @@ per-release summaries.
 <!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/index.rs crates/remanence-library/src/discovery.rs @ 638210f7 -->
 ## Unreleased
 
+- The field-test kit checks the changer not-ready wait on real hardware.
+  `fieldtest/plan/magazine.env` runs `36-magazine-wait.sh`, which asks the
+  operator to pull out one magazine, loads an allowlisted tape through the
+  daemon, checks that live status shows the move waiting on the library, and,
+  once the magazine is back, that the load completes and the tape returns home.
 - The field-test kit can run without a remote session.
   `fieldtest/package-owner-run.sh` builds a package for the host owner to
   install read-only, then run as one unattended plan with `run.sh plan/<name>.env`.
