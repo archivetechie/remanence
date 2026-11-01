@@ -141,6 +141,7 @@ mod actor_runtime;
 pub(crate) use actor_runtime::*;
 
 mod checkpoint;
+pub(crate) use checkpoint::RemovalClose;
 
 pub(crate) struct SessionOpenReadinessContext<'a> {
     action: &'static str,

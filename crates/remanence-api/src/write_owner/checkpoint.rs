@@ -173,6 +173,23 @@ impl RawTapeSink for ActivityTrackingRawTapeSink<'_> {
     }
 }
 
+/// The refusal a removal gets when a tape-I/O fence keeps it from closing an epoch.
+/// The first check runs before the close learns whether an epoch exists.
+const REMOVAL_CLOSE_FENCED: &str = "retained epoch blocked by active tape-I/O fence";
+
+/// What a removal's epoch close did, for callers that remove the cartridge either
+/// way. An `Err` from the close means no close ran (a fence, or catalog evidence
+/// unreadable before the close looked); these values cover a close that got further.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RemovalClose {
+    /// The epoch closed, or the cartridge had no open epoch to close.
+    Done,
+    /// An open epoch was found but no close ran; it stays open.
+    NotAttempted(String),
+    /// A close ran and failed; the epoch stays open or its state is unknown.
+    Failed(String),
+}
+
 /// Whether a tracked write attempt on `drive` may have changed the tape.
 /// The drive adapters refuse a missing, expired or mismatched append admission
 /// before dispatch; such a refusal leaves the media unchanged and is a plain
@@ -1589,6 +1606,18 @@ pub(super) fn close_retained_before_removal(
     retained: &mut Option<RetainedParityEpoch>,
     progress: Option<&crate::operations::OperationHandle>,
 ) -> Result<(), Status> {
+    close_retained_reporting(index, drive, cfg, bay, retained, progress).map(|_| ())
+}
+
+/// [`close_retained_before_removal`], also saying what the close did.
+pub(super) fn close_retained_reporting(
+    index: &mut CatalogIndex,
+    drive: &mut DriveHandle,
+    cfg: &WriteOwnerConfig,
+    bay: u16,
+    retained: &mut Option<RetainedParityEpoch>,
+    progress: Option<&crate::operations::OperationHandle>,
+) -> Result<RemovalClose, Status> {
     let prior_session = cfg.lifecycle.as_ref().and_then(|lifecycle| {
         lifecycle
             .parked
@@ -1630,14 +1659,13 @@ pub(super) fn close_retained_before_removal(
             bay,
             "fenced removal leaves the epoch open until append recovery"
         );
-        return Err(Status::failed_precondition(
-            "retained epoch blocked by active tape-I/O fence",
-        ));
+        return Err(Status::failed_precondition(REMOVAL_CLOSE_FENCED));
     }
     let mut epoch = retained.take();
     let mut closing_tape = epoch.as_ref().map(|e| e.selected.tape_uuid);
     let mut open_range = None;
     let mut epoch_closed = false;
+    let mut outcome = RemovalClose::Done;
     // No failure can use the catalog's epoch range until authority projection succeeds.
     let mut projection_failed = true;
     let shutdown = cfg
@@ -1736,6 +1764,8 @@ pub(super) fn close_retained_before_removal(
         if !fences.is_empty() {
             tracing::info!(tape_uuid = %Uuid::from_bytes(tape_uuid),
                 "fenced removal leaves the epoch open until append recovery");
+            // Found before projection: like the first check, it cannot say an epoch exists.
+            outcome = RemovalClose::NotAttempted(REMOVAL_CLOSE_FENCED.to_string());
             return Ok(());
         }
         let journal = remanence_state::TapeAuthority::open(
@@ -1794,6 +1824,7 @@ pub(super) fn close_retained_before_removal(
                 return Err(crate::status_from_state_error(error));
             }
             tracing::info!(%error, tape_uuid = %Uuid::from_bytes(tape_uuid), "epoch close skipped: write admission refused");
+            outcome = RemovalClose::NotAttempted(format!("write admission refused: {error}"));
             return Ok(());
         }
         let parked_matches = cfg.mounted().is_some()
@@ -1835,6 +1866,9 @@ pub(super) fn close_retained_before_removal(
                 format!("shutdown cannot prove the head is at EOD; [{w},{t})"),
                 Some((w, t)),
             );
+            outcome = RemovalClose::NotAttempted(format!(
+                "shutdown cannot prove the head is at EOD; [{w},{t})"
+            ));
             return Ok(());
         }
         let config = drive
@@ -1842,6 +1876,7 @@ pub(super) fn close_retained_before_removal(
             .map_err(|e| Status::unavailable(e.to_string()))?;
         if let Err(error) = crate::pool_write::require_rewritable_object_media(config) {
             tracing::info!(%error, "epoch close skipped: medium is not writable");
+            outcome = RemovalClose::NotAttempted(format!("medium is not writable: {error}"));
             return Ok(());
         }
         let mut close = |index: &mut CatalogIndex, drive: &mut DriveHandle| {
@@ -1981,7 +2016,10 @@ pub(super) fn close_retained_before_removal(
                 ),
                 None,
             );
-            return Ok(());
+            return Ok(RemovalClose::Failed(format!(
+                "checkpoint projection fails; epoch state is unknown until replay: {}",
+                error.message()
+            )));
         }
         // Projection may close the epoch before a later audit or seal-due write fails.
         // Read its current range; unavailable catalog evidence never supplies a range.
@@ -2012,20 +2050,21 @@ pub(super) fn close_retained_before_removal(
                 });
         if closed {
             tracing::error!(%error, bay, "durable epoch close follow-up fails");
-        } else {
-            tracing::warn!(%error, bay, "epoch_left_open: epoch close fails before removal");
-            audit_removal_epoch(
-                index,
-                cfg,
-                bay,
-                closing_tape,
-                "epoch_left_open",
-                error.to_string(),
-                range,
-            );
+            return Ok(RemovalClose::Done);
         }
+        tracing::warn!(%error, bay, "epoch_left_open: epoch close fails before removal");
+        audit_removal_epoch(
+            index,
+            cfg,
+            bay,
+            closing_tape,
+            "epoch_left_open",
+            error.to_string(),
+            range,
+        );
+        return Ok(RemovalClose::Failed(error.message().to_string()));
     }
-    Ok(())
+    Ok(outcome)
 }
 
 /// Audit an epoch left open by removal or a failed session open.

@@ -18,6 +18,15 @@ per-release summaries.
   retained parity epoch before the cartridge leaves the drive. Without `--dest`
   the cartridge returns to its recorded source slot. The command reports the
   slot that now holds it, and exits 1 with the daemon's message on a refusal.
+- A daemon unload or move whose epoch close fails, or does not run (a tape-I/O
+  fence, a medium that is not writable, a shutdown that cannot prove the head
+  position, a drive owner that stopped), still removes the cartridge, and now
+  says so: the operation progress and its finish audit
+  carry `epoch_close=failed` (a close ran and failed) or
+  `epoch_close=not_attempted` (no close ran), with the reason in
+  `epoch_close_error`, and `rem drive unload` prints a warning line. Neither
+  value says an epoch existed: the fence check runs before the close looks.
+  Before, the operation succeeded with only a daemon log line.
 - A daemon changer move that fails because the library is transiently not
   ready (`02/3B/12` medium magazine removed, `02/04/01` becoming ready,
   `02/04/18` door open), or whose endpoint already reports exception `3B/12`,

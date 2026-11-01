@@ -2330,33 +2330,42 @@ async fn seated_parity_sessions_close_before_unload_and_shutdown() {
         (false, false, false, ProjectionBusy(false, "startup"), false),
         (false, false, false, ProjectionBusy(true, "startup"), false),
     ] {
-        let root = tempfile::tempdir().unwrap();
-        let parity = crate::ParityConfig::Scheme(remanence_parity::ParityScheme {
-            id: remanence_parity::SchemeId::new_static("seated"),
-            data_blocks_per_stripe: 128,
-            parity_blocks_per_stripe: 1,
-            stripes_per_neighborhood: 1,
-        });
-        let world = world();
-        set_rollback_bootstrap(&world, parity.clone());
-        let mut state = state_with_parity(root.path(), true, parity.clone());
-        crate::write_owner::tests::check_seated_parity_sessions(
-            &mut state,
-            world,
-            crate::SelectedTape {
-                standalone_endpoint: None,
-                pool_id: "default".into(),
-                tape_uuid: UUID,
-                block_size: BLOCK,
-                parity_config: parity,
-            },
-            refuse_memory,
-            shutdown,
-            read_before_shutdown,
-            invalidation,
-            failed_close,
-        )
-        .await;
+        // A failed close is also driven through removal preparation, which reports it.
+        let prepares: &[bool] = if failed_close {
+            &[false, true]
+        } else {
+            &[false]
+        };
+        for &prepare_removal in prepares {
+            let root = tempfile::tempdir().unwrap();
+            let parity = crate::ParityConfig::Scheme(remanence_parity::ParityScheme {
+                id: remanence_parity::SchemeId::new_static("seated"),
+                data_blocks_per_stripe: 128,
+                parity_blocks_per_stripe: 1,
+                stripes_per_neighborhood: 1,
+            });
+            let world = world();
+            set_rollback_bootstrap(&world, parity.clone());
+            let mut state = state_with_parity(root.path(), true, parity.clone());
+            crate::write_owner::tests::check_seated_parity_sessions(
+                &mut state,
+                world,
+                crate::SelectedTape {
+                    standalone_endpoint: None,
+                    pool_id: "default".into(),
+                    tape_uuid: UUID,
+                    block_size: BLOCK,
+                    parity_config: parity,
+                },
+                refuse_memory,
+                shutdown,
+                read_before_shutdown,
+                invalidation,
+                failed_close,
+                prepare_removal,
+            )
+            .await;
+        }
     }
 }
 
@@ -2525,6 +2534,7 @@ async fn epoch_removal_admission_failure_matrix() {
                 false,
                 crate::write_owner::tests::RetentionInvalidation::Removal(case, path),
                 false,
+                false,
             )
             .await;
             let log = std::fs::read_to_string(&log_path).unwrap();
@@ -2638,6 +2648,7 @@ async fn durable_session_close_survives_removal_after_projection_busy() {
             false,
             crate::write_owner::tests::RetentionInvalidation::ProjectionBusy(false, path),
             false,
+            false,
         )
         .await;
     }
@@ -2690,6 +2701,7 @@ async fn check_open_checkpoint_removal(fresh: bool, paths: &[&'static str]) {
             false,
             crate::write_owner::tests::RetentionInvalidation::StaleProjection(fresh, path),
             false,
+            false,
         )
         .await;
     }
@@ -2722,6 +2734,7 @@ async fn api_epoch_fills_across_seated_sessions() {
         false,
         false,
         crate::write_owner::tests::RetentionInvalidation::ApiEpochFills,
+        false,
         false,
     )
     .await;
@@ -2802,6 +2815,7 @@ async fn multi_tape_write_history_rebuild_preserves_safety_projections() {
             false,
             history,
             false,
+            false,
         )
         .await;
     }
@@ -2876,6 +2890,7 @@ async fn epoch_finalization_planner_refuses_sealed_and_before_replica_a_authorit
             false,
             false,
             invalidation,
+            false,
             false,
         )
         .await;

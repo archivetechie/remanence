@@ -498,17 +498,52 @@ impl LibraryServiceApi {
                             pool.drive_tx(&crate::drive_pool::DriveKey::new(&library_serial, bay))
                         {
                             let (reply, received) = tokio::sync::oneshot::channel();
-                            if drive
+                            // (outcome, reason): `not_attempted` when no close ran, `failed`
+                            // when it ran and failed. Neither claims an epoch existed: an
+                            // `Err` reply (a fence, an owner that stopped or never started,
+                            // an active session) comes before the close looks.
+                            let close_outcome = if drive
                                 .send(crate::write_owner::DriveCommand::PrepareRemoval {
                                     reply,
                                     progress: Some(handle.clone()),
                                 })
                                 .await
-                                .is_ok()
+                                .is_err()
                             {
-                                if let Ok(Err(error)) = received.await {
-                                    tracing::error!(%error, "epoch close fails; removing cartridge");
+                                Some((
+                                    "not_attempted",
+                                    "drive owner stopped before it could close an epoch"
+                                        .to_string(),
+                                ))
+                            } else {
+                                use crate::write_owner::RemovalClose;
+                                match received.await {
+                                    Ok(Ok(RemovalClose::Done)) => None,
+                                    Ok(Ok(RemovalClose::NotAttempted(reason))) => {
+                                        Some(("not_attempted", reason))
+                                    }
+                                    Ok(Ok(RemovalClose::Failed(reason))) => {
+                                        Some(("failed", reason))
+                                    }
+                                    Ok(Err(error)) => {
+                                        Some(("not_attempted", error.message().to_string()))
+                                    }
+                                    Err(_) => Some((
+                                        "not_attempted",
+                                        "drive owner stopped before it answered the epoch close"
+                                            .to_string(),
+                                    )),
                                 }
+                            };
+                            if let Some((outcome, reason)) = close_outcome {
+                                tracing::error!(
+                                    outcome,
+                                    %reason,
+                                    "epoch close did not complete; removing cartridge"
+                                );
+                                // Removal still proceeds; the operation must say so.
+                                handle.record_note("epoch_close", outcome);
+                                handle.record_note("epoch_close_error", &reason);
                             }
                         }
                     }
@@ -1867,12 +1902,98 @@ mod tests {
                 .map(String::as_str),
             Some("epoch_close")
         );
-        reply.send(Ok(())).unwrap();
-        assert!(matches!(
-            changer_rx.recv().await.unwrap(),
-            crate::write_owner::ChangerCommand::Robotics { .. }
-        ));
+        reply
+            .send(Ok(crate::write_owner::RemovalClose::Done))
+            .unwrap();
+        let crate::write_owner::ChangerCommand::Robotics { handle, .. } =
+            changer_rx.recv().await.unwrap()
+        else {
+            panic!("robotics follows a closed epoch");
+        };
+        assert!(handle.notes().is_empty(), "a clean close leaves no note");
         pool.release_library("DEC418146K_LL02");
+    }
+
+    /// A failed or abandoned epoch close still removes the cartridge, and the
+    /// operation carries the failure to its terminal status and audit.
+    #[tokio::test]
+    async fn robotics_records_an_epoch_close_failure_and_still_removes() {
+        for (close, outcome, expected) in [
+            ("fenced", "not_attempted", "tape is fenced"),
+            ("owner_failed", "not_attempted", "drive actor failed"),
+            ("skipped", "not_attempted", "medium is not writable"),
+            ("failed", "failed", "write error"),
+            (
+                "dropped",
+                "not_attempted",
+                "drive owner stopped before it answered the epoch close",
+            ),
+        ] {
+            let mut state = state_with_snapshot();
+            let (changer_tx, mut changer_rx) = tokio::sync::mpsc::channel(1);
+            let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel(1);
+            let pool = crate::write_owner::DrivePool::new_for_library(
+                "DEC418146K_LL02",
+                changer_tx,
+                HashMap::from([(1, drive_tx)]),
+                Arc::new(HashMap::from([(1, AtomicBool::new(false))])),
+            );
+            state.drive_pool = Some(pool.clone());
+            state
+                .library_service()
+                .dispatch_robotics(
+                    remanence_state::AuditActor::System,
+                    &[],
+                    "unload_drive",
+                    crate::write_owner::RoboticsAction::Unload {
+                        bay: 1,
+                        destination: None,
+                    },
+                    BTreeMap::new(),
+                )
+                .await
+                .unwrap();
+            let crate::write_owner::DriveCommand::PrepareRemoval { reply, .. } =
+                drive_rx.recv().await.unwrap()
+            else {
+                panic!("removal preparation precedes robotics");
+            };
+            use crate::write_owner::RemovalClose;
+            match close {
+                "fenced" => reply
+                    .send(Err(Status::failed_precondition("tape is fenced")))
+                    .unwrap(),
+                "owner_failed" => reply
+                    .send(Err(Status::internal("drive actor failed")))
+                    .unwrap(),
+                "skipped" => reply
+                    .send(Ok(RemovalClose::NotAttempted(
+                        "medium is not writable".into(),
+                    )))
+                    .unwrap(),
+                "failed" => reply
+                    .send(Ok(RemovalClose::Failed("write error".into())))
+                    .unwrap(),
+                _ => drop(reply),
+            }
+            let crate::write_owner::ChangerCommand::Robotics { handle, .. } =
+                changer_rx.recv().await.unwrap()
+            else {
+                panic!("removal proceeds after a failed epoch close");
+            };
+            let notes = handle.notes();
+            assert_eq!(
+                notes.get("epoch_close").map(String::as_str),
+                Some(outcome),
+                "{close}"
+            );
+            assert_eq!(
+                notes.get("epoch_close_error").map(String::as_str),
+                Some(expected),
+                "{close}"
+            );
+            pool.release_library("DEC418146K_LL02");
+        }
     }
 
     #[tokio::test]

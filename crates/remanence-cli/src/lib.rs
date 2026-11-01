@@ -6079,8 +6079,39 @@ fn print_drive_unload(
         });
         return print_json_envelope("rem.operation.status.v1", "item", data, out);
     }
+    // `failed`: a close ran and failed. `not_attempted`: no close ran. Neither
+    // says an epoch existed, so the warning only says one may stay open.
+    let epoch_close = operation
+        .progress
+        .get("epoch_close")
+        .filter(|outcome| matches!(outcome.as_str(), "failed" | "not_attempted"))
+        .map(|outcome| {
+            let error = operation
+                .progress
+                .get("epoch_close_error")
+                .cloned()
+                .unwrap_or_default();
+            (outcome == "failed", error)
+        });
     print_operation(operation, false, out)?;
     let cartridge = location.barcode.as_deref().unwrap_or("cartridge");
+    if let Some((ran, error)) = epoch_close {
+        let what = if ran {
+            "closing the parity epoch failed"
+        } else {
+            "no parity epoch close ran"
+        };
+        let reason = if error.is_empty() {
+            String::new()
+        } else {
+            format!(" ({error})")
+        };
+        writeln!(
+            out,
+            "warning: {what} on {cartridge}{reason}; the cartridge was removed anyway, and any open epoch stays open"
+        )
+        .map_err(|error| error.to_string())?;
+    }
     match location.slot {
         Some(slot) => writeln!(
             out,

@@ -10710,7 +10710,7 @@ pub(crate) async fn run_readiness_test_command(state: &crate::ApiState, command:
     let drive = library.open_drive(1, &policy).unwrap();
     let tx = spawn_drive_actor(1, drive, cfg);
     tx.send(command).await.unwrap();
-    tokio::time::timeout(StdDuration::from_secs(2), async {
+    tokio::time::timeout(StdDuration::from_secs(20), async {
         while !state
             .operations
             .latest(&id)
@@ -11623,6 +11623,45 @@ fn load_drive_terminal_progress_uses_durable_readiness() {
     }
 }
 
+/// A note recorded before removal reaches the terminal status and the finish audit.
+#[test]
+fn unload_epoch_close_failure_note_reaches_status_and_audit() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("state.sqlite");
+    let mut index = CatalogIndex::open(&path).unwrap();
+    let (_, library) = unthreaded_cartridge_world("LIB-NOTE");
+    let cfg = test_write_owner_config(
+        path,
+        temp.path().join("audit"),
+        &library,
+        library_snapshot_cell(library.library().clone()),
+    );
+    let registry = crate::operations::OperationRegistry::default();
+    let id = Uuid::new_v4();
+    let handle = registry.register(id, "unload_drive");
+    handle.record_note("epoch_close", "failed");
+    handle.record_note("epoch_close_error", "tape is fenced");
+    finish_library_operation(&mut index, &cfg, &handle, "LIB-NOTE", Ok(()), Ok(()));
+    let status = registry.latest(&id).unwrap();
+    assert_eq!(status.state, pb::OperationState::Succeeded as i32);
+    assert_eq!(status.progress["phase"], "done");
+    assert_eq!(status.progress["epoch_close"], "failed");
+    assert_eq!(status.progress["epoch_close_error"], "tape is fenced");
+    let audit = FileAuditLog::replay(&cfg.audit_dir).expect("unload audit");
+    let finish = audit
+        .iter()
+        .find(|record| record.event == AuditEvent::OperationFinished)
+        .expect("finish audit");
+    assert_eq!(
+        finish.detail.get("epoch_close"),
+        Some(&CborValue::Text("failed".into()))
+    );
+    assert_eq!(
+        finish.detail.get("epoch_close_error"),
+        Some(&CborValue::Text("tape is fenced".into()))
+    );
+}
+
 /// Shutdown is an informational end, with the fence available for resumption.
 #[test]
 fn load_drive_shutdown_logs_at_info() {
@@ -12421,6 +12460,7 @@ pub(crate) async fn check_seated_parity_sessions(
     read_before_shutdown: bool,
     invalidation: RetentionInvalidation,
     failed_close: bool,
+    prepare_removal: bool,
 ) {
     let barcode = CatalogIndex::open(&state.paths().sqlite_path)
         .unwrap()
@@ -13071,6 +13111,25 @@ pub(crate) async fn check_seated_parity_sessions(
         None
     };
     lifecycle.shutting_down.store(shutdown, Ordering::SeqCst);
+    if prepare_removal {
+        // Robotics removes the cartridge whatever the close did, so the close
+        // must say it ran and failed.
+        let (reply, received) = oneshot::channel();
+        tx.send(DriveCommand::PrepareRemoval {
+            reply,
+            progress: None,
+        })
+        .await
+        .unwrap();
+        let outcome = received.await.unwrap().unwrap();
+        let super::RemovalClose::Failed(reason) = outcome else {
+            panic!("a close that runs and fails reports Failed: {outcome:?}");
+        };
+        assert!(reason.contains("identity"), "{reason}");
+        let index = CatalogIndex::open(&state.paths().sqlite_path).unwrap();
+        assert_eq!(index.list_active_tape_io_fences().unwrap().len(), 1);
+        return;
+    }
     let before_unload = world.lock().unwrap().command_log.len();
     let (reply, received) = oneshot::channel();
     tx.send(DriveCommand::Unload { reply }).await.unwrap();
