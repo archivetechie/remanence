@@ -12,6 +12,11 @@ the day produces a management-ready test record, not just a feeling.
 
 ## 0. Before you start (10 min, read fully)
 
+**Without a remote session:** `fieldtest/package-owner-run.sh <out-dir>` builds a
+package that the host owner installs read-only and runs as one unattended plan
+(`run.sh plan/<name>.env`). See `OWNER.md` in the package. The plans are in
+`fieldtest/plan/`.
+
 ### Safety rules on the semi-production server
 
 1. Everything lives under **`~/remfield/`** (state, spool, logs,

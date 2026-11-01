@@ -1,0 +1,71 @@
+# Running a field plan yourself
+
+This package runs one test plan on the field host with no remote session. You
+install it as root, start it as the kit user and copy back one evidence file.
+Everything else the plan does is in `plan/<name>.env` and in the kit scripts
+under `scripts/`.
+
+## 1. Check the package
+
+The sha256 of the tarball comes to you separately from the tarball itself. Check it before anything else:
+
+```
+sha256sum remfield-run-<commit>.tar.gz     # must match what you were given
+```
+
+## 2. Install it read-only (root, once per package)
+
+```
+install -d -o root -g remfield -m 0750 /opt/remfield
+tar -xzf remfield-run-<commit>.tar.gz -C /opt/remfield
+chown -R root:remfield /opt/remfield/remfield-run-<commit>
+chmod -R u=rwX,g=rX,o= /opt/remfield/remfield-run-<commit>
+cd /opt/remfield/remfield-run-<commit>
+sha256sum -c SHA256SUMS
+setcap cap_sys_rawio+ep bin/rem bin/rem-debug bin/rem-daemon
+ln -sfn remfield-run-<commit> /opt/remfield/current
+```
+
+The kit user can run these binaries but can't replace them, so the raw-SCSI
+capability can't end up on any other program. Once a package is installed this
+way, the kit user no longer needs a sudo rule for `setcap`. Delete that rule.
+
+## 3. Before each run (root)
+
+- Quiesce Miria on the partition the plan uses.
+- Give the kit user the plan's changer and drive device nodes, and nothing else:
+  `setfacl -m u:remfield:rw /dev/sgN ...`. Get the nodes from discovery; sg
+  numbers move after a drive firmware flash.
+- Make sure the spool is the capped home or a tmpfs you sized. The kit's disk
+  guard refuses payloads that would leave the shared `/home` short. See
+  "Disk guard" in RUNBOOK.md.
+- Raise `max_sectors_kb` for throughput plans. See "Host I/O setup" in RUNBOOK.md.
+
+The plan refuses to start unless `~/remfield/allowlist.txt` lists exactly the
+plan's barcodes, with no cleaning cartridge. It also refuses if the kit state has
+selected a different library.
+
+## 4. Start it (as the kit user, in tmux)
+
+```
+sudo -iu remfield tmux new -s run '/opt/remfield/current/run.sh plan/smoke.env'
+```
+
+Detach with `Ctrl-b d`. The run log is in `~/remfield/log/run-<plan>-<stamp>.log`.
+
+To stop early, press `Ctrl-c` in the tmux window, or send TERM to the `run.sh` process.
+Either way the current leg stops. If something failed, run.sh captures read-only
+diagnostics. It then returns the allowlisted cartridges to their slots, stops the
+daemon and packs the evidence. A finished run prints a PASS/FAIL table, the evidence
+pack's path and its sha256.
+
+## 5. Return the evidence
+
+Copy `~/remfield/evidence-pack-<date>.tar.gz` back from your own account. Send its
+sha256 with it.
+
+## Undo
+
+- `rm -rf /opt/remfield`
+- `setfacl -x u:remfield /dev/sgN ...`
+- Restart Miria and rescan its devices, as at the end of any window.

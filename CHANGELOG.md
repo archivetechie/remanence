@@ -7,6 +7,14 @@ per-release summaries.
 <!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/index.rs crates/remanence-library/src/discovery.rs @ 638210f7 -->
 ## Unreleased
 
+- The field-test kit can run without a remote session.
+  `fieldtest/package-owner-run.sh` builds a package for the host owner to
+  install read-only, then run as one unattended plan with `run.sh plan/<name>.env`.
+  However a plan ends, it returns the allowlisted cartridges, stops the daemon
+  and packs the evidence, and on a failure or signal it first captures read-only
+  diagnostics. It refuses to start unless the allowlist is exactly the plan's
+  barcodes and the library is the plan's. `FIELD_BIN_DIR` points the kit at
+  binaries outside its home.
 - The field-test kit refuses any payload write that would crowd its host. A
   shared spool filesystem must keep 150 GiB and 25% free and the kit 40 GiB or
   less; a dedicated loop-backed or tmpfs spool keeps 2 GiB free, and a tmpfs
