@@ -6284,6 +6284,8 @@ async fn changer_move_succeeds_and_publishes_snapshot_when_catalog_observation_f
             src: 0x0400,
             dst: 0x0100,
             recovery_guard: None,
+            after_unload: false,
+            dismount_guard: None,
             caller_gone: None,
             reply: reply_tx,
         })
@@ -6752,6 +6754,7 @@ fn read_harvest_world(
     mpsc::Sender<DriveCommand>,
     String,
     String,
+    Arc<Mutex<VirtualWorld>>,
 ) {
     let index_path = temp.path().join("rem-state.sqlite");
     let mut index = CatalogIndex::open(&index_path).expect("open catalog");
@@ -6808,6 +6811,7 @@ fn read_harvest_world(
         drive_tx,
         serial,
         voltag.to_string(),
+        world,
     )
 }
 
@@ -6839,6 +6843,49 @@ async fn open_read_on_fresh_mount(
         .expect("open read session")
 }
 
+/// A lost read-open reply cannot issue an UNLOAD without a following MOVE.
+#[tokio::test]
+async fn cancelled_read_open_keeps_cartridge_threaded() {
+    let temp = tempfile::tempdir().unwrap();
+    let tape_uuid = [0x79; 16];
+    let (_, _, tx, serial, barcode, world) = read_harvest_world(&temp, tape_uuid, "RDH001L9");
+    world
+        .lock()
+        .unwrap()
+        .drive_states
+        .get_mut(&0x100)
+        .unwrap()
+        .unload_leaves_unthreaded = true;
+    let (reply, received) = oneshot::channel();
+    drop(received);
+    tx.send(DriveCommand::OpenRead {
+        tape_uuid,
+        needs_drive_load: true,
+        library_serial: serial,
+        barcode: Some(barcode),
+        source_slot: Some(0x400),
+        drive_uuid: None,
+        drive_serial: Some("DRV-READ-HARVEST".into()),
+        resume_target: None,
+        daemon_epoch: 1,
+        reply,
+    })
+    .await
+    .unwrap();
+    // The next actor command proves the failed reply path has returned.
+    let (reply, received) = oneshot::channel();
+    tx.send(DriveCommand::PrepareRemoval {
+        reply,
+        progress: None,
+    })
+    .await
+    .unwrap();
+    received.await.unwrap().unwrap();
+    let world = world.lock().unwrap();
+    assert!(world.drive_bays[&0x100].is_some());
+    assert!(!world.drive_states[&0x100].initializing_command_required);
+}
+
 /// The prompt's read-mount harvest fixture: a tape mounted purely to
 /// read — no write session anywhere — calibrates the volume, asserted
 /// through `servable_wrap_map`. Without the read-side harvest a
@@ -6853,7 +6900,7 @@ async fn read_only_mount_harvest_calibrates_the_volume() {
         .tempdir()
         .expect("tempdir");
     let tape_uuid = [0x79; 16];
-    let (index_path, store, drive_tx, serial, voltag) =
+    let (index_path, store, drive_tx, serial, voltag, _world) =
         read_harvest_world(&temp, tape_uuid, "RDH001L9");
     assert_eq!(
         store.row(tape_uuid).state,
@@ -6912,7 +6959,7 @@ async fn read_open_succeeds_when_the_harvest_cannot_calibrate() {
         .expect("tempdir");
     let tape_uuid = [0x7A; 16];
     // M8 is recognised but unsupported (conflicting published geometry).
-    let (index_path, store, drive_tx, serial, voltag) =
+    let (index_path, store, drive_tx, serial, voltag, _world) =
         read_harvest_world(&temp, tape_uuid, "RDH002M8");
 
     let session = open_read_on_fresh_mount(&drive_tx, tape_uuid, &serial, &voltag).await;
@@ -12357,6 +12404,7 @@ pub(crate) async fn check_seated_parity_sessions(
         .unwrap()
         .voltag
         .unwrap();
+    let lifecycle = crate::drive_pool::DrivePoolLifecycle::default();
     let read_fault = Arc::new(AtomicU64::new(0));
     if matches!(
         invalidation,
@@ -12382,6 +12430,7 @@ pub(crate) async fn check_seated_parity_sessions(
             {
                 let world = world.clone();
                 let fault = read_fault.clone();
+                let shutdown = lifecycle.shutting_down.clone();
                 let index_path = state.paths().sqlite_path.clone();
                 move |path| {
                     let role = world.lock().unwrap().role_for_path(path).unwrap();
@@ -12389,6 +12438,7 @@ pub(crate) async fn check_seated_parity_sessions(
                         inner: ModelTransport::new(world.clone(), role),
                         world: world.clone(),
                         fault: fault.clone(),
+                        shutdown: shutdown.clone(),
                         located: 0,
                         index_path: index_path.clone(),
                     }))
@@ -12416,7 +12466,6 @@ pub(crate) async fn check_seated_parity_sessions(
     cfg.checkpoint_journal_dir = state.paths().journal_dir.join("tapes");
     std::fs::create_dir_all(&cfg.checkpoint_journal_dir).unwrap();
     cfg.checkpoint_max_age_seconds = 3600;
-    let lifecycle = crate::drive_pool::DrivePoolLifecycle::default();
     cfg.lifecycle = Some(lifecycle.clone());
     let memory = cfg.io_memory.clone();
     let mut held = None;
@@ -13060,10 +13109,19 @@ pub(crate) async fn check_seated_parity_sessions(
         assert_rebuild_safety_equivalent(state);
         return;
     }
-    unloaded.unwrap();
-    assert!(world.lock().unwrap().command_log[before_unload..]
-        .iter()
-        .any(|c| c.opcode == 0x1b));
+    if invalidation == RetentionInvalidation::ShutdownSealDueBusy {
+        assert_eq!(unloaded.unwrap_err().code(), tonic::Code::Unavailable);
+        let world = world.lock().unwrap();
+        assert!(world.drive_bays[&0x100].is_some());
+        assert!(world.command_log[before_unload..]
+            .iter()
+            .all(|c| c.opcode != 0x1b));
+    } else {
+        unloaded.unwrap();
+        assert!(world.lock().unwrap().command_log[before_unload..]
+            .iter()
+            .any(|c| c.opcode == 0x1b));
+    }
     if (1..=3).contains(&fault) || invalidation == RetentionInvalidation::Fenced {
         let index = CatalogIndex::open(&state.paths().sqlite_path).unwrap();
         assert!(!index.list_active_tape_io_fences().unwrap().is_empty());
@@ -13581,6 +13639,7 @@ enum MagazineEvictionEntry {
     /// The full pinned write open, whose caller goes away while the
     /// eviction's move home waits for the magazine.
     WriteOpenCallerGone,
+    Shutdown,
 }
 
 async fn magazine_eviction_scenario(
@@ -13643,6 +13702,7 @@ async fn magazine_eviction_scenario(
         library_snapshot_cell(library.library().clone()),
     );
     std::fs::create_dir_all(&cfg.audit_dir).unwrap();
+    let lifecycle = crate::drive_pool::DrivePoolLifecycle::default();
     let board = crate::live_status::ChangerWaitBoard::default();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let observer = {
@@ -13665,7 +13725,8 @@ async fn magazine_eviction_scenario(
     cfg.changer_ready_wait =
         remanence_library::ChangerReadyWait::bounded(StdDuration::from_secs(wait_seconds))
             .with_poll_interval(StdDuration::from_millis(1))
-            .with_observer(observer);
+            .with_observer(observer)
+            .with_stop_signal("daemon shutdown", lifecycle.cut_changer_wait.clone());
     cfg.tape_pools = vec![remanence_state::TapePoolConfig {
         scheme: None,
         id: POOL.to_string(),
@@ -13682,7 +13743,6 @@ async fn magazine_eviction_scenario(
     library.set_changer_ready_wait(cfg.changer_ready_wait.clone());
     let key = crate::drive_pool::DriveKey::new(SERIAL, 0x0100);
     let drive = library.open_drive(0x0100, &cfg.policy).unwrap();
-    let lifecycle = crate::drive_pool::DrivePoolLifecycle::default();
     cfg.lifecycle = Some(lifecycle.clone());
     let actor = spawn_drive_actor(0x0100, drive, cfg.clone());
     let changer = spawn_changer_actor(library.into_changer(), cfg.clone());
@@ -13709,9 +13769,46 @@ async fn magazine_eviction_scenario(
             .removed_magazine
             .as_mut()
             .unwrap()
-            .reinsert_after_polls = Some(3);
+            .reinsert_after_polls = if entry == MagazineEvictionEntry::Shutdown {
+            None
+        } else {
+            Some(3)
+        };
     }
     let outcome = match entry {
+        MagazineEvictionEntry::Shutdown => {
+            let mounted_api = api.clone();
+            let mounting = tokio::spawn(async move {
+                crate::mount::test_mount_for_write(&mounted_api, SERIAL, &new_uuid)
+                    .await
+                    .map(Some)
+            });
+            tokio::time::timeout(StdDuration::from_secs(10), async {
+                while board.get(SERIAL).is_none() {
+                    tokio::time::sleep(StdDuration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("MOVE waits for the open magazine after UNLOAD");
+            api.begin_shutdown();
+            let closing_api = api.clone();
+            let closing = tokio::spawn(async move { closing_api.shutdown_drive_pool().await });
+            tokio::time::sleep(StdDuration::from_millis(350)).await;
+            assert!(
+                !closing.is_finished(),
+                "daemon cannot finish while MOVE waits for magazine"
+            );
+            assert!(world.lock().unwrap().drive_bays[&0x0100].is_some());
+            world.lock().unwrap().reinsert_magazine();
+            let outcome = mounting.await.unwrap();
+            tokio::time::timeout(StdDuration::from_secs(10), closing)
+                .await
+                .expect("shutdown completes after MOVE")
+                .unwrap()
+                .unwrap();
+            outcome
+        }
+
         MagazineEvictionEntry::Mount => crate::mount::test_mount_for_write(&api, SERIAL, &new_uuid)
             .await
             .map(Some),
@@ -13856,6 +13953,8 @@ async fn changer_actor_move_wait_stops_for_a_gone_caller_and_skips_during_shutdo
                 src: 0x0400,
                 dst: 0x0100,
                 recovery_guard: None,
+                after_unload: false,
+                dismount_guard: None,
                 caller_gone: Some(Arc::clone(&caller_gone)),
                 reply: reply_tx,
             })
@@ -13920,6 +14019,17 @@ async fn write_open_caller_gone_during_eviction_still_moves_the_old_cartridge_ho
         assert_ne!(world.loaded_barcode(0x0100), Some("OLD001L9"));
     }
     let _ = api.shutdown_drive_pool().await;
+}
+
+/// Shutdown cannot cut a post-UNLOAD magazine wait or finish before MOVE home.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_after_unload_waits_through_open_magazine_for_move_home() {
+    let (_, world, seen, _, _temp) =
+        magazine_eviction_scenario(60, MagazineEvictionEntry::Shutdown).await;
+    assert!(!seen.is_empty());
+    let world = world.lock().unwrap();
+    assert_eq!(world.slots[0].barcode.as_deref(), Some("OLD001L9"));
+    assert_ne!(world.loaded_barcode(0x0100), Some("OLD001L9"));
 }
 
 /// The write's eviction rides out the open magazine: the unloaded cartridge
@@ -14180,6 +14290,34 @@ async fn check_epoch_removal(
         matches!(case, "stale_open" | "stale_shared_lease" | "no_scheme")
             || before.highest_protected_ordinal < before.total_committed_ordinals
     );
+    if case == "shutdown_rebuild" {
+        // A new actor has no retained accumulator, so UNLOAD must rebuild from tape.
+        drop(tx);
+        let mut library = library;
+        let drive = library.open_drive(0x100, &cfg.policy).unwrap();
+        let tx = spawn_drive_actor(0x100, drive, cfg.clone());
+        read_fault.store(32, Ordering::SeqCst);
+        let start = world.lock().unwrap().command_log.len();
+        let (reply, received) = oneshot::channel();
+        tx.send(DriveCommand::Unload { reply }).await.unwrap();
+        let error = received.await.unwrap().unwrap_err();
+        assert_eq!(
+            read_fault.load(Ordering::SeqCst),
+            0,
+            "shutdown injected during Object rebuild READ"
+        );
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(error.message().contains("stays seated"));
+        let world = world.lock().unwrap();
+        assert!(world.drive_bays[&0x100].is_some());
+        assert!(
+            world.command_log[start..]
+                .iter()
+                .all(|c| c.opcode != 0x1b && c.opcode != 0xa5),
+            "no UNLOAD or MOVE after shutdown during parity rebuild"
+        );
+        return;
+    }
     let journal_before = if case == "replay_closed" {
         Some(
             remanence_state::authority::fixtures::AuthorityBuilder::new(
@@ -15159,6 +15297,7 @@ struct EpochRemovalTransport {
     inner: ModelTransport,
     world: Arc<Mutex<VirtualWorld>>,
     fault: Arc<AtomicU64>,
+    shutdown: Arc<AtomicBool>,
     located: u64,
     index_path: PathBuf,
 }
@@ -15168,6 +15307,10 @@ impl SgTransport for EpochRemovalTransport {
         cdb: &[u8],
         data: &mut [u8],
     ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError> {
+        if cdb[0] == 0x08 && self.located == 2 && self.fault.load(Ordering::SeqCst) == 32 {
+            self.fault.store(0, Ordering::SeqCst);
+            self.shutdown.store(true, Ordering::SeqCst);
+        }
         if matches!(cdb[0], 0x1a | 0x5a) && self.fault.load(Ordering::SeqCst) == 4 {
             self.fault.store(0, Ordering::SeqCst);
             return Err(remanence_library::ScsiError::Io(std::io::Error::other(

@@ -54,12 +54,14 @@ pub(crate) enum RoboticsAction {
 #[derive(Debug)]
 pub(crate) struct DriveUnloadOutcome {
     pub(crate) elapsed: StdDuration,
+    pub(crate) dismount_guard: Option<crate::drive_pool::DismountGuard>,
     pub(crate) recovery_guard: Option<crate::mount_support::UnloadRecoveryGuard>,
 }
 impl From<StdDuration> for DriveUnloadOutcome {
     fn from(elapsed: StdDuration) -> Self {
         Self {
             elapsed,
+            dismount_guard: None,
             recovery_guard: None,
         }
     }
@@ -75,6 +77,8 @@ pub(crate) enum ChangerCommand {
     Move {
         src: u16,
         dst: u16,
+        after_unload: bool,
+        dismount_guard: Option<crate::drive_pool::DismountGuard>,
         // Owned by the queued command/actor even if the requester disappears.
         recovery_guard: Option<crate::mount_support::UnloadRecoveryGuard>,
         // Set when the requester has gone away: a not-ready wait for this

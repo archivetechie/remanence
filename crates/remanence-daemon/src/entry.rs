@@ -49,15 +49,14 @@ struct Args {
 /// resolves when SIGINT, SIGTERM or SIGHUP arrives.
 ///
 /// Graceful shutdown stops admission, checkpoints and closes every open session,
-/// and leaves cartridges seated. An UNLOAD already in flight still completes its
-/// changer move home. Handling SIGHUP and repeated stop signals keeps a closing
-/// terminal or a second signal from cutting that work short.
+/// and leaves cartridges seated. Dismounts still rebuilding parity stop before
+/// UNLOAD. After UNLOAD is issued, shutdown waits without a reservation deadline
+/// for MOVE home; its magazine/door wait retains the configured readiness bound.
+/// Handling SIGHUP and repeated signals keeps that work from being cut short.
 ///
 /// The service manager's stop timeout must cover in-flight work and checkpointing
-/// and closing every open session, plus a margin. B6 adds
-/// `daemon.shutdown_close_deadline_secs`; the timeout must then exceed that
-/// deadline plus a margin, while also allowing existing UNLOAD/MOVE work to settle.
-/// SIGKILL or a failed changer move can still leave a cartridge unthreaded.
+/// and closing every open session, plus a margin. SIGKILL or a failed changer
+/// move can still leave a cartridge unthreaded.
 fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()> + Send + 'static> {
     use tokio::signal::unix::{signal, SignalKind};
 

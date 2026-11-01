@@ -58,7 +58,7 @@ string with a suffix: `B`, `KiB`/`K`/`KB`, `MiB`/`M`/`MB`, `GiB`/`G`/`GB`,
 | `default_idle_timeout_seconds` | integer > 0 | required | Default idle timeout for write/read sessions. |
 | `append_ingress_idle_secs` | integer > 0 | `300` | Bounds client inactivity during append ingress, including before Start. Counts only time waiting with no bytes received from the client; empty chunks do not reset it, and daemon backpressure does not count. |
 | `drive_idle_unload_seconds` | integer ≥ 0 | `300` | Rewind, unload, and return a seated cartridge to its home slot after this many idle seconds. `0` keeps it seated until eviction or explicit unload. Graceful shutdown leaves cartridges seated; startup registers them for the normal idle timeout. |
-| `changer_not_ready_wait_seconds` | integer 0–3600 | `600` | Longest wait, measured from the start of the wait, for a changer MOVE MEDIUM that failed because the library was transiently not ready (`02/3B/12` medium magazine removed, `02/04/01` becoming ready, `02/04/18` door open). The daemon polls the changer, re-reads the source and destination, and retries the move up to three times only when both are unchanged; one deadline covers every retry. No move waits during daemon shutdown. `0` fails such a move at once, as before; a value above 3600 is refused at config load. See [Waiting for the library](guide-troubleshooting.md#waiting-for-the-library-open-magazine-or-door). |
+| `changer_not_ready_wait_seconds` | integer 0–3600 | `600` | Longest wait, measured from the start of the wait, for a changer MOVE MEDIUM that failed because the library was transiently not ready (`02/3B/12` medium magazine removed, `02/04/01` becoming ready, `02/04/18` door open). The daemon polls the changer, re-reads the source and destination, and retries the move up to three times only when both are unchanged; one deadline covers every retry. Shutdown cuts ordinary move waits; a MOVE following an issued UNLOAD still waits up to this bound. `0` fails such a move at once, as before; a value above 3600 is refused at config load. See [Waiting for the library](guide-troubleshooting.md#waiting-for-the-library-open-magazine-or-door). |
 | `spool_dir` | absolute path | `<state_dir>/spool` | Pre-commit append spool. Created with mode `0700` at startup. |
 | `spool_tmpfs_ram_budget` | byte size > 0 | unset | Required acknowledgement when the spool resolves to tmpfs/ramfs. Spool growth reserves this fixed budget from the shared `io_memory_ceiling`; runtime `MemAvailable` never clamps or authorizes growth. Must be ≤ `io_memory_ceiling`. |
 | `io_memory_ceiling` | byte size > 0 | `"24GiB"` | Fixed total for ALL pipeline I/O memory: append-spool and overlap-ring reservations plus every drive's read reservoir, granted through one atomic permit manager. See the deployment note below. |
@@ -79,11 +79,12 @@ Checkpoint-batched durability is the only write mode, so there is no
 
 The service manager's stop timeout must cover in-flight work and checkpointing
 and closing every open session, plus a margin. Graceful shutdown leaves cartridges
-seated and finishes any UNLOAD/MOVE already in flight. Migration B6 will add
-`daemon.shutdown_close_deadline_secs`; once available, the stop timeout must exceed
-that deadline plus a margin and allow existing motion to settle. This key is not
-yet available. Startup proves a seated cartridge's identity and append cursor at
-first use.
+seated: a dismount still rebuilding parity stops before issuing UNLOAD. Once
+UNLOAD has been issued, shutdown waits for its MOVE home without a reservation
+wait deadline, including a magazine/door wait bounded by
+`changer_not_ready_wait_seconds`. Other reservations retain a 600-second wait
+bound. A failed MOVE or a forced kill can still leave a cartridge unthreaded.
+Startup proves a seated cartridge's identity and append cursor at first use.
 
 ### Transport trust boundaries
 

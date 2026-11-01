@@ -4,8 +4,9 @@
 #   run.sh plan/<name>.env
 #
 # Runs the plan's legs in order. However it ends (success, a fatal leg, or INT, TERM
-# or HUP), it captures read-only diagnostics if something failed, returns allowlisted
-# cartridges home and stops the daemon (03-bringup.sh --stop), then packs the evidence
+# or HUP), it captures read-only diagnostics if something failed. The stop step
+# unloads allowlisted cartridges; refusals and timeouts are WARNs in the evidence.
+# It stops the daemon (03-bringup.sh --stop), then packs the evidence
 # (90-collect-evidence.sh) and prints a PASS/FAIL table and the pack's sha256.
 # It never uses sudo and never touches a library other than the plan's.
 set -uo pipefail
@@ -46,6 +47,7 @@ done
 export FIELD_BIN_DIR="$pkg/bin"
 export FIELDTEST_LIBRARY_SERIAL="$PLAN_LIBRARY"
 export REMFIELD_ENV="${REMFIELD_ENV:-field}"
+# shellcheck disable=SC1091 # Dynamic kit root; lib.sh is checked separately.
 # shellcheck source=scripts/lib.sh
 source "$scripts/lib.sh"
 set +e
@@ -85,6 +87,8 @@ echo "run.sh: plan $PLAN_NAME on $PLAN_LIBRARY, kit $(cat "$pkg/KIT-COMMIT" 2>/d
 
 child=""
 interrupted=""
+# Called by the traps below.
+# shellcheck disable=SC2317
 on_signal() {
   interrupted="$1"
   echo "run.sh: $1 received; stopping the current leg and tearing down"

@@ -226,9 +226,15 @@ pub(super) fn changer_loop(
                 dst,
                 reply,
                 recovery_guard,
+                dismount_guard,
+                after_unload,
                 caller_gone,
             } => {
-                changer.set_ready_wait(cfg.changer_ready_wait_for(caller_gone, "caller gone"));
+                changer.set_ready_wait(if after_unload {
+                    cfg.changer_ready_wait.clone().without_stop_signals()
+                } else {
+                    cfg.changer_ready_wait_for(caller_gone, "caller gone")
+                });
                 let result =
                     super::robotics::admit_fenced_elements(&index, changer.library(), &[src, dst])
                         .and_then(|()| {
@@ -254,6 +260,7 @@ pub(super) fn changer_loop(
                     publish_library_snapshot(&cfg.library().snapshot, changer.library().clone());
                 }
                 drop(recovery_guard);
+                drop(dismount_guard);
                 let _ = reply.send(result);
             }
             ChangerCommand::Reconcile { tape_uuid, handle } => {
@@ -852,6 +859,7 @@ pub(super) fn drive_loop(
                 let result = unload_actor_drive(
                     drive,
                     std::path::Path::new(crate::mount_support::DEVICE_LOCK_ROOT),
+                    cfg.lifecycle.as_ref(),
                 );
                 if let Some(library) = drive.observed_library() {
                     let _ = observe_refreshed_library(&mut index, &cfg, &library);
@@ -1434,25 +1442,42 @@ pub(super) fn u64_to_i64(value: u64) -> Option<i64> {
 pub(crate) fn unload_actor_drive(
     drive: &mut remanence_library::DriveHandle,
     lock_root: &std::path::Path,
+    lifecycle: Option<&crate::drive_pool::DrivePoolLifecycle>,
 ) -> Result<super::DriveUnloadOutcome, Status> {
     let started = Instant::now();
     let bay = drive
         .bay_address()
         .map_or_else(|| "unplaced".to_string(), |bay| format!("0x{bay:04x}"));
-    let guard = crate::mount_support::unload_drive(drive, lock_root).map_err(|error| {
-        let message = format!("unload drive bay {bay}: {error}");
-        match error {
-            crate::mount_support::DriveUnloadError::Drive(
-                remanence_library::DriveOpError::Inventory(_),
-            )
-            | crate::mount_support::DriveUnloadError::Recovery(_) => {
-                Status::failed_precondition(message)
-            }
-            crate::mount_support::DriveUnloadError::Drive(_) => Status::internal(message),
+    let key = drive.endpoint().durable_key().cloned();
+    let mut dismount_guard = None;
+    let mut admit = || {
+        if dismount_guard.is_none() {
+            dismount_guard = lifecycle
+                .map(|l| l.begin_dismount(key.as_ref().expect("daemon drive has a durable key")))
+                .transpose()
+                .map_err(|error| error.message().to_string())?;
         }
-    })?;
+        Ok(())
+    };
+    let guard =
+        crate::mount_support::unload_drive(drive, lock_root, &mut admit).map_err(|error| {
+            let message = format!("unload drive bay {bay}: {error}");
+            match error {
+                crate::mount_support::DriveUnloadError::Drive(
+                    remanence_library::DriveOpError::UnloadAdmission(_),
+                ) => Status::unavailable(message),
+                crate::mount_support::DriveUnloadError::Drive(
+                    remanence_library::DriveOpError::Inventory(_),
+                )
+                | crate::mount_support::DriveUnloadError::Recovery(_) => {
+                    Status::failed_precondition(message)
+                }
+                crate::mount_support::DriveUnloadError::Drive(_) => Status::internal(message),
+            }
+        })?;
     Ok(super::DriveUnloadOutcome {
         elapsed: started.elapsed(),
+        dismount_guard,
         recovery_guard: guard,
     })
 }

@@ -159,18 +159,12 @@ pub(super) fn handle_drive_open_read(
         daemon_epoch,
     );
     if reply.send(Ok(open_reply)).is_err() {
-        if needs_drive_load {
-            if let Err(error) = crate::mount_support::unload_drive(
-                drive,
-                std::path::Path::new(crate::mount_support::DEVICE_LOCK_ROOT),
-            ) {
-                tracing::warn!(bay, %error, "cancelled read's compensating unload failed");
-            }
-            if let Some(library) = drive.observed_library() {
-                let _ = super::robotics::observe_refreshed_library(index, cfg, &library);
-                super::robotics::publish_library_snapshot(&cfg.library().snapshot, library);
-            }
-        }
+        // No changer reservation or MOVE is owned here. Leave the cartridge
+        // seated; a drive-only compensation would strand it unthreaded.
+        tracing::warn!(
+            bay,
+            "read open reply receiver disappeared; cartridge stays seated"
+        );
         return;
     }
 

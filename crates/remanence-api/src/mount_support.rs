@@ -435,7 +435,28 @@ pub fn unload_library_bay(
     config: Option<&Path>,
     lock_root: &Path,
 ) -> Result<UnloadOutcome, MountError> {
-    match library.unload(bay, destination, policy) {
+    unload_library_bay_with_admission(
+        library,
+        bay,
+        destination,
+        policy,
+        config,
+        lock_root,
+        &mut || Ok(()),
+    )
+}
+
+/// Keep the owner's physical-dispatch check across removal-lock recovery retries.
+pub(crate) fn unload_library_bay_with_admission(
+    library: &mut LibraryHandle,
+    bay: u16,
+    destination: Option<u16>,
+    policy: &dyn remanence_library::AccessPolicy,
+    config: Option<&Path>,
+    lock_root: &Path,
+    admit: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<UnloadOutcome, MountError> {
+    match library.unload_with_admission(bay, destination, policy, admit) {
         Ok(()) => return Ok(UnloadOutcome::Unloaded),
         Err(remanence_library::UnloadError::DriveUnload(ref error))
             if error.is_medium_removal_prevented() => {}
@@ -449,7 +470,7 @@ pub fn unload_library_bay(
     let serial = drive.drive().serial.clone();
     let guard = UnloadRecoveryGuard::acquire(&mut drive, config, lock_root)?;
     let result = library
-        .unload_recovering_removal(bay, destination, policy)
+        .unload_recovering_removal_with_admission(bay, destination, policy, admit)
         .map_err(refusal);
     guard.finish(result)?;
     tracing::warn!(
@@ -482,8 +503,9 @@ pub(crate) enum DriveUnloadError {
 pub(crate) fn unload_drive(
     drive: &mut DriveHandle,
     lock_root: &Path,
+    admit: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<Option<UnloadRecoveryGuard>, DriveUnloadError> {
-    match drive.unload() {
+    match drive.unload_with_admission(admit) {
         Ok(()) => return Ok(None),
         Err(error) if error.is_medium_removal_prevented() => {}
         Err(error) => return Err(DriveUnloadError::Drive(error)),
@@ -492,7 +514,10 @@ pub(crate) fn unload_drive(
     let guard =
         UnloadRecoveryGuard::acquire(drive, None, lock_root).map_err(DriveUnloadError::Recovery)?;
     guard
-        .finish(drive.unload_recovering_removal().map_err(refusal))
+        .finish((|| {
+            drive.allow_medium_removal().map_err(refusal)?;
+            drive.unload_with_admission(admit).map_err(refusal)
+        })())
         .map_err(DriveUnloadError::Recovery)?;
     tracing::warn!(
         %serial,

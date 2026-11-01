@@ -394,6 +394,9 @@ pub enum MoveError {
 /// without conflation.
 #[derive(Debug, Error)]
 pub enum DriveOpError {
+    /// The owner stopped removal after inventory checks, before physical UNLOAD.
+    #[error("unload admission refused: {0}")]
+    UnloadAdmission(String),
     /// Changer inventory refuses the unload before the drive receives a command.
     #[error("unload inventory refusal: {0}")]
     Inventory(#[from] MoveError),

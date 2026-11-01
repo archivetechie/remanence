@@ -101,9 +101,8 @@ pub(crate) enum BayResolution {
 }
 
 /// The daemon's changer not-ready wait: `[daemon] changer_not_ready_wait_seconds`,
-/// reported to live status through `board`. Once `shutting_down` is set no
-/// move waits: shutdown park moves fail at once, as before, rather than each
-/// holding the stop for the full bound.
+/// reported to live status through `board`. Shutdown cuts ordinary move waits.
+/// A MOVE following UNLOAD removes this stop signal and retains the time bound.
 pub(crate) fn changer_ready_wait_from_config(
     config: &RemConfig,
     board: &crate::live_status::ChangerWaitBoard,
@@ -367,7 +366,7 @@ impl ApiState {
         let changer_ready_wait = changer_ready_wait_from_config(
             config,
             &changer_waits,
-            Arc::clone(&drive_pool_lifecycle.shutting_down),
+            Arc::clone(&drive_pool_lifecycle.cut_changer_wait),
         );
         let mut opened_libraries = Vec::new();
         for configured in &config.libraries {
