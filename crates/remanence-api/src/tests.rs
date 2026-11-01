@@ -56,6 +56,9 @@ use crate::startup_guard::*;
 use crate::startup_media_readiness::*;
 use crate::write_session_ingress::*;
 
+#[path = "ingress_deadline_tests.rs"]
+mod ingress_deadline_tests;
+
 const OBJECT_ID_TEXT: &str = "11111111-1111-1111-1111-111111111111";
 const OPERATION_ID_TEXT: &str = "22222222-2222-2222-2222-222222222222";
 const TAPE_UUID: [u8; 16] = [3u8; 16];
@@ -1107,6 +1110,7 @@ async fn overlap_receiver_preserves_bytes_and_accepts_only_the_binding_digest() 
         payload.len() as u64,
         digest,
         control,
+        AppendIngressDeadline::new(300),
     ));
     let consumed = tokio::task::spawn_blocking(move || {
         let mut bytes = Vec::new();
@@ -1157,6 +1161,7 @@ async fn overlap_receiver_rejects_finish_or_observed_digest_disagreement() {
             payload.len() as u64,
             binding_digest,
             control,
+            AppendIngressDeadline::new(300),
         ));
         let consumer_task = tokio::task::spawn_blocking(move || {
             let mut bytes = Vec::new();

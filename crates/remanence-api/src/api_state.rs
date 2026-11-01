@@ -56,6 +56,7 @@ pub struct ApiState {
     pub(crate) spool_budget_bytes: Option<u64>,
     pub(crate) io_memory: Arc<crate::io_memory::IoMemoryReservation>,
     pub(crate) append_staging_mode: remanence_state::AppendStagingMode,
+    pub(crate) append_ingress_idle_secs: u64,
     pub(crate) append_ring_bytes: u64,
     pub(crate) append_overlap_min_bytes: u64,
     pub(crate) append_ring_high_pct: u8,
@@ -189,6 +190,7 @@ impl ApiState {
             calibration_store,
         );
         state.append_staging_mode = config.daemon.append_staging_mode;
+        state.append_ingress_idle_secs = config.daemon.append_ingress_idle_secs;
         state.append_ring_bytes = config.daemon.append_ring_bytes;
         state.append_overlap_min_bytes = config.daemon.append_overlap_min_bytes();
         state.append_ring_high_pct = config.daemon.append_ring_high_pct;
@@ -257,6 +259,7 @@ impl ApiState {
             )
             .expect("nonzero default I/O memory ceiling"),
             append_staging_mode: remanence_state::AppendStagingMode::default(),
+            append_ingress_idle_secs: remanence_state::DEFAULT_APPEND_INGRESS_IDLE_SECS,
             append_ring_bytes: remanence_state::DEFAULT_APPEND_RING_BYTES,
             append_overlap_min_bytes: remanence_state::DEFAULT_APPEND_RING_BYTES,
             append_ring_high_pct: 90,
@@ -508,6 +511,7 @@ impl ApiState {
         state.spool_budget_bytes = Some(spool_budget_bytes);
         state.io_memory = io_memory;
         state.append_staging_mode = config.daemon.append_staging_mode;
+        state.append_ingress_idle_secs = config.daemon.append_ingress_idle_secs;
         state.append_ring_bytes = config.daemon.append_ring_bytes;
         state.append_overlap_min_bytes = config.daemon.append_overlap_min_bytes();
         state.append_ring_high_pct = config.daemon.append_ring_high_pct;
