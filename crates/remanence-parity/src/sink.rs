@@ -35,7 +35,7 @@ use crate::capacity::{
     CapacityReserveCause, TerminalTripleCloseInput, TerminalTripleCloseReport,
     TerminalTripleObjectReservation,
 };
-use crate::codec::ReedSolomonCodec;
+use crate::closeout::EpochAccumulator;
 use crate::durable::DurableBoundaryState;
 use crate::error::ParityError;
 use crate::file_rows::{FileRowsKind, FileRowsReport, FrozenFileRows, TapeFileEntry};
@@ -56,9 +56,7 @@ use crate::resume::{
     checked_bounded_resume_summary, resume_record_result, streamed_filemark_map_digest,
     BoundedResumeSummary, ResumeAppendResult, ResumeLiveEpochState,
 };
-use crate::sidecar::{
-    data_shard_crc64, encode_sidecar_tape_file, parse_sidecar_tape_file, SidecarDescriptor,
-};
+use crate::sidecar::{data_shard_crc64, parse_sidecar_tape_file, SidecarDescriptor};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ActiveObject {
@@ -214,6 +212,31 @@ struct PendingSidecar {
     parity_shards: Vec<Vec<u8>>,
     data_shard_crc64s: Vec<u64>,
     is_terminal: bool,
+}
+
+/// Borrowed parity view used only to compute terminal metadata.
+struct PendingSidecarView<'a> {
+    epoch_id: u64,
+    block_size: u32,
+    protected_ordinal_start: u64,
+    protected_ordinal_end_exclusive: u64,
+    parity_shards: Vec<&'a [u8]>,
+    data_shard_crc64s: &'a [u64],
+    is_terminal: bool,
+}
+
+impl<'a> From<&'a PendingSidecar> for PendingSidecarView<'a> {
+    fn from(sidecar: &'a PendingSidecar) -> Self {
+        Self {
+            epoch_id: sidecar.epoch_id,
+            block_size: sidecar.block_size,
+            protected_ordinal_start: sidecar.protected_ordinal_start,
+            protected_ordinal_end_exclusive: sidecar.protected_ordinal_end_exclusive,
+            parity_shards: sidecar.parity_shards.iter().map(Vec::as_slice).collect(),
+            data_shard_crc64s: &sidecar.data_shard_crc64s,
+            is_terminal: sidecar.is_terminal,
+        }
+    }
 }
 
 fn terminal_triple_runtime_state_from_parts(
@@ -380,16 +403,6 @@ fn expected_resume_stripe_rows(data_blocks: u64, stripes: usize, stripe_index: u
     } else {
         ((data_blocks - 1 - stripe_index) / stripes + 1) as usize
     }
-}
-
-fn new_epoch_parity_accumulators(
-    codec: &ReedSolomonCodec,
-    stripes: usize,
-    block_size: usize,
-) -> Vec<Vec<Vec<u8>>> {
-    (0..stripes)
-        .map(|_| codec.new_parity_accumulators(block_size))
-        .collect()
 }
 
 fn sidecar_summary_to_directory_entry(
@@ -863,13 +876,11 @@ pub struct ParitySinkSessionState {
     identity: WriterIdentity,
     scheme: ParityScheme,
     tape_uuid: [u8; 16],
-    codec: ReedSolomonCodec,
+    accumulator: EpochAccumulator,
     block_size_bytes: u32,
     neighborhood_idx: u64,
     current_epoch_start: u64,
     data_blocks_in_neighborhood: u64,
-    parity_accumulators: Vec<Vec<Vec<u8>>>,
-    current_epoch_data_crc64s: Vec<u64>,
     unverified_rebuild: bool,
     pending_sidecars: Vec<PendingSidecar>,
     highest_protected_ordinal: u64,
@@ -906,11 +917,11 @@ impl ParitySinkSessionState {
     }
     /// Check of the still-uncovered range, with honest cold-rebuild provenance.
     pub fn commit_check(&self) -> (crate::CheckValue, crate::CheckProvenance) {
-        if self.current_epoch_data_crc64s.is_empty() {
+        if self.accumulator.current_epoch_data_crc64s.is_empty() {
             return (crate::CheckValue::EMPTY, crate::CheckProvenance::Empty);
         }
         (
-            crate::check_value(self.current_epoch_data_crc64s.iter().copied()),
+            self.accumulator.check_value(),
             if self.unverified_rebuild {
                 crate::CheckProvenance::UnverifiedRebuild
             } else {
@@ -1014,7 +1025,7 @@ pub struct ParitySink<'a> {
     backend: ParitySinkBackend<'a>,
     scheme: ParityScheme,
     tape_uuid: [u8; 16],
-    codec: ReedSolomonCodec,
+    accumulator: EpochAccumulator,
     /// Tape block size in bytes the sink was constructed with.
     /// Pinned at construction so bootstrap writes (which happen
     /// before any data write) know how big the buffer must be.
@@ -1035,19 +1046,7 @@ pub struct ParitySink<'a> {
     /// 0 at every neighborhood boundary.
     data_blocks_in_neighborhood: u64,
 
-    /// Per-stripe parity accumulators for the current epoch.
-    ///
-    /// Shape: `S` stripes, each containing `m` fixed-size parity shards. The
-    /// sidecar-only writer updates the relevant stripe's accumulators with
-    /// [`ReedSolomonCodec::accumulate`] for every object-data block. Missing
-    /// final partial-epoch data shards are implicit zeros, so no data shard
-    /// buffers are needed for final sidecar emission.
-    parity_accumulators: Vec<Vec<Vec<u8>>>,
-
-    /// CRC-64/XZ values for real object-data shards in the current epoch,
-    /// in `ParityDataOrdinal` order. Logical zero padding used by `finish()`
-    /// for RS math is deliberately excluded.
-    current_epoch_data_crc64s: Vec<u64>,
+    /// Whether the current epoch contains legacy unverified readback.
     unverified_rebuild: bool,
 
     /// Completed-epoch sidecars whose parity has been computed but whose tape
@@ -1223,13 +1222,11 @@ impl<'a> ParitySink<'a> {
             identity: self.identity,
             scheme: self.scheme,
             tape_uuid: self.tape_uuid,
-            codec: self.codec,
+            accumulator: self.accumulator,
             block_size_bytes: self.block_size_bytes,
             neighborhood_idx: self.neighborhood_idx,
             current_epoch_start: self.current_epoch_start,
             data_blocks_in_neighborhood: self.data_blocks_in_neighborhood,
-            parity_accumulators: self.parity_accumulators,
-            current_epoch_data_crc64s: self.current_epoch_data_crc64s,
             unverified_rebuild: self.unverified_rebuild,
             pending_sidecars: self.pending_sidecars,
             highest_protected_ordinal: self.highest_protected_ordinal,
@@ -1394,13 +1391,11 @@ impl<'a> ParitySink<'a> {
             identity: state.identity,
             scheme: state.scheme,
             tape_uuid: state.tape_uuid,
-            codec: state.codec,
+            accumulator: state.accumulator,
             block_size_bytes: state.block_size_bytes,
             neighborhood_idx: state.neighborhood_idx,
             current_epoch_start: state.current_epoch_start,
             data_blocks_in_neighborhood: state.data_blocks_in_neighborhood,
-            parity_accumulators: state.parity_accumulators,
-            current_epoch_data_crc64s: state.current_epoch_data_crc64s,
             unverified_rebuild: state.unverified_rebuild,
             pending_sidecars: state.pending_sidecars,
             highest_protected_ordinal: state.highest_protected_ordinal,
@@ -1609,24 +1604,17 @@ impl<'a> ParitySink<'a> {
                 "block_size_bytes = 0 — must be the tape's logical block size".into(),
             ));
         }
-        let codec = ReedSolomonCodec::new(&scheme)?;
-        let s = scheme.stripes_per_neighborhood as usize;
-        let fixed_block_size = usize::try_from(block_size_bytes).map_err(|_| {
-            ParityError::InvalidScheme("block_size_bytes does not fit usize".into())
-        })?;
-        let parity_accumulators = new_epoch_parity_accumulators(&codec, s, fixed_block_size);
+        let accumulator = EpochAccumulator::new(tape_uuid, &scheme, block_size_bytes, 0, 0)?;
         Ok(Self {
             identity,
             backend,
             scheme,
             tape_uuid,
-            codec,
+            accumulator,
             block_size_bytes,
             neighborhood_idx: 0,
             current_epoch_start: 0,
             data_blocks_in_neighborhood: 0,
-            parity_accumulators,
-            current_epoch_data_crc64s: Vec::new(),
             unverified_rebuild: false,
             pending_sidecars: Vec::new(),
             highest_protected_ordinal: 0,
@@ -1735,6 +1723,8 @@ impl<'a> ParitySink<'a> {
             }
             self.neighborhood_idx = resume_result.next_epoch_id;
             self.current_epoch_start = resume_result.next_data_ordinal;
+            self.accumulator
+                .restart_empty(self.neighborhood_idx, self.current_epoch_start)?;
             return Ok(());
         };
 
@@ -1822,22 +1812,24 @@ impl<'a> ParitySink<'a> {
             }
         }
 
-        self.reset_parity_accumulators()?;
-        for (stripe_index, stripe) in stripe_buffers.iter().enumerate() {
-            for (row_index, block) in stripe.iter().enumerate() {
-                self.codec.accumulate(
-                    row_index,
-                    block,
-                    &mut self.parity_accumulators[stripe_index],
-                )?;
-            }
+        self.accumulator = EpochAccumulator::new(
+            self.tape_uuid,
+            &self.scheme,
+            self.block_size_bytes,
+            epoch_id,
+            protected_ordinal_start,
+        )?;
+        for offset in 0..data_blocks_usize {
+            self.accumulator.push_block(
+                protected_ordinal_start + offset as u64,
+                &stripe_buffers[offset % stripes][offset / stripes],
+            )?;
         }
 
         self.neighborhood_idx = epoch_id;
         self.current_epoch_start = protected_ordinal_start;
         self.data_blocks_in_neighborhood = data_blocks_in_epoch;
         self.block_size = Some(block_size);
-        self.current_epoch_data_crc64s = data_shard_crc64s;
         self.unverified_rebuild = true;
         Ok(())
     }
@@ -2487,13 +2479,12 @@ impl<'a> ParitySink<'a> {
                 protected_ordinal_start: sidecar.protected_ordinal_start,
                 protected_ordinal_end_exclusive: sidecar.protected_ordinal_end_exclusive,
             };
-            let encoded = encode_sidecar_tape_file(
+            let (encoded, _) = crate::sidecar::sidecar_metadata(
                 &descriptor,
                 &sidecar.parity_shards,
-                sidecar.data_shard_crc64s,
+                sidecar.data_shard_crc64s.to_vec(),
             )?;
-            let block_count = u64::try_from(encoded.blocks.len())
-                .map_err(|_| ParityError::Invariant("sidecar block count overflows u64"))?;
+            let block_count = encoded.header.sidecar_total_block_count;
             let map_entry = projected_map.push_parity_sidecar(
                 block_count,
                 sidecar.epoch_id,
@@ -2639,8 +2630,12 @@ impl<'a> ParitySink<'a> {
         })
     }
 
-    fn terminal_prefix_pending_sidecars(&self) -> Result<Vec<PendingSidecar>, ParityError> {
-        let mut pending = self.pending_sidecars.clone();
+    fn terminal_prefix_pending_sidecars(&self) -> Result<Vec<PendingSidecarView<'_>>, ParityError> {
+        let mut pending: Vec<_> = self
+            .pending_sidecars
+            .iter()
+            .map(PendingSidecarView::from)
+            .collect();
         if self.data_blocks_in_neighborhood == 0 {
             return Ok(pending);
         }
@@ -2655,27 +2650,27 @@ impl<'a> ParitySink<'a> {
             ));
         }
         let mut parity_shards = Vec::new();
-        for stripe in &self.parity_accumulators {
-            if stripe.len() != self.codec.parity_blocks()
+        for stripe in &self.accumulator.parity_accumulators {
+            if stripe.len() != self.accumulator.codec.parity_blocks()
                 || stripe.iter().any(|shard| shard.len() != block_size)
             {
                 return Err(ParityError::Invariant(
                     "terminal prefix parity accumulator shape mismatch",
                 ));
             }
-            parity_shards.extend(stripe.iter().cloned());
+            parity_shards.extend(stripe.iter().map(Vec::as_slice));
         }
         let protected_ordinal_end_exclusive = self
             .current_epoch_start
             .checked_add(self.data_blocks_in_neighborhood)
             .ok_or(ParityError::Invariant("sidecar protected range overflows"))?;
-        pending.push(PendingSidecar {
+        pending.push(PendingSidecarView {
             epoch_id: self.neighborhood_idx,
             block_size: self.block_size_bytes,
             protected_ordinal_start: self.current_epoch_start,
             protected_ordinal_end_exclusive,
             parity_shards,
-            data_shard_crc64s: self.current_epoch_data_crc64s.clone(),
+            data_shard_crc64s: &self.accumulator.current_epoch_data_crc64s,
             is_terminal: true,
         });
         Ok(pending)
@@ -3074,11 +3069,13 @@ impl<'a> ParitySink<'a> {
     }
 
     fn reset_parity_accumulators(&mut self) -> Result<(), ParityError> {
-        let fixed_block_size = usize::try_from(self.block_size_bytes)
-            .map_err(|_| ParityError::Invariant("fixed block size does not fit usize"))?;
-        let stripes = self.scheme.stripes_per_neighborhood as usize;
-        self.parity_accumulators =
-            new_epoch_parity_accumulators(&self.codec, stripes, fixed_block_size);
+        self.accumulator = EpochAccumulator::new(
+            self.tape_uuid,
+            &self.scheme,
+            self.block_size_bytes,
+            self.neighborhood_idx,
+            self.current_epoch_start,
+        )?;
         Ok(())
     }
 
@@ -3087,12 +3084,12 @@ impl<'a> ParitySink<'a> {
             .current_epoch_start
             .checked_add(self.data_blocks_in_neighborhood)
             .ok_or(ParityError::Invariant("epoch protected range overflows"))?;
-        self.reset_parity_accumulators()?;
         self.neighborhood_idx = self
             .neighborhood_idx
             .checked_add(1)
             .ok_or(ParityError::Invariant("epoch id overflows"))?;
         self.data_blocks_in_neighborhood = 0;
+        self.reset_parity_accumulators()?;
         Ok(())
     }
 
@@ -3104,38 +3101,15 @@ impl<'a> ParitySink<'a> {
     /// Object writes update parity accumulators and drop the shard; object data
     /// is not retained after the fixed block has been forwarded to raw tape.
     fn record_data_block(&mut self, buf: &[u8]) -> Result<(u32, u16), ParityError> {
-        let s = self.scheme.stripes_per_neighborhood as u64;
-        let k = self.scheme.data_blocks_per_stripe as u64;
-
-        let position_in_neighborhood = self.data_blocks_in_neighborhood;
-        if position_in_neighborhood >= s * k {
-            // Should not happen: emit_parity_for_neighborhood
-            // rolls over before we get here. Belt-and-braces
-            // invariant — if it fires, the stripe accounting
-            // got out of sync.
-            return Err(ParityError::Invariant(
-                "ParitySink: data row overrun (parity flush missed a boundary)",
-            ));
-        }
-        let stripe_index = (position_in_neighborhood % s) as u32;
-        let row = (position_in_neighborhood / s) as u16;
-        let fixed_block_size = usize::try_from(self.block_size_bytes)
-            .map_err(|_| ParityError::Invariant("fixed block size does not fit usize"))?;
-        if buf.len() != fixed_block_size {
-            return Err(ParityError::Invariant(
-                "sidecar-only parity requires object writes to match the configured fixed block size",
-            ));
-        }
-        let accumulators = self
-            .parity_accumulators
-            .get_mut(stripe_index as usize)
-            .ok_or(ParityError::Invariant(
-                "epoch parity accumulator stripe outside S",
-            ))?;
-        self.codec.accumulate(row as usize, buf, accumulators)?;
-        self.current_epoch_data_crc64s.push(data_shard_crc64(buf));
+        let s = u64::from(self.scheme.stripes_per_neighborhood);
+        let offset = self.data_blocks_in_neighborhood;
+        let ordinal = self
+            .current_epoch_start
+            .checked_add(offset)
+            .ok_or(ParityError::Invariant("data ordinal overflows"))?;
+        self.accumulator.push_block(ordinal, buf)?;
         self.data_blocks_in_neighborhood += 1;
-        Ok((stripe_index, row))
+        Ok(((offset % s) as u32, (offset / s) as u16))
     }
 
     /// Internal: queue a sidecar for a completed epoch, then roll over to the
@@ -3172,31 +3146,7 @@ impl<'a> ParitySink<'a> {
         allow_partial_epoch: bool,
         is_terminal: bool,
     ) -> Result<(), ParityError> {
-        let m = self.codec.parity_blocks();
-        let mut parity_shards =
-            Vec::with_capacity(self.parity_accumulators.len().checked_mul(m).ok_or(
-                ParityError::Invariant("sidecar parity shard count overflows"),
-            )?);
-        for stripe in &self.parity_accumulators {
-            if stripe.len() != m {
-                self.poisoned = true;
-                return Err(ParityError::Invariant(
-                    "epoch parity accumulator count does not match m",
-                ));
-            }
-            for shard in stripe {
-                if shard.len() != block_size {
-                    self.poisoned = true;
-                    return Err(ParityError::Invariant(
-                        "epoch parity accumulator block size mismatch",
-                    ));
-                }
-            }
-        }
-        let epoch_accumulators = std::mem::take(&mut self.parity_accumulators);
-        for stripe in epoch_accumulators {
-            parity_shards.extend(stripe);
-        }
+        let parity_shards = self.accumulator.take_parity_shards(block_size)?;
         self.queue_epoch_sidecar_with_parity_shards(
             parity_shards,
             block_size,
@@ -3213,12 +3163,12 @@ impl<'a> ParitySink<'a> {
         is_terminal: bool,
     ) -> Result<(), ParityError> {
         let s = self.scheme.stripes_per_neighborhood as usize;
-        let k = self.codec.data_blocks();
-        let m = self.codec.parity_blocks();
+        let k = self.accumulator.codec.data_blocks();
+        let m = self.accumulator.codec.parity_blocks();
         let logical_data = s
             .checked_mul(k)
             .ok_or(ParityError::Invariant("sidecar real data count overflows"))?;
-        let real_data = self.current_epoch_data_crc64s.len();
+        let real_data = self.accumulator.current_epoch_data_crc64s.len();
         if real_data == 0 {
             return Ok(());
         }
@@ -3277,7 +3227,7 @@ impl<'a> ParitySink<'a> {
         let end = start
             .checked_add(real_data as u64)
             .ok_or(ParityError::Invariant("sidecar protected range overflows"))?;
-        let data_shard_crc64s = std::mem::take(&mut self.current_epoch_data_crc64s);
+        let data_shard_crc64s = std::mem::take(&mut self.accumulator.current_epoch_data_crc64s);
         self.unverified_rebuild = false;
         self.pending_sidecars.push(PendingSidecar {
             epoch_id: self.neighborhood_idx,
@@ -3320,9 +3270,9 @@ impl<'a> ParitySink<'a> {
             protected_ordinal_start: sidecar.protected_ordinal_start,
             protected_ordinal_end_exclusive: sidecar.protected_ordinal_end_exclusive,
         };
-        let encoded = match encode_sidecar_tape_file(
+        let encoded = match crate::sidecar::encode_sidecar_owned(
             &descriptor,
-            &sidecar.parity_shards,
+            sidecar.parity_shards,
             sidecar.data_shard_crc64s,
         ) {
             Ok(encoded) => encoded,

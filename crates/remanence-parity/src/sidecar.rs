@@ -527,6 +527,19 @@ pub fn encode_sidecar_tape_file<B: AsRef<[u8]>>(
     parity_shards: &[B],
     data_shard_crc64s: Vec<u64>,
 ) -> Result<EncodedSidecarTapeFile, ParityError> {
+    encode_sidecar_owned(
+        descriptor,
+        parity_shards.iter().map(|b| b.as_ref().to_vec()).collect(),
+        data_shard_crc64s,
+    )
+}
+
+/// Build only the sidecar metadata, borrowing parity payloads.
+pub(crate) fn sidecar_metadata<B: AsRef<[u8]>>(
+    descriptor: &SidecarDescriptor,
+    parity_shards: &[B],
+    data_shard_crc64s: Vec<u64>,
+) -> Result<(EncodedSidecarIndex, SidecarIndex), ParityError> {
     let block_size = validate_descriptor(descriptor)?;
     let expected_parity_shards = usize::try_from(
         descriptor
@@ -560,6 +573,17 @@ pub fn encode_sidecar_tape_file<B: AsRef<[u8]>>(
 
     let index = SidecarIndex::new(parity_entries, data_shard_crc64s);
     let encoded_index = encode_sidecar_index_blocks(descriptor, &index)?;
+    Ok((encoded_index, index))
+}
+
+/// Move parity buffers into physical emission order without copying their bytes.
+pub(crate) fn encode_sidecar_owned(
+    descriptor: &SidecarDescriptor,
+    parity_shards: Vec<Vec<u8>>,
+    data_shard_crc64s: Vec<u64>,
+) -> Result<EncodedSidecarTapeFile, ParityError> {
+    let (encoded_index, index) = sidecar_metadata(descriptor, &parity_shards, data_shard_crc64s)?;
+    let mut parity_shards: Vec<_> = parity_shards.into_iter().map(Some).collect();
     let mut blocks = encoded_index.blocks;
     let tail_index_block_count = usize::try_from(encoded_index.header.shard_index_block_count)
         .map_err(|_| sidecar_parse("sidecar index block count overflows usize"))?;
@@ -588,7 +612,11 @@ pub fn encode_sidecar_tape_file<B: AsRef<[u8]>>(
                     "sidecar parity locator disagrees with physical emission order",
                 ));
             }
-            blocks.push(parity_shards[entry_index].as_ref().to_vec());
+            blocks.push(
+                parity_shards[entry_index]
+                    .take()
+                    .ok_or(ParityError::Invariant("duplicate parity block position"))?,
+            );
         }
     }
     let block_size = usize::try_from(descriptor.block_size)

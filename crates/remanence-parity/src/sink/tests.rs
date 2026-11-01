@@ -1,4 +1,6 @@
 use super::*;
+use crate::codec::ReedSolomonCodec;
+use crate::sidecar::encode_sidecar_tape_file;
 use remanence_library::scsi::ScsiError;
 
 use crate::filemark_map::TapeFileMapEntry;
@@ -827,8 +829,11 @@ fn sidecar_only_write_path_accumulates_without_retaining_data_shards() {
         .chunks(scheme.parity_blocks_per_stripe as usize)
         .map(|stripe| stripe.to_vec())
         .collect::<Vec<_>>();
-    assert_eq!(sink.parity_accumulators, expected_partial_by_stripe);
-    assert_eq!(sink.current_epoch_data_crc64s.len(), 5);
+    assert_eq!(
+        sink.accumulator.parity_accumulators,
+        expected_partial_by_stripe
+    );
+    assert_eq!(sink.accumulator.current_epoch_data_crc64s.len(), 5);
 
     for i in 5..12 {
         let block = fixed_block(i as u8 + 1, block_size);
@@ -843,13 +848,14 @@ fn sidecar_only_write_path_accumulates_without_retaining_data_shards() {
         expected_epoch_parity(&scheme, &blocks, block_size)
     );
     assert!(
-        sink.parity_accumulators
+        sink.accumulator
+            .parity_accumulators
             .iter()
             .flatten()
             .all(|shard| shard.iter().all(|byte| *byte == 0)),
         "new epoch accumulators should be reset after queuing a sidecar"
     );
-    assert!(sink.current_epoch_data_crc64s.is_empty());
+    assert!(sink.accumulator.current_epoch_data_crc64s.is_empty());
 }
 
 #[test]
