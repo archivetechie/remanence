@@ -210,3 +210,21 @@ StartTapeVerificationRequest.tape_uuid  required exact 16-byte tape identity; an
 # Caller-id lookup scope. Empty explicitly selects an unscoped, exactly-one-pool lookup.
 GetObjectRequest.pool_id empty selects unscoped caller-id resolution; it never selects an arbitrary pool
 FindObjectCopiesRequest.pool_id empty selects unscoped caller-id resolution; it never selects an arbitrary pool
+
+# ---------------------------------------------------------------------------
+# Tape-I/O fences, decided 2026-11-01. Derivation for TapeIoFence is the
+# `tape_io_fences` schema: NOT NULL columns stay plain; nullable ones are
+# `optional`. The counts are computed from the same list the response carries.
+# ---------------------------------------------------------------------------
+TapeIoFence.fence_id                      tape_io_fences.fence_id is the integer primary key; a row cannot exist without one
+TapeIoFence.quarantine_id                 tape_io_fences.quarantine_id is NOT NULL UNIQUE and always a generated non-empty id
+TapeIoFence.tape_uuid                     tape_io_fences.tape_uuid is NOT NULL; every fence names the tape it covers
+TapeIoFence.reason                        tape_io_fences.reason is NOT NULL; every fence records why it was raised
+TapeIoFence.state                         tape_io_fences.state is NOT NULL; every fence is active or released
+TapeIoFence.created_at_utc                tape_io_fences.created_at_utc is NOT NULL
+TapeIoFence.updated_at_utc                tape_io_fences.updated_at_utc is NOT NULL
+HealthResponse.active_tape_io_fence_count    the length of active_tape_io_fences in the same response; a failed fence query fails the RPC, so 0 means no active fence
+GetLiveStatusResponse.active_tape_io_fence_count  the length of active_tape_io_fences in the same response; a failed fence query fails the RPC, so 0 means no active fence
+ListTapesResponse.active_tape_io_fence_count  the length of active_tape_io_fences in the same response; a failed fence query fails the RPC, so 0 means no active fence
+ReleaseTapeIoFenceRequest.quarantine_id   required; an empty id matches no fence (ids are generated non-empty), so the release answers NOT_FOUND
+ReleaseTapeIoFenceRequest.acknowledgment  required; the handler refuses an empty or blank acknowledgment with INVALID_ARGUMENT

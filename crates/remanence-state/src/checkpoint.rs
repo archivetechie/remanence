@@ -6,8 +6,8 @@
 //! before its corresponding SQLite batch projection. Replay stops at a torn
 //! final frame and fails closed on corrupt or unsupported bytes.
 //! All production write admission must acquire this authority through
-//! [`FileCheckpointJournal::acquire_exclusive`] or, for an already-Finalizing
-//! tape, [`FileCheckpointJournal::acquire_exclusive_for_terminal_recovery`].
+//! `FileCheckpointJournal::acquire_exclusive` or, for an already-Finalizing
+//! tape, `FileCheckpointJournal::acquire_exclusive_for_terminal_recovery`.
 //! Opening the backing file directly is not a valid write-admission path and
 //! would bypass the durable Finalizing fence.
 
