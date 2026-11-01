@@ -112,8 +112,8 @@ main() {
 
   local stamp workdir bytes random_file zeros_file prewarm_file top_stop locator restored
   stamp="$(fieldtest_timestamp_id)"
-  workdir="$(mktemp -d "$(fieldtest_spool_dir)/bench-dual-${stamp}.XXXXXX")"
   bytes="$(default_bench_bytes)"
+  fieldtest_make_workdir workdir "bench-dual-${stamp}" "$(( bytes * 4 ))" "dual-drive benchmark payloads"
   random_file="$workdir/random.bin"
   zeros_file="$workdir/zeros.bin"
   make_payload "$random_file" "$bytes" random

@@ -75,7 +75,7 @@ kill_mid_write() {
   prefix_bytes="${FIELD_FAULT_PREFIX_BYTES:-268435456}"
   fieldtest_require_pool_appendable_tapes fieldtest-a 1 "kill-mid-write fixture write"
   fieldtest_require_pool_appendable_tapes fieldtest-b 1 "kill-mid-write committed-prefix and interrupted writes"
-  workdir="$(mktemp -d "$(fieldtest_spool_dir)/fault-kill-${RANDOM}.XXXXXX")"
+  fieldtest_make_workdir workdir "fault-kill-${RANDOM}" "$(( (payload_bytes + prefix_bytes) * 3 ))" "kill-mid-write fixtures"
   IFS='|' read -r source object locator < <(write_fixture_object "$workdir/fieldtest-a-prefix" "$payload_bytes" fieldtest-a)
   IFS='|' read -r b_source b_object b_locator < <(write_fixture_object "$workdir/fieldtest-b-prefix" "$prefix_bytes" fieldtest-b)
   (fieldtest_capture_json "$workdir/write.json" "$(fieldtest_io_bin)" --endpoint "$(fieldtest_rem_endpoint)" write --library "$serial" --file "$object" --pool fieldtest-b; echo $? >"$workdir/write.rc") &
@@ -111,7 +111,7 @@ rebuild_catalog() {
   local serial workdir
   serial="$(fieldtest_selected_library_serial)"
   fieldtest_require_pool_appendable_tapes fieldtest-a 1 "rebuild fault fixture write"
-  workdir="$(mktemp -d "$(fieldtest_spool_dir)/fault-rebuild-${RANDOM}.XXXXXX")"
+  fieldtest_make_workdir workdir "fault-rebuild-${RANDOM}" "$(( ${FIELD_FAULT_REBUILD_BYTES:-268435456} * 3 ))" "rebuild fixture"
   IFS='|' read -r _ fixture locator < <(write_fixture_object "$workdir" "${FIELD_FAULT_REBUILD_BYTES:-268435456}")
   "$(fieldtest_script_dir)/03-bringup.sh" --stop >/dev/null 2>&1 || true
   cp -a -- "$(fieldtest_state_dir)" "$workdir/state-snapshot"
@@ -272,7 +272,7 @@ crash_clean() {
   fi
   local serial op_ref daemon_pid workdir drive_list_json drive_serial cleaning_barcode library_json bay
   serial="$(fieldtest_selected_library_serial)"
-  workdir="$(mktemp -d "$(fieldtest_spool_dir)/fault-clean-${RANDOM}.XXXXXX")"
+  fieldtest_make_workdir workdir "fault-clean-${RANDOM}" 1048576 "crash-clean evidence"
   op_ref="$workdir/clean.json"
   drive_list_json="$workdir/drive-list.json"
   fieldtest_capture_json "$drive_list_json" "$(fieldtest_rem_bin)" drive --endpoint "$(fieldtest_rem_endpoint)" list --foreign --retired --json

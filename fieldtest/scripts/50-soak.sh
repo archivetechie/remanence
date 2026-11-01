@@ -22,15 +22,18 @@ soak_loop() {
   run_id="$(fieldtest_timestamp_id)-$$"
   pidfile="$(fieldtest_soak_pidfile)"
   journal="$(fieldtest_soak_journal)"
-  workdir="$(mktemp -d "$(fieldtest_spool_dir)/soak-${RANDOM}.XXXXXX")"
+  # One cycle holds a 256 MiB source, its object, the restore and the daemon's spool copy.
+  fieldtest_make_workdir workdir "soak-${RANDOM}" "$(( 4 * 268435456 ))" "soak cycle payloads"
   mkdir -p "$(dirname -- "$journal")"
   printf '%s\n' "$$" >"$pidfile"
-  trap 'rm -f "$pidfile"; rm -rf -- "$workdir"' EXIT
+  trap 'rm -f "$pidfile"; fieldtest_cleanup_workdirs' EXIT
   while true; do
     if ! fieldtest_try_lock; then
       sleep 5
       continue
     fi
+    # Each cycle re-checks the disk: a long soak must stop before the host runs low.
+    fieldtest_require_space "$(( 4 * 268435456 ))" "soak cycle $count"
     source="$workdir/soak-$count.bin"
     object="$workdir/soak-$count.rem-object"
     locator="$workdir/soak-$count.json"
@@ -54,6 +57,8 @@ PY
     else
       echo "{\"run\":\"$run_id\",\"utc\":\"$(fieldtest_now_utc)\",\"cycle\":$count,\"status\":\"write-failed\"}" >>"$journal"
     fi
+    # Keep the small JSON evidence; the payloads of a finished cycle are not needed.
+    rm -f -- "$source" "$object" "$restore"
     count=$((count + 1))
     fieldtest_release_lock
     sleep 30
