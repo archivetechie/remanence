@@ -173,16 +173,34 @@ pub(crate) fn handle_robotics(
             bay,
             wait_ready,
         } => run_load_sequence(index, cfg, handle, &mut library, *slot, *bay, *wait_ready),
-        RoboticsAction::Unload { bay, destination } => crate::mount_support::unload_library_bay(
-            &mut library,
-            *bay,
-            *destination,
-            &cfg.policy,
-            None,
-            std::path::Path::new(crate::mount_support::DEVICE_LOCK_ROOT),
-        )
-        .map(|_| ())
-        .map_err(|err| err.to_string()),
+        RoboticsAction::Unload { bay, destination } => {
+            // PrepareRemoval has finished; admit only at physical UNLOAD dispatch,
+            // after all inventory checks. Keep the guard through MOVE and retries.
+            let mut dismount = None;
+            let mut admit = || {
+                if dismount.is_none() {
+                    dismount = cfg
+                        .lifecycle
+                        .as_ref()
+                        .map(|l| l.begin_dismount(&cfg.endpoint(*bay)))
+                        .transpose()
+                        .map_err(|error| error.message().to_string())?;
+                }
+                Ok(())
+            };
+            library.set_changer_ready_wait(cfg.changer_ready_wait.clone().without_stop_signals());
+            crate::mount_support::unload_library_bay_with_admission(
+                &mut library,
+                *bay,
+                *destination,
+                &cfg.policy,
+                None,
+                std::path::Path::new(crate::mount_support::DEVICE_LOCK_ROOT),
+                &mut admit,
+            )
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+        }
         RoboticsAction::Clean {
             drive_uuid,
             trigger,

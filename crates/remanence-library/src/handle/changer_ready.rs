@@ -198,6 +198,13 @@ impl ChangerReadyWait {
         self
     }
 
+    /// Finish an already-admitted UNLOAD/MOVE pair despite shutdown or caller loss.
+    /// The configured deadline, observer, and retry limit remain in force.
+    pub fn without_stop_signals(mut self) -> Self {
+        self.stops.clear();
+        self
+    }
+
     /// The first stop signal that is set, if any.
     pub fn stop_reason(&self) -> Option<&'static str> {
         self.stops

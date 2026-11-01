@@ -77,12 +77,19 @@ The October 2026 window on the MSL3040 produced these operational rules.
    must be installed) before it skips the bay, and `03-bringup.sh --stop`
    first unloads each allowlisted seated cartridge in the selected library through
    `rem drive unload --library <serial> --bay <bay>`. It records every unload and
-   records failures as WARN with the bay, then sends SIGTERM and waits up to 360
+   records refusals, timeouts, and incomplete epoch closes as WARN with the bay.
+   Busy refusals retry every 10 seconds for the kit config's
+   `default_idle_timeout_seconds + 60` (180 seconds with the generated config).
+   Each inventory call is limited to 60 seconds; each unload call to the retry
+   window plus 15 minutes. The entire unload phase shares a limit of the retry
+   window plus 16 minutes (19 minutes with the generated config). After that
+   phase, even if it fails or times out, the kit sends SIGTERM and waits up to 360
    seconds (`REMFIELD_STOP_TIMEOUT_SECONDS`) before a hard kill. `run.sh` uses this
    same teardown. Non-allowlisted cartridges are left alone; daemon shutdown itself
-   leaves cartridges seated. The stop timeout covers in-flight work and every
-   session checkpoint/close. Once B6 adds `daemon.shutdown_close_deadline_secs`,
-   it must exceed that deadline plus a margin.
+   leaves cartridges seated unless UNLOAD has already been issued. Such an UNLOAD
+   completes its MOVE home, including the configured magazine/door wait, before
+   daemon shutdown finishes. The process stop timeout must cover that motion and
+   every session checkpoint/close; a forced kill can interrupt it.
 5. Never rerun `10-init-pools.sh` over initialized tapes without the rerun
    guard, which skips every barcode that has a PASS init record from this
    kit in `evidence/records.jsonl`. `FIELD_INIT_ALLOW_REINIT=1` is the

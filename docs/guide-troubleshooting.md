@@ -342,12 +342,13 @@ tape wait-ready --wait`) send one SSC LOAD when changer inventory shows the
 cartridge in the drive. They record the attempt in the operation before the
 LOAD and send no second one until the drive has reported ready, also across
 a restart. On SIGTERM, SIGINT or SIGHUP, the daemon stops admission, checkpoints
-and closes open sessions, and leaves cartridges seated. It initiates no rewind,
-unload or changer move, but finishes an UNLOAD/MOVE already in flight. The service
-manager's stop timeout must cover this work and closing every open session, plus
-a margin. Migration B6 will add `daemon.shutdown_close_deadline_secs`; the timeout
-must then exceed that configured deadline plus a margin and allow existing motion
-to settle. The deadline setting is not yet available.
+and closes open sessions, and leaves cartridges seated. A dismount still rebuilding
+parity stops before issuing UNLOAD. Once UNLOAD has been issued, its MOVE home
+continues, and shutdown waits for it without the 600-second reservation deadline.
+That MOVE retains the configured `changer_not_ready_wait_seconds` magazine/door
+wait even during shutdown. Other reservations retain their 600-second bound.
+The service manager's stop timeout must cover this work and closing every open
+session, plus a margin. A failed MOVE or forced kill can still leave media unthreaded.
 
 A seated cartridge can retain an open parity epoch across shutdown. At first use
 after startup, the daemon proves identity and the committed append cursor and

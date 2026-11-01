@@ -1414,7 +1414,7 @@ impl LibraryHandle {
         destination: Option<u16>,
         policy: &dyn AccessPolicy,
     ) -> Result<(), UnloadError> {
-        self.unload_inner(bay, destination, policy, false)
+        self.unload_inner(bay, destination, policy, false, &mut || Ok(()))
     }
 
     /// Recover a stranded drive PREVENT after UNLOAD refused with 05/53/02.
@@ -1428,7 +1428,30 @@ impl LibraryHandle {
         destination: Option<u16>,
         policy: &dyn AccessPolicy,
     ) -> Result<(), UnloadError> {
-        self.unload_inner(bay, destination, policy, true)
+        self.unload_inner(bay, destination, policy, true, &mut || Ok(()))
+    }
+
+    /// As `unload`, with the owner's final admission check after inventory and
+    /// drive-open checks, immediately before the physical UNLOAD is dispatched.
+    pub fn unload_with_admission(
+        &mut self,
+        bay: u16,
+        destination: Option<u16>,
+        policy: &dyn AccessPolicy,
+        admit: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), UnloadError> {
+        self.unload_inner(bay, destination, policy, false, admit)
+    }
+
+    /// Removal-lock recovery with the same physical-dispatch admission check.
+    pub fn unload_recovering_removal_with_admission(
+        &mut self,
+        bay: u16,
+        destination: Option<u16>,
+        policy: &dyn AccessPolicy,
+        admit: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), UnloadError> {
+        self.unload_inner(bay, destination, policy, true, admit)
     }
 
     fn unload_inner(
@@ -1437,6 +1460,7 @@ impl LibraryHandle {
         destination: Option<u16>,
         policy: &dyn AccessPolicy,
         recover_removal: bool,
+        admit: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<(), UnloadError> {
         // Resolve destination: explicit override → caller-supplied;
         // otherwise the bay's source_slot. The lookup is *split* so
@@ -1503,7 +1527,7 @@ impl LibraryHandle {
                         .allow_medium_removal()
                         .map_err(UnloadError::DriveAllow)?;
                 }
-                drive.unload_as(op).map_err(UnloadError::DriveUnload)
+                drive.unload_as(op, admit).map_err(UnloadError::DriveUnload)
             }
             Err(e) => Err(UnloadError::OpenDrive(e)),
         };
@@ -2195,12 +2219,21 @@ impl DriveHandle {
     /// bay — modern LTO drives hold the cartridge mechanically until
     /// the host explicitly releases it.
     pub fn unload(&mut self) -> Result<(), DriveOpError> {
+        self.unload_with_admission(&mut || Ok(()))
+    }
+
+    /// Check owner admission after inventory validation, just before UNLOAD.
+    pub fn unload_with_admission(
+        &mut self,
+        admit: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), DriveOpError> {
         self.issue_load_unload(
             /* load */ false,
             /* immed */ false,
             AuditOp::DriveUnload {
                 bay: self.bay_address(),
             },
+            admit,
         )
     }
 
@@ -2225,6 +2258,7 @@ impl DriveHandle {
             AuditOp::DriveLoad {
                 bay: self.bay_address(),
             },
+            &mut || Ok(()),
         )
     }
 
@@ -2238,21 +2272,31 @@ impl DriveHandle {
             AuditOp::DriveLoad {
                 bay: self.bay_address(),
             },
+            &mut || Ok(()),
         )
     }
 
     /// Internal: same as [`Self::unload`] but lets composed
     /// `LibraryHandle::unload` tag the audit events with the outer
     /// op context (`AuditOp::Unload { bay, dst }`).
-    pub(crate) fn unload_as(&mut self, op: AuditOp) -> Result<(), DriveOpError> {
-        self.issue_load_unload(/* load */ false, /* immed */ false, op)
+    pub(crate) fn unload_as(
+        &mut self,
+        op: AuditOp,
+        admit: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), DriveOpError> {
+        self.issue_load_unload(/* load */ false, /* immed */ false, op, admit)
     }
 
     /// Internal: same as [`Self::load`] but lets composed
     /// `LibraryHandle::load` tag the audit events with the outer op
     /// context (`AuditOp::Load { slot, bay }`).
     pub(crate) fn load_as(&mut self, op: AuditOp) -> Result<(), DriveOpError> {
-        self.issue_load_unload(/* load */ true, /* immed */ false, op)
+        self.issue_load_unload(
+            /* load */ true,
+            /* immed */ false,
+            op,
+            &mut || Ok(()),
+        )
     }
 
     fn issue_load_unload(
@@ -2260,6 +2304,7 @@ impl DriveHandle {
         load: bool,
         immed: bool,
         op: AuditOp,
+        admit: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<(), DriveOpError> {
         use remanence_scsi::load_unload as lu;
         if !load {
@@ -2279,6 +2324,9 @@ impl DriveHandle {
                     }));
                 }
             }
+        }
+        if !load {
+            admit().map_err(DriveOpError::UnloadAdmission)?;
         }
         let cdb = lu::build_cdb_with_immed(load, immed);
 

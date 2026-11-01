@@ -19792,6 +19792,53 @@ mod tests {
         }
     }
 
+    /// The kit consumes this exact fixture; compare it with the production top printer.
+    #[test]
+    fn fieldtest_stop_top_fixture_matches_real_printer() {
+        let mut response = pb::GetLiveStatusResponse::default();
+        for (serial, drives) in [
+            (
+                "SELECTED",
+                vec![
+                    (Some(256), Some("ALLOW1")),
+                    (Some(257), Some("FOREIGN")),
+                    (Some(258), Some("ALLOW2")),
+                    (Some(259), None),
+                    (Some(260), Some("CLN001")),
+                    (None, Some("ALLOW1")),
+                ],
+            ),
+            ("OTHER", vec![(Some(300), Some("ALLOW1"))]),
+        ] {
+            response.libraries.push(pb::LibraryState {
+                library: Some(pb::Library {
+                    library_serial: serial.into(),
+                    ..Default::default()
+                }),
+                drives: drives
+                    .into_iter()
+                    .map(|(element_address, barcode)| pb::Drive {
+                        element_address,
+                        loaded_tape_barcode: barcode.map(str::to_owned),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            });
+        }
+        let mut out = Vec::new();
+        print_live_status_json(&response, &mut out).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fieldtest/tests/fixtures/stop-top.json");
+        if std::env::var_os("REMFIELD_UPDATE_TOP_FIXTURE").is_some() {
+            std::fs::write(&fixture, &out).unwrap();
+        }
+        assert_eq!(
+            serde_json::from_slice::<Value>(&out).unwrap(),
+            serde_json::from_slice::<Value>(&std::fs::read(fixture).unwrap()).unwrap()
+        );
+    }
+
     #[test]
     fn top_json_uses_cli_envelope() {
         let mut out = Vec::<u8>::new();

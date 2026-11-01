@@ -2141,15 +2141,7 @@ pub(crate) async fn changer_move_after_unload(
     dst: u16,
     unloaded: crate::write_owner::DriveUnloadOutcome,
 ) -> Result<(), Status> {
-    changer_move_guarded(
-        pool,
-        library_serial,
-        src,
-        dst,
-        unloaded.recovery_guard,
-        None,
-    )
-    .await
+    changer_move_guarded(pool, library_serial, src, dst, Some(unloaded), None).await
 }
 
 async fn changer_move_guarded(
@@ -2157,9 +2149,13 @@ async fn changer_move_guarded(
     library_serial: &str,
     src: u16,
     dst: u16,
-    recovery_guard: Option<crate::mount_support::UnloadRecoveryGuard>,
+    unloaded: Option<crate::write_owner::DriveUnloadOutcome>,
     caller_gone: Option<Arc<AtomicBool>>,
 ) -> Result<(), Status> {
+    let after_unload = unloaded.is_some();
+    let (recovery_guard, dismount_guard) = unloaded
+        .map(|u| (u.recovery_guard, u.dismount_guard))
+        .unwrap_or_default();
     let changer = pool.changer_tx(library_serial)?;
     let (reply_tx, reply_rx) = oneshot::channel();
     changer
@@ -2167,6 +2163,8 @@ async fn changer_move_guarded(
             src,
             dst,
             recovery_guard,
+            dismount_guard,
+            after_unload,
             caller_gone,
             reply: reply_tx,
         })
@@ -2195,6 +2193,11 @@ async fn drive_unload(
     pool: &crate::write_owner::DrivePool,
     drive_key: &crate::drive_pool::DriveKey,
 ) -> Result<crate::write_owner::DriveUnloadOutcome, Status> {
+    if pool.is_shutting_down() {
+        return Err(Status::unavailable(
+            "daemon shutdown before UNLOAD; cartridge stays seated",
+        ));
+    }
     let drive = pool.drive_tx(drive_key)?;
     let (reply_tx, reply_rx) = oneshot::channel();
     drive
@@ -2695,7 +2698,7 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
         else {
             continue; // Standalone endpoints have no daemon changer motion to settle.
         };
-        let reservation_wait_started = Instant::now();
+        let mut reservation_wait_started = tokio::time::Instant::now();
         let reservation = loop {
             match pool.reserve_drive_for_shutdown(&drive_key) {
                 Ok(reservation) => break Some(reservation),
@@ -2706,7 +2709,12 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
                         failures.push(format!("{} bay 0x{:04x}: {err}", *library_serial, *bay));
                         break None;
                     }
-                    if reservation_wait_started.elapsed() >= SHUTDOWN_RESERVATION_WAIT {
+                    if pool.dismount_in_progress(&drive_key) {
+                        // Physical motion has no reservation deadline. Start a
+                        // fresh bounded wait for any work that retains the bay
+                        // after the MOVE reply has been sent.
+                        reservation_wait_started = tokio::time::Instant::now();
+                    } else if reservation_wait_started.elapsed() >= SHUTDOWN_RESERVATION_WAIT {
                         failures.push(format!(
                             "{} bay 0x{:04x}: timed out waiting for an idle drive reservation",
                             *library_serial, *bay
@@ -2725,6 +2733,11 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
         drop(reservation);
     }
 
+    // A library-exclusive operation may have released a bay while its actor
+    // still owns a physical pair. Never exit while that pair is in progress.
+    while pool.has_dismounts() {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     if failures.is_empty() {
         Ok(())
     } else {
@@ -4876,7 +4889,46 @@ mod tests {
         .expect("the finished dismount releases the bay");
     }
 
+    /// Ordinary reservations keep their deadline; only physical pairs extend it.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_bounds_reservations_without_an_unload_move_pair() {
+        let harness = dismount_harness(0);
+        let _reservation = harness
+            .pool
+            .reserve_drive(&harness.seated.drive_key())
+            .unwrap();
+        let state = harness.state.clone();
+        let shutdown = tokio::spawn(async move { shutdown_drive_pool(&state).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(SHUTDOWN_RESERVATION_WAIT + Duration::from_secs(1)).await;
+        let error = shutdown.await.unwrap().unwrap_err();
+        assert!(error.message().contains("timed out waiting"));
+    }
+
+    /// Open compensation also refuses to queue an UNLOAD after shutdown admission.
     #[tokio::test]
+    async fn shutdown_before_open_compensation_leaves_cartridge_seated() {
+        let mut harness = dismount_harness(0);
+        harness.state.begin_shutdown();
+        compensate_open_mount(
+            &harness.pool,
+            &ActorMount {
+                bay: harness.seated.bay,
+                barcode: harness.seated.barcode.clone(),
+                source_slot: Some(harness.seated.home_slot),
+                home_slot: Some(harness.seated.home_slot),
+                needs_drive_load: false,
+                library_serial: harness.seated.library_serial.clone(),
+                drive_uuid: None,
+                drive_serial: None,
+            },
+        )
+        .await;
+        assert!(harness.drive_rx.try_recv().is_err());
+        assert!(harness.changer_rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn shutdown_waits_for_an_in_flight_dismount_to_finish_its_move() {
         let drive_key = crate::drive_pool::DriveKey::new("LIB001", 0x0101);
         let mut harness = dismount_harness(0);
@@ -4906,24 +4958,44 @@ mod tests {
             panic!("dismount must issue drive unload first");
         };
 
+        let dismount_guard = harness.lifecycle.begin_dismount(&drive_key).unwrap();
         // SIGTERM arrives while the drive is unloading.
         let shutdown_state = harness.state.clone();
         let shutdown = tokio::spawn(async move { shutdown_drive_pool(&shutdown_state).await });
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(SHUTDOWN_RESERVATION_WAIT + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
         assert!(
             !shutdown.is_finished(),
             "shutdown must not finish between the unload and the move"
         );
 
         reply
-            .send(Ok(Duration::from_millis(7).into()))
+            .send(Ok(crate::write_owner::DriveUnloadOutcome {
+                elapsed: Duration::from_millis(7),
+                recovery_guard: None,
+                dismount_guard: Some(dismount_guard),
+            }))
             .expect("unload reply receiver");
         let Some(crate::write_owner::ChangerCommand::Move {
-            src, dst, reply, ..
+            src,
+            dst,
+            reply,
+            dismount_guard,
+            after_unload,
+            ..
         }) = harness.changer_rx.recv().await
         else {
             panic!("the move home must follow the unload");
         };
+        assert!(after_unload);
+        assert!(dismount_guard.is_some());
+        tokio::time::advance(SHUTDOWN_RESERVATION_WAIT + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown must wait beyond the reservation deadline for MOVE"
+        );
         assert_eq!((src, dst), (0x0101, 0x0401));
         // The changer actor publishes the moved inventory before it replies.
         let home = test_library(
@@ -4946,6 +5018,7 @@ mod tests {
             },
             captured_at: time::OffsetDateTime::UNIX_EPOCH,
         });
+        drop(dismount_guard);
         reply.send(Ok(())).expect("move reply receiver");
 
         idle.await
@@ -6870,6 +6943,7 @@ mod tests {
 
     struct DismountHarness {
         _temp: tempfile::TempDir,
+        lifecycle: crate::drive_pool::DrivePoolLifecycle,
         state: ApiState,
         pool: crate::write_owner::DrivePool,
         seated: crate::write_owner::SeatedCartridge,
@@ -6907,17 +6981,21 @@ mod tests {
         ))));
         let (drive_tx, drive_rx) = tokio::sync::mpsc::channel(1);
         let (changer_tx, changer_rx) = tokio::sync::mpsc::channel(1);
-        let pool = crate::write_owner::DrivePool::new(
-            changer_tx,
-            std::collections::HashMap::from([(0x0101, drive_tx)]),
+        let lifecycle = crate::drive_pool::DrivePoolLifecycle::default();
+        let key = crate::drive_pool::DriveKey::new("LIB001", 0x0101);
+        let pool = crate::write_owner::DrivePool::new_with_lifecycle(
+            std::collections::HashMap::from([("LIB001".into(), changer_tx)]),
+            std::collections::HashMap::from([(key.clone(), drive_tx)]),
             Arc::new(std::collections::HashMap::from([(
-                0x0101,
+                key,
                 AtomicBool::new(false),
             )])),
+            lifecycle.clone(),
         );
         state.drive_pool = Some(pool.clone());
         DismountHarness {
             _temp: temp,
+            lifecycle,
             state,
             pool,
             seated: crate::write_owner::SeatedCartridge {

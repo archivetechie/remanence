@@ -2726,6 +2726,39 @@ async fn check_open_checkpoint_removal(fresh: bool, paths: &[&'static str]) {
     }
 }
 
+/// Shutdown during the parity reread cancels physical removal and keeps media seated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_during_dismount_parity_rebuild_leaves_cartridge_seated() {
+    let root = tempfile::tempdir().unwrap();
+    let parity = crate::ParityConfig::Scheme(remanence_parity::ParityScheme {
+        id: remanence_parity::SchemeId::new_static("seated"),
+        data_blocks_per_stripe: 4,
+        parity_blocks_per_stripe: 2,
+        stripes_per_neighborhood: 32,
+    });
+    let world = world();
+    set_rollback_bootstrap(&world, parity.clone());
+    let mut state = state_with_parity(root.path(), true, parity.clone());
+    crate::write_owner::tests::check_seated_parity_sessions(
+        &mut state,
+        world,
+        crate::SelectedTape {
+            standalone_endpoint: None,
+            pool_id: "default".into(),
+            tape_uuid: UUID,
+            block_size: BLOCK,
+            parity_config: parity,
+        },
+        false,
+        false,
+        false,
+        crate::write_owner::tests::RetentionInvalidation::Removal("shutdown_rebuild", "idle"),
+        false,
+        false,
+    )
+    .await;
+}
+
 /// An epoch spans API sessions with multiple stripes and fills while the tape stays seated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_epoch_fills_across_seated_sessions() {

@@ -221,7 +221,7 @@ fn stranded_prevent_actor_drive_unload_audits_allow_before_retry_and_keeps_lock(
         }
     });
     log.borrow_mut().clear();
-    let outcome = crate::write_owner::unload_actor_drive(&mut drive, root.path()).unwrap();
+    let outcome = crate::write_owner::unload_actor_drive(&mut drive, root.path(), None).unwrap();
     assert_eq!(controls(&log), [0x1b, 0x1e, 0x1b]);
     assert_eq!(
         *audits.lock().unwrap(),
@@ -272,7 +272,8 @@ fn stranded_prevent_actor_unload_refuses_standalone_writer_without_allow() {
         }
     }
     log.borrow_mut().clear();
-    let error = crate::write_owner::unload_actor_drive(&mut daemon_drive, root.path()).unwrap_err();
+    let error =
+        crate::write_owner::unload_actor_drive(&mut daemon_drive, root.path(), None).unwrap_err();
     assert!(
         error
             .message()
@@ -503,7 +504,7 @@ async fn stranded_prevent_cancelled_move_keeps_recovery_lock_in_command() {
     strand_prevent(&mut library, &policy);
     let mut drive = library.open_drive(BAY, &policy).unwrap();
     log.borrow_mut().clear();
-    let unloaded = crate::write_owner::unload_actor_drive(&mut drive, root.path()).unwrap();
+    let unloaded = crate::write_owner::unload_actor_drive(&mut drive, root.path(), None).unwrap();
     let (changer, mut commands) = tokio::sync::mpsc::channel(1);
     let pool = crate::write_owner::DrivePool::new_for_library(
         "UNLOAD-LIB",
@@ -537,4 +538,63 @@ async fn stranded_prevent_cancelled_move_keeps_recovery_lock_in_command() {
     drop(recovery_guard);
     assert!(reply.send(Ok(())).is_err(), "requester is gone");
     assert!(UnloadRecoveryGuard::acquire(&mut drive, None, root.path()).is_ok());
+}
+
+/// The final owner check follows inventory validation and precedes physical UNLOAD.
+#[test]
+fn shutdown_at_unload_dispatch_keeps_both_actor_and_robotics_media_seated() {
+    for robotics in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let (mut library, policy, world, log) = fixture();
+        let lifecycle = crate::drive_pool::DrivePoolLifecycle::default();
+        if robotics {
+            log.borrow_mut().clear();
+            let mut checked = false;
+            let error = unload_library_bay_with_admission(
+                &mut library,
+                BAY,
+                Some(SLOT),
+                &policy,
+                None,
+                root.path(),
+                &mut || {
+                    checked = true;
+                    assert!(
+                        !log.borrow().is_empty(),
+                        "inventory precedes owner admission"
+                    );
+                    lifecycle
+                        .shutting_down
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    lifecycle
+                        .begin_dismount(&remanence_state::DriveKey::new("UNLOAD-LIB", BAY))
+                        .map(drop)
+                        .map_err(|e| e.message().to_string())
+                },
+            )
+            .unwrap_err();
+            assert!(checked);
+            assert!(error.to_string().contains("stays seated"));
+        } else {
+            let mut drive = library.open_drive(BAY, &policy).unwrap();
+            log.borrow_mut().clear();
+            lifecycle
+                .shutting_down
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let error =
+                crate::write_owner::unload_actor_drive(&mut drive, root.path(), Some(&lifecycle))
+                    .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::Unavailable);
+            assert!(
+                !log.borrow().is_empty(),
+                "inventory precedes owner admission"
+            );
+        }
+        assert!(
+            controls(&log).is_empty(),
+            "no UNLOAD, ALLOW or MOVE after shutdown"
+        );
+        assert!(world.lock().unwrap().drive_bays[&BAY].is_some());
+        assert!(lifecycle.dismounts.lock().unwrap().is_empty());
+    }
 }

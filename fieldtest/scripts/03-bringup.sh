@@ -69,13 +69,15 @@ is_socket_live() {
 # Return only allowlisted media in the selected library while the daemon owns it.
 # Each CLI unload waits for the operation and uses its recorded source slot.
 unload_allowlisted_before_stop() {
-  local serial inventory loaded bay barcode evidence
+  local serial inventory loaded bay barcode evidence rc started cause attempt
+  local retry_window="$1"
+  local call_limit=$((retry_window + 900))
   if ! serial="$(fieldtest_selected_library_serial)" || [[ -z "$serial" ]]; then
     fieldtest_evidence_record "$SCRIPT_NAME" stop-inventory WARN "cannot return cartridges: selected library is unavailable"
     return
   fi
   inventory="$(fieldtest_artifact_path "$SCRIPT_NAME" stop-inventory "$(fieldtest_timestamp_id)")"
-  if ! fieldtest_capture_json "$inventory" "$(fieldtest_rem_bin)" top --endpoint "$(fieldtest_rem_endpoint)" --once --json; then
+  if ! fieldtest_capture_json "$inventory" timeout --foreground --signal=KILL 60 "$(fieldtest_rem_bin)" top --endpoint "$(fieldtest_rem_endpoint)" --once --json; then
     fieldtest_evidence_record "$SCRIPT_NAME" stop-inventory WARN "cannot inspect seated cartridges in library $serial before stopping" "$inventory"
     return
   fi
@@ -83,7 +85,7 @@ unload_allowlisted_before_stop() {
 import json, sys
 from pathlib import Path
 payload = json.loads(Path(sys.argv[1]).read_text())
-libraries = [lib for lib in payload["libraries"]
+libraries = [lib for lib in payload["data"]["libraries"]
              if (lib.get("library") or {}).get("library_serial") == sys.argv[2]]
 if len(libraries) != 1:
     raise SystemExit("selected library absent or ambiguous in live status")
@@ -91,8 +93,10 @@ for drive in libraries[0]["drives"]:
     barcode = drive.get("loaded_tape_barcode")
     if not barcode:
         continue  # An unidentified cartridge cannot pass the allowlist.
-    bay = drive["element_address"]
-    if not isinstance(bay, int) or not 0 < bay <= 65535 or any(c.isspace() for c in barcode):
+    bay = drive.get("element_address")
+    if bay is None:
+        continue  # Unplaced drive; it has no address for a safe unload.
+    if type(bay) is not int or not 0 < bay <= 65535 or any(c.isspace() for c in barcode):
         raise SystemExit("invalid bay or barcode in live status")
     print(f"{bay}\t{barcode}")
 PYLOAD
@@ -104,11 +108,48 @@ PYLOAD
     [[ -n "$bay" ]] || continue
     fieldtest_require_allowlisted "$barcode" || continue
     evidence="$(fieldtest_artifact_path "$SCRIPT_NAME" "stop-unload-$bay" "$(fieldtest_timestamp_id)")"
-    if fieldtest_capture_text "$evidence" "$(fieldtest_rem_bin)" drive unload --endpoint "$(fieldtest_rem_endpoint)" --library "$serial" --bay "$bay"; then
-      fieldtest_evidence_record "$SCRIPT_NAME" "stop-unload-$bay" PASS "returned $barcode from library $serial bay $bay to its recorded source slot" "$evidence"
-    else
-      fieldtest_evidence_record "$SCRIPT_NAME" "stop-unload-$bay" WARN "unload failed for $barcode in library $serial bay $bay; inspect its placement" "$evidence"
-    fi
+    started=$SECONDS
+    attempt=0
+    while :; do
+      attempt=$((attempt + 1))
+      # KILL is deliberate: run.sh teardown ignores TERM/INT/HUP, and its
+      # children inherit those dispositions. Foreground mode keeps the CLI in
+      # the outer phase timeout's process group, so that deadline kills it too.
+      rc=0
+      fieldtest_capture_text "$evidence.$attempt" timeout --foreground --signal=KILL "$call_limit" \
+        "$(fieldtest_rem_bin)" drive unload --endpoint "$(fieldtest_rem_endpoint)" --library "$serial" --bay "$bay" --json || rc=$?
+      cause="$(python3 - "$evidence.$attempt" <<'PYRESULT'
+import json, sys
+from pathlib import Path
+capture = json.loads(Path(sys.argv[1]).read_text())
+text = capture["stdout"] + "\n" + capture["stderr"]
+if capture["exit_code"] in (124, 137):
+    print("timeout")
+elif capture["exit_code"]:
+    print("busy" if "busy" in text.lower() or "resourceexhausted" in text.lower() or "resource_exhausted" in text.lower() else "failed")
+else:
+    try:
+        payload = json.loads(capture["stdout"])
+        notes = payload["data"]["progress"]
+        print("epoch close " + notes["epoch_close"] if notes.get("epoch_close") in ("failed", "not_attempted") else "ok")
+    except (ValueError, KeyError, TypeError, AttributeError):
+        print("unrecognized unload result")
+PYRESULT
+)"
+      if [[ "$cause" == busy ]] && (( SECONDS - started + 10 <= retry_window )); then
+        sleep 10
+        # Scheduling delays must not start another attempt beyond the window.
+        if (( SECONDS - started <= retry_window )); then
+          continue
+        fi
+      fi
+      if (( rc == 0 )) && [[ "$cause" == ok ]]; then
+        fieldtest_evidence_record "$SCRIPT_NAME" "stop-unload-$bay" PASS "returned $barcode from library $serial bay $bay to its recorded source slot" "$evidence.$attempt"
+      else
+        fieldtest_evidence_record "$SCRIPT_NAME" "stop-unload-$bay" WARN "unload for $barcode in library $serial bay $bay: $cause (exit $rc, attempt $attempt); inspect cause and placement in evidence" "$evidence.$attempt"
+      fi
+      break
+    done
   done <<<"$loaded"
 }
 
@@ -118,9 +159,15 @@ main() {
       usage
       exit 0
       ;;
+    --stop-unload-phase)
+      # Internal subprocess boundary gives the entire phase a hard deadline.
+      fieldtest_init_layout
+      unload_allowlisted_before_stop "$2"
+      return
+      ;;
     --stop)
       fieldtest_init_layout
-      local session pid started elapsed forced=0
+      local session pid started elapsed retry_window forced=0
       session="remfield"
       if [[ ! "$DAEMON_STOP_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]]; then
         printf '%s\n' "REMFIELD_STOP_TIMEOUT_SECONDS must be a non-negative integer" >&2
@@ -130,7 +177,23 @@ main() {
       # seated cartridges alone. Keep tmux alive for all operation diagnostics.
       pid="$(pgrep -f "rem-daemon --config $(fieldtest_config_path)" | head -1 || true)"
       if [[ -n "$pid" ]]; then
-        unload_allowlisted_before_stop
+        if retry_window="$(python3 - "$(fieldtest_config_path)" <<'PYCONFIG'
+import sys, tomllib
+from pathlib import Path
+config = tomllib.loads(Path(sys.argv[1]).read_text())
+seconds = config["daemon"]["default_idle_timeout_seconds"]
+if type(seconds) is not int or seconds < 0:
+    raise SystemExit("invalid daemon.default_idle_timeout_seconds")
+print(seconds + 60)
+PYCONFIG
+)"; then
+          # One shared budget: inventory plus idle expiry, rebuild and MOVE.
+          if ! timeout --signal=KILL "$((retry_window + 900 + 60))" bash "${BASH_SOURCE[0]}" --stop-unload-phase "$retry_window"; then
+            fieldtest_evidence_record "$SCRIPT_NAME" stop-unload-phase WARN "unload phase failed or timed out; inspect cartridge placement; proceeding to daemon stop"
+          fi
+        else
+          fieldtest_evidence_record "$SCRIPT_NAME" stop-unload-phase WARN "cannot read idle timeout from kit config; no unload attempted; proceeding to daemon stop"
+        fi
       fi
       # An unload can take minutes; resolve the process again before signalling.
       pid="$(pgrep -f "rem-daemon --config $(fieldtest_config_path)" | head -1 || true)"

@@ -93,10 +93,45 @@ pub(crate) struct DrivePoolLifecycle {
     pub(crate) sessions: Arc<Mutex<HashMap<Uuid, MountedSession>>>,
     pub(crate) parked: Arc<Mutex<ParkedState>>,
     pub(crate) shutting_down: Arc<AtomicBool>,
+    pub(crate) cut_changer_wait: Arc<AtomicBool>,
+    pub(crate) dismounts: Arc<Mutex<HashMap<DriveKey, usize>>>,
     pub(crate) timer_park_tx: Option<mpsc::UnboundedSender<ParkedCartridge>>,
 }
 
+/// Keeps shutdown waiting from physical UNLOAD admission through the MOVE reply.
+#[derive(Debug)]
+pub(crate) struct DismountGuard {
+    active: Arc<Mutex<HashMap<DriveKey, usize>>>,
+    key: DriveKey,
+}
+
+impl Drop for DismountGuard {
+    fn drop(&mut self) {
+        let mut active = self.active.lock().unwrap();
+        let count = active.get_mut(&self.key).expect("active dismount");
+        *count -= 1;
+        if *count == 0 {
+            active.remove(&self.key);
+        }
+    }
+}
+
 impl DrivePoolLifecycle {
+    /// Serialize the final pre-UNLOAD decision with shutdown admission.
+    pub(crate) fn begin_dismount(&self, key: &DriveKey) -> Result<DismountGuard, Status> {
+        let mut active = self.dismounts.lock().unwrap();
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(Status::unavailable(
+                "daemon shutdown before UNLOAD; cartridge stays seated",
+            ));
+        }
+        *active.entry(key.clone()).or_default() += 1;
+        Ok(DismountGuard {
+            active: self.dismounts.clone(),
+            key: key.clone(),
+        })
+    }
+
     /// Publish the actor's real session identity before readiness and tape setup.
     pub(crate) fn set_holder(&self, drive: &DriveKey, serial: Option<&str>, kind: &str, id: Uuid) {
         self.holders
@@ -152,6 +187,8 @@ pub(crate) struct DrivePool {
     tape_reservations: Arc<Mutex<HashSet<TapeUuid>>>,
     pub(crate) parked: Arc<Mutex<ParkedState>>,
     shutting_down: Arc<AtomicBool>,
+    cut_changer_wait: Arc<AtomicBool>,
+    dismounts: Arc<Mutex<HashMap<DriveKey, usize>>>,
 }
 
 impl DrivePool {
@@ -208,6 +245,8 @@ impl DrivePool {
             tape_reservations: Arc::new(Mutex::new(HashSet::new())),
             parked: lifecycle.parked,
             shutting_down: lifecycle.shutting_down,
+            cut_changer_wait: lifecycle.cut_changer_wait,
+            dismounts: lifecycle.dismounts,
         }
     }
 
@@ -572,7 +611,17 @@ impl DrivePool {
     }
 
     pub(crate) fn begin_shutdown(&self) {
+        let _motion = self.dismounts.lock().unwrap();
         self.shutting_down.store(true, Ordering::SeqCst);
+        self.cut_changer_wait.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn dismount_in_progress(&self, key: &DriveKey) -> bool {
+        self.dismounts.lock().unwrap().contains_key(key)
+    }
+
+    pub(crate) fn has_dismounts(&self) -> bool {
+        !self.dismounts.lock().unwrap().is_empty()
     }
 
     pub(crate) fn is_shutting_down(&self) -> bool {
