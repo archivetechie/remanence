@@ -866,7 +866,7 @@ filemark-missing\tevent\tmulti-256k\treplica-a.bin\tmissing-filemark\t\tmissing-
         include_bytes!("../../../fixtures/rem-parity-terminal-index-draft/mutation-section15.json");
     assert_eq!(
         hex(&Sha256::digest(names)),
-        "cfee8f27baaec890162a12ab6df450c53c01764f1b492e8ee390bb9bd7875313"
+        "8301a570c54ee75ad3f86eb25e183876c6266dc619178eac673f0c886f850091"
     );
     let source: Value = serde_json::from_slice(names)?;
     let entries = source["entries"]

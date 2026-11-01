@@ -671,7 +671,8 @@ message ResumeMediaReadinessRequest {
 message UnloadDriveRequest {
   bytes library_uuid              = 1;
   uint32 drive_element_address    = 2;
-  // Destination slot. If unspecified, daemon picks a free slot.
+  // Destination slot. If 0, the cartridge returns to the source slot the
+  // changer recorded for the bay; the unload is refused when there is none.
   uint32 destination_slot_address = 3;
   IdempotencyKey idempotency_key  = 4;
 }

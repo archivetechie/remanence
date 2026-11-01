@@ -489,6 +489,8 @@ fn writer_conflict_is_prompt_and_shared_reader_wait_is_bounded() {
     assert!(matches!(store.acquire(false), Err(StoreError::Locked(_))));
     assert!(start.elapsed() < std::time::Duration::from_millis(100));
     assert!(matches!(store.snapshot(), Err(StoreError::Locked(_))));
+    let conflict = crate::StateError::from(store.acquire(false).unwrap_err());
+    assert!(conflict.is_tape_log_busy(), "{conflict}");
     drop(writer);
     let shared = store.lock(false).unwrap();
     let start = std::time::Instant::now();
