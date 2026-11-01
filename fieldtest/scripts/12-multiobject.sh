@@ -53,7 +53,7 @@ main() {
   min_mb="${FIELD_MULTI_MIN_MB:-5}"
   max_mb="${FIELD_MULTI_MAX_MB:-50}"
   [[ "${REMFIELD_ENV:-unknown}" == vtl ]] && max_mb="${FIELD_MULTI_MAX_MB_VTL:-10}"
-  fieldtest_make_workdir workdir "multi-${stamp}" "$(( count * max_mb * 4 * 1048576 ))" "multi-object payloads"
+  fieldtest_make_workdir workdir "multi-${stamp}" "$(( count * max_mb * 5 * 1048576 ))" "multi-object payloads"
 
   python3 - "$workdir/inputs" "$count" "$min_mb" "$max_mb" <<'PY'
 import os
