@@ -49,7 +49,7 @@ usable.
 
 Remanence does not turn tape-only inventory rows into the ordinary Object,
 copy, and file catalog. `rebuild-catalog-from-journals` replays surviving host
-audit logs and per-tape journals; it does not read a terminal index or a BOT
+audit logs and per-tape logs; it does not read a terminal index or a BOT
 scan. A site that holds only a cartridge can identify and inspect it, but
 Remanence does not yet import its contents into the catalog.
 
@@ -82,7 +82,7 @@ history.
 For example, Site A writes a Remanence tape and sends it to an offsite vault.
 Site B later receives the cartridge without Site A's SQLite catalog. Site B can
 probe and adopt the bootstrap identity, then inventory and verify the terminal
-indexes. If Site A also sent its audit and per-tape journals, Site B can
+indexes. If Site A also sent its audit and per-tape logs, Site B can
 rebuild the ordinary catalog from those host records. With the cartridge alone,
 Site B can inspect the tape but cannot import its inventory rows as ordinary
 catalog entries. An LTFS cartridge in the same shipment needs a distribution
@@ -97,36 +97,36 @@ tape file from the beginning, splitting them at the filemarks. The scan can
 show that an Object-shaped tape file is complete, but the position of a tape
 file does not reveal the Object's name.
 
-Inventory and full verification therefore use the host checkpoint journal, when
-one survives. The per-tape checkpoint journal is fsynced (forced to stable
-storage) only after each Object body and its trailing filemark are durable.
-During the BOT scan, Remanence replays that journal without loading every
+Inventory and full verification therefore use the host per-tape log, when
+one survives. The closing Object commit is fsynced (forced to stable storage)
+only after its body and trailing filemark are durable.
+During the BOT scan, Remanence replays that log without loading every
 Object row into memory. It accepts a name only when all of these facts agree:
 
-- the journal is for the same tape UUID and fixed block size;
+- the log is for the same tape UUID and fixed block size;
 - its committed prefix is present in the measured tape layout;
-- every journal Object names the same tape-file number and block count that
+- every logged Object names the same tape-file number and block count that
   the physical scan measured; and
-- journal rows and measured Objects match one to one throughout that committed
+- log rows and measured Objects match one to one throughout that committed
   prefix.
 
 Each Object is then classified as follows:
 
 | Classification | Meaning |
 |---|---|
-| `Recovered` | The Object tape file is physically complete, and an exact fsynced checkpoint row supplied its Object identifier. |
+| `Recovered` | The Object tape file is physically complete, and an exact fsynced log row supplied its Object identifier. |
 | `Unknown` | The Object tape file is physically complete, but no trustworthy local identity source covers it. |
 | `Incomplete` | EOD was reached before the Object's trailing filemark. Remanence never applies a checkpoint name to it. |
 
 After a crash, a complete Object can lie physically beyond the last fsynced
 checkpoint. It is reported as `Unknown` and is not promoted to `Recovered`. A
-corrupt journal, or one whose geometry conflicts with the tape, stops the
+corrupt log, or one whose geometry conflicts with the tape, stops the
 operation with a data-loss error and is not ignored.
 
-A tape from another installation normally has no checkpoint journal at the
+A tape from another installation normally has no per-tape log at the
 receiving site, and Remanence does not create one because an inventory was
 requested. If all its indexes are invalid, complete Object candidates are
-therefore reported as `Unknown`. Transferring the matching checkpoint journal
+therefore reported as `Unknown`. Transferring the matching per-tape log
 preserves the exact Object names. Without it, the names come from deeper
 REM-OBJECT inspection or from operator recovery. In either case these results
 are inspection evidence and do not populate the writable SQLite catalog.
@@ -278,7 +278,7 @@ them.
 
 If the host stops while writing the body, the tail may hold some physical
 blocks but has no committed Object delimiter and no catalog entry. On an open,
-parity-off, rewritable tape, the last durable checkpoint journal records the
+parity-off, rewritable tape, the last durable per-tape log records the
 EOD after the previous complete Object. After a restart, a new write session
 positions at that checkpoint EOD, and the caller sends the interrupted Object
 again from byte zero. The rewrite replaces the uncommitted tail, and only the
@@ -315,31 +315,30 @@ through the checkpoint. Two drive actors therefore cannot both write the same
 identity.
 
 The one-shot direct writer follows the same rule under the exclusive state
-lock. Before it selects a tape, it replays every checkpoint journal in the
-configured state directory, not only the journal of the tape it might select,
+lock. Before it selects a tape, it replays every per-tape log in the
+configured journal root, not only the log of the tape it might select,
 and resolves an exact committed retry from host state alone. A committed retry
 therefore needs no writable tape and moves no cartridge. This also covers the
 case where tape A has a durable checkpoint but SQLite has not yet recorded the
 Object identity: a retry cannot select tape B and write the same identity again.
 The drive-bound writer repeats the reconciliation and replay check. It takes
-the pool policy, checkpoint directory, parity-journal path, and memory ceiling
+the pool policy, journal root, and memory ceiling
 from the locked operator configuration, not from its caller. Host-only
 encrypted replay reports the committed ordered epoch ids. The host catalog does
 not keep the authenticated on-tape labels, so those labels are reported as
 unknown instead of being copied from the new retry request.
 
-If a checkpoint append reports an error and the rollback also fails, Remanence
-cannot know whether the new frame is absent, torn, or complete. This is the
-distinct `checkpoint append authority uncertain` state. The affected Object
-identities stay quarantined for the life of the process and the write fails. A
-later process must reconcile the journal before it admits a retry. A complete
-valid frame is projected into the catalog, and a torn trailing frame is not
-treated as committed.
+If log publication fails with uncertain authority, Remanence poisons the writer
+and requires physical-tail reconciliation before retrying the affected WRITTEN
+Objects. A later process must reconcile the log before admitting a retry. A
+validated closed group is projected into the catalog. A torn trailing frame
+is not treated as committed. If the log is durable but projection failed,
+replay repairs SQLite without writing the Object again.
 
-This mechanism depends on the host checkpoint journal of an open tape. A
+This mechanism depends on the host per-tape log of an open tape. A
 cartridge arriving from another installation does not gain safe append
 authority just because its bootstrap can be adopted. Transfer the matching host
-journals when they are available. Otherwise keep the cartridge out of ordinary
+tape logs when they are available. Otherwise keep the cartridge out of ordinary
 write service and use terminal inventory or the bounded BOT recovery to find
 out what is on it. Adoption alone never guesses the last committed append
 position.
@@ -356,34 +355,24 @@ behavior of any particular physical drive.
 
 When a tape is finalized, the writer closes the open parity epoch and writes
 the three terminal replicas, A, B, and C, with a separation extent (a control file
-with a header, zero-filled interior records, and a footer) between each pair. If the checkpoint and parity journals prove that
-replica C completed its synchronizing barrier, all three full indexes are
+with a header, zero-filled interior records, and a footer) between each pair.
+If the per-tape log proves that replica C completed its synchronizing barrier, all three full indexes are
 already on tape. A restart then completes the remaining bookkeeping without
 loading, locating, reading, or writing the cartridge. That bookkeeping is the
-sealed checkpoint, the SQLite projection, cleanup of the intent record, and the
-audit entries. It applies to automatic finalization and to an operator-requested
-close-out.
+sealed log record, the SQLite projection and the audit entries. It applies to
+automatic finalization and to an operator-requested close-out.
 
-During finalization Remanence keeps a small durable record on the host, which
-the code calls the **companion intent**. It records what the writer was doing
-and where a restart must resume. It is not an index or checkpoint on the tape.
+During finalization the per-tape log records the decision, immutable plan and
+barrier-proved component progress. An ordinary write session cannot append an
+Object after the first durable finalization transition. Recovery validates the
+plan and projects durable progress before any terminal media motion.
 
-If the operation was already classified `recovery_required`, the companion
-keeps that flag until the sealed checkpoint is safely on disk, so a failure
-before that point cannot silently downgrade the tape to ordinary `finalizing`.
-After the sealed checkpoint is durable, recovery can replay it and remove the
-stale companion. If a sealed checkpoint and a companion exist together after a
-crash, recovery first proves that they describe the same completion. It then
-repairs SQLite while keeping the companion, and removes the companion only
-after the repair succeeds. Changes to a pool's capacity cap or watermarks do not
-block this host-only bookkeeping, because the complete reserved tail is already
-on the tape.
-
-An ordinary write session cannot take ownership while the companion exists,
-even if the sealed checkpoint already matches it. The explicit terminal-recovery
-path must record the completion first and remove the companion second. This
-keeps a normal append from discarding the information a later restart needs to
-finish recovery.
+If the operation was already classified `recovery_required`, that state stays
+until recovery proves the next component or records the completed seal. The
+`Sealed` log record carries the completed intent. A restart replays it into
+SQLite. Changes to a pool's capacity cap or watermarks do not block host-only
+completion after replica C, because the complete reserved tail is already on
+the tape.
 
 The same restart repairs missing completion records in the append-only audit
 log. It records one tape-sealed event and, for a manual close-out, one
@@ -473,7 +462,7 @@ tapes](guide-damaged-tapes.md) explains why a tape with intact replicas can
 still be walked and how to read what the walk reports.
 
 Stop the daemon again before changing host state. Restore any surviving
-per-tape journals and audit material to their configured locations, then
+per-tape logs and audit material to their configured locations, then
 rebuild the SQLite projection offline when appropriate:
 
 ```text

@@ -402,13 +402,13 @@ checkpoint barriers. Standalone `rem put` and pool-selected `rem-debug archive
 write` use that same actor policy; finishing the command closes any remaining
 short epoch without unloading the cartridge.
 
-A checkpoint drains the drive, proves the end position, and commits the journals
+A checkpoint drains the drive, proves the end position, and commits the per-tape log
 and catalog. A CHECKPOINTED receipt keeps this meaning on a parity pool even
 when the newest committed data awaits parity. A short epoch stays open across
 ordinary checkpoints. Completed epochs emit their sidecars after the Object
 filemark; finalization closes its short epoch with `FINAL_PARTIAL_EPOCH`.
 Cartridge removal attempts to close an admitted open epoch without automatic
-finalization. It records a due seal as `seal_due` in the fsynced checkpoint journal and
+finalization. It records a due seal as `seal_due` in the fsynced per-tape log and
 projects it into the catalog, visible in `rem catalog tapes
 --json`; the next write session on that tape or explicit finalize completes it.
 

@@ -201,36 +201,32 @@ B, is already a complete inventory. A scan of the tape alone reports it as
 degraded. In host state the finalization stays resumable. No finalizing state
 permits another Object.
 
-Accepting a finalization durably publishes the finalization companion intent
-at `BeforeReplicaA` before any terminal media motion. From then on the
-checkpoint journal refuses ordinary Object appends. The API and the CLI report
+Accepting a finalization records its decision and immutable plan in the
+per-tape log at `BeforeReplicaA` before any terminal media motion. From then on
+the log refuses ordinary Object appends. The API and the CLI report
 this state as `Finalizing`; internally it is the progress value together with
 an in-progress outcome.
 
 For each of the five components the persistence order is:
 
 1. the synchronizing media barrier;
-2. the component's record and its paired `CheckpointedThrough` watermark in the
-   tape-file journal;
-3. the progress fsync in the checkpoint journal;
-4. the SQLite projection.
+2. the component's `ComponentWritten` group and its closing fsync in the
+   per-tape log;
+3. the SQLite projection.
 
-The journal bundle for each replica, A, B and C, uses the edition digest as its
-canonical metadata. The bundle for each separation, AB and BC, uses the
+The log record for each replica, A, B and C, uses the edition digest as its
+canonical metadata. The record for each separation, AB and BC, uses the
 separation's descriptor digest. All five carry the edition's protected and
 total ordinal watermarks. After the fifth barrier the writer makes one
 read-only position check against the planned terminal EOD.
 
 On restart, before any terminal positioning or write, Remanence reconstructs
 the immutable final edition. It compares every recorded component and
-watermark digest with that plan. It accepts only equal progress in both
-journals. The one exception is a tape-file journal exactly one canonical
-transition ahead. In that case Remanence completes the missing watermark.
-It then advances the checkpoint journal to the same component. It then rebuilds
-SQLite. All three steps come before any media motion. A skip, a regression, a
+watermark digest with that plan. It projects the log's durable progress into
+SQLite before any media motion. A skip, a regression, a
 record that is not the next one, or a conflicting digest fails closed.
 
-A component failure or a completion-unknown result marks the companion as
+A component failure or a completion-unknown result records the finalization as
 needing media reconciliation (`RecoveryRequired`). Restart keeps that mark at
 the same progress. Only a successful next component clears it.
 
@@ -241,18 +237,11 @@ Object. A proved rewritable start is rewritten from that component. On WORM
 media, or at a start that cannot be proved, the tape stays in
 `RecoveryRequired` and no media command is issued.
 
-`AfterReplicaC` stays `Finalizing` until three things are durable: its SQLite
-progress projection, a sealed checkpoint holding the exact completed intent,
-and the final SQLite projection. On the uninterrupted path the checkpoint
-journal fsyncs the sealed record. It then retires the companion. The final SQLite
-projection follows. If a crash leaves the sealed checkpoint beside its
-companion, startup recovery takes a recovery lease. It checks that the sealed
-completion equals the normalized companion. A mismatch fails closed. If they
-agree, it projects the sealed checkpoint. During this projection, the
-companion still routes retries.
-It retires the companion only after the projection succeeds. Only this
-terminal-recovery path may take the checkpoint journal while a companion
-exists; an ordinary append owner cannot.
+`AfterReplicaC` stays `Finalizing` until the completed intent is durably
+recorded as `Sealed` in the per-tape log and projected into SQLite. If a crash
+interrupts these host steps, recovery replays the durable component or sealed
+record before completing the remaining bookkeeping. An ordinary append owner
+cannot take over a finalization in progress.
 
 Once replica C is proved, the reserved tail is already on the medium. Completing
 the host steps therefore does not reapply a changed capacity cap or watermark.
@@ -280,7 +269,7 @@ digests, block and compression facts, writer facts, and the planned layout.
 
 If no replica survives, the fallback is a structural scan from BOT. Missing
 terminal authority is never reported as an empty inventory. When a matching
-fsynced checkpoint journal survives, the BOT walk recovers exact Object
+fsynced per-tape log survives, the BOT walk recovers exact Object
 identifiers only for its measured committed prefix. Complete Objects beyond that
 boundary remain unknown, and a torn tail remains incomplete. A tape from
 another installation, without local authority, stays unknown; Remanence does
@@ -316,40 +305,35 @@ rewrites a cartridge under an existing barcode, the catalog still binds that
 barcode to the old UUID (recycle skew; see
 [troubleshooting](guide-troubleshooting.md#known-open-issue)).
 
-<!-- code-anchor: crates/remanence-state/src/index.rs crates/remanence-state/src/paths.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs crates/remanence-state/src/calibration.rs @ a7fee789 -->
+<!-- code-anchor: crates/remanence-state/src/tape_log/store.rs crates/remanence-state/src/tape_log/projection.rs crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/calibration.rs @ dcf8d39a -->
 ## On disk: durable records and rebuildable state
 
 The host-side records that accompany the tapes. Paths are set by the operator;
 see the [configuration reference](reference-configuration.md).
 
-- **Parity tape-file journals** (`<tape-uuid>.remjournal`) — the Layer 3c
-  record of tape-file entries, parity state, and checkpoint watermarks for
-  parity-enabled tapes. The format is version 4 (magic `REMJRNL\x01`). It
-  includes the `CheckpointedThrough` watermark record and typed terminal-prefix
-  and terminal-component transitions, each followed by its own watermark.
-- **Per-tape checkpoint journals**
-  (`checkpoints/<tape-uuid>.remcheckpoint`) — fsynced checkpoint histories with
-  the barrier-proved physical EOD and replayable catalog projection. Records use
-  magic `REMCKPT\x01` and record format version 3.
-- **Finalization companion intents**
-  (`checkpoints/<tape-uuid>.remcheckpoint.finalizing`) — the fsynced record of a
-  finalization in progress: what triggered it, the operator's identity for a
-  manual close, the barrier-proved progress, whether the current boundary needs
-  media reconciliation, and the edition being written. It has its own format
-  version (magic `REMFINT\x01`, version 3), independent of the journal and
-  checkpoint record versions. Version 3 includes the finalization planning
-  software and time in the immutable terminal-prefix plan. The completed
-  checkpoint record embeds this plan and also uses version 3. Readers reject
-  earlier versions of both formats.
+- **Per-tape logs** (`journal_dir/tapes/<lowercase-simple-uuid>.remtape`) —
+  one append-only authority for each tape, with or without parity. Each log
+  carries tape-file rows, Object and member payloads, parity state, the proved
+  physical cursor, and finalization decisions, plans and progress. Its magic
+  is `REMTAPE\x01`, its format version is 1, and its tape incarnation is 1.
+  Reinitialization assigns a new tape UUID rather than incrementing the incarnation.
+- **Authority marker** (`state_dir/authority-format`) — exact bytes
+  `remanence-tape-log-v1\n`, followed by a JSON string containing the canonical
+  configured journal root, followed by `\n`. It binds the layout to that root.
+- **Log leases and fences** — the log basename with `.lock` holds the stable
+  lease; `.ambiguous` fences uncertain authority; `.repair-required` fences a
+  repaired log until physical-tail reconciliation. Exact-byte repair archives
+  are `.repair-evidence-<uuid>-<unique>`; reconciled evidence is
+  `.repair-reconciled-<uuid>-<unique>`, both under `journal_dir/tapes/`.
 - **Audit segments** (daily `.remaudit` files) — append-only record of
   every state-changing operation, fsynced by default.
-- **SQLite index** — schema version 18, tracked via `PRAGMA
+- **SQLite index** — schema version 23, tracked via `PRAGMA
   user_version`, with tables for tapes, pools, tape files, objects,
   copies, files, catalog units, sessions, operations, idempotency keys,
   media-readiness records, tape-I/O fences, wrap-map cache rows, and the
   drive-stewardship set (drives, events, health snapshots, cleaning runs,
   alarms). It is a projection: `rem rebuild-catalog-from-journals`
-  regenerates it from the journals and audit log.
+  regenerates it from the tape logs and audit log without changing their bytes.
 - **Per-tape catalog caches** — regenerable per-tape files under the
   configured cache directory.
 - **Calibration-control store** (`calibration/control.remcalibration`) — a
@@ -359,27 +343,21 @@ see the [configuration reference](reference-configuration.md).
   SQLite index, this store is never rebuilt or reset; a catalog rebuild or
   reset only marks every cached wrap map uncalibrated again.
 
-For parity tapes, the tape-file journal and checkpoint journal are both
-required commit authority; a parity-off tape needs only the checkpoint journal.
-On open, the tape-file journal's committed view ends at its last checkpoint
-watermark. Bundles written after it are kept as orphan evidence, and while any
-exist the journal refuses ordinary appends until the physical tail and the
-checkpoint authority have been reconciled. The journal removes them only
-through a compare-and-truncate step that names them exactly, and the current
-write paths do not perform that step themselves. Before a write session
-positions to append, or continues a finalization, Remanence compares the two
-journals' checkpointed histories entry by entry: tape-file map entries, object
-identities, parity watermarks and the terminal EOD. A history that lacks an
-entry the other names, is ahead of it, or conflicts with it fails closed.
-During finalization they also carry the exact planned layout and the
-barrier-proved five-component progress. A missing, differently advanced, or
-conflicting history fails closed. SQLite and per-tape catalog caches remain
-projections, not commit authority.
+The writer proves the media barrier before publishing the closing log record,
+fsyncs the log, and then projects it into SQLite. Startup replays only validated
+closed groups. The transactional projection mark identifies the closing
+sequence and offset; a log below that sequence requires recovery. SQLite and
+per-tape catalog caches remain projections, not commit authority.
 
-A catalog that records only the bootstrap, with no checkpointed authority
-behind it, therefore stands for an empty committed prefix. Remanence still
-refuses to write to such a tape until its physical tail has been reconciled:
-while the checkpoint journal is empty and the catalog records any written
-prefix, both write paths stop before loading or positioning the tape, because
-treating a known written prefix as fresh could rewrite BOT. Neither journal is
-recorded on tape, and neither changes any REM-PARITY media byte.
+Initialization, adoption and reset-preserved ready identities create no log.
+Initialization is grouped with the first actual barrier. A known written
+prefix without matching log authority cannot be treated as a fresh tape.
+
+The old `.remjournal`, `.remcheckpoint` and `.finalizing` layout is refused.
+Ordinary catalog opens also refuse schemas 1 through 22. There is no importer;
+use the declared reset and reinitialize approved scratch tapes as described in
+[troubleshooting](guide-troubleshooting.md#authority-layout-refusals-and-declared-reset).
+The per-tape log is not recorded on tape and changes no REM-PARITY media byte.
+
+In plain terms, each tape has one host record of what was committed. Rebuilding
+the catalog reads that record; it does not rewrite it or repair the cartridge.

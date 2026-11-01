@@ -6,6 +6,126 @@ state the hardware is in, it stops and says so rather than guessing, so many
 things that look like an outage are a fence (a recorded block on a tape or
 drive) doing its job.
 
+<!-- code-anchor: crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/state.rs crates/remanence-cli/src/lib.rs @ dcf8d39a -->
+## Authority-layout refusals and declared reset
+
+Old host state is refused before configured device admission. Ordinary catalog
+opens refuse schemas 1 through 22. The layout refusal contains this exact guidance:
+
+```text
+This state directory uses the two-journal authority layout.
+Step 2 requires a declared state reset and reinitialization of its test tapes.
+Run rem reset-catalog --config <config> with the existing explicit reset
+confirmation, then reinitialize the approved scratch tapes. No importer is available.
+```
+
+Stop the daemon and run the declared offline reset with the existing config:
+
+```sh
+rem reset-catalog --config <PATH> --i-understand-this-erases-the-catalog
+```
+
+This is a destructive state reset. It archives the prior audit and journal
+directories and authority marker, removes active authority, and installs the
+per-tape log layout. Configuration and calibration generation allocation
+survive. When the prior audit or journal directory existed, the archive includes
+`state_dir/reset-archives/reset-<number>/authority-reset.json`, which records
+the paths, replacement format and reset request digest. This is not an import
+of the old state.
+
+Reinitialize each approved scratch tape before returning it to write service.
+For a library tape whose existing BOT UUID is absent from the reset catalog,
+use the exact UUID and label reported by init's refusal:
+
+```sh
+rem tape init <LABEL> --config <PATH> --clobber-data --clobber-unknown-tape <OLD-UUID> --confirm-clobber "CLOBBER <LABEL>"
+```
+
+Select the approved geometry with `--block-size <BYTES>` and
+`--parity <none|default>`; a fresh initialization defaults to no parity.
+Initialization assigns a new tape UUID and incarnation 1. It creates no log
+until the first actual barrier publication. An idempotent init of an already
+registered tape does not assign a new identity. Scoped preservation and erase
+selectors still require the matching `catalog reset-preflight` token; see the
+[CLI reference](reference-cli.md#destructive-state-reset).
+
+The following layout details are also refusals, not reasons to delete a marker:
+
+```text
+authority-format does not match remanence-tape-log-v1 and the configured journal root
+marked tape-log layout contains old authority files in active paths; declared state reset required
+```
+
+The first means the marker does not match the configured canonical journal root
+and format. The second means refused old authority files remain in active paths.
+Use the declared reset for an approved layout change. An interrupted reset
+reports `durable fence {path} requires an exact reset rerun`; rerun the same
+reset request rather than removing its fence.
+
+In plain terms, a reset discards the old host authority. It does not make an
+already written cartridge safe to append; the approved test tapes must be
+initialized again.
+
+## Damaged log tails and projection rebuild
+
+Inspect the per-tape log before choosing a retained boundary:
+
+```sh
+rem-debug tape-log inspect --config <PATH> --tape-uuid <UUID>
+```
+
+Inspection returns JSON with `through_sequence`, `valid_bytes`, `original_bytes`
+and `damage`. Sequence and byte counts are decimal strings. With the daemon
+stopped, archive a damaged suffix and retain the last validated closed sequence:
+
+```sh
+rem-debug tape-log repair-tail --config <PATH> --tape-uuid <UUID> --through-sequence <N> --confirm-discard-corrupt-tail
+```
+
+The confirmation flag is mandatory before state is opened. Without it the
+command prints `repair-tail requires --confirm-discard-corrupt-tail`. A sequence
+below the catalog projection mark requires `--rebuild-projection` on the same
+command; otherwise the refusal is
+`repair sequence {requested} is below projection mark {projected}`. With that
+flag the same offline owner repairs the log and transactionally rebuilds only
+that tape's projection. A crash between these steps leaves a durable repair
+fence and permits retry with the same sequence.
+
+Repair returns the archive path and SHA-256, retained byte count and
+`physical_tail_reconciliation_required: true`. It does not permit arbitrary
+discard of valid closed groups, a seal or accepted terminal finalization.
+Keep the evidence and complete physical-tail reconciliation through the existing
+confirmed recovery path. For a daemon-managed tape, after starting the daemon:
+
+```sh
+rem tape supersede-tail --tape-uuid <UUID> --ack-tape-uuid <UUID> --confirm-supersede "SUPERSEDE <LABEL>"
+```
+
+The acknowledgement UUID must match the tape UUID. The command previews the
+tail and checks the exact confirmation, identity and retained cursor before
+physical recovery. Only successful physical recovery and durable reconciliation
+remove `.repair-required`. Declining confirmation, ordinary startup and catalog
+rebuild leave it in place. This path cannot clear terminal intent or make a
+sealed tape writable.
+
+For a lost or damaged SQLite projection with intact authority, stop the daemon
+and run:
+
+```sh
+rem rebuild-catalog-from-journals --config <PATH>
+```
+
+This reads the audit log and per-tape logs and rebuilds SQLite. It preserves
+their bytes, does not clear ambiguity or repair fences, and does not repair
+media. It requires an existing `authority-format` marker. Cached wrap maps are
+evicted and volumes become uncalibrated; calibration generation allocation
+advances. A log below its projection mark requires recovery, not a reset of the
+mark to match an older backup.
+
+In plain terms, log repair retains an evidenced prefix and keeps writing
+blocked until the cartridge agrees. Catalog rebuild only regenerates the
+queryable view of intact host records.
+
 <!-- code-anchor: crates/remanence-library/src/error.rs crates/remanence-cli/src/lib.rs crates/remanence-scsi/src/error.rs @ 6ed03ef0 -->
 ## Discovery finds no libraries
 
@@ -491,9 +611,8 @@ init` first), `tape ... is a <kind> tape, not a data tape` (for example a
 cleaning cartridge), `tape ... is assigned to pool ..., not the required
 pool ...` (the `--pool` guard named the wrong pool), `tape ... is not
 writable: <reason>` (the same writability preconditions above), `tape ...
-is fenced by quarantine ...` (see fences above), and `tape ... carries
-committed data but no adopted checkpoint journal; batched append
-positioning would be unsafe`.
+is fenced by quarantine ...` (see fences above). A tape with a known written
+prefix but no matching per-tape log is also refused before append positioning.
 
 <!-- code-anchor: crates/remanence-daemon/src/entry.rs @ 1dd451b2 -->
 ## Reading the logs
@@ -660,7 +779,7 @@ They reserve the SQLite writer before reading the rows they update, so
 concurrent checkpoints wait instead of failing on a deferred read-to-write
 upgrade. Each drive actor has its own connection to the same catalog.
 
-A checkpoint journal lease is exclusive per tape and lasts through the write
+A per-tape log lease is exclusive per tape and lasts through the write
 session. A competing lease for that tape returns a refusal; it does not block
 indefinitely. Separate tapes use separate lock files. A rejected session open releases its
 journal leases before publishing the refusal, so an immediate retry or replay

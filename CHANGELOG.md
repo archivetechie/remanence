@@ -7,6 +7,24 @@ per-release summaries.
 <!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/index.rs crates/remanence-library/src/discovery.rs @ 638210f7 -->
 ## Unreleased
 
+- Host commit authority now uses one per-tape log at
+  `journal_dir/tapes/<lowercase-simple-uuid>.remtape`, for tapes with or without
+  parity. The layout marker is `state_dir/authority-format` and the catalog
+  schema is 23. Old state is refused and has no importer; stop the daemon, run
+  `rem reset-catalog --config <PATH> --i-understand-this-erases-the-catalog`,
+  and reinitialize approved scratch tapes with new UUIDs. `rem-debug tape-log
+  inspect` reports log-tail damage; `rem-debug tape-log repair-tail` archives a
+  damaged suffix with explicit confirmation and requires physical reconciliation
+  through `rem tape supersede-tail` before append. Catalog rebuild through
+  `rem rebuild-catalog-from-journals` now rebuilds only the projection and
+  preserves log and audit bytes. Append output adds `tape_log_sequence` and
+  `tape_incarnation`; `journal_record_ordinal` remains present and null.
+- Removed the old host journal readers, writers and finalization companion
+  storage. The per-tape log is the only host commit authority. Old file names
+  remain recognized for refusal and declared-reset archival; the removed
+  implementation cannot read or import them. Tape formats and media bytes
+  are unchanged.
+
 - The field-test kit checks the changer not-ready wait on real hardware.
   `fieldtest/plan/magazine.env` runs `36-magazine-wait.sh`, which asks the
   operator to pull out one magazine, loads an allowlisted tape through the
