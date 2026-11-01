@@ -175,7 +175,11 @@ pub(super) fn checked_epoch_rebuild(
         if let ParityError::CloseoutCheckMismatch { expected, found } = error {
             let barcode = match index.get_tape(&selected.tape_uuid) {
                 Ok(tape) => tape.and_then(|t| t.voltag),
-                Err(e) => return crate::status_from_state_error(e),
+                Err(error) => {
+                    tracing::error!(%error, tape_uuid = %Uuid::from_bytes(selected.tape_uuid),
+                        "closeout mismatch barcode lookup failed; fencing by tape UUID");
+                    None
+                }
             };
             let evidence = serde_json::json!({
                 "W": previous.protected, "T": previous.total,
@@ -193,7 +197,15 @@ pub(super) fn checked_epoch_rebuild(
                 },
                 cfg.terminal_config().mounted_endpoint.as_ref(),
             ) {
-                return crate::status_from_state_error(error);
+                tracing::error!(%error, tape_uuid = %Uuid::from_bytes(selected.tape_uuid),
+                    "failed to persist closeout mismatch tape-I/O fence");
+                return Status::new(
+                    status.code(),
+                    format!(
+                        "{}; additionally failed to persist the required tape fence: {error}",
+                        status.message()
+                    ),
+                );
             }
         } else if contradiction {
             record_epoch_fence(

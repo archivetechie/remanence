@@ -214,11 +214,14 @@ impl EpochAccumulator {
         {
             return Err(ParityError::Invariant("epoch block exceeds geometry"));
         }
-        self.codec.accumulate(
-            (offset / s) as usize,
-            block,
-            &mut self.parity_accumulators[(offset % s) as usize],
-        )?;
+        let accumulators = self
+            .parity_accumulators
+            .get_mut((offset % s) as usize)
+            .ok_or(ParityError::Invariant(
+                "epoch parity accumulators unavailable",
+            ))?;
+        self.codec
+            .accumulate((offset / s) as usize, block, accumulators)?;
         let crc = data_shard_crc64(block);
         self.current_epoch_data_crc64s.push(crc);
         self.check.push(crc);
@@ -248,11 +251,15 @@ impl EpochAccumulator {
         block_size: usize,
     ) -> Result<Vec<Vec<u8>>, ParityError> {
         if block_size != self.block_size as usize
+            || self.parity_accumulators.len() != self.scheme.stripes_per_neighborhood as usize
             || self.parity_accumulators.iter().any(|stripe| {
                 stripe.len() != self.codec.parity_blocks()
                     || stripe.iter().any(|shard| shard.len() != block_size)
             })
         {
+            // A failed transfer invalidates the whole accumulator, including
+            // stripes whose shape happened to be valid. Further pushes fail.
+            self.parity_accumulators.clear();
             return Err(ParityError::Invariant("epoch parity shape mismatch"));
         }
         Ok(std::mem::take(&mut self.parity_accumulators)
@@ -489,6 +496,33 @@ mod tests {
         scheme.stripes_per_neighborhood = u32::MAX;
         scheme.parity_blocks_per_stripe = u16::MAX;
         assert!(EpochAccumulator::reservation_bytes(&scheme, u32::MAX).is_err());
+    }
+
+    #[test]
+    fn wrong_shard_shape_invalidates_all_stripes() {
+        for wrong_block_size in [false, true] {
+            let mut epoch = EpochAccumulator::new([7; 16], &scheme(), 256, 2, 10).unwrap();
+            epoch.push_block(10, &[1; 256]).unwrap();
+            if !wrong_block_size {
+                // The next ordinal would use stripe 1, which is still valid.
+                epoch.parity_accumulators[0][0].pop();
+            }
+            let check = epoch.check_value();
+            assert!(matches!(
+                epoch.take_parity_shards(if wrong_block_size { 255 } else { 256 }),
+                Err(ParityError::Invariant(_))
+            ));
+            assert!(matches!(
+                epoch.push_block(11, &[2; 256]),
+                Err(ParityError::Invariant(_))
+            ));
+            assert!(matches!(
+                epoch.take_parity_shards(256),
+                Err(ParityError::Invariant(_))
+            ));
+            assert_eq!(epoch.check_value(), check);
+            assert_eq!(epoch.covered_end(), 11);
+        }
     }
 
     #[test]

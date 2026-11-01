@@ -1298,6 +1298,7 @@ fn rebuild_open_epoch_from_committed_prefix(
 ///
 /// Physical positions for only the intersecting Object extents were retained
 /// during journal replay, so this path does not need a complete filemark map.
+#[cfg(any(test, feature = "fixtures"))]
 pub fn rebuild_open_epoch_from_bounded_summary(
     source: &mut dyn RawTapeSource,
     summary: &BoundedResumeSummary,

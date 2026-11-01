@@ -859,6 +859,54 @@ fn sidecar_only_write_path_accumulates_without_retaining_data_shards() {
 }
 
 #[test]
+fn push_after_taken_and_failed_sidecar_returns_invariant() {
+    let block_size: u32 = 32;
+    let mut raw = RecordingRawTapeSink::default();
+    let mut sink =
+        ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), block_size).unwrap();
+    start_object(&mut sink, 2, block_size);
+    sink.write_block(&fixed_block(1, block_size)).unwrap();
+    // Force the non-poisoning queue failure after parity ownership is taken.
+    sink.active_object
+        .as_mut()
+        .unwrap()
+        .pending_sidecars_at_start = 1;
+    assert!(matches!(
+        sink.queue_partial_sidecar_without_writing_padding(block_size as usize, false),
+        Err(ParityError::Invariant(
+            "pending sidecar count regressed during object write"
+        ))
+    ));
+    assert!(!sink.poisoned);
+    assert!(sink.accumulator.parity_accumulators.is_empty());
+    let check = sink.accumulator.check_value();
+    assert!(matches!(
+        sink.accumulator.push_block(1, &fixed_block(2, block_size)),
+        Err(ParityError::Invariant(_))
+    ));
+    assert_eq!(sink.accumulator.covered_end(), 1);
+    assert_eq!(sink.accumulator.check_value(), check);
+}
+
+#[test]
+fn wrong_shard_shape_poisons_sidecar_sink() {
+    let block_size: u32 = 32;
+    let mut raw = RecordingRawTapeSink::default();
+    let mut sink =
+        ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), block_size).unwrap();
+    start_object(&mut sink, 2, block_size);
+    sink.write_block(&fixed_block(1, block_size)).unwrap();
+    sink.accumulator.parity_accumulators[0][0].pop();
+    assert!(matches!(
+        sink.queue_partial_sidecar_without_writing_padding(block_size as usize, false),
+        Err(ParityError::Invariant(_))
+    ));
+    assert!(sink.poisoned);
+    assert!(sink.accumulator.parity_accumulators.is_empty());
+    assert!(sink.into_session_state().is_err());
+}
+
+#[test]
 fn completed_sidecar_queue_is_bounded_by_object_reserve() {
     let block_size: u32 = 32;
     let mut raw = RecordingRawTapeSink::default();
