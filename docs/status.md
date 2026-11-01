@@ -161,11 +161,10 @@ and audit replay rebuilds their timestamps, states and terminal edition digests.
 Drive allocation policy belongs to the caller; the daemon does not preempt a
 verification to admit a write or restore.
 
-**The catalog rebuild's summary leaves out the checkpoint journals.**
-`rem rebuild-catalog-from-journals` replays the checkpoint journals after the
-audit log and the per-tape journals, but its printed counts cover only the
-audit log and the per-tape journals. The counts for tapes, tape files and
-object copies can read zero even when the rebuilt catalog is complete.
+**Catalog rebuild reads the per-tape logs.**
+`rem rebuild-catalog-from-journals` rebuilds the SQLite projection from the audit
+log and tape logs. Its summary includes `tape logs:` with the snapshot count.
+It preserves log and audit bytes and does not clear repair fences.
 
 **Write throughput is below the drive rate.** On the field-test host, the host
 adapter limits each SCSI command to 1 MiB, and the daemon's staging ring keeps

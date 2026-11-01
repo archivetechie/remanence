@@ -200,24 +200,18 @@ separate Remanence distribution. Core Remanence owns the normalized reader and
 registry contract but ships with an empty registry and no concrete adapters.
 See [foreign-format adapters](reference-foreign-format-adapters.md).
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-api/src/pool_write.rs crates/remanence-state/src/index.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs @ 6ed03ef0 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-api/src/pool_write.rs crates/remanence-state/src/index.rs crates/remanence-state/src/checkpoint.rs crates/remanence-state/src/tape_log/authority.rs @ dcf8d39a -->
 ## Catalog and daemon
 
 **catalog** — the queryable model of what is on which tape. The durable
-truth is the required per-tape journals plus the audit log; the SQLite index
+truth is the per-tape logs plus the audit log; the SQLite index
 is a rebuildable projection of them.
 
-**tape-file journal** — the Layer 3c append-file
-(`<tape-uuid>.remjournal`) recording tape-file entries, parity state, and
-checkpoint watermarks for a parity-enabled tape.
-
-**checkpoint journal** — the append-file
-(`checkpoints/<hyphenated-uuid>.remcheckpoint`) recording synchronized
-checkpoint EOD positions and replayable catalog projections. On parity tapes,
-Layer 3c bundles beyond the last checkpoint watermark are kept as orphan
-evidence, and the journal refuses appends until they are reconciled with the
-physical tail; the checkpointed histories must agree with the tape-file
-journal before append resume. SQLite is not commit authority.
+**per-tape log** — the append-only host authority at
+`journal_dir/tapes/<lowercase-simple-uuid>.remtape`, for tapes with or without
+parity. It records closed commits, tape-file rows, Object and member payloads,
+parity state, physical cursors and finalization progress. SQLite is a replayable
+projection of validated closed log groups.
 
 **audit log** — append-only daily `.remaudit` segments recording every
 state-changing operation and who asked for it.

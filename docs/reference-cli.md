@@ -189,7 +189,7 @@ The table omits the device/authorization flags, which all media verbs accept.
 | `rem tape assign-pool [--tape <UUID>] (--pool <POOL> \| --unassign)` | With UUID, change assignment offline; otherwise identify loaded media. |
 | `rem tape set-generation --generation <GEN>` | Record generation for loaded media; supported values are L5–L9 and M8. |
 | `rem tape rebind --label <LABEL> --previous-uuid <UUID>` | Bind a reused operator label to loaded media, checking the previous UUID. |
-| `rem tape import-journals --from <DIR>` | Validate and import matching checkpoint/parity journal authority for append recovery. |
+| `rem tape import-journals --from <DIR>` | Validate and import matching per-tape log authority for append recovery. |
 | `rem tape supersede-tail --acknowledge-tape <LABEL\|UUID> [--confirm-supersede "SUPERSEDE <LABEL>"]` | List and explicitly discard the suffix beyond local authority, with typed confirmation and audit. Rescue files first. |
 | `rem tape quarantine list` | List local active tape-I/O fences. |
 | `rem tape quarantine release <ID> --ack <TEXT>` | Release through the configured daemon socket when it is listening; otherwise use the exclusive offline state lock. The acknowledgment is durable before the fence clears. This does not bypass append admission. |
@@ -302,7 +302,7 @@ and fencing checks. The CLI performs no local SCSI discovery for these verbs.
 | `rem tape retire <TARGET> --reason <TEXT> --i-understand-copies-become-unreadable [--dry-run]` | Permanently retire a tape identity in the local catalog. Every copy on that tape becomes unreadable through the catalog. |
 | `rem tape finalize --tape-uuid <UUID> [--expected-pool <ID>] --reason <EXACT> --idempotency-key <UUID> --ack-tape-uuid <UUID> [--wait] [--json] [--endpoint <URI>]` | Irreversibly finalize one exact reconciled tape, including below the automatic low watermark. Voltags are not accepted, the acknowledgement must name the same UUID, and a pooled tape requires its canonical current pool id. The reason is sent exactly as supplied. Without `--wait`, the command submits once and prints the current status; with it, the command polls the read-only status RPC across daemon reconnects until a terminal outcome and never resubmits finalization. While the projection is FINALIZING it also checks the operation and exits non-zero with its summary on FAILED, CANCELLED or COMPLETION_UNKNOWN. Reuse the same idempotency key to resume durable intent under the same operation id. JSON uses schema `rem.tape.finalization.v2`; `replica_progress` is historical barrier evidence, not a current media-health observation. A value the daemon does not have is `null`, never `0`: `operation_id` is `null` for a finalization an automatic trigger started, and a BUSY response has `null` `operation_id`, `completed_replicas` and digests. `completed_replicas` `0` is a real value (before replica A). |
 | `rem tape supersede-tail --tape-uuid <UUID> --ack-tape-uuid <UUID> [--confirm-supersede <TEXT>]` | Through the daemon, list and explicitly discard a suffix beyond checkpoint authority using the same append checks. Rescue first; confirm the exact text requested. |
-| `rem tape inventory --tape-uuid <UUID> [--json] [--endpoint <URI>]` | The quick check of a tape's structure. When the terminal index is readable, it reads the first record of the tape and the terminal replicas at the end of the data, and no Object data. If the terminal index cannot be used, it falls back to a walk from the beginning of tape that reads records throughout the prefix; that walk classifies tape files and is not a content verification. `verify-index` below is the whole-tape check. Stream the complete bounded terminal inventory by locating EOD and selecting C, then B, then A. Human output labels every pre-summary row `provisional`; the final summary names the authoritative `attempt_id`. `--json` emits NDJSON events under `rem.tape.inventory.stream.v1` and ends with exactly one `summary` event. Consumers must commit only that summary's selected attempt. Rejected attempts make fallback evidence explicit; no surviving replica triggers a `bot_recovery_started` notice followed by per-tape-file `bot_recovery_progress` events and streamed BOT classifications rather than empty success. Cancellation is honored at those between-file boundaries. During BOT fallback, an exact surviving checkpoint journal can classify matching complete Objects as recovered; later or foreign Objects without that authority remain unknown. In the summary, a selection, count or digest the outcome does not carry is `null`, never `"0"`: BOT-recovery-required has no counts, fast outcomes have no BOT classification counts, and a torn BOT Object's `stored_block_count` is `null`. |
+| `rem tape inventory --tape-uuid <UUID> [--json] [--endpoint <URI>]` | The quick check of a tape's structure. When the terminal index is readable, it reads the first record of the tape and the terminal replicas at the end of the data, and no Object data. If the terminal index cannot be used, it falls back to a walk from the beginning of tape that reads records throughout the prefix; that walk classifies tape files and is not a content verification. `verify-index` below is the whole-tape check. Stream the complete bounded terminal inventory by locating EOD and selecting C, then B, then A. Human output labels every pre-summary row `provisional`; the final summary names the authoritative `attempt_id`. `--json` emits NDJSON events under `rem.tape.inventory.stream.v1` and ends with exactly one `summary` event. Consumers must commit only that summary's selected attempt. Rejected attempts make fallback evidence explicit; no surviving replica triggers a `bot_recovery_started` notice followed by per-tape-file `bot_recovery_progress` events and streamed BOT classifications rather than empty success. Cancellation is honored at those between-file boundaries. During BOT fallback, an exact surviving per-tape log can classify matching complete Objects as recovered; later or foreign Objects without that authority remain unknown. In the summary, a selection, count or digest the outcome does not carry is `null`, never `"0"`: BOT-recovery-required has no counts, fast outcomes have no BOT classification counts, and a torn BOT Object's `stored_block_count` is `null`. |
 | `rem tape verify-index --tape-uuid <UUID> [--ready-wait <DURATION>] [--json] [--endpoint <URI>]` | Watch a media-readiness fence locally for up to `15m`, then retry verification once it reports ready; `--ready-wait 0` returns the refusal immediately. The daemon resumes with a 9000 s timeout independent of `--ready-wait` and keeps waiting after the command returns, so the fence clears when the drive becomes ready within that timeout; an operator release is required if the daemon wait times out. Resume attaches to the same running readiness operation. If readiness fails or the resume or watch fails, return the original refusal with the wait error appended after a semicolon. A busy drive bay gets one retry after 1 s. Verify the tape's structure and, on a tape written with parity, read and checksum all the data that the parity sidecars protect and all the parity shards. On a tape written without parity there is no sidecar-protected content, so this pass does not read or checksum Object interiors; only the structure and the terminal index are verified. It has no shallow option; `rem tape inventory` is the quicker structural check, and it does not verify the protected content. Use `verify-index` for the periodic check of an archive and for any tape that is suspect. Perform a full verification in the sense of REM-PARITY Section 2.2: measure EOD, walk the prefix, compare the canonical map, validate all three replicas and both separation extents, and read every data block that a sidecar protects and every parity shard, checking each against its sidecar's index. A finding about any data block, parity shard, sidecar copy or footer, ParityMap copy or footer, or the bootstrap's trailing fill leaves the tape not complete: the state is `verified_degraded` and `complete` is `false`. `verified` says that the verification ran to the end; `complete` says whether the tape passed. The findings are printed as described under [Recovery report and verification output](#recovery-report-and-verification-output). See [Full verification](guide-full-verification.md) and [Damaged tapes](guide-damaged-tapes.md). Its all-replicas-invalid BOT outcome applies the same checkpoint-assisted recovered/unknown/incomplete classification as inventory. `verified_interior_record_count` is present only for a valid separation extent (`"0"` for a two-record extent) and `null` for an invalid or unknown one; the verified-prefix counts and digests are `null` when recovery is required. |
 | `rem tape verify-index --tape-uuid <UUID> --detach [--json]` | Start a `tape_verification` operation and print its UUID. Use `rem operation watch <UUID>` and `rem operation cancel <UUID> [--force]` to control it. Cancellation sends `force=false` unless `--force` is supplied. |
 | `rem tape verify-index --result <OPERATION_ID> [--json]` | Fetch the retained verdict with the verification rendering. The daemon retains results in memory alongside operations; a restart or pruning removes them. A running, failed or cancelled operation has no verdict. |
@@ -715,6 +715,27 @@ reset-preflight`.
 
 What `rem-debug` adds:
 
+`rem-debug tape-log inspect --config <PATH> --tape-uuid <UUID>` reports the
+last validated closed boundary without mutation. Its JSON fields are
+`tape_uuid`, `tape_incarnation`, `through_sequence`, `valid_bytes`,
+`original_bytes` and `damage`. The UUID is hyphenated, incarnation is the
+number 1, sequence and byte counts are decimal strings, and damage is a string
+or null.
+
+`rem-debug tape-log repair-tail --config <PATH> --tape-uuid <UUID>
+--through-sequence <N> --confirm-discard-corrupt-tail [--rebuild-projection]`
+archives a damaged suffix and retains the last validated closed sequence.
+The confirmation is required before opening state. Below the catalog's
+projection mark, `--rebuild-projection` is required and rebuilds only that tape
+under the same offline owner. JSON returns `tape_uuid`, `tape_incarnation`,
+`through_sequence`, `archive`, `archive_sha256`, `reconciliation_record`,
+`original_bytes`, `retained_bytes`, `projection_rebuilt` and
+`physical_tail_reconciliation_required`. Sequence and byte counts are decimal
+strings, the digest is lowercase hexadecimal, and the last field is true.
+The durable repair fence remains until confirmed `rem tape supersede-tail`
+reconciles physical media. See the
+[repair procedure](guide-troubleshooting.md#damaged-log-tails-and-projection-rebuild).
+
 Robotics (direct SCSI against the changer; all require `--allow <SERIAL>`):
 
 | Command | What it does |
@@ -754,12 +775,21 @@ journals):
 | `rem-debug archive probe/scan/restore/recover --format <ID> --tape <SERIAL> --bay <BAY> [--rewind]` | Run a registered foreign-format adapter directly against a mounted tape instead of a dump file. `--tape` takes the serial of the library that holds the tape, and `--bay` the drive bay; that library must be on `--allow`. `restore` and `recover` also take `--dest <DIR>`, as with a dump file. |
 | `rem-debug tape alerts --bay <BAY> [--library <SERIAL>]` | Read the loaded drive's TapeAlert LOG SENSE page directly. `--library` selects a configured library when more than one is present. `rem tape alerts` has no `--bay`; it is the daemon alias that takes a drive serial or UUID. |
 
-Destructive maintenance:
+## Destructive state reset
 
 | Command | What it does |
 |---|---|
-| `rem-debug catalog reset-preflight [--preserve-tape-voltag <VOLTAG>]... [--allow-erase-tape-voltag <VOLTAG>]...` | Read-only admission for a scoped catalog reset. It enumerates every data and cleaning tape, rejects any bound label outside the two exact selector sets, and returns a source-bound token plus `source_schema_version`. A catalog of schema 16 or 17 is inspectable only when the preservation set is empty and every bound tape is explicitly allowed to be erased; such a catalog is never migrated and never accepted for preservation. |
-| `rem-debug catalog reset --i-understand-this-erases-the-catalog [--expected-preflight-token <SHA256>] [--preserve-tape-voltag <VOLTAG>]... [--allow-erase-tape-voltag <VOLTAG>]...` | Destructively reset local catalog state from the configured paths. Any scoped reset requires the exact current preflight token and repeats selector and source-schema admission under the exclusive state lock before mutation. |
+| `rem-debug catalog reset-preflight [--config <PATH>] [--preserve-tape-voltag <VOLTAG>]... [--allow-erase-tape-voltag <VOLTAG>]...` | Read-only admission for a scoped catalog reset. It enumerates every data and cleaning tape, rejects any bound label outside the two exact selector sets, and returns a source-bound token plus `source_schema_version`. A predecessor catalog of schema 16 through 21 with the required tape identity and geometry columns is inspectable only when the preservation set is empty and every bound tape is explicitly allowed to be erased; such a catalog is never migrated and never accepted for preservation. Schema 22 has a separate declared-reset reader that permits identity preservation without retaining old commit authority. |
+| `rem-debug catalog reset [--config <PATH>] --i-understand-this-erases-the-catalog [--expected-preflight-token <SHA256>] [--preserve-tape-voltag <VOLTAG>]... [--allow-erase-tape-voltag <VOLTAG>]...` | Destructively reset local catalog state from the configured paths. Any scoped reset requires the exact current preflight token and repeats selector and source-schema admission under the exclusive state lock before mutation. |
+
+`rem reset-catalog --config <PATH> --i-understand-this-erases-the-catalog`
+declares the offline reset required by an authority-layout change. It uses the
+same implementation and accepts the same preservation, erase and preflight
+arguments as `rem-debug catalog reset`. Stop the daemon first. Old state is
+refused rather than imported; reset archives the prior authority and installs
+the per-tape log layout. Configuration and calibration generation allocation
+survive. Reinitialize approved scratch tapes afterwards, with fresh UUIDs;
+see the [reset procedure](guide-troubleshooting.md#authority-layout-refusals-and-declared-reset).
 
 The global `--allow-derived <SERIAL>` flag additionally permits operating
 drive bays whose identity was derived rather than read from the device, in
@@ -773,9 +803,20 @@ fences when it runs; offline release requires exclusive state ownership.
 ## Catalog rebuild
 
 `rem rebuild-catalog-from-journals [--config <PATH>]` rebuilds the SQLite
-catalog projection from the audit log and per-tape journals. This is the
-recovery path that makes the SQLite file a disposable cache rather than a
-single point of failure.
+catalog projection from the audit log and per-tape logs. Stop the daemon first.
+The command requires an existing `authority-format` marker and never installs
+one. It preserves log and audit bytes, leaves ambiguity and repair fences in
+place, and does not reconcile startup authority or touch media. It evicts wrap
+maps and marks volumes uncalibrated while advancing calibration generation
+allocation. The output includes `tape logs:` with the snapshot count.
+
+## Append log references
+
+The append locator's `append_commit_info` includes `tape_log_sequence` as a
+decimal string and `tape_incarnation` as the number 1 when the catalog join is
+available. Both are null without that join. `journal_record_ordinal` remains
+present and always null. Checkpoint and session ordinals keep their existing
+meaning; they are not log sequence numbers.
 
 <!-- code-anchor: crates/rem-recover/src/main.rs @ 1dd451b2 -->
 ## `rem-recover`: standalone recovery

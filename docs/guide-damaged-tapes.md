@@ -125,7 +125,7 @@ reports intact replicas as tape files of the walk and not as the authority for
 which Objects the tape holds. A trailing artifact appears as an Object
 candidate of unknown identity or, when it is torn, as an incomplete candidate
 (REM-PARITY Sections 8.4.1 and 12.6). Identities come back as unknown unless
-separate host records, such as a surviving checkpoint journal, supply them.
+separate host records, such as a surviving per-tape log, supply them.
 
 What to do next. Let the walk finish; the [implementation guide](../specs/publication/rem-implementation-guide.md)
 says that it can take hours. The need for a walk does not by itself mean that

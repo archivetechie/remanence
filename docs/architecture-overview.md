@@ -172,16 +172,17 @@ streaming, and ranged opens use a REMP `--private-key` file; the key's epoch id
 selects the matching slot in the key frame. `rem-recover` performs the same
 encrypted open without the daemon, catalog, or config.
 
-<!-- code-anchor: crates/remanence-state/src/lib.rs crates/remanence-state/src/state.rs @ 244bc6de -->
+<!-- code-anchor: crates/remanence-state/src/state.rs crates/remanence-state/src/tape_log/projection.rs crates/remanence-state/src/index.rs @ dcf8d39a -->
 ## Layer 4: state
 
 `remanence-state` holds everything the daemon remembers: the validated
 operator configuration, an exclusive state lock, the append-only audit log, and
 the SQLite catalog. The catalog is a projection of other records, not the
-source of truth: `rebuild_index_from_journals` replays the audit log and the
-per-tape journals to regenerate it. A catalog opened read-only is never
-migrated. The schema is version 18, tracked in SQLite's `user_version`. Its
-tables cover tapes, pools, tape files, objects, copies and files, catalog
+source of truth: the projection-only rebuild replays the audit log and the
+per-tape logs to regenerate it. A catalog opened read-only is never migrated.
+The schema is version 23, tracked in SQLite's `user_version`. Ordinary opens
+refuse schemas 1 through 22. Its tables cover tapes, pools, tape files, objects,
+copies and files, catalog
 units, sessions, operations, idempotency keys, media-readiness records,
 tape-I/O fences, wrap-map cache rows, and the drive-stewardship set (drives,
 events, health snapshots, clean runs, and alarms).
@@ -196,9 +197,10 @@ daemon runs. The kernel releases the lock when the owning process dies.
 Maintenance procedures stop the daemon before taking it.
 
 Catalog reset goes through a single admission check. A current catalog is
-inspected normally. A catalog at schema 16 or 17, which this version cannot
-migrate, may be inspected only for one purpose: erasing the whole catalog while
-preserving nothing. For that, the reader lists every bound tape and refuses any
+inspected normally. A schema-22 catalog is readable only for declared-reset
+admission. A predecessor catalog at schema 16 through 21 with the
+required tape identity and geometry columns may be inspected only for one
+purpose: erasing the whole catalog while preserving nothing. For that, the reader lists every bound tape and refuses any
 label outside the erase allowlist. It does not preserve or migrate the old
 rows. It records the observed schema and tape identities in a token that the
 mutation checks again under the same lock. The result is a safe path to an
@@ -445,7 +447,7 @@ the committed copy set. After any loss of the session, the stream, or the
 daemon, the caller re-sends every object that was not reported CHECKPOINTED.
 The retry is the complete Object from byte zero, not a continuation.
 
-For an open, parity-off, rewritable tape, the durable checkpoint journal
+For an open, parity-off, rewritable tape, the durable per-tape log
 identifies the last committed EOD. After a restart the daemon locates there and
 overwrites any longer uncommitted tail, then writes the retried Object's single
 trailing filemark. A multi-member REM-OBJECT therefore stays one ordinary tar
@@ -455,16 +457,16 @@ report `NotWorm`. WORM and unknown media are refused, because an interrupted
 tail on them could not safely be replaced. Finalization of the terminal index
 only appends, and it has its own WORM-aware recovery, so it remains available.
 
-One-shot direct writes first replay the whole configured checkpoint-journal
-tree and resolve an exact committed retry from host state before any tape is
+One-shot direct writes first replay the whole configured tape-log
+namespace and resolve an exact committed retry from host state before any tape is
 selected. An idempotent success therefore needs neither a writable tape nor
 robot motion. The checks are repeated at drive-bound admission. A replay
 returns only a copy whose stored representation and ordered recipient ids match
 the request, and it never relabels an old copy from new retry arguments. The
 pool policy, journal paths, and resource ceiling come from the exclusively
-locked state configuration. If an append fails and its rollback also fails, the
-error is typed as uncertain durable authority, and the pending identities are
-quarantined until a restart and journal reconciliation.
+locked state configuration. If log publication fails with uncertain authority,
+the writer is poisoned and requires physical-tail reconciliation before retry. A durable log
+record whose SQLite projection failed is replayed rather than written again.
 
 ### Finalization
 
@@ -475,9 +477,8 @@ precedes replica A, and emits replica A, separation AB, replica B, separation
 BC, and replica C. A filemark and a persistence barrier follow each component,
 and the daemon durably records each proved boundary before it advances.
 
-For parity tapes, the checkpoint journal and the Layer 3c tape-file journal
-together are the required authority for the open prefix and for terminal
-progress. The first durable finalization transition permanently disables Object
+For tapes with or without parity, the per-tape log is the authority for the
+open prefix and terminal progress. The first durable finalization transition permanently disables Object
 admission. A failure puts the tape in `RecoveryRequired`, where only missing
 terminal suffix components may be repaired, at proved positions. There is no
 path back to Open and no second terminal suffix. SQLite is a replayable
@@ -485,8 +486,8 @@ projection. On a finalized cartridge, the three terminal replicas provide
 authority without any catalog: the reader selects C, then B, then A, and
 requires agreement among the survivors. The [on-tape layout
 reference](reference-tape-layout.md#finalization-and-catalog-less-recovery)
-describes the finalization lifecycle, the companion intent (the host's durable
-record of a finalization in progress), and the recovery rules.
+describes the finalization lifecycle, the decisions and plans recorded in the
+log, and the recovery rules.
 
 When a finalization completes, Remanence ensures that the append-only audit log
 holds exactly one `TapeSealed` fact for the tape and, for an operator's
@@ -496,7 +497,7 @@ under the audit append lock, so a repeat after an interruption neither loses
 nor duplicates it. Both facts are fsynced whatever the configured audit fsync
 setting is.
 
-<!-- code-anchor: crates/remanence-api/src/read_core.rs crates/remanence-api/src/write_owner.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs @ 6ed03ef0 -->
+<!-- code-anchor: crates/remanence-api/src/read_core.rs crates/remanence-api/src/write_owner.rs crates/remanence-state/src/checkpoint.rs crates/remanence-state/src/tape_log/authority.rs @ dcf8d39a -->
 ## The read path
 
 `OpenReadSession` resolves the object to a tape, mounts it, and checks the
@@ -655,6 +656,9 @@ Cut numbers count capture events from one; `keep` counts retained tape records,
 `receipts` counts client commit receipts, and a tail length counts retained
 unsynced bytes. All unlisted unsynced tails are discarded. These examples use the
 default suite; they remain defects rather than accepted production guarantees.
+
+These trace examples predate the per-tape log cut-over. Their parity-journal
+names are retained trace labels, not descriptions of current host authority.
 
 | Reference | Refusal without tape identity | Example cut and crash choice |
 | --- | --- | --- |

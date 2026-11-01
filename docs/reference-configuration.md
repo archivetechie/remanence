@@ -436,7 +436,7 @@ minimal config above puts them there.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `journal.dir` | absolute path | required | Directory of Layer 3c journals, one `<32-hex-uuid>.remjournal` file per parity-enabled tape; checkpoint journals are stored beneath its `checkpoints/` subdirectory as `<hyphenated-uuid>.remcheckpoint`. |
+| `journal.dir` | absolute path | required | Directory containing `tapes/<lowercase-simple-uuid>.remtape`, one authority log per tape with or without parity. The authority marker binds this configured root to the state directory. |
 | `journal.require_trusted_volume` | bool | `true` | Refuse to start if state, journal, audit, index, cache, or socket paths sit on tmpfs, ramfs, NFS, SMB/CIFS, or overlayfs. |
 | `audit.dir` | absolute path | required | Directory of daily append-only `.remaudit` segments. |
 | `audit.fsync` | bool | `true` | fsync each audit append before returning. |
@@ -463,6 +463,19 @@ the config file.
 Hardware integration tests read additional `REM_QUADSTOR_*` variables; they
 are documented in the test modules and are never read by production code.
 
+The coordinated harness has two separately gated fault surfaces. TIX retains
+`REM_TIX_TERMINAL_FAULT_ENABLE` and `REM_TIX_TERMINAL_FAULT_PLAN`; its enable
+value is `terminal-index-tape-log-v2-abort`, and its plan and evidence schemas
+are `rem.tix.terminal-fault-plan.v2` and `rem.tix.terminal-fault-evidence.v2`.
+Its fsync cuts are `before_tape_log_fsync` and `after_tape_log_fsync`.
+WOR retains `REM_WOR_DIRECT_REPLAY_FAULT_ENABLE` and
+`REM_WOR_DIRECT_REPLAY_FAULT_PLAN`; its enable value is
+`direct-replay-after-tape-log-v2-abort`, and its plan and evidence schemas are
+`rem.wor.direct-replay-fault-plan.v2` and `rem.wor.direct-replay-fault-evidence.v2`.
+Its hook is `abort_after_tape_log_append`. Both surfaces report
+`tape_log_sequence` and `tape_incarnation`; old split-journal fsync aliases and
+v1 plans are rejected.
+
 <!-- code-anchor: crates/remanence-state/src/paths.rs crates/remanence-state/src/lock.rs crates/remanence-daemon/src/lib.rs crates/remanence-state/src/calibration.rs @ 4dc2a3c6 -->
 ## What ends up on disk
 
@@ -473,9 +486,20 @@ For the minimal config above, a running daemon owns:
 /var/lib/rem/state.lock           daemon/offline-state kernel ownership lock (see below)
 /var/lib/rem/rem.sock             gRPC Unix socket (mode 0660)
 /var/lib/rem/spool/               pre-commit append spool (mode 0700, spool-<uuid>.bin files)
-/var/lib/rem/journal/*.remjournal per-tape Layer 3c tape-file journals
-/var/lib/rem/journal/checkpoints/*.remcheckpoint
-                                 fsynced checkpoint histories and replayable projections
+/var/lib/rem/authority-format     layout marker bound to the canonical journal root
+/var/lib/rem/journal/tapes/*.remtape
+                                 per-tape authority logs
+/var/lib/rem/journal/tapes/*.lock  stable per-tape leases
+/var/lib/rem/journal/tapes/*.ambiguous
+                                 uncertain-authority fences
+/var/lib/rem/journal/tapes/*.repair-required
+                                 physical-tail reconciliation fences
+/var/lib/rem/journal/tapes/.repair-evidence-<uuid>-<unique>
+                                 exact-byte repair archives
+/var/lib/rem/journal/tapes/.repair-reconciled-<uuid>-<unique>
+                                 completed reconciliation evidence
+/var/lib/rem/reset-archives/reset-<number>/authority-reset.json
+                                 declared-reset path binding and request digest
 /var/lib/rem/audit/*.remaudit     daily append-only audit segments
 /var/lib/rem/rem-state.sqlite     rebuildable SQLite catalog projection
 /var/lib/rem/tape-catalog/        per-tape catalog cache files
@@ -493,8 +517,8 @@ Home mode uses a different generated layout under
 ```text
 config.toml                     generated config, default pool, saved home serial
 state.lock                      invocation ownership lock
-journals/                       tape-file journals
-journals/checkpoints/           checkpoint histories
+authority-format                layout marker
+journals/tapes/                 per-tape logs, leases, fences and repair evidence
 index/rem-state.sqlite          rebuildable catalog
 cache/tapes/                    tape catalog cache
 audit/                          audit segments
@@ -516,9 +540,9 @@ be writable by the user who runs `rem`; the
 [standalone guide](guide-standalone-drive.md#what-you-need) creates it for the
 `tape` group and recreates it at boot.
 
-On parity tapes, the matching `.remjournal` and `.remcheckpoint` histories are
-both required while the tape is open and during terminal repair. In addition
-to the open prefix, they record the immutable terminal plan and the last
+The per-tape log is the authority while a tape is open and during terminal
+repair, with or without parity. In addition to the open prefix, it records
+the immutable terminal plan and the last
 barrier-proved progress state: `BeforeReplicaA`, `AfterReplicaA`,
 `AfterSeparationAb`, `AfterReplicaB`, `AfterSeparationBc`, or
 `AfterReplicaC`. Once finalization begins,
@@ -526,6 +550,17 @@ Object admission is permanently disabled. A failure enters
 `RecoveryRequired`; only missing terminal suffix components may be written at
 their proved positions, never a new Object or a second terminal suffix. SQLite
 and the per-tape catalog files remain rebuildable projections.
+
+The marker contains `remanence-tape-log-v1\n`, the canonical configured journal
+root encoded as a JSON string, and a final `\n`. SQLite uses schema 23. Old
+state is refused and requires
+`rem reset-catalog --config <PATH> --i-understand-this-erases-the-catalog`,
+followed by reinitialization of the approved scratch tapes. The reset archives
+the prior marker, audit and journals when those directories exist; it preserves
+configuration and calibration generation allocation. See the
+[reset procedure](guide-troubleshooting.md#authority-layout-refusals-and-declared-reset).
+`rem rebuild-catalog-from-journals --config <PATH>` instead rebuilds only the
+catalog projection and preserves the tape logs and audit bytes.
 
 `state.lock` is a kernel `flock`. Every `rem-daemon`, including a read-only
 one, acquires it before opening the API state and holds it for the process
