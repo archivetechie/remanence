@@ -58,7 +58,9 @@ fieldtest_init_layout() {
 }
 
 fieldtest_bin_dir() {
-  printf '%s\n' "$(fieldtest_home)/bin"
+  # FIELD_BIN_DIR: binaries installed outside the kit home, e.g. a root-owned
+  # package whose capabilities the kit user cannot replace.
+  printf '%s\n' "${FIELD_BIN_DIR:-$(fieldtest_home)/bin}"
 }
 
 fieldtest_target_release_dir() {
