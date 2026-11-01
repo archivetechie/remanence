@@ -26,6 +26,8 @@ remanence-library = { path = "../remanence-library", features = ["test-support"]
 remanence-api    = { path = "../remanence-api" }
 remanence-format = { path = "../remanence-format" }
 remanence-parity = { path = "../remanence-parity", features = ["fixtures"] }
+# Keep the structural authority's fixture trait and implementation gates aligned.
+remanence-state  = { path = "../remanence-state", features = ["fixtures"] }
 tempfile         = { workspace = true }
 
 [lints.rust]

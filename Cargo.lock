@@ -2602,6 +2602,7 @@ dependencies = [
  "remanence-library",
  "remanence-parity",
  "remanence-scsi",
+ "remanence-state",
  "rusqlite",
  "serde",
  "serde_json",
