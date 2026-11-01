@@ -751,12 +751,13 @@ pub(super) fn resumer(v: &Resolved, _: usize, _: usize) -> Result<(), ObservedEr
         let journal = append_point_claims(&input, &base, &temp.path().join("claims"))?;
         let snapshot = resume_record_result(journal.committed_snapshot_bounded())?;
         let summary = checked_bounded_resume_summary(&snapshot)?;
-        rebuild_open_epoch_from_bounded_summary(
+        rebuild_open_epoch_from_bounded_summary_checked(
             &mut DriveHandleRawSource::new(&mut drive),
             &summary,
             &base.written.inputs.scheme,
             base.written.inputs.tape_uuid,
             BLOCK,
+            Some(crate::resume_vectors::original_write_check(&input)?),
         )?;
         Ok(())
     })();

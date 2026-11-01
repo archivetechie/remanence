@@ -620,6 +620,24 @@ pub fn append_object(
     Ok((row, sidecars, publications))
 }
 
+/// Check of the fixture's original-write CRC evidence, before any tape mutation.
+pub(crate) fn original_write_check(input: &Value) -> Result<CheckValue, ParityError> {
+    let crcs = input["data_shard_crc64"]
+        .as_array()
+        .ok_or_else(|| ParityError::ResumeAppend("missing original-write CRC evidence".into()))?;
+    let mut builder = CheckValueBuilder::new();
+    for crc in crcs {
+        let value = crc
+            .as_str()
+            .and_then(|s| u64::from_str_radix(s, 16).ok())
+            .ok_or_else(|| {
+                ParityError::ResumeAppend("invalid original-write CRC evidence".into())
+            })?;
+        builder.push(value);
+    }
+    Ok(builder.value())
+}
+
 /// Actual bytes and observations; no expected values enter execution.
 pub struct Resumed {
     pub image: remanence_chaos::model::ExportedTapeImage,
@@ -638,12 +656,13 @@ pub fn execute_positive(input: &Value, vector: &VectorImage) -> Result<Resumed, 
     let append = summary.append_position.lba;
     let (mut drive, world, _) = model(vector, input);
     let mut trace = ReadTrace::new(DriveHandleRawSource::new(&mut drive), input);
-    let rebuild = rebuild_open_epoch_from_bounded_summary(
+    let rebuild = rebuild_open_epoch_from_bounded_summary_checked(
         &mut trace,
         &summary,
         &vector.written.inputs.scheme,
         vector.written.inputs.tape_uuid,
         BLOCK,
+        Some(original_write_check(input).map_err(|e| e.to_string())?),
     )
     .map_err(|e| e.to_string())?;
     let reads = trace.lbas;
@@ -849,12 +868,13 @@ mod tests {
             inject_row_fault(&mut journal, fault)?;
             let snapshot = resume_record_result(journal.committed_snapshot_bounded())?;
             let summary = checked_bounded_resume_summary(&snapshot)?;
-            rebuild_open_epoch_from_bounded_summary(
+            rebuild_open_epoch_from_bounded_summary_checked(
                 &mut DriveHandleRawSource::new(&mut drive),
                 &summary,
                 &vector.written.inputs.scheme,
                 vector.written.inputs.tape_uuid,
                 BLOCK,
+                Some(original_write_check(&input)?),
             )?;
             Ok(())
         })();
@@ -1057,12 +1077,13 @@ mod tests {
                 let snapshot = resume_record_result(journal.committed_snapshot_bounded())?;
                 let summary = checked_bounded_resume_summary(&snapshot)?;
                 append_lba = Some(summary.append_position.lba);
-                rebuild_open_epoch_from_bounded_summary(
+                rebuild_open_epoch_from_bounded_summary_checked(
                     &mut trace,
                     &summary,
                     &vector.written.inputs.scheme,
                     vector.written.inputs.tape_uuid,
                     BLOCK,
+                    Some(original_write_check(&input)?),
                 )?;
                 Ok(())
             })();
@@ -1217,12 +1238,13 @@ mod tests {
                 fail_at,
                 error,
             };
-            let result = rebuild_open_epoch_from_bounded_summary(
+            let result = rebuild_open_epoch_from_bounded_summary_checked(
                 &mut source,
                 &summary,
                 &vector.written.inputs.scheme,
                 vector.written.inputs.tape_uuid,
                 BLOCK,
+                Some(original_write_check(&input).unwrap()),
             )
             .map(|_| ());
             let wrote = world
@@ -1296,12 +1318,13 @@ mod tests {
                 let journal = adapt(&input, &vector, &temp.path().join("resume.journal"))?;
                 let snapshot = resume_record_result(journal.committed_snapshot_bounded())?;
                 let summary = checked_bounded_resume_summary(&snapshot)?;
-                rebuild_open_epoch_from_bounded_summary(
+                rebuild_open_epoch_from_bounded_summary_checked(
                     &mut trace,
                     &summary,
                     &vector.written.inputs.scheme,
                     vector.written.inputs.tape_uuid,
                     BLOCK,
+                    Some(original_write_check(&input)?),
                 )?;
                 Ok(())
             })();

@@ -814,30 +814,30 @@ pub(super) fn drive_loop(
                 drive_serial,
                 reply,
             } => {
-                let result = super::readiness::session_open_short_probe_or_load(
+                let result = super::terminal_finalize::plan_mounted_epoch_finalization(
                     &mut index,
+                    &cfg,
                     drive,
-                    super::SessionOpenReadinessContext {
-                        action: "plan terminal finalization",
-                        bay,
-                        library_serial: &cfg.library().serial,
-                        barcode: barcode.as_deref(),
-                        source_slot,
-                        drive_serial: drive_serial.as_deref(),
-                        needs_drive_load,
+                    bay,
+                    &request,
+                    needs_drive_load,
+                    &mut retained,
+                    |index, drive| {
+                        super::readiness::session_open_short_probe_or_load(
+                            index,
+                            drive,
+                            super::SessionOpenReadinessContext {
+                                action: "plan terminal finalization",
+                                bay,
+                                library_serial: &cfg.library().serial,
+                                barcode: barcode.as_deref(),
+                                source_slot,
+                                drive_serial: drive_serial.as_deref(),
+                                needs_drive_load,
+                            },
+                        )
                     },
-                )
-                .and_then(|()| {
-                    super::terminal_finalize::plan_mounted_epoch_finalization(
-                        &mut index,
-                        &cfg,
-                        drive,
-                        bay,
-                        &request,
-                        needs_drive_load,
-                        &mut retained,
-                    )
-                });
+                );
 
                 let _ = reply.send(ownership.complete(result));
             }

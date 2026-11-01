@@ -72,6 +72,7 @@ mod tests;
 #[cfg(test)]
 fn test_fence_config(root: &std::path::Path) -> crate::write_owner::TerminalWriteConfig {
     crate::write_owner::TerminalWriteConfig {
+        io_memory: crate::io_memory::IoMemoryReservation::new(1024 * 1024 * 1024).unwrap(),
         mounted_endpoint: None,
         checkpoint_journal_dir: root.join("tapes"),
         audit_dir: root.join("audit"),
