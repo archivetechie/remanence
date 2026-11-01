@@ -37,6 +37,7 @@ pub mod bot_recovery;
 pub mod capacity;
 mod cbor;
 pub mod check_value;
+pub mod closeout;
 pub mod codec;
 mod diagnostic_text;
 mod durable;
