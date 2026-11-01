@@ -473,3 +473,37 @@ impl AuthorityFinalization {
         Ok(())
     }
 }
+
+impl TryFrom<&AuthorityPrefixPlan> for remanence_parity::TerminalPrefixPlan {
+    type Error = StateError;
+    fn try_from(plan: &AuthorityPrefixPlan) -> Result<Self, StateError> {
+        plan.validate()?;
+        Ok(Self {
+            diagnostics: plan.diagnostics.clone(),
+            start_tape_file_number: plan.start_tape_file_number,
+            tail_start_tape_file_number: plan.tail_start_tape_file_number,
+            start_lba: plan.start_lba,
+            tail_start_lba: plan.tail_start_lba,
+            parity_map_tape_file_number: plan.parity_map_tape_file_number,
+            sidecar_directory_entries: plan.sidecar_directory_entries.clone(),
+            committed_bundle: (&plan.publication).into(),
+        })
+    }
+}
+impl From<&remanence_parity::TerminalPrefixPlan> for AuthorityPrefixPlan {
+    fn from(plan: &remanence_parity::TerminalPrefixPlan) -> Self {
+        Self {
+            diagnostics: plan.diagnostics.clone(),
+            start_tape_file_number: plan.start_tape_file_number,
+            tail_start_tape_file_number: plan.tail_start_tape_file_number,
+            start_lba: plan.start_lba,
+            tail_start_lba: plan.tail_start_lba,
+            parity_map_tape_file_number: plan.parity_map_tape_file_number,
+            sidecar_directory_entries: plan.sidecar_directory_entries.clone(),
+            publication: remanence_parity::authority::FilePublication::try_from(
+                &plan.committed_bundle,
+            )
+            .expect("terminal prefix publication"),
+        }
+    }
+}

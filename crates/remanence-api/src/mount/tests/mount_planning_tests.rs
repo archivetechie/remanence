@@ -32,12 +32,12 @@ impl RawTapeSink for CounterSink {
 }
 
 /// Keep sink bundles in memory so checkpoint annotations precede durable journal writes.
-struct Bundles(Vec<CommittedBundle>);
+struct Bundles(Vec<FileRowsReport>);
 impl TapeReportPublisher for Bundles {
     remanence_parity::fixture_publication_methods!();
     fn load_committed(
         &self,
-    ) -> Result<remanence_parity::CommittedState, remanence_parity::JournalError> {
+    ) -> Result<remanence_parity::FileRowsState, remanence_parity::JournalError> {
         panic!("fixture only records new writes")
     }
     fn tape_uuid(&self) -> TapeUuid {
@@ -130,7 +130,7 @@ fn planning_harness(
             .unwrap()
             .highest_protected_ordinal,
     );
-    if let CheckpointObjectRecoveryRepresentation::Plaintext {
+    if let ObjectRecoveryFixtureRepresentation::Plaintext {
         manifest_first_chunk_lba,
         ..
     } = &mut checkpoint.objects[0].object_recovery_row.representation

@@ -41,9 +41,9 @@ pub mod codec;
 mod diagnostic_text;
 mod durable;
 pub mod error;
+pub mod file_rows;
 pub mod filemark_map;
 pub mod index_separation;
-pub mod journal;
 pub mod mapping;
 pub mod model;
 pub mod object_recovery;
@@ -89,6 +89,13 @@ pub use capacity::{
 pub use check_value::{check_value, CheckProvenance, CheckValue, CheckValueBuilder, CommitCursor};
 pub use diagnostic_text::escape_member_name;
 pub use error::{BootstrapRefusedField, ParityError};
+#[cfg(any(test, feature = "fixtures"))]
+pub use file_rows::FileRowsState;
+pub use file_rows::{
+    validate_committed_bundle_shape, BoundedJournalReplayMetrics, FileRowsKind, FileRowsReport,
+    FileRowsShapeError, FrozenFileRows, JournalError, TapeFileEntry,
+    TerminalComponentAuthorityRelation,
+};
 pub use filemark_map::{
     sole_bot_filemark_map_digest, FilemarkMap, FilemarkMapBuilder, FilemarkMapDigest, MapScope,
     MapSource, ScopedFilemarkMap, TapeFileKind, TapeFileMapEntry, TapeFilePosition,
@@ -102,11 +109,6 @@ pub use index_separation::{
     IndexSeparationInteriorBlockSource, IndexSeparationObservation, IndexSeparationPlan,
     DEFAULT_INDEX_SEPARATION_BYTES, INDEX_SEPARATION_CRC_OFFSET, INDEX_SEPARATION_FRAME_LEN,
     INDEX_SEPARATION_SCHEMA_VERSION,
-};
-pub use journal::{
-    validate_committed_bundle_shape, validate_trusted_journal_volume, BoundedJournalReplayMetrics,
-    CommittedBundle, CommittedBundleKind, CommittedBundleShapeError, CommittedState,
-    FrozenFileRows, JournalError, TapeFileEntry, TerminalComponentAuthorityRelation,
 };
 pub use mapping::data_shards_per_epoch;
 pub use model::{
@@ -362,7 +364,7 @@ fn stripes_for_tolerance(
     u32::try_from(stripes).unwrap_or(u32::MAX)
 }
 
-pub use authority::{TapeReportPublisher, TapeRowAuthority, TapeRowReader};
+pub use authority::TapeReportPublisher;
 
 #[cfg(test)]
 mod parse_arg_tests {

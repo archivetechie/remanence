@@ -2095,7 +2095,7 @@ mod tests {
     use remanence_format::{RemTarEntryType, RemTarObjectOptions};
     use remanence_library::{TapeIoError, VecBlockSink, VecBlockSource, VecBlockSourceCall};
     use remanence_parity::{
-        BlockSinkRawTapeSink, CommittedBundle, CommittedBundleKind, CommittedState, FilemarkMap,
+        BlockSinkRawTapeSink, FileRowsKind, FileRowsReport, FileRowsState, FilemarkMap,
         JournalError, ObjectParitySource, OpenTrust, ParityScheme, PhysicalPositionHint,
         RawReadOutcome, RawTapeSource, SchemeId, ScopedFilemarkMap, SpaceFilemarksOutcome,
         TapeFileMapEntry, TapeReportPublisher, TerminalTripleCloseInput,
@@ -2145,7 +2145,7 @@ mod tests {
 
     #[derive(Default)]
     struct TestJournal {
-        bundles: Vec<CommittedBundle>,
+        bundles: Vec<FileRowsReport>,
     }
 
     impl TapeReportPublisher for TestJournal {
@@ -2164,21 +2164,21 @@ mod tests {
             Ok(())
         }
 
-        fn load_committed(&self) -> Result<CommittedState, JournalError> {
+        fn load_committed(&self) -> Result<FileRowsState, JournalError> {
             let retained_end = self
                 .bundles
                 .iter()
-                .rposition(|bundle| bundle.kind == CommittedBundleKind::CheckpointedThrough)
+                .rposition(|bundle| bundle.kind == FileRowsKind::FixtureBoundary)
                 .map_or(0, |index| index + 1);
             let retained = &self.bundles[..retained_end];
             let last = retained
                 .iter()
                 .rev()
-                .find(|bundle| bundle.kind != CommittedBundleKind::CheckpointedThrough);
-            Ok(CommittedState {
+                .find(|bundle| bundle.kind != FileRowsKind::FixtureBoundary);
+            Ok(FileRowsState {
                 entries: retained
                     .iter()
-                    .filter(|bundle| bundle.kind != CommittedBundleKind::CheckpointedThrough)
+                    .filter(|bundle| bundle.kind != FileRowsKind::FixtureBoundary)
                     .flat_map(|bundle| bundle.entries.iter().cloned())
                     .collect(),
                 highest_protected_ordinal: last

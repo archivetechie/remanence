@@ -2660,8 +2660,8 @@ mod l1b_tests {
         StaticAllowlist, TapeIoError,
     };
     use remanence_parity::{
-        scan_reconstruct_filemark_map, CommittedBundle, CommittedBundleKind, CommittedState,
-        DriveHandleRawSink, DriveHandleRawSource, JournalError, ObjectParitySource, OpenTrust,
+        scan_reconstruct_filemark_map, DriveHandleRawSink, DriveHandleRawSource, FileRowsKind,
+        FileRowsReport, FileRowsState, JournalError, ObjectParitySource, OpenTrust,
         ParityAuditHook, ParityError, ParityScheme, ParitySink, RecoveryEvent, RecoveryOutcome,
         SchemeId, ScopedFilemarkMap, TapeFilePosition, TapeReportPublisher,
         TerminalTripleCloseInput, TerminalTripleObjectReservation, DEFAULT_INDEX_SEPARATION_BYTES,
@@ -2698,7 +2698,7 @@ mod l1b_tests {
 
     #[derive(Default)]
     struct ModelJournal {
-        bundles: Vec<CommittedBundle>,
+        bundles: Vec<FileRowsReport>,
     }
 
     impl TapeReportPublisher for ModelJournal {
@@ -2717,21 +2717,21 @@ mod l1b_tests {
             Ok(())
         }
 
-        fn load_committed(&self) -> Result<CommittedState, JournalError> {
+        fn load_committed(&self) -> Result<FileRowsState, JournalError> {
             let retained_end = self
                 .bundles
                 .iter()
-                .rposition(|bundle| bundle.kind == CommittedBundleKind::CheckpointedThrough)
+                .rposition(|bundle| bundle.kind == FileRowsKind::FixtureBoundary)
                 .map_or(0, |index| index + 1);
             let retained = &self.bundles[..retained_end];
             let last = retained
                 .iter()
                 .rev()
-                .find(|bundle| bundle.kind != CommittedBundleKind::CheckpointedThrough);
-            Ok(CommittedState {
+                .find(|bundle| bundle.kind != FileRowsKind::FixtureBoundary);
+            Ok(FileRowsState {
                 entries: retained
                     .iter()
-                    .filter(|bundle| bundle.kind != CommittedBundleKind::CheckpointedThrough)
+                    .filter(|bundle| bundle.kind != FileRowsKind::FixtureBoundary)
                     .flat_map(|bundle| bundle.entries.iter().cloned())
                     .collect(),
                 highest_protected_ordinal: last

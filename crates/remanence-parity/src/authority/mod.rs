@@ -1,20 +1,18 @@
 //! Shared tape authority contracts. Parity owns structural evidence; state
 //! supplies catalog payloads and intent storage without a reverse dependency.
 //!
-//! The production binding remains the two-journal implementation during B2.
+//! State binds these contracts to its native per-tape log.
 //! Reports describe completed publication; they do not publish a second copy.
 
 #[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
 mod identity;
 mod publication;
+use crate::file_rows as records;
 pub use publication::{
     CommitPublication, FilePublication, FilePurpose, PublicationDisposition, PublicationReceipt,
     PublicationShapeError, PublishedItem, SidecarProvenance, StructuralState,
 };
-mod legacy;
-pub use legacy::{TapeRowAuthority, TapeRowReader};
-pub mod records;
 mod rows;
 pub use identity::{
     ManualTerminalFinalizationIdentity, SealDueReason, TerminalFinalizationTrigger,
@@ -23,7 +21,7 @@ pub use rows::{CommittedFileRows, FileRowCursor, FrozenFileRows};
 
 use crate::{CommitCursor, JournalError};
 #[cfg(any(test, feature = "fixtures"))]
-use records::CommittedBundle;
+use records::FileRowsReport;
 use records::TapeFileEntry;
 
 /// Small read model, independent of catalog member count and host encoding.
@@ -243,13 +241,13 @@ pub trait TapeAuthorityWriter: TapeAuthorityView {
 #[cfg(any(test, feature = "fixtures"))]
 pub struct ShadowPublication {
     /// Units in publication order, including empty watermark units.
-    pub bundles: Vec<CommittedBundle>,
+    pub bundles: Vec<FileRowsReport>,
 }
 
 #[cfg(any(test, feature = "fixtures"))]
 impl ShadowPublication {
     /// A single successful legacy publication.
-    pub fn one(bundle: CommittedBundle) -> Self {
+    pub fn one(bundle: FileRowsReport) -> Self {
         Self {
             bundles: vec![bundle],
         }
@@ -308,7 +306,7 @@ pub trait TapeReportPublisher {
     }
     /// Materialized legacy fixture evidence; production readers use frozen rows.
     #[cfg(any(test, feature = "fixtures"))]
-    fn load_committed(&self) -> Result<records::CommittedState, JournalError> {
+    fn load_committed(&self) -> Result<records::FileRowsState, JournalError> {
         Err(JournalError::Codec(
             "legacy fixture replay is not supported by this authority".into(),
         ))
@@ -361,7 +359,7 @@ impl<T: TapeReportPublisher + ?Sized> TapeReportPublisher for &mut T {
     }
 
     #[cfg(any(test, feature = "fixtures"))]
-    fn load_committed(&self) -> Result<records::CommittedState, JournalError> {
+    fn load_committed(&self) -> Result<records::FileRowsState, JournalError> {
         (**self).load_committed()
     }
     fn session_resume_snapshot(&self) -> Result<Option<FrozenFileRows>, JournalError> {
@@ -404,19 +402,6 @@ fn validate_terminal_publication(
     }
     Ok(())
 }
-fn terminal_receipt(
-    publication: &FilePublication,
-    disposition: [PublicationDisposition; 2],
-) -> PublicationReceipt {
-    PublicationReceipt {
-        items: vec![PublishedItem {
-            publication: publication.clone(),
-            disposition: disposition[0],
-            durability: disposition[1],
-        }],
-    }
-}
-
 /// Structural read/recovery facet borrowed from the selected tape writer.
 /// Every operation names semantic media evidence, never a storage file.
 pub trait StructuralAuthority: TapeReportPublisher + std::fmt::Debug + Send + 'static {
@@ -477,7 +462,7 @@ impl<T: TapeReportPublisher + ?Sized> TapeReportPublisher for Box<T> {
         (**self).publish_terminal_component(component)
     }
     #[cfg(any(test, feature = "fixtures"))]
-    fn load_committed(&self) -> Result<records::CommittedState, JournalError> {
+    fn load_committed(&self) -> Result<records::FileRowsState, JournalError> {
         (**self).load_committed()
     }
     fn session_resume_snapshot(&self) -> Result<Option<FrozenFileRows>, JournalError> {
@@ -567,3 +552,6 @@ mod default_publication_tests {
         assert_eq!(publisher.0, 0);
     }
 }
+
+#[cfg(test)]
+pub(crate) mod native_fixture_tests;

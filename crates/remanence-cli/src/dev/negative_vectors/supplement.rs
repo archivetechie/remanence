@@ -948,7 +948,7 @@ fn resume(v: &Resolved) -> Result<(), ObservedError> {
     let base = generate("unfinalized-open").unwrap();
     let input = &v.descriptor["commit_record_inputs"];
     let temp = tempfile::tempdir().expect("journal temp directory");
-    let j = crate::resume_vectors::adapt(input, &base, &temp.path().join("claims"))?;
+    let j = super::overflow::append_point_claims(input, &base, &temp.path().join("claims"))?;
     let snapshot = resume_record_result(j.committed_snapshot_bounded())?;
     checked_bounded_resume_summary(&snapshot)?;
     Ok(())
@@ -1375,7 +1375,8 @@ const ISOLATION_RULES: &[(&str, Option<&str>)] = &[
     ("terminal-scope-scalars/isolated-2", Some("terminal index total data ordinals 0, expected 1")),
     ("terminal-scope-scalars/isolated-3", None),
     ("terminal-scope-scalars/isolated-4", Some("terminal index highest protected ordinal 2, expected 5")),
-    ("overflow-3.2-14-append-point/isolated", Some("bounded resume append position overflows")),
+    // Native replay checks the same hostile extent before a bounded resume summary exists.
+    ("overflow-3.2-14-append-point/isolated", Some("counter overflow")),
     ("overflow-7.2-T/isolated", Some("terminal tape-index arithmetic overflow: Object data ordinal range")),
     ("overflow-8.3-component-starts/isolated", Some("invalid terminal layout for tape index: terminal-tail arithmetic overflow: next component start LBA")),
     ("overflow-8.3-eod/isolated", Some("invalid terminal layout for tape index: terminal-tail arithmetic overflow: next component start LBA")),

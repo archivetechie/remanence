@@ -50,7 +50,7 @@ fn written(uuid: [u8; 16], build: impl FnOnce(&mut TapeAuthorityLease)) -> Vec<u
     std::fs::read(authority.path()).unwrap()
 }
 
-fn third_record(uuid: [u8; 16]) -> crate::CheckpointJournalRecord {
+fn third_record(uuid: [u8; 16]) -> crate::CommitFixture {
     let mut record = second_record(uuid);
     let object = uuid::Uuid::from_bytes([0x53; 16]).to_string();
     record.ordinal = 3;

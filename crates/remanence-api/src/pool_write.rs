@@ -46,7 +46,6 @@ pub use selection::*;
 
 mod append;
 mod replay;
-mod resume_authority;
 #[cfg(test)]
 mod test_support;
 
@@ -55,11 +54,9 @@ pub(crate) use append::{
     write_batched_to_selected_tape_after_replay_check,
 };
 pub(crate) use capacity::authorize_terminal_close_only_plan;
+pub(crate) use remanence_state::authority::AuthorityAgreementError as ResumeAuthorityRefusal;
 pub use replay::replay_committed_pool_write_from_state;
 pub(crate) use replay::replay_committed_pool_write_reconciled;
-pub(crate) use resume_authority::{
-    validate_parity_resume_checkpoint_authority, ResumeAuthorityRefusal,
-};
 #[cfg(test)]
 pub(crate) use test_support::{
     write_object_to_pool, write_to_selected_tape, write_to_selected_tape_with_live_counter,

@@ -8,6 +8,7 @@ use remanence_chaos::{
 };
 use remanence_library::DriveHandle;
 use remanence_parity::*;
+use remanence_state::authority::row_fixtures::RowAuthority as TapeRowAuthority;
 use serde_json::{json, Value};
 use std::{
     path::Path,
@@ -190,13 +191,13 @@ pub fn adapt(
             lba = physical;
         }
         let (kind, bundle) = match row["kind"].as_str().unwrap() {
-            "Bootstrap" => (TapeFileKind::Bootstrap, CommittedBundleKind::BotBootstrap),
-            "Object" => (TapeFileKind::Object, CommittedBundleKind::Object),
+            "Bootstrap" => (TapeFileKind::Bootstrap, FileRowsKind::BotBootstrap),
+            "Object" => (TapeFileKind::Object, FileRowsKind::Object),
             "ParitySidecar" => (
                 TapeFileKind::ParitySidecar,
-                CommittedBundleKind::CheckpointSidecars,
+                FileRowsKind::CheckpointSidecars,
             ),
-            "ParityMap" => (TapeFileKind::ParityMap, CommittedBundleKind::TerminalPrefix),
+            "ParityMap" => (TapeFileKind::ParityMap, FileRowsKind::TerminalPrefix),
             other => panic!("unsupported resume row {other}"),
         };
         if let Some(first) = row["first_parity_data_ordinal"].as_u64() {
@@ -240,7 +241,7 @@ pub fn adapt(
             canonical_metadata_hash: hash,
             object_recovery_row: None,
         };
-        claims.push(CommittedBundle {
+        claims.push(FileRowsReport {
             kind: bundle,
             entries: vec![entry],
             highest_protected_ordinal: w,
@@ -250,14 +251,14 @@ pub fn adapt(
             lba += row["block_count"].as_u64().unwrap_or(0) + 1;
         }
     }
-    claims.push(CommittedBundle {
-        kind: CommittedBundleKind::CheckpointedThrough,
+    claims.push(FileRowsReport {
+        kind: FileRowsKind::FixtureBoundary,
         entries: Vec::new(),
         highest_protected_ordinal: input["W"].as_u64().unwrap(),
         total_committed_ordinals: input["T"].as_u64().unwrap(),
     });
     resume_record_result(
-        remanence_parity::authority::fixtures::RowAuthorityBuilder::new(
+        remanence_state::authority::row_fixtures::RowAuthorityBuilder::new(
             path,
             vector.written.inputs.tape_uuid,
             BLOCK,
@@ -685,10 +686,10 @@ pub fn execute_positive(input: &Value, vector: &VectorImage) -> Result<Resumed, 
     let _state = sink.into_session_state().map_err(|e| e.to_string())?;
     // The offline reference adapter owns host publication; the sink reports
     // physical rows only. Preserve the legacy fixture's pinned representation.
-    let mut bundles: Vec<CommittedBundle> = publications.iter().map(Into::into).collect();
+    let mut bundles: Vec<FileRowsReport> = publications.iter().map(Into::into).collect();
     let last = bundles.last().expect("appended Object report");
-    bundles.push(CommittedBundle {
-        kind: CommittedBundleKind::CheckpointedThrough,
+    bundles.push(FileRowsReport {
+        kind: FileRowsKind::FixtureBoundary,
         entries: Vec::new(),
         highest_protected_ordinal: last.highest_protected_ordinal,
         total_committed_ordinals: last.total_committed_ordinals,
@@ -834,8 +835,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("resume.journal");
         let result = (|| -> Result<(), ParityError> {
-            let journal = adapt(&input, &vector, &path)?;
-            use remanence_parity::authority::fixtures::{inject_row_fault, RowFixtureFault};
+            let mut journal = adapt(&input, &vector, &path)?;
+            use remanence_state::authority::row_fixtures::{inject_row_fault, RowFixtureFault};
             let fault = match kind {
                 "missing" => RowFixtureFault::MissingFirst,
                 "ambiguous" => RowFixtureFault::DuplicateObject,
@@ -845,7 +846,7 @@ mod tests {
                 "incomplete" => RowFixtureFault::IncompleteFinal,
                 _ => panic!("unknown commit-record mutation"),
             };
-            inject_row_fault(&journal, fault)?;
+            inject_row_fault(&mut journal, fault)?;
             let snapshot = resume_record_result(journal.committed_snapshot_bounded())?;
             let summary = checked_bounded_resume_summary(&snapshot)?;
             rebuild_open_epoch_from_bounded_summary(
@@ -864,9 +865,7 @@ mod tests {
         let error = result.expect_err("bad commit records must refuse");
         if kind.starts_with("checkpoint-") {
             assert!(
-                error
-                    .to_string()
-                    .contains("must equal preceding journal state (4/4)"),
+                error.to_string().contains("commit counters/cursor"),
                 "{error}"
             );
             assert!(!error.to_string().contains("not dense"), "{error}");
@@ -1361,7 +1360,3 @@ mod tests {
         assert!(disagreements.is_empty(), "{}", disagreements.join("\n"));
     }
 }
-
-#[cfg(test)]
-#[path = "resume_vectors/legacy_codec_tests.rs"]
-mod legacy_codec_tests;

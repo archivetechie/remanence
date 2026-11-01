@@ -12,7 +12,7 @@ use remanence_format::{
 use remanence_library::DriveHandle;
 use remanence_parity::{
     assemble_terminal_plan, checked_tape_index_replica_layout, index_separation_records,
-    write_terminal_tail, CommittedBundle, CommittedBundleKind, CommittedState, DriveHandleRawSink,
+    write_terminal_tail, DriveHandleRawSink, FileRowsKind, FileRowsReport, FileRowsState,
     FilemarkMap, JournalError, ObjectRecoveryRepresentation, ParityError, ParityMapDiagnostics,
     ParityScheme, ParitySink, RawTapeSink, SidecarWriteSummary, TapeFileEntry, TapeFileKind,
     TapeIndexReplicaCounts, TapeIndexReplicaFileKind, TapeIndexReplicaMapEntry,
@@ -209,7 +209,7 @@ pub(crate) fn write_tape_image_with_init(
     let (_, bootstrap_report) = parity
         .write_bootstrap_report()
         .map_err(|error| format!("write BOT bootstrap: {error}"))?;
-    let mut reports: Vec<CommittedBundle> = bootstrap_report
+    let mut reports: Vec<FileRowsReport> = bootstrap_report
         .items
         .into_iter()
         .map(|item| (&item.publication).into())
@@ -314,7 +314,7 @@ pub(crate) fn write_tape_image_with_init(
         let entries = journal
             .bundles
             .iter()
-            .filter(|bundle| bundle.kind != CommittedBundleKind::CheckpointedThrough)
+            .filter(|bundle| bundle.kind != FileRowsKind::FixtureBoundary)
             .flat_map(|bundle| bundle.entries.iter().map(TapeFileEntry::to_map_entry))
             .collect();
         let map = FilemarkMap::new(entries).map_err(|error| error.to_string())?;
@@ -399,7 +399,7 @@ pub(crate) fn write_tape_image_with_init(
 
 struct ImageJournal {
     tape_uuid: [u8; 16],
-    bundles: Vec<CommittedBundle>,
+    bundles: Vec<FileRowsReport>,
 }
 
 impl ImageJournal {
@@ -434,17 +434,17 @@ impl TapeReportPublisher for ImageJournal {
         Ok(())
     }
 
-    fn load_committed(&self) -> Result<CommittedState, JournalError> {
+    fn load_committed(&self) -> Result<FileRowsState, JournalError> {
         let retained_end = self.bundles.len();
         let retained = &self.bundles[..retained_end];
         let last = retained
             .iter()
             .rev()
-            .find(|bundle| bundle.kind != CommittedBundleKind::CheckpointedThrough);
-        Ok(CommittedState {
+            .find(|bundle| bundle.kind != FileRowsKind::FixtureBoundary);
+        Ok(FileRowsState {
             entries: retained
                 .iter()
-                .filter(|bundle| bundle.kind != CommittedBundleKind::CheckpointedThrough)
+                .filter(|bundle| bundle.kind != FileRowsKind::FixtureBoundary)
                 .flat_map(|bundle| bundle.entries.iter().cloned())
                 .collect(),
             highest_protected_ordinal: last.map_or(0, |bundle| bundle.highest_protected_ordinal),
@@ -592,7 +592,7 @@ fn plan_image_terminal_tail(
     edition_id: [u8; 16],
     edition_sequence: u64,
     prefix: &TerminalPrefixPlan,
-    committed: &CommittedState,
+    committed: &FileRowsState,
     object_rows: &[TapeIndexReplicaObjectRow],
 ) -> Result<(ImageTerminalRows, TerminalTripleWritePlan), String> {
     let mut rows = ImageTerminalRows {

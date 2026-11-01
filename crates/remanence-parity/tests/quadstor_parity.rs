@@ -69,12 +69,12 @@ use remanence_library::{
 use remanence_parity::{
     checked_bounded_resume_summary, emit_resume_rebuilt_sidecars_to_raw,
     rebuild_open_epoch_from_bounded_summary, scan_reconstruct_filemark_map,
-    BoundedResumeWriterSeed, CommittedBundle, CommittedBundleKind, CommittedState,
-    DriveHandleRawSink, DriveHandleRawSource, FilemarkMap, JournalError, ObjectParitySource,
-    OpenTrust, ParityError, ParityScheme, ParitySink, PhysicalPositionHint, RawReadOutcome,
-    RawTapeSource, SchemeId, ScopedFilemarkMap, SpaceFilemarksOutcome, TapeFileKind,
-    TapeFilePosition, TapeReportPublisher, TerminalTripleCloseInput,
-    DEFAULT_INDEX_SEPARATION_BYTES, DEFAULT_SCHEME_BLOCK_SIZE_BYTES,
+    BoundedResumeWriterSeed, DriveHandleRawSink, DriveHandleRawSource, FileRowsKind,
+    FileRowsReport, FileRowsState, FilemarkMap, JournalError, ObjectParitySource, OpenTrust,
+    ParityError, ParityScheme, ParitySink, PhysicalPositionHint, RawReadOutcome, RawTapeSource,
+    SchemeId, ScopedFilemarkMap, SpaceFilemarksOutcome, TapeFileKind, TapeFilePosition,
+    TapeReportPublisher, TerminalTripleCloseInput, DEFAULT_INDEX_SEPARATION_BYTES,
+    DEFAULT_SCHEME_BLOCK_SIZE_BYTES,
 };
 
 const TAPE_UUID: [u8; 16] = [
@@ -83,7 +83,7 @@ const TAPE_UUID: [u8; 16] = [
 
 #[derive(Default)]
 struct FixtureJournal {
-    bundles: Vec<CommittedBundle>,
+    bundles: Vec<FileRowsReport>,
 }
 
 impl TapeReportPublisher for FixtureJournal {
@@ -102,21 +102,21 @@ impl TapeReportPublisher for FixtureJournal {
         Ok(())
     }
 
-    fn load_committed(&self) -> Result<CommittedState, JournalError> {
+    fn load_committed(&self) -> Result<FileRowsState, JournalError> {
         let retained_end = self
             .bundles
             .iter()
-            .rposition(|bundle| bundle.kind == CommittedBundleKind::CheckpointedThrough)
+            .rposition(|bundle| bundle.kind == FileRowsKind::FixtureBoundary)
             .map_or(0, |index| index + 1);
         let retained = &self.bundles[..retained_end];
         let last = retained
             .iter()
             .rev()
-            .find(|bundle| bundle.kind != CommittedBundleKind::CheckpointedThrough);
-        Ok(CommittedState {
+            .find(|bundle| bundle.kind != FileRowsKind::FixtureBoundary);
+        Ok(FileRowsState {
             entries: retained
                 .iter()
-                .filter(|bundle| bundle.kind != CommittedBundleKind::CheckpointedThrough)
+                .filter(|bundle| bundle.kind != FileRowsKind::FixtureBoundary)
                 .flat_map(|bundle| bundle.entries.iter().cloned())
                 .collect(),
             highest_protected_ordinal: last.map_or(0, |bundle| bundle.highest_protected_ordinal),
@@ -192,7 +192,7 @@ fn journal_path(name: &str) -> PathBuf {
         .expect("clock after epoch")
         .as_nanos();
     std::env::temp_dir().join(format!(
-        "remanence-quadstor-{name}-{}-{stamp}.remjournal",
+        "remanence-quadstor-{name}-{}-{stamp}.native",
         std::process::id()
     ))
 }
@@ -576,7 +576,7 @@ fn quadstor_parity_journaled_session() {
     drive.rewind().expect("rewind before destructive write");
 
     {
-        let mut journal = remanence_parity::authority::fixtures::RowAuthorityBuilder::new(
+        let mut journal = remanence_state::authority::row_fixtures::RowAuthorityBuilder::new(
             &journal_path,
             TAPE_UUID,
             block_size,
@@ -628,7 +628,7 @@ fn quadstor_parity_journaled_session() {
         );
     }
 
-    let reopened = remanence_parity::authority::fixtures::RowAuthorityBuilder::new(
+    let reopened = remanence_state::authority::row_fixtures::RowAuthorityBuilder::new(
         &journal_path,
         TAPE_UUID,
         block_size,
@@ -785,7 +785,7 @@ fn quadstor_parity_bounded_resume_append_roundtrip() {
         configure_parity_write_session(&mut drive, block_size, "bounded resume smoke");
     drive.rewind().expect("rewind before bounded resume write");
 
-    let mut journal = remanence_parity::authority::fixtures::RowAuthorityBuilder::new(
+    let mut journal = remanence_state::authority::row_fixtures::RowAuthorityBuilder::new(
         &journal_path,
         TAPE_UUID,
         block_size,

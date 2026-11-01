@@ -35,18 +35,22 @@ pub use audit::{
     AuditActor, AuditEvent, AuditEventRecord, AuditReceipt, AuditRecord, AuditSink, AuditSubject,
     FileAuditLog, SourceLayer,
 };
+#[cfg(any(test, feature = "fixtures"))]
+pub use authority::{
+    CommitFixture, ObjectProjectionFixture, ObjectRecoveryFixture,
+    ObjectRecoveryFixtureRepresentation, TerminalFinalizationIntent,
+    TerminalFinalizationPrefixPlan, TerminalFinalizationSidecarDirectoryEntry,
+    TerminalRecoveryFixture,
+};
 pub use calibration::{
     CalibrationControlStore, HarvestRefusal, HarvestTransition, VolumeCalibrationRow,
     VolumeCalibrationState, VolumeMediaWriteFence, WritePathTrust, CALIBRATION_CONTROL_FILENAME,
 };
 pub use checkpoint::{
-    CheckpointBoundedReplayMetrics, CheckpointJournalRecord, CheckpointObjectProjection,
-    CheckpointObjectRecoveryRepresentation, CheckpointObjectRecoveryRow,
-    CheckpointTerminalRecoveryAuthority, ManualTerminalFinalizationIdentity, SealDueReason,
-    TerminalFinalizationComponent, TerminalFinalizationComponentKind, TerminalFinalizationIntent,
-    TerminalFinalizationLayout, TerminalFinalizationPrefixPlan, TerminalFinalizationProgress,
-    TerminalFinalizationSidecarDirectoryEntry, TerminalFinalizationTrigger,
-    TerminalIndexAuthorityReplayMetrics, TerminalIndexAuthoritySummary,
+    CheckpointBoundedReplayMetrics, ManualTerminalFinalizationIdentity, SealDueReason,
+    TerminalFinalizationComponent, TerminalFinalizationComponentKind, TerminalFinalizationLayout,
+    TerminalFinalizationProgress, TerminalFinalizationTrigger, TerminalIndexAuthorityReplayMetrics,
+    TerminalIndexAuthoritySummary,
 };
 pub use config::{
     derive_tape_pool_from_voltag, effective_tape_pool_capacity_bytes, load_config,

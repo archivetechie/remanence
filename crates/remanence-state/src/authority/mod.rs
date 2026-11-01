@@ -3,19 +3,19 @@
 #[cfg(test)]
 pub(crate) mod contract_tests;
 #[cfg(any(test, feature = "fixtures"))]
+mod fixture_records;
+#[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
 mod import_legacy;
-#[allow(dead_code)] // Retained legacy codec for B4 removal and codec characterization tests.
-pub(crate) mod legacy;
-#[cfg(test)]
-pub(crate) mod legacy_fixtures;
+#[cfg(any(test, feature = "fixtures"))]
+pub use fixture_records::*;
+mod resume;
 pub use crate::tape_log::authority::{TapeAuthority, TapeAuthorityLease};
 pub use import_legacy::{publish_import_authority, ImportPublication};
-pub use legacy::AuthorityAgreementError;
-pub(crate) use legacy::{structural_path, structural_path_in};
 pub use remanence_parity::authority::{
     AuthoritySummary, TapeAuthoritySnapshot, TapeAuthorityView, TapeAuthorityWriter,
 };
+pub use resume::AuthorityAgreementError;
 
 mod terminal;
 pub use terminal::TerminalIndexSource;
@@ -86,3 +86,6 @@ pub(crate) mod validation;
 
 mod bot_recovery;
 pub use bot_recovery::BotRecoveryAuthority;
+
+#[cfg(any(test, feature = "fixtures"))]
+pub mod row_fixtures;

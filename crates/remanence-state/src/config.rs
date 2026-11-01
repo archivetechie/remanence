@@ -498,7 +498,7 @@ const fn default_checkpoint_max_age_seconds() -> u64 {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct JournalConfig {
-    /// Directory containing one `.remjournal` file per tape.
+    /// Directory containing native per-tape authority logs.
     pub dir: PathBuf,
     /// Whether startup rejects untrusted flush volumes.
     #[serde(default = "default_require_trusted_volume")]

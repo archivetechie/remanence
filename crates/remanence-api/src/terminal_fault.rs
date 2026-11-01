@@ -867,8 +867,8 @@ impl<S: RawTapeSink + ?Sized> RawTapeSink for TerminalFaultSink<'_, S> {
 mod tests {
     use super::*;
     use remanence_parity::{
-        CommittedBundle, CommittedBundleKind, ParityConfig, SidecarEpochDirectoryEntry,
-        TapeFileEntry, TapeFileKind, TerminalTailComponentKind,
+        FileRowsKind, FileRowsReport, ParityConfig, SidecarEpochDirectoryEntry, TapeFileEntry,
+        TapeFileKind, TerminalTailComponentKind,
     };
     use remanence_state::{CatalogIndex, ProvisionTapeInput, TapePoolProjectionInput};
 
@@ -907,8 +907,8 @@ mod tests {
                 canonical_metadata_hash: [0x91; 32],
                 flags: 0,
             }],
-            committed_bundle: CommittedBundle {
-                kind: CommittedBundleKind::TerminalPrefix,
+            committed_bundle: FileRowsReport {
+                kind: FileRowsKind::TerminalPrefix,
                 entries: vec![TapeFileEntry {
                     tape_file_number: 9,
                     kind: TapeFileKind::ParityMap,

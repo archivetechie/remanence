@@ -356,3 +356,6 @@ impl Record {
 mod reference_fixtures;
 #[cfg(test)]
 mod tests;
+
+mod metrics;
+pub use metrics::*;
