@@ -291,6 +291,7 @@ open for real hardware (O1/O2/O3) — capture is automatic.
 | 3.2 | `30-stewardship.sh --tapealert-probe` | reads TapeAlert twice back-to-back and records whether flags clear on read (O3) — safe: rem is the only reader today |
 | 3.3 | 🖐 + `31-cleaning.sh` | **real cleaning cycle**: registers the CLN cart, runs `rem drive clean` on drive 1, follows the `clean_runs` phase machine live, verifies completion + use-count credit (O1). Repeat on drive 2 if time allows |
 | 3.4 | `32-robotics.sh` | move-medium slot↔slot, IE-port export/import of one scratch tape, inventory refresh consistency |
+| 3.5 | 🖐 + `36-magazine-wait.sh` | a daemon load rides out an open magazine: the operator pulls one magazine holding no allowlisted tape, the leg checks live status shows the changer wait, the operator pushes it back, and the load must complete after the re-check; the tape then goes home. Interactive (reads `/dev/tty`); `plan/magazine.env` runs it as an owner plan |
 
 **Note:** if the drive doesn't auto-eject the CLN cart within the
 timeout, the script parks the run `needs-operator`, fences the drive,
