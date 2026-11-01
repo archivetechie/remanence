@@ -1457,8 +1457,18 @@ pub(super) fn finalize_terminal_no_parity(
         );
     }
     drive
-        .locate(previous.cursor.lba)
-        .map_err(|error| Status::unavailable(format!("locate checkpoint EOD: {error}")))?;
+        .prove_cursor(
+            crate::append_admission::context(
+                previous.tape_uuid,
+                previous.block_size,
+                previous.cursor.partition,
+                previous.cursor.lba,
+            )
+            .boundary,
+            previous.block_size,
+            drive.identity_generation(),
+        )
+        .map_err(|error| Status::unavailable(format!("prove checkpoint EOD: {error}")))?;
     finish_terminal_tail(
         index,
         cfg,
@@ -2165,6 +2175,40 @@ pub(super) fn finish_terminal_tail(
                 prefix_plan.as_ref(),
             )?);
         }
+        if admission.is_some()
+            && matches!(
+                evidence,
+                remanence_parity::TerminalComponentReconcileEvidence::Absent
+                    | remanence_parity::TerminalComponentReconcileEvidence::TornRewritable
+                    | remanence_parity::TerminalComponentReconcileEvidence::Complete
+            )
+        {
+            let lba = if evidence == remanence_parity::TerminalComponentReconcileEvidence::Complete
+            {
+                component
+                    .planned_start_lba
+                    .checked_add(component.record_count)
+                    .and_then(|lba| lba.checked_add(1))
+                    .ok_or_else(|| Status::failed_precondition("terminal cursor overflow"))?
+            } else {
+                component.planned_start_lba
+            };
+            drive
+                .prove_cursor(
+                    crate::append_admission::context(
+                        selected.tape_uuid,
+                        selected.block_size,
+                        plan.edition.descriptor.terminal_layout.partition,
+                        lba,
+                    )
+                    .boundary,
+                    selected.block_size,
+                    drive.identity_generation(),
+                )
+                .map_err(|e| {
+                    Status::unavailable(format!("prove terminal cursor after reconciliation: {e}"))
+                })?;
+        }
         authority.set_reconciliation(progress, component, evidence);
         let dispatches_before = drive.media_write_dispatch_count();
         let step_result = {
@@ -2664,9 +2708,10 @@ pub(super) fn terminal_epoch_state(
         return Ok(None);
     }
     if let Some(state) = carried.filter(|s| s.matches_committed_summary(&summary)) {
-        remanence_parity::RawTapeSource::locate_physical(
+        remanence_parity::RawTapeSource::prove_cursor(
             &mut DriveHandleRawSource::new(drive),
             summary.append_position,
+            selected.block_size,
         )
         .map_err(|e| status_from_parity_error(&e, e.to_string()))?;
         return Ok(Some(state));

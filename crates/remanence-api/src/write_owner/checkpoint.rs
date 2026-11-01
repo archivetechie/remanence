@@ -2393,6 +2393,18 @@ impl remanence_parity::RawTapeSource for EpochRebuildSource<'_> {
     fn configure_fixed_block_size(&mut self, size: u32) -> Result<(), ParityError> {
         self.inner.configure_fixed_block_size(size)
     }
+    fn prove_cursor(
+        &mut self,
+        cursor: PhysicalPositionHint,
+        block_size: u32,
+    ) -> Result<(), ParityError> {
+        let result = self.inner.prove_cursor(cursor, block_size);
+        self.contradiction |= result
+            .as_ref()
+            .is_err_and(|e| committed_read_contradiction(e, 1, 1));
+        result
+    }
+
     fn locate_physical(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
         let result = self.inner.locate_physical(hint);
         self.contradiction |= result

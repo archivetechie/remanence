@@ -447,11 +447,16 @@ pub(crate) fn reprove_checkpoint_boundary(
     require_rewritable_object_media(config)?;
     crate::drive_mode::configure_fixed_uncompressed_write(drive, config, record.block_size)?;
     drive.bind_identity_generation(generation)?;
-    let position = drive.locate(record.cursor.lba)?;
-    if position.partition != record.cursor.partition || position.lba != record.cursor.lba {
-        return Err(PoolWriteError::InvalidInput(
-            "checkpoint append position mismatch".into(),
-        ));
-    }
+    drive.prove_cursor(
+        crate::append_admission::context(
+            record.tape_uuid,
+            record.block_size,
+            record.cursor.partition,
+            record.cursor.lba,
+        )
+        .boundary,
+        record.block_size,
+        generation,
+    )?;
     Ok(())
 }

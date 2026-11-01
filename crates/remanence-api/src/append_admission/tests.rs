@@ -17,6 +17,9 @@ struct ProbeTransport {
     inner: ModelTransport,
     response: ProbeResponse,
     fail_read_after: Arc<Mutex<Option<usize>>>,
+    response_skip: Arc<Mutex<usize>>,
+    omit_kernel_residual: Arc<Mutex<bool>>,
+    position_fault: Arc<Mutex<Option<(u64, u32)>>>,
     commands: Arc<Mutex<Vec<u8>>>,
 }
 impl SgTransport for ProbeTransport {
@@ -34,14 +37,48 @@ impl SgTransport for ProbeTransport {
                 }
                 *remaining -= 1;
             }
-            if let Some((sense, bytes_transferred)) = self.response.lock().unwrap().take() {
+            let mut skip = self.response_skip.lock().unwrap();
+            let response = if *skip > 0 {
+                *skip -= 1;
+                None
+            } else {
+                self.response.lock().unwrap().take()
+            };
+            if let Some((sense, bytes_transferred)) = response {
                 return Err(ScsiError::CheckCondition {
                     sense,
                     bytes_transferred,
                 });
             }
         }
-        self.inner.execute_in(cdb, buf)
+        let mut result = self.inner.execute_in(cdb, buf);
+        if cdb[0] == 0x08 && *self.omit_kernel_residual.lock().unwrap() {
+            if let Err(ScsiError::CheckCondition {
+                sense,
+                bytes_transferred,
+            }) = &mut result
+            {
+                if cdb[1] & 1 == 0
+                    && sense.len() >= 7
+                    && (sense[2] & 0x80 != 0 || sense[2] & 15 == 8)
+                {
+                    sense[0] |= 0x80;
+                    sense[3..7]
+                        .copy_from_slice(&(buf.len() as u32 - *bytes_transferred).to_be_bytes());
+                }
+                *bytes_transferred = buf.len() as u32;
+            }
+        }
+        if cdb[0] == 0x34 && result.is_ok() {
+            let commands = self.commands.lock().unwrap();
+            if commands.len() >= 2 && commands[commands.len() - 2] == 0x08 {
+                if let Some((lba, partition)) = *self.position_fault.lock().unwrap() {
+                    buf[4..8].copy_from_slice(&partition.to_be_bytes());
+                    buf[8..16].copy_from_slice(&lba.to_be_bytes());
+                }
+            }
+        }
+        result
     }
     fn execute_out(&mut self, cdb: &[u8], buf: &[u8]) -> Result<TransferOutcome, ScsiError> {
         self.commands.lock().unwrap().push(cdb[0]);
@@ -57,6 +94,9 @@ struct Fixture {
     world: World,
     response: ProbeResponse,
     fail_read_after: Arc<Mutex<Option<usize>>>,
+    response_skip: Arc<Mutex<usize>>,
+    omit_kernel_residual: Arc<Mutex<bool>>,
+    position_fault: Arc<Mutex<Option<(u64, u32)>>>,
     commands: Arc<Mutex<Vec<u8>>>,
 }
 fn fixture() -> Fixture {
@@ -77,12 +117,18 @@ fn fixture() -> Fixture {
     let response = Arc::new(Mutex::new(None));
     let commands = Arc::new(Mutex::new(Vec::new()));
     let fail_read_after = Arc::new(Mutex::new(None));
+    let response_skip = Arc::new(Mutex::new(0));
+    let omit_kernel_residual = Arc::new(Mutex::new(false));
+    let position_fault = Arc::new(Mutex::new(None));
     let drive = DriveHandle::open_standalone_with_transport(
         Path::new("/dev/sg-append-test"),
         Box::new(ProbeTransport {
             inner: ModelTransport::new(world.clone(), DeviceRole::Drive { bay: 0x100 }),
             response: response.clone(),
             fail_read_after: fail_read_after.clone(),
+            response_skip: response_skip.clone(),
+            omit_kernel_residual: omit_kernel_residual.clone(),
+            position_fault: position_fault.clone(),
             commands: commands.clone(),
         }),
         &StaticAllowlist::new(["APPEND-DRIVE"]),
@@ -93,6 +139,9 @@ fn fixture() -> Fixture {
         world,
         response,
         fail_read_after,
+        response_skip,
+        omit_kernel_residual,
+        position_fault,
         commands,
     }
 }
@@ -118,7 +167,10 @@ fn clean_checkpoint_counts_commands_and_preserves_the_normal_write_bytes() {
     // The writer's existing initial LOCATE reuses the admission's device proof.
     DriveHandleSink(&mut f.drive).locate(2).unwrap();
     let commands = f.commands.lock().unwrap().clone();
-    assert_eq!(commands, [0x92, 0x34, 0x08, 0x92, 0x34]);
+    assert_eq!(
+        commands,
+        [0x92, 0x34, 0x08, 0x34, 0x08, 0x92, 0x34, 0x08, 0x34]
+    );
     assert_eq!(writes(&commands), 0);
     let block = vec![0xab; SIZE as usize];
     DriveHandleSink(&mut f.drive).write_block(&block).unwrap();
@@ -177,6 +229,7 @@ fn only_exact_current_zero_transfer_blank_check_is_eod() {
         (vec![0x72, 6, 0x29, 0], 0, false),
     ] {
         let mut f = fixture();
+        *f.response_skip.lock().unwrap() = 1; // Inject at C, after its predecessor proof.
         *f.response.lock().unwrap() = Some((sense.clone(), bytes));
         assert_eq!(
             checkpoint(&mut f.drive).is_ok(),
@@ -347,7 +400,10 @@ fn terminal_admission_preserves_reconciliation_at_each_component_cut() {
                 admit_append_boundary(&mut f.drive, AppendAuthority::Terminal { plan }, ctx)
                     .unwrap();
             if progress == TerminalTailProgress::BeforeReplicaA && retained == 0 {
-                assert_eq!(*f.commands.lock().unwrap(), [0x92, 0x34, 0x08, 0x92, 0x34]);
+                assert_eq!(
+                    *f.commands.lock().unwrap(),
+                    [0x92, 0x34, 0x08, 0x34, 0x08, 0x92, 0x34, 0x08, 0x34]
+                );
             }
             let evidence = remanence_parity::reconcile_terminal_tail_next(
                 &mut DriveHandleRawSource::new(&mut f.drive),
@@ -826,4 +882,166 @@ fn unused_fresh_session_abandonment_dispatches_nothing() {
     assert_eq!(f.drive.media_write_dispatch_count(), 0);
     f.drive.clear_append_admission();
     assert!(abandon_pending_append(&mut f.drive, &mut lease).is_err());
+}
+
+/// All physical append entry adapters must refuse a bad predecessor or a bad
+/// post-filemark device report, even while a previously good admission is held.
+#[tokio::test]
+async fn cursor_refusal_matrix_before_any_write() {
+    use remanence_parity::{DriveHandleRawSource, PhysicalPositionHint, RawTapeSource};
+    let vector = crate::tape_image_vectors::generate("a4-minimal").unwrap();
+    let plan = vector.written.terminal_plan.as_ref().unwrap();
+    for omitted in [false, true] {
+        for route in ["admission", "terminal", "checkpoint", "parity", "overlap"] {
+            for fault in ["data", "missing", "short", "io", "lba", "partition"] {
+                let mut f = fixture();
+                *f.omit_kernel_residual.lock().unwrap() = omitted;
+                let _old_admission = checkpoint(&mut f.drive).unwrap();
+                // Configure a real fixed-mode writer before sink repositioning.
+                let mut config = f.drive.read_config().unwrap();
+                config.block_size = remanence_library::BlockSize::Fixed { size_bytes: SIZE };
+                f.drive.write_config(config).unwrap();
+                match fault {
+                    "data" | "short" => {
+                        f.world
+                            .lock()
+                            .unwrap()
+                            .tapes
+                            .get_mut("TAIL")
+                            .unwrap()
+                            .records[1] =
+                            Record::Block(vec![
+                                0x57;
+                                if fault == "data" { SIZE as usize } else { 7 }
+                            ]);
+                    }
+                    "missing" => f
+                        .world
+                        .lock()
+                        .unwrap()
+                        .tapes
+                        .get_mut("TAIL")
+                        .unwrap()
+                        .records
+                        .truncate(1),
+                    "io" => {
+                        *f.fail_read_after.lock().unwrap() =
+                            Some(usize::from(route == "checkpoint"))
+                    }
+                    "lba" => *f.position_fault.lock().unwrap() = Some((3, 0)),
+                    "partition" => *f.position_fault.lock().unwrap() = Some((2, 1)),
+                    _ => unreachable!(),
+                }
+                f.commands.lock().unwrap().clear();
+                let boundary = context(UUID, SIZE, 0, 2).boundary;
+                let refused = match route {
+                    "admission" => checkpoint(&mut f.drive).is_err(),
+                    "terminal" => admit_append_boundary(
+                        &mut f.drive,
+                        AppendAuthority::Terminal { plan },
+                        context(UUID, SIZE, 0, 2),
+                    )
+                    .is_err(),
+                    "checkpoint" => {
+                        let record = remanence_state::authority::AuthorityCommit {
+                            ordinal: 1,
+                            object_count: 0,
+                            protected: 0,
+                            total: 0,
+                            cursor: remanence_state::tape_log::CommitCursor {
+                                partition: 0,
+                                lba: 2,
+                            },
+                            tape_uuid: UUID,
+                            operation_id: [1; 16],
+                            next_file: 1,
+                            block_size: SIZE,
+                            payloads: vec![],
+                            scheme: None,
+                            object_files: vec![],
+                            barrier: None,
+                            finalization: None,
+                            sealed: false,
+                            seal_due: None,
+                            check: None,
+                        };
+                        crate::pool_write::reprove_checkpoint_boundary(&mut f.drive, &record)
+                            .is_err()
+                    }
+                    "parity" => DriveHandleRawSource::new(&mut f.drive)
+                        .prove_cursor(PhysicalPositionHint::new(2), SIZE)
+                        .is_err(),
+                    "overlap" => {
+                        let capacity = crate::append_ring::APPEND_RING_SLAB_BYTES as u64 * 2;
+                        let manager = crate::io_memory::IoMemoryReservation::new(capacity).unwrap();
+                        let (mut producer, _consumer, control) =
+                            crate::append_ring::create_append_ring(
+                                &manager, capacity, 50, 25, capacity,
+                            )
+                            .unwrap();
+                        producer
+                            .push(&vec![0; crate::append_ring::APPEND_RING_SLAB_BYTES])
+                            .await
+                            .unwrap();
+                        // An explicit locate revokes the old proof even at the same C.
+                        f.drive.locate(boundary.lba).unwrap();
+                        let mut sink = DriveHandleSink(&mut f.drive);
+                        let mut overlap = crate::pool_write::overlap::OverlapBlockSink {
+                            inner: &mut sink,
+                            control,
+                            expected_initial_lba: 2,
+                            expected_next_lba: 2,
+                            initial_position_proved: false,
+                            write_started: false,
+                            low_water_events: 0,
+                        };
+                        overlap.locate(2).is_err()
+                    }
+                    _ => unreachable!(),
+                };
+                assert!(refused, "{route}/{fault}/omitted={omitted}");
+                assert!(
+                    DriveHandleSink(&mut f.drive)
+                        .write_block(&[1; SIZE as usize])
+                        .is_err(),
+                    "failed proof left a usable capability: {route}/{fault}"
+                );
+                assert_eq!(writes(&f.commands.lock().unwrap()), 0, "{route}/{fault}");
+            }
+        }
+    }
+}
+
+/// A late locate is dangerous even after the session's first write, and even
+/// when it returns to the exact same LBA. Only another proof restores permission.
+#[test]
+fn cursor_capability_is_revoked_by_later_locate_and_read() {
+    for omitted in [false, true] {
+        let mut f = fixture();
+        *f.omit_kernel_residual.lock().unwrap() = omitted;
+        let _admission = checkpoint(&mut f.drive).unwrap();
+        DriveHandleSink(&mut f.drive)
+            .write_block(&[0x55; SIZE as usize])
+            .unwrap();
+        DriveHandleSink(&mut f.drive).write_filemarks(1).unwrap();
+        let before = writes(&f.commands.lock().unwrap());
+        f.drive.locate(4).unwrap();
+        assert!(DriveHandleSink(&mut f.drive).write_filemarks(1).is_err());
+        assert_eq!(writes(&f.commands.lock().unwrap()), before);
+        let cursor = context(UUID, SIZE, 0, 4).boundary;
+        f.drive
+            .prove_cursor(cursor, SIZE, f.drive.identity_generation())
+            .unwrap();
+        assert!(f
+            .drive
+            .read_block(&mut [0; SIZE as usize])
+            .unwrap_err()
+            .is_physical_eod());
+        assert!(DriveHandleSink(&mut f.drive).write_filemarks(1).is_err());
+        f.drive
+            .prove_cursor(cursor, SIZE, f.drive.identity_generation())
+            .unwrap();
+        DriveHandleSink(&mut f.drive).write_filemarks(1).unwrap();
+        assert_eq!(writes(&f.commands.lock().unwrap()), before + 1);
+    }
 }

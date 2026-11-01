@@ -28,8 +28,8 @@ use crate::parity_map::{
     SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
 };
 use crate::raw::{
-    device_position_error, read_fixed_record, tape_error_is_end_of_data, FixedRecordRead,
-    PhysicalPositionHint, RawTapeSink, RawTapeSource, RawWriteOutcome,
+    read_fixed_record, tape_error_is_end_of_data, FixedRecordRead, PhysicalPositionHint,
+    RawTapeSink, RawTapeSource, RawWriteOutcome,
 };
 use crate::sidecar::{parity_block_position, parse_sidecar_tape_file, EncodedSidecarTapeFile};
 use crate::sink::{SidecarTapeFile, TerminalPrefixPlan, TerminalPrefixReconcileEvidence};
@@ -1336,7 +1336,7 @@ pub fn rebuild_open_epoch_from_bounded_summary_checked(
                 "closed bounded resume summary retained open-epoch Object extents",
             ));
         }
-        locate_resume_append_position(source, plan.append_position)?;
+        locate_resume_append_position(source, plan.append_position, block_size)?;
         return Ok(ResumeOpenEpochRebuild {
             plan,
             rebuilt_sidecars: Vec::new(),
@@ -1391,7 +1391,7 @@ pub fn rebuild_open_epoch_from_bounded_summary_checked(
         accumulator,
         original_check.is_some(),
     ));
-    locate_resume_append_position(source, plan.append_position)?;
+    locate_resume_append_position(source, plan.append_position, block_size)?;
     Ok(ResumeOpenEpochRebuild {
         plan,
         rebuilt_sidecars: Vec::new(),
@@ -1575,7 +1575,7 @@ fn rebuild_open_epoch_from_plan(
             plan.sidecars_to_emit.is_empty(),
             "W == T resume plan must not schedule rebuilt sidecars"
         );
-        locate_resume_append_position(source, plan.append_position)?;
+        locate_resume_append_position(source, plan.append_position, block_size)?;
         return Ok(ResumeOpenEpochRebuild {
             plan,
             rebuilt_sidecars: Vec::new(),
@@ -1643,7 +1643,7 @@ fn rebuild_open_epoch_from_plan(
 
     validate_rebuilt_sidecars(&rebuilt_sidecars, &plan.sidecars_to_emit)?;
 
-    locate_resume_append_position(source, plan.append_position)?;
+    locate_resume_append_position(source, plan.append_position, block_size)?;
 
     Ok(ResumeOpenEpochRebuild {
         plan,
@@ -2287,18 +2287,16 @@ fn locate_committed_position(
 fn locate_resume_append_position(
     source: &mut dyn RawTapeSource,
     append_position: PhysicalPositionHint,
+    block_size: u32,
 ) -> Result<(), ParityError> {
-    locate_committed_position(source, append_position, format_args!("append position"))?;
-    // A position the drive reports after locating is a device report: one that
-    // differs from the located position faults the device (REM-PARITY 2.4).
-    let actual = source.position()?;
-    if actual != append_position {
-        return Err(device_position_error(format_args!(
-            "differs from the located append position: LBA {} partition {}, expected LBA {} partition {}",
-            actual.lba, actual.partition, append_position.lba, append_position.partition
-        )));
-    }
-    Ok(())
+    source
+        .prove_cursor(append_position, block_size)
+        .map_err(|error| match error {
+            ParityError::TapeIo(ref io) if tape_error_is_end_of_data(io) => resume_error(
+                "append predecessor lies past end-of-data: tape contradicts the commit record",
+            ),
+            other => other,
+        })
 }
 
 fn validate_rebuilt_sidecars(
@@ -2582,12 +2580,12 @@ mod tests {
             "{error:?}"
         );
         // An append position past end-of-data likewise contradicts the record.
-        let error =
-            locate_resume_append_position(&mut image, PhysicalPositionHint::new(99)).unwrap_err();
+        let error = locate_resume_append_position(&mut image, PhysicalPositionHint::new(99), 256)
+            .unwrap_err();
         assert!(matches!(error, ParityError::ResumeAppend(_)), "{error:?}");
         // The append position at end-of-data itself is fine.
         let eod = image.locate_end_of_data().unwrap();
-        locate_resume_append_position(&mut image, eod).unwrap();
+        locate_resume_append_position(&mut image, eod, 256).unwrap();
     }
 
     /// REM-PARITY 14 step 3 and E-1: a filemark, EOD or a record shorter or
@@ -2681,6 +2679,11 @@ mod tests {
         }
         fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
             self.reads += 1;
+            if self.position.is_some() {
+                return Ok(RawReadOutcome::Filemark {
+                    position_after: PhysicalPositionHint::new(5),
+                });
+            }
             buf.fill(0x42);
             Ok(RawReadOutcome::Block {
                 bytes: buf.len(),
@@ -2785,7 +2788,7 @@ mod tests {
                 position,
                 reads: 0,
             };
-            let error = locate_resume_append_position(&mut source, append).unwrap_err();
+            let error = locate_resume_append_position(&mut source, append, 256).unwrap_err();
             if device {
                 assert!(
                     matches!(error, ParityError::TapeIo(_)),
@@ -2803,7 +2806,7 @@ mod tests {
             position: Some(Ok(append)),
             reads: 0,
         };
-        locate_resume_append_position(&mut good, append).expect("the append point is reached");
+        locate_resume_append_position(&mut good, append, 256).expect("the append point is reached");
     }
 
     /// REM-PARITY 2.4 and 3.4: sidecar geometry from a commit record that does
@@ -2967,6 +2970,7 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct RecordingResumeRawSource {
+        filemarks: Vec<u64>,
         blocks: BTreeMap<u64, Vec<u8>>,
         cursor: u64,
         calls: Vec<RawCall>,
@@ -3090,6 +3094,12 @@ mod tests {
 
         fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
             self.calls.push(RawCall::Read(self.cursor));
+            if self.filemarks.contains(&self.cursor) {
+                self.cursor += 1;
+                return Ok(RawReadOutcome::Filemark {
+                    position_after: PhysicalPositionHint::new(self.cursor),
+                });
+            }
             let Some(block) = self.blocks.get(&self.cursor) else {
                 return Ok(RawReadOutcome::EndOfData {
                     position_after: PhysicalPositionHint::new(self.cursor),
@@ -3248,6 +3258,8 @@ mod tests {
         end: u64,
     ) -> RecordingResumeRawSource {
         let mut raw = RecordingResumeRawSource::default();
+        raw.filemarks
+            .push(map.append_position_after_prefix().unwrap().lba - 1);
         for ordinal in start..end {
             let position = map.position_for_ordinal(ordinal).unwrap();
             let physical = map.physical_position(position).unwrap();
@@ -3504,7 +3516,8 @@ mod tests {
             RawCall::Read(13),
             RawCall::Locate(14),
             RawCall::Read(14),
-            RawCall::Locate(16),
+            RawCall::Locate(15),
+            RawCall::Read(15),
         ];
         assert_eq!(raw.calls, expected_calls);
     }
@@ -3543,6 +3556,7 @@ mod tests {
         ])
         .expect("map validates");
         let mut raw = RecordingResumeRawSource::default();
+        raw.filemarks.push(7);
 
         let rebuild = rebuild_open_epoch_from_committed_prefix(
             &mut raw,
@@ -3562,7 +3576,8 @@ mod tests {
             raw.calls,
             vec![
                 RawCall::Configure(RESUME_TEST_BLOCK_SIZE),
-                RawCall::Locate(8),
+                RawCall::Locate(7),
+                RawCall::Read(7),
             ]
         );
     }
@@ -5374,7 +5389,14 @@ mod tests {
                 panic!("no SPACE")
             }
             fn read_record(&mut self, _: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
-                panic!("rebuild must batch")
+                assert_eq!(
+                    self.cursor, 65537,
+                    "only the predecessor proof reads singly"
+                );
+                self.cursor += 1;
+                Ok(RawReadOutcome::Filemark {
+                    position_after: PhysicalPositionHint::new(self.cursor),
+                })
             }
             fn read_forward_records(
                 &mut self,
@@ -5525,6 +5547,7 @@ mod tests {
         assert_eq!(summary.append_position, PhysicalPositionHint::new(31));
 
         let mut bounded_source = RecordingResumeRawSource::default();
+        bounded_source.filemarks.push(30);
         for offset in 0..3u64 {
             let block = vec![
                 u8::try_from(offset + 1).expect("small test byte");
@@ -5549,7 +5572,8 @@ mod tests {
                 RawCall::Read(27),
                 RawCall::Read(28),
                 RawCall::Read(29),
-                RawCall::Locate(31),
+                RawCall::Locate(30),
+                RawCall::Read(30),
             ]
         );
     }

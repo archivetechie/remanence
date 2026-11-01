@@ -60,6 +60,9 @@ impl OverlapBlockSink<'_> {
         }
     }
 
+    // This is a drift check during an in-flight file: its predecessor can be
+    // data. Append/recovery LOCATE below delegates to the drive sink's shared
+    // cursor proof; pauses do not move the head or issue another admission.
     pub(crate) fn prove_position(
         &self,
         observed: TapePosition,

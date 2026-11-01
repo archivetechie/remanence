@@ -529,13 +529,15 @@ impl BlockSink for DriveHandleSink<'_> {
         self.0.write_filemarks_pipelined(count)
     }
     fn space_to_end_of_data(&mut self) -> Result<TapePosition, TapeIoError> {
-        Ok(self.0.space(0, SpaceKind::EndOfData)?.position_after)
+        let position = self.0.space(0, SpaceKind::EndOfData)?.position_after;
+        self.0.locate_admitted_append(position.lba)
     }
     fn space_to_end_of_data_pipelined(&mut self) -> Result<TapePosition, TapeIoError> {
-        Ok(self
+        let position = self
             .0
             .space_pipelined(0, SpaceKind::EndOfData)?
-            .position_after)
+            .position_after;
+        self.0.locate_admitted_append(position.lba)
     }
     fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
         self.0.locate_admitted_append(lba)
