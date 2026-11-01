@@ -790,15 +790,16 @@ async fn restart_with_seated_cartridge_does_not_repeat_load() {
     append(&rig.api, &session, "before-restart").await.unwrap();
     rig.close(&session).await;
     rig.assert_released().await;
-    let seated = rig.worlds[0].lock().unwrap().clone();
     let commands = rig.controls[0].commands.lock().unwrap().clone();
     rig.api.begin_shutdown();
     rig.api.shutdown_drive_pool().await.unwrap();
     rig.assert_loads();
-    // Stop the old workers, then retain the device state at the restart cut.
-    // Shutdown's orderly eject is not part of an abrupt daemon restart.
-    *rig.worlds[0].lock().unwrap() = seated;
-    *rig.controls[0].commands.lock().unwrap() = commands;
+    assert_eq!(
+        *rig.controls[0].commands.lock().unwrap(),
+        commands,
+        "idle graceful shutdown sends no transport commands"
+    );
+    // Restart with the actual post-shutdown placement and media bytes.
     assert_eq!(
         rig.worlds[0].lock().unwrap().loaded_barcode(BAY),
         Some(barcode(0).as_str())

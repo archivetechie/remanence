@@ -48,21 +48,16 @@ struct Args {
 /// Install the graceful-shutdown signal handlers and return a future that
 /// resolves when SIGINT, SIGTERM or SIGHUP arrives.
 ///
-/// The graceful path closes write sessions and dismounts every seated
-/// cartridge: SSC UNLOAD, then the changer move home. A process that dies
-/// between those two commands leaves the cartridge unthreaded in the drive,
-/// and the drive answers NOT READY / INITIALIZING COMMAND REQUIRED until a
-/// host sends LOAD. SIGHUP is handled for that reason: a closing terminal or
-/// multiplexer session sends it, and its default action ends the process at
-/// once, wherever the dismount stands. Handled, it starts the same graceful
-/// shutdown as SIGTERM.
+/// Graceful shutdown stops admission, checkpoints and closes every open session,
+/// and leaves cartridges seated. An UNLOAD already in flight still completes its
+/// changer move home. Handling SIGHUP and repeated stop signals keeps a closing
+/// terminal or a second signal from cutting that work short.
 ///
-/// The handlers stay installed for the life of the process, so a repeated
-/// stop request (another SIGTERM, SIGINT or SIGHUP) does not cut a dismount
-/// short; the daemon exits once the shutdown pass has finished every move it
-/// started. SIGKILL or a failed changer move can leave a cartridge unthreaded, so a
-/// supervisor's stop timeout must cover a rewind, an unload and a changer
-/// move, which together can take more than a minute on LTO-9.
+/// The service manager's stop timeout must cover in-flight work and checkpointing
+/// and closing every open session, plus a margin. B6 adds
+/// `daemon.shutdown_close_deadline_secs`; the timeout must then exceed that
+/// deadline plus a margin, while also allowing existing UNLOAD/MOVE work to settle.
+/// SIGKILL or a failed changer move can still leave a cartridge unthreaded.
 fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()> + Send + 'static> {
     use tokio::signal::unix::{signal, SignalKind};
 
@@ -82,7 +77,7 @@ fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()> + 
 async fn report_shutdown_signal(signal: impl std::future::Future<Output = &'static str>) {
     let name = signal.await;
     stderr_message!(
-        "rem-daemon: {name} received; closing sessions and finishing every cartridge dismount before exit"
+        "rem-daemon: {name} received; closing sessions and finishing in-flight motion; cartridges stay seated"
     );
 }
 

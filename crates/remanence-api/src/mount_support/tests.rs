@@ -2314,7 +2314,7 @@ async fn committed_barrier_context_failures_preserve_receipts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn seated_parity_sessions_close_before_unload_and_shutdown() {
+async fn seated_parity_sessions_close_before_unload_but_shutdown_leaves_seated() {
     use crate::write_owner::tests::RetentionInvalidation::{
         AutomaticSeal, Discarded, Disconnected, ExpectedEnd, Fenced, Finalize, FinalizeRebuilt,
         IdentityGeneration, JournalFailure, NoHomeSlot, NoWriteShutdown, None as Unchanged,
@@ -2557,7 +2557,10 @@ async fn epoch_removal_admission_failure_matrix() {
             .await;
             let log = std::fs::read_to_string(&log_path).unwrap();
             let log = &log[log_start..];
-            let expected = if matches!(
+            let expected = if path == "shutdown" {
+                // Shutdown does not enter removal or its epoch-close diagnostics.
+                ""
+            } else if matches!(
                 case,
                 "replay_failure" | "journal_corrupt" | "lease" | "finalize_lease" | "catalog_read"
             ) {
@@ -2605,9 +2608,7 @@ async fn epoch_removal_admission_failure_matrix() {
                     | "eod"
                     | "blank_locate"
                     | "absent_bootstrap"
-            ) || (path == "shutdown"
-                && matches!(case, "read" | "medium" | "identity" | "late_barcode_fence"))
-            {
+            ) {
                 "epoch_left_open"
             } else if matches!(
                 case,

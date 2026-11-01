@@ -12998,7 +12998,32 @@ pub(crate) async fn check_seated_parity_sessions(
     } else {
         None
     };
-    lifecycle.shutting_down.store(shutdown, Ordering::SeqCst);
+    if shutdown {
+        // Exercise daemon shutdown, not an ordinary Unload with a shutdown flag.
+        let mut api = crate::ApiState::new(CatalogIndex::open(&cfg.index_path).unwrap());
+        api.library_snapshot = Some(cfg.library().snapshot.clone());
+        let key = crate::drive_pool::DriveKey::new(&serial, 0x100);
+        api.drive_pool = Some(DrivePool::new_with_lifecycle(
+            HashMap::from([(
+                serial.clone(),
+                spawn_changer_actor(library.into_changer(), cfg.clone()),
+            )]),
+            HashMap::from([(key.clone(), tx)]),
+            Arc::new(HashMap::from([(key, AtomicBool::new(false))])),
+            lifecycle,
+        ));
+        let before = world.lock().unwrap().command_log.len();
+        api.shutdown_drive_pool().await.unwrap();
+        let world = world.lock().unwrap();
+        assert_eq!(
+            world.command_log.len(),
+            before,
+            "shutdown dispatches no media commands even after a read"
+        );
+        assert!(world.drive_bays[&0x100].is_some());
+        return;
+    }
+
     if prepare_removal {
         // Robotics removes the cartridge whatever the close did, so the close
         // must say it ran and failed.
@@ -13039,16 +13064,6 @@ pub(crate) async fn check_seated_parity_sessions(
     assert!(world.lock().unwrap().command_log[before_unload..]
         .iter()
         .any(|c| c.opcode == 0x1b));
-    if read_before_shutdown {
-        assert!(world.lock().unwrap().command_log[before_unload..]
-            .iter()
-            .all(|c| !matches!(c.opcode, 0x08 | 0x0a | 0x10 | 0x2b | 0x92)));
-        assert!(FileAuditLog::replay(&state.paths().audit_dir)
-            .unwrap()
-            .iter()
-            .any(|record| record.detail.get("session_kind")
-                == Some(&CborValue::Text("epoch_left_open".into()))));
-    }
     if (1..=3).contains(&fault) || invalidation == RetentionInvalidation::Fenced {
         let index = CatalogIndex::open(&state.paths().sqlite_path).unwrap();
         assert!(!index.list_active_tape_io_fences().unwrap().is_empty());
@@ -13090,9 +13105,8 @@ pub(crate) async fn check_seated_parity_sessions(
     }
     let index = CatalogIndex::open(&state.paths().sqlite_path).unwrap();
     let tape = index.get_tape(&selected.tape_uuid).unwrap().unwrap();
-    assert_eq!(
+    assert!(
         tape.highest_protected_ordinal == tape.total_committed_ordinals,
-        !read_before_shutdown,
         "audit: {:?}",
         FileAuditLog::replay(&state.paths().audit_dir).unwrap()
     );
@@ -13110,7 +13124,7 @@ pub(crate) async fn check_seated_parity_sessions(
     );
     assert_eq!(
         records.len(),
-        if refuse_memory || read_before_shutdown {
+        if refuse_memory {
             2
         } else if invalidation == RetentionInvalidation::ExpectedEnd {
             4
@@ -13118,7 +13132,7 @@ pub(crate) async fn check_seated_parity_sessions(
             3
         }
     );
-    if !refuse_memory && !read_before_shutdown {
+    if !refuse_memory {
         assert!(records.last().unwrap().objects.is_empty());
         assert!(records.last().unwrap().barrier_bundle.is_some());
     }
@@ -13262,87 +13276,6 @@ pub(crate) async fn check_seated_parity_sessions(
             .unwrap()
             .seal_due
             .is_none());
-    }
-    if read_before_shutdown {
-        // A fresh actor has no accumulator from the stopped actor. Its open
-        // rebuilds the committed range before another Object reaches media.
-        lifecycle.shutting_down.store(false, Ordering::SeqCst);
-        let bay = if invalidation == RetentionInvalidation::OtherDrive {
-            let mut world = world.lock().unwrap();
-            let cartridge = world.drive_bays.get_mut(&0x100).unwrap().take();
-            world.drive_bays.insert(0x101, cartridge);
-            world.drive_serials.insert(0x101, "SECOND-DRIVE".into());
-            world.drive_source_slots.insert(0x101, None);
-            world.drive_states.insert(0x101, Default::default());
-            world.drive_alert_flags.insert(0x101, Default::default());
-            world.element_layout.drive_count = 2;
-            0x101
-        } else {
-            0x100
-        };
-        let mut library = open_model_library(world.clone());
-        let drive = library
-            .open_drive(
-                bay,
-                &remanence_library::StaticAllowlist::new([serial.as_str()]),
-            )
-            .unwrap();
-        let tx = spawn_drive_actor(bay, drive, cfg);
-        let (reply, received) = oneshot::channel();
-        tx.send(DriveCommand::OpenWrite {
-            actor: remanence_state::AuditActor::System,
-            pool_cfg: state.config().tape_pools[0].clone(),
-            selected: selected.clone(),
-            target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
-            needs_drive_load: true,
-            library_serial: serial.clone(),
-            barcode: Some(barcode.as_str().into()),
-            source_slot: None,
-            drive_uuid: None,
-            drive_serial: None,
-            reply,
-        })
-        .await
-        .unwrap();
-        let id = Uuid::from_slice(&received.await.unwrap().unwrap().session_id).unwrap();
-        lifecycle.sessions.lock().unwrap().insert(
-            id,
-            MountedSession {
-                bay,
-                library_serial: serial,
-                barcode: Some(barcode.as_str().into()),
-                home_slot: Some(0x400),
-                tape_uuid: selected.tape_uuid,
-                drive_uuid: None,
-            },
-        );
-        append_actor_test_file(
-            &tx,
-            id,
-            state.paths().state_dir.join("after-restart.bin"),
-            "after-restart.bin",
-            "after-restart",
-            b"new committed payload",
-        )
-        .await;
-        let (reply, received) = oneshot::channel();
-        tx.send(DriveCommand::Close {
-            session_id: id,
-            reply,
-        })
-        .await
-        .unwrap();
-        received.await.unwrap().unwrap();
-        lifecycle.sessions.lock().unwrap().remove(&id);
-        let (reply, received) = oneshot::channel();
-        tx.send(DriveCommand::Unload { reply }).await.unwrap();
-        received.await.unwrap().unwrap();
-        assert_eq!(memory.granted(), 0);
-        let tape = index.get_tape(&selected.tape_uuid).unwrap().unwrap();
-        assert_eq!(
-            tape.highest_protected_ordinal,
-            tape.total_committed_ordinals
-        );
     }
 }
 /// A resumed close-at-barrier session preserves a durable close on SQLite busy.
@@ -14040,7 +13973,7 @@ async fn write_eviction_without_the_wait_fails_as_before_on_an_open_magazine() {
     {
         let mut world = world.lock().unwrap();
         assert_eq!(world.loaded_barcode(0x0100), Some("OLD001L9"));
-        // The operator closes the magazine; shutdown can then park the cartridge.
+        // The operator closes the magazine before the daemon settles existing work.
         world.reinsert_magazine();
         world.changer_unit_attention = None;
     }
@@ -14717,16 +14650,17 @@ async fn check_epoch_removal(
             );
         }
     }
-    if index
-        .tape_io_is_fenced(
-            Some(&selected.tape_uuid),
-            Some("HAND"),
-            Some(&remanence_state::DriveKey::new(
-                &cfg.library().serial,
-                0x100,
-            )),
-        )
-        .unwrap()
+    if path != "shutdown"
+        && index
+            .tape_io_is_fenced(
+                Some(&selected.tape_uuid),
+                Some("HAND"),
+                Some(&remanence_state::DriveKey::new(
+                    &cfg.library().serial,
+                    0x100,
+                )),
+            )
+            .unwrap()
     {
         let commands = world.lock().unwrap().command_log.len();
         let (reply, received) = oneshot::channel();
@@ -14812,11 +14746,6 @@ async fn check_epoch_removal(
         pool.park_cartridge(seated.clone());
     }
     api.drive_pool = Some(pool);
-    if case == "summary_mismatch" && path == "shutdown" {
-        // Permit identity, cursor-filemark and EOD probes, but assert in the
-        // transport that shutdown never reads committed Object blocks.
-        read_fault.store(31, Ordering::SeqCst);
-    }
     let command_start = world.lock().unwrap().command_log.len();
     match path {
         "shutdown" => {
@@ -14884,6 +14813,19 @@ async fn check_epoch_removal(
     if let Some((resume, task)) = preflight {
         resume.send(()).unwrap();
         task.await.unwrap().unwrap();
+    }
+    if path == "shutdown" {
+        let world = world.lock().unwrap();
+        assert_eq!(
+            world.command_log.len(),
+            command_start,
+            "{case}: shutdown sends no transport commands"
+        );
+        assert!(
+            world.drive_bays[&0x100].is_some(),
+            "{case}: cartridge stays seated"
+        );
+        return;
     }
     if case == "projection_busy" {
         assert!(
@@ -15102,13 +15044,6 @@ async fn check_epoch_removal(
             "durable close writes no abandonment filemark after journal EOD"
         );
     }
-    if case == "summary_mismatch" && path == "shutdown" {
-        assert_eq!(
-            read_fault.load(Ordering::SeqCst),
-            31,
-            "shutdown never rebuilds a mismatching retained summary"
-        );
-    }
     if matches!(
         case,
         "post_projection" | "projection_busy" | "success" | "replay_closed"
@@ -15125,32 +15060,24 @@ async fn check_epoch_removal(
             tape.total_committed_ordinals > before.total_committed_ordinals,
             "{path}: removal replays the open checkpoint"
         );
-        if tape.highest_protected_ordinal < tape.total_committed_ordinals {
-            assert_eq!(path, "shutdown");
-            assert!(
-                audit.iter().any(|r| r.detail.get("session_kind")
-                    == Some(&CborValue::Text("epoch_left_open".into()))
-                    && r.detail.get("open_epoch_start")
-                        == Some(&CborValue::Integer(tape.highest_protected_ordinal.into()))
-                    && r.detail.get("open_epoch_end")
-                        == Some(&CborValue::Integer(tape.total_committed_ordinals.into()))),
-                "shutdown audits the replayed open range"
-            );
-        } else {
-            let records = remanence_state::authority::fixtures::AuthorityBuilder::new(
-                &cfg.checkpoint_journal_dir,
-                selected.tape_uuid,
-            )
-            .build()
-            .unwrap()
-            .replay()
-            .unwrap();
-            assert!(
-                records.last().unwrap().objects.is_empty(),
-                "removal commits a sidecar-only checkpoint"
-            );
-        }
+        assert_eq!(
+            tape.highest_protected_ordinal,
+            tape.total_committed_ordinals
+        );
+        let records = remanence_state::authority::fixtures::AuthorityBuilder::new(
+            &cfg.checkpoint_journal_dir,
+            selected.tape_uuid,
+        )
+        .build()
+        .unwrap()
+        .replay()
+        .unwrap();
+        assert!(
+            records.last().unwrap().objects.is_empty(),
+            "removal commits a sidecar-only checkpoint"
+        );
     }
+
     if let Some(before) = journal_before {
         let after = remanence_state::authority::fixtures::AuthorityBuilder::new(
             &cfg.checkpoint_journal_dir,
@@ -15191,8 +15118,7 @@ async fn check_epoch_removal(
             | "open_medium"
             | "open_admission_blank"
             | "open_admission_medium"
-    ) && !(path == "shutdown"
-        && matches!(case, "read" | "medium" | "identity" | "late_barcode_fence"));
+    );
     if expect_fence {
         assert_eq!(fences.len(), 1, "{case} through {path}");
         assert!(
@@ -15221,7 +15147,7 @@ async fn check_epoch_removal(
             assert_eq!(evidence["phase"], "append_admission");
         }
         assert!(!evidence["error"].as_str().unwrap().is_empty());
-    } else if case == "barcode_fence" || (case == "late_barcode_fence" && path != "shutdown") {
+    } else if matches!(case, "barcode_fence" | "late_barcode_fence") {
         assert_eq!(fences.len(), 1);
     } else {
         assert!(fences.is_empty(), "{case} through {path}: {fences:?}");
@@ -15242,19 +15168,6 @@ impl SgTransport for EpochRemovalTransport {
         cdb: &[u8],
         data: &mut [u8],
     ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError> {
-        if cdb[0] == 0x08 && self.fault.load(Ordering::SeqCst) == 31 {
-            assert!(
-                self.located < 2
-                    || matches!(
-                        self.world.lock().unwrap().tapes["HAND"]
-                            .records
-                            .get(self.located as usize),
-                        None | Some(Record::Filemark)
-                    ),
-                "shutdown reread committed Object data at LBA {}",
-                self.located
-            );
-        }
         if matches!(cdb[0], 0x1a | 0x5a) && self.fault.load(Ordering::SeqCst) == 4 {
             self.fault.store(0, Ordering::SeqCst);
             return Err(remanence_library::ScsiError::Io(std::io::Error::other(

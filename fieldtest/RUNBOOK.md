@@ -75,7 +75,14 @@ The October 2026 window on the MSL3040 produced these operational rules.
    shows the resulting fence as `media_initializing`, and waiting does not
    clear it. The drain now sends one LOAD with `sg_start --load` (sg3_utils
    must be installed) before it skips the bay, and `03-bringup.sh --stop`
-   waits a minute for a graceful stop before the hard kill.
+   first unloads each allowlisted seated cartridge in the selected library through
+   `rem drive unload --library <serial> --bay <bay>`. It records every unload and
+   records failures as WARN with the bay, then sends SIGTERM and waits up to 360
+   seconds (`REMFIELD_STOP_TIMEOUT_SECONDS`) before a hard kill. `run.sh` uses this
+   same teardown. Non-allowlisted cartridges are left alone; daemon shutdown itself
+   leaves cartridges seated. The stop timeout covers in-flight work and every
+   session checkpoint/close. Once B6 adds `daemon.shutdown_close_deadline_secs`,
+   it must exceed that deadline plus a margin.
 5. Never rerun `10-init-pools.sh` over initialized tapes without the rerun
    guard, which skips every barcode that has a PASS init record from this
    kit in `evidence/records.jsonl`. `FIELD_INIT_ALLOW_REINIT=1` is the
