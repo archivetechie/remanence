@@ -7,6 +7,12 @@ per-release summaries.
 <!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/index.rs crates/remanence-library/src/discovery.rs @ 638210f7 -->
 ## Unreleased
 
+- The field-test kit refuses any payload write that would crowd its host. A
+  shared spool filesystem must keep 150 GiB and 25% free and the kit 40 GiB or
+  less; a dedicated loop-backed or tmpfs spool keeps 2 GiB free, and a tmpfs
+  spool also keeps 64 GiB of RAM available. Run directories are removed on
+  every exit path, including a signal sent to the script, and preflight sweeps
+  stale ones. `fieldtest/RUNBOOK.md` lists the knobs.
 - `rem drive unload --library <SERIAL> --bay <BAY> [--dest <SLOT>]` unloads a
   drive bay through the daemon and waits for completion. The daemon closes any
   retained parity epoch before the cartridge leaves the drive. Without `--dest`
