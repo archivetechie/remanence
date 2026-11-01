@@ -669,10 +669,10 @@ fn read_filemark_signal_detects_valid_fixed_filemark() {
 }
 
 #[test]
-fn read_filemark_signal_requires_valid_bit() {
+fn read_filemark_signal_accepts_without_valid_bit() {
     let mut sense = filemark_sense();
     sense[0] = 0x70;
-    assert!(!read_filemark_signal(&sense));
+    assert!(read_filemark_signal(&sense));
 }
 
 #[test]
@@ -682,9 +682,35 @@ fn read_filemark_signal_detects_valid_current_descriptor_filemark() {
 }
 
 #[test]
-fn read_filemark_signal_requires_valid_information_descriptor() {
+fn read_filemark_signal_accepts_without_valid_information_descriptor() {
     let sense = current_descriptor_test_sense(0x00, 0x80, 0x00, 0x01, false);
-    assert!(!read_filemark_signal(&sense));
+    assert!(read_filemark_signal(&sense));
+}
+
+/// FILEMARK with NO SENSE or RECOVERED ERROR is sufficient, irrespective of
+/// residual validity or additional sense codes; ILI and all other keys refuse.
+#[test]
+fn read_filemark_signal_key_flags_and_validity_matrix() {
+    for valid in [false, true] {
+        for key in 0..16 {
+            for flags in [0, 0x80, 0x20, 0xa0] {
+                for ascq in [0, 1, 5] {
+                    let mut fixed = filemark_sense();
+                    fixed[0] = 0x70 | if valid { 0x80 } else { 0 };
+                    fixed[2] = flags | key;
+                    fixed[13] = ascq;
+                    let descriptor = current_descriptor_test_sense(key, flags, 0, ascq, valid);
+                    for sense in [fixed, descriptor] {
+                        assert_eq!(
+                            read_filemark_signal(&sense),
+                            matches!(key, 0 | 1) && flags == 0x80,
+                            "{sense:02x?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[test]

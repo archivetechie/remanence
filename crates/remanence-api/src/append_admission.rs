@@ -203,29 +203,25 @@ pub(crate) fn admit_append_boundary(
     }
     let cursor_proof = restored?;
     probe?;
+    let (position, generation) = cursor_proof.map_or(
+        (ctx.write_position, generation),
+        remanence_library::cursor::CursorProof::into_position,
+    );
     // SAFETY: this private, non-cloneable type can only be constructed here,
     // after successful classification, cursor restoration and generation proof.
     // Installation immediately consumes it on the same exclusively held drive.
-    struct ProvedBoundary(
-        [u8; 16],
-        u32,
-        u64,
-        u64,
-        Option<remanence_library::cursor::CursorProof>,
-    );
+    struct ProvedBoundary([u8; 16], u32, u64, u64);
     unsafe impl remanence_library::AppendBoundaryProof for ProvedBoundary {
         fn into_boundary(self) -> ([u8; 16], u32, u64, u64) {
-            let _cursor_proof = self.4;
             (self.0, self.1, self.2, self.3)
         }
     }
     drive
         .install_append_admission(ProvedBoundary(
             ctx.tape_uuid,
-            ctx.write_position.partition,
-            ctx.write_position.lba,
+            position.partition,
+            position.lba,
             generation,
-            cursor_proof,
         ))
         .map(|session| AppendAdmission { session })
         .map_err(AdmissionError::Io)
@@ -344,6 +340,12 @@ fn abandon_pending_append_with_rows(
     // both; the marker replaces only its first uncheckpointed object.
     let lba = last.as_ref().map_or(2, |r| r.cursor.lba);
     let partition = last.as_ref().map_or(0, |r| r.cursor.partition);
+    // Before the first checkpoint, the accepted bootstrap and delimiter are C.
+    if last.is_none() {
+        drive
+            .advance_append_commit(context(tape_uuid, 0, partition, lba).boundary)
+            .map_err(|e| e.to_string())?;
+    }
     let actual = drive
         .locate_admitted_append(lba)
         .map_err(|e| e.to_string())?;

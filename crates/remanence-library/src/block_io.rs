@@ -265,6 +265,14 @@ pub trait BlockRead {
 /// Implemented by [`DriveHandleSource`] for production and
 /// [`VecBlockSource`] for tests. Format decoders accept [`BlockRead`] instead.
 pub trait BlockSource: BlockRead {
+    /// Prove and re-arm an append cursor through its owning drive. Sources that
+    /// cannot bind a proof to the write session refuse without moving the head.
+    fn prove_cursor(&mut self, _cursor: TapePosition, _block_size: u32) -> Result<(), TapeIoError> {
+        Err(TapeIoError::OperationFailed(
+            "block source does not support cursor proof".into(),
+        ))
+    }
+
     /// Read one fixed-size batch. The default loops through
     /// [`BlockRead::read_block`] and never intentionally crosses `remaining`.
     fn read_block_batch(
@@ -562,6 +570,11 @@ impl BlockRead for DriveHandleSource<'_> {
 }
 
 impl BlockSource for DriveHandleSource<'_> {
+    fn prove_cursor(&mut self, cursor: TapePosition, block_size: u32) -> Result<(), TapeIoError> {
+        self.0
+            .prove_cursor(cursor, block_size, self.0.identity_generation())?;
+        Ok(())
+    }
     fn read_block_batch(
         &mut self,
         buf: &mut [u8],

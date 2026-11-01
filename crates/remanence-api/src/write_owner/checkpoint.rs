@@ -1210,6 +1210,11 @@ fn perform_checkpoint_barrier_with_rows(
             }
             session.retention = None;
         }
+        if err.is_checkpoint_append_durable() {
+            drive.advance_append_commit(captured).map_err(|error| {
+                CheckpointBarrierFailure::after_journal(Status::unavailable(error.to_string()))
+            })?;
+        }
         return Err(if err.is_checkpoint_append_durable() {
             CheckpointBarrierFailure::after_journal(Status::internal(format!("checkpoint is durable in the tape log but folding or projection failed; retry after journal replay: {err}")))
         } else if err.is_checkpoint_append_authority_uncertain() {
@@ -1225,6 +1230,9 @@ fn perform_checkpoint_barrier_with_rows(
             )))
         });
     }
+    drive.advance_append_commit(captured).map_err(|error| {
+        CheckpointBarrierFailure::after_journal(Status::unavailable(error.to_string()))
+    })?;
     if let Some(session) = parity_session.as_deref_mut() {
         if let Some(state) = session.sink_state.as_mut() {
             state.acknowledge_publication();
@@ -2360,7 +2368,10 @@ fn committed_io_contradiction(error: &TapeIoError, size: u32, count: u32) -> boo
     if matches!(error, TapeIoError::GoodReadLengthMismatch { .. }) {
         return false;
     }
-    if matches!(error, TapeIoError::FilemarkEncountered) {
+    if matches!(
+        error,
+        TapeIoError::FilemarkEncountered | TapeIoError::CursorPredecessorNotFilemark
+    ) {
         return true;
     }
     use remanence_library::VerificationReadCompletion as Completion;

@@ -568,8 +568,14 @@ impl SgTransport for Transport {
                 && sense.get(2).is_some_and(|key| key & 0x80 != 0)
             {
                 injection.corrected_filemark += 1;
+                let mut sense = sense.clone();
+                if cdb[1] & 1 == 0 {
+                    // Variable READ filemarks transfer no data: when SG_IO
+                    // omits its residual, sense must carry the requested bytes.
+                    sense[3..7].copy_from_slice(&(buf.len() as u32).to_be_bytes());
+                }
                 return Err(ScsiError::CheckCondition {
-                    sense: sense.clone(),
+                    sense,
                     bytes_transferred: buf.len() as u32,
                 });
             }

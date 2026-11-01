@@ -249,6 +249,14 @@ impl<'a> RetainedSource<'a> {
 }
 
 impl RawTapeSource for RetainedSource<'_> {
+    fn prove_cursor(&mut self, cursor: PhysicalPositionHint, size: u32) -> Result<(), ParityError> {
+        if self.enabled {
+            return Err(ParityError::Invariant(
+                "retained source cannot prove a physical cursor",
+            ));
+        }
+        self.source.prove_cursor(cursor, size)
+    }
     fn verification_context(&self) -> remanence_library::verification_io::VerificationContext {
         self.source.verification_context()
     }

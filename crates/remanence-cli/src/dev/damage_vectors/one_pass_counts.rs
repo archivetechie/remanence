@@ -12,6 +12,12 @@ struct Counted<S> {
     eod: usize,
 }
 impl<S: RawTapeSource> RawTapeSource for Counted<S> {
+    fn prove_cursor(&mut self, cursor: PhysicalPositionHint, size: u32) -> Result<(), ParityError> {
+        self.cursor = None;
+        self.inner.prove_cursor(cursor, size)?;
+        self.cursor = Some(cursor);
+        Ok(())
+    }
     fn verification_context(&self) -> remanence_library::verification_io::VerificationContext {
         self.inner.verification_context()
     }

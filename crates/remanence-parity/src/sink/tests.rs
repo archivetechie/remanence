@@ -566,6 +566,9 @@ impl RecordingRawTapeSource {
 }
 
 impl RawTapeSource for RecordingRawTapeSource {
+    fn prove_cursor(&mut self, cursor: PhysicalPositionHint, size: u32) -> Result<(), ParityError> {
+        crate::raw::prove_fixture_cursor(self, cursor, size)
+    }
     fn configure_fixed_block_size(&mut self, block_size: u32) -> Result<(), ParityError> {
         self.configured_block_size = Some(block_size);
         Ok(())
