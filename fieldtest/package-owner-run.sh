@@ -35,7 +35,7 @@ git archive HEAD fieldtest/scripts fieldtest/plan fieldtest/run.sh fieldtest/OWN
 mv "$stage/fieldtest/"* "$pkg/"
 rmdir "$stage/fieldtest"
 printf '%s\n' "$commit" >"$pkg/KIT-COMMIT"
-(cd "$pkg" && sha256sum bin/* run.sh >SHA256SUMS)
+(cd "$pkg" && find . -type f ! -name SHA256SUMS -printf '%P\n' | LC_ALL=C sort | xargs -d '\n' sha256sum >SHA256SUMS)
 
 tar -C "$stage" --owner=0 --group=0 -czf "$out/$name.tar.gz" "$name"
 (cd "$out" && sha256sum "$name.tar.gz" >"$name.tar.gz.sha256")

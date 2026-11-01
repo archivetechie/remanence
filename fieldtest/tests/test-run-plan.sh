@@ -26,11 +26,11 @@ name="$(basename -- "$0")"
 printf '%s %s\n' "$name" "$*" >>"$HOME/calls"
 printf '%s %s\n' "${FIELD_BIN_DIR:-}" "${FIELDTEST_LIBRARY_SERIAL:-}" >"$HOME/env"
 if [[ "$(cat "$HOME/hang-on" 2>/dev/null)" == "$name" ]]; then
-  trap 'echo termed >>"$HOME/calls"; exit 143' TERM
+  trap 'echo termed >>"$HOME/calls"; exit 143' TERM HUP
   touch "$HOME/hanging"
   while :; do sleep 0.1; done
 fi
-[[ "$name" == 90-collect-evidence.sh ]] && : >"$REMFIELD_HOME/evidence-pack-test.tar.gz"
+[[ "$name" == 90-collect-evidence.sh ]] && cp "$REMFIELD_HOME"/evidence/run-*.log "$REMFIELD_HOME/packed-log" && : >"$FIELD_EVIDENCE_PACK"
 [[ "$(cat "$HOME/fail-on" 2>/dev/null)" == "$name" ]] && exit 7
 exit 0
 STUB
@@ -56,6 +56,8 @@ rc=0; run_case "$c" plan/smoke.env || rc=$?
 check "pass: exit 0" "[[ $rc -eq 0 ]]"
 check "pass: leg order and teardown" "[[ '$(calls "$c")' == '00-preflight.sh |09-media-ready.sh --count 4 --no-wait|03-bringup.sh |02-discovery.sh |11-happy-path.sh |33-diag-capture.sh --note smoke-plan-baseline|03-bringup.sh --stop|90-collect-evidence.sh |' ]]"
 check "pass: result line" "grep -q '^result: PASS' '$c/out'"
+check "pass: named pack reported" "grep -q 'evidence pack: .*/evidence-pack-smoke-.*tar.gz' '$c/out'"
+check "pass: the log and result are in evidence before packing" "grep -q '11-happy-path.sh exit 0' '$c/home/remfield/packed-log' && grep -q '^result: PASS' '$c'/home/remfield/evidence/run-smoke-*.result"
 check "pass: table has six legs" "[[ \$(tail -n +2 '$c'/home/remfield/evidence/run-smoke-*.tsv | wc -l) -eq 6 ]]"
 check "pass: legs see the package bins and the plan's library" "[[ \"\$(cat '$c/home/env')\" == \"\$(cd '$c/pkg/bin' && pwd -P) DEC418146K_LL01\" ]]"
 
@@ -86,6 +88,31 @@ rc=0; wait "$pid" || rc=$?
 check "TERM: exit 130" "[[ $rc -eq 130 ]]"
 check "TERM: leg got the signal, then teardown ran" "[[ '$(calls "$c")' == *'11-happy-path.sh |termed|33-diag-capture.sh --note run.sh teardown: interrupted by TERM during 11-happy-path.sh|03-bringup.sh --stop|90-collect-evidence.sh |' ]]"
 check "TERM: pidfile removed" "[[ ! -e '$c/home/remfield/state/run.pid' ]]"
+
+# A signal to the whole process group (Ctrl-c in tmux, a closed window, shutdown)
+# must not kill the logger or skip teardown, and the leg must stop. run.sh starts
+# with SIGINT at its default, as in a tmux pane; a background job would inherit
+# it ignored, and bash cannot trap a signal ignored on entry.
+for sig in INT HUP TERM; do
+  c="$(make_case)"
+  echo 11-happy-path.sh >"$c/home/hang-on"
+  env -i PATH=/usr/bin:/bin HOME="$c/home" REMFIELD_HOME="$c/home/remfield" \
+    setsid -w python3 -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.execvp(sys.argv[1], sys.argv[1:])' \
+    bash "$c/pkg/run.sh" plan/smoke.env >"$c/out" 2>&1 &
+  pid=$!
+  for _ in $(seq 100); do [[ -e "$c/home/hanging" ]] && break; sleep 0.1; done
+  pgid="$(ps -o pgid= -p "$(cat "$c/home/remfield/state/run.pid")" | tr -d ' ')"
+  if [[ -z "$pgid" || "$pgid" == "$(ps -o pgid= -p $$ | tr -d ' ')" ]]; then
+    bad "group $sig: run.sh is not in its own process group"
+    kill -TERM "$pid" 2>/dev/null
+  else
+    kill "-$sig" -- "-$pgid"
+  fi
+  rc=0; wait "$pid" || rc=$?
+  check "group $sig: exit 130" "[[ $rc -eq 130 ]]"
+  check "group $sig: leg stopped, then teardown ran" "[[ '$(calls "$c")' == *'11-happy-path.sh |termed|33-diag-capture.sh --note run.sh teardown: interrupted by $sig during 11-happy-path.sh|03-bringup.sh --stop|90-collect-evidence.sh |' ]]"
+  check "group $sig: log kept to the end" "grep -q '^result: INTERRUPTED ($sig)' '$c'/home/remfield/evidence/run-smoke-*.log"
+done
 
 # Refusals happen before any leg runs.
 c="$(make_case)"

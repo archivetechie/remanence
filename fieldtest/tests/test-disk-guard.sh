@@ -160,20 +160,26 @@ main() {
 }
 fieldtest_run_with_lock main
 LOCKED
-env -i PATH="$stubs:/usr/bin:/bin" HOME="$home" REMFIELD_HOME="$home/remfield" \
-  STUB_TOTAL=$((618 * GIB)) STUB_AVAIL=$((363 * GIB)) STUB_KIT=$GIB STUB_TARGET=/home \
-  bash "$home/locked.sh" >/dev/null 2>&1 &
-locked=$!
-for _ in $(seq 100); do [[ -s "$home/progress" ]] && break; sleep 0.1; done
-kill -TERM "$locked"
-rc=0
-wait "$locked" || rc=$?
-lines="$(wc -l <"$home/progress")"
-sleep 0.5
-expect "locked TERM: exit status" "143" "$rc"
-expect "locked TERM: main stopped" "$lines" "$(wc -l <"$home/progress")"
-wd="$(cat "$home/wd")"
-if [[ -n "$wd" && ! -e "$wd" ]]; then echo "ok   locked TERM: run dir removed"; else echo "FAIL locked TERM left $wd"; failures=$((failures + 1)); fi
+# INT is forwarded as TERM: main runs as an asynchronous subshell, which ignores INT.
+# The script starts with SIGINT at its default, as from a terminal.
+for sig in TERM INT; do
+  rm -f "$home/progress" "$home/wd"
+  env -i PATH="$stubs:/usr/bin:/bin" HOME="$home" REMFIELD_HOME="$home/remfield" \
+    STUB_TOTAL=$((618 * GIB)) STUB_AVAIL=$((363 * GIB)) STUB_KIT=$GIB STUB_TARGET=/home \
+    python3 -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.execvp(sys.argv[1], sys.argv[1:])' \
+    bash "$home/locked.sh" >/dev/null 2>&1 &
+  locked=$!
+  for _ in $(seq 100); do [[ -s "$home/progress" ]] && break; sleep 0.1; done
+  kill "-$sig" "$locked"
+  rc=0
+  wait "$locked" || rc=$?
+  lines="$(wc -l <"$home/progress")"
+  sleep 0.5
+  expect "locked $sig: exit status" "143" "$rc"
+  expect "locked $sig: main stopped" "$lines" "$(wc -l <"$home/progress")"
+  wd="$(cat "$home/wd")"
+  if [[ -n "$wd" && ! -e "$wd" ]]; then echo "ok   locked $sig: run dir removed"; else echo "FAIL locked $sig left $wd"; failures=$((failures + 1)); fi
+done
 
 if (( failures )); then
   printf '%d disk-guard check(s) failed\n' "$failures"

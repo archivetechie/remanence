@@ -43,15 +43,20 @@ way, the kit user no longer needs a sudo rule for `setcap`. Delete that rule.
 
 The plan refuses to start unless `~/remfield/allowlist.txt` lists exactly the
 plan's barcodes, with no cleaning cartridge. It also refuses if the kit state has
-selected a different library.
+selected a different library. Check the allowlist with
+`sudo -u remfield cat ~remfield/remfield/allowlist.txt`. To write a new one, run
+`FIELD_BIN_DIR=/opt/remfield/current/bin /opt/remfield/current/scripts/01-allowlist.sh`
+interactively as remfield; it asks you to type the barcodes.
 
 ## 4. Start it (as the kit user, in tmux)
 
 ```
-sudo -iu remfield tmux new -s run '/opt/remfield/current/run.sh plan/smoke.env'
+sudo -iu remfield tmux new -s run '/opt/remfield/current/run.sh plan/smoke.env; exec bash'
 ```
 
-Detach with `Ctrl-b d`. The run log is in `~/remfield/log/run-<plan>-<stamp>.log`.
+Detach with `Ctrl-b d`, and reattach with `sudo -iu remfield tmux attach -t run`.
+The window stays open after the run, so you can read the result. The run log is
+`~/remfield/evidence/run-<plan>-<stamp>.log`, and it goes into the evidence pack.
 
 To stop early, press `Ctrl-c` in the tmux window, or send TERM to the `run.sh` process.
 Either way the current leg stops. If something failed, run.sh captures read-only
@@ -61,8 +66,8 @@ pack's path and its sha256.
 
 ## 5. Return the evidence
 
-Copy `~/remfield/evidence-pack-<date>.tar.gz` back from your own account. Send its
-sha256 with it.
+Copy `~/remfield/evidence-pack-<plan>-<stamp>.tar.gz` (the path run.sh printed)
+back from your own account. Send its sha256 with it.
 
 ## Undo
 
