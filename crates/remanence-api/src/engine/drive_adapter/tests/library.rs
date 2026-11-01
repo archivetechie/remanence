@@ -518,6 +518,7 @@ fn mounted_library_terminal_capacity_refusal_keeps_typed_cause() {
     let (_library, mut drive, _policy) = library_parts(&fixture);
     for mounted in [true, false] {
         let cfg = write_owner::TerminalWriteConfig {
+            io_memory: crate::io_memory::IoMemoryReservation::new(1024 * 1024 * 1024).unwrap(),
             mounted_endpoint: mounted.then(|| remanence_library::DriveKey::new(LIBRARY, BAY)),
             checkpoint_journal_dir: fixture.config.journal.dir.join("tapes"),
             audit_dir: fixture.config.audit.dir.clone(),

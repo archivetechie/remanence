@@ -39,12 +39,12 @@ pub struct UncoveredRange {
 
 /// One epoch's parity and ordered CRCs; never owns data blocks.
 pub struct EpochAccumulator {
-    tape_uuid: [u8; 16],
-    scheme: ParityScheme,
-    block_size: u32,
-    epoch_id: u64,
-    epoch_start: u64,
-    next_ordinal: u64,
+    pub(crate) tape_uuid: [u8; 16],
+    pub(crate) scheme: ParityScheme,
+    pub(crate) block_size: u32,
+    pub(crate) epoch_id: u64,
+    pub(crate) epoch_start: u64,
+    pub(crate) next_ordinal: u64,
     pub(crate) codec: ReedSolomonCodec,
     pub(crate) parity_accumulators: Vec<Vec<Vec<u8>>>,
     pub(crate) current_epoch_data_crc64s: Vec<u64>,
@@ -64,6 +64,55 @@ impl EpochAccumulator {
                     .and_then(|n| v.checked_add(n))
             })
             .ok_or(ParityError::Invariant("epoch reservation overflows"))
+    }
+
+    /// Conservative closeout working set, including containers, codec, bounded
+    /// forward reads, index encoding, both index copies, and extent summaries.
+    pub fn working_reservation_bytes(
+        scheme: &ParityScheme,
+        block_size: u32,
+        extent_count: u64,
+    ) -> Result<u64, ParityError> {
+        scheme.validate()?;
+        let core = Self::reservation_bytes(scheme, block_size)?;
+        let s = u64::from(scheme.stripes_per_neighborhood);
+        let m = u64::from(scheme.parity_blocks_per_stripe);
+        let k = u64::from(scheme.data_blocks_per_stripe);
+        let p = s
+            .checked_mul(m)
+            .ok_or(ParityError::Invariant("closeout parity count overflows"))?;
+        let d = s
+            .checked_mul(k)
+            .ok_or(ParityError::Invariant("closeout data count overflows"))?;
+        let h = crate::sidecar::checked_sidecar_index_capacity_layout(u64::from(block_size), p, d)?
+            .block_count;
+        let bytes = (|| {
+            let headers = s
+                .checked_add(p.checked_mul(4)?)?
+                .checked_add(m)?
+                .checked_mul(std::mem::size_of::<Vec<u8>>() as u64)?;
+            let index = p
+                .checked_mul(std::mem::size_of::<crate::sidecar::ParityShardIndexEntry>() as u64)?
+                .checked_add(d.checked_mul(8)?)?
+                .checked_mul(6)?;
+            let scratch = h
+                .checked_mul(3)?
+                .checked_add(3)?
+                .checked_add(u64::from(remanence_library::DEFAULT_TAPE_IO_BATCH_BLOCKS))?
+                .checked_mul(u64::from(block_size))?;
+            let extents = extent_count
+                .checked_mul(std::mem::size_of::<CommittedExtent>() as u64)?
+                .checked_mul(3)?;
+            core.checked_add(headers)?
+                .checked_add(m.checked_mul(k)?)?
+                .checked_add(index)?
+                .checked_add(scratch)?
+                .checked_add(extents)?
+                .checked_add(std::mem::size_of::<Self>() as u64)
+        })();
+        bytes.ok_or(ParityError::Invariant(
+            "closeout working reservation overflows",
+        ))
     }
 
     /// Start an empty epoch after its memory has been reserved.
@@ -98,6 +147,55 @@ impl EpochAccumulator {
             parity_accumulators,
             current_epoch_data_crc64s: Vec::with_capacity(capacity),
             check: CheckValueBuilder::new(),
+        })
+    }
+
+    /// Adopt rebuilt parity without allocating another epoch payload.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_rebuilt(
+        tape_uuid: [u8; 16],
+        scheme: &ParityScheme,
+        block_size: u32,
+        epoch_id: u64,
+        epoch_start: u64,
+        next_ordinal: u64,
+        parity_accumulators: Vec<Vec<Vec<u8>>>,
+        block_crcs: Vec<u64>,
+    ) -> Result<Self, ParityError> {
+        scheme.validate()?;
+        let count = next_ordinal
+            .checked_sub(epoch_start)
+            .ok_or(ParityError::Invariant("rebuilt epoch range reversed"))?;
+        if block_size == 0
+            || count != block_crcs.len() as u64
+            || count
+                > u64::from(scheme.stripes_per_neighborhood)
+                    * u64::from(scheme.data_blocks_per_stripe)
+            || parity_accumulators.len() != scheme.stripes_per_neighborhood as usize
+            || parity_accumulators.iter().any(|stripe| {
+                stripe.len() != scheme.parity_blocks_per_stripe as usize
+                    || stripe
+                        .iter()
+                        .any(|shard| shard.len() != block_size as usize)
+            })
+        {
+            return Err(ParityError::Invariant("rebuilt epoch geometry mismatch"));
+        }
+        let mut check = CheckValueBuilder::new();
+        for &crc in &block_crcs {
+            check.push(crc);
+        }
+        Ok(Self {
+            tape_uuid,
+            scheme: scheme.clone(),
+            block_size,
+            epoch_id,
+            epoch_start,
+            next_ordinal,
+            codec: ReedSolomonCodec::new(scheme)?,
+            parity_accumulators,
+            current_epoch_data_crc64s: block_crcs,
+            check,
         })
     }
 
@@ -209,6 +307,23 @@ pub trait CommittedReader {
     fn locate(&mut self, partition: u32, lba: u64) -> Result<(), CloseoutError>;
     /// Fill exactly one fixed block; reject boundaries and short records.
     fn read_block(&mut self, buf: &mut [u8]) -> Result<(), CloseoutError>;
+    /// Read one contiguous committed extent. Adapters may batch these reads.
+    fn read_extent(
+        &mut self,
+        partition: u32,
+        lba: u64,
+        start: u64,
+        end: u64,
+        accumulator: &mut EpochAccumulator,
+    ) -> Result<(), CloseoutError> {
+        self.locate(partition, lba)?;
+        let mut block = vec![0; accumulator.block_size as usize];
+        for ordinal in start..end {
+            self.read_block(&mut block)?;
+            accumulator.push_block(ordinal, &block)?;
+        }
+        Ok(())
+    }
 }
 
 /// Failure to establish checked rebuilt parity.
@@ -250,6 +365,42 @@ pub fn rebuild_uncovered(
     partition: u32,
     range: &UncoveredRange,
 ) -> Result<EpochAccumulator, CloseoutError> {
+    for attempt in 0..2 {
+        let accumulator =
+            rebuild_uncovered_once(tape_uuid, reader, scheme, block_size, partition, range)?;
+        let found = accumulator.check_value();
+        if found == range.check {
+            return Ok(accumulator);
+        }
+        // Release the whole parity payload before identity proof or another allocation.
+        drop(accumulator);
+        if attempt == 1 {
+            return Err(CloseoutError::CheckMismatch {
+                expected: range.check,
+                found,
+            });
+        }
+        tracing::warn!(
+            epoch_id = range.epoch_id,
+            start = range.w,
+            end = range.t,
+            "closeout check mismatch; re-proving identity before one full reread"
+        );
+        reader.reprove_identity()?;
+    }
+    unreachable!("two attempts return")
+}
+
+/// One shared read pass, also used for pre-cut-over UnverifiedRebuild authority.
+/// Only the checked entry point may claim agreement with original-write bytes.
+pub(crate) fn rebuild_uncovered_once(
+    tape_uuid: [u8; 16],
+    reader: &mut dyn CommittedReader,
+    scheme: &ParityScheme,
+    block_size: u32,
+    partition: u32,
+    range: &UncoveredRange,
+) -> Result<EpochAccumulator, CloseoutError> {
     let count = range
         .t
         .checked_sub(range.w)
@@ -259,6 +410,7 @@ pub fn rebuild_uncovered(
         return Err(ParityError::Invariant("uncovered range exceeds epoch").into());
     }
     let mut spans = Vec::new();
+    let mut previous_file = None;
     let mut next = range.w;
     for extent in &range.extents {
         let end = extent
@@ -270,6 +422,10 @@ pub fn rebuild_uncovered(
         if start >= end {
             continue;
         }
+        if previous_file.is_some_and(|file| file >= extent.tape_file_number) {
+            return Err(ParityError::Invariant("committed files out of order").into());
+        }
+        previous_file = Some(extent.tape_file_number);
         if start != next {
             return Err(ParityError::Invariant("committed extent gap or overlap").into());
         }
@@ -285,32 +441,29 @@ pub fn rebuild_uncovered(
     if next != range.t {
         return Err(ParityError::Invariant("committed extent gap").into());
     }
-    for attempt in 0..2 {
-        let mut accumulator =
-            EpochAccumulator::new(tape_uuid, scheme, block_size, range.epoch_id, range.w)?;
-        let mut block = vec![0; block_size as usize];
-        for &(start, end, lba) in &spans {
-            reader.locate(partition, lba)?;
-            for ordinal in start..end {
-                reader.read_block(&mut block)?;
-                accumulator.push_block(ordinal, &block)?;
-            }
-        }
-        let found = accumulator.check_value();
-        if found == range.check {
-            return Ok(accumulator);
-        }
-        drop(accumulator);
-        drop(block);
-        if attempt == 1 {
-            return Err(CloseoutError::CheckMismatch {
-                expected: range.check,
-                found,
-            });
-        }
-        reader.reprove_identity()?;
+    let mut accumulator =
+        EpochAccumulator::new(tape_uuid, scheme, block_size, range.epoch_id, range.w)?;
+    for (start, end, lba) in spans {
+        reader.read_extent(partition, lba, start, end, &mut accumulator)?;
     }
-    unreachable!("two attempts return")
+    Ok(accumulator)
+}
+
+impl CloseoutError {
+    /// Preserve existing reader classes at the legacy parity API boundary.
+    pub(crate) fn into_parity(self) -> ParityError {
+        match self {
+            Self::CheckMismatch { expected, found } => {
+                ParityError::CloseoutCheckMismatch { expected, found }
+            }
+            Self::Boundary { lba } => {
+                ParityError::ResumeAppend(format!("committed boundary contradiction at LBA {lba}"))
+            }
+            Self::TapeIo(error) => ParityError::TapeIo(error),
+            Self::Parity(error) => error,
+            Self::Memory => ParityError::Invariant("closeout memory reservation refused"),
+        }
+    }
 }
 
 #[cfg(test)]

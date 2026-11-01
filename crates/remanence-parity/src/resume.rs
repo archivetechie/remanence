@@ -12,6 +12,7 @@ use ciborium::value::Value as CborValue;
 use remanence_library::{TapeIoError, TapePosition, WriteFilemarksOutcome};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
 use crate::codec::ReedSolomonCodec;
 use crate::durable::DurableBoundaryState;
 use crate::error::ParityError;
@@ -30,10 +31,7 @@ use crate::raw::{
     device_position_error, read_fixed_record, tape_error_is_end_of_data, FixedRecordRead,
     PhysicalPositionHint, RawTapeSink, RawTapeSource, RawWriteOutcome,
 };
-use crate::sidecar::{
-    data_shard_crc64, encode_sidecar_tape_file, parity_block_position, parse_sidecar_tape_file,
-    EncodedSidecarTapeFile, SidecarDescriptor,
-};
+use crate::sidecar::{parity_block_position, parse_sidecar_tape_file, EncodedSidecarTapeFile};
 use crate::sink::{SidecarTapeFile, TerminalPrefixPlan, TerminalPrefixReconcileEvidence};
 
 /// Interpret off-tape record validation at the Resumer boundary (§3.4/§14).
@@ -135,12 +133,8 @@ pub struct ResumeRebuiltSidecar {
 
 /// Rebuilt state for the final partial epoch that remains live after resume.
 ///
-/// The current rebuild bridge stores the partial data shards across the
-/// resume handoff so the writer can validate CRCs and reconstruct the live
-/// parity accumulators before accepting new object data. The public shape
-/// makes the resume boundary explicit; a later bridge can carry parity
-/// accumulators directly without changing the catalog-driven append-point
-/// rule.
+/// Owns only the shared kernel's parity buffers and ordered CRCs. The sink
+/// consumes these buffers directly; no data shards cross the resume boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResumeLiveEpochState {
     /// Bare monotonic epoch identifier.
@@ -151,10 +145,12 @@ pub struct ResumeLiveEpochState {
     pub next_data_ordinal: u64,
     /// Number of real data shards currently loaded in this epoch.
     pub data_blocks_in_epoch: u64,
-    /// Per-stripe data buffers in row-major epoch order.
-    pub stripe_buffers: Vec<Vec<Vec<u8>>>,
+    /// Per-stripe parity buffers; data blocks are never retained.
+    pub parity_accumulators: Vec<Vec<Vec<u8>>>,
     /// CRC-64/XZ values for the real data shards in ordinal order.
     pub data_shard_crc64s: Vec<u64>,
+    /// True only after matching the durable original-write check.
+    pub(crate) original_write_verified: bool,
 }
 
 /// Result of rereading `[W,T)` from the committed prefix.
@@ -232,30 +228,6 @@ pub struct ResumeOpenEpochObjectExtent {
     pub block_count: u64,
     /// Physical start LBA derived from the validated structural prefix.
     pub physical_start_lba: u64,
-}
-
-impl ResumeOpenEpochObjectExtent {
-    fn end_exclusive(&self) -> Result<u64, ParityError> {
-        self.first_parity_data_ordinal
-            .checked_add(self.block_count)
-            .ok_or_else(|| resume_error("resume Object ordinal range overflows"))
-    }
-
-    fn position_for_ordinal(
-        &self,
-        ordinal: u64,
-    ) -> Result<Option<PhysicalPositionHint>, ParityError> {
-        let end = self.end_exclusive()?;
-        if ordinal < self.first_parity_data_ordinal || ordinal >= end {
-            return Ok(None);
-        }
-        let block_within_file = ordinal - self.first_parity_data_ordinal;
-        let lba = self
-            .physical_start_lba
-            .checked_add(block_within_file)
-            .ok_or_else(|| resume_error("resume Object physical position overflows"))?;
-        Ok(Some(PhysicalPositionHint::new(lba)))
-    }
 }
 
 /// Allocation-bounded authority needed to reopen a parity append session.
@@ -1308,6 +1280,7 @@ fn rebuild_open_epoch_from_committed_prefix(
     scheme: &ParityScheme,
     tape_uuid: [u8; 16],
     block_size: u32,
+    original_check: crate::CheckValue,
 ) -> Result<ResumeOpenEpochRebuild, ParityError> {
     let plan = plan_resume_append_from_committed_prefix(committed_prefix, scheme)?;
     rebuild_open_epoch_from_plan(
@@ -1317,6 +1290,7 @@ fn rebuild_open_epoch_from_committed_prefix(
         tape_uuid,
         block_size,
         plan,
+        original_check,
     )
 }
 
@@ -1331,6 +1305,23 @@ pub fn rebuild_open_epoch_from_bounded_summary(
     tape_uuid: [u8; 16],
     block_size: u32,
 ) -> Result<ResumeOpenEpochRebuild, ParityError> {
+    rebuild_open_epoch_from_bounded_summary_checked(
+        source, summary, scheme, tape_uuid, block_size, None,
+    )
+}
+
+/// Rebuild from frozen committed extents through the shared kernel. `Some`
+/// supplies the last durable original-write check; `None` is solely the legacy
+/// UnverifiedRebuild case. Callers reserve closeout memory before entry.
+pub fn rebuild_open_epoch_from_bounded_summary_checked(
+    source: &mut dyn RawTapeSource,
+    summary: &BoundedResumeSummary,
+    scheme: &ParityScheme,
+    tape_uuid: [u8; 16],
+    block_size: u32,
+    original_check: Option<crate::CheckValue>,
+) -> Result<ResumeOpenEpochRebuild, ParityError> {
+    use crate::closeout::{CommittedExtent, UncoveredRange};
     let plan = summary.append_plan(scheme)?;
     if block_size == 0 {
         return Err(resume_error("resume rebuild block size is zero"));
@@ -1351,119 +1342,217 @@ pub fn rebuild_open_epoch_from_bounded_summary(
             live_epoch: None,
         });
     }
-
-    let mut accumulator = ResumeEpochAccumulator::new(
-        scheme,
+    let range = UncoveredRange {
+        epoch_id: plan.next_epoch_id,
+        w: plan.highest_protected_ordinal_before_rebuild,
+        t: plan.next_data_ordinal,
+        check: original_check.unwrap_or(crate::CheckValue::EMPTY),
+        extents: summary
+            .open_epoch_object_extents
+            .iter()
+            .map(|e| CommittedExtent {
+                tape_file_number: e.tape_file_number,
+                first_ordinal: e.first_parity_data_ordinal,
+                block_count: e.block_count,
+                physical_start_lba: e.physical_start_lba,
+            })
+            .collect(),
+    };
+    let mut reader = CommittedRawReader {
+        source,
         tape_uuid,
+        scheme,
         block_size,
-        plan.highest_protected_ordinal_before_rebuild,
-        plan.next_epoch_id,
-    )?;
-    // Each committed extent is contiguous. Limit buffers to the same batch
-    // geometry used by the forward verification reader.
-    let batch_blocks = remanence_library::DEFAULT_TAPE_IO_BATCH_BLOCKS;
-    let mut buffer = vec![
-        0;
-        ParityError::host_usize(
-            u64::from(block_size) * u64::from(batch_blocks),
-            "resume read buffer"
-        )?
-    ];
-    let mut ordinal = plan.highest_protected_ordinal_before_rebuild;
-    for extent in &summary.open_epoch_object_extents {
-        let start = extent.first_parity_data_ordinal.max(ordinal);
-        let end = extent.end_exclusive()?.min(plan.next_data_ordinal);
-        if start >= end {
-            continue;
-        }
-        if start != ordinal {
-            return Err(resume_error("open-epoch extents omit committed data"));
-        }
-        let physical = extent
-            .position_for_ordinal(start)?
-            .ok_or_else(|| resume_error("open-epoch extent omits its first ordinal"))?;
-        locate_committed_position(
-            source,
-            physical,
-            format_args!("committed extent at ordinal {start}"),
-        )?;
-        while ordinal < end {
-            let count = (end - ordinal).min(u64::from(batch_blocks)) as u32;
-            let forward = source.read_forward_records(&mut buffer, block_size, count);
-            let batch = forward.batch;
-            if batch.records_read > count {
-                return Err(ParityError::Invariant(
-                    "resume forward read exceeds requested count",
-                ));
-            }
-            // Only full records count; a short record, boundary or unclean
-            // command contradicts the extent or retains its original I/O error.
-            if let crate::raw::RawReadEnd::Error(error) = batch.end {
-                let length_refusal = match &error {
-                    ParityError::TapeIo(
-                        remanence_library::TapeIoError::InvalidRequest(_)
-                        | remanence_library::TapeIoError::ReadBufferTooSmall { .. },
-                    ) => true,
-                    ParityError::TapeIo(io) => {
-                        io.check_condition_transfer().is_some_and(|(sense, _)| {
-                            remanence_library::decode_scsi_sense(sense)
-                                .is_some_and(|s| !s.is_deferred() && s.key == 0 && s.ili)
-                        })
-                    }
-                    _ => false,
-                };
-                if length_refusal {
-                    // A fixed READ cannot always measure a malformed record.
-                    // Re-read this failed batch one record at a time to retain
-                    // the Resumer's length checks. Transport/medium errors do not retry.
-                    let position = extent
-                        .position_for_ordinal(ordinal)?
-                        .expect("validated extent");
-                    locate_committed_position(source, position, format_args!("malformed extent"))?;
-                    for offset in 0..u64::from(count) {
-                        reread_committed_data_block(
-                            source,
-                            ordinal + offset,
-                            PhysicalPositionHint::new(position.lba + offset),
-                            block_size,
-                        )?;
-                    }
-                }
-                return Err(error);
-            }
-            if forward.unconfirmed_boundary
-                || batch.records_read == 0
-                || !matches!(batch.end, crate::raw::RawReadEnd::Complete)
-            {
-                return Err(resume_error(format!(
-                    "resume rebuild ordinal {ordinal} encounters {:?} instead of {count} committed {block_size}-byte blocks",
-                    batch.end)));
-            }
-            for block in buffer[..batch.records_read as usize * block_size as usize]
-                .chunks_exact(block_size as usize)
-            {
-                accumulator.push_block(ordinal, block.to_vec())?;
-                ordinal += 1;
-            }
-        }
-    }
-    if ordinal != plan.next_data_ordinal {
-        return Err(resume_error("open-epoch extents omit committed data"));
-    }
-    let (rebuilt_sidecars, live_epoch) = accumulator.finish()?;
-    if !rebuilt_sidecars.is_empty() {
-        return Err(ParityError::Invariant(
-            "v1 bounded open epoch unexpectedly rebuilt a complete sidecar",
-        ));
-    }
+        next_lba: 0,
+        buffer: vec![
+            0;
+            ParityError::host_usize(
+                u64::from(block_size) * u64::from(remanence_library::DEFAULT_TAPE_IO_BATCH_BLOCKS),
+                "resume read buffer"
+            )?
+        ],
+    };
+    let rebuild = if original_check.is_some() {
+        crate::closeout::rebuild_uncovered
+    } else {
+        crate::closeout::rebuild_uncovered_once
+    };
+    let accumulator = rebuild(
+        tape_uuid,
+        &mut reader,
+        scheme,
+        block_size,
+        plan.append_position.partition,
+        &range,
+    )
+    .map_err(crate::closeout::CloseoutError::into_parity)?;
+    let live_epoch = Some(live_epoch_from_accumulator(
+        accumulator,
+        original_check.is_some(),
+    ));
     locate_resume_append_position(source, plan.append_position)?;
     Ok(ResumeOpenEpochRebuild {
         plan,
-        rebuilt_sidecars,
+        rebuilt_sidecars: Vec::new(),
         live_epoch,
     })
 }
 
+/// Batched forward reader preserving the existing committed-length and I/O rules.
+struct CommittedRawReader<'a> {
+    source: &'a mut dyn RawTapeSource,
+    tape_uuid: [u8; 16],
+    scheme: &'a ParityScheme,
+    block_size: u32,
+    next_lba: u64,
+    buffer: Vec<u8>,
+}
+
+impl crate::closeout::CommittedReader for CommittedRawReader<'_> {
+    fn reprove_identity(&mut self) -> Result<(), crate::closeout::CloseoutError> {
+        self.locate(0, 0)?;
+        let mut block = vec![0; self.block_size as usize];
+        self.read_block(&mut block)?;
+        let bot = crate::bootstrap::parse_bootstrap_block(&block)?;
+        let geometry_matches = bot.scheme.as_ref().is_some_and(|s| {
+            s.id == self.scheme.id.as_str()
+                && s.data_blocks_per_stripe == self.scheme.data_blocks_per_stripe
+                && s.parity_blocks_per_stripe == self.scheme.parity_blocks_per_stripe
+                && s.stripes_per_neighborhood == self.scheme.stripes_per_neighborhood
+        });
+        if bot.tape_uuid != self.tape_uuid
+            || bot.block_size_bytes != self.block_size
+            || bot.drive_compression
+            || !geometry_matches
+        {
+            return Err(ParityError::SessionOpen(
+                "closeout reread identity or geometry changed".into(),
+            )
+            .into());
+        }
+        Ok(())
+    }
+    fn locate(&mut self, partition: u32, lba: u64) -> Result<(), crate::closeout::CloseoutError> {
+        locate_committed_position(
+            self.source,
+            PhysicalPositionHint { partition, lba },
+            format_args!("committed closeout extent"),
+        )?;
+        self.next_lba = lba;
+        Ok(())
+    }
+    fn read_block(&mut self, buf: &mut [u8]) -> Result<(), crate::closeout::CloseoutError> {
+        match self.source.read_record(buf)? {
+            crate::raw::RawReadOutcome::Block { bytes, .. } if bytes == buf.len() => {
+                self.next_lba += 1;
+                Ok(())
+            }
+            _ => Err(crate::closeout::CloseoutError::Boundary { lba: self.next_lba }),
+        }
+    }
+    fn read_extent(
+        &mut self,
+        partition: u32,
+        lba: u64,
+        start: u64,
+        end: u64,
+        accumulator: &mut crate::closeout::EpochAccumulator,
+    ) -> Result<(), crate::closeout::CloseoutError> {
+        self.locate(partition, lba)?;
+        accumulate_extent(
+            self.source,
+            &mut self.buffer,
+            self.block_size,
+            partition,
+            lba,
+            start,
+            end,
+            accumulator,
+        )?;
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accumulate_extent(
+    source: &mut dyn RawTapeSource,
+    buffer: &mut [u8],
+    block_size: u32,
+    partition: u32,
+    lba: u64,
+    start: u64,
+    end: u64,
+    accumulator: &mut crate::closeout::EpochAccumulator,
+) -> Result<(), ParityError> {
+    let batch_blocks = remanence_library::DEFAULT_TAPE_IO_BATCH_BLOCKS;
+    let mut ordinal = start;
+    while ordinal < end {
+        let count = (end - ordinal).min(u64::from(batch_blocks)) as u32;
+        let forward = source.read_forward_records(buffer, block_size, count);
+        let batch = forward.batch;
+        if batch.records_read > count {
+            return Err(ParityError::Invariant(
+                "resume forward read exceeds requested count",
+            ));
+        }
+        // Only full records count; a short record, boundary or unclean
+        // command contradicts the extent or retains its original I/O error.
+        if let crate::raw::RawReadEnd::Error(error) = batch.end {
+            let length_refusal = match &error {
+                ParityError::TapeIo(
+                    remanence_library::TapeIoError::InvalidRequest(_)
+                    | remanence_library::TapeIoError::ReadBufferTooSmall { .. },
+                ) => true,
+                ParityError::TapeIo(io) => {
+                    io.check_condition_transfer().is_some_and(|(sense, _)| {
+                        remanence_library::decode_scsi_sense(sense)
+                            .is_some_and(|s| !s.is_deferred() && s.key == 0 && s.ili)
+                    })
+                }
+                _ => false,
+            };
+            if length_refusal {
+                // A fixed READ cannot always measure a malformed record.
+                // Re-read this failed batch one record at a time to retain
+                // the Resumer's length checks. Transport/medium errors do not retry.
+                let position = PhysicalPositionHint {
+                    partition,
+                    lba: lba + (ordinal - start),
+                };
+                locate_committed_position(source, position, format_args!("malformed extent"))?;
+                for offset in 0..u64::from(count) {
+                    reread_committed_data_block(
+                        source,
+                        ordinal + offset,
+                        PhysicalPositionHint {
+                            partition,
+                            lba: position.lba + offset,
+                        },
+                        block_size,
+                    )?;
+                }
+            }
+            return Err(error);
+        }
+        if forward.unconfirmed_boundary
+            || batch.records_read == 0
+            || !matches!(batch.end, crate::raw::RawReadEnd::Complete)
+        {
+            return Err(resume_error(format!(
+                    "resume rebuild ordinal {ordinal} encounters {:?} instead of {count} committed {block_size}-byte blocks",
+                    batch.end)));
+        }
+        for block in buffer[..batch.records_read as usize * block_size as usize]
+            .chunks_exact(block_size as usize)
+        {
+            accumulator.push_block(ordinal, block)?;
+            ordinal += 1;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn rebuild_open_epoch_from_plan(
     source: &mut dyn RawTapeSource,
     committed_prefix: &FilemarkMap,
@@ -1471,6 +1560,7 @@ fn rebuild_open_epoch_from_plan(
     tape_uuid: [u8; 16],
     block_size: u32,
     plan: ResumeAppendPlan,
+    original_check: crate::CheckValue,
 ) -> Result<ResumeOpenEpochRebuild, ParityError> {
     if block_size == 0 {
         return Err(resume_error("resume rebuild block size is zero"));
@@ -1498,18 +1588,57 @@ fn rebuild_open_epoch_from_plan(
         .next_epoch_id
         .checked_sub(rebuilt_epoch_count)
         .ok_or_else(|| resume_error("resume rebuild epoch id underflows"))?;
-    let mut accumulator = ResumeEpochAccumulator::new(
-        scheme,
-        tape_uuid,
-        block_size,
-        plan.highest_protected_ordinal_before_rebuild,
-        first_rebuild_epoch_id,
-    )?;
-    for ordinal in plan.highest_protected_ordinal_before_rebuild..plan.next_data_ordinal {
-        let block = read_committed_object_block(source, committed_prefix, ordinal, block_size)?;
-        accumulator.push_block(ordinal, block)?;
-    }
-    let (rebuilt_sidecars, live_epoch) = accumulator.finish()?;
+    let (rebuilt_sidecars, live_epoch) = {
+        let mut attempt = 0;
+        loop {
+            let mut accumulator = ResumeEpochBuilder::new(
+                scheme,
+                tape_uuid,
+                block_size,
+                plan.highest_protected_ordinal_before_rebuild,
+                first_rebuild_epoch_id,
+            )?;
+            for ordinal in plan.highest_protected_ordinal_before_rebuild..plan.next_data_ordinal {
+                let block =
+                    read_committed_object_block(source, committed_prefix, ordinal, block_size)?;
+                accumulator.push_block(ordinal, &block)?;
+            }
+            let (sidecars, mut live) = accumulator.finish()?;
+            let found = crate::check_value(
+                sidecars
+                    .iter()
+                    .flat_map(|s| s.encoded.index.data_shard_crc64s.iter().copied())
+                    .chain(
+                        live.iter()
+                            .flat_map(|s| s.data_shard_crc64s.iter().copied()),
+                    ),
+            );
+            if found == original_check {
+                if let Some(live) = &mut live {
+                    live.original_write_verified = true;
+                }
+                break (sidecars, live);
+            }
+            drop(sidecars);
+            drop(live);
+            if attempt == 1 {
+                return Err(ParityError::CloseoutCheckMismatch {
+                    expected: original_check,
+                    found,
+                });
+            }
+            crate::closeout::CommittedReader::reprove_identity(&mut CommittedRawReader {
+                source,
+                tape_uuid,
+                scheme,
+                block_size,
+                next_lba: 0,
+                buffer: Vec::new(),
+            })
+            .map_err(crate::closeout::CloseoutError::into_parity)?;
+            attempt += 1;
+        }
+    };
 
     validate_rebuilt_sidecars(&rebuilt_sidecars, &plan.sidecars_to_emit)?;
 
@@ -1876,7 +2005,8 @@ fn plan_legacy_forensic_resume_append_from_committed_prefix(
 /// [`rebuild_open_epoch_from_committed_prefix`], which rejects such prefixes as
 /// catalog corruption or legacy media. This helper exists to keep historical
 /// crash-window and forensic recovery tests explicit while preserving the
-/// sidecar-emission bridge.
+/// sidecar-emission bridge. Original-write CRC evidence is required even here;
+/// no forensic sidecar may be published from an unchecked reread.
 #[doc(hidden)]
 pub fn rebuild_legacy_forensic_open_epoch_from_committed_prefix(
     source: &mut dyn RawTapeSource,
@@ -1884,6 +2014,7 @@ pub fn rebuild_legacy_forensic_open_epoch_from_committed_prefix(
     scheme: &ParityScheme,
     tape_uuid: [u8; 16],
     block_size: u32,
+    original_check: crate::CheckValue,
 ) -> Result<ResumeOpenEpochRebuild, ParityError> {
     let plan = plan_legacy_forensic_resume_append_from_committed_prefix(committed_prefix, scheme)?;
     rebuild_open_epoch_from_plan(
@@ -1893,6 +2024,7 @@ pub fn rebuild_legacy_forensic_open_epoch_from_committed_prefix(
         tape_uuid,
         block_size,
         plan,
+        original_check,
     )
 }
 
@@ -1959,22 +2091,21 @@ fn epoch_data_shards(scheme: &ParityScheme) -> Result<u64, ParityError> {
         .ok_or_else(|| resume_error("epoch data-shard count overflows or is zero"))
 }
 
-struct ResumeEpochAccumulator {
+/// Legacy multi-epoch adapter. Each block uses the shared incremental kernel;
+/// completed output sidecars remain queued, but no original data is retained.
+struct ResumeEpochBuilder {
     scheme: ParityScheme,
-    codec: ReedSolomonCodec,
     tape_uuid: [u8; 16],
     block_size: u32,
     epoch_data_shards: u64,
     expected_next_ordinal: u64,
     current_epoch_id: u64,
     current_epoch_start: u64,
-    current_epoch_data: u64,
-    stripe_buffers: Vec<Vec<Vec<u8>>>,
-    data_shard_crc64s: Vec<u64>,
+    accumulator: Option<crate::closeout::EpochAccumulator>,
     rebuilt_sidecars: Vec<ResumeRebuiltSidecar>,
 }
 
-impl ResumeEpochAccumulator {
+impl ResumeEpochBuilder {
     fn new(
         scheme: &ParityScheme,
         tape_uuid: [u8; 16],
@@ -1982,137 +2113,84 @@ impl ResumeEpochAccumulator {
         first_ordinal: u64,
         first_epoch_id: u64,
     ) -> Result<Self, ParityError> {
-        let epoch_data_shards = epoch_data_shards(scheme)?;
-        let codec = ReedSolomonCodec::new(scheme)?;
-        let stripe_buffers = (0..scheme.stripes_per_neighborhood)
-            .map(|_| Vec::with_capacity(codec.data_blocks()))
-            .collect();
         Ok(Self {
             scheme: scheme.clone(),
-            codec,
             tape_uuid,
             block_size,
-            epoch_data_shards,
+            epoch_data_shards: epoch_data_shards(scheme)?,
             expected_next_ordinal: first_ordinal,
             current_epoch_id: first_epoch_id,
             current_epoch_start: first_ordinal,
-            current_epoch_data: 0,
-            stripe_buffers,
-            data_shard_crc64s: Vec::new(),
+            accumulator: None,
             rebuilt_sidecars: Vec::new(),
         })
     }
 
-    fn push_block(&mut self, ordinal: u64, block: Vec<u8>) -> Result<(), ParityError> {
+    fn push_block(&mut self, ordinal: u64, block: &[u8]) -> Result<(), ParityError> {
         if ordinal != self.expected_next_ordinal {
-            return Err(resume_error(format!(
-                "resume rebuild expected ordinal {}, got {ordinal}",
-                self.expected_next_ordinal
-            )));
+            return Err(resume_error("resume rebuild ordinal gap"));
         }
-        if block.len() != self.block_size as usize {
-            return Err(resume_error(format!(
-                "resume rebuild ordinal {ordinal} length {} != block_size {}",
-                block.len(),
-                self.block_size
-            )));
+        if self.accumulator.is_none() {
+            self.accumulator = Some(crate::closeout::EpochAccumulator::new(
+                self.tape_uuid,
+                &self.scheme,
+                self.block_size,
+                self.current_epoch_id,
+                self.current_epoch_start,
+            )?);
         }
-
-        let stripe_index =
-            (self.current_epoch_data % u64::from(self.scheme.stripes_per_neighborhood)) as usize;
-        let row = self.current_epoch_data / u64::from(self.scheme.stripes_per_neighborhood);
-        if row >= u64::from(self.scheme.data_blocks_per_stripe) {
-            return Err(resume_error(
-                "resume rebuild epoch row exceeds data_blocks_per_stripe",
-            ));
-        }
-        self.data_shard_crc64s.push(data_shard_crc64(&block));
-        self.stripe_buffers[stripe_index].push(block);
-        self.current_epoch_data += 1;
-        self.expected_next_ordinal += 1;
-
-        if self.current_epoch_data == self.epoch_data_shards {
-            self.close_full_epoch()?;
-        }
-
-        Ok(())
-    }
-
-    fn close_full_epoch(&mut self) -> Result<(), ParityError> {
-        let s = self.scheme.stripes_per_neighborhood as usize;
-        let k = self.codec.data_blocks();
-        let m = self.codec.parity_blocks();
-        let mut parity_shards = Vec::with_capacity(
-            s.checked_mul(m)
-                .ok_or_else(|| resume_error("resume rebuild parity shard count overflows"))?,
-        );
-        for (stripe_index, data) in self.stripe_buffers.iter().enumerate() {
-            if data.len() != k {
-                return Err(resume_error(format!(
-                    "resume rebuild full epoch stripe {stripe_index} has {} shards, expected {k}",
-                    data.len()
-                )));
-            }
-            parity_shards.extend(self.codec.encode(data)?);
-        }
-
-        let plan = ResumeSidecarPlan {
-            epoch_id: self.current_epoch_id,
-            protected_ordinal_start: self.current_epoch_start,
-            protected_ordinal_end_exclusive: self
-                .current_epoch_start
-                .checked_add(self.epoch_data_shards)
-                .ok_or_else(|| resume_error("resume rebuild sidecar range overflows"))?,
-        };
-        let descriptor = SidecarDescriptor {
-            tape_uuid: self.tape_uuid,
-            epoch_id: plan.epoch_id,
-            k: self.scheme.data_blocks_per_stripe,
-            m: self.scheme.parity_blocks_per_stripe,
-            stripes_per_epoch: self.scheme.stripes_per_neighborhood,
-            block_size: self.block_size,
-            protected_ordinal_start: plan.protected_ordinal_start,
-            protected_ordinal_end_exclusive: plan.protected_ordinal_end_exclusive,
-        };
-        let encoded = encode_sidecar_tape_file(
-            &descriptor,
-            &parity_shards,
-            std::mem::take(&mut self.data_shard_crc64s),
-        )?;
-        self.rebuilt_sidecars
-            .push(ResumeRebuiltSidecar { plan, encoded });
-
-        for stripe in &mut self.stripe_buffers {
-            stripe.clear();
-        }
-        self.current_epoch_start = self
-            .current_epoch_start
-            .checked_add(self.epoch_data_shards)
-            .ok_or_else(|| resume_error("resume rebuild epoch start overflows"))?;
-        self.current_epoch_id = self
-            .current_epoch_id
+        self.accumulator
+            .as_mut()
+            .expect("initialized")
+            .push_block(ordinal, block)?;
+        self.expected_next_ordinal = ordinal
             .checked_add(1)
-            .ok_or_else(|| resume_error("resume rebuild epoch id overflows"))?;
-        self.current_epoch_data = 0;
+            .ok_or_else(|| resume_error("resume ordinal overflows"))?;
+        if self.expected_next_ordinal - self.current_epoch_start == self.epoch_data_shards {
+            let plan = ResumeSidecarPlan {
+                epoch_id: self.current_epoch_id,
+                protected_ordinal_start: self.current_epoch_start,
+                protected_ordinal_end_exclusive: self.expected_next_ordinal,
+            };
+            let encoded = self
+                .accumulator
+                .take()
+                .expect("full epoch")
+                .into_sidecar()?;
+            self.rebuilt_sidecars
+                .push(ResumeRebuiltSidecar { plan, encoded });
+            self.current_epoch_start = self.expected_next_ordinal;
+            self.current_epoch_id = self
+                .current_epoch_id
+                .checked_add(1)
+                .ok_or_else(|| resume_error("resume epoch id overflows"))?;
+        }
         Ok(())
     }
 
     fn finish(
         self,
     ) -> Result<(Vec<ResumeRebuiltSidecar>, Option<ResumeLiveEpochState>), ParityError> {
-        let live_epoch = if self.current_epoch_data == 0 {
-            None
-        } else {
-            Some(ResumeLiveEpochState {
-                epoch_id: self.current_epoch_id,
-                protected_ordinal_start: self.current_epoch_start,
-                next_data_ordinal: self.expected_next_ordinal,
-                data_blocks_in_epoch: self.current_epoch_data,
-                stripe_buffers: self.stripe_buffers,
-                data_shard_crc64s: self.data_shard_crc64s,
-            })
-        };
-        Ok((self.rebuilt_sidecars, live_epoch))
+        Ok((
+            self.rebuilt_sidecars,
+            self.accumulator
+                .map(|acc| live_epoch_from_accumulator(acc, false)),
+        ))
+    }
+}
+
+fn live_epoch_from_accumulator(
+    acc: crate::closeout::EpochAccumulator,
+    original_write_verified: bool,
+) -> ResumeLiveEpochState {
+    ResumeLiveEpochState {
+        epoch_id: acc.epoch_id,
+        protected_ordinal_start: acc.epoch_start,
+        next_data_ordinal: acc.next_ordinal,
+        data_blocks_in_epoch: acc.next_ordinal - acc.epoch_start,
+        parity_accumulators: acc.parity_accumulators,
+        data_shard_crc64s: acc.current_epoch_data_crc64s,
+        original_write_verified,
     }
 }
 
@@ -2446,6 +2524,7 @@ fn resume_error(message: impl Into<String>) -> ParityError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data_shard_crc64;
     use crate::raw::RawReadOutcome;
 
     /// One scripted re-read outcome per call.
@@ -3150,6 +3229,18 @@ mod tests {
         block
     }
 
+    fn original_resume_check(map: &FilemarkMap) -> crate::CheckValue {
+        let Ok(plan) =
+            plan_legacy_forensic_resume_append_from_committed_prefix(map, &rebuild_scheme())
+        else {
+            return crate::CheckValue::EMPTY; // malformed authority is rejected before reading
+        };
+        crate::check_value(
+            (plan.highest_protected_ordinal_before_rebuild..plan.next_data_ordinal)
+                .map(|ordinal| data_shard_crc64(&block_for_ordinal(ordinal))),
+        )
+    }
+
     fn raw_source_for_resume_map(
         map: &FilemarkMap,
         start: u64,
@@ -3271,6 +3362,7 @@ mod tests {
                 &scheme(),
                 [0; 16],
                 256,
+                original_resume_check(&map),
             )
             .unwrap_err();
             assert!(
@@ -3344,6 +3436,7 @@ mod tests {
             &rebuild_scheme(),
             [0x33; 16],
             RESUME_TEST_BLOCK_SIZE,
+            original_resume_check(&map),
         )
         .expect("resume rebuild succeeds");
 
@@ -3377,8 +3470,17 @@ mod tests {
         assert_eq!(live.protected_ordinal_start, 8);
         assert_eq!(live.next_data_ordinal, 10);
         assert_eq!(live.data_blocks_in_epoch, 2);
-        assert_eq!(live.stripe_buffers[0], vec![block_for_ordinal(8)]);
-        assert_eq!(live.stripe_buffers[1], vec![block_for_ordinal(9)]);
+        let codec = ReedSolomonCodec::new(&rebuild_scheme()).unwrap();
+        for (stripe, ordinal) in [8, 9].into_iter().enumerate() {
+            let mut expected = codec.new_parity_accumulators(RESUME_TEST_BLOCK_SIZE as usize);
+            codec
+                .accumulate(0, &block_for_ordinal(ordinal), &mut expected)
+                .unwrap();
+            assert!(
+                live.parity_accumulators[stripe] == expected,
+                "rebuilt stripe {stripe}"
+            );
+        }
         assert_eq!(
             live.data_shard_crc64s,
             vec![
@@ -3417,6 +3519,7 @@ mod tests {
             &rebuild_scheme(),
             [0x33; 16],
             RESUME_TEST_BLOCK_SIZE,
+            original_resume_check(&map),
         )
         .unwrap_err();
 
@@ -3446,6 +3549,7 @@ mod tests {
             &rebuild_scheme(),
             [0x33; 16],
             RESUME_TEST_BLOCK_SIZE,
+            original_resume_check(&map),
         )
         .expect("nothing to reread");
 
@@ -3494,6 +3598,7 @@ mod tests {
             &rebuild_scheme(),
             [0x33; 16],
             RESUME_TEST_BLOCK_SIZE,
+            original_resume_check(&map),
         )
         .expect("resume rebuild succeeds");
         let mut raw_sink = RecordingResumeRawSink::at_position(rebuild.plan.append_position);
@@ -3547,6 +3652,7 @@ mod tests {
             &rebuild_scheme(),
             [0x33; 16],
             RESUME_TEST_BLOCK_SIZE,
+            original_resume_check(&map),
         )
         .expect("resume rebuild succeeds");
         let mut raw_sink = RecordingResumeRawSink::at_position(rebuild.plan.append_position)
@@ -3598,6 +3704,7 @@ mod tests {
             &rebuild_scheme(),
             [0x33; 16],
             RESUME_TEST_BLOCK_SIZE,
+            original_resume_check(&map),
         )
         .expect("resume rebuild succeeds");
         let mut raw_sink = RecordingResumeRawSink::at_position(rebuild.plan.append_position);
@@ -3656,6 +3763,7 @@ mod tests {
             &rebuild_scheme(),
             [0x33; 16],
             RESUME_TEST_BLOCK_SIZE,
+            original_resume_check(&map),
         )
         .expect("resume rebuild succeeds");
         assert_eq!(rebuild.rebuilt_sidecars.len(), 2);
@@ -3742,6 +3850,7 @@ mod tests {
             &rebuild_scheme(),
             [0x33; 16],
             RESUME_TEST_BLOCK_SIZE,
+            original_resume_check(&map),
         )
         .expect("resume rebuild succeeds");
         assert_eq!(rebuild.rebuilt_sidecars.len(), 2);
@@ -3840,6 +3949,7 @@ mod tests {
             &rebuild_scheme(),
             [0x33; 16],
             RESUME_TEST_BLOCK_SIZE,
+            original_resume_check(&map),
         )
         .expect("resume rebuild succeeds");
         assert_eq!(rebuild.rebuilt_sidecars.len(), 2);
@@ -3929,6 +4039,7 @@ mod tests {
             &rebuild_scheme(),
             [0x33; 16],
             RESUME_TEST_BLOCK_SIZE,
+            original_resume_check(&map),
         )
         .expect("resume rebuild succeeds");
         assert_eq!(rebuild.rebuilt_sidecars.len(), 2);
@@ -4016,6 +4127,7 @@ mod tests {
             &rebuild_scheme(),
             [0x33; 16],
             RESUME_TEST_BLOCK_SIZE,
+            original_resume_check(&map),
         )
         .expect("resume rebuild succeeds");
         assert!(
@@ -4074,6 +4186,7 @@ mod tests {
             &rebuild_scheme(),
             [0x33; 16],
             RESUME_TEST_BLOCK_SIZE,
+            original_resume_check(&map),
         )
         .expect("resume rebuild succeeds");
         let mut raw_sink = RecordingResumeRawSink::at_position(rebuild.plan.append_position)
@@ -4134,6 +4247,7 @@ mod tests {
             &rebuild_scheme(),
             [0x33; 16],
             RESUME_TEST_BLOCK_SIZE,
+            original_resume_check(&map),
         )
         .expect("resume rebuild succeeds");
         assert_eq!(rebuild.rebuilt_sidecars.len(), 2);
@@ -4218,6 +4332,7 @@ mod tests {
             &rebuild_scheme(),
             [0x33; 16],
             RESUME_TEST_BLOCK_SIZE,
+            original_resume_check(&map),
         )
         .expect("resume rebuild succeeds");
         assert_eq!(rebuild.rebuilt_sidecars.len(), 2);
@@ -4302,6 +4417,7 @@ mod tests {
             &rebuild_scheme(),
             [0x33; 16],
             RESUME_TEST_BLOCK_SIZE,
+            original_resume_check(&map),
         )
         .expect("resume rebuild succeeds");
         assert_eq!(rebuild.rebuilt_sidecars.len(), 2);
@@ -4359,6 +4475,7 @@ mod tests {
             &rebuild_scheme(),
             [0x33; 16],
             RESUME_TEST_BLOCK_SIZE,
+            original_resume_check(&map),
         )
         .expect("resume rebuild succeeds");
         let mut raw_sink =
@@ -4410,6 +4527,7 @@ mod tests {
                 &rebuild_scheme(),
                 [0x33; 16],
                 RESUME_TEST_BLOCK_SIZE,
+                original_resume_check(&map),
             )
             .expect("resume rebuild succeeds");
             let mut raw_sink = RecordingResumeRawSink::at_position(rebuild.plan.append_position)
@@ -4461,6 +4579,7 @@ mod tests {
             &rebuild_scheme(),
             [0x33; 16],
             RESUME_TEST_BLOCK_SIZE,
+            original_resume_check(&map),
         )
         .expect("resume rebuild succeeds");
         let mut raw_sink = RecordingResumeRawSink::at_position(rebuild.plan.append_position)
@@ -4513,6 +4632,7 @@ mod tests {
             &rebuild_scheme(),
             [0x33; 16],
             RESUME_TEST_BLOCK_SIZE,
+            original_resume_check(&map),
         )
         .expect("resume rebuild succeeds");
         rebuild.rebuilt_sidecars[0].encoded.header.epoch_id += 1;
@@ -4554,6 +4674,7 @@ mod tests {
             &rebuild_scheme(),
             [0x33; 16],
             RESUME_TEST_BLOCK_SIZE,
+            original_resume_check(&map),
         )
         .expect("resume rebuild succeeds");
         let footer_index = rebuild.rebuilt_sidecars[0]
@@ -4599,6 +4720,7 @@ mod tests {
             &rebuild_scheme(),
             [0x33; 16],
             RESUME_TEST_BLOCK_SIZE,
+            original_resume_check(&map),
         )
         .expect("resume rebuild succeeds");
         let mut raw_sink = RecordingResumeRawSink::at_position(rebuild.plan.append_position);

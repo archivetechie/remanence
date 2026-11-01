@@ -1,6 +1,6 @@
 use super::*;
 use crate::codec::ReedSolomonCodec;
-use crate::sidecar::encode_sidecar_tape_file;
+use crate::sidecar::{data_shard_crc64, encode_sidecar_tape_file};
 use remanence_library::scsi::ScsiError;
 
 use crate::filemark_map::TapeFileMapEntry;
@@ -5740,12 +5740,18 @@ fn checkpoint_handoffs_and_crash_rebuild_preserve_epoch_parity() {
                 let snapshot = journal.committed_snapshot_bounded().unwrap();
                 let summary = checked_bounded_resume_summary(&snapshot).unwrap();
                 let mut source = RecordingRawTapeSource::from_sink(&raw);
-                let rebuilt = crate::rebuild_open_epoch_from_bounded_summary(
+                let rebuilt = crate::rebuild_open_epoch_from_bounded_summary_checked(
                     &mut source,
                     &summary,
                     &scheme,
                     [0x81; 16],
                     BLOCK,
+                    Some(crate::check_value(
+                        data[summary.highest_protected_ordinal as usize
+                            ..summary.total_committed_ordinals as usize]
+                            .iter()
+                            .map(|b| data_shard_crc64(b)),
+                    )),
                 )
                 .unwrap();
                 let result = rebuilt.plan.complete(Vec::new()).unwrap();
@@ -5784,12 +5790,18 @@ fn checkpoint_handoffs_and_crash_rebuild_preserve_epoch_parity() {
             let summary = checked_bounded_resume_summary(&snapshot).unwrap();
             assert!(summary.highest_protected_ordinal < summary.total_committed_ordinals);
             let mut source = RecordingRawTapeSource::from_sink(&raw);
-            let rebuilt = crate::rebuild_open_epoch_from_bounded_summary(
+            let rebuilt = crate::rebuild_open_epoch_from_bounded_summary_checked(
                 &mut source,
                 &summary,
                 &scheme,
                 [0x81; 16],
                 BLOCK,
+                Some(crate::check_value(
+                    data[summary.highest_protected_ordinal as usize
+                        ..summary.total_committed_ordinals as usize]
+                        .iter()
+                        .map(|b| data_shard_crc64(b)),
+                )),
             )
             .unwrap();
             let result = rebuilt.plan.complete(Vec::new()).unwrap();

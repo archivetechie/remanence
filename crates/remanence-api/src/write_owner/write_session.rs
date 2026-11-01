@@ -208,7 +208,7 @@ impl WriteSessionState<'_> {
         let Some(parity) = self.parity_session.as_mut() else {
             return Ok(());
         };
-        if parity.retention.is_some()
+        if (parity.retention.is_some() && !parity.close_at_barrier)
             || !parity.sink_state.as_ref().is_some_and(|state| {
                 state
                     .terminal_triple_capacity_runtime_state()
@@ -938,6 +938,7 @@ impl WriteSessionState<'_> {
                                     self.parity_session
                                         .as_mut()
                                         .and_then(|s| s.sink_state.take()),
+                                    None,
                                 ),
                                 None => Err(Status::internal(
                                     "automatic parity rollover has no session-owned append journal",
@@ -1805,6 +1806,61 @@ pub(super) fn handle_drive_open_write(
         }
     }
 
+    // A cold open can know its memory obligation from host authority alone.
+    // Each intersecting Object owns at least one ordinal, so this extent bound
+    // is conservative without materializing any prefix or issuing drive commands.
+    let mut preflight_rebuild_permit = None;
+    if retained.is_none() {
+        if let (remanence_parity::ParityConfig::Scheme(scheme), Some(last)) =
+            (&selected.parity_config, durable_checkpoint_records.last())
+        {
+            let prefix_durable = (|| -> Result<bool, Status> {
+                let Some(prefix) = pending_terminal_intent
+                    .as_ref()
+                    .and_then(|intent| intent.terminal_prefix.as_ref())
+                else {
+                    return Ok(false);
+                };
+                let prefix = remanence_parity::TerminalPrefixPlan::try_from(prefix)
+                    .map_err(status_from_state_error)?;
+                let journal = checkpoint_lease
+                    .open_structural(selected.block_size, scheme.clone())
+                    .map_err(|e| Status::failed_precondition(e.to_string()))?;
+                journal
+                    .prefix_is_durable(
+                        &prefix
+                            .media_publication()
+                            .map_err(|e| Status::failed_precondition(e.to_string()))?,
+                    )
+                    .map_err(|e| Status::failed_precondition(e.to_string()))
+            })();
+            let prefix_durable = match prefix_durable {
+                Ok(durable) => durable,
+                Err(status) => {
+                    let _ = reply.send(Err(status));
+                    return None;
+                }
+            };
+            if last.protected < last.total && !prefix_durable {
+                let extents = usize::try_from((last.total - last.protected).min(last.next_file))
+                    .unwrap_or(usize::MAX);
+                match super::checkpoint::reserve_closeout_memory(
+                    cfg,
+                    scheme,
+                    selected.block_size,
+                    extents,
+                    tape_uuid,
+                ) {
+                    Ok(permit) => preflight_rebuild_permit = Some(permit),
+                    Err(status) => {
+                        let _ = reply.send(Err(status));
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
     if let Err(status) = if cfg.mounted().is_some() {
         cfg.mounted_ready(index, drive)
     } else {
@@ -1963,6 +2019,7 @@ pub(super) fn handle_drive_open_write(
                 None,
                 rewritable,
                 None,
+                preflight_rebuild_permit.take(),
             ),
         };
         match result {
@@ -2148,6 +2205,7 @@ pub(super) fn handle_drive_open_write(
                 &durable_checkpoint_records,
                 authority,
                 &mut checkpoint_lease,
+                preflight_rebuild_permit.take(),
             ) {
                 Ok(session) => Some(session),
                 Err(status) => {

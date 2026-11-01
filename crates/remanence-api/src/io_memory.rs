@@ -141,7 +141,7 @@ pub(crate) struct IoMemoryPermit {
 }
 
 impl IoMemoryPermit {
-    #[cfg(test)]
+    /// Bytes already owned by this permit, for checked carrier-to-rebuild transfer.
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes
     }

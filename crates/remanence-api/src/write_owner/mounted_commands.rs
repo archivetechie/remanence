@@ -241,13 +241,19 @@ pub(super) fn finalize(
             && tape.scheme_id.is_some()
             && tape.highest_protected_ordinal < tape.total_committed_ordinals
         {
-            cfg.mounted_ready(index, drive)?;
-            let (plan, state) = super::terminal_finalize::plan_unretained_epoch_finalization(
-                index, &terminal, drive, &request,
-            )?;
+            let (plan, state, permit) =
+                super::terminal_finalize::plan_unretained_epoch_finalization(
+                    index,
+                    &terminal,
+                    drive,
+                    &request,
+                    |index, drive| cfg.mounted_ready(index, drive),
+                )?;
             (
                 Some(plan),
-                state.map(|state| (drive.identity_generation(), state)),
+                state
+                    .zip(permit)
+                    .map(|(state, permit)| (drive.identity_generation(), state, permit)),
             )
         } else {
             (None, None)

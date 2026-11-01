@@ -292,6 +292,15 @@ pub enum ParityError {
     #[error("resume append error: {0}")]
     ResumeAppend(String),
 
+    /// Two complete readbacks disagree with the durable original-write check.
+    #[error("closeout check mismatch: expected {expected:?}, found {found:?}")]
+    CloseoutCheckMismatch {
+        /// Original-write value recorded by the last durable commit.
+        expected: crate::CheckValue,
+        /// Value computed on the second full readback.
+        found: crate::CheckValue,
+    },
+
     /// Durable tape-file journal failed while committing or replaying a
     /// bundle.
     #[error("tape-file journal error: {0}")]

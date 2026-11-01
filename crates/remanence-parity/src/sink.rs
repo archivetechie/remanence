@@ -56,7 +56,7 @@ use crate::resume::{
     checked_bounded_resume_summary, resume_record_result, streamed_filemark_map_digest,
     BoundedResumeSummary, ResumeAppendResult, ResumeLiveEpochState,
 };
-use crate::sidecar::{data_shard_crc64, parse_sidecar_tape_file, SidecarDescriptor};
+use crate::sidecar::{parse_sidecar_tape_file, SidecarDescriptor};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ActiveObject {
@@ -392,16 +392,6 @@ fn physical_to_tape_position(position: PhysicalPositionHint) -> TapePosition {
         beginning_of_partition: position.lba == 0,
         end_of_partition: false,
         block_position_end_of_warning: false,
-    }
-}
-
-fn expected_resume_stripe_rows(data_blocks: u64, stripes: usize, stripe_index: usize) -> usize {
-    let stripes = stripes as u64;
-    let stripe_index = stripe_index as u64;
-    if data_blocks <= stripe_index {
-        0
-    } else {
-        ((data_blocks - 1 - stripe_index) / stripes + 1) as usize
     }
 }
 
@@ -1447,6 +1437,7 @@ impl<'a> ParitySink<'a> {
                 "remanence-test".into(),
                 std::time::SystemTime::UNIX_EPOCH.into(),
             ),
+            None,
         )
     }
 
@@ -1473,6 +1464,7 @@ impl<'a> ParitySink<'a> {
             tape_uuid,
             block_size_bytes,
             identity,
+            None,
         )
     }
 
@@ -1537,6 +1529,33 @@ impl<'a> ParitySink<'a> {
         resume_seed: BoundedResumeWriterSeed<'_>,
         identity: WriterIdentity,
     ) -> Result<Self, ParityError> {
+        let original_write_verified = resume_seed
+            .live_epoch
+            .as_ref()
+            .is_some_and(|live| live.original_write_verified);
+        let accumulator = resume_seed
+            .live_epoch
+            .map(|live| {
+                if live.data_blocks_in_epoch
+                    != live
+                        .next_data_ordinal
+                        .checked_sub(live.protected_ordinal_start)
+                        .ok_or(ParityError::Invariant("resume epoch range reversed"))?
+                {
+                    return Err(ParityError::Invariant("resume epoch data count mismatch"));
+                }
+                EpochAccumulator::from_rebuilt(
+                    tape_uuid,
+                    &scheme,
+                    block_size_bytes,
+                    live.epoch_id,
+                    live.protected_ordinal_start,
+                    live.next_data_ordinal,
+                    live.parity_accumulators,
+                    live.data_shard_crc64s,
+                )
+            })
+            .transpose()?;
         let mut sink = Self::new_with_backend(
             ParitySinkBackend(inner),
             journal,
@@ -1544,6 +1563,7 @@ impl<'a> ParitySink<'a> {
             tape_uuid,
             block_size_bytes,
             identity,
+            accumulator,
         )?;
         sink.validate_bounded_resume_prefix(
             &resume_seed.committed_prefix_summary,
@@ -1586,7 +1606,8 @@ impl<'a> ParitySink<'a> {
             .next_parity_map_sequence;
         sink.last_data_lba = actual_append_position.lba;
         sink.last_physical_lba = actual_append_position.lba;
-        sink.load_resume_live_epoch(resume_seed.resume_result, resume_seed.live_epoch)?;
+        sink.load_resume_live_epoch(resume_seed.resume_result)?;
+        sink.unverified_rebuild = sink.data_blocks_in_neighborhood > 0 && !original_write_verified;
         Ok(sink)
     }
 
@@ -1597,6 +1618,7 @@ impl<'a> ParitySink<'a> {
         tape_uuid: [u8; 16],
         block_size_bytes: u32,
         identity: WriterIdentity,
+        accumulator: Option<EpochAccumulator>,
     ) -> Result<Self, ParityError> {
         scheme.validate()?;
         if block_size_bytes == 0 {
@@ -1604,7 +1626,10 @@ impl<'a> ParitySink<'a> {
                 "block_size_bytes = 0 — must be the tape's logical block size".into(),
             ));
         }
-        let accumulator = EpochAccumulator::new(tape_uuid, &scheme, block_size_bytes, 0, 0)?;
+        let accumulator = match accumulator {
+            Some(accumulator) => accumulator,
+            None => EpochAccumulator::new(tape_uuid, &scheme, block_size_bytes, 0, 0)?,
+        };
         Ok(Self {
             identity,
             backend,
@@ -1705,132 +1730,34 @@ impl<'a> ParitySink<'a> {
         Ok(())
     }
 
+    /// Validate the moved rebuild against the frozen resume boundary.
     fn load_resume_live_epoch(
         &mut self,
         resume_result: &ResumeAppendResult,
-        live_epoch: Option<ResumeLiveEpochState>,
     ) -> Result<(), ParityError> {
-        let Some(live) = live_epoch else {
-            if resume_result.live_epoch_start != resume_result.next_data_ordinal {
-                return Err(ParityError::Invariant(
-                    "resume result without live epoch has a non-empty live range",
-                ));
+        let count = self.accumulator.current_epoch_data_crc64s.len() as u64;
+        if count == 0 {
+            if resume_result.live_epoch_start != resume_result.next_data_ordinal
+                || resume_result.highest_protected_ordinal != resume_result.next_data_ordinal
+            {
+                return Err(ParityError::Invariant("resume result lacks its live epoch"));
             }
-            if resume_result.highest_protected_ordinal != resume_result.next_data_ordinal {
-                return Err(ParityError::Invariant(
-                    "resume result without live epoch does not end at its protection watermark",
-                ));
-            }
-            self.neighborhood_idx = resume_result.next_epoch_id;
-            self.current_epoch_start = resume_result.next_data_ordinal;
             self.accumulator
-                .restart_empty(self.neighborhood_idx, self.current_epoch_start)?;
-            return Ok(());
-        };
-
-        let epoch_data_shards = self.epoch_data_shards()?;
-
-        let ResumeLiveEpochState {
-            epoch_id,
-            protected_ordinal_start,
-            next_data_ordinal,
-            data_blocks_in_epoch,
-            stripe_buffers,
-            data_shard_crc64s,
-        } = live;
-
-        if protected_ordinal_start != resume_result.live_epoch_start
-            || next_data_ordinal != resume_result.next_data_ordinal
+                .restart_empty(resume_result.next_epoch_id, resume_result.next_data_ordinal)?;
+        } else if self.accumulator.epoch_start != resume_result.live_epoch_start
+            || self.accumulator.epoch_start != resume_result.highest_protected_ordinal
+            || self.accumulator.next_ordinal != resume_result.next_data_ordinal
+            || self.accumulator.epoch_id != resume_result.next_epoch_id
+            || count >= self.epoch_data_shards()?
         {
             return Err(ParityError::Invariant(
-                "resume live epoch range does not match ResumeAppendResult",
+                "resume accumulator disagrees with its committed range",
             ));
         }
-        if protected_ordinal_start != resume_result.highest_protected_ordinal {
-            return Err(ParityError::Invariant(
-                "resume live epoch does not start at the protected-range watermark",
-            ));
-        }
-        if epoch_id != resume_result.next_epoch_id {
-            return Err(ParityError::Invariant(
-                "resume live epoch id does not match the next monotonic epoch id",
-            ));
-        }
-        let data_blocks = next_data_ordinal
-            .checked_sub(protected_ordinal_start)
-            .ok_or(ParityError::Invariant(
-                "resume live epoch next ordinal precedes start",
-            ))?;
-        if data_blocks == 0 || data_blocks >= epoch_data_shards {
-            return Err(ParityError::Invariant(
-                "resume live epoch must contain a partial epoch",
-            ));
-        }
-        if data_blocks_in_epoch != data_blocks {
-            return Err(ParityError::Invariant(
-                "resume live epoch data count does not match its ordinal range",
-            ));
-        }
-        let data_blocks_usize = usize::try_from(data_blocks).map_err(|_| {
-            ParityError::Invariant("resume live epoch data count does not fit usize")
-        })?;
-        if data_shard_crc64s.len() != data_blocks_usize {
-            return Err(ParityError::Invariant(
-                "resume live epoch CRC count does not match its data count",
-            ));
-        }
-
-        let block_size = usize::try_from(self.block_size_bytes)
-            .map_err(|_| ParityError::Invariant("fixed block size does not fit usize"))?;
-        let stripes = self.scheme.stripes_per_neighborhood as usize;
-        if stripe_buffers.len() != stripes {
-            return Err(ParityError::Invariant(
-                "resume live epoch stripe count does not match scheme",
-            ));
-        }
-        for (stripe_index, stripe) in stripe_buffers.iter().enumerate() {
-            let expected_rows = expected_resume_stripe_rows(data_blocks, stripes, stripe_index);
-            if stripe.len() != expected_rows {
-                return Err(ParityError::Invariant(
-                    "resume live epoch stripe rows do not match row-major fill",
-                ));
-            }
-            if stripe.iter().any(|block| block.len() != block_size) {
-                return Err(ParityError::Invariant(
-                    "resume live epoch block length does not match fixed block size",
-                ));
-            }
-        }
-        for (ordinal_offset, expected_crc) in data_shard_crc64s.iter().enumerate() {
-            let stripe_index = ordinal_offset % stripes;
-            let row_index = ordinal_offset / stripes;
-            let block = &stripe_buffers[stripe_index][row_index];
-            if data_shard_crc64(block) != *expected_crc {
-                return Err(ParityError::Invariant(
-                    "resume live epoch CRC does not match its shard bytes",
-                ));
-            }
-        }
-
-        self.accumulator = EpochAccumulator::new(
-            self.tape_uuid,
-            &self.scheme,
-            self.block_size_bytes,
-            epoch_id,
-            protected_ordinal_start,
-        )?;
-        for offset in 0..data_blocks_usize {
-            self.accumulator.push_block(
-                protected_ordinal_start + offset as u64,
-                &stripe_buffers[offset % stripes][offset / stripes],
-            )?;
-        }
-
-        self.neighborhood_idx = epoch_id;
-        self.current_epoch_start = protected_ordinal_start;
-        self.data_blocks_in_neighborhood = data_blocks_in_epoch;
-        self.block_size = Some(block_size);
-        self.unverified_rebuild = true;
+        self.neighborhood_idx = self.accumulator.epoch_id;
+        self.current_epoch_start = self.accumulator.epoch_start;
+        self.data_blocks_in_neighborhood = count;
+        self.block_size = (count > 0).then_some(self.block_size_bytes as usize);
         Ok(())
     }
 

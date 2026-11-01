@@ -3276,6 +3276,11 @@ mod tests {
             &scheme,
             TAPE_UUID,
             BLOCK_SIZE,
+            crate::check_value(
+                second_object_blocks
+                    .iter()
+                    .map(|block| crate::data_shard_crc64(block)),
+            ),
         )
         .expect("resume rebuild rereads the committed object tail");
         assert_eq!(rebuild.plan.append_after_tape_file_number, 3);

@@ -597,6 +597,15 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
             },
         ),
         (
+            "remanence-api/src/write_owner/closeout_tests.rs",
+            DispatchPolicy::Exact {
+                execute_out: 1,
+                execute_none: 1,
+                why: "cfg(test) closeout read-corruption forwarder to in-memory ModelTransport; \
+                      both adapters dispatch through DriveHandle and assert zero media writes",
+            },
+        ),
+        (
             "remanence-api/src/engine/drive_adapter/tests.rs",
             DispatchPolicy::Exact {
                 execute_out: 1,

@@ -1,3 +1,5 @@
+#[path = "closeout_tests.rs"]
+mod closeout_tests;
 use remanence_parity::authority::StructuralAuthority;
 use remanence_state::authority::TapeAuthorityView;
 use remanence_state::authority::TapeAuthorityWriter;
@@ -2533,6 +2535,7 @@ fn fresh_parity_bootstrap_short_completion_fences_without_journal_visibility() {
             &[],
             authority,
             &mut checkpoint_lease,
+            None,
         ) {
             Ok(_) => panic!("short bootstrap completion must fail closed"),
             Err(status) => status,
@@ -9347,6 +9350,7 @@ fn resume_vectors_layer5_authorities(refusal: Option<&str>) {
         &checkpoints.iter().map(Into::into).collect::<Vec<_>>(),
         authority,
         &mut lease,
+        None,
     )
     .unwrap();
     let mut raw = DriveHandleRawSink::new(&mut drive);
@@ -13341,7 +13345,7 @@ pub(crate) async fn check_seated_parity_sessions(
         );
     }
 }
-/// A resumed session with no retention grant preserves a durable close on SQLite busy.
+/// A resumed close-at-barrier session preserves a durable close on SQLite busy.
 #[allow(clippy::too_many_arguments)]
 async fn check_session_projection_busy(
     state: &StateHandle,
@@ -13354,9 +13358,10 @@ async fn check_session_projection_busy(
     path: &str,
 ) {
     let memory = cfg.io_memory.clone();
-    let held = memory
-        .try_reserve(memory.ceiling() - memory.granted())
-        .unwrap();
+    // Checked cold rebuilds now require a memory grant. Request the same
+    // close-at-barrier policy explicitly while retaining that grant, rather
+    // than allowing an unbudgeted rebuild by exhausting memory at open.
+    memory.epoch_test_action.store(12, Ordering::Relaxed);
     let drive = library
         .open_drive(
             0x100,
@@ -13382,7 +13387,7 @@ async fn check_session_projection_busy(
     .unwrap();
     let session = received.await.unwrap().unwrap();
     let id = Uuid::from_slice(&session.session_id).unwrap();
-    drop(held);
+    memory.epoch_test_action.store(0, Ordering::Relaxed);
     if append {
         append_actor_test_file(
             &tx,
@@ -15474,6 +15479,7 @@ fn check_terminal_write_failure(tail: bool, reached_drive: bool) {
         })
         .unwrap();
     let cfg = super::terminal_types::TerminalWriteConfig {
+        io_memory: crate::io_memory::IoMemoryReservation::new(1024 * 1024 * 1024).unwrap(),
         mounted_endpoint: None,
         checkpoint_journal_dir: {
             let p = root.path().join("tapes");

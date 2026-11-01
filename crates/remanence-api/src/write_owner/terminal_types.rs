@@ -91,9 +91,11 @@ impl<'a> From<&'a WriteOwnerConfig> for TerminalFinalizeAuditConfig<'a> {
 }
 
 /// Persistence-only context shared by actor and standalone terminal writers.
-/// It carries only persistence settings and optional local error identity, with no motion capability.
+/// It carries persistence settings, the shared I/O memory budget, and optional local error identity.
 #[derive(Clone)]
 pub(crate) struct TerminalWriteConfig {
+    /// Shared manager for checked open-epoch rebuilds.
+    pub io_memory: Arc<crate::io_memory::IoMemoryReservation>,
     /// Local mounted ownership carries typed causes even for an actual library bay.
     pub mounted_endpoint: Option<remanence_library::DriveKey>,
     pub checkpoint_journal_dir: std::path::PathBuf,
@@ -112,6 +114,7 @@ impl TerminalConfig for TerminalWriteConfig {
 impl TerminalConfig for WriteOwnerConfig {
     fn terminal_config(&self) -> TerminalWriteConfig {
         TerminalWriteConfig {
+            io_memory: Arc::clone(&self.io_memory),
             mounted_endpoint: self.mounted().map(|m| m.endpoint.clone()),
             checkpoint_journal_dir: self.checkpoint_journal_dir.clone(),
             audit_dir: self.audit_dir.clone(),
