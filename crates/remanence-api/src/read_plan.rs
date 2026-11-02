@@ -1,7 +1,7 @@
 //! The `PlanBatchRead` RPC.
 //!
 //! The handler resolves cartridge facts by the §6.3 matrix, fetches the
-//! volume's cached wrap map through the P4 serve path, and calls the
+//! volume's cached wrap map through the state layer's serving checks, and calls the
 //! pure `remanence-order` planning core. It owns every wire concern the
 //! pure core deliberately does not: statuses, the §11 precedence order,
 //! `written_extent_lba` validation, the `MAX_TARGETS` degraded

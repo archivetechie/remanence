@@ -18,7 +18,7 @@
 //! rational; longitudinal positions are exact [`rational::Ratio`]s and
 //! durations are integer nanoseconds with the unit in the type name.
 //! REOWP acquisition, the map cache and its lifecycle, and the
-//! `PlanBatchRead` RPC live elsewhere (prompts P2, P4, P5).
+//! `PlanBatchRead` RPC live in the library, state, and API crates.
 
 #![forbid(unsafe_code)]
 

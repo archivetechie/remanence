@@ -166,7 +166,7 @@ impl ParityScheme {
         // Per design §11.3: total neighborhood blocks must fit
         // in u32 (4 G blocks). Mapping / writer code uses u32
         // counters internally and would overflow above the
-        // bound. Codex 00:10 idref=36acce12 Medium catch.
+        // bound.
         let neighborhood = self.neighborhood_blocks();
         if neighborhood > u32::MAX as u64 {
             return Err(crate::error::ParityError::InvalidScheme(format!(
@@ -646,7 +646,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_neighborhood_blocks_above_u32_max() {
-        // Codex idref=36acce12 Medium: design §11.3 requires
+        // REM-PARITY §11.3 requires
         // neighborhood total to fit in u32.
         let s = ParityScheme {
             id: SchemeId::new_static("oversized"),

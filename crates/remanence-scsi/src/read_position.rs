@@ -41,9 +41,7 @@ pub const LONG_FORM_RESPONSE_LEN: u16 = 32;
 /// Uses service action 6. Allocation length is required to be 0
 /// for this service action — the drive returns a fixed 32 bytes
 /// regardless. Setting alloc length non-zero is INVALID FIELD IN
-/// CDB on real LTO drives (codex review cb91b17b caught an
-/// earlier version of this builder that incorrectly set it to
-/// `0x0020`).
+/// CDB on real LTO drives.
 pub fn build_cdb_long() -> [u8; 10] {
     [
         OPCODE,

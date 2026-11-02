@@ -2030,6 +2030,7 @@ impl BotDriveConfigOps for DriveHandle {
     }
 }
 
+/// Read records of unknown size with compression off, then verify restoration.
 fn with_temporary_bot_read_config<D, T>(
     drive: &mut D,
     operation: impl FnOnce(&mut D) -> Result<T, String>,
@@ -2040,25 +2041,16 @@ where
     let current = drive
         .bot_read_config()
         .map_err(|error| format!("read drive config: {error}"))?;
-    if current.max_block_size_bytes < remanence_api::CANONICAL_ADOPTION_BLOCK_SIZE_BYTES {
-        return Err(format!(
-            "drive maximum block size {} is smaller than canonical adoption block size {}",
-            current.max_block_size_bytes,
-            remanence_api::CANONICAL_ADOPTION_BLOCK_SIZE_BYTES
-        ));
-    }
     let configured_for_bot = TapeConfig {
         density_code: None,
-        block_size: BlockSize::Fixed {
-            size_bytes: remanence_api::CANONICAL_ADOPTION_BLOCK_SIZE_BYTES,
-        },
+        block_size: BlockSize::Variable,
         compression: false,
         max_block_size_bytes: current.max_block_size_bytes,
         write_protected: current.write_protected,
         worm: current.worm,
     };
     if let Err(error) = drive.bot_write_config(configured_for_bot) {
-        let primary = format!("configure fixed 1 MiB BOT read: {error}");
+        let primary = format!("configure variable-block BOT read: {error}");
         return match restore_prior_bot_drive_config(drive, current) {
             Ok(()) => Err(primary),
             Err(restore) => Err(format!("{primary}; additionally failed to {restore}")),
@@ -2067,10 +2059,10 @@ where
     let primary = (|| {
         let verified = drive
             .bot_read_config()
-            .map_err(|error| format!("verify fixed 1 MiB BOT read config: {error}"))?;
+            .map_err(|error| format!("verify variable-block BOT read config: {error}"))?;
         if verified.block_size != configured_for_bot.block_size || verified.compression {
             return Err(format!(
-                "drive did not verify fixed 1 MiB/compression-off BOT read config: {verified:?}"
+                "drive did not verify variable-block/compression-off BOT read config: {verified:?}"
             ));
         }
         operation(drive)
@@ -2330,6 +2322,38 @@ fn run_bot_identity_hardware(
     _expected_home_slot: u16,
 ) -> Result<PhysicalBotIdentityResult, String> {
     Err("BOT identity commands require Linux SG_IO access".to_string())
+}
+
+/// Check every library drive before recording the tape's on-media block size.
+#[cfg(target_os = "linux")]
+fn check_library_bootstrap_block_size(
+    library: &Library,
+    policy: &StaticAllowlist,
+    block_size_bytes: u32,
+) -> Result<(), String> {
+    let mut handle = open_library_handle(library, policy)
+        .map_err(|error| format!("opening library for block-size checks: {error}"))?;
+    let mut limits = Vec::new();
+    for bay in &library.drive_bays {
+        let mut drive = handle
+            .open_drive(bay.element_address, policy)
+            .map_err(|error| format!("open drive for block-size check: {error}"))?;
+        let config = drive
+            .read_config()
+            .map_err(|error| format!("read drive block-size limit: {error}"))?;
+        limits.push((bay.element_address, config.max_block_size_bytes));
+    }
+    remanence_api::validate_bootstrap_adoption_drive_limits(block_size_bytes, limits)
+}
+
+/// Refuse library capability checks where the SG_IO transport is unavailable.
+#[cfg(not(target_os = "linux"))]
+fn check_library_bootstrap_block_size(
+    _library: &Library,
+    _policy: &StaticAllowlist,
+    _block_size_bytes: u32,
+) -> Result<(), String> {
+    Err("library block-size checks require Linux SG_IO access".to_string())
 }
 
 #[derive(Args, Debug)]
@@ -11239,12 +11263,19 @@ fn run_tape_adopt_bootstrap(
     let payload =
         match adoption.payload.as_ref() {
             Some(payload) if remanence_api::has_canonical_adoption_geometry(payload) => payload,
-            Some(_) => return print_command_error(
-                "valid Bootstrap does not have canonical 1 MiB default parity adoption geometry"
+            Some(payload) if payload.drive_compression => return print_command_error(
+                "bootstrap adoption requires drive compression disabled: this tape was written with drive compression on"
                     .to_string(),
                 &fresh_report,
                 err,
             ),
+            Some(_) => {
+                return print_command_error(
+                    "valid Bootstrap has invalid adoption geometry".to_string(),
+                    &fresh_report,
+                    err,
+                )
+            }
             None => {
                 return print_command_error(
                     format!("BOT is not adoptable: {:?}", adoption.tail),
@@ -11263,6 +11294,11 @@ fn run_tape_adopt_bootstrap(
             &fresh_report,
             err,
         );
+    }
+    if let Err(error) =
+        check_library_bootstrap_block_size(library, &policy, payload.block_size_bytes)
+    {
+        return print_command_error(error, &fresh_report, err);
     }
     let tail = match &adoption.tail {
         remanence_api::BootstrapTailClassification::ExactBootstrapFilemarkEod => {
@@ -13109,7 +13145,7 @@ fn resolve_foreign_format(
 
 /// Build a portable REM-OBJECT object file from local filesystem inputs.
 ///
-/// This is the local-file half of the REM-OBJECT work order: it writes exactly one
+/// This local-file REM-OBJECT writer writes exactly one
 /// REM-OBJECT object byte string to `--out` using the same `BlockSink` contract as
 /// tape writers, but without tape-only filemarks, the BOT bootstrap, or parity
 /// sidecars. REM-PARITY §8: "Every generation-2 bootstrap is Object-count independent:
@@ -18702,12 +18738,7 @@ mod tests {
     #[test]
     fn temporary_bot_config_restores_after_success_and_primary_failure() {
         let prior = bot_test_config(BlockSize::Variable, true);
-        let selected = bot_test_config(
-            BlockSize::Fixed {
-                size_bytes: remanence_api::CANONICAL_ADOPTION_BLOCK_SIZE_BYTES,
-            },
-            false,
-        );
+        let selected = bot_test_config(BlockSize::Variable, false);
         for primary_ok in [true, false] {
             let mut spy = BotConfigSpy {
                 reads: VecDeque::from([Ok(prior), Ok(selected), Ok(prior)]),
@@ -18738,7 +18769,7 @@ mod tests {
     #[test]
     fn temporary_bot_config_restores_after_verification_failure_and_surfaces_restore_failure() {
         let prior = bot_test_config(BlockSize::Variable, true);
-        let wrong = bot_test_config(BlockSize::Variable, false);
+        let wrong = bot_test_config(BlockSize::Fixed { size_bytes: 1024 }, false);
         let mut verification_failure = BotConfigSpy {
             reads: VecDeque::from([Ok(prior), Ok(wrong), Ok(prior)]),
             writes: VecDeque::from([Ok(()), Ok(())]),
@@ -18758,12 +18789,7 @@ mod tests {
             ]
         );
 
-        let selected = bot_test_config(
-            BlockSize::Fixed {
-                size_bytes: remanence_api::CANONICAL_ADOPTION_BLOCK_SIZE_BYTES,
-            },
-            false,
-        );
+        let selected = bot_test_config(BlockSize::Variable, false);
         let mut restore_failure = BotConfigSpy {
             reads: VecDeque::from([Ok(prior), Ok(selected)]),
             writes: VecDeque::from([Ok(()), Err("mode select failed".to_string())]),
@@ -18781,7 +18807,7 @@ mod tests {
         };
         let error = with_temporary_bot_read_config(&mut configure_failure, |_| Ok(()))
             .expect_err("configure failure must still attempt restoration");
-        assert!(error.contains("configure fixed 1 MiB BOT read"));
+        assert!(error.contains("configure variable-block BOT read"));
         assert_eq!(
             configure_failure.calls,
             ["read_config", "write_config", "write_config", "read_config",]

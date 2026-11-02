@@ -76,9 +76,7 @@ impl HotplugSource for LinuxUdevSource {
         //
         // Only mark this source as `subscribed` after spawn succeeds —
         // a thread-spawn failure (rare, but happens under FD/PID
-        // pressure) leaves the source reusable for retry. Codex
-        // review 6221138f Low flagged the previous "mark first, spawn
-        // second" ordering as a poisoning hazard.
+        // pressure) leaves the source reusable for retry.
         std::thread::Builder::new()
             .name("rem-udev-watcher".into())
             .spawn(move || {

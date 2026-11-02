@@ -108,17 +108,18 @@ pub enum DiscoveryWarning {
         command: &'static str,
         summary: String,
     },
-    /// DVCID+CurData didn't yield identifiers; topology was safely
-    /// derivable. Affected drives carry `IdentitySource::Derived` and
-    /// operations against them require explicit opt-in.
+    /// Reserved for a future topology-derived mapping with an explicitly
+    /// validated bay convention. Current discovery does not emit this warning
+    /// or produce `IdentitySource::Derived` drive identities.
     DriveMappingDerived {
         library: String,
         method: &'static str,
     },
-    /// DVCID failed AND the host:channel topology can't safely
-    /// disambiguate (multiple logical libraries share the channel —
-    /// e.g., the MSL3040 partitioning case). Affected bays have
-    /// `installed = None`.
+    /// READ ELEMENT STATUS left bays without drive serials after the
+    /// all-elements DVCID+CurData probe and drives-only retries with
+    /// CurData set and cleared. Discovery preserves resolved bays and
+    /// leaves unresolved bays with `installed = None`; it does not infer
+    /// their identities from host SCSI topology.
     DriveMappingUnavailable { library: String, bays: Vec<u16> },
     /// A tape device's VPD 0x80 serial didn't match any library's
     /// drive bay.

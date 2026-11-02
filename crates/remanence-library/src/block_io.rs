@@ -1199,7 +1199,7 @@ impl BlockRead for VecBlockSource {
                 // CHECK CONDITION. DriveHandle::read_block
                 // surfaces this as TapeIoError::ReadBufferTooSmall;
                 // the fixture must match so 3b/3c tests behave
-                // like production. Codex 23:26 catch.
+                // like production.
                 let actual = b.len() as u32;
                 let provided = buf.len() as u32;
                 self.cursor += 1;
@@ -1341,8 +1341,7 @@ impl BlockSource for VecBlockSource {
         // key 0x08 BLANK CHECK + ASC/ASCQ 00/05 and leaves the
         // tape at EOD. The fixture clamps the cursor to
         // blocks.len() on past-EOD so a follow-up call doesn't
-        // start from an impossible LBA. Codex 23:41 idref=1343a11b
-        // Medium catch on the prior commit. Three cases:
+        // start from an impossible LBA. Three cases:
         //   - lba <  blocks.len(): normal LOCATE, cursor = lba.
         //   - lba == blocks.len(): LOCATE to EOD boundary,
         //     cursor = lba, position.end_of_partition = true.
@@ -1375,7 +1374,6 @@ impl BlockSource for VecBlockSource {
         // units_traversed. The fixture clamps the cursor and
         // reports the actual move so 3b/3c tests can distinguish
         // a real boundary stop from a successful full-count move.
-        // Codex 23:26 idref=25cf017f Medium catch.
         self.calls.push(VecBlockSourceCall::Space { count, kind });
         let blocks_len = self.blocks.len() as i64;
         let cursor_signed = self.cursor as i64;
@@ -1426,8 +1424,7 @@ impl BlockSource for VecBlockSource {
 /// data path. Per IBM LTO SCSI Reference §5.2.15 (READ(6)) and
 /// Annex B Table B.9: a READ that hits EOD returns CHECK
 /// CONDITION with sense key **0x08 BLANK CHECK** + ASC 0x00 /
-/// ASCQ 0x05. Codex 23:26 idref=25cf017f Medium catch on the
-/// earlier draft, which incorrectly used key 0 NO SENSE.
+/// ASCQ 0x05.
 fn synth_blank_check_eod_sense() -> Vec<u8> {
     let mut sense = vec![0u8; 32];
     sense[0] = 0x70; // fixed-format current
@@ -1778,7 +1775,7 @@ mod tests {
     #[test]
     fn vec_source_locate_past_eod_returns_blank_check_and_clamps() {
         // Per IBM Table 17: LOCATE (target after EOD) → 8/0005,
-        // position at EOD. Codex 23:41 idref=1343a11b catch.
+        // position at EOD.
         let mut src = VecBlockSource::new(vec![vec![1], vec![2], vec![3]]);
         let err = src.locate(100).expect_err("past-EOD locate");
         match err {
@@ -1799,7 +1796,7 @@ mod tests {
 
     #[test]
     fn vec_source_locate_past_eod_then_space_accounts_from_clamped_cursor() {
-        // Regression for codex's example: after locate(100) on a
+        // After locate(100) on a
         // 5-block fixture, space(0, Blocks) should not produce
         // nonzero negative units_traversed. With the clamp,
         // cursor is at 5 (blocks.len()) and space(0) does nothing.
@@ -1838,7 +1835,7 @@ mod tests {
         // 64-byte block on tape; caller passes 8-byte buffer.
         // Real DriveHandle::read_block returns
         // TapeIoError::ReadBufferTooSmall after consuming the
-        // block. The fixture must match — codex 23:26 catch.
+        // block. The fixture must match.
         let mut src = VecBlockSource::new(vec![vec![0xAA; 64]]);
         let mut buf = [0u8; 8];
         let err = src.read_block(&mut buf).expect_err("ReadBufferTooSmall");
@@ -1891,7 +1888,7 @@ mod tests {
     #[test]
     fn vec_source_space_backward_past_bop_clamps_and_flags_boundary() {
         // Real drives stop at BOP with stopped_at_boundary = true
-        // and report actual move via residual. Codex 23:26 catch.
+        // and report actual move via residual.
         let mut src = VecBlockSource::new(vec![vec![0u8; 1]; 5]);
         src.locate(2).unwrap();
         let result = src.space(-10, SpaceKind::Blocks).expect("space ok");

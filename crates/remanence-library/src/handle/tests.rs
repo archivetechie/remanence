@@ -1642,10 +1642,7 @@ fn drive_handle_load_immediate_sets_immed_bit() {
 #[cfg(target_os = "linux")]
 #[test]
 fn drive_handle_load_transport_error_marks_parent_dirty() {
-    // Step 9.1d (codex 97997d71) closed the TODO at the old
-    // handle.rs:1308 that said the DriveHandle couldn't flip
-    // the parent LibraryHandle's dirty bit. Now it can: a
-    // direct DriveHandle::load() failing with a completion-
+    // A direct DriveHandle::load() failing with a completion-
     // ambiguous transport error must leave the parent handle
     // with is_dirty() == true and dirty_cause() ==
     // CompletionUnknown — same signal the composed
@@ -1735,8 +1732,7 @@ use crate::handle::tape_io::TapeIoError;
 
 /// Build a 32-byte READ POSITION long-form response. `lba`
 /// goes into bytes 8..16; `flags` is byte 0; `partition` is a
-/// u32 big-endian at bytes 4..8 per IBM Table 99 (codex 19:57
-/// fix).
+/// u32 big-endian at bytes 4..8 per IBM Table 99.
 fn rp_long_response(flags: u8, partition: u32, lba: u64) -> Vec<u8> {
     let mut v = vec![0u8; 32];
     v[0] = flags;
@@ -2214,7 +2210,7 @@ fn drive_handle_space_early_stop_at_filemark_returns_boundary_signal() {
 fn drive_handle_space_rejects_sequential_filemarks() {
     // IBM LTO drives only implement SPACE codes 0 / 1 / 3.
     // CODE 2 (SequentialFilemarks) is reserved — Layer 3a
-    // rejects it at the API boundary (codex 20:00 catch).
+    // rejects it at the API boundary.
     let lib = open_drive_test_lib("LIB_SP04");
     let policy = StaticAllowlist::new(["LIB_SP04"]);
     let (factory, log) = multi_recording_factory(vec![
@@ -5113,7 +5109,7 @@ impl<T: SgTransport> SgTransport for FailFirstWfWithCheckCondition<T> {
 
 #[test]
 fn drive_handle_write_filemarks_near_eom_returns_early_warning() {
-    // Codex 20:17 (idref=6e9b56d9 High) regression: WRITE FILEMARKS
+    // WRITE FILEMARKS
     // crossing PEWZ raises CHECK CONDITION with NO SENSE + EOM but
     // the marks ARE committed. Must surface as Ok(EW), not Err.
     let lib = open_drive_test_lib("LIB_WF02");
@@ -6156,7 +6152,7 @@ fn readiness_wait_bounds_initializing_loads_to_its_budget() {
 
 #[test]
 fn drive_handle_write_config_rejects_fixed_block_size_zero() {
-    // Codex 20:22 (idref=01cf3e76 Medium): BlockSize::Fixed
+    // BlockSize::Fixed
     // { size_bytes: 0 } is invalid per model.rs §4.2 and must
     // be rejected at the API boundary, no CDB on the wire.
     let lib = open_drive_test_lib("LIB_WC02");
@@ -6202,7 +6198,7 @@ fn drive_handle_write_config_rejects_fixed_block_size_zero() {
 fn drive_handle_write_config_rejects_fixed_block_size_above_24_bits() {
     // size_bytes > 0x00FF_FFFF doesn't fit the 3-byte block-
     // descriptor field. Silent truncation would let 0x0100_0000
-    // become variable-block (codex catch).
+    // become variable-block.
     let lib = open_drive_test_lib("LIB_WC03");
     let policy = StaticAllowlist::new(["LIB_WC03"]);
     let (factory, log) = multi_recording_factory(vec![
@@ -6245,7 +6241,7 @@ fn drive_handle_write_config_rejects_fixed_block_size_above_24_bits() {
 
 #[test]
 fn drive_handle_read_config_rejects_short_rbl_response() {
-    // Codex 20:22 (idref=01cf3e76 Medium): read_config slices
+    // read_config slices
     // the RBL buffer to bytes_transferred before
     // parse_response, so a 4-byte transfer surfaces as
     // MalformedModeResponse instead of being silently parsed

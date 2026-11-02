@@ -1412,7 +1412,7 @@ impl super::DriveHandle {
         // Reference SPACE table; CODE 2 (sequential filemarks) is
         // listed as reserved. Issuing it would yield INVALID FIELD
         // IN CDB at runtime on hardware — reject at the API
-        // boundary so the failure is locatable. Codex 20:00 catch.
+        // boundary so the failure is locatable.
         let scsi_code = match kind {
             SpaceKind::Blocks => SpaceCode::Blocks,
             SpaceKind::Filemarks => SpaceCode::Filemarks,
@@ -2818,8 +2818,8 @@ impl super::DriveHandle {
     /// helper as [`Self::write_block`] and returns success-with-EW;
     /// sense key
     /// `0x0D` (VOLUME OVERFLOW) escalates to `end_of_medium = true`.
-    /// Codex 20:17 (idref=6e9b56d9 High) caught the earlier
-    /// always-Err-on-CC behaviour.
+    /// A CHECK CONDITION reporting committed marks and early warning
+    /// must return a successful outcome to prevent duplicate writes on retry.
     ///
     /// Transport errors flip the parent dirty bit with cause
     /// [`DirtyCause::CompletionUnknown`].
@@ -3123,7 +3123,7 @@ impl super::DriveHandle {
     ///
     /// 1. READ BLOCK LIMITS (CDB `0x05`) for
     ///    [`TapeConfig::max_block_size_bytes`]. MODE SENSE pages do
-    ///    not carry the per-block size limit (codex 19:45 catch).
+    ///    not carry the per-block size limit.
     /// 2. MODE SENSE(6) (CDB `0x1A`) for page `0x0F` (Data
     ///    Compression) with `DBD=0` so the response includes the
     ///    block descriptor — block size comes from the
@@ -3147,7 +3147,7 @@ impl super::DriveHandle {
         let mut rbl_buf = [0u8; 6];
         let max_block_size_bytes = match self.transport.execute_in(&cdb_rbl, &mut rbl_buf) {
             Ok(outcome) => {
-                // Codex 20:22 (idref=01cf3e76 Medium): slice to
+                // Slice to
                 // bytes_transferred so a short successful transfer
                 // isn't accepted with fabricated trailing zeros
                 // from the zero-initialised buffer — mirrors the
@@ -3248,8 +3248,7 @@ impl super::DriveHandle {
         // CDB so the failure is locatable (and matches our public
         // contract — model.rs §4.2 says "size_bytes: zero is
         // invalid; multi-MiB values must fit in the drive's
-        // documented maximum"). Codex 20:22 (idref=01cf3e76
-        // Medium) caught the missing validation: the prior path
+        // documented maximum"). Without validation, the descriptor
         // would silently truncate 0x0100_0000 to 0 (variable mode)
         // and accept Fixed{0}.
         if let BlockSize::Fixed { size_bytes } = cfg.block_size {
@@ -4002,8 +4001,8 @@ fn worm_state_from_medium_type(medium_type: u8) -> WormMediaState {
 /// 0x0F (Data Compression). `cfg.max_block_size_bytes` is ignored
 /// — the drive's own cap always wins.
 ///
-/// **Important non-changeable field rules per IBM Table 345**
-/// (codex 20:22 idref=01cf3e76 High): DCC is non-changeable 1,
+/// **Important non-changeable field rules per IBM Table 345**:
+/// DCC is non-changeable 1,
 /// DDE is non-changeable 1, and the compression / decompression
 /// algorithm fields must be `0x00000001`. Sending any other value
 /// for these non-changeable fields makes the drive return CHECK
@@ -4028,7 +4027,7 @@ fn build_compression_param_list(cfg: &TapeConfig) -> Vec<u8> {
     // initiator sharing the drive. We emit 0x10 = BUFFERED MODE
     // 001b, SPEED 0 — the IBM-documented default — so
     // write_config() touches only block size + compression as
-    // intended. Codex 20:38 (idref=7714c4dc Medium) catch.
+    // intended.
     buf.extend_from_slice(&[
         0,    // Mode Data Length (reserved on SELECT)
         0,    // Medium Type
@@ -4060,8 +4059,7 @@ fn build_compression_param_list(cfg: &TapeConfig) -> Vec<u8> {
     // 16-byte page 0x0F (Data Compression). DCE per
     // cfg.compression; DCC = 1 and DDE = 1 always (non-changeable
     // per IBM Table 345); algorithms always 1 (also non-changeable).
-    // Codex 20:22 catch — earlier version sent DCC=0, DDE=0, and
-    // algorithms=0 in the compression-off path, which would
+    // Sending DCC=0, DDE=0, or algorithms=0 in the compression-off path would
     // surface as 5/2600 on real IBM drives.
     let byte_2 = if cfg.compression { 0xC0 } else { 0x40 }; // DCE | DCC=1
     let byte_3 = 0x80; // DDE = 1

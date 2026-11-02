@@ -156,7 +156,7 @@ pub(crate) fn no_parity_scheme_conflict(
 
 /// Serialize a `BootstrapPayload` into a tape block buffer.
 ///
-/// **Buffer contract** (codex idref=794a16ac Low catch): `buf`
+/// **Buffer contract**: `buf`
 /// must be at least `payload.block_size_bytes` long — exactly
 /// one tape block. The function writes the framed bootstrap
 /// into the prefix `buf[0..written]` and **zero-fills the
@@ -171,7 +171,7 @@ pub fn write_bootstrap_block(
     payload: &BootstrapPayload,
     buf: &mut [u8],
 ) -> Result<usize, ParityError> {
-    // Codex idref=99c40750 Low: enforce the documented
+    // Enforce the documented
     // invariants on the no_parity_flag / scheme pair before
     // serializing, so the writer never emits a frame the
     // parser would reject.
@@ -371,7 +371,7 @@ pub(crate) fn parse_bootstrap_block_with_fill(
 
     let decoded = decode_cbor_payload(cbor_bytes, no_parity)?;
 
-    // Codex idref=794a16ac Medium: scheme record is optional
+    // The scheme record is optional
     // only when FLAG_NO_PARITY is set. Reject a missing scheme
     // record on a parity-protected tape.
     no_parity_scheme_conflict(no_parity, decoded.scheme_record.is_some())
@@ -622,7 +622,7 @@ fn encode_cbor_payload(payload: &BootstrapPayload) -> Result<Vec<u8>, ParityErro
     let mut entries: Vec<(CborValue, CborValue)> = Vec::new();
 
     // Tag 1: scheme record. Omitted on no-parity bootstraps
-    // per design §5.6 / codex idref=794a16ac.
+    // per REM-PARITY §5.6.
     if let Some(scheme) = payload.scheme.as_ref() {
         let scheme_map = CborValue::Map(vec![
             (
@@ -1634,7 +1634,7 @@ mod tests {
 
     #[test]
     fn roundtrip_no_parity_bootstrap_without_scheme_record() {
-        // Codex idref=794a16ac Medium: a no-parity bootstrap
+        // A no-parity bootstrap
         // may omit the scheme record entirely per design §5.6.
         let mut payload = sample_payload();
         payload.no_parity_flag = true;
@@ -1650,7 +1650,7 @@ mod tests {
 
     #[test]
     fn writer_rejects_scheme_none_without_no_parity_flag() {
-        // Codex idref=99c40750 Low: the writer must enforce
+        // The writer must enforce
         // the BootstrapPayload invariants — emitting a
         // scheme=None payload with no_parity_flag=false would
         // produce a frame the parser rejects.
@@ -1755,7 +1755,7 @@ mod tests {
 
     #[test]
     fn write_rejects_buffer_smaller_than_block_size() {
-        // Codex idref=794a16ac Low: writer must reject buffers
+        // The writer must reject buffers
         // shorter than block_size_bytes, not just shorter than
         // the framed payload.
         let payload = sample_payload(); // block_size_bytes = 1 MiB
@@ -1791,7 +1791,7 @@ mod tests {
 
     #[test]
     fn write_zero_fills_padding_so_stale_bytes_dont_leak() {
-        // Codex idref=794a16ac Low: a reused scratch buffer
+        // A reused scratch buffer
         // carrying nonzero bytes must end up zero in the
         // padding region after a write.
         let payload = sample_payload(); // block_size_bytes = 1 MiB
