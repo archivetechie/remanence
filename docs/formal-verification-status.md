@@ -157,12 +157,16 @@ any reconstruction of data from parity.
 Target: the fixed-layout arithmetic in `crates/remanence-parity/src/sidecar.rs`.
 A sidecar is the tape file that holds an epoch's parity.
 
-The proofs cover the fixed byte ranges of the sidecar header and footer, the
-windows each header and footer CRC covers and where each is stored, the
-trailing CRC ranges of block 0 and of spill-index blocks, the block placement
-of a whole sidecar tape file (header copy, parity blocks, tail copy, footer,
-`2H + P + 1` blocks in all), the refusal of blocks that are too small, and that
-every fixed range the production code reads or writes lies inside its buffer.
+The proofs cover:
+
+- the fixed byte ranges of the sidecar header and footer;
+- the bytes each header and footer CRC covers, and where each CRC is stored;
+- the trailing CRC ranges of block 0 and of the spill-index blocks;
+- the block placement of a whole sidecar tape file: header copy, parity
+  blocks, tail copy and footer, `2H + P + 1` blocks in all;
+- the refusal of blocks that are too small;
+- that every fixed range the production code reads or writes lies inside its
+  buffer.
 
 Not proved: the keyed-hash (HMAC-SHA-256), SHA-256 and CRC algebra,
 allocation and slice copying, walking variable-length index entries, parity
@@ -194,10 +198,10 @@ The proofs cover:
   beginning of the tape when none is valid.
 
 Not proved: the encoding of the terminal index in CBOR (a compact binary data
-format), the cryptographic and CRC algebra, building the replica and
-separation bytes, device positioning and filemarks, the order of tape-log and
-catalog writes, the byte-level agreement check between replicas, and the
-production code that gathers the inputs. The no-parity case is
+format), the cryptographic and CRC algebra, and building the replica and
+separation bytes. Nor are device positioning and filemarks, the order of
+tape-log and catalog writes, the byte-level agreement check between replicas,
+or the production code that gathers the inputs. The no-parity case is
 extracted but has no dedicated theorem; the compiled behaviour comparison
 covers it.
 
@@ -226,11 +230,11 @@ collection code.
 Target: the writer schema and validation arithmetic of the encrypted object's
 metadata frame, in `crates/remanence-aead/src/metadata.rs`.
 
-The proofs cover the conditions under which validation succeeds, the refusal
-of bad chunk and plaintext sizes and of arithmetic overflow, the exact
-four-key layout the writer emits, the round trip decode(encode(x)) = x for a
-valid metadata core, and the refusal of wrong versions, digest algorithms,
-digest lengths and trailing data.
+The proofs cover the conditions under which validation succeeds, and the
+refusal of bad chunk and plaintext sizes and of arithmetic overflow. They
+cover the exact four-key layout the writer emits and the round trip
+decode(encode(x)) = x for a valid metadata core. The decoder is proved to
+refuse wrong versions, digest algorithms, digest lengths and trailing data.
 
 Not proved: copying the real digest bytes, skipping unknown CBOR extension
 keys, encryption, hashing, or the byte-level round trip over production
@@ -242,12 +246,17 @@ Target: the manifest writer schema and validation arithmetic in
 `crates/remanence-format/src/layout.rs` and `manifest.rs`. The manifest is the
 CBOR member index at the end of every object.
 
-The proofs cover the chunk-count arithmetic, the writer's key layout for the
-root and for a regular file, and round trips for three shapes: a one-file
-manifest, a fixed five-entry manifest (a file with one `user.` attribute, an
-empty file, a hard link, a symbolic link and a directory), and the same five
-entries checked as an array, with duplicate paths and file ids refused and the
-hard-link target required to be an earlier regular file. For manifests of any
+The proofs cover the chunk-count arithmetic and the writer's key layout for
+the root and for a regular file. They prove round trips for three shapes:
+
+- a manifest with one regular file;
+- a fixed five-entry manifest: a file with one `user.` attribute, an empty
+  file, a hard link, a symbolic link and a directory;
+- the same five entries checked as an array, with duplicate paths and file
+  ids refused and the hard-link target required to be an earlier regular
+  file.
+
+For manifests of any
 length, they prove only progress: a sequence of steps that are each already
 valid and duplicate-free reaches a final state. That result says nothing about
 the final state, and duplicate refusal is proved only at the fixed size.

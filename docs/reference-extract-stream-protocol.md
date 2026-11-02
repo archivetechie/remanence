@@ -70,7 +70,7 @@ command reads and validates the whole stored object. No JSON, progress or
 diagnostic text is written to standard output.
 
 On success, after the whole object has validated and standard output has been
-flushed, the command writes one JSON line to standard error with these fields:
+flushed, the command writes one JSON line to standard error. Its fields are
 `command` (`"archive extract-stream"`), `status` (`"ok"`), `object_id`,
 `recipient_epochs` (each slot's `epoch_id` and `label`), `format_version`,
 `chunk_size`, `stored_size_bytes`, `plaintext_size_bytes`, `plaintext_sha256`,
@@ -82,10 +82,10 @@ On failure the command writes one line to standard error beginning
 `error: archive extract-stream:`.
 
 Standard output is a stream, not a transaction. Each chunk's plaintext is
-written as soon as its tag verifies. A later failure (truncated input, a bad
-tag, the footer, the fill, the plaintext size or digest, trailing bytes, a
-range past the end of the plaintext, or a failed write) is reported after
-earlier plaintext has already been written. Standard output never holds
+written as soon as its tag verifies, so a later failure is reported after
+earlier plaintext has already been written. Such a failure can be truncated
+input, a bad tag, a bad footer or fill, a wrong plaintext size or digest,
+trailing bytes, a range past the end of the plaintext, or a failed write. Standard output never holds
 plaintext from a chunk whose tag failed. The consumer discards or invalidates
 what it received unless the command exits with status 0.
 
