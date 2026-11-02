@@ -26,6 +26,7 @@ use tempfile::TempDir;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+use remanence_format::parse_ustar_octal;
 use remanence_parity::escape_member_name;
 
 use crate::{
@@ -2200,6 +2201,7 @@ fn validate_wrap_tar_paths(wrapper: &Path, _tar_engine: &TarEngineReport) -> Res
         if header.iter().all(|byte| *byte == 0) {
             break;
         }
+        verify_tar_checksum(&header)?;
         let size = parse_tar_size(&header)?;
         let typeflag = header[156];
         let data_offset = offset
@@ -2396,6 +2398,7 @@ fn write_wrap_index(path: &Path, index: &WrapIndex) -> Result<(), String> {
 fn parse_tar_size(header: &[u8; 512]) -> Result<u64, String> {
     let field = &header[124..136];
     if field[0] & 0x80 != 0 {
+        // Base-256 size (GNU and libarchive both write it for sizes octal cannot hold).
         let mut value = 0u64;
         for byte in &field[1..] {
             value = value
@@ -2405,13 +2408,30 @@ fn parse_tar_size(header: &[u8; 512]) -> Result<u64, String> {
         }
         return Ok(value);
     }
-    let text = field
+    parse_ustar_octal(field, "size").map_err(|error| error.to_string())
+}
+
+/// Validate wrapper checksums before trusting a header's member boundaries.
+fn verify_tar_checksum(header: &[u8; 512]) -> Result<(), String> {
+    let stored =
+        parse_ustar_octal(&header[148..156], "checksum").map_err(|error| error.to_string())?;
+    let computed: u64 = header
         .iter()
-        .copied()
-        .take_while(|byte| *byte != 0 && *byte != b' ')
-        .collect::<Vec<_>>();
-    let text = String::from_utf8_lossy(&text);
-    u64::from_str_radix(text.trim(), 8).map_err(|error| format!("parse tar size {text:?}: {error}"))
+        .enumerate()
+        .map(|(index, &byte)| {
+            if (148..156).contains(&index) {
+                u64::from(b' ')
+            } else {
+                u64::from(byte)
+            }
+        })
+        .sum();
+    if stored != computed {
+        return Err(format!(
+            "tar checksum mismatch: stored {stored}, computed {computed}"
+        ));
+    }
+    Ok(())
 }
 
 fn parse_pax_records(data: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, String> {
@@ -2482,18 +2502,15 @@ fn parse_tar_octal_field(field: &[u8], label: &str) -> Result<Option<u64>, Strin
     if field.first().is_some_and(|byte| byte & 0x80 != 0) {
         return Ok(None);
     }
-    let end = field
+    let value = parse_ustar_octal(field, label).map_err(|error| error.to_string())?;
+    if field
         .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(field.len());
-    let text = String::from_utf8_lossy(&field[..end]);
-    let text = text.trim();
-    if text.is_empty() {
-        return Ok(None);
+        .all(|byte| *byte == 0 || byte.is_ascii_whitespace() || *byte == b'\x0b')
+    {
+        Ok(None)
+    } else {
+        Ok(Some(value))
     }
-    u64::from_str_radix(text, 8)
-        .map(Some)
-        .map_err(|error| format!("parse {label} {text:?}: {error}"))
 }
 
 fn parse_pax_mtime_nanos(value: &str) -> Result<i128, String> {
@@ -3371,6 +3388,53 @@ blob Literal/Sub/
         let p = Pattern::parse("**/*.[fF][cC][pP]bundle/");
         assert!(p.matches("Cut/Show.fcpbundle", true, false));
         assert!(!p.matches("Cut/Show.fcpxml", false, false));
+    }
+
+    #[test]
+    fn wrapper_validator_rejects_signed_checksum() {
+        assert_wrapper_rejects_signed_numeric_field(148, "checksum");
+    }
+
+    #[test]
+    fn wrapper_validator_rejects_signed_size() {
+        assert_wrapper_rejects_signed_numeric_field(124, "size");
+    }
+
+    /// Exercise wrapper validation directly, without invoking an external tar engine.
+    fn assert_wrapper_rejects_signed_numeric_field(offset: usize, name: &str) {
+        let temp = tempfile::tempdir().unwrap();
+        let wrapper = temp.path().join("numeric.remwrap.tar");
+        let engine = TarEngineReport {
+            program: "unused".to_string(),
+            version: "unused".to_string(),
+            create_invocation: Vec::new(),
+            extract_invocation: Vec::new(),
+        };
+        let mut header = remanence_format::tar::encode_header(
+            "a.txt",
+            5,
+            remanence_format::tar::TYPE_REGULAR,
+            0o644,
+        )
+        .unwrap();
+        let mut archive = header.to_vec();
+        archive.extend_from_slice(b"hello");
+        archive.resize(2048, 0);
+        fs::write(&wrapper, &archive).unwrap();
+        validate_wrap_tar_paths(&wrapper, &engine).unwrap();
+
+        assert_eq!(header[offset], b'0');
+        header[offset] = b'+';
+        if name == "size" {
+            header[148..156].fill(b' ');
+            let checksum: u64 = header.iter().map(|&byte| u64::from(byte)).sum();
+            header[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+            verify_tar_checksum(&header).unwrap();
+        }
+        archive[..512].copy_from_slice(&header);
+        fs::write(&wrapper, &archive).unwrap();
+        let error = validate_wrap_tar_paths(&wrapper, &engine).unwrap_err();
+        assert!(error.contains(&format!("{name} field")), "{error}");
     }
 
     #[test]

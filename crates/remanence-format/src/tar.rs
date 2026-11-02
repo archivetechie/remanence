@@ -1,4 +1,4 @@
-//! Minimal tar header encoding used by `rem-object-v1`.
+//! Minimal tar header encoding and strict numeric parsing used by `rem-object-v1`.
 
 use crate::error::FormatError;
 use crate::model::TAR_RECORD_SIZE;
@@ -21,6 +21,41 @@ pub const USTAR_SIZE_FIELD_MAX: u64 = 0o77777777777;
 
 const PAX_BACKED_PATH_PLACEHOLDER: &str = "remanence/pax-path";
 const PAX_BACKED_LINK_PLACEHOLDER: &str = "remanence/pax-linkpath";
+
+/// Parse a ustar numeric field using the REM-OBJECT octal grammar.
+///
+/// Leading ASCII whitespace (including vertical tab) is skipped. Octal digits
+/// end at the first NUL or ASCII whitespace, or at the field's end. After a terminator,
+/// only NUL or ASCII whitespace is allowed. An empty field is zero; signs,
+/// non-octal bytes, digits after a terminator, and `u64` overflow are errors.
+/// Errors use the caller-supplied field name for context.
+pub fn parse_ustar_octal(field: &[u8], name: &str) -> Result<u64, FormatError> {
+    let is_whitespace = |byte: u8| byte.is_ascii_whitespace() || byte == b'\x0b';
+    let invalid = || FormatError::parse(format!("{name} field is not octal"));
+    let start = field
+        .iter()
+        .position(|&byte| !is_whitespace(byte))
+        .unwrap_or(field.len());
+    let mut value = 0u64;
+    let mut terminated = false;
+    for &byte in &field[start..] {
+        if terminated {
+            if byte != 0 && !is_whitespace(byte) {
+                return Err(invalid());
+            }
+        } else if byte == 0 || is_whitespace(byte) {
+            terminated = true;
+        } else if (b'0'..=b'7').contains(&byte) {
+            value = value
+                .checked_mul(8)
+                .and_then(|value| value.checked_add(u64::from(byte - b'0')))
+                .ok_or_else(invalid)?;
+        } else {
+            return Err(invalid());
+        }
+    }
+    Ok(value)
+}
 
 /// Encode a POSIX ustar header record.
 pub fn encode_header(
@@ -213,6 +248,80 @@ fn write_checksum(field: &mut [u8], value: u64) -> Result<(), FormatError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_octal_accepts_canonical_builder_fields() {
+        let header = encode_header("hello.txt", 12, TYPE_REGULAR, 0o644).unwrap();
+        for (range, name, expected) in [
+            (100..108, "mode", 0o644),
+            (108..116, "uid", 0),
+            (116..124, "gid", 0),
+            (124..136, "size", 12),
+            (136..148, "mtime", 0),
+        ] {
+            assert_eq!(parse_ustar_octal(&header[range], name).unwrap(), expected);
+        }
+        let expected: u64 = header[..148]
+            .iter()
+            .chain(&header[156..])
+            .map(|&byte| u64::from(byte))
+            .sum::<u64>()
+            + 8 * u64::from(b' ');
+        assert_eq!(
+            parse_ustar_octal(&header[148..156], "checksum").unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn strict_octal_accepts_whitespace_empty_and_boundaries() {
+        let cases: &[(&[u8], u64)] = &[
+            (b"   644 \0\0", 0o644),
+            (b" \t\r\n\x0b\x0c17 \0\t\r\n\x0b\x0c ", 0o17),
+            (b"17", 0o17),
+            (b"", 0),
+            (b"\0\0\0", 0),
+            (b" \t\r\n\x0b\x0c", 0),
+            (b" \0 \t\r\n\x0b\x0c\0", 0),
+            (b"1777777777777777777777", u64::MAX),
+            (b"17\t", 0o17),
+            (b"17\r\n", 0o17),
+            (b"17\x0b", 0o17),
+        ];
+        for &(field, expected) in cases {
+            assert_eq!(
+                parse_ustar_octal(field, "size").unwrap(),
+                expected,
+                "{field:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_octal_rejects_ambiguous_invalid_and_overflow_fields() {
+        let cases: &[&[u8]] = &[
+            b"+17",
+            b"-1",
+            b"\x0017",
+            b"17x",
+            b"1 7",
+            b"8",
+            b"2000000000000000000000",
+            b"7777777777777777777777",
+            b"17\0x",
+            b"17\0 7",
+            b" \0 17",
+            b"17\t7",
+            b"\xff",
+            b"\x8017",
+            b"\xc2\xa017",
+        ];
+        for &field in cases {
+            let error = parse_ustar_octal(field, "size").unwrap_err();
+            assert!(matches!(error, FormatError::Parse(_)), "{field:?}: {error}");
+            assert!(error.to_string().contains("size field"), "{error}");
+        }
+    }
 
     #[test]
     fn encodes_header_with_valid_checksum() {
