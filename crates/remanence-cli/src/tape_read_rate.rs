@@ -883,6 +883,11 @@ mod tests {
             }
         }
         let result = with_temporary_bot_read_config(&mut RestoreFailure(&mut drive, 0), |drive| {
+            // As production does after the bootstrap read: switch to the tape's fixed block size.
+            // Written through the inner handle so the injected failure still lands on the restore.
+            let mut mode = drive.0.bot_read_config()?;
+            mode.block_size = BlockSize::Fixed { size_bytes: 262144 };
+            drive.0.bot_write_config(mode)?;
             let value = measure(drive.0, 262144, 1, 2, Mode::Space);
             measured = Some(value.clone());
             Ok(value)
