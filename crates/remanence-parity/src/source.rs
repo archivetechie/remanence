@@ -1158,8 +1158,7 @@ fn parity_error_to_tape_io_error(err: ParityError) -> TapeIoError {
 ///
 /// Every other sense key — NOT_READY (0x02), HARDWARE_ERROR
 /// (0x04), ILLEGAL_REQUEST (0x05), DATA_PROTECT (0x07), and the
-/// rest — propagates as a drive error. Per codex idref=d4e7492e
-/// (Medium): the prior HARDWARE_ERROR "positioning ASC"
+/// rest — propagates as a drive error. A HARDWARE_ERROR "positioning ASC"
 /// allowlist (0x09/0x15/0x3B/0x52) is not grounded in the IBM
 /// LTO SCSI Reference GA32-0928-08 — Annex B Table B.5 lists
 /// 03/02, 04/03, 10/01, 40/XX, 41/00, 44/00, 51/00, 52/00, 53/00,

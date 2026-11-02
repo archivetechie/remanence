@@ -29,9 +29,8 @@
 //! it's an explicit-LBA-addressed form with partition + logical
 //! object identifier + a 24-bit transfer-length field, intended
 //! for FCS / LCS (First/Last-cycle stage) staged-write workflows.
-//! An earlier draft of this module incorrectly treated 0x80 as a
-//! 64-bit count CDB (a SPACE(16)-style layout); codex review
-//! cb91b17b caught it. Since rem doesn't need to address file
+//! Opcode 0x80 does not provide a 64-bit count in a SPACE(16)-style
+//! layout. Since rem doesn't need to address file
 //! marks by logical-object identifier, the 16-byte form is
 //! dropped entirely.
 

@@ -9,8 +9,11 @@ remaining short epoch's full sidecar and its closeout barrier under the
 recommended session policy.
 `CHECKPOINTED` means the Object is durable; parity for its open epoch may follow.
 The scope of `caller_object_id` for retry identity is the pool.
-Session opens queue for a drive; clients accumulate ready Objects before
-opening and stream the batch when admitted.
+A session open does not wait for a drive. When no drive bay can take the tape
+because the bays are reserved by other work, the daemon refuses the open with
+`FAILED_PRECONDITION` and appends the holders to the message, for example
+`no free drive bay available to load cartridge RMJ101L9; held by: drive <SERIAL> held by write session <UUID>`.
+The daemon keeps no queue of waiting opens; the client retries the open later.
 
 ## Tape-I/O fences
 

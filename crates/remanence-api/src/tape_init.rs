@@ -10,8 +10,7 @@ use remanence_parity::{
     bootstrap::{
         has_bootstrap_magic, parse_bootstrap_block, write_bootstrap_block, BootstrapPayload,
     },
-    default_scheme_for_block_size, sole_bot_filemark_map_digest, ParityConfig, ParityScheme,
-    ParitySchemeRecord, SchemeId,
+    sole_bot_filemark_map_digest, ParityConfig, ParityScheme, ParitySchemeRecord, SchemeId,
 };
 use remanence_state::{CatalogIndex, LabelProvenance, StateError, TapeIoFenceRecord, TapeRecord};
 
@@ -73,9 +72,10 @@ pub fn write_tape_bootstrap(
 }
 
 const BOT_CLASSIFY_READ_BYTES: usize = 1024 * 1024;
+// Identity probes use variable-block READs for any READ(6)-representable record.
+const BOT_IDENTITY_READ_BYTES: usize = 0xFF_FFFF;
 
-/// Canonical fixed block size used by the identity-only bootstrap adoption
-/// ceremony.
+/// Reference size for a 1 MiB Bootstrap. Adoption also accepts other sizes.
 pub const CANONICAL_ADOPTION_BLOCK_SIZE_BYTES: u32 = 1024 * 1024;
 
 /// Typed result of one BOT-only physical identity probe.
@@ -89,7 +89,8 @@ pub enum BotIdentityClassification {
         payload: BootstrapPayload,
         /// Exact physical record length returned by READ.
         physical_record_bytes: u32,
-        /// Whether the payload has the canonical 1 MiB default parity geometry.
+        /// Whether the payload permits adoption, before checking library drive limits.
+        /// The field name is retained for BOT-probe output compatibility.
         canonical_adoption_geometry: bool,
     },
     /// Native Bootstrap magic was present, but its framing or checksum failed.
@@ -619,7 +620,7 @@ pub fn probe_bot_identity_from_source(
             )),
         };
     }
-    let mut block = vec![0u8; BOT_CLASSIFY_READ_BYTES];
+    let mut block = vec![0u8; BOT_IDENTITY_READ_BYTES];
     match source.read_block(&mut block) {
         Ok(read) => classify_bot_identity_bytes(&block[..read]),
         Err(error) if is_blank_check_eod(&error) => BotIdentityClassification::BlankCheckEod,
@@ -647,7 +648,7 @@ pub fn classify_bootstrap_adoption_from_source(
         };
     };
 
-    let mut next = vec![0u8; BOT_CLASSIFY_READ_BYTES];
+    let mut next = vec![0u8; BOT_IDENTITY_READ_BYTES];
     let tail = match source.read_block(&mut next) {
         Ok(_) => BootstrapTailClassification::DataAfterBootstrap,
         Err(remanence_library::TapeIoError::FilemarkEncountered) => {
@@ -675,23 +676,39 @@ pub fn classify_bootstrap_adoption_from_source(
     }
 }
 
-/// Whether one decoded Bootstrap has the clean-break adoption geometry.
+/// Whether a decoded Bootstrap has valid geometry and compression off.
+/// Library drive limits are checked separately before catalog adoption.
 pub fn has_canonical_adoption_geometry(payload: &BootstrapPayload) -> bool {
     if !is_uuid_v4(payload.tape_uuid)
-        || payload.block_size_bytes != CANONICAL_ADOPTION_BLOCK_SIZE_BYTES
-        || payload.no_parity_flag
+        || payload.block_size_bytes == 0
+        || !payload.block_size_bytes.is_multiple_of(512)
         || payload.drive_compression
     {
         return false;
     }
-    let expected = default_scheme_for_block_size(CANONICAL_ADOPTION_BLOCK_SIZE_BYTES);
-    payload.scheme.as_ref().is_some_and(|scheme| {
-        !scheme.no_parity_flag
-            && scheme.id == expected.id.as_str()
-            && scheme.data_blocks_per_stripe == expected.data_blocks_per_stripe
-            && scheme.parity_blocks_per_stripe == expected.parity_blocks_per_stripe
-            && scheme.stripes_per_neighborhood == expected.stripes_per_neighborhood
-    })
+    match (&payload.scheme, payload.no_parity_flag) {
+        (None, true) => true,
+        (Some(scheme), false) if !scheme.no_parity_flag => {
+            let geometry = geometry_from_bootstrap(payload);
+            matches!(geometry.parity, ParityConfig::Scheme(scheme) if scheme.validate().is_ok())
+        }
+        _ => false,
+    }
+}
+
+/// Require the recorded block size to fit every library drive's reported limit.
+pub fn validate_bootstrap_adoption_drive_limits(
+    block_size_bytes: u32,
+    drive_limits: impl IntoIterator<Item = (u16, u32)>,
+) -> Result<(), String> {
+    for (bay, maximum) in drive_limits {
+        if block_size_bytes > maximum {
+            return Err(format!(
+                "drive 0x{bay:04x} maximum block size {maximum} is smaller than Bootstrap block size {block_size_bytes}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn is_uuid_v4(bytes: [u8; 16]) -> bool {
@@ -1365,6 +1382,7 @@ mod tests {
         VecBlockSource,
     };
     use remanence_parity::bootstrap::write_bootstrap_block;
+    use remanence_parity::default_scheme_for_block_size;
 
     use super::*;
 
@@ -2091,6 +2109,138 @@ mod tests {
             }
         ));
         assert_eq!(source.calls, ["locate", "read"]);
+    }
+
+    /// Exercise the physical recheck with the tape's recorded block size and parity.
+    fn assert_adoption_geometry(block_size: u32, parity: ParityConfig) {
+        let payload = build_tape_bootstrap(
+            ADOPTION_UUID,
+            block_size,
+            parity,
+            "2026-11-02T00:00:00Z",
+            "test",
+        );
+        let mut block = vec![0; block_size as usize];
+        write_bootstrap_block(&payload, &mut block).expect("encode Bootstrap");
+        assert!(matches!(
+            classify_bot_identity_bytes(&block),
+            BotIdentityClassification::ValidRemBootstrap {
+                canonical_adoption_geometry: true,
+                ..
+            }
+        ));
+        let mut source = ScriptedSource::new([
+            ScriptRead::Data(block),
+            ScriptRead::Filemark,
+            ScriptRead::Eod,
+        ]);
+        let projection = classify_bootstrap_adoption_from_source(&mut source);
+        assert_eq!(projection.payload, Some(payload));
+        assert_eq!(
+            projection.tail,
+            BootstrapTailClassification::ExactBootstrapFilemarkEod
+        );
+        assert_eq!(source.calls, ["locate", "read", "read", "read"]);
+    }
+
+    /// Library init's default no-parity geometry is adoptable.
+    #[test]
+    fn adoption_accepts_256_kib_no_parity() {
+        assert_adoption_geometry(256 * 1024, ParityConfig::None);
+    }
+
+    /// Enabling default parity does not change block-size admission.
+    #[test]
+    fn adoption_accepts_256_kib_default_parity() {
+        assert_adoption_geometry(
+            256 * 1024,
+            ParityConfig::Scheme(default_scheme_for_block_size(256 * 1024)),
+        );
+    }
+
+    /// The formerly required geometry remains adoptable.
+    #[test]
+    fn adoption_accepts_1_mib_default_parity() {
+        assert_adoption_geometry(
+            1024 * 1024,
+            ParityConfig::Scheme(default_scheme_for_block_size(1024 * 1024)),
+        );
+    }
+
+    /// The tape may record a custom scheme and blocks larger than 1 MiB.
+    #[test]
+    fn adoption_accepts_2_mib_custom_parity() {
+        let mut scheme = default_scheme_for_block_size(2 * 1024 * 1024);
+        scheme.stripes_per_neighborhood = 1;
+        assert_adoption_geometry(2 * 1024 * 1024, ParityConfig::Scheme(scheme));
+    }
+
+    /// A later drive's limit must constrain adoption even if the reading drive fits.
+    #[test]
+    fn adoption_refuses_block_size_unsupported_by_any_library_drive() {
+        let block_size = 256 * 1024;
+        let error = validate_bootstrap_adoption_drive_limits(
+            block_size,
+            [(0x0101, 1024 * 1024), (0x0102, 128 * 1024)],
+        )
+        .expect_err("second drive cannot use the recorded block size");
+        assert!(error.contains("drive 0x0102"));
+        assert!(error.contains("131072"));
+        assert!(error.contains("262144"));
+        validate_bootstrap_adoption_drive_limits(
+            block_size,
+            [(0x0101, block_size), (0x0102, 1024 * 1024)],
+        )
+        .expect("every drive supports the block size, including equality");
+    }
+
+    /// A valid no-parity Bootstrap can record compression on, but cannot be adopted.
+    #[test]
+    fn adoption_refuses_bootstrap_recording_compression_on() {
+        let mut payload = build_tape_bootstrap(
+            ADOPTION_UUID,
+            256 * 1024,
+            ParityConfig::None,
+            "2026-11-02T00:00:00Z",
+            "test",
+        );
+        payload.drive_compression = true;
+        let mut block = vec![0; payload.block_size_bytes as usize];
+        write_bootstrap_block(&payload, &mut block).expect("encode no-parity Bootstrap");
+        assert!(matches!(
+            classify_bot_identity_bytes(&block),
+            BotIdentityClassification::ValidRemBootstrap {
+                canonical_adoption_geometry: false,
+                ..
+            }
+        ));
+    }
+
+    /// Relaxing the default geometry must not admit malformed recorded geometry.
+    #[test]
+    fn adoption_refuses_invalid_block_size_and_parity_geometry() {
+        let mut payload = build_tape_bootstrap(
+            ADOPTION_UUID,
+            256 * 1024,
+            ParityConfig::None,
+            "2026-11-02T00:00:00Z",
+            "test",
+        );
+        for block_size in [0, 513] {
+            payload.block_size_bytes = block_size;
+            assert!(!has_canonical_adoption_geometry(&payload));
+        }
+        payload.block_size_bytes = 256 * 1024;
+        payload.no_parity_flag = false;
+        assert!(!has_canonical_adoption_geometry(&payload));
+        payload.scheme = Some(ParitySchemeRecord {
+            id: "rs-cauchy-gf256-v1".into(),
+            data_blocks_per_stripe: 128,
+            parity_blocks_per_stripe: 0,
+            stripes_per_neighborhood: 1,
+            no_parity_flag: false,
+        });
+        assert!(!has_canonical_adoption_geometry(&payload));
     }
 
     #[test]

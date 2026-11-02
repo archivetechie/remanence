@@ -402,7 +402,7 @@ fn selected_in(args: &[OsString], env: &Environment) -> bool {
             .is_some();
     match words.first().map(String::as_str) {
         Some("setup" | "doctor" | "drives" | "diagnostics" | "list") => true,
-        Some("pool") => words.get(1).is_some_and(|w| w == "new"),
+        Some("pool") => words.get(1).is_none_or(|w| w == "new"),
         Some("put" | "get") => home,
         Some("tape") => match words.get(1).map(String::as_str) {
             Some(
@@ -2179,7 +2179,10 @@ fn prepare_init(
     .map_err(err)?;
     if let remanence_api::LabelLifecycleState::AssignedTo { uuid, .. } = &facts.barcode_state {
         if loaded_uuid != Some(*uuid) {
-            return Err(format!("label {label} belongs to tape {}; use tape rebind --previous-uuid {} or choose a new label", Uuid::from_bytes(*uuid), Uuid::from_bytes(*uuid)));
+            return Err(format!(
+                "label {label} belongs to tape {}; choose a new label",
+                Uuid::from_bytes(*uuid)
+            ));
         }
     }
     let decision = remanence_api::decide_tape_init(
@@ -3211,6 +3214,9 @@ mod tests {
                     (vec!["setup"], true),
                     (vec!["list"], true),
                     (vec!["pool", "new", "backup"], true),
+                    (vec!["pool", "--help"], true),
+                    (vec!["help", "pool"], true),
+                    (vec!["pool", "new", "--help"], true),
                     (vec!["tape", "identify"], true),
                     (vec!["help", "tape", "init"], saved && !system),
                     (vec!["tape", "help", "init"], saved && !system),

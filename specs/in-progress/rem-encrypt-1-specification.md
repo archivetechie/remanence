@@ -1221,6 +1221,15 @@ wrapped-DEK ciphertexts, HPKE intermediate values, salt, all derived keys,
 header, key frame, metadata, payload digest, footer, fill, and both object
 digests. `plaintext_digest` MUST equal Core vector P1's `stored_digest`.
 
+**Interim notice.** REM-OBJECT 1.0.0-draft.4, in preparation, changes the
+ustar header bytes of every plaintext object (REM-OBJECT §13.7). The
+`plaintext_digest` above, and every value pinned here that depends on the
+sealed bytes, among them the payload frame, the footer and `stored_digest`,
+record P1's earlier bytes and are stale under that preparing copy. The
+requirement that `plaintext_digest` equal P1's `stored_digest` is unchanged
+and holds for the regenerated pair. REM-OBJECT's open item RO-3 regenerates
+both vectors. No requirement of this document changes.
+
 The DEK and the HPKE randomness above are fixed inputs, chosen so that the
 vector can be reproduced. The independent verifier implements OPEN from this
 document using generic primitives and verifies both slots, the canonical
@@ -1241,6 +1250,13 @@ Core D1 object.
 | Stored size / blocks | 1310720 / 5 |
 | `plaintext_digest` | `5d07a7aca146a80dfae22f06de976924a6f5c95aceff119b057894a3ab8e1bf5` |
 | `stored_digest` | `69fa820b0c1ab581ac5e04383865b3ac9d15952e0b1e144721377836a696f859` |
+
+**Interim notice.** As for REM-OBJECT-TV-E2 (Section 13.1), the
+`plaintext_digest` and `stored_digest` above, and every value pinned for
+this vector that depends on the sealed bytes, record the earlier bytes of
+REM-OBJECT-TV-D1 and are stale under REM-OBJECT 1.0.0-draft.4, in
+preparation; REM-OBJECT's open item RO-3 regenerates them. No requirement of
+this document changes.
 
 The additive `encrypted-last-object-chunk` range vector uses
 REM-OBJECT-TV-D1's manifest range: `first_inner_chunk = 3`, `range_start = 0`,
@@ -1674,6 +1690,11 @@ effect on conformance.
 
   Section 10 points to REM-PARITY's “Versioning and Change Policy” section for
   that document's version axes.
+
+  REM-OBJECT 1.0.0-draft.4's names and headers change then made the values
+  that Sections 13.1 and 13.2 pin from the sealed plaintext objects stale.
+  Both sections carry an interim notice, and REM-OBJECT's open item RO-3
+  regenerates the values. No requirement of this document changed.
 
 - **2026-09-10 — 1.0.0-draft.3 — review-draft errata.** This revision makes
   three changes.

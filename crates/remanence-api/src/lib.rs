@@ -177,12 +177,13 @@ pub use tape_init::{
     has_canonical_adoption_geometry, match_unknown_tape_clobber, maybe_write_tape_init_bootstrap,
     maybe_write_tape_init_bootstrap_on_drive, probe_bot_identity_from_source,
     project_tape_init_catalog_inputs, refuse_tape_init_while_fenced, sniff,
-    tape_init_fence_conflicts, tape_init_fence_refusal, BootstrapAdoptionProjection,
-    BootstrapTailClassification, BotClassification, BotIdentityClassification, BotInitProjection,
-    CatalogBarcodeRelation, CatalogRowDisposition, CatalogTapeInitRow, CommittedCopyState,
-    FormatId, InitDecision, LabelLifecycleState, TapeInitCatalogProjection, TapeInitError,
-    TapeInitGeometry, TapeInitWriteAction, TapeInitWriteError, TapeInitWriteOptions,
-    UnknownTapeClobber, UnknownTapeClobberRefusal, CANONICAL_ADOPTION_BLOCK_SIZE_BYTES,
+    tape_init_fence_conflicts, tape_init_fence_refusal, validate_bootstrap_adoption_drive_limits,
+    BootstrapAdoptionProjection, BootstrapTailClassification, BotClassification,
+    BotIdentityClassification, BotInitProjection, CatalogBarcodeRelation, CatalogRowDisposition,
+    CatalogTapeInitRow, CommittedCopyState, FormatId, InitDecision, LabelLifecycleState,
+    TapeInitCatalogProjection, TapeInitError, TapeInitGeometry, TapeInitWriteAction,
+    TapeInitWriteError, TapeInitWriteOptions, UnknownTapeClobber, UnknownTapeClobberRefusal,
+    CANONICAL_ADOPTION_BLOCK_SIZE_BYTES,
 };
 pub use tape_init::{build_tape_bootstrap, write_tape_bootstrap};
 pub use write_session_ingress::WriteSessionApi;

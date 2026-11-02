@@ -1,98 +1,133 @@
 # Remanence documentation
 
 Remanence writes archives to LTO tape and reads them back years later. This
-directory holds the guides and references for people who install it, run it,
-or want to understand how it works: how to build and try it, how a tape is laid
-out, what each command does, and what to do when something goes wrong.
+directory holds the documentation for people who install and run it, write
+software against it, or review how it works. The root [README](../README.md)
+is the project's front page.
 
-If you are new, read the [quickstart](guide-quickstart.md) and then the
-[architecture overview](architecture-overview.md). The format specifications,
-their plain-language companion, and the REM Implementation and Operations Guide
-are in [../specs/publication](../specs/publication). The root
-[README.md](../README.md) is the project entry point.
+If you are new, read [Concepts](concepts.md) for the vocabulary, then follow
+the [Quickstart](guide-quickstart.md). If your hardware is one manually loaded
+LTO drive, follow [Using a standalone LTO drive](guide-standalone-drive.md)
+instead. [What works, and what does not](status.md) says how mature each part
+is and what has been released.
 
-If your hardware is one manually loaded LTO drive, start with
-[Using a standalone LTO drive](guide-standalone-drive.md). Library operators
-can continue through the daemon half of the quickstart.
+The pages are grouped by what the reader wants: tutorials to learn by doing,
+how-to guides to reach a goal, references to look things up, and explanations
+to understand why.
 
-## Start here
+## Tutorials
 
-- [guide-install.md](guide-install.md) — install the release binaries or
-  build from source, and prepare a host for tape hardware.
-- [guide-quickstart.md](guide-quickstart.md) — runnable walkthrough from
-  build to first tape write, with separate standalone-drive and library paths.
-- [guide-standalone-drive.md](guide-standalone-drive.md) — initialize, write,
-  restore, finalize, and recover tapes with one manually loaded LTO drive and
-  no daemon.
-- [status.md](status.md) — what works today, what does not, and how
-  mature each part is.
-- [architecture-overview.md](architecture-overview.md) — crate stack,
-  write/read data flow, invariants.
-- [reference-cli.md](reference-cli.md) — `rem`, `rem-debug`,
-  `rem-daemon` command surfaces and exit codes.
-- [reference-configuration.md](reference-configuration.md) — config
-  file, defaults, environment variables, on-disk state.
-- [reference-tape-layout.md](reference-tape-layout.md) — what a written
-  cartridge contains.
-- [guide-object-sizing.md](guide-object-sizing.md) — terminal-index capacity
-  terms and the operational tradeoffs for Object and bundle size.
-- [guide-troubleshooting.md](guide-troubleshooting.md) — failure modes
-  and their remedies.
-- [guide-full-verification.md](guide-full-verification.md) — what
-  `rem tape verify-index` checks, what "complete" means, how to read its
-  findings, and how long it takes.
-- [guide-damaged-tapes.md](guide-damaged-tapes.md) — what an operator sees
-  when a tape's index or bootstrap is damaged, and what each refusal means.
-- [importing-and-recovering-remanence-tapes.md](importing-and-recovering-remanence-tapes.md)
-  — safely reconstruct a locally unknown Remanence tape identity before
+- [Quickstart](guide-quickstart.md): from a clean checkout to a local archive,
+  an encrypted copy, and a first tape in a library.
+- [Using a standalone LTO drive](guide-standalone-drive.md): initialize, write,
+  restore, finalize and recover tapes with one drive and no daemon.
+
+## How-to guides
+
+- [Installing Remanence](guide-install.md): build from source, install the
+  binaries, and prepare a host for tape hardware.
+- [Troubleshooting](guide-troubleshooting.md): failure modes, the messages
+  they produce, and their remedies.
+- [Full verification](guide-full-verification.md): what
+  `rem tape verify-index` checks, how to read its findings, and how long it
+  takes.
+- [Damaged tapes](guide-damaged-tapes.md): what an operator sees when a tape's
+  index or bootstrap is damaged, and what each refusal means.
+- [Importing and recovering Remanence tapes](importing-and-recovering-remanence-tapes.md):
+  rebuild the identity of a Remanence tape this host does not know, before
   inventory and catalog recovery.
-- [reference-glossary.md](reference-glossary.md) — project and tape
-  vocabulary.
-- [reference-extended-attributes.md](reference-extended-attributes.md) —
+- [Sizing objects and write sessions](guide-object-sizing.md): capacity terms
+  for the terminal index, and the trade-offs in object and bundle size.
+- [Release verification](guide-release-verification.md): what a binary release
+  contains and how to check that it was built from the signed source.
+
+## Reference
+
+- [CLI reference](reference-cli.md): the `rem`, `rem-debug`, `rem-daemon` and
+  `rem-recover` commands and their exit codes.
+- [Configuration reference](reference-configuration.md): the configuration
+  file, defaults, environment variables and on-disk state.
+- [On-tape layout reference](reference-tape-layout.md): what a written
+  cartridge contains.
+- [Glossary](reference-glossary.md): project and tape vocabulary.
+- [API reference](reference-api.md): notes on the write-session contract; the
+  gRPC contract itself is [proto/layer5.proto](../proto/layer5.proto).
+- [Extended attributes and file metadata](reference-extended-attributes.md):
   what file metadata is preserved, how it is stored, and how it behaves on
-  restore (including the standard-`tar` fallback).
-- [reference-foreign-format-adapters.md](reference-foreign-format-adapters.md)
-  — the read-only interface for reading archive formats written by other
-  software, and where adapter crates live relative to core.
+  restore.
+- [`rem archive extract-stream` protocol](reference-extract-stream-protocol.md):
+  the contract for streaming ranged ciphertext out of an encrypted object.
+- [Foreign-format adapters](reference-foreign-format-adapters.md): the
+  read-only interface for archive formats written by other software.
+- [What works, and what does not](status.md): maturity, releases, known
+  limitations and tested hardware.
+- [The versioning register](versioning-register.md): every versioned component
+  of the system, with its current value and what an unknown value means.
+- [Formal verification status](formal-verification-status.md): what is proved
+  in Lean, and what is deliberately not.
 
-## Deeper background
+## Explanation
 
-- [REM Implementation and Operations Guide](../specs/publication/rem-implementation-guide.md) — alongside the specifications in
-  `specs/publication/`: informative, tool-neutral practice for
-  tools that read or write the REM formats (hostile media, restoring onto a
-  host, staging and durability, catalogs, keys and secrets, verification,
-  writing, finalizing and reading tapes, capacity admission, ingest, descriptive
-  fields). The specifications point to it for everything outside
-  conformance.
-- [why-remanence.md](why-remanence.md) — the project's rationale and the
-  bets behind the design.
-- [why-sg-passthrough.md](why-sg-passthrough.md) — why the stack
-  bypasses the kernel `st` driver and `mt`/`mtx`, told through two
-  classic failures of the conventional stack.
-- [tape-identity-lifecycle-explainer.md](tape-identity-lifecycle-explainer.md)
-  — how a cartridge acquires and keeps its identity.
-- [pfr-reference.md](pfr-reference.md) — how partial-file restore reads a byte range from tape
-  (drive mechanics and arithmetic).
-- [reference-extract-stream-protocol.md](reference-extract-stream-protocol.md)
-  — the ranged-ciphertext extract-stream contract.
-- [encryption-explained.md](encryption-explained.md) — why REM-ENCRYPT
-  seals objects in software instead of relying on LTO drive-level
-  encryption, and what an operator still has to manage themselves.
-- [versioning-explained.md](versioning-explained.md) — the three-question
-  change policy for format revisions, in plain language.
-- [versioning-register.md](versioning-register.md) — every versioned
-  component (bootstrap, sidecar, object, encryption registries, the
-  documents themselves), one entry each: current value, what an unknown
-  value means, how it can ever change.
-- [formal-verification-status.md](formal-verification-status.md) — what
-  is Lean-proved, and what is deliberately not.
-- [decision-log.md](decision-log.md) — public format and compatibility
-  decisions that affect independent implementations.
-- [guide-specification-preservation.md](guide-specification-preservation.md) —
-  the mechanical check that no text is lost when a specification is reorganized.
-- [guide-release-verification.md](guide-release-verification.md) — what a binary
-  release contains and how to check it was built from the signed source.
-- [api-module-organization.md](api-module-organization.md) — where each
-  behavior of the `remanence-api` crate lives in the source.
+- [Concepts](concepts.md): how a tape behaves, and the terms the rest of the
+  documentation uses.
+- [Architecture overview](architecture-overview.md): the crate stack, the write
+  and read paths, and the design invariants.
+- [Why Remanence?](why-remanence.md): what Remanence is for, compared with the
+  other ways of putting data on tape.
+- [Why Remanence speaks SCSI directly](why-sg-passthrough.md): why the stack
+  bypasses the kernel `st` driver and `mt`/`mtx`.
+- [Why Remanence keeps only user extended attributes](why-user-xattrs-only.md):
+  why security labels, ACLs, file capabilities and file flags are not
+  preserved, and how to keep them when a collection needs them.
+- [Encryption explained](encryption-explained.md): why REM-ENCRYPT seals objects
+  in software instead of using drive encryption, and what an operator still
+  manages.
+- [How these formats change](versioning-explained.md): the change policy for
+  format revisions, in plain language.
+- [Tape identity and the retire operation](tape-identity-lifecycle-explainer.md):
+  how a cartridge acquires and keeps its identity.
+- [Partial-file restore on LTO](pfr-reference.md): how one byte range of a file
+  is read from tape, with the drive mechanics and the arithmetic.
+
+## The specifications and their companions
+
+The format specifications and their companion documents are in
+[`specs/publication/`](../specs/publication):
+
+- [The formats, explained](../specs/publication/formats-explained.md): a
+  plain-language companion to the specifications.
+- [REM Implementation and Operations Guide](../specs/publication/rem-implementation-guide.md):
+  informative, tool-neutral practice for tools that read or write the REM
+  formats. [rem-implementation-guide.md](rem-implementation-guide.md) in this
+  directory points to it.
+
+## For contributors
+
+These pages are for people who change Remanence itself: its code, its
+specifications or its test vectors.
+
+- [API module organization](api-module-organization.md): where each behaviour
+  of the `remanence-api` crate lives in the source.
+- [Development tools](development-tools.md): building `rem-dev`, and its
+  review-vector generator, two scratch-tape drills and dump writer.
+- [Checking specification preservation](guide-specification-preservation.md):
+  the check that every piece of a specification's text survives an edit or is
+  accounted for, with a worked example.
+- [Running the proof inventory](formal-verification-status.md#running-the-inventory-gate):
+  what `make proof-inventory` checks and what it needs installed. The rest of
+  [Formal verification status](formal-verification-status.md) says what each
+  proof covers.
+- [POSIX pax and ustar](reference/posix/README.md): the tar format that the
+  plaintext body of an object follows, and the editions of the standard to
+  read.
+
+## Records
+
+- [Public decision log](decision-log.md): format and compatibility decisions
+  that affect independent implementations.
+- [Software release checklist](releases/CHECKLIST.md): the maintainers' release
+  procedure.
+- [Remanence 0.2.1 draft release note](releases/v0.2.1-draft.md): a draft, not
+  a published release.
 
 This page lists every document in this directory.

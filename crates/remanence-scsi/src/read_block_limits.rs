@@ -14,9 +14,7 @@
 //!   data of **Table 79**. Not used by rem today; not implemented
 //!   here. A future caller wanting the MLOI=1 variant should add
 //!   `build_cdb_mloi(true)` + a separate parser rather than try
-//!   to fold the two layouts into one type. Codex 20:17
-//!   (idref=447d7348 Low) caught the earlier ambiguous naming
-//!   that suggested the command was variant-free.
+//!   to fold the two layouts into one type.
 //!
 //! Table 78 layout (the MLOI=0 response decoded here):
 //!
@@ -126,7 +124,7 @@ mod tests {
     #[test]
     fn parse_response_decodes_full_24bit_max() {
         // Verify the 24-bit MAX field decodes correctly at the
-        // upper bound (codex 19:57 catch: §4.11 supported max).
+        // upper bound (§4.11 supported max).
         let buf = [0x00, 0xFF, 0xFF, 0xFF, 0x00, 0x04];
         let parsed = parse_response(&buf).expect("parse ok");
         assert_eq!(parsed.max_block_length, 0x00FF_FFFF);

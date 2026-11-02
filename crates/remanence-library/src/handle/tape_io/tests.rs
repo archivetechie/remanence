@@ -836,7 +836,7 @@ fn build_compression_param_list_variable_no_compression() {
     assert_eq!(buf[0], 0, "MODE SELECT MDL byte is reserved 0");
     assert_eq!(buf[1], 0, "Medium Type = 0");
     // Device-Specific Parameter byte: BUFFERED MODE 001b in
-    // bits 4..6 → 0x10 (codex 20:38 idref=7714c4dc Medium).
+    // bits 4..6 → 0x10.
     assert_eq!(
         buf[2], 0x10,
         "Device-Specific Parameter: BUFFERED MODE=001, SPEED=0"
@@ -848,7 +848,7 @@ fn build_compression_param_list_variable_no_compression() {
     assert_eq!(buf[12], 0x0F);
     assert_eq!(buf[13], 14);
     // DCE bit clear, but DCC = 1 (non-changeable per IBM
-    // Table 345; codex 20:22).
+    // Table 345).
     assert_eq!(buf[14] & 0x80, 0, "DCE clear when compression off");
     assert_eq!(buf[14] & 0x40, 0x40, "DCC must be 1");
     // DDE bit always 1 (non-changeable).

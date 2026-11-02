@@ -3,12 +3,13 @@
 //!
 //! Configuration CDBs used at write-session open to set block size +
 //! compression, and queried at session open to confirm. Mode pages
-//! that Layer 3a / rem-chunked-v1 cares about:
+//! used by the tape I/O layer:
 //!
 //! - **0x0F — Data Compression Mode Page.** Toggles the drive's
 //!   hardware compression (DCE bit). rem defaults to `compression =
-//!   false` because format-level zstd already compresses the
-//!   payload (see `docs/pfr-reference.md` §6.3).
+//!   false`. REM-OBJECT performs no compression (Section 1.5);
+//!   REM-PARITY Section 16.3 requires drive compression off to
+//!   preserve the correspondence between logical blocks and media.
 //! - **0x10 — Device Configuration Mode Page.** Block-size sense
 //!   live in the block descriptor (not the page itself), but the
 //!   page exposes other knobs (active partition, BIS, etc.) that
@@ -18,8 +19,7 @@
 //! parameter list — a **3-byte** BLOCK LENGTH at descriptor bytes
 //! 5..8 (bytes 5, 6, 7), big-endian, per IBM LTO SCSI Reference
 //! Tables 332/337. Block length 0 → variable-block mode; non-zero
-//! → fixed-block of that size. Codex 20:22 (idref=01cf3e76 Low)
-//! caught the earlier "4-byte" wording.
+//! → fixed-block of that size.
 
 /// SCSI opcode for MODE SELECT(6).
 pub const OPCODE_MODE_SELECT_6: u8 = 0x15;

@@ -51,6 +51,10 @@ per-release summaries.
   before terminal media work. Further appends return `SessionSealed`.
   `FINAL_PARTIAL_EPOCH` belongs only to a short sidecar following an accepted
   finalization decision; ordinary session closeout does not set it.
+- Remanence now captures and restores only `user.*` extended attributes; namespace
+  widening and full-fidelity options are removed, and wrappers apply no xattrs,
+  ACLs or file flags. Long-term preservation must not reapply one host’s security
+  posture on a different system.
 
 - Host commit authority now uses one per-tape log at
   `journal_dir/tapes/<lowercase-simple-uuid>.remtape`, for tapes with or without
@@ -511,9 +515,13 @@ per-release summaries.
   to attach to a hardware report, and lists the limitations found in field
   testing.
 
-## 0.2.0 — 2026-10-15
+## 0.2.0 — not released
 
-- First release with prebuilt Linux binaries (`remanence-x86_64-linux.tar.gz`, `rem-recover-x86_64-linux-musl.tar.gz`, `SHA256SUMS`) and build provenance attestation.
+Version 0.2.0 was prepared on 2026-10-15 but was never tagged or published.
+The changes below are in the source, as are those under Unreleased; no
+published release contains them.
+
+- Added a release workflow that builds prebuilt Linux binaries (`remanence-x86_64-linux.tar.gz`, `rem-recover-x86_64-linux-musl.tar.gz`, `SHA256SUMS`) with build provenance attestation. No release made with it was published.
 
 - Wording pass over the REM-PARITY text that the recent clarifications touched.
   No requirement changes. Section 17 opens with the damage matrix as it now

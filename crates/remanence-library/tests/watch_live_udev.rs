@@ -68,8 +68,7 @@ async fn live_udev_delivers_change_event() {
     // just ours, so an unrelated burst could plausibly arrive first.
     // Keep reading until the deadline; succeed as soon as any burst
     // touches our sg path; only fail if the deadline elapses with no
-    // match. Codex review d38cc769 flagged the fail-on-first variant
-    // as fragile on busy hosts.
+    // match. Unrelated bursts can arrive first on busy hosts.
     let sg_name = sg.file_name().unwrap().to_string_lossy().to_string();
     let sg_canonical = std::fs::canonicalize(&sg).ok();
     let burst_matches_target = |burst: &remanence_library::watch::Coalesced| -> bool {

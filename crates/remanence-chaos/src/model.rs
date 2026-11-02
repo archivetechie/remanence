@@ -1397,10 +1397,12 @@ impl ModelTransport {
     fn mode_select(&mut self, buf: &[u8]) -> Result<TransferOutcome, ScsiError> {
         let mut world = self.world.lock().expect("virtual world lock");
         self.with_loaded_tape(&mut world, |tape| {
-            if buf.len() >= 12 {
+            // A block descriptor (block descriptor length 8) sets the block length; 0 selects
+            // variable-block mode, as on a real drive (SSC MODE SELECT block descriptor).
+            if buf.len() >= 12 && buf[3] >= 8 {
                 let block_length =
                     ((buf[9] as u32) << 16) | ((buf[10] as u32) << 8) | buf[11] as u32;
-                if block_length != 0 && !tape.retain_block_size_on_mode_select {
+                if !tape.retain_block_size_on_mode_select {
                     tape.block_size = block_length;
                 }
             }
