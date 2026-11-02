@@ -5,7 +5,7 @@ use crate::{
     StateError,
 };
 use remanence_parity::authority::{
-    ManualTerminalFinalizationIdentity, SealDueReason, TerminalFinalizationTrigger,
+    ManualTerminalFinalizationIdentity, TerminalFinalizationTrigger,
 };
 
 /// Exact parity close plan persisted before any terminal-prefix media motion.
@@ -307,7 +307,7 @@ pub struct CommitFixture {
     /// Whether the fixture supplies terminal completion after all components.
     pub sealed_after_write: bool,
     /// Deferred terminal finalization, durable in the checkpoint's own fsync.
-    pub seal_due: Option<SealDueReason>,
+    pub seal_due: Option<TerminalFinalizationTrigger>,
 }
 
 /// Ordinary checkpoint prefix and pending structured intent loaded under the
@@ -338,6 +338,8 @@ impl From<&CommitFixture> for super::AuthorityCommit {
             |unit| unit.total_committed_ordinals,
         );
         Self {
+            session_id: Some(record.batch_id),
+            committed_at_utc: "2026-11-02T00:00:00Z".into(),
             protected,
             total,
             ordinal: record.ordinal,

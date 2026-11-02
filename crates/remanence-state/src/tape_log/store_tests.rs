@@ -15,10 +15,11 @@ fn store(dir: &std::path::Path) -> Store {
 }
 fn append_object(lease: &mut Lease) {
     let summary = lease.summary().clone();
-    let mut group = lease.prepare().unwrap();
     if summary.is_fresh() {
-        group.push(&init(false), &[]).unwrap();
+        let group = lease.prepare().unwrap();
+        lease.append(group.close(&init(false)).unwrap()).unwrap();
     }
+    let mut group = lease.prepare().unwrap();
     let file = summary.next_file.max(1);
     let lba = if summary.is_fresh() {
         2
@@ -183,8 +184,7 @@ fn staged_first_group_is_invisible_and_drop_fences_lease() {
     let dir = tempfile::tempdir().unwrap();
     let store = store(dir.path());
     let mut lease = store.acquire(true).unwrap();
-    let mut group = lease.prepare().unwrap();
-    group.push(&init(false), &[]).unwrap();
+    let group = lease.prepare().unwrap();
     let staged = lease.stage(group).unwrap();
     assert!(!store.path().exists());
     drop(staged);
@@ -214,7 +214,8 @@ fn three_thousand_short_epochs_and_streamed_plan_directory() {
     for epoch in 0..EPOCHS {
         let mut group = lease.prepare().unwrap();
         if epoch == 0 {
-            group.push(&init(true), &[]).unwrap();
+            lease.append(group.close(&init(true)).unwrap()).unwrap();
+            group = lease.prepare().unwrap();
         }
         let file = 1 + 2 * epoch;
         let lba = 2 + 7 * epoch;
@@ -600,10 +601,7 @@ impl remanence_library::durable_file::DurableDirectory for FaultDirectory {
     }
 }
 fn bot_group(lease: &Lease) -> crate::tape_log::store::PreparedGroup {
-    let mut group = lease.prepare().unwrap();
-    group.push(&init(false), &[]).unwrap();
-    let c = Record::Committed(commit(group.reference(0), 1, 2, 0));
-    group.close(&c).unwrap()
+    lease.prepare().unwrap().close(&init(false)).unwrap()
 }
 #[test]
 fn single_log_fault_observer_surrounds_fsync_and_first_directory_publication() {
@@ -619,8 +617,8 @@ fn single_log_fault_observer_surrounds_fsync_and_first_directory_publication() {
     let observed = faults.clone();
     lease.set_publication_observer(crate::tape_log::store::PublicationObserver(Arc::new(
         move |record, sequence, after| {
-            assert!(matches!(record, Record::Committed(_)));
-            assert_eq!(sequence, 2);
+            assert!(matches!(record, Record::Initialized(_)));
+            assert_eq!(sequence, 1);
             observed.events.lock().unwrap().push(
                 if after {
                     "after_tape_log_fsync"
@@ -665,12 +663,12 @@ fn provisional_data_sync_then_closing_fsync_and_first_directory_sync() {
         if failure == 0 {
             result.unwrap();
             let events = faults.events.lock().unwrap();
-            assert_eq!(events.iter().filter(|e| *e == "fdatasync").count(), 1);
+            assert_eq!(events.iter().filter(|e| *e == "fdatasync").count(), 0);
             assert_eq!(events.iter().filter(|e| *e == "fsync").count(), 1);
             assert_eq!(events.iter().filter(|e| *e == "directory").count(), 1);
             assert_eq!(
-                &events[events.len() - 5..],
-                &["fdatasync", "append", "fsync", "rename", "directory"]
+                &events[events.len() - 4..],
+                &["append", "fsync", "rename", "directory"]
             );
             drop(events);
             faults.events.lock().unwrap().clear();
@@ -749,7 +747,7 @@ fn fsync_failure_after_existing_append_fences_even_if_bytes_replay() {
     assert!(matches!(store.snapshot(), Err(StoreError::Fenced)));
     assert!(store.path().with_extension("ambiguous").exists());
     store.clear_ambiguity().unwrap();
-    assert_eq!(store.acquire(false).unwrap().summary().barrier_count, 2);
+    assert_eq!(store.acquire(false).unwrap().summary().barrier_count, 3);
 }
 #[test]
 fn unvalidated_capture_survives_concurrent_torn_repair_and_append() {
@@ -873,7 +871,7 @@ fn explicit_repair_persists_append_fence_and_exact_boundary_record() {
     assert!(store.acquire(false).is_ok());
 }
 #[test]
-fn unverified_cold_check_is_retained_in_disk_snapshot() {
+fn original_write_check_is_retained_in_disk_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::new_fixture(
         dir.path(),
@@ -886,7 +884,8 @@ fn unverified_cold_check_is_retained_in_disk_snapshot() {
     .unwrap();
     let mut lease = store.acquire(true).unwrap();
     let mut group = lease.prepare().unwrap();
-    group.push(&init(true), &[]).unwrap();
+    lease.append(group.close(&init(true)).unwrap()).unwrap();
+    group = lease.prepare().unwrap();
     let row = object(1, 2, Some(0), 3);
     group
         .push(
@@ -915,8 +914,7 @@ fn unverified_cold_check_is_retained_in_disk_snapshot() {
     let mut c = commit(group.reference(0), 2, 6, 1);
     c.total = 3;
     c.check = CheckValue(7);
-    c.provenance = CheckProvenance::UnverifiedRebuild;
-    c.unverified_end = Some(3);
+    c.provenance = CheckProvenance::OriginalWrite;
     let prepared = group.close(&Record::Committed(c)).unwrap();
     lease.append(prepared).unwrap();
     drop(lease);
@@ -924,9 +922,8 @@ fn unverified_cold_check_is_retained_in_disk_snapshot() {
     assert_eq!(snapshot.summary().check, CheckValue(7));
     assert_eq!(
         snapshot.summary().provenance,
-        CheckProvenance::UnverifiedRebuild
+        CheckProvenance::OriginalWrite
     );
-    assert_eq!(snapshot.summary().unverified_end, Some(3));
 }
 
 #[test]
@@ -937,7 +934,8 @@ fn high_file_count_small_objects_stream_without_a_batch_vector() {
     let store = store(dir.path());
     let mut lease = store.acquire(true).unwrap();
     let mut group = lease.prepare().unwrap();
-    group.push(&init(false), &[]).unwrap();
+    lease.append(group.close(&init(false)).unwrap()).unwrap();
+    group = lease.prepare().unwrap();
     const OBJECTS: u64 = 25_000;
     for file in 1..=OBJECTS {
         let row = object(file, 2 + 4 * (file - 1), None, 3);
@@ -1022,7 +1020,7 @@ fn high_file_count_small_objects_stream_without_a_batch_vector() {
 }
 
 #[test]
-fn unclosed_initialized_is_a_torn_group_but_never_a_fresh_name() {
+fn closed_initialized_is_valid_authority_but_never_a_fresh_name() {
     let dir = tempfile::tempdir().unwrap();
     let store = store(dir.path());
     let mut lease = store.acquire(true).unwrap();
@@ -1046,20 +1044,14 @@ fn unclosed_initialized_is_a_torn_group_but_never_a_fresh_name() {
     encode_frame(&mut file, 1, &init(false), &[]).unwrap();
     let bytes = std::fs::read(store.path()).unwrap();
     let snapshot = store.snapshot().unwrap();
-    assert!(snapshot.summary().is_fresh());
-    assert!(matches!(
-        snapshot.tail(),
-        Tail::Torn {
-            kind: TornKind::UnclosedGroup { .. },
-            ..
-        }
-    ));
+    assert!(!snapshot.summary().is_fresh());
+    assert_eq!(snapshot.tail(), Tail::Complete);
     assert_eq!(std::fs::read(store.path()).unwrap(), bytes);
     assert!(matches!(
         store.acquire(true),
         Err(StoreError::AlreadyExists)
     ));
-    assert!(matches!(store.acquire(false), Err(StoreError::Refused(_))));
+    assert!(store.acquire(false).is_ok());
     assert_eq!(std::fs::read(store.path()).unwrap(), bytes);
     let mut rows = 0;
     snapshot
@@ -1068,7 +1060,7 @@ fn unclosed_initialized_is_a_torn_group_but_never_a_fresh_name() {
             Ok(())
         })
         .unwrap();
-    assert_eq!(rows, 0);
+    assert_eq!(rows, 1);
 }
 
 #[path = "review_store_tests.rs"]
@@ -1220,4 +1212,97 @@ fn post_barrier_prefix_and_component_use_only_one_closing_sync() {
         )
         .unwrap();
     assert_syncs();
+}
+
+#[test]
+fn session_tail_snapshot_streams_only_the_last_closed_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let mut lease = store.acquire(true).unwrap();
+    let group = lease.prepare().unwrap();
+    lease.append(group.close(&init(false)).unwrap()).unwrap();
+    let open = SessionOpened {
+        session_id: [9; 16],
+        incarnation: 1,
+        base_media_sequence: 1,
+        cursor: SessionCursor {
+            partition: 0,
+            lba: 2,
+            next_file: 1,
+        },
+        opened_at_utc: "2026-11-02T00:00:00Z".into(),
+    };
+    let group = lease.prepare().unwrap();
+    lease
+        .append(group.close(&Record::SessionOpened(open.clone())).unwrap())
+        .unwrap();
+    let before = lease.snapshot().unwrap();
+    let mut group = lease.prepare().unwrap();
+    let file = TailFile {
+        tape_file_number: 1,
+        identity: TailIdentity::Object("abandoned".into()),
+        known_blocks: 3,
+        unknown_blocks: 1,
+        filemark: TailFilemark::Unknown,
+    };
+    group
+        .push(
+            &Record::PayloadContinuation(Continuation {
+                group: group.sequence(),
+                chunk: Chunk::TailFile(file.clone()),
+            }),
+            &[],
+        )
+        .unwrap();
+    let end = SessionEnded {
+        session_id: open.session_id,
+        incarnation: 1,
+        base_media_sequence: 1,
+        cursor: open.cursor,
+        ended_at_utc: "2026-11-02T00:01:00Z".into(),
+        reason: SessionEndReason::DriveError,
+        tail: group.reference(0),
+        tail_file_count: 1,
+        crash_ack_audit_sequence: None,
+    };
+    lease
+        .append(group.close(&Record::SessionEnded(end)).unwrap())
+        .unwrap();
+    let frozen = lease.snapshot().unwrap();
+    before
+        .visit_last_session_tail(|_| panic!("snapshot precedes the end"))
+        .unwrap();
+    let mut seen = Vec::new();
+    frozen
+        .visit_last_session_tail(|row| {
+            seen.push(row.clone());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(seen, [file]);
+    let group = lease.prepare().unwrap();
+    lease
+        .append(group.close(&Record::SessionOpened(open)).unwrap())
+        .unwrap();
+    lease
+        .snapshot()
+        .unwrap()
+        .visit_last_session_tail(|_| panic!("new session consumed last end"))
+        .unwrap();
+    let mut count = 0;
+    frozen
+        .visit_last_session_tail(|_| {
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        count, 1,
+        "frozen snapshot retains its own closed tail reference"
+    );
+    drop(lease);
+    assert_eq!(
+        store.snapshot().unwrap().summary().last_media_commit,
+        Some(1)
+    );
 }

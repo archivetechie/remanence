@@ -41,22 +41,15 @@ pub struct ManualTerminalFinalizationIdentity {
     pub reason: String,
 }
 
-/// A durable obligation to finalize before another object is appended.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SealDueReason {
-    /// The drive reports its early-warning boundary.
-    HardwareEarlyWarning,
-    /// The measured capacity reaches the pool's low watermark.
-    ReachedLowWatermark,
-}
-
-impl SealDueReason {
-    /// Stable catalog spelling of the journal reason.
+impl TerminalFinalizationTrigger {
+    /// Stable public display spelling of the typed barrier trigger.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::HardwareEarlyWarning => "hardware_early_warning",
             Self::ReachedLowWatermark => "reached_low_watermark",
+            Self::OperatorCloseOut => "operator_close_out",
+            Self::PoolCloseOut => "pool_close_out",
+            Self::NoPendingObjectFits => "no_pending_object_fits",
         }
     }
 }

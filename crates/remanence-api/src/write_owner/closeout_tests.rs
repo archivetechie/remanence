@@ -190,6 +190,8 @@ fn check_closeout_route_case(
                 .map(|s| u64::from_str_radix(s.as_str().unwrap(), 16).unwrap()),
         );
         let original = remanence_state::authority::AuthorityCommit {
+            session_id: Some([9; 16]),
+            committed_at_utc: "2026-11-02T00:00:00Z".into(),
             ordinal: 1,
             object_count: summary.committed_object_count,
             protected: summary.highest_protected_ordinal,
@@ -209,14 +211,7 @@ fn check_closeout_route_case(
             finalization: None,
             sealed: false,
             seal_due: None,
-            check: Some((
-                expected,
-                if legacy {
-                    CheckProvenance::UnverifiedRebuild
-                } else {
-                    CheckProvenance::OriginalWrite
-                },
-            )),
+            check: (!legacy).then_some((expected, CheckProvenance::OriginalWrite)),
         };
         let extent = &summary.open_epoch_object_extents[0];
         let target = extent.physical_start_lba + summary.highest_protected_ordinal
@@ -307,7 +302,7 @@ fn check_closeout_route_case(
                 None,
             )
         };
-        let successful = !refuse_memory && (corrupt < 2 || legacy);
+        let successful = !refuse_memory && corrupt < 2 && !legacy;
         if cursor_fault.is_some() {
             assert!(
                 result.is_err(),
@@ -326,11 +321,7 @@ fn check_closeout_route_case(
                 .check_append_admission()
                 .expect("checked read-back must renew the cursor proof");
             let check = session.sink_state.as_ref().unwrap().commit_check();
-            if legacy {
-                assert_eq!(check.1, CheckProvenance::UnverifiedRebuild);
-            } else {
-                assert_eq!(check, (expected, CheckProvenance::OriginalWrite));
-            }
+            assert_eq!(check, (expected, CheckProvenance::OriginalWrite));
             assert!(cfg.io_memory.granted() > 0);
             drop(session);
         } else {
@@ -343,7 +334,11 @@ fn check_closeout_route_case(
                     tonic::Code::FailedPrecondition
                 }
             );
-            if !refuse_memory {
+            if legacy {
+                assert!(status
+                    .message()
+                    .contains("open epoch lacks durable check provenance"));
+            } else if !refuse_memory {
                 assert!(status.message().contains("closeout check mismatch"));
             }
             if matches!(fence_failure, Some(FenceFailure::FenceWrite)) {
@@ -363,7 +358,7 @@ fn check_closeout_route_case(
         assert_eq!(cfg.io_memory.granted(), 0);
         assert_eq!(
             corruptions.load(Ordering::Relaxed),
-            if legacy { 1 } else { corrupt as u64 }
+            if legacy { 0 } else { corrupt as u64 }
         );
         let world = world.lock().unwrap();
         assert!(

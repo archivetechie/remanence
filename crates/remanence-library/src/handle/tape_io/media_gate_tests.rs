@@ -618,9 +618,17 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
         (
             "remanence-api/src/engine/drive_adapter/tests/pool_sessions.rs",
             DispatchPolicy::Exact {
+                execute_out: 2,
+                execute_none: 3,
+                why: "cfg(test) session fault and bootstrap barrier crash forwarders use only in-memory ModelTransport; production uses DriveHandle",
+            },
+        ),
+        (
+            "remanence-api/src/write_owner/b5_fix2_tests.rs",
+            DispatchPolicy::Exact {
                 execute_out: 1,
-                execute_none: 1,
-                why: "cfg(test) virtual fault transport for migrated session assertions; production uses DriveHandle",
+                execute_none: 2,
+                why: "cfg(test) cleaning shutdown fault forwarder uses only in-memory ModelTransport; no hardware transport",
             },
         ),
         (

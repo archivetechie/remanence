@@ -561,8 +561,8 @@ Object admission is permanently disabled. A failure enters
 their proved positions, never a new Object or a second terminal suffix. SQLite
 and the per-tape catalog files remain rebuildable projections.
 
-The marker contains `remanence-tape-log-v1\n`, the canonical configured journal
-root encoded as a JSON string, and a final `\n`. SQLite uses schema 23. Old
+The marker contains `remanence-tape-log-v2\n`, the canonical configured journal
+root encoded as a JSON string, and a final `\n`. SQLite uses schema 24. Old
 state is refused and requires
 `rem reset-catalog --config <PATH> --i-understand-this-erases-the-catalog`,
 followed by reinitialization of the approved scratch tapes. The reset archives

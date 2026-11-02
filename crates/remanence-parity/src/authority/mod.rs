@@ -14,9 +14,7 @@ pub use publication::{
     PublicationShapeError, PublishedItem, SidecarProvenance, StructuralState,
 };
 mod rows;
-pub use identity::{
-    ManualTerminalFinalizationIdentity, SealDueReason, TerminalFinalizationTrigger,
-};
+pub use identity::{ManualTerminalFinalizationIdentity, TerminalFinalizationTrigger};
 pub use rows::{CommittedFileRows, FileRowCursor, FrozenFileRows};
 
 use crate::{CommitCursor, JournalError};
@@ -44,7 +42,7 @@ pub struct AuthoritySummary {
     /// Fixed record size, once authority exists.
     pub block_size: Option<u32>,
     /// Admission obligation observed at the last barrier.
-    pub seal_due: Option<SealDueReason>,
+    pub seal_due: Option<TerminalFinalizationTrigger>,
     /// Completed terminal authority.
     pub sealed: bool,
 }

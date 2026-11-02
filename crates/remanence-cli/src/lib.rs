@@ -23190,27 +23190,44 @@ tape_catalog_dir = "{0}/cache/tapes"
 
     #[test]
     fn authority_layout_refusals_precede_device_discovery() {
-        for layout in ["unmarked", "schema22", "mixed", "reset-in-progress"] {
+        for layout in [
+            "unmarked",
+            "schema22",
+            "schema23",
+            "v1",
+            "mixed",
+            "reset-in-progress",
+        ] {
             let root = tempfile::tempdir().unwrap();
             let config = write_retire_test_config(root.path());
             drop(remanence_state::StateHandle::open_from_config_file(&config).unwrap());
             let expected = match layout {
                 "unmarked" => {
                     fs::remove_file(root.path().join("authority-format")).unwrap();
-                    "This state directory uses the two-journal authority layout."
+                    remanence_state::authority_layout::RESET_REQUIRED
                 }
-                "schema22" => {
+                "schema22" | "schema23" => {
                     let path = root.path().join("index/rem-state.sqlite");
                     let mut database = fs::read(&path).unwrap();
                     // SQLite's application user_version is a big-endian u32
                     // at header offset 60. The closed handle has checkpointed WAL.
-                    database[60..64].copy_from_slice(&22_u32.to_be_bytes());
+                    database[60..64].copy_from_slice(
+                        &(if layout == "schema23" { 23_u32 } else { 22_u32 }).to_be_bytes(),
+                    );
                     fs::write(path, database).unwrap();
-                    "This state directory uses the two-journal authority layout."
+                    remanence_state::authority_layout::RESET_REQUIRED
+                }
+                "v1" => {
+                    let path = root.path().join("authority-format");
+                    let marker = fs::read_to_string(&path)
+                        .unwrap()
+                        .replace("remanence-tape-log-v2", "remanence-tape-log-v1");
+                    fs::write(path, marker).unwrap();
+                    remanence_state::authority_layout::RESET_REQUIRED
                 }
                 "mixed" => {
                     fs::write(root.path().join("journals/obsolete.remcheckpoint"), b"old").unwrap();
-                    "marked tape-log layout contains old authority files"
+                    remanence_state::authority_layout::RESET_REQUIRED
                 }
                 "reset-in-progress" => {
                     fs::write(root.path().join("catalog-reset.in-progress"), b"fenced").unwrap();

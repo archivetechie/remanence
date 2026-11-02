@@ -155,7 +155,7 @@ fn automatic_finalization_carries_seal_reason_and_reports_after_durability_failu
     let authority = TapeAuthority::open_fixture(dir.path(), id).unwrap();
     let mut writer = authority.acquire_exclusive().unwrap();
     let mut report: AuthorityCommit = (&record(id)).into();
-    report.seal_due = Some(SealDueReason::HardwareEarlyWarning);
+    report.seal_due = Some(TerminalFinalizationTrigger::HardwareEarlyWarning);
     writer.publish_report(&report).unwrap();
     let mut plan: AuthorityFinalization = (&finalization_intent(id)).into();
     plan.trigger = TerminalFinalizationTrigger::HardwareEarlyWarning;
@@ -358,7 +358,13 @@ fn streaming_report_producer_and_visitor_errors_preserve_the_old_boundary() {
         .publish_report_streaming(&report, &mut |_, _| Err(invalid("producer failed")))
         .unwrap_err();
     assert!(error.to_string().contains("producer failed"));
-    assert!(writer.authority_summary().unwrap().cursor.is_none());
+    assert_eq!(
+        writer.authority_summary().unwrap().cursor,
+        Some(CommitCursor {
+            partition: 0,
+            lba: 2
+        })
+    );
     writer
         .publish_report_streaming(&report, &mut |index, _| {
             assert_eq!(index, 0);
@@ -376,7 +382,7 @@ fn streaming_report_producer_and_visitor_errors_preserve_the_old_boundary() {
 }
 
 #[test]
-fn streaming_report_preserves_unverified_check_and_range_end() {
+fn streaming_report_preserves_original_write_check() {
     let dir = tempfile::tempdir().unwrap();
     let id = [0x78; 16];
     let (seed, _, _) = crate::authority::contract_tests::structural_fixture(id);
@@ -388,7 +394,7 @@ fn streaming_report_preserves_unverified_check_and_range_end() {
     report.protected = 0;
     report.next_file = 2;
     report.cursor.lba = 6;
-    report.check = Some((CheckValue(7), CheckProvenance::UnverifiedRebuild));
+    report.check = Some((CheckValue(7), CheckProvenance::OriginalWrite));
     let authority = TapeAuthority::open_fixture(dir.path(), id).unwrap();
     let mut writer = authority.acquire_exclusive().unwrap();
     writer
@@ -398,7 +404,6 @@ fn streaming_report_preserves_unverified_check_and_range_end() {
     writer
         .visit_reports(&mut |view| {
             assert_eq!(view.summary().check, report.check);
-            assert_eq!(view.commit().unverified_end, Some(3));
             count += 1;
             Ok(())
         })
@@ -454,13 +459,39 @@ fn staged_and_ambiguous_leases_explicitly_refuse_abandonment_and_stale_latest() 
     let id = [0x82; 16];
     let authority = TapeAuthority::open_fixture(dir.path(), id).unwrap();
     let mut writer = authority.acquire_exclusive().unwrap();
-    let report = (&record(id)).into();
+    let report: AuthorityCommit = (&record(id)).into();
+    if writer.authority_summary().unwrap().cursor.is_none() {
+        writer
+            .publish_initialized(
+                report.block_size,
+                report.scheme.clone(),
+                CommitCursor {
+                    partition: 0,
+                    lba: 2,
+                },
+            )
+            .unwrap();
+    }
+    writer.bind_session([9; 16]);
     writer.stage_report(&report).unwrap();
     assert!(writer.ensure_abandonment_allowed().is_err());
     assert!(writer.latest_commit().is_err());
     writer.cancel_staged_report().unwrap();
     writer.ensure_abandonment_allowed().unwrap();
-    assert!(writer.latest_commit().unwrap().is_none());
+    assert_eq!(writer.latest_commit().unwrap().unwrap().ordinal, 0);
+    if writer.authority_summary().unwrap().cursor.is_none() {
+        writer
+            .publish_initialized(
+                report.block_size,
+                report.scheme.clone(),
+                CommitCursor {
+                    partition: 0,
+                    lba: 2,
+                },
+            )
+            .unwrap();
+    }
+    writer.bind_session([9; 16]);
     writer.stage_report(&report).unwrap();
     writer
         .set_publication_observer(crate::tape_log::store::PublicationObserver(Arc::new(
@@ -481,7 +512,20 @@ fn after_durable_report_clears_cached_snapshot_and_has_distinct_error_type() {
     let id = [0x83; 16];
     let authority = TapeAuthority::open_fixture(dir.path(), id).unwrap();
     let mut writer = authority.acquire_exclusive().unwrap();
-    let report = (&record(id)).into();
+    let report: AuthorityCommit = (&record(id)).into();
+    if writer.authority_summary().unwrap().cursor.is_none() {
+        writer
+            .publish_initialized(
+                report.block_size,
+                report.scheme.clone(),
+                CommitCursor {
+                    partition: 0,
+                    lba: 2,
+                },
+            )
+            .unwrap();
+    }
+    writer.bind_session([9; 16]);
     writer.stage_report(&report).unwrap();
     writer
         .set_publication_observer(crate::tape_log::store::PublicationObserver(Arc::new(

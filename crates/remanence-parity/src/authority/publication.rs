@@ -1,5 +1,5 @@
 //! Media publications and their durable outcomes, independent of host-log framing.
-use super::{SealDueReason, TapeFileEntry};
+use super::{TapeFileEntry, TerminalFinalizationTrigger};
 use crate::{CheckProvenance, CheckValue, CommitCursor, TapeFileKind};
 
 /// Physical event whose files became durable.
@@ -56,7 +56,7 @@ pub struct FilePublication {
     /// Writer check and its source, absent in old stored records.
     pub check: Option<(CheckValue, CheckProvenance)>,
     /// Admission obligation observed at this boundary.
-    pub seal_due: Option<SealDueReason>,
+    pub seal_due: Option<TerminalFinalizationTrigger>,
 }
 
 /// Outcome for one unit of host durability.
@@ -116,6 +116,10 @@ impl PublicationReceipt {
 /// semantic projection: no field selects a host record or bundle encoding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitPublication<P, F> {
+    /// Session owning the Object commits, absent on pure maintenance records.
+    pub session_id: Option<[u8; 16]>,
+    /// RFC3339 UTC commit time retained by semantic replay and deterministic fixtures.
+    pub committed_at_utc: String,
     /// Monotonic authority generation.
     pub ordinal: u64,
     /// Cumulative Object count.
@@ -147,7 +151,7 @@ pub struct CommitPublication<P, F> {
     /// This commit proves sealed completion.
     pub sealed: bool,
     /// Deferred finalization obligation.
-    pub seal_due: Option<SealDueReason>,
+    pub seal_due: Option<TerminalFinalizationTrigger>,
     /// Check evidence when retained by the active format.
     pub check: Option<(CheckValue, CheckProvenance)>,
 }

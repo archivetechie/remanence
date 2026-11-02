@@ -45,6 +45,13 @@ fn written(uuid: [u8; 16], build: impl FnOnce(&mut TapeAuthorityLease)) -> Vec<u
     let dir = tempfile::tempdir().unwrap();
     let authority = TapeAuthority::open_fixture(dir.path(), uuid).unwrap();
     let mut writer = authority.acquire_exclusive().unwrap();
+    struct RestoreClock(bool);
+    impl Drop for RestoreClock {
+        fn drop(&mut self) {
+            super::authority::FIXED_TERMINAL_TIME.set(self.0);
+        }
+    }
+    let _clock = RestoreClock(super::authority::FIXED_TERMINAL_TIME.replace(true));
     build(&mut writer);
     drop(writer);
     std::fs::read(authority.path()).unwrap()
@@ -348,7 +355,7 @@ fn describe(case: &Case, frames_tsv: &mut String, summary_tsv: &mut String) -> S
 
 const README_HEAD: &str = "# Per-tape log reference fixtures
 
-Host per-tape logs (`<tape-uuid>.remtape`, format version 1) for testing an
+Host per-tape logs (`<tape-uuid>.remtape`, format version 2) for testing an
 independent decoder. The Rust authority writer produced every healthy log from
 fixed inputs; the damaged tails are cut or edited from a healthy log afterwards.
 These are host authority files, not tape images, and carry no on-tape bytes.
@@ -357,8 +364,7 @@ Each file starts with its header: magic, version, tape UUID, incarnation,
 geometry length, block size, geometry and a CRC-64/XZ. Frames follow. Each frame
 has a 28-byte prefix with its own CRC, then structural and payload sections,
 each with a CRC-64/XZ trailer. Sequences start at 1 and are contiguous. A group
-is authoritative only once its closing record (any tag other than Initialized
-or PayloadContinuation) has been decoded.
+is authoritative only once its closing record (any tag other than PayloadContinuation) has been decoded.
 
 Tail classes:
 

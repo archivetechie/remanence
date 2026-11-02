@@ -1,4 +1,4 @@
-//! Step-2 per-tape host authority format; this module performs no tape I/O.
+//! V2 per-tape host authority format; this module performs no tape I/O.
 //!
 //! The fixed little-endian prefix is CRC protected before lengths are trusted;
 //! structural and catalog sections have independent CRC-64/XZ trailers. The
@@ -9,7 +9,8 @@
 //! Field keys are their zero-based declaration order in `wire.rs`. Unknown keys,
 //! tags, versions, nonminimal integers and trailing bytes are refused.
 //!
-//! Groups start at Initialized or a continuation and close at an authoritative
+//! Initialized is a standalone closed group. Streamed groups start at a
+//! continuation and close at an authoritative
 //! record. Their SHA-256 covers each preceding frame's prefix fields (without
 //! CRC), structural bytes and payload bytes, in order. The closing reference
 //! binds first sequence, byte offset, frame/byte/member counts and this digest.
@@ -23,7 +24,7 @@
 //! therefore stage output until close; they must not publish provisional rows.
 //! Frames and group digests do not bind a tape UUID: storage validates the
 //! file header and its tape identity before folding these bytes.
-//! Session tags and step-6 semantics are reserved, not accepted by the fold.
+//! Session records are accepted by v2; step-6 tags remain reserved.
 
 pub mod authority;
 pub mod codec;
@@ -32,19 +33,21 @@ pub mod fold;
 pub mod measure;
 pub mod payload;
 mod rows;
+mod session;
 pub mod snapshot;
 pub mod store;
 mod terminal_source;
 mod wire;
+pub use session::*;
 
-pub use remanence_parity::authority::{SealDueReason, TerminalFinalizationTrigger};
+pub use remanence_parity::authority::TerminalFinalizationTrigger;
 pub use remanence_parity::{
     CheckProvenance, CheckValue, CommitCursor, ObjectRecoveryRow, ParityScheme, TapeFileEntry,
 };
 use remanence_parity::{SidecarEpochDirectoryEntry, TerminalTailLayout};
 
 /// Host frame version; independent of every on-tape format version.
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 /// Maximum sum of structural and payload bytes per frame.
 pub const MAX_FRAME_BODY: usize = 64 * 1024 * 1024;
 /// Fixed prefix bytes, including its CRC.
@@ -54,7 +57,7 @@ pub const FRAME_OVERHEAD: usize = PREFIX_LEN + 16;
 
 macro_rules! tags {
     ($($name:ident = $value:literal, $doc:literal;)+) => {
-        /// Stable frame discriminator. Reserved tags are never emitted in step 2.
+        /// Stable frame discriminator. Reserved step-6 tags are never emitted.
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         #[repr(u16)]
         pub enum Tag { $(#[doc = $doc] $name = $value,)+ }
@@ -67,7 +70,7 @@ macro_rules! tags {
     }
 }
 tags! {
-    Initialized = 1, "Provisional BOT and geometry.";
+    Initialized = 1, "Standalone barrier-proved BOT and geometry.";
     PayloadContinuation = 2, "Provisional catalog, file row or directory chunk.";
     Committed = 3, "Ordinary media barrier closing a group.";
     TerminalPrefix = 4, "Distinct sidecar/ParityMap prefix barrier.";
@@ -78,13 +81,13 @@ tags! {
     FinalizationPreparationRetired = 9, "Retire provisional request; removed at step 6.";
     FinalizationRecoveryRequired = 10, "Compatibility recovery flag; removed at step 6.";
     FinalizationPlanned = 16, "Reserved for step 6.";
-    ClosedOut = 17, "Reserved for step 3.";
-    SessionOpened = 18, "Reserved for step 3.";
-    SessionEnded = 19, "Reserved for step 3.";
+    ClosedOut = 17, "Barrier-proved uncovered-range closeout.";
+    SessionOpened = 18, "Exclusive session opened at proved C.";
+    SessionEnded = 19, "Session ending and streamed tail binding.";
     UnprotectedAccepted = 20, "Reserved for step 6.";
 }
 
-/// Provisional initialization; incarnation is always one, reinit uses a new UUID.
+/// Standalone barrier-proved initialization; incarnation is always one, reinit uses a new UUID.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Initialized {
     /// Tape UUID as binary.
@@ -132,6 +135,8 @@ pub enum Chunk {
         /// Last chunk of this object's catalog stream.
         last: bool,
     },
+    /// An abandoned file streamed into a SessionEnded group.
+    TailFile(TailFile),
     /// An immutable plan directory row, carried structurally.
     PlanDirectory(SidecarEpochDirectoryEntry),
 }
@@ -160,9 +165,6 @@ pub struct Committed {
     pub check: CheckValue,
     /// Provenance, carried through retained and rebuilt state.
     pub provenance: CheckProvenance,
-    /// End of the rebuilt, still-unverified prefix. Present exactly while W is
-    /// below that end; fresh writes do not extend it. Not a verification claim.
-    pub unverified_end: Option<u64>,
     /// Next actual sidecar epoch ID.
     pub next_epoch: u64,
     /// Next physical file number.
@@ -171,10 +173,12 @@ pub struct Committed {
     pub object_count: u64,
     /// Stable diagnostic batch identity.
     pub batch_id: [u8; 16],
-    /// Diagnostic only; no step-3 session semantics.
+    /// Required for every commit containing Object rows.
     pub session_id: Option<[u8; 16]>,
     /// Obligation observed at this barrier.
-    pub seal_due: Option<SealDueReason>,
+    pub seal_due: Option<TerminalFinalizationTrigger>,
+    /// RFC3339 UTC barrier completion time.
+    pub committed_at_utc: String,
 }
 
 /// Step-2 decision and immutable plan; the potentially large directory is a reference.
@@ -205,10 +209,16 @@ pub struct FinalizationPlan {
 /// Structural record. Catalog bytes live separately, never in this enum.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Record {
-    /// Provisional initialization.
+    /// Standalone barrier-proved bootstrap.
     Initialized(Initialized),
     /// Provisional stream frame.
     PayloadContinuation(Continuation),
+    /// Exclusive session opened.
+    SessionOpened(SessionOpened),
+    /// Session ended, binding its streamed tail.
+    SessionEnded(SessionEnded),
+    /// Uncovered range protected by one proved sidecar.
+    ClosedOut(ClosedOut),
     /// Ordinary barrier.
     Committed(Committed),
     /// Terminal prefix barrier, binding the decision sequence.
@@ -339,6 +349,9 @@ impl Record {
     pub fn tag(&self) -> Tag {
         match self {
             Self::Initialized(_) => Tag::Initialized,
+            Self::SessionOpened(_) => Tag::SessionOpened,
+            Self::SessionEnded(_) => Tag::SessionEnded,
+            Self::ClosedOut(_) => Tag::ClosedOut,
             Self::PayloadContinuation(_) => Tag::PayloadContinuation,
             Self::Committed(_) => Tag::Committed,
             Self::TerminalPrefix { .. } => Tag::TerminalPrefix,

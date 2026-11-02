@@ -295,10 +295,7 @@ fn stream_reports(
     let mut start = None;
     while let Some(frame) = decoder.next_row_frame().map_err(StoreError::from)? {
         let (sequence, offset) = *start.get_or_insert((frame.sequence, frame.offset));
-        if matches!(
-            frame.record,
-            Record::Initialized(_) | Record::PayloadContinuation(_)
-        ) {
+        if matches!(frame.record, Record::PayloadContinuation(_)) {
             continue;
         }
         if let Record::Committed(c) = frame.record {
@@ -429,6 +426,7 @@ impl TapeAuthority {
             structural: None,
             scope: Scope::Idle,
             pending: None,
+            session_id: None,
             read_cache: Arc::new(Mutex::new(None)),
         })
     }
@@ -447,9 +445,52 @@ pub struct TapeAuthorityLease {
     structural: Option<StructuralCapability>,
     scope: Scope,
     pending: Option<(StagedGroup, Committed)>,
+    session_id: Option<[u8; 16]>,
     read_cache: Arc<Mutex<Option<Snapshot>>>,
 }
 impl TapeAuthorityLease {
+    /// Bind Object publications to their owning actor session (no session record yet).
+    pub fn bind_session(&mut self, session_id: [u8; 16]) {
+        self.session_id = Some(session_id);
+    }
+    /// Current actor session for semantic checkpoint reports.
+    pub fn bound_session_id(&self) -> Option<[u8; 16]> {
+        self.session_id
+    }
+    /// Publish the sole BOT record after the caller's synchronous media barrier.
+    pub fn publish_initialized(
+        &mut self,
+        block_size: u32,
+        scheme: Option<ParityScheme>,
+        cursor: CommitCursor,
+    ) -> Result<(), StateError> {
+        if cursor
+            != (CommitCursor {
+                partition: 0,
+                lba: 2,
+            })
+        {
+            return Err(invalid("bootstrap barrier cursor"));
+        }
+        let mut core = self.core()?;
+        core.bind_header(Header {
+            tape_uuid: self.uuid,
+            block_size,
+            scheme: scheme.clone(),
+        })?;
+        let group = core.prepare()?;
+        let record = Record::Initialized(Initialized {
+            tape_uuid: self.uuid,
+            incarnation: 1,
+            group: group.sequence(),
+            block_size,
+            scheme,
+            bot: plain(0, TapeFileKind::Bootstrap, 1, 0),
+        });
+        core.append(group.close(&record)?)?;
+        Ok(())
+    }
+
     /// Whether explicit physical recovery must retire a repaired-tail fence.
     pub fn repair_pending(&self) -> Result<bool, StateError> {
         Ok(self.core()?.repair_pending())
@@ -478,7 +519,11 @@ impl TapeAuthorityLease {
         }
         let (staged, closer, snapshot) = {
             let mut core = self.core()?;
-            let (group, closer) = prepare_report(&mut core, report, None)?;
+            if core.summary().is_fresh() {
+                return Err(invalid("Object stage before bootstrap commit"));
+            }
+            let (group, mut closer) = prepare_report(&mut core, report, None)?;
+            closer.session_id = self.session_id;
             let snapshot = core.snapshot()?;
             (core.stage_detached(group)?, closer, snapshot)
         };
@@ -551,8 +596,7 @@ impl TapeAuthorityLease {
         (closer.check, closer.provenance) = report
             .check
             .unwrap_or((CheckValue::EMPTY, CheckProvenance::Empty));
-        closer.unverified_end =
-            (closer.provenance == CheckProvenance::UnverifiedRebuild).then_some(report.total);
+        closer.committed_at_utc = report.committed_at_utc.clone();
         closer.seal_due = report.seal_due;
         self.core()?
             .complete_detached(staged, &Record::Committed(closer))?;
@@ -766,10 +810,7 @@ fn visit_reports(
     let mut ordinal = 0;
     while let Some(frame) = decoder.next_row_frame().map_err(StoreError::from)? {
         let (sequence, offset) = *start.get_or_insert((frame.sequence, frame.offset));
-        if matches!(
-            frame.record,
-            Record::Initialized(_) | Record::PayloadContinuation(_)
-        ) {
+        if matches!(frame.record, Record::PayloadContinuation(_)) {
             continue;
         }
         if let Record::Committed(c) = frame.record {
@@ -852,6 +893,8 @@ fn visit_reports(
                 measured.peak_live_object_rows.max(payloads.len() as u64);
             previous_protected = c.protected;
             visitor(&AuthorityCommit {
+                session_id: c.session_id,
+                committed_at_utc: c.committed_at_utc.clone(),
                 ordinal,
                 object_count: c.object_count,
                 protected: c.protected,
@@ -878,12 +921,32 @@ fn visit_reports(
 // B2's compatibility shape is retained, but latest admission needs only the
 // last ordinary closer. Catalogs remain accessible through report/snapshot cursors.
 fn latest_report(s: &TapeSummary, header: &Header) -> Result<Option<AuthorityCommit>, StateError> {
+    if !s.is_fresh() && s.last_ordinary_record.is_none() {
+        let c = Committed {
+            group: GroupRef::default(),
+            cursor: s.cursor,
+            protected: 0,
+            total: 0,
+            check: CheckValue::EMPTY,
+            provenance: CheckProvenance::Empty,
+            next_epoch: 0,
+            next_file: s.next_file,
+            object_count: 0,
+            batch_id: [0; 16],
+            session_id: None,
+            seal_due: None,
+            committed_at_utc: "1970-01-01T00:00:00Z".into(),
+        };
+        return Ok(Some(report_summary(&c, 0, header)));
+    }
     Ok(s.last_ordinary_record
         .as_ref()
         .map(|c| report_summary(c, s.ordinary_count, header)))
 }
 fn report_summary(c: &Committed, sequence: u64, header: &Header) -> AuthorityCommit {
     AuthorityCommit {
+        session_id: c.session_id,
+        committed_at_utc: c.committed_at_utc.clone(),
         ordinal: sequence,
         object_count: c.object_count,
         protected: c.protected,
@@ -1166,32 +1229,26 @@ fn prepare_report(
         block_size: report.block_size,
         scheme: report.scheme.clone(),
     })?;
+    if core.summary().is_fresh() {
+        // Complete semantic fixtures/imports already represent barrier-proved media.
+        // The production stage path must have initialized the tape at session open.
+        let group = core.prepare()?;
+        let record = Record::Initialized(Initialized {
+            tape_uuid: report.tape_uuid,
+            incarnation: 1,
+            group: group.sequence(),
+            block_size: report.block_size,
+            scheme: report.scheme.clone(),
+            bot: plain(0, TapeFileKind::Bootstrap, 1, 0),
+        });
+        core.append(group.close(&record)?)?;
+    }
     let s = core.summary();
-    if report
-        .barrier
-        .as_ref()
-        .is_some_and(|barrier| barrier.files.is_empty())
-    {
+    if report.barrier.as_ref().is_some_and(|b| b.files.is_empty()) {
         return Err(unsupported("empty legacy barrier bundle"));
     }
-    if report.payloads.is_empty() && s.is_fresh() {
-        return Err(invalid("first barrier requires an Object"));
-    }
     let mut group = core.prepare()?;
-    let mut lba = if s.is_fresh() { 2 } else { s.cursor.lba };
-    if s.is_fresh() {
-        group.push(
-            &Record::Initialized(Initialized {
-                tape_uuid: report.tape_uuid,
-                incarnation: 1,
-                group: group.sequence(),
-                block_size: report.block_size,
-                scheme: report.scheme.clone(),
-                bot: plain(0, TapeFileKind::Bootstrap, 1, 0),
-            }),
-            &[],
-        )?;
-    }
+    let mut lba = s.cursor.lba;
     if report.scheme.is_some() && (!report.payloads.is_empty() || report.barrier.is_some()) {
         crate::authority::validation::validate_parity_barrier_bundles(report)
             .map_err(|e| invalid(e.to_string()))?;
@@ -1296,13 +1353,13 @@ fn prepare_report(
         total: report.total,
         check,
         provenance,
-        unverified_end: (provenance == CheckProvenance::UnverifiedRebuild).then_some(report.total),
         next_epoch,
         next_file: report.next_file,
         object_count: report.object_count,
         batch_id: report.operation_id,
-        session_id: None,
+        session_id: report.session_id,
         seal_due: report.seal_due,
+        committed_at_utc: report.committed_at_utc.clone(),
     };
     Ok((group, c))
 }
@@ -1432,6 +1489,19 @@ fn receipt(publication: &FilePublication, existing: bool) -> PublicationReceipt 
         }],
     }
 }
+// Reference-byte fixtures pin completion time explicitly on their test thread.
+#[cfg(test)]
+thread_local! { pub(super) static FIXED_TERMINAL_TIME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+fn terminal_completion_time(plan: &AuthorityFinalization) -> Result<String, StateError> {
+    #[cfg(test)]
+    if FIXED_TERMINAL_TIME.get() {
+        return Ok(plan.write_timestamp.clone());
+    }
+    let _ = plan;
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(|e| invalid(format!("terminal commit timestamp: {e}")))
+}
 fn terminal(
     core: &mut Lease,
     publication: &FilePublication,
@@ -1511,12 +1581,11 @@ fn terminal(
                 r.tape_file_number + 1,
             )
         });
-    let (check, provenance, unverified_end) =
-        if prefix && publication.protected == publication.total {
-            (CheckValue::EMPTY, CheckProvenance::Empty, None)
-        } else {
-            (s.check, s.provenance, s.unverified_end)
-        };
+    let (check, provenance) = if prefix && publication.protected == publication.total {
+        (CheckValue::EMPTY, CheckProvenance::Empty)
+    } else {
+        (s.check, s.provenance)
+    };
     let commit = Committed {
         group: group.reference(0),
         cursor,
@@ -1524,13 +1593,13 @@ fn terminal(
         total: publication.total,
         check,
         provenance,
-        unverified_end,
         next_epoch,
         next_file,
         object_count: s.object_count,
         batch_id: plan.edition_id,
         session_id: None,
         seal_due: s.seal_due,
+        committed_at_utc: terminal_completion_time(&plan)?,
     };
     let record = if prefix {
         Record::TerminalPrefix { decision, commit }

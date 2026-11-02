@@ -1311,9 +1311,8 @@ pub fn rebuild_open_epoch_from_bounded_summary(
     )
 }
 
-/// Rebuild from frozen committed extents through the shared kernel. `Some`
-/// supplies the last durable original-write check; `None` is solely the legacy
-/// UnverifiedRebuild case. Callers reserve closeout memory before entry.
+/// Rebuild from frozen committed extents through the checked shared kernel.
+/// A nonempty range requires original-write evidence before any drive command.
 pub fn rebuild_open_epoch_from_bounded_summary_checked(
     source: &mut dyn RawTapeSource,
     summary: &BoundedResumeSummary,
@@ -1324,6 +1323,12 @@ pub fn rebuild_open_epoch_from_bounded_summary_checked(
 ) -> Result<ResumeOpenEpochRebuild, ParityError> {
     use crate::closeout::{CommittedExtent, UncoveredRange};
     let plan = summary.append_plan(scheme)?;
+    if original_check.is_none()
+        && plan.highest_protected_ordinal_before_rebuild < plan.next_data_ordinal
+    {
+        return Err(resume_error("open epoch lacks original-write check"));
+    }
+
     if block_size == 0 {
         return Err(resume_error("resume rebuild block size is zero"));
     }
@@ -1373,12 +1378,7 @@ pub fn rebuild_open_epoch_from_bounded_summary_checked(
             )?
         ],
     };
-    let rebuild = if original_check.is_some() {
-        crate::closeout::rebuild_uncovered
-    } else {
-        crate::closeout::rebuild_uncovered_once
-    };
-    let accumulator = rebuild(
+    let accumulator = crate::closeout::rebuild_uncovered(
         tape_uuid,
         &mut reader,
         scheme,
@@ -5480,9 +5480,18 @@ mod tests {
             reads: 0,
             positions: 0,
         };
-        let rebuilt =
-            rebuild_open_epoch_from_bounded_summary(&mut source, &summary, &scheme, [7; 16], 256)
-                .unwrap();
+        let rebuilt = rebuild_open_epoch_from_bounded_summary_checked(
+            &mut source,
+            &summary,
+            &scheme,
+            [7; 16],
+            256,
+            Some(crate::check_value(std::iter::repeat_n(
+                remanence_crc::crc64_xz(&[0x53; 256]),
+                65535,
+            ))),
+        )
+        .unwrap();
         assert_eq!(rebuilt.live_epoch.unwrap().data_blocks_in_epoch, 65535);
         assert_eq!(
             (source.locates, source.reads, source.positions),
@@ -5576,12 +5585,15 @@ mod tests {
             ];
             bounded_source = bounded_source.with_block(27 + offset, block);
         }
-        let bounded_rebuild = rebuild_open_epoch_from_bounded_summary(
+        let bounded_rebuild = rebuild_open_epoch_from_bounded_summary_checked(
             &mut bounded_source,
             &summary,
             &scheme(),
             tape_uuid,
             RESUME_TEST_BLOCK_SIZE,
+            Some(crate::check_value((1..=3u8).map(|b| {
+                remanence_crc::crc64_xz(&vec![b; RESUME_TEST_BLOCK_SIZE as usize])
+            }))),
         )
         .expect("rebuild bounded open epoch");
         assert_eq!(bounded_rebuild.plan, bounded_plan);

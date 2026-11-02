@@ -261,8 +261,8 @@ fn bot_recovery_authority_reads_the_ordinary_prefix_of_a_sealed_journal() {
 fn checkpoint_seal_due_is_optional_and_round_trips() {
     for reason in [
         None,
-        Some(SealDueReason::HardwareEarlyWarning),
-        Some(SealDueReason::ReachedLowWatermark),
+        Some(TerminalFinalizationTrigger::HardwareEarlyWarning),
+        Some(TerminalFinalizationTrigger::ReachedLowWatermark),
     ] {
         let directory = tempfile::tempdir().unwrap();
         let mut source = record([0x72; 16]);

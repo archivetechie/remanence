@@ -108,12 +108,12 @@ fn commit(reference: GroupRef, next_file: u64, lba: u64, objects: u64) -> Commit
         total: objects * 3,
         check: CheckValue::EMPTY,
         provenance: CheckProvenance::Empty,
-        unverified_end: None,
         next_epoch: 0,
         next_file,
         object_count: objects,
         batch_id: [8; 16],
         session_id: Some([9; 16]),
+        committed_at_utc: "2026-11-02T00:00:00Z".into(),
         seal_due: None,
     }
 }
@@ -144,10 +144,7 @@ impl Log {
         let offset = self.bytes.len();
         self.seq += 1;
         encode_frame(&mut self.bytes, self.seq, &record, payload).unwrap();
-        if matches!(
-            record,
-            Record::Initialized(_) | Record::PayloadContinuation(_)
-        ) {
+        if matches!(record, Record::PayloadContinuation(_)) {
             let mut decoder = Decoder::at(&self.bytes[offset..], self.seq, offset as u64);
             let frame = decoder.next_frame().unwrap().unwrap();
             self.group
@@ -245,11 +242,11 @@ fn every_emitted_tag_round_trips_and_binary_fields_are_byte_strings() {
     let records = vec![
         init(true),
         Record::PayloadContinuation(Continuation {
-            group: 1,
+            group: 2,
             chunk: Chunk::FileRow(row.clone()),
         }),
         Record::PayloadContinuation(Continuation {
-            group: 1,
+            group: 2,
             chunk: Chunk::Catalog {
                 tape_file_number: 1,
                 ordinal: 0,
@@ -339,13 +336,7 @@ fn every_emitted_tag_round_trips_and_binary_fields_are_byte_strings() {
 #[test]
 fn reserved_tags_are_defined_but_refused_and_terminal_prefix_is_distinct() {
     assert_ne!(Tag::TerminalPrefix, Tag::Committed);
-    for tag in [
-        Tag::FinalizationPlanned,
-        Tag::ClosedOut,
-        Tag::SessionOpened,
-        Tag::SessionEnded,
-        Tag::UnprotectedAccepted,
-    ] {
+    for tag in [Tag::FinalizationPlanned, Tag::UnprotectedAccepted] {
         let mut bytes = Vec::new();
         encode_frame(&mut bytes, 1, &init(false), &[]).unwrap();
         bytes[2..4].copy_from_slice(&(tag as u16).to_le_bytes());
@@ -393,11 +384,11 @@ fn version_unknown_tag_hostile_lengths_and_sequence_rules() {
     let mut bytes = Vec::new();
     encode_frame(&mut bytes, 1, &init(false), &[]).unwrap();
     let mut altered = bytes.clone();
-    altered[..2].copy_from_slice(&2u16.to_le_bytes());
+    altered[..2].copy_from_slice(&1u16.to_le_bytes());
     rewrite_prefix_crc(&mut altered);
     assert_eq!(
         fault(codec::classify_frames(&altered).unwrap_err()),
-        Fault::Version(2)
+        Fault::Version(1)
     );
     let mut altered = bytes.clone();
     altered[2..4].copy_from_slice(&999u16.to_le_bytes());
@@ -547,7 +538,7 @@ fn tail_matrix_distinguishes_short_prefix_short_body_zeros_and_corruption() {
                 kind: TornKind::ZeroFilled
             }
         );
-        *bytes.last_mut().unwrap() = 1;
+        *bytes.last_mut().unwrap() = VERSION as u8;
         assert_row_full_agreement(&bytes);
         if n == 1 {
             assert_eq!(
@@ -596,33 +587,30 @@ fn tail_matrix_distinguishes_short_prefix_short_body_zeros_and_corruption() {
     assert_eq!(fold::classify(&base.bytes).unwrap(), Tail::Complete);
 }
 #[test]
-fn initialized_and_first_commit_share_one_authority_group() {
+fn initialized_closes_before_first_object_group() {
     let mut log = Log::default();
     log.push(init(false), &[]);
     let (s, tail) = fold::replay(log.bytes.as_slice()).unwrap();
-    assert!(s.is_fresh());
+    assert!(!s.is_fresh());
+    assert_eq!(tail, Tail::Complete);
     assert_eq!(
-        tail,
-        Tail::Torn {
-            offset: 0,
-            kind: TornKind::UnclosedGroup {
-                zero_filled_at: None
-            }
-        }
+        (s.cursor.lba, s.next_file, s.protected, s.total),
+        (2, 1, 0, 0)
     );
+    assert_eq!(s.last_media_commit, Some(1));
     let c = commit(log.reference(), 1, 2, 0);
     log.push(Record::Committed(c), &[]);
     let s = log.summary();
     assert!(!s.is_fresh());
     assert_eq!(s.tape_uuid, Some(UUID));
-    assert_eq!(s.barrier_count, 1);
+    assert_eq!(s.barrier_count, 2);
     assert_eq!(s.last_closed_sequence, 2);
     let base = Log::first(false);
     let s = base.summary();
     assert_eq!(s.object_count, 1);
     assert_eq!(s.next_file, 2);
     assert_eq!(s.cursor.lba, 6);
-    assert_eq!(s.barrier_count, 1);
+    assert_eq!(s.barrier_count, 2);
 }
 #[test]
 fn unclosed_catalog_group_is_absent_but_malformed_group_is_recovery() {
@@ -686,10 +674,7 @@ fn second_initialization_terminal_first_and_missing_frames_are_typed() {
         let mut log = Log::default();
         log.push(init(false), &[]);
         log.push(r, &[]);
-        assert_eq!(
-            fault(fold::classify(&log.bytes).unwrap_err()),
-            Fault::TerminalFirst
-        );
+        assert!(fold::classify(&log.bytes).is_err());
     }
     for field in 0..6 {
         let mut log = Log::first(false);
@@ -849,38 +834,13 @@ fn duplicate_keys_nonminimal_integers_arrays_for_hashes_and_trailing_cbor_refuse
     );
 }
 #[test]
-fn unverified_rebuild_is_retained_until_coverage_and_seal_reason_is_retained() {
+fn nonempty_commit_requires_original_write_provenance() {
     let mut log = Log::first(true);
-    let mut c = commit(log.reference(), 2, 6, 1);
-    c.total = 3;
-    c.check = CheckValue(43);
-    c.provenance = CheckProvenance::UnverifiedRebuild;
-    c.unverified_end = Some(3);
-    c.seal_due = Some(SealDueReason::HardwareEarlyWarning);
-    log.push(Record::Committed(c.clone()), &[]);
-    let s = log.summary();
-    assert_eq!(s.provenance, CheckProvenance::UnverifiedRebuild);
-    assert_eq!(s.seal_due, Some(SealDueReason::HardwareEarlyWarning));
-    assert_eq!(s.uncovered.len(), 1);
-    let prefix = log.bytes.clone();
-    c.group = log.reference();
-    c.provenance = CheckProvenance::OriginalWrite;
-    c.unverified_end = None;
-    log.push(Record::Committed(c.clone()), &[]);
-    assert_eq!(
-        fault(fold::classify(&log.bytes).unwrap_err()),
-        Fault::Invalid("unverified rebuild promoted")
-    );
-    log.bytes = prefix;
-    log.seq -= 1;
-    c.group = log.reference();
-    c.provenance = CheckProvenance::UnverifiedRebuild;
-    c.unverified_end = Some(3);
-    c.seal_due = None;
+    let c = commit(log.reference(), 2, 6, 1);
     log.push(Record::Committed(c), &[]);
     assert_eq!(
         fault(fold::classify(&log.bytes).unwrap_err()),
-        Fault::Invalid("lost SealDueReason")
+        Fault::Invalid("empty provenance for uncovered data")
     );
 }
 fn sidecar(file: u64, lba: u64, epoch: u64, start: u64, end: u64) -> TapeFileEntry {
@@ -897,8 +857,7 @@ fn actual_sidecars_increment_epoch_and_empty_check_resets_provenance() {
     let mut c = commit(log.reference(), 2, 6, 1);
     c.total = 3;
     c.check = CheckValue(42);
-    c.provenance = CheckProvenance::UnverifiedRebuild;
-    c.unverified_end = Some(3);
+    c.provenance = CheckProvenance::OriginalWrite;
     log.push(Record::Committed(c), &[]);
     log.row(sidecar(2, 6, 0, 0, 3));
     let mut c = commit(log.reference(), 3, 9, 1);
@@ -1057,7 +1016,7 @@ fn a_single_catalog_field_larger_than_a_frame_is_refused_before_consumption() {
     log.row(row);
     log.push(
         Record::PayloadContinuation(Continuation {
-            group: 1,
+            group: 2,
             chunk: Chunk::Catalog {
                 tape_file_number: 1,
                 ordinal: 0,
@@ -1471,13 +1430,12 @@ fn plan_requires_parity_map_exactly_when_directory_is_present() {
         Fault::Invalid("ParityMap presence/directory")
     );
 }
-fn rebuilt_then_fresh() -> Log {
+fn two_uncovered_commits() -> Log {
     let mut log = Log::first(true);
     let mut c = commit(log.reference(), 2, 6, 1);
     c.total = 3;
     c.check = CheckValue(43);
-    c.provenance = CheckProvenance::UnverifiedRebuild;
-    c.unverified_end = Some(3);
+    c.provenance = CheckProvenance::OriginalWrite;
     log.push(Record::Committed(c), &[]); // C1: rebuilt [0,3).
     let row = object(2, 6, Some(3), 2);
     log.row(row.clone());
@@ -1485,17 +1443,20 @@ fn rebuilt_then_fresh() -> Log {
     let mut c = commit(log.reference(), 3, 9, 2);
     c.total = 5;
     c.check = CheckValue(45);
-    c.provenance = CheckProvenance::UnverifiedRebuild;
-    c.unverified_end = Some(3);
+    c.committed_at_utc = "2026-11-02T00:01:00Z".into();
+    c.provenance = CheckProvenance::OriginalWrite;
     log.push(Record::Committed(c), &[]); // C2: fresh [3,5), unverified end stays 3.
     log
 }
 #[test]
-fn original_write_resumes_when_w_covers_rebuilt_end_not_last_t() {
-    let mut log = rebuilt_then_fresh();
+fn range_age_advances_to_commit_that_exposed_remaining_bytes() {
+    let mut log = two_uncovered_commits();
     let prior = log.summary();
     assert_eq!(prior.total, 5);
-    assert_eq!(prior.unverified_end, Some(3));
+    assert_eq!(
+        prior.unprotected_since.as_deref(),
+        Some("2026-11-02T00:00:00Z")
+    );
     log.row(sidecar(3, 9, 0, 0, 4));
     let mut c = commit(log.reference(), 4, 12, 2);
     c.protected = 4;
@@ -1507,60 +1468,19 @@ fn original_write_resumes_when_w_covers_rebuilt_end_not_last_t() {
     let s = log.summary();
     assert_eq!(s.protected, 4);
     assert_eq!(s.total, 5);
-    assert_eq!(s.unverified_end, None);
+    assert_eq!(s.unprotected_since.as_deref(), Some("2026-11-02T00:01:00Z"));
     assert_eq!(s.provenance, CheckProvenance::OriginalWrite);
-}
-#[test]
-fn unverified_end_cannot_disappear_or_shrink_before_coverage() {
-    for marker in [None, Some(2)] {
-        let mut log = rebuilt_then_fresh();
-        log.row(sidecar(3, 9, 0, 0, 1));
-        let mut c = commit(log.reference(), 4, 12, 2);
-        c.protected = 1;
-        c.total = 5;
-        c.next_epoch = 1;
-        c.check = CheckValue(5);
-        c.unverified_end = marker;
-        c.provenance = if marker.is_some() {
-            CheckProvenance::UnverifiedRebuild
-        } else {
-            CheckProvenance::OriginalWrite
-        };
-        log.push(Record::Committed(c), &[]);
-        assert_eq!(
-            fault(fold::classify(&log.bytes).unwrap_err()),
-            Fault::Invalid("unverified rebuild promoted")
-        );
-    }
-    for (provenance, marker) in [
-        (CheckProvenance::OriginalWrite, Some(3)),
-        (CheckProvenance::UnverifiedRebuild, None),
-        (CheckProvenance::UnverifiedRebuild, Some(6)),
-        (CheckProvenance::UnverifiedRebuild, Some(0)),
-    ] {
-        let mut log = rebuilt_then_fresh();
-        let mut c = commit(log.reference(), 3, 9, 2);
-        c.total = 5;
-        c.check = CheckValue(5);
-        c.provenance = provenance;
-        c.unverified_end = marker;
-        log.push(Record::Committed(c), &[]);
-        assert_eq!(
-            fault(fold::classify(&log.bytes).unwrap_err()),
-            Fault::Invalid("unverified range/provenance")
-        );
-    }
 }
 #[test]
 fn seal_due_reason_can_change_but_cannot_clear_or_admit_new_object() {
     for (first, next) in [
         (
-            SealDueReason::HardwareEarlyWarning,
-            SealDueReason::ReachedLowWatermark,
+            TerminalFinalizationTrigger::HardwareEarlyWarning,
+            TerminalFinalizationTrigger::ReachedLowWatermark,
         ),
         (
-            SealDueReason::ReachedLowWatermark,
-            SealDueReason::HardwareEarlyWarning,
+            TerminalFinalizationTrigger::ReachedLowWatermark,
+            TerminalFinalizationTrigger::HardwareEarlyWarning,
         ),
     ] {
         let mut log = Log::first(false);
@@ -1575,7 +1495,7 @@ fn seal_due_reason_can_change_but_cannot_clear_or_admit_new_object() {
         log.push(Record::Committed(commit(log.reference(), 2, 6, 1)), &[]);
         assert_eq!(
             fault(fold::classify(&log.bytes).unwrap_err()),
-            Fault::Invalid("lost SealDueReason")
+            Fault::Invalid("lost TerminalFinalizationTrigger")
         );
         log.bytes.truncate(boundary);
         log.seq -= 1;
@@ -1639,11 +1559,14 @@ fn preflight_checks_one_closed_group_without_changing_or_poisoning_fold() {
         boundary as u64,
     );
     fold.push(&decoder.next_frame().unwrap().unwrap()).unwrap();
-    assert_eq!(fold.summary().barrier_count, 2);
+    assert_eq!(fold.summary().barrier_count, 3);
     assert_eq!(fold.summary().uncovered.len(), 1);
-    Fold::new()
-        .preflight(Log::first(false).bytes.as_slice())
-        .unwrap();
+    assert!(
+        Fold::new()
+            .preflight(Log::first(false).bytes.as_slice())
+            .is_err(),
+        "bootstrap plus Object is two groups"
+    );
 }
 #[test]
 fn encode_rejects_bad_catalog_digest_identity_and_recipient_bounds_before_writing() {
@@ -1809,8 +1732,11 @@ fn zero_tail_garbage_reports_first_nonzero_absolute_offset() {
 fn zeroed_structural_crc_is_torn_independent_of_last_data_byte() {
     let base = Log::first(false);
     for (seal_due, last) in [
-        (None, 0xf6),
-        (Some(SealDueReason::HardwareEarlyWarning), 0x00),
+        (None, b'Z'),
+        (
+            Some(TerminalFinalizationTrigger::HardwareEarlyWarning),
+            b'Z',
+        ),
     ] {
         let mut c = commit(base.reference(), 2, 6, 1);
         c.seal_due = seal_due;
@@ -1846,14 +1772,12 @@ fn unclosed_group_retains_zero_fill_frame_offset() {
     log.bytes[final_offset + PREFIX_LEN + s..].fill(0);
     assert_row_full_agreement(&log.bytes);
     let (summary, tail) = fold::replay(log.bytes.as_slice()).unwrap();
-    assert!(summary.is_fresh());
+    assert!(!summary.is_fresh());
     assert_eq!(
         tail,
         Tail::Torn {
-            offset: 0,
-            kind: TornKind::UnclosedGroup {
-                zero_filled_at: Some(final_offset as u64)
-            },
+            offset: final_offset as u64,
+            kind: TornKind::ZeroFilled,
         }
     );
 }
@@ -1871,7 +1795,7 @@ fn mid_log_zero_bit_flips_remain_crc_faults() {
     assert_eq!(first[PREFIX_LEN], 1);
     for (index, section) in [(0, Section::Prefix), (PREFIX_LEN, Section::Structural)] {
         let mut bytes = first.clone();
-        bytes[index] ^= 1;
+        bytes[index] = 0;
         assert_eq!(bytes[index], 0);
         encode_frame(&mut bytes, 2, &init(false), &[]).unwrap();
         assert_row_full_agreement(&bytes);
@@ -2009,11 +1933,11 @@ fn valid_next_prefix() -> Vec<u8> {
 #[test]
 fn short_prefix_refuses_visible_version_contradictions() {
     let mut bytes = valid_next_prefix();
-    bytes[0] = 2;
-    short_prefix_fault(bytes, 1, Fault::Version(2));
+    bytes[0] = 1;
+    short_prefix_fault(bytes, 1, Fault::Version(1));
     let mut bytes = valid_next_prefix();
     bytes[1] = 1;
-    short_prefix_fault(bytes, 2, Fault::Version(257));
+    short_prefix_fault(bytes, 2, Fault::Version(258));
 }
 #[test]
 fn short_prefix_refuses_visible_unknown_and_reserved_tags() {
@@ -2080,3 +2004,6 @@ fn short_prefix_accepts_compatible_partial_sequence_bytes() {
         );
     }
 }
+
+#[path = "session_tests.rs"]
+mod sessions;

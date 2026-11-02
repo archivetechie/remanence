@@ -65,8 +65,6 @@ pub enum CheckProvenance {
     Empty,
     /// Computed from original write bytes.
     OriginalWrite,
-    /// Includes reread bytes not compared to prior authority (until step 3).
-    UnverifiedRebuild,
 }
 
 /// Barrier-proved physical append coordinate.

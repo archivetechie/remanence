@@ -5,12 +5,16 @@
 //! reset authority.
 use crate::{StateError, StatePaths};
 use remanence_library::durable_file::{self, File};
-use std::{fs, io::Write, path::Path};
+use std::{
+    fs,
+    io::{Read, Write},
+    path::Path,
+};
 
 /// Active host authority layout identifier.
-pub const FORMAT: &str = "remanence-tape-log-v1";
+pub const FORMAT: &str = "remanence-tape-log-v2";
 /// Exact operator guidance for the declared clean break.
-pub const RESET_REQUIRED: &str = "This state directory uses the two-journal authority layout.\nStep 2 requires a declared state reset and reinitialization of its test tapes.\nRun rem reset-catalog --config <config> with the existing explicit reset\nconfirmation, then reinitialize the approved scratch tapes. No importer is available.";
+pub const RESET_REQUIRED: &str = "This state directory predates the current tape-log format. A declared state reset and reinitialization of its test tapes is required. Run rem reset-catalog --config <config> with the existing explicit reset confirmation. No importer is available.";
 
 fn invalid(message: impl Into<String>) -> StateError {
     StateError::ConfigInvalid(message.into())
@@ -38,6 +42,19 @@ fn old_authority(path: &Path, archive: &Path) -> Result<bool, StateError> {
                 && (name.ends_with(".init") || name.ends_with(".lock")))
         {
             return Ok(true);
+        }
+        if ty.is_file() && name.ends_with(".remtape") {
+            // Inspect only the format discriminator. No predecessor decoder is
+            // available, even if somebody replaced its authority marker.
+            let mut prefix = [0u8; 10];
+            let mut file = fs::File::open(entry.path())
+                .map_err(|e| StateError::io_at("inspect tape-log format", entry.path(), e))?;
+            if file.read_exact(&mut prefix).is_ok()
+                && &prefix[..8] == b"REMTAPE\x01"
+                && prefix[8..] != 2u16.to_le_bytes()
+            {
+                return Ok(true);
+            }
         }
         if ty.is_symlink() {
             return Err(invalid(format!(
@@ -85,16 +102,30 @@ enum Layout {
 /// Read-only layout check: creates, locks and installs nothing.
 fn validate_layout(paths: &StatePaths) -> Result<Layout, StateError> {
     crate::state::ensure_no_catalog_reset_fence(paths)?;
+    if paths.sqlite_path.exists() {
+        let conn = rusqlite::Connection::open_with_flags(
+            &paths.sqlite_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|e| invalid(e.to_string()))?;
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .map_err(|e| invalid(e.to_string()))?;
+        if version < crate::index::SCHEMA_VERSION {
+            return Err(invalid(RESET_REQUIRED));
+        }
+    }
     let marker = paths.state_dir.join("authority-format");
     let old = old_authority(&paths.journal_dir, &paths.state_dir.join("reset-archives"))?;
     if marker.exists() {
-        if fs::read(&marker).map_err(|e| StateError::io_at("read authority format", &marker, e))?
-            != contents(paths)?
+        let marker_bytes = fs::read(&marker)
+            .map_err(|e| StateError::io_at("read authority format", &marker, e))?;
+        if !marker_bytes.starts_with(b"remanence-tape-log-v2\n") || marker_bytes != contents(paths)?
         {
-            return Err(invalid("authority-format does not match remanence-tape-log-v1 and the configured journal root"));
+            return Err(invalid(RESET_REQUIRED));
         }
         if old {
-            return Err(invalid("marked tape-log layout contains old authority files in active paths; declared state reset required"));
+            return Err(invalid(RESET_REQUIRED));
         }
         return Ok(Layout::Marked);
     }

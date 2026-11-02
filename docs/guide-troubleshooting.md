@@ -10,13 +10,10 @@ drive) doing its job.
 ## Authority-layout refusals and declared reset
 
 Old host state is refused before configured device admission. Ordinary catalog
-opens refuse schemas 1 through 22. The layout refusal contains this exact guidance:
+opens refuse schemas 1 through 23. The layout refusal contains this exact guidance:
 
 ```text
-This state directory uses the two-journal authority layout.
-Step 2 requires a declared state reset and reinitialization of its test tapes.
-Run rem reset-catalog --config <config> with the existing explicit reset
-confirmation, then reinitialize the approved scratch tapes. No importer is available.
+This state directory predates the current tape-log format. A declared state reset and reinitialization of its test tapes is required. Run rem reset-catalog --config <config> with the existing explicit reset confirmation. No importer is available.
 ```
 
 Stop the daemon and run the declared offline reset with the existing config:
@@ -44,21 +41,16 @@ rem tape init <LABEL> --config <PATH> --clobber-data --clobber-unknown-tape <OLD
 Select the approved geometry with `--block-size <BYTES>` and
 `--parity <none|default>`; a fresh initialization defaults to no parity.
 Initialization assigns a new tape UUID and incarnation 1. It creates no log
-until the first actual barrier publication. An idempotent init of an already
+until the first write-session open. That open writes the one-block BOT file and
+its filemark, takes a synchronous barrier, then closes an `Initialized` record
+before writing an Object. Both parity modes use this order. An idempotent init of an already
 registered tape does not assign a new identity. Scoped preservation and erase
 selectors still require the matching `catalog reset-preflight` token; see the
 [CLI reference](reference-cli.md#destructive-state-reset).
 
-The following layout details are also refusals, not reasons to delete a marker:
-
-```text
-authority-format does not match remanence-tape-log-v1 and the configured journal root
-marked tape-log layout contains old authority files in active paths; declared state reset required
-```
-
-The first means the marker does not match the configured canonical journal root
-and format. The second means refused old authority files remain in active paths.
-Use the declared reset for an approved layout change. An interrupted reset
+The same refusal covers the old two-journal layout, v1 tape logs and predecessor
+catalog schemas. A changed configured journal root also refuses admission;
+use the declared reset for an approved layout change. An interrupted reset
 reports `durable fence {path} requires an exact reset rerun`; rerun the same
 reset request rather than removing its fence.
 

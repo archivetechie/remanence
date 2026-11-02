@@ -6734,7 +6734,62 @@ mod cutover_tests {
         assert!(StateHandle::open_from_config_file(&config)
             .unwrap_err()
             .to_string()
-            .contains("old authority files in active paths"));
+            .contains(crate::authority_layout::RESET_REQUIRED));
+    }
+
+    #[test]
+    fn v2_reset_archives_each_predecessor_authority_without_reading_it() {
+        for layout in ["two-journal", "v1", "schema23", "v1-header"] {
+            let (_root, config) = setup();
+            let state = StateHandle::open_from_config_file(&config).unwrap();
+            let paths = state.paths.clone();
+            drop(state);
+            let marker_path = paths.state_dir.join("authority-format");
+            let mut marker = fs::read_to_string(&marker_path).unwrap();
+            if layout == "v1" {
+                marker = marker.replace("remanence-tape-log-v2", "remanence-tape-log-v1");
+                fs::write(&marker_path, &marker).unwrap();
+            }
+            if layout == "schema23" {
+                let conn = rusqlite::Connection::open(&paths.sqlite_path).unwrap();
+                conn.pragma_update(None, "user_version", 23).unwrap();
+            }
+            let relative = if layout == "two-journal" {
+                "old.remjournal"
+            } else {
+                "tapes/11111111111111111111111111111111.remtape"
+            };
+            let bytes: &[u8] = if layout == "v1-header" {
+                b"REMTAPE\x01\x01\x00predecessor header under a v2 marker"
+            } else {
+                b"predecessor authority must be archived without a compatibility reader"
+            };
+            fs::write(paths.journal_dir.join(relative), bytes).unwrap();
+            if layout == "two-journal" {
+                fs::remove_file(&marker_path).unwrap();
+            }
+            assert!(StateHandle::open_from_config_file(&config)
+                .unwrap_err()
+                .to_string()
+                .contains(crate::authority_layout::RESET_REQUIRED));
+            StateHandle::reset_catalog_from_config_file(&config).unwrap();
+            let archive = paths.state_dir.join("reset-archives/reset-000001");
+            assert_eq!(
+                fs::read(archive.join("journals").join(relative)).unwrap(),
+                bytes
+            );
+            if layout != "two-journal" {
+                assert_eq!(
+                    fs::read_to_string(archive.join("authority-format")).unwrap(),
+                    marker
+                );
+            }
+            assert!(fs::read_to_string(marker_path)
+                .unwrap()
+                .starts_with("remanence-tape-log-v2\n"));
+            assert!(!paths.journal_dir.join(relative).exists());
+            StateHandle::open_from_config_file(&config).unwrap();
+        }
     }
 
     #[test]

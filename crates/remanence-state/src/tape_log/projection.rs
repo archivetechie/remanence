@@ -328,13 +328,35 @@ fn project_snapshot(
     let mut start = None;
     while let Some(frame) = decoder.next_row_frame().map_err(StoreError::from)? {
         let (sequence, begin) = *start.get_or_insert((frame.sequence, frame.offset));
-        if matches!(
-            frame.record,
-            Record::Initialized(_) | Record::PayloadContinuation(_)
-        ) {
+        if matches!(frame.record, Record::PayloadContinuation(_)) {
             continue;
         }
         let group = raw.group_snapshot(sequence, begin, frame.end);
+        if let Record::Initialized(init) = &frame.record {
+            insert_tape_file(tx, uuid, &init.bot)?;
+            project_tape_written_extent_tx(tx, uuid, 2)?;
+            tx.execute(
+                "update tapes set last_committed_tape_file = ?2 where tape_uuid = ?1",
+                params![uuid.as_slice(), SqliteU64::new(0)],
+            )
+            .map_err(|e| sqlite_error("project bootstrap boundary", e))?;
+        }
+        if let Record::ClosedOut(close) = &frame.record {
+            let mut failure = None;
+            group
+                .visit_file_rows(|row| {
+                    insert_tape_file(tx, uuid, row).map_err(|e| {
+                        failure = Some(e);
+                        StoreError::Refused("closeout row projection failed")
+                    })
+                })
+                .map_err(|e| failure.take().unwrap_or_else(|| e.into()))?;
+            tx.execute("update tapes set highest_protected_ordinal = ?2, last_committed_tape_file = ?3 where tape_uuid = ?1",
+                params![uuid.as_slice(), SqliteU64::new(close.to_t), SqliteU64::new(close.next_file - 1)])
+                .map_err(|e| sqlite_error("project closeout range", e))?;
+            project_tape_written_extent_tx(tx, uuid, close.cursor_after.lba)?;
+        }
+
         if let Record::Committed(commit)
         | Record::TerminalPrefix { commit, .. }
         | Record::ComponentWritten { commit, .. } = &frame.record
@@ -430,6 +452,11 @@ fn project_snapshot(
             .map_err(|e| sqlite_error("advance tape-log projection mark", e))?;
         start = None;
     }
+    tx.execute(
+        "update tapes set unprotected_since = ?2 where tape_uuid = ?1",
+        params![uuid.as_slice(), raw.summary().unprotected_since.as_deref()],
+    )
+    .map_err(|e| sqlite_error("project uncovered range age", e))?;
     if raw
         .summary()
         .finalization
@@ -523,10 +550,7 @@ fn validate_projected_history(
         let mut start = None;
         while let Some(frame) = decoder.next_row_frame().map_err(StoreError::from)? {
             let (sequence, begin) = *start.get_or_insert((frame.sequence, frame.offset));
-            if matches!(
-                frame.record,
-                Record::Initialized(_) | Record::PayloadContinuation(_)
-            ) {
+            if matches!(frame.record, Record::PayloadContinuation(_)) {
                 continue;
             }
             let group = snapshot.raw.group_snapshot(sequence, begin, frame.end);

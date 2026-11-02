@@ -834,6 +834,7 @@ fn combined_transport_and_audit_failure_latches_until_recovery_persists_quaranti
     .unwrap();
     let mounted = backend.mount(target()).unwrap();
     let (mut actor, reopen_state) = own_mount!(backend, mounted, state);
+    actor.open_session("default").unwrap(); // Commit BOT before injecting the Object failure.
     *fault.lock().unwrap() = Some(0x0a);
     assert!(actor
         .write_checkpointed(request(root.path(), "cut"))

@@ -950,6 +950,8 @@ async fn cursor_refusal_matrix_before_any_write() {
                     .is_err(),
                     "checkpoint" => {
                         let record = remanence_state::authority::AuthorityCommit {
+                            session_id: Some([9; 16]),
+                            committed_at_utc: "2026-11-02T00:00:00Z".into(),
                             ordinal: 1,
                             object_count: 0,
                             protected: 0,

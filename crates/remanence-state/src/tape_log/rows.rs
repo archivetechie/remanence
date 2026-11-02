@@ -71,10 +71,7 @@ impl FileRowCursor for RowsCursor {
                     .next_row_frame()
                     .map_err(journal)?
                 {
-                    if !matches!(
-                        close.record,
-                        Record::Initialized(_) | Record::PayloadContinuation(_)
-                    ) {
+                    if !matches!(close.record, Record::PayloadContinuation(_)) {
                         self.plan = matches!(
                             close.record,
                             Record::FinalizationPrepared(_) | Record::FinalizationDecided(_)
