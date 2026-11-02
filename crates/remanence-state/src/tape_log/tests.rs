@@ -1103,6 +1103,28 @@ fn manual_plan(reference: GroupRef) -> FinalizationPlan {
     });
     p
 }
+
+/// Automatic operator recovery requires an exact, previously committed obligation.
+#[test]
+fn operator_plan_without_manual_identity_requires_durable_operator_seal_due() {
+    for due in [
+        None,
+        Some(TerminalFinalizationTrigger::HardwareEarlyWarning),
+    ] {
+        let mut log = Log::first(false);
+        let mut c = commit(log.reference(), 2, 6, 1);
+        c.seal_due = due;
+        log.push(Record::Committed(c), &[]);
+        let mut p = plan(log.reference(), 2, 6);
+        p.trigger = TerminalFinalizationTrigger::OperatorCloseOut;
+        log.push(Record::FinalizationDecided(Box::new(p)), &[]);
+        assert_eq!(
+            fault(fold::replay(log.bytes.as_slice()).unwrap_err()),
+            Fault::Invalid("manual identity absent")
+        );
+    }
+}
+
 #[test]
 fn compatibility_preparation_retirement_recovery_and_acceptance() {
     for retire in [false, true] {

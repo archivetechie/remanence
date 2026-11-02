@@ -452,7 +452,7 @@ const ROLES: &[RoleEntry] = &[
     RoleEntry {role:Role::InverseMapping, entry:"mapping::stripe_data_shard_in_epoch (unit level; the one inverse every Recoverer caller uses)", run:overflow::inverse},
     RoleEntry {role:Role::TerminalScanner, entry:"read_terminal_index_inventory (no off-tape state; prefix records present, their bytes unread)", run:overflow::terminal_scanner},
     RoleEntry {role:Role::WalkScanner, entry:"scan_reconstruct_filemark_map_with_report (device report injected by the raw source)", run:overflow::walk_scanner},
-    RoleEntry {role:Role::Resumer, entry:"FileTapeFileJournal replay -> checked_bounded_resume_summary -> rebuild_open_epoch_from_bounded_summary", run:overflow::resumer},
+    RoleEntry {role:Role::Resumer, entry:"FileTapeFileJournal replay -> checked_bounded_resume_summary -> rebuild_open_epoch_from_bounded_summary_checked", run:overflow::resumer},
     RoleEntry {role:Role::ParityLocator, entry:"parity_block_position (unit-level formula probe after header rejection)", run:overflow::locator},
     RoleEntry {role:Role::SidecarCopy, entry:"parse_sidecar_index_blocks (includes parse_sidecar_header_block)", run:|v,f,b| { parse_sidecar_index_blocks(&v.files[&f][b..b+1],&v.uuid)?; Ok(()) }},
     RoleEntry {role:Role::SidecarFooter, entry:"parse_sidecar_footer_block", run:|v,f,b| { parse_sidecar_footer_block(&v.files[&f][b],&v.uuid)?; Ok(()) }},

@@ -85,7 +85,7 @@ fn contents(paths: &StatePaths) -> Result<Vec<u8>, StateError> {
 /// Validate admission under the caller's exclusive state lock. A genuinely
 /// empty layout is provisioned atomically; any existing authority needs reset.
 pub fn admit(paths: &StatePaths) -> Result<(), StateError> {
-    if validate_layout(paths)? == Layout::Marked {
+    if matches!(validate_layout(paths)?, Layout::Marked { .. }) {
         return Ok(());
     }
     install(paths, false)
@@ -94,14 +94,15 @@ pub fn admit(paths: &StatePaths) -> Result<(), StateError> {
 #[derive(Debug, PartialEq, Eq)]
 enum Layout {
     /// The marker matches and no old authority remains.
-    Marked,
-    /// No marker and no state at all: only an owner may install one.
+    Marked { empty_catalog: bool },
+    /// No marker or authority; an empty SQLite file may already exist.
     Empty,
 }
 
 /// Read-only layout check: creates, locks and installs nothing.
 fn validate_layout(paths: &StatePaths) -> Result<Layout, StateError> {
     crate::state::ensure_no_catalog_reset_fence(paths)?;
+    let mut empty_catalog = false;
     if paths.sqlite_path.exists() {
         let conn = rusqlite::Connection::open_with_flags(
             &paths.sqlite_path,
@@ -111,7 +112,15 @@ fn validate_layout(paths: &StatePaths) -> Result<Layout, StateError> {
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .map_err(|e| invalid(e.to_string()))?;
-        if version < crate::index::SCHEMA_VERSION {
+        empty_catalog = version == 0
+            && !conn
+                .query_row(
+                    "select exists(select 1 from sqlite_master where type = 'table' and name not like 'sqlite_%')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(|e| invalid(e.to_string()))?;
+        if version < crate::index::SCHEMA_VERSION && !empty_catalog {
             return Err(invalid(RESET_REQUIRED));
         }
     }
@@ -127,10 +136,10 @@ fn validate_layout(paths: &StatePaths) -> Result<Layout, StateError> {
         if old {
             return Err(invalid(RESET_REQUIRED));
         }
-        return Ok(Layout::Marked);
+        return Ok(Layout::Marked { empty_catalog });
     }
     if old
-        || paths.sqlite_path.exists()
+        || (paths.sqlite_path.exists() && !empty_catalog)
         || directory_nonempty(&paths.audit_dir)?
         || directory_nonempty(&paths.journal_dir.join("tapes"))?
     {
@@ -199,8 +208,14 @@ pub fn admit_owned_config(config: &crate::RemConfig) -> Result<(), StateError> {
 /// that holds the exclusive state lock may install one ([`admit`]).
 pub fn validate_config_layout(config: &crate::RemConfig) -> Result<(), StateError> {
     let paths = StatePaths::from_config(Path::new(""), config);
-    validate_layout(&paths)?;
-    if paths.sqlite_path.exists() {
+    let layout = validate_layout(&paths)?;
+    if matches!(
+        layout,
+        Layout::Marked {
+            empty_catalog: false
+        }
+    ) && paths.sqlite_path.exists()
+    {
         crate::CatalogIndex::open_read_only(&paths.sqlite_path)?;
     }
     Ok(())

@@ -3,7 +3,7 @@
   "case": "overflow-3.2-14-append-point",
   "edits": [],
   "entry_points": [
-    "FileTapeFileJournal replay -> checked_bounded_resume_summary -> rebuild_open_epoch_from_bounded_summary"
+    "FileTapeFileJournal replay -> checked_bounded_resume_summary -> rebuild_open_epoch_from_bounded_summary_checked"
   ],
   "injection": {
     "commit_record_inputs": {

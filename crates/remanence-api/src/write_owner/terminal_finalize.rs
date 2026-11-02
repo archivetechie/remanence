@@ -3188,3 +3188,7 @@ pub(crate) fn set_manual_preflight_hook(after_intent: bool, hook: impl FnOnce() 
     };
     slot.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
+
+#[cfg(test)]
+#[path = "terminal_finalize_tests.rs"]
+mod tests;

@@ -141,8 +141,6 @@ pub use raw::{
 pub use recovery::{
     recover_object_block_from_sidecar, recover_ordinal_from_sidecar, SidecarRecoveryResult,
 };
-#[cfg(any(test, feature = "fixtures"))]
-pub use resume::rebuild_open_epoch_from_bounded_summary;
 pub use resume::{
     checked_bounded_resume_summary, checked_checkpointed_terminal_close_summary,
     close_checkpointed_terminal_index_prefix, emit_resume_rebuilt_sidecars_to_raw,

@@ -1294,23 +1294,6 @@ fn rebuild_open_epoch_from_committed_prefix(
     )
 }
 
-/// Reread the single open epoch from bounded resume authority.
-///
-/// Physical positions for only the intersecting Object extents were retained
-/// during journal replay, so this path does not need a complete filemark map.
-#[cfg(any(test, feature = "fixtures"))]
-pub fn rebuild_open_epoch_from_bounded_summary(
-    source: &mut dyn RawTapeSource,
-    summary: &BoundedResumeSummary,
-    scheme: &ParityScheme,
-    tape_uuid: [u8; 16],
-    block_size: u32,
-) -> Result<ResumeOpenEpochRebuild, ParityError> {
-    rebuild_open_epoch_from_bounded_summary_checked(
-        source, summary, scheme, tape_uuid, block_size, None,
-    )
-}
-
 /// Rebuild from frozen committed extents through the checked shared kernel.
 /// A nonempty range requires original-write evidence before any drive command.
 pub fn rebuild_open_epoch_from_bounded_summary_checked(

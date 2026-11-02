@@ -6738,6 +6738,125 @@ mod cutover_tests {
     }
 
     #[test]
+    /// Restart after SQLite file creation is safe; unversioned user data is refused.
+    fn authority_layout_restarts_an_empty_unversioned_catalog_only() {
+        for marked in [false, true] {
+            for populated in [false, true] {
+                let (_root, config_path) = setup();
+                let config = crate::load_config(&config_path).unwrap();
+                let paths = StatePaths::from_config(&config_path, &config);
+                let lock = StateLockGuard::acquire(&paths.state_dir).unwrap();
+                crate::authority_layout::admit_owned_config(&config).unwrap();
+                ensure_state_directories(&paths).unwrap();
+                let marker = paths.state_dir.join("authority-format");
+                if !marked {
+                    fs::remove_file(&marker).unwrap();
+                }
+                let conn = rusqlite::Connection::open(&paths.sqlite_path).unwrap();
+                conn.execute_batch("pragma user_version = 0;").unwrap();
+                if populated {
+                    conn.execute_batch("create table existing_data(value text);")
+                        .unwrap();
+                }
+                drop(conn);
+                drop(lock);
+                let before = fs::read(&paths.sqlite_path).unwrap();
+                let validated = crate::authority_layout::validate_config_layout(&config);
+                assert_eq!(fs::read(&paths.sqlite_path).unwrap(), before);
+                if populated {
+                    assert!(validated
+                        .unwrap_err()
+                        .to_string()
+                        .contains(crate::authority_layout::RESET_REQUIRED));
+                } else {
+                    validated.expect("runtime validation admits an empty catalog read-only");
+                }
+                let restarted = StateHandle::open_from_config_file(&config_path);
+                if populated {
+                    assert!(restarted
+                        .unwrap_err()
+                        .to_string()
+                        .contains(crate::authority_layout::RESET_REQUIRED));
+                    assert_eq!(fs::read(&paths.sqlite_path).unwrap(), before);
+                    assert_eq!(marker.exists(), marked);
+                } else {
+                    let state = restarted.expect("restart initializes the empty catalog");
+                    assert_eq!(
+                        state.index.schema_version().unwrap(),
+                        crate::index::SCHEMA_VERSION
+                    );
+                    assert!(fs::read_to_string(&marker)
+                        .unwrap()
+                        .starts_with("remanence-tape-log-v2\n"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    /// Reset a historical catalog, preserving archived authority bytes exactly.
+    fn v2_reset_genuine_schema23_catalog_preserves_archive_bytes() {
+        let (_root, config_path) = setup();
+        let config = crate::load_config(&config_path).unwrap();
+        let paths = StatePaths::from_config(&config_path, &config);
+        let lock = StateLockGuard::acquire(&paths.state_dir).unwrap();
+        crate::authority_layout::admit_owned_config(&config).unwrap();
+        ensure_state_directories(&paths).unwrap();
+        let marker = fs::read(paths.state_dir.join("authority-format")).unwrap();
+        let conn = rusqlite::Connection::open(&paths.sqlite_path).unwrap();
+        conn.execute_batch(include_str!("../tests/fixtures/schema23.sql"))
+            .unwrap();
+        let has_column: bool = conn.query_row(
+            "select exists(select 1 from pragma_table_info('tapes') where name = 'unprotected_since')",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(!has_column, "the genuine predecessor lacks the v24 column");
+        conn.execute(
+            "insert into tapes(tape_uuid, voltag, block_size, state, updated_at_utc)
+             values(?1, 'SCHEMA23L9', 262144, 'ready', '2026-11-02T00:00:00Z')",
+            [[0x23u8; 16].as_slice()],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            23
+        );
+        drop(conn);
+        let journal = b"schema-23 predecessor authority\x00\xff";
+        let audit = b"schema-23 predecessor audit\x00\xfe";
+        fs::write(paths.journal_dir.join("old.remjournal"), journal).unwrap();
+        fs::write(paths.audit_dir.join("old.audit"), audit).unwrap();
+        drop(lock);
+        let before = fs::read(&paths.sqlite_path).unwrap();
+        assert!(StateHandle::open_from_config_file(&config_path)
+            .unwrap_err()
+            .to_string()
+            .contains(crate::authority_layout::RESET_REQUIRED));
+        assert_eq!(fs::read(&paths.sqlite_path).unwrap(), before);
+        StateHandle::reset_catalog_from_config_file(&config_path).unwrap();
+        let archive = paths.state_dir.join("reset-archives/reset-000001");
+        assert_eq!(
+            fs::read(archive.join("journals/old.remjournal")).unwrap(),
+            journal
+        );
+        assert_eq!(fs::read(archive.join("audit/old.audit")).unwrap(), audit);
+        assert_eq!(fs::read(archive.join("authority-format")).unwrap(), marker);
+        let state = StateHandle::open_from_config_file(&config_path).unwrap();
+        assert_eq!(
+            state.index.schema_version().unwrap(),
+            crate::index::SCHEMA_VERSION
+        );
+        assert!(state
+            .index
+            .list_tapes(None, crate::TapeKindFilter::All)
+            .unwrap()
+            .is_empty());
+        assert!(!paths.journal_dir.join("old.remjournal").exists());
+        assert!(!paths.audit_dir.join("old.audit").exists());
+    }
+
+    #[test]
     fn v2_reset_archives_each_predecessor_authority_without_reading_it() {
         for layout in ["two-journal", "v1", "schema23", "v1-header"] {
             let (_root, config) = setup();

@@ -1919,13 +1919,9 @@ pub(super) fn handle_drive_open_write(
     if needs_drive_load {
         run_load_calibration_harvest(index, drive, cfg, &tape_uuid, barcode.as_deref());
     }
-    let seal_due = match index.get_tape(&tape_uuid) {
-        Ok(tape) => tape.and_then(|tape| tape.seal_due),
-        Err(error) => {
-            let _ = reply.send(Err(status_from_state_error(error)));
-            return None;
-        }
-    };
+    let seal_due = durable_checkpoint_records
+        .last()
+        .and_then(|commit| commit.seal_due);
     if pending_terminal_intent.is_some() || seal_due.is_some() {
         if pending_terminal_intent
             .as_ref()
@@ -1959,11 +1955,7 @@ pub(super) fn handle_drive_open_write(
         let mut spec = if let Some(intent) = pending_terminal_intent.as_ref() {
             TerminalFinalizeSpec::resume(intent, selected.block_size, &pool_cfg)
         } else {
-            let trigger = if seal_due.as_deref() == Some("hardware_early_warning") {
-                remanence_state::TerminalFinalizationTrigger::HardwareEarlyWarning
-            } else {
-                remanence_state::TerminalFinalizationTrigger::ReachedLowWatermark
-            };
+            let trigger = seal_due.expect("automatic recovery requires durable seal due");
             TerminalFinalizeSpec::automatic(&selected, &pool_cfg, trigger)
         };
         spec.actor = actor.clone();
