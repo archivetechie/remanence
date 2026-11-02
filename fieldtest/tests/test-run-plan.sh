@@ -44,7 +44,7 @@ STUB
 run_case() {
   local case_dir="$1"
   shift
-  env -i PATH=/usr/bin:/bin HOME="$case_dir/home" REMFIELD_HOME="$case_dir/home/remfield" \
+  env -i PATH="$case_dir/pkg/bin:/usr/bin:/bin" HOME="$case_dir/home" REMFIELD_HOME="$case_dir/home/remfield" \
     bash "$case_dir/pkg/run.sh" "$@" >"$case_dir/out" 2>&1
 }
 
@@ -68,6 +68,24 @@ rc=0; run_case "$c" plan/smoke.env || rc=$?
 check "fatal: exit 1" "[[ $rc -eq 1 ]]"
 check "fatal: stops after the failing leg, then diagnoses and tears down" "[[ '$(calls "$c")' == '00-preflight.sh |09-media-ready.sh --count 4 --no-wait|03-bringup.sh |33-diag-capture.sh --note run.sh teardown: 03-bringup.sh failed|03-bringup.sh --stop|90-collect-evidence.sh |' ]]"
 check "fatal: result names the leg" "grep -q '^result: FAIL (03-bringup.sh)' '$c/out'"
+
+# A hung teardown diagnostic is killed at its deadline and still reaches stop.
+c="$(make_case)"
+echo 03-bringup.sh >"$c/home/fail-on"
+echo 33-diag-capture.sh >"$c/home/hang-on"
+cat >"$c/pkg/bin/timeout" <<'TIMEOUT'
+#!/usr/bin/env bash
+[[ "$1 $2 $3" == '--foreground --signal=KILL 300' ]] || exit 99
+printf '%s\n' "$1 $2 $3" >"$HOME/diag-timeout"
+shift 3
+exec /usr/bin/timeout --foreground --signal=KILL 1 "$@"
+TIMEOUT
+chmod +x "$c/pkg/bin/timeout"
+rc=0; run_case "$c" plan/smoke.env || rc=$?
+check "hung diagnostics: exit 1" "[[ $rc -eq 1 ]]"
+check "hung diagnostics: production deadline used" "[[ \$(cat '$c/home/diag-timeout') == '--foreground --signal=KILL 300' ]]"
+check "hung diagnostics: stop and packing still run" "[[ '$(calls "$c")' == *'33-diag-capture.sh --note run.sh teardown: 03-bringup.sh failed|03-bringup.sh --stop|90-collect-evidence.sh |' ]]"
+check "hung diagnostics: WARN recorded" "grep -q '\"status\":\"WARN\".*diagnostics cut after the 300s deadline' '$c/home/remfield/evidence/records.jsonl'"
 
 # A failing "continue" leg is recorded but does not fail the plan.
 c="$(make_case)"

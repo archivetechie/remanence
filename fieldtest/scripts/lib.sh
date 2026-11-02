@@ -204,6 +204,8 @@ fieldtest_space_refusal() {
   read -r total avail kit < <(fieldtest_space_report)
   read -r min_gb min_pct mode < <(fieldtest_space_floors)
   floor=$(( min_gb * FIELDTEST_GIB ))
+  # Divide first to keep filesystem byte counts from overflowing shell integers.
+  # shellcheck disable=SC2017
   pct_floor=$(( total / 100 * min_pct ))
   cap=$(( ${FIELD_MAX_KIT_GB:-40} * FIELDTEST_GIB ))
   after=$(( avail - needed ))
@@ -1800,6 +1802,7 @@ parts = [
     "[daemon]",
     f'state_dir = "{home / "state"}"',
     "default_idle_timeout_seconds = 120",
+    "changer_not_ready_wait_seconds = 300",
     "read_only = false",
     f'socket_path = "{home / "rem.sock"}"',
     f'spool_dir = "{home / "spool"}"',

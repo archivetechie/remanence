@@ -2,8 +2,6 @@
 set -euo pipefail
 
 SCRIPT_NAME="03-bringup"
-# Allow in-flight work and every session checkpoint/close to finish after SIGTERM.
-DAEMON_STOP_TIMEOUT_SECONDS="${REMFIELD_STOP_TIMEOUT_SECONDS:-360}"
 # shellcheck disable=SC1091
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
@@ -69,7 +67,7 @@ is_socket_live() {
 # Return only allowlisted media in the selected library while the daemon owns it.
 # Each CLI unload waits for the operation and uses its recorded source slot.
 unload_allowlisted_before_stop() {
-  local serial inventory loaded bay barcode evidence rc started cause attempt
+  local serial inventory loaded bay barcode eligible="" count=0
   local retry_window="$1"
   local call_limit=$((retry_window + 900))
   if ! serial="$(fieldtest_selected_library_serial)" || [[ -z "$serial" ]]; then
@@ -104,6 +102,25 @@ PYLOAD
     fieldtest_evidence_record "$SCRIPT_NAME" stop-inventory WARN "cannot parse seated cartridges in library $serial; no unload attempted" "$inventory"
     return
   fi
+  while IFS=$'\t' read -r bay barcode; do
+    [[ -n "$bay" ]] || continue
+    fieldtest_require_allowlisted "$barcode" || continue
+    eligible+="$bay"$'\t'"$barcode"$'\n'
+    count=$((count + 1))
+  done <<<"$loaded"
+  # Inventory has its own deadline. Give every allowlisted seated bay its
+  # full call budget, plus 60 seconds for phase bookkeeping.
+  if ! timeout --signal=KILL "$((call_limit * count + 60))" bash "${BASH_SOURCE[0]}" --stop-unload-phase "$retry_window" "$serial" "$eligible"; then
+    fieldtest_evidence_record "$SCRIPT_NAME" stop-unload-phase WARN "unload phase failed or timed out; inspect cartridge placement; proceeding to daemon stop"
+  fi
+}
+
+# Run only the inspected, allowlisted bays inside the shared phase deadline.
+unload_inspected_bays() {
+  local retry_window="$1" serial="$2" loaded="$3"
+  local call_limit=$((retry_window + 900))
+  local bay barcode evidence rc started cause attempt
+  [[ "$serial" == "$(fieldtest_selected_library_serial)" ]] || return 1
   while IFS=$'\t' read -r bay barcode; do
     [[ -n "$bay" ]] || continue
     fieldtest_require_allowlisted "$barcode" || continue
@@ -162,14 +179,30 @@ main() {
     --stop-unload-phase)
       # Internal subprocess boundary gives the entire phase a hard deadline.
       fieldtest_init_layout
-      unload_allowlisted_before_stop "$2"
+      unload_inspected_bays "$2" "$3" "$4"
       return
       ;;
     --stop)
       fieldtest_init_layout
-      local session pid started elapsed retry_window forced=0
+      local session pid started elapsed retry_window stop_timeout forced=0
       session="remfield"
-      if [[ ! "$DAEMON_STOP_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]]; then
+      # The daemon may already have dispatched UNLOAD. Let its changer wait
+      # expire and finish cleanup before the kit resorts to a forced kill.
+      stop_timeout="${REMFIELD_STOP_TIMEOUT_SECONDS:-}"
+      if [[ -z "$stop_timeout" ]]; then
+        stop_timeout="$(python3 - "$(fieldtest_config_path)" <<'PYSTOP'
+import sys, tomllib
+from pathlib import Path
+config = tomllib.loads(Path(sys.argv[1]).read_text())
+# Older kit configs omit the setting and use the daemon's 600-second default.
+seconds = config["daemon"].get("changer_not_ready_wait_seconds", 600)
+if type(seconds) is not int or seconds < 0:
+    raise SystemExit("invalid daemon.changer_not_ready_wait_seconds")
+print(seconds + 120)
+PYSTOP
+)"
+      fi
+      if [[ ! "$stop_timeout" =~ ^[0-9]+$ ]]; then
         printf '%s\n' "REMFIELD_STOP_TIMEOUT_SECONDS must be a non-negative integer" >&2
         exit 1
       fi
@@ -187,10 +220,7 @@ if type(seconds) is not int or seconds < 0:
 print(seconds + 60)
 PYCONFIG
 )"; then
-          # One shared budget: inventory plus idle expiry, rebuild and MOVE.
-          if ! timeout --signal=KILL "$((retry_window + 900 + 60))" bash "${BASH_SOURCE[0]}" --stop-unload-phase "$retry_window"; then
-            fieldtest_evidence_record "$SCRIPT_NAME" stop-unload-phase WARN "unload phase failed or timed out; inspect cartridge placement; proceeding to daemon stop"
-          fi
+          unload_allowlisted_before_stop "$retry_window"
         else
           fieldtest_evidence_record "$SCRIPT_NAME" stop-unload-phase WARN "cannot read idle timeout from kit config; no unload attempted; proceeding to daemon stop"
         fi
@@ -201,7 +231,7 @@ PYCONFIG
       if [[ -n "$pid" ]]; then
         kill "$pid" 2>/dev/null || true
       fi
-      while (( SECONDS - started < 10#$DAEMON_STOP_TIMEOUT_SECONDS )); do
+      while (( SECONDS - started < 10#$stop_timeout )); do
         pid="$(pgrep -f "rem-daemon --config $(fieldtest_config_path)" | head -1 || true)"
         [[ -n "$pid" ]] || break
         sleep 1
@@ -222,9 +252,9 @@ PYCONFIG
       fi
       rm -f -- "$(fieldtest_socket_path)"
       if (( forced )); then
-        fieldtest_evidence_record "$SCRIPT_NAME" stop WARN "daemon needs a hard kill after ${elapsed}s; at next start check rem top --once for a bay busy with no I/O and rem tape quarantine list" "" "{\"duration_seconds\":$elapsed}"
+        fieldtest_evidence_record "$SCRIPT_NAME" stop WARN "daemon needs a forced kill after ${elapsed}s; a forced kill may leave a cartridge unthreaded in its drive. Check rem top --once and the library's front panel; a manual LOAD may be needed" "" "{\"duration_seconds\":$elapsed,\"timeout_seconds\":$((10#$stop_timeout))}"
       else
-        fieldtest_evidence_record "$SCRIPT_NAME" stop PASS "daemon stops gracefully and is gone after ${elapsed}s" "" "{\"duration_seconds\":$elapsed}"
+        fieldtest_evidence_record "$SCRIPT_NAME" stop PASS "daemon stops gracefully and is gone after ${elapsed}s" "" "{\"duration_seconds\":$elapsed,\"timeout_seconds\":$((10#$stop_timeout))}"
       fi
       exit 0
       ;;

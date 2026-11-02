@@ -1,3 +1,5 @@
+#[path = "b5_fix2_tests.rs"]
+mod b5_fix2_tests;
 #[path = "closeout_tests.rs"]
 mod closeout_tests;
 use remanence_parity::authority::StructuralAuthority;
@@ -6756,6 +6758,24 @@ fn read_harvest_world(
     String,
     Arc<Mutex<VirtualWorld>>,
 ) {
+    read_harvest_world_with_lifecycle(temp, tape_uuid, voltag, None)
+}
+
+/// The same read fixture with the daemon's parking and idle-timer channel.
+#[allow(clippy::type_complexity)]
+fn read_harvest_world_with_lifecycle(
+    temp: &tempfile::TempDir,
+    tape_uuid: [u8; 16],
+    voltag: &str,
+    lifecycle: Option<crate::drive_pool::DrivePoolLifecycle>,
+) -> (
+    std::path::PathBuf,
+    remanence_state::CalibrationControlStore,
+    mpsc::Sender<DriveCommand>,
+    String,
+    String,
+    Arc<Mutex<VirtualWorld>>,
+) {
     let index_path = temp.path().join("rem-state.sqlite");
     let mut index = CatalogIndex::open(&index_path).expect("open catalog");
     index
@@ -6797,7 +6817,8 @@ fn read_harvest_world(
     let snapshot = library_snapshot_cell(library.library().clone());
     let audit_dir = temp.path().join("audit");
     std::fs::create_dir_all(&audit_dir).expect("create audit dir");
-    let cfg = test_write_owner_config(index_path.clone(), audit_dir, &library, snapshot);
+    let mut cfg = test_write_owner_config(index_path.clone(), audit_dir, &library, snapshot);
+    cfg.lifecycle = lifecycle;
     let calibration_store = cfg.calibration_store.clone();
     let serial = library.library().serial.clone();
     let policy = remanence_library::StaticAllowlist::new([serial.as_str()]);

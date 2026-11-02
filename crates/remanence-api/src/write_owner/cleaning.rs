@@ -397,6 +397,21 @@ pub(crate) fn run_cleaning_sequence(
             Some("{\"phase\":\"moving-back\"}"),
         )
         .map_err(status_from_state_error)?;
+    // Admission happens at physical UNLOAD dispatch. Retain it across both
+    // retries and MOVE so shutdown cannot strand the unthreaded cartridge.
+    let mut dismount = None;
+    let mut admit = || {
+        if dismount.is_none() {
+            dismount = cfg
+                .lifecycle
+                .as_ref()
+                .map(|l| l.begin_dismount(&cfg.endpoint(drive_bay)))
+                .transpose()
+                .map_err(|error| error.message().to_string())?;
+        }
+        Ok(())
+    };
+    library.set_changer_ready_wait(cfg.changer_ready_wait.clone().without_stop_signals());
     retry_cleaning_move(
         index,
         cfg,
@@ -404,18 +419,20 @@ pub(crate) fn run_cleaning_sequence(
         drive_uuid,
         "moving-back",
         || {
-            crate::mount_support::unload_library_bay(
+            crate::mount_support::unload_library_bay_with_admission(
                 library,
                 drive_bay,
                 Some(slot_address),
                 &cfg.policy,
                 None,
                 std::path::Path::new(crate::mount_support::DEVICE_LOCK_ROOT),
+                &mut admit,
             )
             .map_err(|err| format!("unload cleaning cartridge: {err}"))?;
             Ok(())
         },
     )?;
+    drop(dismount);
     let eject_observed = std::time::Instant::now();
     if eject_observed.duration_since(load_completed)
         < std::time::Duration::from_millis(min_cycle_millis)
