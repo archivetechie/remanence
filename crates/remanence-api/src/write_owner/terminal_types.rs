@@ -182,10 +182,6 @@ impl TerminalFinalizeSpec {
         pool_config: &TapePoolConfig,
         trigger: remanence_state::TerminalFinalizationTrigger,
     ) -> Self {
-        debug_assert_ne!(
-            trigger,
-            remanence_state::TerminalFinalizationTrigger::OperatorCloseOut
-        );
         Self {
             actor: AuditActor::System,
             tape_uuid: selected.tape_uuid,

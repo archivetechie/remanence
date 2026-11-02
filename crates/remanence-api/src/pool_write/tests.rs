@@ -805,6 +805,57 @@ async fn overlap_append_gate_counts_bootstrap_and_committed_trailing_filemark() 
 }
 
 #[test]
+/// Both append admission and the byte writer refuse an Object before bootstrap.
+fn batched_object_before_bootstrap_is_refused_without_media_commands() {
+    let (temp, mut state, mut selected) = fence_test_fixture();
+    selected.block_size = 4096;
+    let error = first_batched_append_context(&state, &selected, &[]).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("Object stage before bootstrap commit"));
+    let path = temp.path().join("input");
+    fs::write(&path, b"payload").unwrap();
+    let request = WriteObjectToPoolRequest {
+        pool_id: selected.pool_id.clone(),
+        source: WriteObjectSource::Path(path),
+        archive_path: "input".into(),
+        caller_object_id: "before-bootstrap".into(),
+        expected_content_sha256: None,
+        expected_object_id: None,
+        input_kind: WriteObjectInputKind::LogicalFile,
+        representation: PoolWriteRepresentation::Plaintext,
+    };
+    let prepared = prepare_pool_object(&request, selected.block_size).unwrap();
+    let stored = prepare_stored_object(&prepared, &request.representation).unwrap();
+    let mut sink = StagedTestSink::new(2);
+    let error = write_no_parity_object_to_selected_tape(
+        &mut state,
+        &test_fence_config(temp.path()),
+        &mut CountingBlockSink::new(&mut sink, selected.block_size),
+        &test_capacity_pool_config(&selected),
+        request,
+        selected,
+        PreparedPoolWrite { prepared, stored },
+        PoolWriteDurability::Batched(BatchedNoParityAppendContext {
+            append: NoParityAppendContext {
+                tape_file_number: 1,
+                previous_total_committed_ordinals: 0,
+                fresh_tape: true,
+                expected_append_lba: None,
+            },
+            position: BatchedAppendPosition::JournalEod(0),
+            object_row_count: 0,
+        }),
+    )
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("Object stage before bootstrap commit"));
+    assert!(sink.events.is_empty());
+    assert!(state.list_active_tape_io_fences().unwrap().is_empty());
+}
+
+#[test]
 fn batched_recovery_locates_to_journal_eod_and_overwrites_longer_physical_tail() {
     let mut sink = StagedTestSink::new(2);
     for seed in 0..7u8 {
@@ -1196,7 +1247,7 @@ fn no_parity_exact_close_capacity_rolls_before_whole_object_motion() {
             fresh_tape: true,
             expected_append_lba: None,
         },
-        position: BatchedAppendPosition::FreshTape,
+        position: BatchedAppendPosition::JournalEod(0),
         object_row_count: 0,
     };
     let error = ensure_no_parity_terminal_close_capacity(

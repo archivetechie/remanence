@@ -1208,6 +1208,8 @@ fn validate_plan(
     if prepared && plan.manual.is_none() {
         return Err(Fault::Invalid("automatic plan cannot be provisional"));
     }
+    // A matching durable seal reason authorizes automatic recovery, including
+    // OperatorCloseOut. New operator decisions still require manual identity.
     if let Some(m) = &plan.manual {
         if plan.trigger != TerminalFinalizationTrigger::OperatorCloseOut
             || m.operation_id == [0; 16]
@@ -1220,7 +1222,9 @@ fn validate_plan(
         {
             return Err(Fault::Invalid("manual acceptance identity"));
         }
-    } else if plan.trigger == TerminalFinalizationTrigger::OperatorCloseOut {
+    } else if plan.trigger == TerminalFinalizationTrigger::OperatorCloseOut
+        && s.seal_due != Some(plan.trigger)
+    {
         return Err(Fault::Invalid("manual identity absent"));
     }
     if let Some(reason) = s.seal_due {

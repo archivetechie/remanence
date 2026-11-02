@@ -1230,18 +1230,24 @@ fn prepare_report(
         scheme: report.scheme.clone(),
     })?;
     if core.summary().is_fresh() {
-        // Complete semantic fixtures/imports already represent barrier-proved media.
-        // The production stage path must have initialized the tape at session open.
-        let group = core.prepare()?;
-        let record = Record::Initialized(Initialized {
-            tape_uuid: report.tape_uuid,
-            incarnation: 1,
-            group: group.sequence(),
-            block_size: report.block_size,
-            scheme: report.scheme.clone(),
-            bot: plain(0, TapeFileKind::Bootstrap, 1, 0),
-        });
-        core.append(group.close(&record)?)?;
+        #[cfg(not(any(test, feature = "fixtures")))]
+        return Err(invalid("Object stage before bootstrap commit"));
+
+        #[cfg(any(test, feature = "fixtures"))]
+        {
+            // Complete semantic fixtures/imports already represent barrier-proved media.
+            // The production stage path must have initialized the tape at session open.
+            let group = core.prepare()?;
+            let record = Record::Initialized(Initialized {
+                tape_uuid: report.tape_uuid,
+                incarnation: 1,
+                group: group.sequence(),
+                block_size: report.block_size,
+                scheme: report.scheme.clone(),
+                bot: plain(0, TapeFileKind::Bootstrap, 1, 0),
+            });
+            core.append(group.close(&record)?)?;
+        }
     }
     let s = core.summary();
     if report.barrier.as_ref().is_some_and(|b| b.files.is_empty()) {

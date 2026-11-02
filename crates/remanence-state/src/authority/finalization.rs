@@ -457,17 +457,14 @@ impl AuthorityFinalization {
                     ));
                 }
             }
-            (TerminalFinalizationTrigger::OperatorCloseOut, None) => {
-                return Err(StateError::JournalReplayFailed(
-                    "operator close-out is missing durable operation identity".to_string(),
-                ));
-            }
             (_, Some(_)) => {
                 return Err(StateError::JournalReplayFailed(
                     "automatic terminal finalization unexpectedly carries manual identity"
                         .to_string(),
                 ));
             }
+            // Native validate_plan binds an automatic OperatorCloseOut to the
+            // tape's durable seal_due; this shape check has no tape summary.
             (_, None) => {}
         }
         Ok(())

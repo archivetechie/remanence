@@ -68,7 +68,7 @@ use remanence_library::{
 };
 use remanence_parity::{
     checked_bounded_resume_summary, emit_resume_rebuilt_sidecars_to_raw,
-    rebuild_open_epoch_from_bounded_summary, scan_reconstruct_filemark_map,
+    rebuild_open_epoch_from_bounded_summary_checked, scan_reconstruct_filemark_map,
     BoundedResumeWriterSeed, DriveHandleRawSink, DriveHandleRawSource, FileRowsKind,
     FileRowsReport, FileRowsState, FilemarkMap, JournalError, ObjectParitySource, OpenTrust,
     ParityError, ParityScheme, ParitySink, PhysicalPositionHint, RawReadOutcome, RawTapeSource,
@@ -830,12 +830,13 @@ fn quadstor_parity_bounded_resume_append_roundtrip() {
 
     let rebuild = {
         let mut raw_source = DriveHandleRawSource::new(&mut drive);
-        rebuild_open_epoch_from_bounded_summary(
+        rebuild_open_epoch_from_bounded_summary_checked(
             &mut raw_source,
             &summary,
             &scheme,
             TAPE_UUID,
             block_size,
+            None, // The checkpoint closed the epoch; there is no range to reread.
         )
         .expect("rebuild bounded open epoch")
     };

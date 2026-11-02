@@ -399,16 +399,9 @@ pub(crate) fn first_batched_append_context(
             })
         }
         None if tape.total_committed_ordinals == 0 && tape.last_committed_tape_file.is_none() => {
-            Ok(BatchedNoParityAppendContext {
-                append: NoParityAppendContext {
-                    tape_file_number: 1,
-                    previous_total_committed_ordinals: 0,
-                    fresh_tape: true,
-                    expected_append_lba: None,
-                },
-                position: BatchedAppendPosition::FreshTape,
-                object_row_count: 0,
-            })
+            Err(PoolWriteError::InvalidInput(
+                "Object stage before bootstrap commit".into(),
+            ))
         }
         None => Err(PoolWriteError::MissingTapeGeometry(
             "batched append requires a checkpoint journal for a non-fresh tape".to_string(),

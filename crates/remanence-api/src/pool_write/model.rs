@@ -1043,7 +1043,6 @@ impl NoParityAppendContext {
 /// Session-local positioning rule for one batched parity-off append.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum BatchedAppendPosition {
-    FreshTape,
     JournalEod(u64),
     CurrentBoundary(u64),
 }

@@ -11002,11 +11002,6 @@ fn validate_terminal_finalization_input(
     input: &TerminalFinalizationProjectionInput,
 ) -> Result<(), StateError> {
     match (input.trigger, input.operation_id) {
-        (TerminalFinalizationTrigger::OperatorCloseOut, None) => {
-            return Err(StateError::JournalReplayFailed(
-                "operator terminal finalization is missing operation identity".to_string(),
-            ));
-        }
         (TerminalFinalizationTrigger::OperatorCloseOut, Some(_)) => {}
         (_, Some(_)) => {
             return Err(StateError::JournalReplayFailed(
@@ -11014,6 +11009,8 @@ fn validate_terminal_finalization_input(
                     .to_string(),
             ));
         }
+        // Automatic recovery can preserve a durable OperatorCloseOut reason
+        // without accepting a new operator operation. Native authority gates it.
         (_, None) => {}
     }
     if matches!(input.outcome, TerminalFinalizationOutcome::Finalized)

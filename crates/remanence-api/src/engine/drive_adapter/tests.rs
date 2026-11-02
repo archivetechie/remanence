@@ -1038,6 +1038,24 @@ fn device_lock_excludes_another_state_directory_until_owner_finish() {
 /// A successful media-path seal still refuses Objects, but is not a lost write.
 #[test]
 fn automatic_terminal_media_completion_closes_audit_without_a_false_fence() {
+    use remanence_state::TerminalFinalizationTrigger as Trigger;
+    for trigger in [
+        Trigger::ReachedLowWatermark,
+        Trigger::HardwareEarlyWarning,
+        Trigger::OperatorCloseOut,
+        Trigger::PoolCloseOut,
+        Trigger::NoPendingObjectFits,
+    ] {
+        check_automatic_terminal_media_completion(trigger);
+    }
+}
+
+/// Exercise recovery through the actor with a durable typed seal obligation.
+fn check_automatic_terminal_media_completion(
+    trigger: remanence_state::TerminalFinalizationTrigger,
+) {
+    use remanence_state::authority::{TapeAuthorityView, TapeAuthorityWriter};
+
     let (mut fixture, state) = Fixture::new(false);
     drop(state);
     fixture.config.tape_pools[0].capacity_cap_bytes = Some(3 * 1024 * 1024 * 1024);
@@ -1047,20 +1065,24 @@ fn automatic_terminal_media_completion_closes_audit_without_a_false_fence() {
     owner.open_session("default").unwrap();
     let receipt = owner.append(fixture.request("seal-due")).unwrap();
     owner.close_session().unwrap();
-    // Project the durable seal obligation at the recovery cut. The complete
-    // object checkpoint remains the authority for the terminal suffix.
-    let journal = remanence_state::authority::fixtures::AuthorityBuilder::new(
+    // Persist the typed seal obligation at the recovery cut before projecting
+    // its display cache. Recovery takes the reason from native authority.
+    let mut index = fixture.index();
+    let journal = remanence_state::TapeAuthority::open(
         fixture.config.journal.dir.join("tapes"),
         UUID,
+        index.path(),
     )
-    .build()
     .unwrap();
-    let mut checkpoint = journal.last().unwrap().unwrap();
-    checkpoint.seal_due = Some(remanence_state::TerminalFinalizationTrigger::ReachedLowWatermark);
-    fixture
-        .index()
-        .project_checkpoint_record(&checkpoint)
-        .unwrap();
+    let mut writer = journal.acquire_exclusive().unwrap();
+    let mut checkpoint = writer.latest_commit().unwrap().unwrap();
+    checkpoint.ordinal += 1;
+    checkpoint.operation_id = [0x43; 16];
+    checkpoint.seal_due = Some(trigger);
+    writer.publish_report(&checkpoint).unwrap();
+    index.project_tape_log(&writer.freeze().unwrap()).unwrap();
+    drop(writer);
+    drop(index);
     assert!(fixture
         .index()
         .get_tape(&UUID)
@@ -1085,12 +1107,16 @@ fn automatic_terminal_media_completion_closes_audit_without_a_false_fence() {
     // A subsequent mailbox command waits for the open's audit settlement.
     owner.finish().unwrap();
     let index = fixture.index();
-    assert!(index
-        .get_tape(&UUID)
-        .unwrap()
-        .unwrap()
-        .terminal_finalization
-        .is_some());
+    assert_eq!(
+        index
+            .get_tape(&UUID)
+            .unwrap()
+            .unwrap()
+            .terminal_finalization
+            .unwrap()
+            .trigger,
+        trigger
+    );
     let endpoint = remanence_library::DriveKey::Standalone {
         drive_serial: SERIAL.into(),
     };

@@ -31,8 +31,8 @@ use super::prepare::{
     log_transfer_diagnostics, no_parity_encrypted_write_report, no_parity_write_report,
     open_prepared_readers, position_no_parity_append_at_checkpoint,
     prove_no_parity_append_boundary, validate_input_kind_guards, write_canonical_plaintext_blocks,
-    write_fixed_blocks, write_no_parity_bootstrap, write_object_delimiter, CopyRepresentation,
-    PreparedPoolObject, PreparedPoolWrite, PreparedStoredObject, TransferDiagnosticOutcome,
+    write_fixed_blocks, write_object_delimiter, CopyRepresentation, PreparedPoolObject,
+    PreparedPoolWrite, PreparedStoredObject, TransferDiagnosticOutcome,
 };
 use super::staging::{
     run_faulted_counted_fenced_staged_transfer, CountingBlockSink, ObjectDigestBlockSink,
@@ -42,7 +42,9 @@ use crate::bytes_to_hex;
 #[cfg(test)]
 use super::capacity::{no_parity_append_context, seal_selected_tape_if_needed};
 #[cfg(test)]
-use super::prepare::{log_commit_diagnostics, position_no_parity_append};
+use super::prepare::{
+    log_commit_diagnostics, position_no_parity_append, write_no_parity_bootstrap,
+};
 #[cfg(test)]
 use remanence_parity::ParityScheme;
 #[cfg(test)]
@@ -61,6 +63,11 @@ pub(super) fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
 ) -> Result<PoolWriteResult, PoolWriteError> {
     let PreparedPoolWrite { prepared, stored } = prepared_write;
     let tape_uuid = selected.tape_uuid;
+    if matches!(&durability, PoolWriteDurability::Batched(context) if context.append.fresh_tape) {
+        return Err(PoolWriteError::InvalidInput(
+            "Object stage before bootstrap commit".into(),
+        ));
+    }
     let append = match &durability {
         #[cfg(test)]
         PoolWriteDurability::PerObject => no_parity_append_context(state, &selected)?,
@@ -101,15 +108,6 @@ pub(super) fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
                                 &remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION")),
                             )?
                         }
-                        PoolWriteDurability::Batched(BatchedNoParityAppendContext {
-                            position: BatchedAppendPosition::FreshTape,
-                            ..
-                        }) => write_no_parity_bootstrap(
-                            gated,
-                            tape_uuid,
-                            selected.block_size,
-                            &remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION")),
-                        )?,
                         #[cfg(test)]
                         PoolWriteDurability::PerObject => {
                             position_no_parity_append(gated)?;
