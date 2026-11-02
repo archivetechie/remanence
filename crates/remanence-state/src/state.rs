@@ -992,16 +992,16 @@ impl StateHandle {
                 .and_then(|label| derive_tape_pool_from_voltag(label, &self.config.tape_pool_rules))
                 .ok_or_else(|| {
                     StateError::TapeProvisionConflict(format!(
-                        "bootstrap barcode {:?} does not match any locked tape_pool_rule",
-                        input.voltag
+                        "bootstrap barcode {} does not match any locked tape_pool_rule",
+                        input.voltag.as_deref().unwrap_or("unlabelled")
                     ))
                 })?
                 .to_string()
         };
         if !self.config.tape_pools.iter().any(|pool| pool.id == pool_id) {
             return Err(StateError::TapeProvisionConflict(format!(
-                "bootstrap barcode {:?} derives unconfigured pool {pool_id:?}",
-                input.voltag
+                "bootstrap barcode {} derives unconfigured pool {pool_id}",
+                input.voltag.as_deref().unwrap_or("unlabelled")
             )));
         }
         let geometry = match &input.parity {
@@ -1024,6 +1024,7 @@ impl StateHandle {
         let records = FileAuditLog::replay(&self.paths.audit_dir)?;
         self.index.replay_audit_records(&records)?;
         let tape_subject = hex_tape_uuid(input.tape_uuid);
+        let tape_display = uuid::Uuid::from_bytes(input.tape_uuid);
         let mut matching_operation_authority = false;
         let mut tape_adoption_authority = false;
         let mut tape_adoption_generation = None;
@@ -1052,7 +1053,7 @@ impl StateHandle {
                     .is_some_and(|prior| prior != recorded_generation)
                 {
                     return Err(StateError::IndexCorrupt(format!(
-                        "tape {tape_subject} has conflicting adoption assignment generations"
+                        "tape {tape_display} has conflicting adoption assignment generations"
                     )));
                 }
             }
@@ -1061,8 +1062,8 @@ impl StateHandle {
             }
             if record.event != AuditEvent::TapeIdentityAdopted || !tape_match {
                 return Err(StateError::TapeProvisionConflict(format!(
-                    "operation {} is already bound to different {:?} authority",
-                    input.operation_id, record.event
+                    "operation {} is already bound to a different recorded action",
+                    input.operation_id
                 )));
             }
             let recorded_fingerprint = record
@@ -1095,12 +1096,12 @@ impl StateHandle {
         if matching_operation_authority || tape_adoption_authority {
             let outcome = preview.ok_or_else(|| {
                 StateError::IndexCorrupt(format!(
-                    "adoption audit for tape {tape_subject} did not project its identity"
+                    "adoption audit for tape {tape_display} did not project its identity"
                 ))
             })?;
             if tape_adoption_generation != Some(outcome.assignment_generation) {
                 return Err(StateError::TapeProvisionConflict(format!(
-                    "Bootstrap identity {tape_subject} assignment generation evolved after adoption"
+                    "Bootstrap identity {tape_display} assignment generation evolved after adoption"
                 )));
             }
             return Ok(outcome);
@@ -4072,7 +4073,7 @@ pool_id = "camera.copy-a"
             .expect_err("one operation UUID cannot bind a different tape");
         assert!(different_tape_same_operation
             .to_string()
-            .contains("different TapeIdentityAdopted authority"));
+            .contains("already bound to a different recorded action"));
 
         let mut invalid = adoption_input(Uuid::new_v4());
         invalid.tape_uuid = [0; 16];
@@ -4191,16 +4192,45 @@ pool_id = "camera.copy-a"
         drop(conn);
 
         let mut handle = StateHandle::open_from_config_file(&config_path).expect("reopen state");
+        let expected_identity = format!(
+            "Bootstrap identity {} barcode {}",
+            Uuid::from_bytes(input.tape_uuid),
+            input.voltag.as_deref().unwrap()
+        );
         let error = handle
             .adopt_bootstrap_identity(
                 input,
                 adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
             )
             .expect_err("cleaning identity conflict must fail");
+        assert!(error.to_string().contains(&expected_identity), "{error}");
         assert!(
             error.to_string().contains("cleaning catalog row"),
             "{error}"
         );
+    }
+
+    /// Adoption refusals expose an optional barcode as ordinary operator text.
+    #[test]
+    fn bootstrap_adoption_rule_refusal_prints_plain_barcode() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).unwrap();
+        let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
+        let mut input = adoption_input(Uuid::new_v4());
+        input.voltag = Some("BARCODE".into());
+        let error = handle
+            .adopt_bootstrap_identity(
+                input,
+                adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("bootstrap barcode BARCODE does not match any locked tape_pool_rule"),
+            "{error}"
+        );
+        assert!(!error.contains("Some("), "{error}");
     }
 
     #[test]

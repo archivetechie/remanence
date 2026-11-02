@@ -10,7 +10,6 @@ authors:
     email: "specs@archivetech.org"
 version: 0.2.0
 doi: 10.5281/zenodo.21551570
-date-released: 2026-10-15
 license: Apache-2.0
 repository-code: "https://github.com/archivetechie/remanence"
 url: "https://archivetech.org"
