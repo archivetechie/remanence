@@ -1299,15 +1299,6 @@ pub(crate) async fn service_closeout_obligation(
     let prepared = tokio::task::spawn_blocking(move || -> Result<_, Status> {
         let state = &preparing;
         let pool = state.drive_pool()?.clone();
-        let _admission = state.operations.readiness_start.lock().unwrap();
-        if state
-            .readiness_shutdown
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return Err(Status::unavailable(
-                "daemon shutdown; maintenance admission closed",
-            ));
-        }
         let (_closing, tape_reservation) = pool.reserve_worker_tape(tape_uuid)?;
         let mut index = state.index_write()?;
         if index
@@ -1362,6 +1353,15 @@ pub(crate) async fn service_closeout_obligation(
             )? {
                 return Ok(None);
             }
+        }
+        let _admission = state.operations.readiness_start.lock().unwrap();
+        if state
+            .readiness_shutdown
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Status::unavailable(
+                "daemon shutdown; maintenance admission closed",
+            ));
         }
         let mut _finalization_operation = None;
         let terminal_handle = if finalize || intent.as_ref().is_some_and(|i| i.manual.is_some()) {
@@ -6220,7 +6220,10 @@ mod tests {
             .terminal_finalization(&STARTUP_TAPE)
             .unwrap();
         spawn_startup_terminal_recoveries(lowered_state.clone());
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        lowered_state
+            .closeout_work
+            .wait_for_fence_refusal(STARTUP_TAPE)
+            .await;
         assert_eq!(
             lowered_state
                 .index()
@@ -7237,7 +7240,7 @@ mod tests {
         )
         .unwrap();
         spawn_startup_terminal_recoveries(state.clone());
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        state.closeout_work.wait_for_fence_refusal(tape_uuid).await;
         assert!(
             drive_rx.try_recv().is_err(),
             "fenced manual intent never relaunches"

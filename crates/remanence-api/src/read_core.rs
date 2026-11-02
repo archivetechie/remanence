@@ -1246,7 +1246,6 @@ impl ReadStreamSender {
         let waker = std::task::Waker::from(Arc::new(SenderWake(std::thread::current())));
         let mut context = std::task::Context::from_waker(&waker);
         let mut permit = Box::pin(self.inner.tx.reserve());
-        let started = Instant::now();
         loop {
             if self
                 .inner
@@ -1255,7 +1254,6 @@ impl ReadStreamSender {
                 .unwrap()
                 .as_ref()
                 .is_some_and(|s| s.load(std::sync::atomic::Ordering::Acquire))
-                || started.elapsed() >= Duration::from_secs(30)
             {
                 return Err(mpsc::error::SendError(item));
             }

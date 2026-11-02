@@ -338,8 +338,8 @@ pub(super) fn drive_loop(
     }
     let mut snapshot_misses = 0u32;
     while let Some(cmd) = rx.blocking_recv() {
-        // The existing ownership waiter covers every actor command through settlement.
-        let _active = cfg
+        // Maintenance stays owned through settlement; opens hand off to session ownership.
+        let active = cfg
             .lifecycle
             .as_ref()
             .map(|l| l.actor_work.begin([0; 16], cfg.endpoint(bay)).0);
@@ -405,6 +405,7 @@ pub(super) fn drive_loop(
                     &mut rx,
                     drive,
                     &mut snapshot_misses,
+                    active,
                     OpenWriteActorRequest {
                         actor: mounted.actor.clone(),
                         pool_cfg,
@@ -508,6 +509,7 @@ pub(super) fn drive_loop(
                     &mut rx,
                     drive,
                     &mut snapshot_misses,
+                    active,
                     OpenWriteActorRequest {
                         actor,
                         pool_cfg,
@@ -541,6 +543,7 @@ pub(super) fn drive_loop(
                 &mut rx,
                 drive,
                 &mut snapshot_misses,
+                active,
                 OpenReadActorRequest {
                     tape_uuid,
                     needs_drive_load,

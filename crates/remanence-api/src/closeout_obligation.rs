@@ -203,6 +203,32 @@ impl WorkList {
     pub(crate) fn parked_for_test(&self) -> bool {
         self.entries.lock().unwrap().values().all(|r| r.parked)
     }
+    /// Wait for the startup worker to relinquish a fenced tape before a test competes.
+    #[cfg(test)]
+    pub(crate) async fn wait_for_fence_refusal(&self, tape: [u8; 16]) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if self
+                    .reason(tape)
+                    .is_some_and(|r| r.contains("active tape-I/O fence"))
+                    && !self.running_for_test(tape)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("startup worker records the fence refusal and releases its attempt");
+    }
+    #[cfg(test)]
+    fn running_for_test(&self, tape: [u8; 16]) -> bool {
+        self.entries
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|((t, _), r)| *t == tape && r.running)
+    }
     /// Explicit operator motion wakes only work in that library.
     pub(crate) fn wake_library(&self, library: &str) {
         let tapes: Vec<_> = self

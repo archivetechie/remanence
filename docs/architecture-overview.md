@@ -457,8 +457,10 @@ ending names the dispatched tail, distinguishing accepted blocks and immediate
 filemarks from the prefix synchronized by a completed non-immediate filemark or
 barrier. Failed barriers do not promote accepted data. Recovery accepts proved
 EOD anywhere from that synchronized prefix through the possible accepted tail,
-records the exact EOD as a refinement of the same `SessionEnded` before reuse,
-and fences EOD below either the synchronized prefix or committed cursor.
+records the exact EOD as a refinement of the same `SessionEnded` before reuse
+when the possible tail extends beyond the synchronized prefix, and fences EOD
+below either the synchronized prefix or committed cursor. An already exact
+ending needs no refinement record.
 This permits automatic recovery after buffered-tail loss; a crash tail
 containing a complete Object requires `rem tape supersede-tail` acknowledgement.
 A crash-only torn header prefix is named by its byte digest and must be proved

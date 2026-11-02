@@ -12235,7 +12235,7 @@ pub(crate) async fn check_context_failure_receipts(
         let mut index = CatalogIndex::open(&cfg.index_path).unwrap();
         FAIL_APPEND_CONTEXT_AFTER.with(|count| count.set(2));
         handle_drive_open_write(
-            0x100, &mut index, &cfg, actor_tx, &mut rx, &mut drive, &mut 0, request,
+            0x100, &mut index, &cfg, actor_tx, &mut rx, &mut drive, &mut 0, None, request,
         );
         assert_eq!(
             FAIL_APPEND_CONTEXT_AFTER.with(|count| count.get()),

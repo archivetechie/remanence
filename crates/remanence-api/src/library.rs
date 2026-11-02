@@ -500,7 +500,7 @@ impl LibraryServiceApi {
         for key in pool.drive_keys() {
             if matches!(&key, crate::drive_pool::DriveKey::Bay { library_serial: serial, .. } if serial == &library_serial)
             {
-                pool.wait_drive_closeout(&key).await;
+                pool.wait_busy_closeout(&library_serial, key.bay()).await;
             }
         }
         pool.reserve_library_exclusive(&library_serial)?;
