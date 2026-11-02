@@ -100,15 +100,23 @@ The format specifications and their companion documents are in
 
 ## For contributors
 
+These pages are for people who change Remanence itself: its code, its
+specifications or its test vectors.
+
 - [API module organization](api-module-organization.md): where each behaviour
   of the `remanence-api` crate lives in the source.
-- [Development tools](development-tools.md): the `rem-dev` vector generator and
-  scratch-tape drills.
+- [Development tools](development-tools.md): building `rem-dev`, and its
+  review-vector generator, two scratch-tape drills and dump writer.
 - [Checking specification preservation](guide-specification-preservation.md):
-  the mechanical check that no text is lost when a specification is
-  reorganized.
-- [POSIX pax and ustar reference](reference/posix/README.md): the local copy of
-  the POSIX archive format that an object carries.
+  the check that every piece of a specification's text survives an edit or is
+  accounted for, with a worked example.
+- [Running the proof inventory](formal-verification-status.md#running-the-inventory-gate):
+  what `make proof-inventory` checks and what it needs installed. The rest of
+  [Formal verification status](formal-verification-status.md) says what each
+  proof covers.
+- [POSIX pax and ustar](reference/posix/README.md): the tar format that the
+  plaintext body of an object follows, and the editions of the standard to
+  read.
 
 ## Records
 
