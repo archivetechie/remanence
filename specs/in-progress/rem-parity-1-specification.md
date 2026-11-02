@@ -3209,6 +3209,16 @@ a torn tail, one after a closed epoch and one with an epoch still open.
 each torn tail and of the whole stream. The image bytes are regenerated from
 the inputs, not stored.
 
+**Interim notice.** The Objects in these tape images are written by a
+REM-OBJECT Builder. REM-OBJECT 1.0.0-draft.4, in preparation, changes the
+ustar header bytes of every object (REM-OBJECT §13.7). The tape-file, block
+CRC, parity, replica and stream values that `tape-images/MANIFEST.tsv` pins,
+and the values the damage-matrix, resume and negative candidates and the
+second implementation's inputs derive from them, therefore record the earlier
+Object bytes and are stale under that preparing copy. REM-OBJECT's open item
+RO-3 regenerates them, and the evidence for freeze criterion 2 is gathered
+again then. No requirement of this document changes.
+
 The damage matrix, `tape-images/cases/`, holds 72 cases, and 70 of them are
 pinned; `parity-map-and-sidecar` and `e1-07` are not. Each case gives the
 outcome it expects under this document: the inventory a Scanner reports, the
