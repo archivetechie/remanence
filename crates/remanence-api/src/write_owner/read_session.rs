@@ -502,12 +502,12 @@ pub(super) fn session_open_reject_tape_io_fences(
     let Some(first) = conflicts.first() else {
         return Ok(());
     };
-    Err(Status::failed_precondition(format!(
+    Err(crate::closeout_obligation::RetryCause::Operator.attach(Status::failed_precondition(format!(
         "{action} blocked by active tape-I/O fence {} tape_uuid={} barcode={} reason={}; release via `rem tape quarantine release {}` before retrying",
         first.quarantine_id,
         Uuid::from_bytes(*tape_uuid),
         barcode.unwrap_or("(unknown)"),
         first.reason,
         first.quarantine_id
-    )))
+    ))))
 }

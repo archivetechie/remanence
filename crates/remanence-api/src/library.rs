@@ -495,6 +495,18 @@ impl LibraryServiceApi {
         }
         match changer.try_reserve_owned() {
             Ok(permit) => {
+                let mut completion = self.state.operations.watch(&operation_id)?;
+                let work = self.state.closeout_work.clone();
+                let wake_library = library_serial.clone();
+                tokio::spawn(async move {
+                    use tokio_stream::StreamExt;
+                    while let Some(Ok(status)) = completion.next().await {
+                        if status.state == pb::OperationState::Succeeded as i32 {
+                            work.wake_library(&wake_library);
+                            break;
+                        }
+                    }
+                });
                 tokio::spawn(async move {
                     handle.publish_state(
                         pb::OperationState::Running,
@@ -616,7 +628,7 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         .map_err(|error| Status::internal(error.to_string()))??;
         if let Some(pool) = &self.state.drive_pool {
             pool.readiness_wake.notify.notify_one();
-            self.state.closeout_work.wake.notify_one();
+            self.state.closeout_work.wake_all();
         }
         Ok(Response::new(
             crate::daemon_catalog_services::tape_io_fence_to_proto(record),

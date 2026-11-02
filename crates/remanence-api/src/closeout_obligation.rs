@@ -33,6 +33,8 @@ struct Retry {
     library: String,
     parked: bool,
     reason: Option<String>,
+    woken: bool,
+    readiness: Option<Uuid>,
 }
 struct Attempt {
     work: std::sync::Arc<WorkList>,
@@ -92,6 +94,8 @@ impl WorkList {
                 library: "unlocated".into(),
                 parked: false,
                 reason: None,
+                woken: false,
+                readiness: None,
             });
         } else if entries.get(&key).is_some_and(|r| !r.running) {
             entries.remove(&key);
@@ -100,7 +104,8 @@ impl WorkList {
     fn claim(&self, now: Instant, wake: bool) -> Vec<Key> {
         let mut entries = self.entries.lock().unwrap();
         if wake {
-            for retry in entries.values_mut().filter(|r| !r.running) {
+            for retry in entries.values_mut() {
+                retry.woken |= retry.running;
                 retry.parked = false;
                 retry.next = now;
             }
@@ -118,6 +123,7 @@ impl WorkList {
                     && busy.insert(r.library.clone())
                 {
                     r.running = true;
+                    r.woken = false;
                     Some(*key)
                 } else {
                     None
@@ -139,8 +145,74 @@ impl WorkList {
                 tracing::warn!(tape_uuid = %Uuid::from_bytes(key.0), %error, "closeout needs operator; waiting for wake");
             }
             r.parked = !transient;
+            r.readiness = crate::readiness_wait::ReadinessFence::from_status(error).map(|f| f.0);
             r.reason = Some(reason);
         }
+    }
+    /// Record the wake synchronously, including during an in-flight attempt.
+    /// Notify is only a scheduling hint; coalescing it cannot lose eligibility.
+    pub(crate) fn wake_tape(&self, uuid: [u8; 16]) {
+        for ((tape, _), retry) in self.entries.lock().unwrap().iter_mut() {
+            if *tape == uuid {
+                retry.woken |= retry.running;
+                retry.parked = false;
+                retry.next = Instant::now();
+                retry.readiness = None;
+            }
+        }
+        self.wake.notify_one();
+    }
+    pub(crate) fn wake_all(&self) {
+        let tapes: Vec<_> = self.entries.lock().unwrap().keys().map(|k| k.0).collect();
+        for tape in tapes {
+            self.wake_tape(tape);
+        }
+    }
+    /// Explicit operator robotics/refresh wakes only work in that library.
+    pub(crate) fn wake_library(&self, library: &str) {
+        let tapes: Vec<_> = self
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, r)| r.library == library)
+            .map(|(k, _)| k.0)
+            .collect();
+        for tape in tapes {
+            self.wake_tape(tape);
+        }
+    }
+    fn succeeded(&self, key: Key) {
+        if let Some(retry) = self.entries.lock().unwrap().get_mut(&key) {
+            retry.reason = None;
+            retry.parked = false;
+            retry.readiness = None;
+        }
+    }
+    /// A ready/released fence wakes exactly its refused tape, even when the
+    /// clearance preceded the failing attempt's publication of its reason.
+    fn wake_ready(&self, state: &ApiState) -> Result<(), Status> {
+        let waiting: Vec<_> = self
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(key, r)| r.readiness.map(|id| (key.0, id)))
+            .collect();
+        if waiting.is_empty() {
+            return Ok(());
+        }
+        let index = state.index()?;
+        for (tape, id) in waiting {
+            if index
+                .media_readiness_operation(id)
+                .map_err(crate::status_from_state_error)?
+                .is_some_and(|r| matches!(r.state.as_str(), "ready" | "released"))
+            {
+                self.wake_tape(tape);
+            }
+        }
+        Ok(())
     }
     fn reason(&self, uuid: [u8; 16]) -> Option<String> {
         self.entries
@@ -154,37 +226,82 @@ impl WorkList {
     fn finish(&self, key: Key) {
         if let Some(r) = self.entries.lock().unwrap().get_mut(&key) {
             r.running = false;
-            r.next = Instant::now() + backoff(r.attempt);
+            r.next = if r.woken {
+                r.parked = false;
+                Instant::now()
+            } else {
+                Instant::now() + backoff(r.attempt)
+            };
             r.attempt = r.attempt.saturating_add(1);
         }
     }
 }
 
-/// Media/identity refusals require an explicit wake even if a lower layer
-/// wrapped the cause in Unavailable. Busy and memory remain transient.
+/// Preserve retry semantics when typed lower-layer causes become actor Status.
+/// Metadata survives holder diagnostics and RPC forwarding; text is fallback only.
+#[derive(Clone, Copy)]
+pub(crate) enum RetryCause {
+    Transient,
+    Operator,
+}
+impl RetryCause {
+    pub(crate) fn tape_io(error: &remanence_library::TapeIoError) -> Self {
+        use remanence_library::TapeIoError;
+        match error {
+            TapeIoError::WriteProtected
+            | TapeIoError::DataProtect(_)
+            | TapeIoError::IdentityInvalidated { .. }
+            | TapeIoError::MultiPartitionMedium { .. } => Self::Operator,
+            _ => Self::Transient,
+        }
+    }
+    pub(crate) fn identity(error: &crate::TapeIdentityError) -> Self {
+        match error {
+            crate::TapeIdentityError::Io(error) => Self::tape_io(error),
+            _ => Self::Operator,
+        }
+    }
+    pub(crate) fn attach(self, mut status: Status) -> Status {
+        status.metadata_mut().insert(
+            "remanence-retry",
+            match self {
+                Self::Transient => "transient",
+                Self::Operator => "operator",
+            }
+            .parse()
+            .unwrap(),
+        );
+        status
+    }
+}
 fn transient(error: &Status) -> bool {
-    let message = error.message().to_ascii_lowercase();
-    if [
+    if crate::readiness_wait::ReadinessFence::from_status(error).is_some()
+        || crate::drive_pool::TapeBusy::from_status(error).is_some()
+    {
+        return true;
+    }
+    if let Some(cause) = error.metadata().get("remanence-retry") {
+        return cause != "operator";
+    }
+    // Holder labels describe other work, never the cause of this refusal.
+    let message = error
+        .message()
+        .split("; held by:")
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if message.contains("media-readiness fence") {
+        return true;
+    }
+    ![
         "write-protect",
         "write protect",
-        "fence",
+        "tape-i/o fence",
+        "fenced",
         "wrong medium",
-        "identity",
+        "identity mismatch",
+        "identity invalidated",
         "supersede-tail",
-    ]
-    .iter()
-    .any(|s| message.contains(s))
-    {
-        return false;
-    }
-    matches!(
-        error.code(),
-        tonic::Code::Unavailable | tonic::Code::ResourceExhausted
-    ) || [
-        "tape is already mounted",
-        "busy",
-        "reserved",
-        "no free drive",
     ]
     .iter()
     .any(|s| message.contains(s))
@@ -302,7 +419,12 @@ impl ApiState {
             .list_tapes(None, remanence_state::TapeKindFilter::Data)
             .map_err(crate::status_from_state_error)?;
         let mut all = HashMap::new();
+        let mut retired = HashSet::new();
         for tape in tapes {
+            if tape.state == "retired" {
+                retired.insert(tape.tape_uuid);
+                continue;
+            }
             let tape = self.tape_with_debt_or_error(crate::catalog_conversion::tape_to_proto(tape));
             all.insert(tape.tape_uuid.clone(), tape);
         }
@@ -312,7 +434,12 @@ impl ApiState {
                     closeout_authority_error: Some("loaded tape authority is unavailable".into()),
                     ..Default::default()
                 };
-                let tape = all.get(uuid).unwrap_or(&missing);
+                let retired_tape = pb::Tape::default();
+                let tape = if retired.contains(uuid) {
+                    &retired_tape
+                } else {
+                    all.get(uuid).unwrap_or(&missing)
+                };
                 drive.open_epoch_start = tape.open_epoch_start;
                 drive.open_epoch_end = tape.open_epoch_end;
                 drive.unprotected_bytes = tape.unprotected_bytes;
@@ -495,6 +622,33 @@ fn alarm(state: &ApiState, key: Key, s: &TapeSummary) -> Result<(), Status> {
 
 /// Start after admission and ownership. Concurrent tape attempts retain the
 /// existing per-tape/drive reservations; no fair scheduler or placement map.
+fn inventory_membership(state: &ApiState) -> HashSet<(String, String)> {
+    state
+        .current_library_snapshot()
+        .map(|snapshot| {
+            snapshot
+                .report
+                .libraries
+                .iter()
+                .flat_map(|library| {
+                    library
+                        .drive_bays
+                        .iter()
+                        .filter_map(|bay| bay.loaded_tape.clone())
+                        .chain(
+                            library
+                                .slots
+                                .iter()
+                                .filter_map(|slot| slot.cartridge.clone()),
+                        )
+                        .map(|barcode| (library.serial.clone(), barcode))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub(crate) fn spawn(state: ApiState) {
     if state.closeout_work.started.swap(true, Ordering::SeqCst) {
         state.closeout_work.wake.notify_one();
@@ -502,42 +656,38 @@ pub(crate) fn spawn(state: ApiState) {
     }
     tokio::spawn(async move {
         let mut wake = true;
-        let mut inventory_at = None;
+        let mut inventory_at: Option<HashSet<(String, String)>> = None;
         let mut next_scan = Instant::now();
         loop {
             if state.readiness_shutdown.load(Ordering::SeqCst) {
                 break;
             }
-            let current_inventory = state.current_library_snapshot().map(|s| {
-                s.report
-                    .libraries
-                    .iter()
-                    .map(|l| {
-                        (
-                            l.serial.clone(),
-                            l.drive_bays
-                                .iter()
-                                .map(|b| {
-                                    (
-                                        b.element_address,
-                                        b.loaded,
-                                        b.loaded_tape.clone(),
-                                        b.source_slot,
-                                    )
-                                })
-                                .collect::<Vec<_>>(),
-                            l.slots
-                                .iter()
-                                .map(|slot| {
-                                    (slot.element_address, slot.full, slot.cartridge.clone())
-                                })
-                                .collect::<Vec<_>>(),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            });
-            wake |= inventory_at != current_inventory;
-            inventory_at = current_inventory;
+            let current_inventory = inventory_membership(&state);
+            if let Some(previous) = &inventory_at {
+                if previous != &current_inventory {
+                    if let Ok(index) = state.index() {
+                        if let Ok(tapes) =
+                            index.list_tapes(None, remanence_state::TapeKindFilter::Data)
+                        {
+                            for tape in tapes {
+                                if tape.voltag.as_ref().is_some_and(|barcode| {
+                                    previous
+                                        .symmetric_difference(&current_inventory)
+                                        .any(|(_, b)| b == barcode)
+                                }) {
+                                    if let Ok(uuid) = tape.tape_uuid.try_into() {
+                                        state.closeout_work.wake_tape(uuid);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            inventory_at = Some(current_inventory);
+            if let Err(error) = state.closeout_work.wake_ready(&state) {
+                tracing::debug!(%error, "closeout readiness wake check failed; retrying");
+            }
             // Full native replay is for discovery, not the retry clock. Keep
             // large cold logs off the one-second dispatch polling path.
             if wake || Instant::now() >= next_scan {
@@ -546,7 +696,7 @@ pub(crate) fn spawn(state: ApiState) {
                 }
                 next_scan = Instant::now() + Duration::from_secs(60);
             }
-            for key in state.closeout_work.claim(Instant::now(), wake) {
+            for key in state.closeout_work.claim(Instant::now(), false) {
                 let state = state.clone();
                 let attempt = Attempt {
                     work: state.closeout_work.clone(),
@@ -559,6 +709,8 @@ pub(crate) fn spawn(state: ApiState) {
                     {
                         state.closeout_work.failed(key, &error);
                         tracing::debug!(tape_uuid = %Uuid::from_bytes(key.0), %error, "closeout obligation remains queued");
+                    } else {
+                        state.closeout_work.succeeded(key);
                     }
                     drop(attempt);
                     if state
@@ -612,7 +764,7 @@ mod tests {
         work.observe(key, true);
         assert_eq!(work.claim(Instant::now(), false), vec![key]);
         assert!(
-            work.claim(Instant::now(), true).is_empty(),
+            work.claim(Instant::now(), false).is_empty(),
             "running tape is not dispatched twice"
         );
         for seconds in [1, 5, 30, 60, 60] {
@@ -719,7 +871,7 @@ mod fix_tests {
             .library = "other-library".into();
         let claimed = work.claim(Instant::now(), true);
         assert_eq!(claimed.len(), 2);
-        assert!(work.claim(Instant::now(), true).is_empty());
+        assert!(work.claim(Instant::now(), false).is_empty());
         let key = *claimed.iter().find(|key| **key != keys[2]).unwrap();
         work.failed(key, &Status::unavailable("write-protected cartridge"));
         work.finish(key);
@@ -748,5 +900,171 @@ mod fix_tests {
         ] {
             assert!(!transient(&error));
         }
+    }
+    /// Each typed class beats misleading diagnostics; unknown failures retry.
+    #[test]
+    fn b7_fix2_retry_causes_and_unknown_backoff() {
+        use crate::write_owner::status_from_pool_write_error;
+        use remanence_library::TapeIoError;
+        for error in [
+            crate::PoolWriteError::TapeIo(TapeIoError::WriteProtected),
+            crate::PoolWriteError::TapeIdentity(crate::TapeIdentityError::Mismatch {
+                expected: "a".into(),
+                actual: "b".into(),
+            }),
+            crate::PoolWriteError::TapeIo(TapeIoError::MultiPartitionMedium {
+                count: 2,
+                device: "model".into(),
+            }),
+        ] {
+            let mut status = status_from_pool_write_error(error);
+            // Retain only typed metadata, with text that cannot classify it.
+            status = Status::with_details_and_metadata(
+                status.code(),
+                "opaque refusal",
+                status.details().to_vec().into(),
+                status.metadata().clone(),
+            );
+            assert!(!transient(&status));
+        }
+        let fence = crate::status_from_state_error(remanence_state::StateError::from(
+            remanence_state::tape_log::store::StoreError::Fenced,
+        ));
+        assert!(!transient(&fence));
+        assert!(transient(
+            &crate::readiness_wait::ReadinessFence(Uuid::new_v4())
+                .status("identity mismatch; fence")
+        ));
+        let transport = crate::PoolWriteError::TapeIo(TapeIoError::OperationFailed(
+            "identity mismatch in transport diagnostic".into(),
+        ));
+        assert!(transient(&status_from_pool_write_error(transport)));
+        assert!(transient(&Status::unavailable(
+            "no free drive; held by: identity mismatch fenced"
+        )));
+        for message in [
+            "write-protected",
+            "wrong medium",
+            "identity mismatch",
+            "tape-I/O fence",
+        ] {
+            assert!(!transient(&Status::failed_precondition(message)));
+        }
+        let work = WorkList::default();
+        let key = ([0xf1; 16], 1);
+        work.observe(key, true);
+        for (attempt, seconds) in [1, 5, 30, 60, 60].into_iter().enumerate() {
+            let now = Instant::now() + Duration::from_secs(1000 * attempt as u64);
+            assert_eq!(work.claim(now, false), vec![key]);
+            work.failed(key, &Status::internal("unrecognised temporary failure"));
+            work.finish(key);
+            let entries = work.entries.lock().unwrap();
+            let retry = &entries[&key];
+            assert!(!retry.parked);
+            let remaining = retry.next.duration_since(Instant::now()).as_secs_f64();
+            assert!(remaining <= seconds as f64 && remaining > seconds as f64 - 0.5);
+        }
+    }
+
+    #[test]
+    fn b7_fix2_wake_during_attempt_retries_once_and_success_clears_reason() {
+        for before_failure in [true, false] {
+            let work = WorkList::default();
+            let key = ([0xf2; 16], 1);
+            work.observe(key, true);
+            assert_eq!(work.claim(Instant::now(), false), vec![key]);
+            if before_failure {
+                work.wake_tape(key.0);
+            }
+            work.failed(key, &Status::failed_precondition("write-protected"));
+            if !before_failure {
+                work.wake_tape(key.0);
+            }
+            assert!(work.claim(Instant::now(), false).is_empty());
+            work.finish(key);
+            assert_eq!(work.claim(Instant::now(), false), vec![key]);
+            work.failed(key, &Status::failed_precondition("write-protected"));
+            work.finish(key);
+            assert!(work
+                .claim(Instant::now() + Duration::from_secs(3600), false)
+                .is_empty());
+            work.wake_tape(key.0);
+            assert_eq!(work.claim(Instant::now(), false), vec![key]);
+            work.succeeded(key);
+            work.finish(key);
+            assert!(work.reason(key.0).is_none());
+        }
+    }
+
+    #[test]
+    fn b7_fix2_readiness_clearance_wakes_only_affected_tape() {
+        let root = tempfile::tempdir().unwrap();
+        let mut index =
+            remanence_state::CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
+        let id = Uuid::new_v4();
+        index
+            .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+                operation_id: id,
+                run_id: None,
+                endpoint: remanence_state::DriveKey::new("model", 1),
+                changer_sg: None,
+                drive_sg: None,
+                drive_serial: None,
+                barcode: Some("TAPE".into()),
+                source_slot: None,
+                media_generation: Some(9),
+                phase: "poll".into(),
+                state: "becoming_ready".into(),
+                dirty_scope: Some("drive".into()),
+                deadline_at_utc: None,
+                evidence_path: None,
+            })
+            .unwrap();
+        let state = ApiState::new(index);
+        let key = ([0xf3; 16], 1);
+        let other = ([0xf4; 16], 1);
+        for key in [key, other] {
+            state.closeout_work.observe(key, true);
+            state
+                .closeout_work
+                .failed(key, &Status::failed_precondition("write-protected"));
+            state.closeout_work.finish(key);
+        }
+        state.closeout_work.wake_tape(key.0);
+        assert_eq!(state.closeout_work.claim(Instant::now(), false), vec![key]);
+        // Clearance can precede publication of the refusal: polling the typed
+        // operation after failure must still remember it.
+        state
+            .index_write()
+            .unwrap()
+            .record_media_readiness_transition(remanence_state::MediaReadinessTransitionInput {
+                operation_id: id,
+                phase: None,
+                state: "ready".into(),
+                dirty_scope: Some("none".into()),
+                last_cdb_opcode: None,
+                last_sense_raw: None,
+                last_sense_key: None,
+                last_asc: None,
+                last_ascq: None,
+                last_host_status: None,
+                last_driver_status: None,
+                target_status: None,
+                transport_class: None,
+                cancel_source: None,
+                signal: None,
+                evidence_path: None,
+                last_error_json: None,
+                quarantine_id: None,
+            })
+            .unwrap();
+        state.closeout_work.failed(
+            key,
+            &crate::readiness_wait::ReadinessFence(id).status("opaque"),
+        );
+        state.closeout_work.wake_ready(&state).unwrap();
+        state.closeout_work.finish(key);
+        assert_eq!(state.closeout_work.claim(Instant::now(), false), vec![key]);
+        assert!(state.closeout_work.entries.lock().unwrap()[&other].parked);
     }
 }

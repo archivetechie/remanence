@@ -91,6 +91,7 @@ impl remanence_state::index::MediaReadinessObserver for ReadinessWake {
 #[derive(Clone, Default)]
 pub(crate) struct ClosingWork(Arc<Mutex<HashMap<(TapeUuid, Uuid), ClosingEntry>>>);
 struct ClosingEntry {
+    finalization: Option<Uuid>,
     drive: DriveKey,
     done: tokio::sync::watch::Receiver<()>,
 }
@@ -113,6 +114,7 @@ impl ClosingWork {
         entries.insert(
             key,
             ClosingEntry {
+                finalization: None,
                 drive,
                 done: receiver,
             },
@@ -147,6 +149,44 @@ impl ClosingWork {
             };
             let _ = done.changed().await;
         }
+    }
+}
+impl ClosingGuard {
+    /// Switch the short discovery hold to a long, watchable finalization.
+    pub(crate) fn finalizing(&self, operation: Uuid) {
+        self.work
+            .0
+            .lock()
+            .unwrap()
+            .get_mut(&self.key)
+            .unwrap()
+            .finalization = Some(operation);
+        self._done.send_replace(());
+    }
+}
+
+/// Typed Busy refusal with the operation clients can watch, independent of text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TapeBusy(pub(crate) Uuid);
+impl TapeBusy {
+    pub(crate) fn status(self) -> Status {
+        let mut status = Status::aborted(format!(
+            "Busy: tape is finalizing; watch operation {}",
+            self.0
+        ));
+        status.metadata_mut().insert_bin(
+            "remanence-busy-operation-bin",
+            tonic::metadata::MetadataValue::from_bytes(self.0.as_bytes()),
+        );
+        status
+    }
+    pub(crate) fn from_status(status: &Status) -> Option<Self> {
+        let bytes = status
+            .metadata()
+            .get_bin("remanence-busy-operation-bin")?
+            .to_bytes()
+            .ok()?;
+        Uuid::from_slice(&bytes).ok().map(Self)
     }
 }
 impl Drop for ClosingGuard {
@@ -325,8 +365,23 @@ impl DrivePool {
         self.session(id)
     }
     pub(crate) async fn wait_tape_closeout(&self, tape: TapeUuid) {
-        self.worker_closing.wait(|t, _| *t == tape).await;
+        self.worker_closing
+            .wait(|t, e| *t == tape && e.finalization.is_none())
+            .await;
         self.closing.wait(|t, _| *t == tape).await;
+    }
+    pub(crate) fn check_finalizing(&self, tape: TapeUuid) -> Result<(), Status> {
+        if let Some(operation) = self
+            .worker_closing
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|((t, _), e)| (*t == tape).then_some(e.finalization).flatten())
+        {
+            return Err(TapeBusy(operation).status());
+        }
+        Ok(())
     }
     pub(crate) fn drive_is_closing(&self, drive: &DriveKey) -> bool {
         self.closing.drive_is_closing(drive)
@@ -695,6 +750,7 @@ impl DrivePool {
             .tape_reservations
             .lock()
             .unwrap_or_else(|err| err.into_inner());
+        self.check_finalizing(tape)?;
         if self
             .worker_closing
             .0
@@ -742,6 +798,7 @@ impl DrivePool {
             .tape_reservations
             .lock()
             .unwrap_or_else(|err| err.into_inner());
+        self.check_finalizing(tape_uuid)?;
         if !reservations.insert(tape_uuid) {
             return Err(Status::failed_precondition("tape is already mounted"));
         }

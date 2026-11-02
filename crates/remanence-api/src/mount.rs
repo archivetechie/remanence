@@ -896,17 +896,27 @@ async fn manual_finalize_tape_critical(
     _ready_wait: Duration,
 ) -> Result<crate::write_owner::ManualFinalizeTapeResult, Status> {
     let pool = state.drive_pool()?.clone();
-    pool.wait_tape_closeout(admission.tape_uuid).await;
+    if pool.mounted_tape_uuids().contains(&admission.tape_uuid) {
+        if let Some(reply) = rejoin_accepted_manual_finalization(state, &admission)? {
+            return Ok(crate::write_owner::ManualFinalizeTapeResult::Accepted(
+                reply,
+            ));
+        }
+    }
     let tape_reservation = match pool.reserve_tape_after_closeout(admission.tape_uuid).await {
         Ok(reservation) => reservation,
         Err(error)
-            if error.code() == tonic::Code::FailedPrecondition
-                && error.message() == "tape is already mounted" =>
+            if (error.code() == tonic::Code::FailedPrecondition
+                && error.message() == "tape is already mounted")
+                || crate::drive_pool::TapeBusy::from_status(&error).is_some() =>
         {
             if let Some(reply) = rejoin_accepted_manual_finalization(state, &admission)? {
                 return Ok(crate::write_owner::ManualFinalizeTapeResult::Accepted(
                     reply,
                 ));
+            }
+            if crate::drive_pool::TapeBusy::from_status(&error).is_some() {
+                return Err(error);
             }
             return Ok(crate::write_owner::ManualFinalizeTapeResult::Busy);
         }
@@ -1019,25 +1029,8 @@ fn rejoin_accepted_manual_finalization(
     }))
 }
 
-/// Execute the physical manual-finalization tail while retaining exact-tape
-/// ownership transferred from durable admission or startup recovery.
-async fn run_manual_finalize_worker(
-    state: ApiState,
-    pool: crate::write_owner::DrivePool,
-    _tape_reservation: std::sync::Arc<crate::write_owner::TapeReservation>,
-    actor_request: crate::write_owner::ManualFinalizeTapeActorRequest,
-) -> Result<(), Status> {
-    run_manual_finalize_worker_with_budget(
-        state,
-        pool,
-        _tape_reservation,
-        actor_request,
-        Duration::from_secs(crate::readiness_wait::DEFAULT_OPERATION_READY_WAIT_SECONDS),
-    )
-    .await
-}
-
-/// Keep one readiness deadline across every session-open attempt.
+/// Exercise a manual-finalization worker with a deterministic readiness budget.
+#[cfg(test)]
 async fn run_manual_finalize_worker_with_budget(
     state: ApiState,
     pool: crate::write_owner::DrivePool,
@@ -1124,7 +1117,12 @@ async fn run_started_manual_finalize_worker(
                     "{summary}; persist attempt failure: {audit_error}"
                 )));
             }
-            Err(Status::new(error.code(), summary))
+            Err(Status::with_details_and_metadata(
+                error.code(),
+                summary,
+                error.details().to_vec().into(),
+                error.metadata().clone(),
+            ))
         }
     }
 }
@@ -1280,8 +1278,8 @@ pub(crate) async fn service_closeout_obligation(
         .tape_io_is_fenced(Some(&tape_uuid), None, None)
         .map_err(status_from_state_error)?
     {
-        return Err(Status::failed_precondition(
-            "terminal recovery blocked by active tape-I/O fence",
+        return Err(crate::closeout_obligation::RetryCause::Operator.attach(
+            Status::failed_precondition("terminal recovery blocked by active tape-I/O fence"),
         ));
     }
     // Resolve only within configured library/drive ownership, before dispatch.
@@ -1301,8 +1299,6 @@ pub(crate) async fn service_closeout_obligation(
     let mut lease = journal
         .acquire_exclusive_for_terminal_recovery()
         .map_err(status_from_state_error)?;
-    #[cfg(test)]
-    run_startup_terminal_lease_hook(tape_uuid);
     let snapshot = lease.freeze().map_err(status_from_state_error)?;
     let summary = snapshot.tape_summary();
     if summary.incarnation != incarnation {
@@ -1322,40 +1318,91 @@ pub(crate) async fn service_closeout_obligation(
             return Ok(());
         }
     }
+    let mut _finalization_operation = None;
+    let terminal_handle = if finalize || intent.as_ref().is_some_and(|i| i.manual.is_some()) {
+        let id = intent
+            .as_ref()
+            .and_then(|i| i.manual.as_ref())
+            .map_or_else(Uuid::new_v4, |m| Uuid::from_bytes(m.operation_id));
+        _finalization_operation = Some(
+            journal
+                .finalization_operation(id)
+                .map_err(status_from_state_error)?,
+        );
+        _closing.finalizing(id);
+        let handle = state.operations.register(id, "finalize_tape");
+        handle.publish_state(pb::OperationState::Running, &[("phase", "recovery")]);
+        Some(handle)
+    } else {
+        None
+    };
+    #[cfg(test)]
+    run_startup_terminal_lease_hook(tape_uuid);
     drop(lease);
     drop(index);
     if finalize || intent.as_ref().is_some_and(|i| i.manual.is_some()) {
-        if let Some(intent) = intent.as_ref().filter(|i| i.manual.is_some()) {
-            recover_manual_terminal_tape(state, &pool, tape_reservation, intent).await
+        let result = if let Some(intent) = intent.as_ref().filter(|i| i.manual.is_some()) {
+            recover_manual_terminal_tape(
+                state,
+                &pool,
+                tape_reservation,
+                intent,
+                terminal_handle.as_ref().unwrap().clone(),
+            )
+            .await
         } else {
             recover_automatic_terminal_tape(state, &pool, tape_reservation, tape_uuid).await
-        }
-    } else if closeout {
-        let progress =
-            crate::closeout_progress::CloseoutProgress::new(Uuid::new_v4(), tape_uuid, None)?;
-        let result = closeout_tape_reserved(
-            state,
-            tape_uuid,
-            None,
-            progress.clone(),
-            Some(tape_reservation),
-        )
-        .await;
-        let (event, reason) = match &result {
-            Ok(()) => (remanence_state::AuditEvent::OperationFinished, None),
-            Err(error) => (remanence_state::AuditEvent::OperationFailed, Some(error)),
         };
+        if let Some(handle) = terminal_handle {
+            match &result {
+                Ok(()) => {
+                    handle.publish_state(pb::OperationState::Succeeded, &[("phase", "complete")])
+                }
+                Err(error) => handle.publish_failed(error.message(), &[("phase", "recovery")]),
+            }
+        }
+        result
+    } else if closeout {
+        closeout_worker_attempt(state, tape_uuid, Some(tape_reservation)).await
+    } else {
+        Ok(())
+    }
+}
+
+/// Pair each worker closeout attempt, including failures before actor dispatch.
+pub(crate) async fn closeout_worker_attempt(
+    state: &ApiState,
+    tape_uuid: TapeUuid,
+    tape_reservation: Option<crate::write_owner::TapeReservation>,
+) -> Result<(), Status> {
+    let progress =
+        crate::closeout_progress::CloseoutProgress::new(Uuid::new_v4(), tape_uuid, None)?;
+    progress.audit(
+        &mut state.index_write()?,
+        &state.audit_dir,
+        &state.audit_append_lock,
+        remanence_state::AuditEvent::OperationStarted,
+        None,
+    )?;
+    let result =
+        closeout_tape_reserved(state, tape_uuid, None, progress.clone(), tape_reservation).await;
+    let (event, reason) = match &result {
+        Ok(()) => (remanence_state::AuditEvent::OperationFinished, None),
+        Err(error) => (remanence_state::AuditEvent::OperationFailed, Some(error)),
+    };
+    let audit = state.index_write().and_then(|mut index| {
         progress.audit(
-            &mut state.index_write()?,
+            &mut index,
             &state.audit_dir,
             &state.audit_append_lock,
             event,
             reason,
-        )?;
-        result
-    } else {
-        Ok(())
+        )
+    });
+    if let Err(error) = &audit {
+        tracing::warn!(%error, operation_id = %progress.id, "closeout terminal audit failed");
     }
+    result.and(audit)
 }
 
 /// One-shot pause for one tape, taken while startup recovery holds that
@@ -1395,13 +1442,22 @@ async fn recover_manual_terminal_tape(
     pool: &crate::write_owner::DrivePool,
     tape_reservation: crate::write_owner::TapeReservation,
     intent: &remanence_state::authority::AuthorityFinalization,
+    handle: crate::operations::OperationHandle,
 ) -> Result<(), Status> {
     let request = manual_finalize_request_from_intent(state, intent)?;
-    run_manual_finalize_worker(
+    record_finalize_attempt(
+        state,
+        &request,
+        remanence_state::AuditEvent::OperationStarted,
+        None,
+    )?;
+    run_started_manual_finalize_worker(
         state.clone(),
         pool.clone(),
         std::sync::Arc::new(tape_reservation),
         request,
+        Duration::from_secs(crate::readiness_wait::DEFAULT_OPERATION_READY_WAIT_SECONDS),
+        handle,
     )
     .await
 }
@@ -1468,8 +1524,8 @@ async fn recover_automatic_terminal_tape(
         .tape_io_is_fenced(Some(&tape_uuid), None, None)
         .map_err(status_from_state_error)?
     {
-        return Err(Status::failed_precondition(
-            "terminal recovery blocked by active tape-I/O fence",
+        return Err(crate::closeout_obligation::RetryCause::Operator.attach(
+            Status::failed_precondition("terminal recovery blocked by active tape-I/O fence"),
         ));
     }
     let tape = index
@@ -3558,13 +3614,15 @@ pub(crate) async fn closeout_tape(
     expected_pool: Option<String>,
     progress: crate::closeout_progress::CloseoutProgress,
 ) -> Result<(), Status> {
-    state.closeout_work.wake.notify_one();
     let reservation = if let Some(pool) = &state.drive_pool {
         Some(pool.reserve_tape_after_closeout(tape_uuid).await?)
     } else {
         None
     };
-    closeout_tape_reserved(state, tape_uuid, expected_pool, progress, reservation).await
+    let result =
+        closeout_tape_reserved(state, tape_uuid, expected_pool, progress, reservation).await;
+    state.closeout_work.wake_tape(tape_uuid);
+    result
 }
 
 /// Retain the worker's original reservation through dispatch; never create an
@@ -6301,7 +6359,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn startup_terminal_recovery_owns_the_tape_and_same_key_finalize_waits() {
+    async fn startup_terminal_recovery_owns_the_tape_so_same_key_finalize_rejoins() {
         use std::sync::atomic::AtomicBool;
         use std::sync::Arc;
 
@@ -6445,16 +6503,24 @@ mod tests {
             .await
             .expect("startup recovery takes the tape-log lease")
             .expect("lease hook reports exact-tape ownership");
-        let mut replay = tokio::spawn({
-            let state = state.clone();
-            let admission = admission.clone();
-            async move { manual_finalize_tape(&state, admission).await }
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut replay)
-                .await
-                .is_err(),
-            "same-key finalization waits for the startup worker hold"
+        let replay = tokio::time::timeout(
+            Duration::from_secs(1),
+            manual_finalize_tape(&state, admission.clone()),
+        )
+        .await
+        .expect("same-key retry must return while recovery is held")
+        .unwrap();
+        let crate::write_owner::ManualFinalizeTapeResult::Accepted(replay) = replay else {
+            panic!("same-key retry must rejoin, never Busy");
+        };
+        assert_eq!(replay.operation_id, accepted.operation_id);
+        let busy = pool
+            .reserve_tape_after_closeout(tape_uuid)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            crate::drive_pool::TapeBusy::from_status(&busy).unwrap().0,
+            accepted.operation_id
         );
         resume_tx.send(()).expect("resume startup recovery");
         assert!(
@@ -6463,7 +6529,7 @@ mod tests {
         );
 
         // Startup recovery remains the only owner: it dispatches exactly one
-        // tail for the original operation while the same-key caller waits.
+        // tail for the original operation after the same-key caller rejoins.
         let reply = match tokio::time::timeout(Duration::from_secs(30), drive_rx.recv())
             .await
             .expect("startup recovery dispatches")
@@ -6485,17 +6551,7 @@ mod tests {
             changer_rx.try_recv().is_err(),
             "loaded-tape tail moved media"
         );
-        assert!(!replay.is_finished(), "worker still owns the tape");
         drop(reply);
-        let replay = tokio::time::timeout(Duration::from_secs(5), replay)
-            .await
-            .expect("finalization resumes after the worker releases its hold")
-            .expect("same-key caller joins")
-            .expect("same-key finalization is accepted");
-        let crate::write_owner::ManualFinalizeTapeResult::Accepted(replay) = replay else {
-            panic!("same-key FinalizeTape must not degrade to BUSY after waiting");
-        };
-        assert_eq!(replay.operation_id, accepted.operation_id);
     }
 
     #[tokio::test]
@@ -6871,7 +6927,7 @@ mod tests {
             state.clone(),
             pool.clone(),
             guard.into(),
-            retry_request,
+            retry_request.clone(),
             Duration::from_millis(20),
         )
         .await
@@ -6908,6 +6964,38 @@ mod tests {
                 ),
             )
             .unwrap();
+        // A resumed finalization's diagnostic suffix must preserve the actor's
+        // typed retry cause even when its text cannot classify the refusal.
+        let guard = pool.reserve_tape(tape_uuid).unwrap();
+        let typed_attempt = tokio::spawn(run_manual_finalize_worker_with_budget(
+            state.clone(),
+            pool.clone(),
+            guard.into(),
+            retry_request,
+            Duration::from_secs(1),
+        ));
+        let command = tokio::time::timeout(Duration::from_secs(2), drive_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let crate::write_owner::DriveCommand::FinalizeTape { reply, .. } = command else {
+            panic!("expected finalization dispatch");
+        };
+        reply
+            .send(Err(crate::closeout_obligation::RetryCause::Operator
+                .attach(Status::failed_precondition("opaque media refusal"))))
+            .unwrap();
+        let typed_error = tokio::time::timeout(Duration::from_secs(2), typed_attempt)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            typed_error.metadata().get("remanence-retry").unwrap(),
+            "operator"
+        );
+        assert!(typed_error.message().contains("same idempotency key"));
+
         let mut recovery_index = CatalogIndex::open(&index_path).expect("open recovery projection");
         recovery_index
             .project_terminal_finalization(remanence_state::TerminalFinalizationProjectionInput {

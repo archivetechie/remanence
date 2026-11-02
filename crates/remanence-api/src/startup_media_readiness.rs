@@ -28,9 +28,21 @@ const STARTUP_INITIALIZING_LOAD_POLL: Duration = Duration::from_secs(5);
 pub(crate) fn status_from_state_error(err: impl std::borrow::Borrow<StateError>) -> Status {
     let err = err.borrow();
     match err {
+        StateError::TapeBusy { operation_id } => {
+            crate::drive_pool::TapeBusy(*operation_id).status()
+        }
         // Another owner holds the tape-log lease: busy, so a retry can succeed.
         StateError::TapeLog(_) if err.is_tape_log_busy() => Status::unavailable(err.to_string()),
-        StateError::TapeLog(_) => Status::failed_precondition(err.to_string()),
+        StateError::TapeLog(cause) => {
+            use remanence_state::tape_log::store::StoreError;
+            let retry = match cause.as_ref() {
+                StoreError::Fenced | StoreError::Ambiguous(_) | StoreError::Header => {
+                    crate::closeout_obligation::RetryCause::Operator
+                }
+                _ => crate::closeout_obligation::RetryCause::Transient,
+            };
+            retry.attach(Status::failed_precondition(err.to_string()))
+        }
         StateError::ConfigInvalid(_) => Status::invalid_argument(err.to_string()),
         StateError::IdempotencyConflict(_) => Status::already_exists(err.to_string()),
         StateError::TapePoolAssignmentConflict(_)

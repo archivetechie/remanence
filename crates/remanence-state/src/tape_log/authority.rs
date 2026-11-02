@@ -402,9 +402,12 @@ type SummaryMirror = std::sync::RwLock<Result<TapeSummary, String>>;
 #[derive(Default)]
 struct Observation {
     owner: Weak<SummaryMirror>,
+    finalization: Option<uuid::Uuid>,
     cached: Option<(LogChange, TapeSummary)>,
     #[cfg(test)]
     replays: usize,
+    #[cfg(test)]
+    before_replay: Option<Box<dyn FnOnce() + Send>>,
 }
 /// Linux inode change notification: includes in-place writes and replacements,
 /// not just appends. No unchanged log is replayed by status polling.
@@ -423,9 +426,23 @@ fn log_change(path: &Path) -> Result<LogChange, StateError> {
         m.ctime_nsec(),
     ))
 }
-type ObservedOwners = std::collections::HashMap<std::path::PathBuf, Observation>;
+type ObservedOwners = std::collections::HashMap<std::path::PathBuf, Arc<Mutex<Observation>>>;
 static OBSERVED_OWNERS: std::sync::OnceLock<Mutex<ObservedOwners>> = std::sync::OnceLock::new();
 
+/// Process-local identity of long finalization work, released with its owner.
+pub struct FinalizationOperation {
+    observation: Arc<Mutex<Observation>>,
+    operation: uuid::Uuid,
+}
+impl Drop for FinalizationOperation {
+    fn drop(&mut self) {
+        if let Ok(mut entry) = self.observation.lock() {
+            if entry.finalization == Some(self.operation) {
+                entry.finalization = None;
+            }
+        }
+    }
+}
 /// Factory for the per-tape authority backend.
 #[derive(Debug)]
 pub struct TapeAuthority {
@@ -539,14 +556,13 @@ impl TapeAuthority {
     /// its lease. This is a display/scheduling observation, never an admission
     /// capability. Other processes still require the ordinary shared snapshot.
     pub fn observe_summary(&self) -> Result<TapeSummary, StateError> {
-        let mut owners = OBSERVED_OWNERS
-            .get_or_init(Mutex::default)
+        let observation = self.observation()?;
+        let mut entry = observation
             .lock()
-            .map_err(|_| invalid("authority observer registry poisoned"))?;
+            .map_err(|_| invalid("authority observer poisoned"))?;
         if self.store.has_ambiguity()? {
             return Err(StoreError::Fenced.into());
         }
-        let entry = owners.entry(self.store.path().to_owned()).or_default();
         if let Some(owner) = entry.owner.upgrade() {
             return owner
                 .read()
@@ -560,6 +576,10 @@ impl TapeAuthority {
                 return Ok(summary.clone());
             }
         }
+        #[cfg(test)]
+        if let Some(hook) = entry.before_replay.take() {
+            hook();
+        }
         let summary = self.store.snapshot()?.summary().clone();
         #[cfg(test)]
         {
@@ -570,25 +590,62 @@ impl TapeAuthority {
             (log_change(self.store.path())? == change).then(|| (change, summary.clone()));
         Ok(summary)
     }
-    fn wrap_lease(&self, recovery: bool) -> Result<TapeAuthorityLease, StateError> {
-        // Serialize registration with observations so no reader can fall into
-        // the gap between acquiring the flock and publishing the mirror.
+    /// Publish a watchable operation while the caller retains tape ownership.
+    pub fn finalization_operation(
+        &self,
+        operation: uuid::Uuid,
+    ) -> Result<FinalizationOperation, StateError> {
+        let observation = self.observation()?;
+        observation
+            .lock()
+            .map_err(|_| invalid("authority observer poisoned"))?
+            .finalization = Some(operation);
+        Ok(FinalizationOperation {
+            observation,
+            operation,
+        })
+    }
+    /// Refuse long work before retirement attempts to acquire the native lease.
+    pub fn check_finalizing(&self) -> Result<(), StateError> {
+        let observation = self.observation()?;
+        let entry = observation
+            .lock()
+            .map_err(|_| invalid("authority observer poisoned"))?;
+        if let Some(operation_id) = entry.finalization {
+            return Err(StateError::TapeBusy { operation_id });
+        }
+        Ok(())
+    }
+    /// The global registry only locates stable per-tape guards; no filesystem
+    /// access, replay, mirror read or lease acquisition runs under its lock.
+    fn observation(&self) -> Result<Arc<Mutex<Observation>>, StateError> {
         let mut owners = OBSERVED_OWNERS
             .get_or_init(Mutex::default)
             .lock()
             .map_err(|_| invalid("authority observer registry poisoned"))?;
+        Ok(owners
+            .entry(self.store.path().to_owned())
+            .or_default()
+            .clone())
+    }
+    fn wrap_lease(&self, recovery: bool) -> Result<TapeAuthorityLease, StateError> {
+        // Only this tape is held across flock acquisition and validation. The
+        // same guard excludes observers until the durable mirror is registered.
+        let observation = self.observation()?;
+        let mut entry = observation
+            .lock()
+            .map_err(|_| invalid("authority observer poisoned"))?;
         let lease = if recovery {
             self.store.acquire_for_tail_reconciliation()?
         } else {
             self.store.acquire(false)?
         };
-        owners.insert(
-            self.store.path().to_owned(),
-            Observation {
-                owner: Arc::downgrade(&lease.observation()),
-                ..Default::default()
-            },
-        );
+        entry.owner = Arc::downgrade(&lease.observation());
+        entry.cached = None;
+        #[cfg(test)]
+        {
+            entry.replays = 0;
+        }
         let core = Arc::new(ObservedLease::new(lease));
         Ok(TapeAuthorityLease {
             uuid: self.store.header.tape_uuid,

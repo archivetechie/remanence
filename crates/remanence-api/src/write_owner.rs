@@ -17,6 +17,8 @@ pub(crate) use tests::{
 };
 mod reconcile;
 mod restore;
+#[cfg(test)]
+pub(crate) use restore::status_from_pool_write_error;
 mod robotics;
 pub(crate) mod terminal_inventory;
 pub(crate) use restore::{status_from_pinned_tape_error, status_from_select_tape_error};
