@@ -28,8 +28,11 @@ struct Evidence {
     tape_uuid: [u8; 16],
     stopped: bool,
     spool_failed: bool,
+    source_control: Option<std::sync::Weak<crate::append_ring::AppendRingControl>>,
     #[cfg(feature = "field-kit")]
     field_gate: Option<super::field_gate::Gate>,
+    #[cfg(feature = "field-kit")]
+    field_barcode: Option<String>,
 }
 
 fn invalid() -> TapeIoError {
@@ -54,9 +57,19 @@ impl SessionTail {
             tape_uuid,
             stopped: false,
             spool_failed: false,
+            source_control: None,
             #[cfg(feature = "field-kit")]
             field_gate: None,
+            #[cfg(feature = "field-kit")]
+            field_barcode: None,
         }))))
+    }
+
+    /// Bind field arming to the catalog identity captured at session admission.
+    #[cfg(feature = "field-kit")]
+    pub(crate) fn with_field_barcode(self, barcode: Option<String>) -> Self {
+        self.0.lock().expect("new session tail lock").field_barcode = barcode;
+        self
     }
 
     pub(crate) fn observe(
@@ -106,15 +119,22 @@ impl SessionTail {
     }
 
     /// Set by object preparation before any of its blocks can be dispatched.
-    pub(crate) fn object(&self, id: &str) -> Result<(), String> {
+    pub(crate) fn object(
+        &self,
+        id: &str,
+        source_control: Option<Arc<crate::append_ring::AppendRingControl>>,
+    ) -> Result<(), String> {
         let mut e = self.0.lock().map_err(|_| "session tail lock poisoned")?;
         if e.stopped || e.spool_failed || id.is_empty() || id.len() > 64 {
             return Err("session tail object identity unavailable".into());
         }
         #[cfg(feature = "field-kit")]
         {
-            e.field_gate = super::field_gate::Gate::load(e.tape_uuid, id)?;
+            e.field_gate =
+                super::field_gate::Gate::load(e.tape_uuid, e.field_barcode.as_deref(), id)?;
         }
+        // Observation must not retain the ring memory reservation after append.
+        e.source_control = source_control.as_ref().map(Arc::downgrade);
         e.next_object = Some(id.to_owned());
         Ok(())
     }
@@ -130,6 +150,7 @@ impl SessionTail {
         e.synchronized_blocks = 0;
         e.current = None;
         e.next_object = None;
+        e.source_control = None;
         e.stopped = false;
         e.spool_failed = false;
         Ok(())
@@ -221,6 +242,19 @@ impl MediaDispatchObserver for SessionTail {
         // WFM(0) settles buffered work but does not introduce a tail file.
         if cdb[0] == 0x10 && count == 0 {
             return Ok(());
+        }
+        // The encoder can already hold another block when ingress fails. Check
+        // at physical dispatch, after the previous WRITE/field hold has settled.
+        // WFM(0) above remains available to synchronize the accepted prefix.
+        if let Some(message) = e
+            .source_control
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .and_then(|c| c.failure_message())
+        {
+            return Err(TapeIoError::OperationFailed(format!(
+                "append source failed before media dispatch: {message}"
+            )));
         }
         if cdb[0] == 0x0a {
             let bytes = data.ok_or_else(invalid)?;
@@ -441,7 +475,7 @@ mod tests {
         for barrier in [false, true] {
             let mut tail = SessionTail::new([1; 16], 512, 1).unwrap();
             for n in 0..3 {
-                tail.object(&format!("o{n}")).unwrap();
+                tail.object(&format!("o{n}"), None).unwrap();
                 let write = [0x0a, 1, 0, 0, 1, 0];
                 tail.dispatching(&write, Some(&[0; 512])).unwrap();
                 tail.settled(&write, &Ok(Some(TransferOutcome::clean(512))));
@@ -468,11 +502,35 @@ mod tests {
         }
     }
 
+    /// Cancellation wins over already-buffered data without retaining ring memory
+    /// or preventing the zero-filemark barrier for previously accepted bytes.
+    #[test]
+    fn cancelled_source_refuses_dispatch_and_releases_ring_reservation() {
+        let manager = crate::io_memory::IoMemoryReservation::new(1024).unwrap();
+        let (producer, consumer, control) =
+            crate::append_ring::create_append_ring(&manager, 1024, 75, 25, 1024).unwrap();
+        let mut tail = SessionTail::new([1; 16], 512, 1).unwrap();
+        tail.object("cancelled", Some(control.clone())).unwrap();
+        let cdb = [0x0a, 1, 0, 0, 1, 0];
+        tail.dispatching(&cdb, Some(&[0; 512])).unwrap();
+        tail.settled(&cdb, &Ok(Some(TransferOutcome::clean(512))));
+        control.fail("client disconnected during append");
+        assert!(tail.dispatching(&cdb, Some(&[0; 512])).is_err());
+        assert!(tail.dispatching(&[0x10, 0, 0, 0, 1, 0], None).is_err());
+        tail.dispatching(&[0x10, 0, 0, 0, 0, 0], None).unwrap();
+        drop((producer, consumer, control));
+        assert_eq!(
+            manager.granted(),
+            0,
+            "tail must not retain the ring reservation"
+        );
+    }
+
     #[test]
     fn completed_files_stream_and_unknown_last_command_stops_writes() {
         let mut tail = SessionTail::new([1; 16], 512, 4).unwrap();
         for n in 0..1000 {
-            tail.object(&format!("object-{n}")).unwrap();
+            tail.object(&format!("object-{n}"), None).unwrap();
             tail.dispatching(&[0x0a, 1, 0, 0, 2, 0], Some(&[0; 1024]))
                 .unwrap();
             tail.settled(
@@ -483,7 +541,7 @@ mod tests {
             tail.settled(&[0x10, 1, 0, 0, 1, 0], &Ok(None));
             assert!(tail.0.lock().unwrap().current.is_some());
         }
-        tail.object("last").unwrap();
+        tail.object("last", None).unwrap();
         tail.dispatching(&[0x0a, 1, 0, 0, 3, 0], Some(&[0; 1536]))
             .unwrap();
         tail.settled(
@@ -513,7 +571,7 @@ mod tests {
     fn lost_write_and_filemark_responses_remain_unknown_and_barriers_add_no_file() {
         for mark in [false, true] {
             let mut tail = SessionTail::new([1; 16], 512, 1).unwrap();
-            tail.object("object").unwrap();
+            tail.object("object", None).unwrap();
             let write = [0x0a, 1, 0, 0, 1, 0];
             tail.dispatching(&write, Some(&[0; 512])).unwrap();
             let lost = Err(ScsiError::InvalidInput("completed but response lost"));

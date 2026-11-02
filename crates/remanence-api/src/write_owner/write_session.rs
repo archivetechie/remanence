@@ -2768,6 +2768,14 @@ pub(super) fn handle_drive_open_write(
             return None;
         }
     };
+    #[cfg(feature = "field-kit")]
+    let tail = tail.with_field_barcode(
+        index
+            .get_tape(&tape_uuid)
+            .ok()
+            .flatten()
+            .and_then(|t| t.voltag),
+    );
     if let Err(error) = checkpoint_lease.open_session(*session_id.as_bytes(), opened_at_utc.clone())
     {
         let status = status_from_state_error(error);

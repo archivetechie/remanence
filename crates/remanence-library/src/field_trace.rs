@@ -13,7 +13,7 @@ pub(crate) fn record(
     drive: &serde_json::Value,
     cdb: &[u8],
     requested: usize,
-    result: &Result<TransferOutcome, ScsiError>,
+    result: &Result<TransferOutcome, &ScsiError>,
     elapsed: Duration,
 ) {
     let Some(path) = std::env::var_os("REM_FIELD_TRACE") else {

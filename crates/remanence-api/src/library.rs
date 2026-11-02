@@ -465,6 +465,27 @@ impl LibraryServiceApi {
         Ok(())
     }
 
+    /// Close the request audit even when watching fails before changer dispatch.
+    fn publish_watch_failure(
+        &self,
+        operation_id: Uuid,
+        operation_kind: &'static str,
+        handle: &crate::operations::OperationHandle,
+        error: &Status,
+    ) {
+        if let Err(err) =
+            self.state
+                .record_operation_failed(operation_id, operation_kind, error.message())
+        {
+            handle.publish_failed(
+                &format!("{}; audit record failed: {err}", error.message()),
+                &[("phase", "watch")],
+            );
+        } else {
+            handle.publish_failed(error.message(), &[("phase", "watch")]);
+        }
+    }
+
     async fn dispatch_robotics(
         &self,
         actor: remanence_state::AuditActor,
@@ -530,7 +551,7 @@ impl LibraryServiceApi {
             Ok(permit) => {
                 self.watch_robotics_completion(&pool, &library_serial, operation_id, &action)
                     .inspect_err(|error| {
-                        handle.publish_failed(error.message(), &[("phase", "watch")])
+                        self.publish_watch_failure(operation_id, operation_kind, &handle, error);
                     })?;
                 tokio::spawn(async move {
                     handle.publish_state(
@@ -2072,6 +2093,47 @@ mod tests {
         assert_eq!(
             response.expect("response").into_inner().drives[0].status,
             pb::drive::Status::DriveStatusBusy as i32
+        );
+    }
+
+    /// Watch admission is currently infallible for a just-registered operation;
+    /// exercise its terminal publication helper with the same request audit.
+    #[test]
+    fn b8_watch_admission_failure_has_terminal_audit() {
+        let state = state_with_snapshot();
+        let id = Uuid::new_v4();
+        state
+            .record_library_request_received(
+                remanence_state::AuditActor::System,
+                id,
+                "unload",
+                "DEC418146K_LL02",
+                BTreeMap::new(),
+            )
+            .unwrap();
+        let handle = state.operations.register(id, "unload");
+        state.library_service().publish_watch_failure(
+            id,
+            "unload",
+            &handle,
+            &Status::not_found("watch unavailable"),
+        );
+        assert_eq!(
+            state.operations.latest(&id).unwrap().state,
+            pb::OperationState::Failed as i32
+        );
+        let rows = FileAuditLog::replay(state.audit_dir.as_ref()).unwrap();
+        let events: Vec<_> = rows
+            .iter()
+            .filter(|r| r.operation_id == Some(id))
+            .map(|r| r.event.clone())
+            .collect();
+        assert_eq!(
+            events,
+            vec![
+                remanence_state::AuditEvent::RequestReceived,
+                remanence_state::AuditEvent::OperationFailed
+            ]
         );
     }
 

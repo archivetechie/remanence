@@ -517,7 +517,7 @@ on. A refused unsafe operation is a PASS.
 ## Migration step 3: session epoch leg A
 
 Run `run.sh plan/session-epoch-a.env` using OWNER.md's written Miria exclusion,
-capability custody and explicit field/chaos arming. The plan verifies the exact
+capability custody and explicit field arming (`REM_FIELD_ALLOW_FAIL=1`). The plan verifies the exact
 four AOX barcodes, discovers LL01, starts the scoped daemon, checks readiness,
 stops it for retirement/re-init with default parity and pool assignment, and
 restarts it before the three fault legs. It then measures the near-full range
@@ -529,7 +529,7 @@ variable-READ filemark/EOD sense vectors, and collects evidence.
 `--live-control`. `run.sh` sets `FIELD_SESSION_RUN_ID`; manual runs can set a
 unique ID too, and must reuse it for `42-session-evidence.sh`. Historical receipts
 are preserved but excluded from a later run after tape re-initialisation. The first object is checkpointed without closing the session.
-The second object's real WRITE completion publishes a nonce-bound proof and
+The second object's real WRITE completion publishes a proof carrying the helper's nonce and
 holds dispatch before any further write or filemark. Kill verifies executable,
 config, owner, PID and proof before SIGKILL. Abort cancels the stream then calls
 Abort. Failed append releases the owner-armed one-shot refusal after that real
@@ -566,3 +566,15 @@ Expected end reasons include `abort`, `failed_append`, `drive_error`,
 than inferring it from the client error. Use the same closeout idempotency key
 when retrying an interrupted watch. All fault legs are fatal; preserve the first
 failure and use the normal run.sh teardown rather than continuing manually.
+
+The kit refuses before device access if `REM_CHAOS_ENABLED`,
+`REM_CHAOS_ALLOW_REAL` or `REM_CHAOS_STATE` is present, even with an empty value.
+The refusal names the variable; clear it deliberately before starting the kit.
+`REM_FIELD_ALLOW_FAIL=1` arms only the field failure and is required by preflight.
+The arm is consumed at object begin and checks the tape UUID and its catalog
+barcode. Its nonce correlates helper/daemon evidence; it is not compared with a
+separate daemon-held nonce or used as an authorization token.
+`gate/holding.json` marks a live hold; `gate/timeout.json` records expiry.
+Kill requires the live marker and refuses expiry. The helper and verifier also
+refuse expiry, retaining the observed gate state in the evidence.
+Dry review packages refuse direct script entry as well as `run.sh`.

@@ -361,7 +361,6 @@ fn transient(error: &Status) -> bool {
         "fenced",
         "wrong medium",
         "identity mismatch",
-        "identity invalidated",
         "supersede-tail",
     ]
     .iter()
@@ -1068,6 +1067,11 @@ mod fix_tests {
                 current: 2
             })
         )));
+        let untyped = TapeIoError::IdentityInvalidated {
+            proved: 1,
+            current: 2,
+        };
+        assert!(transient(&Status::internal(untyped.to_string())));
         let fence = crate::status_from_state_error(remanence_state::StateError::from(
             remanence_state::tape_log::store::StoreError::Fenced,
         ));

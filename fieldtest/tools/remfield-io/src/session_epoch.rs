@@ -96,14 +96,37 @@ fn native(path: &Path, tape: Uuid) -> AppResult<Value> {
         "barrier_count":s.barrier_count, "records":records}),
     )
 }
+/// A timeout is evidence of an expired hold, never a successful fault leg.
+fn check_gate(gate: &Path) -> AppResult<()> {
+    let state = json!({"holding":gate.join("holding.json").exists(),
+        "timeout":gate.join("timeout.json").exists()});
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(gate.join("helper-observations.jsonl"))?;
+    writeln!(file, "{state}")?;
+    if state["timeout"] == true {
+        return Err(AppError::new(
+            "field hold expired: gate/timeout.json exists",
+        ));
+    }
+    Ok(())
+}
 async fn wait_file(path: &Path, timeout: Duration) -> AppResult<()> {
     tokio::time::timeout(timeout, async {
         while !path.exists() {
+            if path.with_file_name("timeout.json").exists() {
+                check_gate(path.parent().expect("gate parent"))?;
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        if path.with_file_name("timeout.json").exists() {
+            check_gate(path.parent().expect("gate parent"))?;
+        }
+        Ok(())
     })
     .await
-    .map_err(|_| AppError::new(format!("gate timed out: {}", path.display())))
+    .map_err(|_| AppError::new(format!("gate timed out: {}", path.display())))?
 }
 fn receipt(record: &pb::ObjectRecord, pool: &str) -> Value {
     write_result_json(
@@ -122,6 +145,7 @@ pub(super) async fn run(endpoint: &str, args: Args) -> AppResult<()> {
     if args.seed_bytes == 0 {
         return Err(AppError::new("seed must be nonempty"));
     }
+    check_gate(&args.gate)?;
     if args.phase == "snapshot" {
         return print_json_line(native(&args.log, args.tape)?);
     }
@@ -183,8 +207,15 @@ async fn prepare(channel: Channel, args: &Args) -> AppResult<()> {
     )?;
     let result = prepare_open(&mut client, &session, args).await;
     if result.is_err() {
-        // Release a held dispatch before asking the actor to tear down.
-        let _ = std::fs::write(args.gate.join("release"), b"cleanup");
+        // prepare_open has stopped both stream tasks. Wait for daemon cancellation
+        // before release; otherwise leave the bounded hold to expire closed.
+        if args.gate.join("holding.json").exists()
+            && wait_file(&args.gate.join("cancelled.json"), Duration::from_secs(30))
+                .await
+                .is_ok()
+        {
+            let _ = std::fs::write(args.gate.join("release"), b"cleanup");
+        }
         abort_write_session(&mut client, &session).await;
     }
     result?;
@@ -305,14 +336,21 @@ async fn prepare_open(
     });
     let result = async {
         wait_file(&args.gate.join("dispatch.json"),Duration::from_secs(120)).await?;
+        check_gate(&args.gate)?;
         let proof = read_json(&args.gate.join("dispatch.json"))?;
         if proof["nonce"] != nonce.to_string() || proof["tape_uuid"] != args.tape.to_string() || proof["bytes_completed"].as_u64().unwrap_or(0) == 0 {
             return Err(AppError::new("dispatch proof identity or byte count differs"));
         }
         save(&args.evidence.join("fault.json"),&proof)?;
         print_json_line(json!({"gate":"data-dispatched", "evidence":args.evidence}))?;
-        if args.mode == "kill-mid-write" { std::future::pending::<()>().await; }
+        if args.mode == "kill-mid-write" {
+            loop {
+                check_gate(&args.gate)?;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
         if args.mode == "failed-append" {
+            check_gate(&args.gate)?;
             std::fs::write(args.gate.join("release"), b"fail")?;
             // Further queued data meets the one-shot refusal after the proved write.
             let response = tokio::time::timeout(Duration::from_secs(60), &mut append).await
@@ -329,8 +367,10 @@ async fn prepare_open(
                 return Err(AppError::new("stream cancellation identity differs"));
             }
             save(&args.evidence.join("stream-cancelled.json"), &cancelled)?;
+            check_gate(&args.gate)?;
             std::fs::write(args.gate.join("release"), b"abort")?;
         }
+        check_gate(&args.gate)?;
         let aborted = client.abort_write_session(pb::AbortWriteSessionRequest {session_id:session.to_vec(),idempotency_key:None,reason:Some("field leg A".into())}).await?.into_inner();
         if aborted.checkpointed_objects.iter().any(|r| r.caller_object_id.as_deref().is_some_and(|v| v.starts_with("field-abandoned-"))) {
             return Err(AppError::new("abandoned receipt leaked"));
@@ -339,7 +379,11 @@ async fn prepare_open(
         Ok(())
     }.await;
     sender.abort();
-    append.abort();
+    let _ = sender.await;
+    if !append.is_finished() {
+        append.abort();
+        let _ = append.await;
+    }
     result
 }
 fn validate_preview(
@@ -581,6 +625,25 @@ mod tests {
         assert!(validate_preview(tape, &before, &proof, &preview).is_err());
         preview.found.pop();
         assert!(validate_preview(Uuid::new_v4(), &before, &proof, &preview).is_err());
+    }
+    #[tokio::test]
+    async fn expired_hold_refuses_even_when_dispatch_exists() {
+        let root = std::env::temp_dir().join(format!("field-expiry-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("timeout.json"), b"{}").unwrap();
+        std::fs::write(root.join("dispatch.json"), b"{}").unwrap();
+        assert!(check_gate(&root)
+            .unwrap_err()
+            .to_string()
+            .contains("hold expired"));
+        assert!(
+            wait_file(&root.join("dispatch.json"), Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+        let evidence = std::fs::read_to_string(root.join("helper-observations.jsonl")).unwrap();
+        assert!(evidence.contains("\"timeout\":true"));
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[tokio::test]
     async fn gate_timeout_is_a_failure_and_never_a_media_claim() {

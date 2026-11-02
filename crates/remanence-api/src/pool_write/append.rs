@@ -102,8 +102,11 @@ pub(crate) fn write_batched_parity_to_selected_tape_after_replay_check(
     }
     let stored = prepare_stored_object(&prepared, &request.representation)?;
     if let Some(tail) = tail {
-        tail.object(&prepared.object_uuid.to_string())
-            .map_err(PoolWriteError::InvalidInput)?;
+        tail.object(
+            &prepared.object_uuid.to_string(),
+            request.source.stream_control(),
+        )
+        .map_err(PoolWriteError::InvalidInput)?;
     }
     let capacity_blocks = parity_capacity_basis_blocks(state, pool_cfg, &selected)?;
     let projected_object_blocks = match &stored {
@@ -343,8 +346,11 @@ pub(super) fn write_to_selected_tape_inner<S: BlockSink + ?Sized>(
     }
     let stored = prepare_stored_object(&prepared, &request.representation)?;
     if let Some(tail) = tail {
-        tail.object(&prepared.object_uuid.to_string())
-            .map_err(PoolWriteError::InvalidInput)?;
+        tail.object(
+            &prepared.object_uuid.to_string(),
+            request.source.stream_control(),
+        )
+        .map_err(PoolWriteError::InvalidInput)?;
     }
     let stored_projected_blocks = stored.projected_size_blocks(&prepared);
     let mut stored_size_bytes = stored_footprint_bytes(&stored, &prepared, selected.block_size)?;
