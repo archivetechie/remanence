@@ -12285,22 +12285,28 @@ pub(crate) async fn check_context_failure_receipts(
         b"second",
     )
     .await;
-    let error = match trigger {
-        "threshold" => second.expect_err("threshold context renewal fails"),
+    let claimed = match trigger {
+        "threshold" => {
+            assert_eq!(
+                second
+                    .expect("durable threshold succeeds")
+                    .record
+                    .append_commit_info
+                    .unwrap()
+                    .durability,
+                pb::AppendDurability::Checkpointed as i32
+            );
+            Vec::new()
+        }
         "explicit" => {
             second.unwrap();
             checkpoint(CheckpointTrigger::Explicit)
                 .await
-                .expect_err("explicit context renewal fails")
+                .expect("durable checkpoint succeeds")
+                .committed_objects
         }
         _ => panic!("unknown trigger"),
     };
-    assert!(
-        error
-            .message()
-            .contains("injected next append context failure"),
-        "{error}"
-    );
     actor.await.unwrap();
     let (session, _) = lifecycle
         .ended_writes
@@ -12309,7 +12315,8 @@ pub(crate) async fn check_context_failure_receipts(
         .get(&id)
         .cloned()
         .unwrap();
-    let receipts = session.checkpointed_objects.clone();
+    let mut receipts = session.checkpointed_objects.clone();
+    receipts.extend(claimed);
     assert_eq!(
         receipts.len(),
         2,

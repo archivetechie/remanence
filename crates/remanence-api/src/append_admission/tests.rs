@@ -1308,8 +1308,10 @@ fn native_session_suffix_rows_and_unknown_command_frontiers() {
                                 "00000000-0000-4000-8000-000000000001".into(),
                             ),
                             known_blocks: 0,
+                            synchronized_blocks: 0,
                             unknown_blocks: 2,
                             filemark: TailFilemark::Absent,
+                            synchronized_filemark: false,
                         }]
                     } else {
                         vec![]
@@ -1479,8 +1481,10 @@ fn durable_torn_prefix_reproof_rejects_every_physical_contradiction_and_fences()
                     tape_file_number: 1,
                     identity: TailIdentity::TornPrefix(Sha256::digest(&observed).into()),
                     known_blocks: 1,
+                    synchronized_blocks: 1,
                     unknown_blocks: 0,
                     filemark: TailFilemark::Absent,
+                    synchronized_filemark: false,
                 })],
             )
             .unwrap();
@@ -1542,5 +1546,29 @@ fn durable_torn_prefix_reproof_rejects_every_physical_contradiction_and_fences()
             assert_eq!(fences[0].reason, "SessionSuffixContradiction");
         }
         assert_eq!(writes(&f.commands.lock().unwrap()), 0);
+    }
+}
+
+/// EOD may cut an accepted suffix, but cannot erase any synchronized record.
+#[test]
+fn b9_named_tail_accepts_buffer_loss_and_fences_below_sync() {
+    use remanence_state::tape_log::{TailFile, TailFilemark, TailIdentity};
+    for synchronized in [0, 1] {
+        let mut f = fixture();
+        f.drive.locate(2).unwrap();
+        let file = TailFile {
+            tape_file_number: 1,
+            identity: TailIdentity::Object("object".into()),
+            known_blocks: 3,
+            unknown_blocks: 0,
+            filemark: TailFilemark::Present,
+            synchronized_blocks: synchronized,
+            synchronized_filemark: false,
+        };
+        let result = super::session_suffix::named_file(&mut f.drive, &UUID, SIZE, &file);
+        assert_eq!(result.is_ok(), synchronized == 0);
+        if let Err(error) = result {
+            assert!(error.to_string().contains("SessionSuffixContradiction"));
+        }
     }
 }

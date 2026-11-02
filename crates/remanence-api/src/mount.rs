@@ -922,47 +922,61 @@ async fn manual_finalize_tape_critical(
         Err(error) => return Err(error),
     };
     let tape_reservation = std::sync::Arc::new(tape_reservation);
-    let mut index = CatalogIndex::open(state.index_path.as_ref())
-        .map_err(|error| Status::internal(error.to_string()))?;
-    let (tape, mut actor_request) =
-        prepare_manual_finalize_request(&index, admission, |pool_id| state.pool_config(pool_id))?;
-    let prefix = None;
-    if reply.is_closed() {
-        return Err(Status::cancelled(
-            "finalization request dropped before acceptance",
-        ));
-    }
-    if let Some(reply) = crate::write_owner::preflight_manual_finalize_cancellable(
-        &mut index,
-        crate::write_owner::ManualFinalizePreflightConfig {
-            mounted_endpoint: None,
-            checkpoint_journal_dir: state.checkpoint_journal_dir.as_path(),
-            audit_dir: state.audit_dir.as_path(),
-            audit_fsync: state.audit_fsync,
-            audit_append_lock: &state.audit_append_lock,
-        },
-        tape.voltag.as_deref(),
-        &mut actor_request,
-        prefix.as_ref(),
-        || reply.is_closed(),
-    )? {
-        return Ok(crate::write_owner::ManualFinalizeTapeResult::Accepted(
-            reply,
-        ));
-    }
-    let projection = index
-        .terminal_finalization(&actor_request.tape_uuid)
-        .map_err(crate::startup_media_readiness::status_from_state_error)?
-        .ok_or_else(|| {
-            Status::internal("durably accepted FinalizeTape has no finalization projection")
-        })?;
-    let accepted = crate::write_owner::ManualFinalizeTapeActorReply {
-        operation_id: actor_request.candidate_operation_id,
-        projection,
-    };
-    drop(index);
+    let (accepted, actor_request, handle) = {
+        let _admission = state.operations.readiness_start.lock().unwrap();
+        if state
+            .readiness_shutdown
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Status::unavailable(
+                "daemon shutdown; maintenance admission closed",
+            ));
+        }
+        let mut index = CatalogIndex::open(state.index_path.as_ref())
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let (tape, mut actor_request) =
+            prepare_manual_finalize_request(&index, admission, |pool_id| {
+                state.pool_config(pool_id)
+            })?;
+        let prefix = None;
+        if reply.is_closed() {
+            return Err(Status::cancelled(
+                "finalization request dropped before acceptance",
+            ));
+        }
+        if let Some(reply) = crate::write_owner::preflight_manual_finalize_cancellable(
+            &mut index,
+            crate::write_owner::ManualFinalizePreflightConfig {
+                mounted_endpoint: None,
+                checkpoint_journal_dir: state.checkpoint_journal_dir.as_path(),
+                audit_dir: state.audit_dir.as_path(),
+                audit_fsync: state.audit_fsync,
+                audit_append_lock: &state.audit_append_lock,
+            },
+            tape.voltag.as_deref(),
+            &mut actor_request,
+            prefix.as_ref(),
+            || reply.is_closed(),
+        )? {
+            return Ok(crate::write_owner::ManualFinalizeTapeResult::Accepted(
+                reply,
+            ));
+        }
+        let projection = index
+            .terminal_finalization(&actor_request.tape_uuid)
+            .map_err(crate::startup_media_readiness::status_from_state_error)?
+            .ok_or_else(|| {
+                Status::internal("durably accepted FinalizeTape has no finalization projection")
+            })?;
+        let accepted = crate::write_owner::ManualFinalizeTapeActorReply {
+            operation_id: actor_request.candidate_operation_id,
+            projection,
+        };
+        drop(index);
 
-    let handle = start_finalize_attempt(state, &actor_request)?;
+        let handle = publish_finalize_attempt(state, &actor_request)?;
+        (accepted, actor_request, handle)
+    };
     let worker_state = state.clone();
     tokio::spawn(async move {
         let tape_uuid = actor_request.tape_uuid;
@@ -1050,7 +1064,25 @@ async fn run_manual_finalize_worker_with_budget(
 }
 
 /// Publish the new attempt before returning acceptance or launching its worker.
+#[cfg(test)]
 fn start_finalize_attempt(
+    state: &ApiState,
+    request: &crate::write_owner::ManualFinalizeTapeActorRequest,
+) -> Result<crate::operations::OperationHandle, Status> {
+    let _admission = state.operations.readiness_start.lock().unwrap();
+    if state
+        .readiness_shutdown
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err(Status::unavailable(
+            "daemon shutdown; maintenance admission closed",
+        ));
+    }
+    publish_finalize_attempt(state, request)
+}
+
+/// Publish under the caller's shared shutdown admission guard.
+fn publish_finalize_attempt(
     state: &ApiState,
     request: &crate::write_owner::ManualFinalizeTapeActorRequest,
 ) -> Result<crate::operations::OperationHandle, Status> {
@@ -1263,82 +1295,125 @@ pub(crate) async fn service_closeout_obligation(
     tape_uuid: TapeUuid,
     incarnation: u64,
 ) -> Result<(), Status> {
-    let pool = state.drive_pool()?.clone();
-    let (_closing, tape_reservation) = pool.reserve_worker_tape(tape_uuid)?;
-    let mut index = state.index_write()?;
-    if index
-        .get_tape(&tape_uuid)
-        .map_err(status_from_state_error)?
-        .is_none_or(|t| t.state == "retired")
-    {
-        return Ok(());
-    }
-    if index
-        .tape_io_is_fenced(Some(&tape_uuid), None, None)
-        .map_err(status_from_state_error)?
-    {
-        return Err(crate::closeout_obligation::RetryCause::Operator.attach(
-            Status::failed_precondition("terminal recovery blocked by active tape-I/O fence"),
-        ));
-    }
-    // Resolve only within configured library/drive ownership, before dispatch.
-    let library = resolve_tape_library_serial(state, &pool, &tape_uuid)?;
-    let _library_attempt = state.closeout_work.reserve_library(&library)?;
-    let route = resolve_actor_mount(state, &library, &tape_uuid, &HashSet::new())?;
-    let mount = match &route {
-        ActorMountPlan::Ready(mount) | ActorMountPlan::Evict { mount, .. } => mount,
-    };
-    pool.drive_tx(&mount.drive_key())?;
-    let journal = remanence_state::TapeAuthority::open(
-        state.checkpoint_journal_dir.as_ref(),
-        tape_uuid,
-        state.index_path.as_ref(),
-    )
-    .map_err(status_from_state_error)?;
-    let mut lease = journal
-        .acquire_exclusive_for_terminal_recovery()
-        .map_err(status_from_state_error)?;
-    let snapshot = lease.freeze().map_err(status_from_state_error)?;
-    let summary = snapshot.tape_summary();
-    if summary.incarnation != incarnation {
-        return Ok(());
-    }
-    let closeout = summary.closeout_due();
-    let finalize = !summary.sealed
-        && (summary.seal_due.is_some()
-            || summary.finalization.as_ref().is_some_and(|p| !p.prepared));
-    let intent =
-        remanence_state::authority::TapeAuthoritySnapshot::finalization(&snapshot).cloned();
-    index
-        .project_tape_log(&snapshot)
-        .map_err(status_from_state_error)?;
-    if let Some(intent) = intent.as_ref().filter(|i| i.manual.is_some()) {
-        if !crate::write_owner::reconcile_manual_terminal_acceptance(&index, &mut lease, intent)? {
-            return Ok(());
+    let preparing = state.clone();
+    let prepared = tokio::task::spawn_blocking(move || -> Result<_, Status> {
+        let state = &preparing;
+        let pool = state.drive_pool()?.clone();
+        let _admission = state.operations.readiness_start.lock().unwrap();
+        if state
+            .readiness_shutdown
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Status::unavailable(
+                "daemon shutdown; maintenance admission closed",
+            ));
         }
-    }
-    let mut _finalization_operation = None;
-    let terminal_handle = if finalize || intent.as_ref().is_some_and(|i| i.manual.is_some()) {
-        let id = intent
-            .as_ref()
-            .and_then(|i| i.manual.as_ref())
-            .map_or_else(Uuid::new_v4, |m| Uuid::from_bytes(m.operation_id));
-        _finalization_operation = Some(
-            journal
-                .finalization_operation(id)
-                .map_err(status_from_state_error)?,
-        );
-        _closing.finalizing(id);
-        let handle = state.operations.register(id, "finalize_tape");
-        handle.publish_state(pb::OperationState::Running, &[("phase", "recovery")]);
-        Some(handle)
-    } else {
-        None
+        let (_closing, tape_reservation) = pool.reserve_worker_tape(tape_uuid)?;
+        let mut index = state.index_write()?;
+        if index
+            .get_tape(&tape_uuid)
+            .map_err(status_from_state_error)?
+            .is_none_or(|t| t.state == "retired")
+        {
+            return Ok(None);
+        }
+        if index
+            .tape_io_is_fenced(Some(&tape_uuid), None, None)
+            .map_err(status_from_state_error)?
+        {
+            return Err(crate::closeout_obligation::RetryCause::Operator.attach(
+                Status::failed_precondition("terminal recovery blocked by active tape-I/O fence"),
+            ));
+        }
+        // Resolve only within configured library/drive ownership, before dispatch.
+        let library = resolve_tape_library_serial(state, &pool, &tape_uuid)?;
+        let _library_attempt = state.closeout_work.reserve_library(&library)?;
+        let route = resolve_actor_mount(state, &library, &tape_uuid, &HashSet::new())?;
+        let mount = match &route {
+            ActorMountPlan::Ready(mount) | ActorMountPlan::Evict { mount, .. } => mount,
+        };
+        pool.drive_tx(&mount.drive_key())?;
+        let journal = remanence_state::TapeAuthority::open(
+            state.checkpoint_journal_dir.as_ref(),
+            tape_uuid,
+            state.index_path.as_ref(),
+        )
+        .map_err(status_from_state_error)?;
+        let mut lease = journal
+            .acquire_exclusive_for_terminal_recovery()
+            .map_err(status_from_state_error)?;
+        let snapshot = lease.freeze().map_err(status_from_state_error)?;
+        let summary = snapshot.tape_summary();
+        if summary.incarnation != incarnation {
+            return Ok(None);
+        }
+        let closeout = summary.closeout_due();
+        let finalize = !summary.sealed
+            && (summary.seal_due.is_some()
+                || summary.finalization.as_ref().is_some_and(|p| !p.prepared));
+        let intent =
+            remanence_state::authority::TapeAuthoritySnapshot::finalization(&snapshot).cloned();
+        index
+            .project_tape_log(&snapshot)
+            .map_err(status_from_state_error)?;
+        if let Some(intent) = intent.as_ref().filter(|i| i.manual.is_some()) {
+            if !crate::write_owner::reconcile_manual_terminal_acceptance(
+                &index, &mut lease, intent,
+            )? {
+                return Ok(None);
+            }
+        }
+        let mut _finalization_operation = None;
+        let terminal_handle = if finalize || intent.as_ref().is_some_and(|i| i.manual.is_some()) {
+            let id = intent
+                .as_ref()
+                .and_then(|i| i.manual.as_ref())
+                .map_or_else(Uuid::new_v4, |m| Uuid::from_bytes(m.operation_id));
+            _finalization_operation = Some(
+                journal
+                    .finalization_operation(id)
+                    .map_err(status_from_state_error)?,
+            );
+            _closing.finalizing(id);
+            let handle = state.operations.register(id, "finalize_tape");
+            handle.publish_state(pb::OperationState::Running, &[("phase", "recovery")]);
+            Some(handle)
+        } else {
+            None
+        };
+        drop(_admission);
+        #[cfg(test)]
+        run_startup_terminal_lease_hook(tape_uuid);
+        drop(lease);
+        drop(index);
+        Ok(Some((
+            pool,
+            _closing,
+            tape_reservation,
+            _library_attempt,
+            _finalization_operation,
+            terminal_handle,
+            intent,
+            finalize,
+            closeout,
+        )))
+    })
+    .await
+    .map_err(|e| Status::internal(format!("maintenance admission task: {e}")))??;
+    let Some((
+        pool,
+        _closing,
+        tape_reservation,
+        _library_attempt,
+        _finalization_operation,
+        terminal_handle,
+        intent,
+        finalize,
+        closeout,
+    )) = prepared
+    else {
+        return Ok(());
     };
-    #[cfg(test)]
-    run_startup_terminal_lease_hook(tape_uuid);
-    drop(lease);
-    drop(index);
     if finalize || intent.as_ref().is_some_and(|i| i.manual.is_some()) {
         let result = if let Some(intent) = intent.as_ref().filter(|i| i.manual.is_some()) {
             recover_manual_terminal_tape(
@@ -1383,15 +1458,27 @@ pub(crate) async fn closeout_worker_attempt(
     tape_uuid: TapeUuid,
     tape_reservation: Option<crate::write_owner::TapeReservation>,
 ) -> Result<(), Status> {
-    let progress =
-        crate::closeout_progress::CloseoutProgress::new(Uuid::new_v4(), tape_uuid, None)?;
-    progress.audit(
-        &mut state.index_write()?,
-        &state.audit_dir,
-        &state.audit_append_lock,
-        remanence_state::AuditEvent::OperationStarted,
-        None,
-    )?;
+    let progress = {
+        let _admission = state.operations.readiness_start.lock().unwrap();
+        if state
+            .readiness_shutdown
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Status::unavailable(
+                "daemon shutdown; maintenance admission closed",
+            ));
+        }
+        let progress =
+            crate::closeout_progress::CloseoutProgress::new(Uuid::new_v4(), tape_uuid, None)?;
+        progress.audit(
+            &mut state.index_write()?,
+            &state.audit_dir,
+            &state.audit_append_lock,
+            remanence_state::AuditEvent::OperationStarted,
+            None,
+        )?;
+        progress
+    };
     let result =
         closeout_tape_reserved(state, tape_uuid, None, progress.clone(), tape_reservation).await;
     let (event, reason) = match &result {
@@ -6949,7 +7036,9 @@ mod tests {
         .expect("shutdown ends the finalize attempt")
         .unwrap_err();
         assert!(shutdown_error.message().contains("shutdown"));
-        assert!(shutdown_error.message().contains("same idempotency key"));
+        assert!(shutdown_error
+            .message()
+            .contains("maintenance admission closed"));
         assert_eq!(
             state
                 .operations

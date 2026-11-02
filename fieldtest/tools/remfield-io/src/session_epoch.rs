@@ -58,6 +58,7 @@ fn native(path: &Path, tape: Uuid) -> AppResult<Value> {
                 remanence_state::tape_log::Chunk::TailFile(f) => Some(json!({
                     "file":f.tape_file_number, "known_blocks":f.known_blocks, "unknown_blocks":f.unknown_blocks,
                     "filemark":format!("{:?}",f.filemark),
+                    "synchronized_blocks":f.synchronized_blocks, "synchronized_filemark":f.synchronized_filemark,
                     "identity":match &f.identity {
                         remanence_state::tape_log::TailIdentity::Object(id) => json!({"object_id":id}),
                         remanence_state::tape_log::TailIdentity::TornPrefix(hash) => json!({"torn_sha256":bytes_to_hex(hash)}),
@@ -89,6 +90,7 @@ fn native(path: &Path, tape: Uuid) -> AppResult<Value> {
         "W":s.protected, "T":s.total, "check":s.check.0,
         "block_size":s.block_size, "epoch_blocks":s.epoch_blocks(), "geometry":format!("{:?}",s.scheme),
         "open_session":s.open_session.as_ref().map(|v| Uuid::from_bytes(v.session_id).to_string()),
+        "tail_evidence":s.last_session_end.as_ref().map(|e| json!({"synchronized_tail_blocks":e.synchronized_tail_blocks,"possible_tail_blocks":e.possible_tail_blocks,"proved_eod":e.proved_eod})),
         "end":format!("{:?}",s.last_session_end), "sidecar":format!("{:?}",s.last_closeout_record),
         "closed_out":s.last_closeout_record.as_ref().map(|c| json!({"from_w":c.from_w,"to_t":c.to_t,"check_before":c.check_before.0,"epoch_id":c.epoch_id,"sidecar_file_number":c.sidecar_file_number})),
         "barrier_count":s.barrier_count, "records":records}),

@@ -23,6 +23,28 @@ fn session(parity: bool) -> Log {
 }
 fn ended(log: &Log, count: u64) -> SessionEnded {
     let o = opened(log);
+    let mut possible = 0;
+    let mut synchronized = 0;
+    let mut decoder = Decoder::at(
+        &log.bytes[log.reference().start_offset as usize..],
+        log.reference().first_sequence,
+        log.reference().start_offset,
+    );
+    while let Some(frame) = decoder.next_frame().unwrap() {
+        if let Record::PayloadContinuation(Continuation {
+            chunk: Chunk::TailFile(file),
+            ..
+        }) = frame.record
+        {
+            if file.synchronized_blocks > 0 || file.synchronized_filemark {
+                synchronized =
+                    possible + file.synchronized_blocks + u64::from(file.synchronized_filemark);
+            }
+            possible += file.known_blocks
+                + file.unknown_blocks
+                + u64::from(file.filemark != TailFilemark::Absent);
+        }
+    }
     SessionEnded {
         session_id: o.session_id,
         incarnation: 1,
@@ -33,6 +55,9 @@ fn ended(log: &Log, count: u64) -> SessionEnded {
         tail: log.reference(),
         tail_file_count: count,
         crash_ack_audit_sequence: None,
+        synchronized_tail_blocks: synchronized,
+        possible_tail_blocks: possible,
+        proved_eod: None,
     }
 }
 fn tail(log: &mut Log, file: u64, known: u64, unknown: u64, mark: TailFilemark) {
@@ -43,8 +68,10 @@ fn tail(log: &mut Log, file: u64, known: u64, unknown: u64, mark: TailFilemark) 
                 tape_file_number: file,
                 identity: TailIdentity::Object("object".into()),
                 known_blocks: known,
+                synchronized_blocks: known,
                 unknown_blocks: unknown,
                 filemark: mark,
+                synchronized_filemark: mark == TailFilemark::Present,
             }),
         }),
         &[],
@@ -176,8 +203,10 @@ fn tail_cuts_at_every_byte_never_publish_a_partial_end() {
                 tape_file_number: 2,
                 identity: TailIdentity::Sidecar([4; 32]),
                 known_blocks: 0,
+                synchronized_blocks: 0,
                 unknown_blocks: 3,
                 filemark: TailFilemark::Absent,
+                synchronized_filemark: false,
             }),
         }),
         &[],
@@ -327,8 +356,10 @@ fn large_named_tail_folds_with_constant_retained_state() {
                 tape_file_number: n + 1,
                 identity: TailIdentity::Object("object".into()),
                 known_blocks: 1,
+                synchronized_blocks: 1,
                 unknown_blocks: 0,
                 filemark: TailFilemark::Present,
+                synchronized_filemark: true,
             }),
         });
         let mut bytes = Vec::new();
@@ -343,6 +374,8 @@ fn large_named_tail_folds_with_constant_retained_state() {
     }
     let mut end = ended(&log, FILES);
     end.tail = digest.reference(0);
+    end.synchronized_tail_blocks = FILES * 2;
+    end.possible_tail_blocks = FILES * 2;
     let mut bytes = Vec::new();
     encode_frame(&mut bytes, base + FILES, &Record::SessionEnded(end), &[]).unwrap();
     let mut decoder = Decoder::at(&bytes[..], base + FILES, offset);
@@ -423,7 +456,9 @@ fn torn_prefix_wire_and_crash_only_final_geometry() {
             tape_file_number: 1,
             identity: TailIdentity::TornPrefix([0x5a; 32]),
             known_blocks: if mutation == 1 { 0 } else { 2 },
+            synchronized_blocks: if mutation == 1 { 0 } else { 2 },
             unknown_blocks: u64::from(mutation == 2),
+            synchronized_filemark: mutation == 3,
             filemark: if mutation == 3 {
                 TailFilemark::Present
             } else {
@@ -446,6 +481,8 @@ fn torn_prefix_wire_and_crash_only_final_geometry() {
         }
         let mut end = ended(&session(false), if mutation == 4 { 2 } else { 1 });
         end.tail = log.reference();
+        end.synchronized_tail_blocks = 2;
+        end.possible_tail_blocks = 2;
         end.reason = if mutation == 5 {
             SessionEndReason::FailedAppend
         } else {

@@ -61,7 +61,7 @@ pub(super) fn named_file(
     uuid: &[u8; 16],
     size: u32,
     file: &TailFile,
-) -> Result<(), AdmissionError> {
+) -> Result<bool, AdmissionError> {
     let start = drive.position()?.lba;
     let mut block = vec![0; size as usize];
     let mut first = None;
@@ -86,8 +86,9 @@ pub(super) fn named_file(
             Err(e) => return Err(e.into()),
         }
     };
-    if count < file.known_blocks
-        || (file.filemark == TailFilemark::Present && !mark)
+    if count < file.synchronized_blocks
+        || (file.synchronized_filemark && !mark)
+        || (mark && count != file.known_blocks)
         || (file.filemark == TailFilemark::Absent && mark)
     {
         return Err(contradiction(
@@ -106,7 +107,7 @@ pub(super) fn named_file(
                 ));
             }
         }
-        (_, None) if file.known_blocks == 0 && !mark => (),
+        (_, None) if file.synchronized_blocks == 0 && !mark => (),
         (TailIdentity::Sidecar(expected), Some(first)) => {
             let header = remanence_parity::sidecar::parse_sidecar_header_block(&first, uuid)
                 .map_err(|_| contradiction("named sidecar header is unrecognizable"))?;
@@ -134,5 +135,5 @@ pub(super) fn named_file(
         }
         _ => return Err(contradiction("empty named file")),
     }
-    Ok(())
+    Ok(mark)
 }

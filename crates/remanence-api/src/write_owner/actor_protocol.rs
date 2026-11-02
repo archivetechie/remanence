@@ -205,6 +205,8 @@ pub(crate) enum DriveCommand {
         reply: oneshot::Sender<Result<DriveUnloadOutcome, Status>>,
     },
     PollHealth {
+        /// Ownership travels with the queued command if its requester disappears.
+        ownership: Option<crate::drive_pool::ClosingGuard>,
         drive_uuid: Vec<u8>,
         trigger: &'static str,
         session_id: Option<Uuid>,
@@ -212,6 +214,7 @@ pub(crate) enum DriveCommand {
         reply: oneshot::Sender<Result<DriveHealthSnapshotRecord, Status>>,
     },
     Heartbeat {
+        ownership: Option<crate::drive_pool::ClosingGuard>,
         drive_uuid: Vec<u8>,
         reply: oneshot::Sender<Result<(), Status>>,
     },

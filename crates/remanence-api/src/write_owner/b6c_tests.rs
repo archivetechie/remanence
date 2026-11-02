@@ -3,16 +3,19 @@ use super::*;
 use remanence_state::tape_log::{SessionEndReason, TailIdentity};
 
 /// A transport call owns the gate until released, including on transport loss.
-struct CommandGate {
-    armed: AtomicBool,
-    entered: Mutex<Option<oneshot::Sender<()>>>,
-    release: (Mutex<bool>, std::sync::Condvar),
-    sidecar: bool,
-    lost: bool,
+pub(super) struct CommandGate {
+    pub(super) armed: AtomicBool,
+    pub(super) entered: Mutex<Option<oneshot::Sender<()>>>,
+    pub(super) release: (Mutex<bool>, std::sync::Condvar),
+    pub(super) sidecar: bool,
+    pub(super) opcode: Option<u8>,
+    pub(super) lost: bool,
 }
 impl CommandGate {
     fn wait(&self, cdb: &[u8]) -> Result<(), remanence_library::ScsiError> {
-        let target = if self.sidecar {
+        let target = if let Some(opcode) = self.opcode {
+            cdb[0] == opcode
+        } else if self.sidecar {
             cdb[0] == 0x0a
         } else {
             cdb[0] == 0x10 && cdb[2..5] == [0, 0, 0]
@@ -39,14 +42,14 @@ impl CommandGate {
         }
         Ok(())
     }
-    fn release(&self) {
+    pub(super) fn release(&self) {
         *self.release.0.lock().unwrap() = true;
         self.release.1.notify_all();
     }
 }
-struct GatedTransport {
-    inner: ModelTransport,
-    gate: Arc<CommandGate>,
+pub(super) struct GatedTransport {
+    pub(super) inner: ModelTransport,
+    pub(super) gate: Arc<CommandGate>,
 }
 impl SgTransport for GatedTransport {
     fn execute_in(
@@ -81,6 +84,7 @@ async fn interrupted_session(sidecar: bool, lost: bool) {
         entered: Mutex::new(Some(entered)),
         release: (Mutex::new(false), std::sync::Condvar::new()),
         sidecar,
+        opcode: None,
         lost,
     });
     let model = world.lock().unwrap().library_snapshot();
@@ -216,7 +220,14 @@ async fn interrupted_session(sidecar: bool, lost: bool) {
         thread.join().unwrap();
     } else {
         let end = summary.last_session_end.as_ref().unwrap();
-        assert_eq!(end.reason, SessionEndReason::GracefulShutdown);
+        assert_eq!(
+            end.reason,
+            if sidecar {
+                SessionEndReason::CloseoutFailed
+            } else {
+                SessionEndReason::FailedAppend
+            }
+        );
         assert_eq!(end.tail_file_count, 1);
         assert!(summary.open_session.is_none());
         assert!(index.list_active_tape_io_fences().unwrap().is_empty());
@@ -457,7 +468,7 @@ async fn shutdown_deadline_wakes_stalled_overlap_ingress_and_ends_actor() {
     .unwrap();
     let snapshot = authority.freeze().unwrap();
     let end = snapshot.tape_summary().last_session_end.as_ref().unwrap();
-    assert_eq!(end.reason, SessionEndReason::GracefulShutdown);
+    assert_eq!(end.reason, SessionEndReason::FailedAppend);
     assert!(end.tail_file_count > 0);
 }
 
@@ -559,7 +570,7 @@ async fn commit_sync_crossing_deadline_returns_receipts_and_leaves_closeout_due(
     let snapshot = authority.freeze().unwrap();
     let summary = snapshot.tape_summary();
     let end = summary.last_session_end.as_ref().unwrap();
-    assert_eq!(end.reason, SessionEndReason::GracefulShutdown);
+    assert_eq!(end.reason, SessionEndReason::FailedAppend);
     assert_eq!(end.tail_file_count, 0);
     assert!(summary.closeout_due());
 }

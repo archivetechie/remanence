@@ -1212,9 +1212,14 @@ pub(crate) struct ReadStreamSender {
 
 struct ReadStreamSenderInner {
     tx: mpsc::Sender<ReadStreamItem>,
+    shutdown: Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
 }
 
 impl ReadStreamSender {
+    /// Interrupt host backpressure separately from issued drive commands.
+    pub(crate) fn set_shutdown_signal(&self, signal: Option<Arc<std::sync::atomic::AtomicBool>>) {
+        *self.inner.shutdown.lock().unwrap() = signal;
+    }
     #[cfg(test)]
     pub(crate) async fn send(
         &self,
@@ -1227,7 +1232,42 @@ impl ReadStreamSender {
         &self,
         item: ReadStreamItem,
     ) -> Result<(), mpsc::error::SendError<ReadStreamItem>> {
-        self.inner.tx.blocking_send(item)
+        // Poll channel capacity with a thread waker: consumer progress wakes us
+        // immediately; only shutdown observation uses the bounded parking interval.
+        struct SenderWake(std::thread::Thread);
+        impl std::task::Wake for SenderWake {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let waker = std::task::Waker::from(Arc::new(SenderWake(std::thread::current())));
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut permit = Box::pin(self.inner.tx.reserve());
+        let started = Instant::now();
+        loop {
+            if self
+                .inner
+                .shutdown
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|s| s.load(std::sync::atomic::Ordering::Acquire))
+                || started.elapsed() >= Duration::from_secs(30)
+            {
+                return Err(mpsc::error::SendError(item));
+            }
+            match std::future::Future::poll(permit.as_mut(), &mut context) {
+                std::task::Poll::Ready(Ok(permit)) => {
+                    permit.send(item);
+                    return Ok(());
+                }
+                std::task::Poll::Ready(Err(_)) => return Err(mpsc::error::SendError(item)),
+                std::task::Poll::Pending => std::thread::park_timeout(Duration::from_millis(10)),
+            }
+        }
     }
 
     fn blocking_send_observed(
@@ -1236,7 +1276,7 @@ impl ReadStreamSender {
     ) -> Result<Duration, BlockingReadStreamSendError> {
         let was_full = self.inner.tx.capacity() == 0;
         let started = Instant::now();
-        let result = self.inner.tx.blocking_send(item);
+        let result = self.blocking_send(item);
         let stalled = if was_full {
             started.elapsed()
         } else {
@@ -1276,7 +1316,10 @@ fn read_stream_channel_with_capacity(capacity: usize) -> (ReadStreamSender, Read
     let rx = Arc::new(Mutex::new(rx));
     (
         ReadStreamSender {
-            inner: Arc::new(ReadStreamSenderInner { tx }),
+            inner: Arc::new(ReadStreamSenderInner {
+                tx,
+                shutdown: Mutex::new(None),
+            }),
         },
         ReadStreamReceiver { rx },
     )
@@ -2022,6 +2065,24 @@ mod tests {
         }
         handle.await.unwrap();
         assert_eq!(chunk_lengths, [3, 3, 1]);
+    }
+
+    /// Shutdown interrupts a full client channel without waiting for its receiver.
+    #[test]
+    fn b9_shutdown_interrupts_read_stream_backpressure() {
+        let (tx, _rx) = read_stream_channel_with_capacity(1);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        tx.set_shutdown_signal(Some(shutdown.clone()));
+        tx.blocking_send(Ok(pb::BytesChunk::default())).unwrap();
+        let (done, completed) = std::sync::mpsc::channel();
+        let sender = std::thread::spawn(move || {
+            let result = tx.blocking_send(Ok(pb::BytesChunk::default()));
+            done.send(result.is_err()).unwrap();
+        });
+        assert!(completed.recv_timeout(Duration::from_millis(30)).is_err());
+        shutdown.store(true, Ordering::Release);
+        assert!(completed.recv_timeout(Duration::from_secs(1)).unwrap());
+        sender.join().unwrap();
     }
 
     #[test]

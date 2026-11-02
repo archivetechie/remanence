@@ -6,13 +6,17 @@ use crate::{
 use remanence_state::CatalogIndex;
 use std::path::PathBuf;
 
-/// A catalog-backed receipt; no physical writer report is invented for an actor append.
+/// The actor's retained native receipt; no physical writer report is invented.
 #[derive(Debug)]
 pub struct MountedWriteResult {
     pub object: crate::PoolWriteObjectRecord,
     replay: bool,
 }
 impl MountedWriteResult {
+    /// Build from the append's retained native receipt, without a postcommit catalog read.
+    pub(crate) fn committed(object: crate::PoolWriteObjectRecord, replay: bool) -> Self {
+        Self { object, replay }
+    }
     pub(crate) fn replayed(object: crate::PoolWriteObjectRecord) -> Self {
         Self {
             object,
@@ -23,24 +27,6 @@ impl MountedWriteResult {
         self.replay
     }
 }
-pub(crate) fn receipt(
-    index: &CatalogIndex,
-    record: crate::pb::ObjectRecord,
-    pool: &str,
-    replay: bool,
-) -> Result<MountedWriteResult, MountError> {
-    let id = uuid::Uuid::from_slice(&record.object_id)
-        .map_err(refusal)?
-        .to_string();
-    let native = index
-        .get_native_object(&id)
-        .map_err(refusal)?
-        .ok_or_else(|| refusal("committed receipt disappeared"))?;
-    let object = crate::pool_write::pool_write_object_record_from_native(native, pool)
-        .map_err(|e| MountError::PoolWrite(Box::new(e)))?;
-    Ok(MountedWriteResult { object, replay })
-}
-
 pub(crate) fn prepare_version(
     index: &CatalogIndex,
     mut request: WriteObjectToPoolRequest,

@@ -171,8 +171,10 @@ fn hundred_thousand_tail_files_peak_heap_bound() {
                 tape_file_number: file,
                 identity: TailIdentity::Object("object".into()),
                 known_blocks: 10,
+                synchronized_blocks: 10,
                 unknown_blocks: 0,
                 filemark: TailFilemark::Present,
+                synchronized_filemark: true,
             }),
         });
         let mut bytes = Vec::new();
@@ -194,6 +196,9 @@ fn hundred_thousand_tail_files_peak_heap_bound() {
         tail: group.reference(0),
         tail_file_count: 100_000,
         crash_ack_audit_sequence: None,
+        synchronized_tail_blocks: 1_100_000,
+        possible_tail_blocks: 1_100_000,
+        proved_eod: None,
     });
     let mut bytes = Vec::new();
     encode_frame(&mut bytes, sequence, &record, &[]).unwrap();

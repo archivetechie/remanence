@@ -13,6 +13,8 @@ use remanence_state::authority::TapeAuthorityView;
 #[must_use = "hold the admission for the entire write session"]
 pub struct AppendAdmission {
     session: AppendSession,
+    /// Proved ended-tail EOD; publish through the existing native ending before reuse.
+    pub(crate) ended_tail_eod: Option<u64>,
     pub(crate) recovered_tail: Option<crate::write_owner::session_tail::SessionTail>,
 }
 impl AppendAdmission {
@@ -117,6 +119,7 @@ pub(crate) fn admit_append_boundary(
         }
         _ => None,
     };
+    let mut ended_tail_eod = None;
     let probe = (|| {
         let boundary = match &authority {
             AppendAuthority::Fresh => {
@@ -194,9 +197,14 @@ pub(crate) fn admit_append_boundary(
             }
             if summary.open_session.is_none() {
                 let mut failure = None;
+                let mut reached_eod = false;
                 snapshot
                     .visit_session_tail(&mut |file| {
+                        if reached_eod {
+                            return Ok(());
+                        }
                         session_suffix::named_file(drive, &ctx.tape_uuid, ctx.block_size, file)
+                            .map(|mark| reached_eod = !mark)
                             .map_err(|e| {
                                 failure = Some(e);
                                 remanence_state::StateError::JournalReplayFailed(
@@ -209,7 +217,21 @@ pub(crate) fn admit_append_boundary(
                             .take()
                             .unwrap_or_else(|| AdmissionError::Unproved(e.to_string()))
                     })?;
-                session_suffix::eod(drive, ctx.block_size)?;
+                if !reached_eod {
+                    session_suffix::eod(drive, ctx.block_size)?;
+                }
+                let eod = drive.position()?.lba;
+                if let Some(end) = &summary.last_session_end {
+                    if eod < end.cursor.lba.saturating_add(end.synchronized_tail_blocks)
+                        || eod > end.cursor.lba.saturating_add(end.possible_tail_blocks)
+                        || end.proved_eod.is_some_and(|old| old != eod)
+                    {
+                        return Err(AdmissionError::Unproved(
+                            "SessionSuffixContradiction: EOD outside recorded tail bounds".into(),
+                        ));
+                    }
+                    ended_tail_eod = Some(eod);
+                }
                 return Ok(AppendSuffix::default());
             }
         }
@@ -335,6 +357,7 @@ pub(crate) fn admit_append_boundary(
         .map(|session| AppendAdmission {
             session,
             recovered_tail,
+            ended_tail_eod,
         })
         .map_err(AdmissionError::Io)
 }

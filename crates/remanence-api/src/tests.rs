@@ -7920,6 +7920,8 @@ async fn append_finish_does_not_double_count() {
                     counter.record_write_bytes(5);
                     let _ = std::fs::remove_file(spool_path);
                     let _ = reply.send(Ok(crate::write_owner::AppendFinishOutcome {
+                        native_record: empty_actor_native_record(),
+                        durable_receipt: Default::default(),
                         record: pb::ObjectRecord {
                             object_id: Uuid::nil().to_string().into_bytes(),
                             caller_object_id: Some("caller-object".to_string()),
@@ -8116,6 +8118,8 @@ async fn overlap_idempotent_replay_cancels_the_live_receive_and_returns_the_reco
         };
         assert!(matches!(source, crate::WriteObjectSource::Streamed(_)));
         let _ = reply.send(Ok(crate::write_owner::AppendFinishOutcome {
+            native_record: empty_actor_native_record(),
+            durable_receipt: Default::default(),
             record: pb::ObjectRecord {
                 object_id: replayed_id.as_bytes().to_vec(),
                 caller_object_id: Some("caller-object".to_string()),
@@ -8234,8 +8238,11 @@ async fn overlap_success_response_waits_for_checkpointed_receipt() {
             }),
             ..Default::default()
         };
+        let durable_receipt = Arc::new(std::sync::Mutex::new(None));
         reply
             .send(Ok(crate::write_owner::AppendFinishOutcome {
+                native_record: empty_actor_native_record(),
+                durable_receipt: durable_receipt.clone(),
                 record: written,
                 replay: false,
             }))
@@ -8255,6 +8262,7 @@ async fn overlap_success_response_waits_for_checkpointed_receipt() {
             durability: pb::AppendDurability::Checkpointed as i32,
             ..Default::default()
         });
+        *durable_receipt.lock().unwrap() = Some(checkpointed.clone());
         reply
             .expect("explicit checkpoint carries a reply")
             .send(Ok(crate::write_owner::CheckpointActorReply {
@@ -9534,6 +9542,8 @@ async fn default_overlap_stream_fallbacks_reach_completed_spool() {
             std::fs::remove_file(path).unwrap();
             reply
                 .send(Ok(crate::write_owner::AppendFinishOutcome {
+                    native_record: empty_actor_native_record(),
+                    durable_receipt: Default::default(),
                     record: pb::ObjectRecord::default(),
                     replay: false,
                 }))
@@ -9633,8 +9643,8 @@ async fn overlap_reservation_refuses_before_payload_receive() {
 
 /// An explicit checkpoint can deliver a ring receipt before the internal barrier runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn overlap_checkpoint_interleaving_uses_committed_records_and_preserves_errors() {
-    for destination in ["catalog", "session", "checkpoint_error"] {
+async fn b9_overlap_checkpoint_claim_survives_catalog_and_later_checkpoint_failure() {
+    for destination in ["catalog", "session", "catalog_error", "checkpoint_error"] {
         let mut state = populated_state();
         let session_id = Uuid::new_v4();
         let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
@@ -9665,6 +9675,7 @@ async fn overlap_checkpoint_interleaving_uses_committed_records_and_preserves_er
         state.append_overlap_min_bytes = slab as u64;
         let api = WriteSessionApi { state };
         let explicit_api = api.clone();
+        let index_path = api.state.index_path.clone();
         let (append_seen_tx, append_seen_rx) = tokio::sync::oneshot::channel();
         let actor = tokio::spawn(async move {
             let crate::write_owner::DriveCommand::AppendFinish {
@@ -9706,11 +9717,18 @@ async fn overlap_checkpoint_interleaving_uses_committed_records_and_preserves_er
                     committed_objects: vec![record.clone()],
                 }))
                 .unwrap();
+            if destination == "catalog_error" {
+                std::fs::rename(index_path.as_ref(), index_path.with_extension("held")).unwrap();
+                std::fs::create_dir(index_path.as_ref()).unwrap();
+                assert!(CatalogIndex::open_read_only(index_path.as_ref()).is_err());
+            }
             let mut written = record.clone();
             written.append_commit_info.as_mut().unwrap().durability =
                 pb::AppendDurability::Written as i32;
             append_reply
                 .send(Ok(crate::write_owner::AppendFinishOutcome {
+                    native_record: empty_actor_native_record(),
+                    durable_receipt: Arc::new(std::sync::Mutex::new(Some(record.clone()))),
                     record: written,
                     replay: false,
                 }))
@@ -9771,11 +9789,7 @@ async fn overlap_checkpoint_interleaving_uses_committed_records_and_preserves_er
             .await
             .unwrap()
             .unwrap();
-        if destination == "checkpoint_error" {
-            let error = response.unwrap_err();
-            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-            assert_eq!(error.message(), "injected internal checkpoint cause");
-        } else {
+        {
             let record = response.unwrap().into_inner();
             assert_eq!(record.object_id, object_uuid().as_bytes());
             assert_eq!(
@@ -10621,4 +10635,17 @@ pub(crate) fn assert_fences_survive_empty_rebuild(
         remanence_state::FileAuditLog::replay(audit_dir).unwrap(),
         records
     );
+}
+
+/// Native actor data is irrelevant to these synthetic RPC delivery tests.
+fn empty_actor_native_record() -> crate::PoolWriteObjectRecord {
+    crate::PoolWriteObjectRecord {
+        object_id: [0; 16],
+        caller_object_id: String::new(),
+        content_sha256: [0; 32],
+        logical_size_bytes: 0,
+        body_format: String::new(),
+        created_at_utc: String::new(),
+        copies: Vec::new(),
+    }
 }

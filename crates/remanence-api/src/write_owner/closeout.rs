@@ -114,6 +114,11 @@ pub(super) fn handle(
             error,
         )
     })?;
+    if let Some(eod) = admission.ended_tail_eod {
+        lease
+            .record_session_tail_eod(eod)
+            .map_err(crate::status_from_state_error)?;
+    }
     if let Some(open) = &snapshot.tape_summary().open_session {
         lease
             .end_session(

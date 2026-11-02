@@ -3,7 +3,7 @@ use super::*;
 use crate::closeout_obligation::{scan, summary};
 
 /// Commit a short epoch, then exercise the B6c cutoff to leave durable debt.
-async fn due_tape(root: &Path) -> Arc<Mutex<VirtualWorld>> {
+pub(super) async fn due_tape(root: &Path) -> Arc<Mutex<VirtualWorld>> {
     let world = setup(root);
     let lifecycle = DrivePoolLifecycle::default();
     let (tx, opened, thread) = open_writer_configured(
@@ -50,7 +50,7 @@ async fn due_tape(root: &Path) -> Arc<Mutex<VirtualWorld>> {
     assert!(summary(&state, TAPE).unwrap().closeout_due());
     world
 }
-fn state(root: &Path) -> crate::ApiState {
+pub(super) fn state(root: &Path) -> crate::ApiState {
     let mut s = crate::ApiState::new_with_pool_configs(
         CatalogIndex::open(root.join("state.sqlite")).unwrap(),
         vec![pool()],
@@ -1396,6 +1396,15 @@ async fn b7_fix2_worker_motion_does_not_wake_parked_media_failure() {
 /// A completed same-key closeout replays even while a later finalization owns tape.
 #[tokio::test]
 async fn b8_closeout_replay_precedes_finalizing_busy() {
+    closeout_replay_after_admission_change(true).await;
+}
+
+#[tokio::test]
+async fn b9_closeout_completed_replay_precedes_changed_pool() {
+    closeout_replay_after_admission_change(false).await;
+}
+
+async fn closeout_replay_after_admission_change(finalizing: bool) {
     let root = tempfile::tempdir().unwrap();
     due_tape(root.path()).await;
     let mut state = state(root.path());
@@ -1425,7 +1434,9 @@ async fn b8_closeout_replay_precedes_finalizing_busy() {
     let pool =
         DrivePool::new_for_library(LIBRARY, changer, HashMap::new(), Arc::new(HashMap::new()));
     let (hold, _reservation) = pool.reserve_worker_tape(TAPE).unwrap();
-    hold.finalizing(Uuid::new_v4());
+    if finalizing {
+        hold.finalizing(Uuid::new_v4());
+    }
     state.drive_pool = Some(pool);
     assert_eq!(
         crate::tape_closeout::start(&state, AuditActor::System, request.clone()).unwrap(),
@@ -1450,6 +1461,11 @@ async fn b8_closeout_replay_precedes_finalizing_busy() {
         },
     )
     .unwrap();
+    state
+        .index_write()
+        .unwrap()
+        .clear_tape_pool_membership(TAPE)
+        .unwrap();
     state.operations = Default::default();
     assert_eq!(
         crate::tape_closeout::start(&state, AuditActor::System, request).unwrap(),

@@ -656,26 +656,30 @@ impl WriteSessionApi {
                             info.durability == pb::AppendDurability::Written as i32
                         }) =>
                 {
-                    let object_id = outcome.record.object_id.clone();
                     let checkpoint = crate::mount::checkpoint_write_session(
                         &self.state,
                         session_id,
                         crate::write_owner::CheckpointTrigger::Append,
                     )
                     .await;
-                    match checkpoint {
-                        Ok(checkpoint) => {
-                            committed_overlap_record(&self.state, object_id, checkpoint).map(
-                                |record| {
-                                    outcome.record = record;
-                                    outcome
-                                },
-                            )
+                    let durable = outcome
+                        .durable_receipt
+                        .lock()
+                        .expect("append receipt lock")
+                        .take();
+                    match durable {
+                        Some(record) => {
+                            outcome.record = record;
+                            Ok(outcome)
                         }
-                        Err(err) => {
+                        None => {
                             receive_task.abort();
                             let _ = receive_task.await;
-                            return Err(err);
+                            return Err(checkpoint.err().unwrap_or_else(|| {
+                                Status::internal(
+                                    "overlap checkpoint has no committed append receipt",
+                                )
+                            }));
                         }
                     }
                 }
@@ -1012,35 +1016,4 @@ pub(crate) fn log_append_object_failure(spool_dir: &str, status: &Status) {
             message,
         );
     }
-}
-
-/// Resolve a durable ring object even when a concurrent caller claims its receipt.
-fn committed_overlap_record(
-    state: &ApiState,
-    object_id: Vec<u8>,
-    checkpoint: crate::write_owner::CheckpointActorReply,
-) -> Result<pb::ObjectRecord, Status> {
-    if let Some(record) = checkpoint
-        .committed_objects
-        .into_iter()
-        .chain(checkpoint.session.checkpointed_objects)
-        .find(|record| record.object_id == object_id)
-    {
-        return Ok(record);
-    }
-    // An explicit checkpoint can claim the receipt while the internal checkpoint
-    // waits in the actor queue. The catalog retains the committed object by ID.
-    let mut record = crate::catalog_conversion::find_object_for_key(
-        state,
-        Some(pb::get_object_request::Key::ObjectId(object_id)),
-        "",
-    )?
-    .ok_or_else(|| Status::internal("overlap checkpoint has no committed object record"))?;
-    record.copies.retain(|copy| copy.status == "committed");
-    if record.copies.is_empty() {
-        return Err(Status::internal(
-            "overlap checkpoint has no committed object copy",
-        ));
-    }
-    crate::catalog_conversion::object_record_to_proto(record)
 }

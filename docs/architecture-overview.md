@@ -453,7 +453,13 @@ The retry is the complete Object from byte zero, not a continuation.
 For an open, rewritable tape, the durable per-tape log identifies the committed
 cursor and the session that owns any uncommitted tail. Before another write,
 the daemon proves the complete expected suffix through EOD. A durable session
-ending names the dispatched tail and permits automatic recovery; a crash tail
+ending names the dispatched tail, distinguishing accepted blocks and immediate
+filemarks from the prefix synchronized by a completed non-immediate filemark or
+barrier. Failed barriers do not promote accepted data. Recovery accepts proved
+EOD anywhere from that synchronized prefix through the possible accepted tail,
+records the exact EOD as a refinement of the same `SessionEnded` before reuse,
+and fences EOD below either the synchronized prefix or committed cursor.
+This permits automatic recovery after buffered-tail loss; a crash tail
 containing a complete Object requires `rem tape supersede-tail` acknowledgement.
 A crash-only torn header prefix is named by its byte digest and must be proved
 exactly on the next access. Any due parity closeout runs before a new session

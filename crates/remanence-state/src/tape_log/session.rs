@@ -52,7 +52,7 @@ pub enum SessionEndReason {
 /// Observed outcome of the filemark command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TailFilemark {
-    /// Filemark completed.
+    /// Accepted filemark, possibly immediate; synchronization is recorded separately.
     Present,
     /// No filemark was written.
     Absent,
@@ -77,12 +77,16 @@ pub struct TailFile {
     pub tape_file_number: u64,
     /// Kind and identity.
     pub identity: TailIdentity,
-    /// Successfully completed blocks.
+    /// Accepted blocks (GOOD completion does not imply synchronization).
     pub known_blocks: u64,
     /// Requested blocks whose completion is unknown.
     pub unknown_blocks: u64,
     /// Filemark outcome.
     pub filemark: TailFilemark,
+    /// Prefix blocks proved present by synchronization or recovery readback.
+    pub synchronized_blocks: u64,
+    /// Closing filemark proved present by synchronization or recovery readback.
+    pub synchronized_filemark: bool,
 }
 /// End metadata closing the preceding TailFile continuation stream.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,6 +109,12 @@ pub struct SessionEnded {
     pub tail_file_count: u64,
     /// Optional operator acknowledgement audit reference for crash recovery.
     pub crash_ack_audit_sequence: Option<u64>,
+    /// Physical lower bound on the suffix, relative to cursor.lba.
+    pub synchronized_tail_blocks: u64,
+    /// Physical upper bound, including uncertain command completion.
+    pub possible_tail_blocks: u64,
+    /// Exact proved EOD recorded before reusing an ended session's tail.
+    pub proved_eod: Option<u64>,
 }
 /// Barrier proof for precisely the current uncovered range and one sidecar row.
 #[derive(Clone, Debug, PartialEq, Eq)]

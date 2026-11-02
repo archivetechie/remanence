@@ -27,6 +27,22 @@ pub(crate) fn run(args: &TapeCloseoutArgs, out: &mut dyn Write, err: &mut dyn Wr
                 "--idempotency-key must not be the nil UUID",
             ));
         }
+        // Publish and flush before even connecting: a lost response can be retried.
+        if args.idempotency_key.is_none() {
+            if args.json {
+                writeln!(
+                    err,
+                    "{}",
+                    serde_json::json!({"idempotency_key": key.to_string()})
+                )
+                .map_err(|e| super::DaemonClientError::client(e.to_string()))?;
+            } else {
+                writeln!(err, "closeout idempotency key: {key}")
+                    .map_err(|e| super::DaemonClientError::client(e.to_string()))?;
+            }
+            err.flush()
+                .map_err(|e| super::DaemonClientError::client(e.to_string()))?;
+        }
         let runtime = super::daemon_runtime()?;
         runtime.block_on(async {
             let channel = super::connect_daemon(&args.endpoint)
@@ -124,5 +140,98 @@ mod tests {
             crate::Cli::try_parse_from(["rem", "tape", "closeout", "CLOSE01L9", "--force"])
                 .is_err()
         );
+    }
+    /// A failed connection still leaves the generated retry key available first.
+    #[test]
+    fn b9_generated_key_precedes_connection_failure() {
+        for json in [true, false] {
+            let args = TapeCloseoutArgs {
+                tape: Uuid::new_v4().to_string(),
+                expected_pool: None,
+                idempotency_key: None,
+                endpoint: "not a URI".into(),
+                json,
+            };
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            assert_eq!(run(&args, &mut out, &mut err), ExitCode::from(1));
+            assert!(out.is_empty());
+            let text = String::from_utf8(err).unwrap();
+            let lines = text.lines().collect::<Vec<_>>();
+            assert_eq!(lines.len(), 2);
+            if json {
+                let key: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+                assert!(!Uuid::parse_str(key["idempotency_key"].as_str().unwrap())
+                    .unwrap()
+                    .is_nil());
+                let error: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+                assert_eq!(error["code"], "daemon_client_error");
+                assert!(error["details"].get("state").is_none());
+            } else {
+                assert!(lines[0].starts_with("closeout idempotency key: "));
+            }
+        }
+    }
+
+    /// All unsuccessful terminal states preserve identity in rem.error.v1 on stderr.
+    #[test]
+    fn b9_terminal_json_errors_keep_operation_identity() {
+        for state in [
+            pb::OperationState::Failed,
+            pb::OperationState::Cancelled,
+            pb::OperationState::CompletionUnknown,
+        ] {
+            let id = Uuid::new_v4();
+            let result = crate::operation_result(pb::OperationStatus {
+                operation_id: id.as_bytes().to_vec(),
+                state: state as i32,
+                error_summary: "injected failure".into(),
+                ..Default::default()
+            });
+            let mut err = Vec::new();
+            assert_eq!(
+                crate::finish_daemon_client_result(result.map(|_| ()), true, &mut err),
+                ExitCode::from(1)
+            );
+            let json: serde_json::Value = serde_json::from_slice(&err).unwrap();
+            assert_eq!(json["schema"], "rem.error.v1");
+            assert_eq!(json["code"], "operation_failed");
+            assert_eq!(json["details"]["operation_id"], id.to_string());
+            assert_eq!(
+                json["details"]["state"],
+                crate::operation_state_name(state as i32)
+            );
+        }
+    }
+    /// The user-facing reference and wire overview name the implemented retry contract.
+    #[test]
+    fn b9_closeout_reference_and_proto_describe_implemented_contract() {
+        let reference = include_str!("../../../docs/reference-cli.md");
+        let section = reference
+            .split("### rem tape closeout")
+            .nth(1)
+            .expect("closeout command section")
+            .split("### ")
+            .next()
+            .unwrap();
+        for required in [
+            "barcode",
+            "disambiguate",
+            "--expected-pool",
+            "--idempotency-key",
+            "before",
+            "stderr",
+            "details.operation_id",
+            "details.state",
+            "exit 1",
+            "exit 2",
+        ] {
+            assert!(
+                section.contains(required),
+                "missing closeout contract: {required}"
+            );
+        }
+        let proto = include_str!("../../../proto/layer5.proto");
+        let overview = proto.split("syntax =").next().unwrap();
+        assert!(overview.contains("Catalog.CloseoutTape and Catalog.FinalizeTape implement"));
     }
 }

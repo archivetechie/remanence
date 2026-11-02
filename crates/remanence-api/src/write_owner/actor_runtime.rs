@@ -325,6 +325,7 @@ pub(super) fn drive_loop(
     actor_tx: mpsc::Sender<DriveCommand>,
     mut rx: mpsc::Receiver<DriveCommand>,
 ) -> Option<MountedFinish> {
+    drive.set_command_deadline(cfg.lifecycle.as_ref().map(|l| l.shutdown_deadline.clone()));
     let mut index = match CatalogIndex::open(cfg.index_path.as_path()) {
         Ok(index) => index,
         Err(err) => {
@@ -337,6 +338,12 @@ pub(super) fn drive_loop(
     }
     let mut snapshot_misses = 0u32;
     while let Some(cmd) = rx.blocking_recv() {
+        // The existing ownership waiter covers every actor command through settlement.
+        let _active = cfg
+            .lifecycle
+            .as_ref()
+            .map(|l| l.actor_work.begin([0; 16], cfg.endpoint(bay)).0);
+
         match cmd {
             DriveCommand::OpenMountedWrite {
                 host_only_recovery,
@@ -572,7 +579,7 @@ pub(super) fn drive_loop(
                 );
                 if let Err(error) = &result {
                     let _ = stream_tx
-                        .blocking_send(Err(Status::new(error.code(), error.message().to_string())));
+                        .try_send(Err(Status::new(error.code(), error.message().to_string())));
                 }
                 let _ = reply.send(result);
             }
@@ -780,6 +787,7 @@ pub(super) fn drive_loop(
                 let _ = reply.send(result);
             }
             DriveCommand::PollHealth {
+                ownership: _ownership,
                 drive_uuid,
                 trigger,
                 session_id,
@@ -799,7 +807,11 @@ pub(super) fn drive_loop(
                 );
                 let _ = reply.send(result);
             }
-            DriveCommand::Heartbeat { drive_uuid, reply } => {
+            DriveCommand::Heartbeat {
+                ownership: _ownership,
+                drive_uuid,
+                reply,
+            } => {
                 let result = drive
                     .test_unit_ready()
                     .map_err(|err| Status::unavailable(format!("drive heartbeat: {err}")))
@@ -872,6 +884,8 @@ pub(super) fn drive_loop(
             }
             DriveCommand::ReadFile { chunk_tx, .. }
             | DriveCommand::ReadObjectRange { chunk_tx, .. } => {
+                chunk_tx
+                    .set_shutdown_signal(cfg.lifecycle.as_ref().map(|l| l.shutting_down.clone()));
                 let _ = chunk_tx.blocking_send(Err(Status::not_found("no active read session")));
             }
             DriveCommand::CloseRead { reply, .. } | DriveCommand::GetRead { reply, .. } => {

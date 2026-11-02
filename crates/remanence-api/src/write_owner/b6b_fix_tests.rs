@@ -22,7 +22,11 @@ pub(super) fn native_records(root: &Path) -> Vec<NativeRecord> {
 }
 
 /// Keep the media bootstrap and selected geometry identical for both policies.
-fn selection(root: &Path, world: &Arc<Mutex<VirtualWorld>>, parity: bool) -> SelectedTape {
+pub(super) fn selection(
+    root: &Path,
+    world: &Arc<Mutex<VirtualWorld>>,
+    parity: bool,
+) -> SelectedTape {
     if parity {
         return selected();
     }

@@ -190,18 +190,29 @@ fn wor_checkpoint_child() {
                 )
                 .unwrap();
             }
-            let error = owner.write_checkpointed(request).unwrap_err();
-            let crate::MountError::Actor(error) = error else {
-                panic!("expected typed actor error: {error}")
-            };
-            assert!(matches!(
-                error.pool_write_error.as_deref(),
-                Some(crate::PoolWriteError::InvalidInput(_))
-            ));
-            assert_eq!(
-                error.status.message(),
-                error.pool_write_error.as_ref().unwrap().to_string()
-            );
+            let result = owner.write_checkpointed(request);
+            if mode == "publish-failure" {
+                assert_eq!(
+                    result
+                        .expect("native durable receipt survives evidence failure")
+                        .object
+                        .caller_object_id,
+                    "wor-object"
+                );
+            } else {
+                let error = result.unwrap_err();
+                let crate::MountError::Actor(error) = error else {
+                    panic!("expected typed actor error: {error}")
+                };
+                assert!(matches!(
+                    error.pool_write_error.as_deref(),
+                    Some(crate::PoolWriteError::InvalidInput(_))
+                ));
+                assert_eq!(
+                    error.status.message(),
+                    error.pool_write_error.as_ref().unwrap().to_string()
+                );
+            }
             if mode == "mismatch" {
                 assert!(!fixture.commands.lock().unwrap()[before_object..]
                     .iter()
@@ -621,19 +632,10 @@ fn placed_library_returns_committed_receipt_after_checkpoint_publication_failure
         .store(9, std::sync::atomic::Ordering::Relaxed);
     let mut owner =
         MountedDrive::start_configured(state, mounted, cfg, Some(library.into_changer())).unwrap();
-    let error = owner
+    let receipt = owner
         .write_checkpointed(fixture.request("committed-before-failure"))
-        .unwrap_err();
-    let crate::MountError::Committed {
-        receipt, failure, ..
-    } = error
-    else {
-        panic!("missing committed receipt: {error}");
-    };
+        .expect("durable checkpoint returns its receipt despite host failure");
     assert_eq!(receipt.object.caller_object_id, "committed-before-failure");
-    assert!(failure
-        .to_string()
-        .contains("injected post-projection failure"));
     assert_eq!(owner.receipts().len(), 1);
     assert_eq!(owner.receipts()[0].object_id, receipt.object.object_id);
     let _ = owner.finish();

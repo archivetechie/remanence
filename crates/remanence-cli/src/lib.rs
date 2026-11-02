@@ -5991,6 +5991,11 @@ async fn wait_for_operation(
     let status = terminal.ok_or_else(|| {
         DaemonClientError::client("operation watch ended before a terminal status")
     })?;
+    operation_result(status)
+}
+
+/// Preserve terminal identity in the ordinary CLI error envelope.
+fn operation_result(status: pb::OperationStatus) -> Result<pb::OperationStatus, DaemonClientError> {
     if status.state != pb::OperationState::Succeeded as i32 {
         let state = operation_state_name(status.state);
         let detail = if status.error_summary.is_empty() {
@@ -5998,10 +6003,17 @@ async fn wait_for_operation(
         } else {
             format!("{state}: {}", status.error_summary)
         };
-        return Err(DaemonClientError::client(format!(
-            "operation {} finished {detail}",
-            bytes_to_uuid_text(&status.operation_id)
-        )));
+        return Err(DaemonClientError {
+            code: "operation_failed",
+            message: format!(
+                "operation {} finished {detail}",
+                bytes_to_uuid_text(&status.operation_id)
+            ),
+            details: Some(serde_json::json!({
+                "operation_id": bytes_to_uuid_text(&status.operation_id),
+                "state": state,
+            })),
+        });
     }
     Ok(status)
 }
@@ -6574,6 +6586,7 @@ impl CatalogUnitOriginFilterArg {
 struct DaemonClientError {
     code: &'static str,
     message: String,
+    details: Option<serde_json::Value>,
 }
 
 impl DaemonClientError {
@@ -6581,6 +6594,7 @@ impl DaemonClientError {
         Self {
             code: "daemon_client_error",
             message: message.into(),
+            details: None,
         }
     }
 
@@ -6589,6 +6603,7 @@ impl DaemonClientError {
         Self {
             code,
             message: format!("daemon returned {code}: {}", error.message()),
+            details: None,
         }
     }
 }
@@ -6637,7 +6652,12 @@ fn finish_daemon_client_result(
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             if json_output {
-                let _ = print_json_error(error.code, &error.message, err);
+                let _ = print_json_error_details(
+                    error.code,
+                    &error.message,
+                    error.details.unwrap_or_else(|| json!({})),
+                    err,
+                );
             } else {
                 let _ = writeln!(err, "error: {}", error.message);
             }
@@ -7396,12 +7416,21 @@ fn print_json_envelope(
 }
 
 fn print_json_error(code: &str, message: &str, err: &mut dyn Write) -> Result<(), String> {
+    print_json_error_details(code, message, json!({}), err)
+}
+
+fn print_json_error_details(
+    code: &str,
+    message: &str,
+    details: Value,
+    err: &mut dyn Write,
+) -> Result<(), String> {
     let envelope = json!({
         "schema": "rem.error.v1",
         "kind": "error",
         "code": code,
         "message": message,
-        "details": {}
+        "details": details
     });
     let envelope = with_capabilities(envelope);
     serde_json::to_writer(&mut *err, &envelope).map_err(|error| error.to_string())?;

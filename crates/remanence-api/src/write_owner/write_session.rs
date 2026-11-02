@@ -124,6 +124,12 @@ type FinishRequest = (
     oneshot::Receiver<Result<CloseWriteActorReply, Status>>,
 );
 
+/// Weak waiters retain no receipt after the corresponding append reply is dropped.
+type AppendReceiptWaiters = std::collections::HashMap<
+    Vec<u8>,
+    Vec<std::sync::Weak<std::sync::Mutex<Option<pb::ObjectRecord>>>>,
+>;
+
 pub(super) struct WriteSessionState<'a> {
     closing_error: Option<Status>,
     closing_work: Option<crate::drive_pool::ClosingGuard>,
@@ -159,6 +165,7 @@ pub(super) struct WriteSessionState<'a> {
     tape_committed_object_count: u64,
     pending_batch: Option<PendingCheckpointBatch>,
     committed_receipts: Vec<pb::ObjectRecord>,
+    append_receipts: AppendReceiptWaiters,
     timer_checkpoint_waiting: Option<Uuid>,
     append_gate: SessionAppendGate,
     append_commit_diagnostics: crate::pool_write::AppendCommitDiagnostics,
@@ -166,6 +173,29 @@ pub(super) struct WriteSessionState<'a> {
 }
 
 impl WriteSessionState<'_> {
+    /// Keep only live append waiters, independently of the batch claim contract.
+    fn append_receipt(
+        &mut self,
+        record: &pb::ObjectRecord,
+    ) -> std::sync::Arc<std::sync::Mutex<Option<pb::ObjectRecord>>> {
+        self.append_receipts.retain(|_, waiters| {
+            waiters.retain(|w| w.strong_count() != 0);
+            !waiters.is_empty()
+        });
+        let committed = record
+            .append_commit_info
+            .as_ref()
+            .is_none_or(|info| info.durability != pb::AppendDurability::Written as i32);
+        let receipt = std::sync::Arc::new(std::sync::Mutex::new(committed.then(|| record.clone())));
+        if !committed {
+            self.append_receipts
+                .entry(record.object_id.clone())
+                .or_default()
+                .push(std::sync::Arc::downgrade(&receipt));
+        }
+        receipt
+    }
+
     fn begin_closing_work(&mut self) {
         if self.closing_work.is_none() {
             if let Some(lifecycle) = &self.cfg.lifecycle {
@@ -205,6 +235,11 @@ impl WriteSessionState<'_> {
             self.begin_closing_work();
         }
         for record in &outcome.committed_objects {
+            if let Some(waiters) = self.append_receipts.remove(&record.object_id) {
+                for waiter in waiters.into_iter().filter_map(|w| w.upgrade()) {
+                    *waiter.lock().expect("append receipt lock") = Some(record.clone());
+                }
+            }
             retain_committed_receipt(&mut self.committed_receipts, record);
         }
         self.objects_committed = self.objects_committed.saturating_add(outcome.object_count);
@@ -526,7 +561,15 @@ impl WriteSessionState<'_> {
             }
         }
         if self.drive.command_deadline_expired() {
-            self.end_reason = SessionEndReason::GracefulShutdown;
+            // A shutdown cutoff cannot erase an already recorded failure.
+            if !matches!(
+                self.end_reason,
+                SessionEndReason::FailedAppend
+                    | SessionEndReason::DriveError
+                    | SessionEndReason::CloseoutFailed
+            ) {
+                self.end_reason = SessionEndReason::GracefulShutdown;
+            }
             if self.drive.command_completion_unknown() {
                 return Err(Status::unavailable(
                     "shutdown command completion unknown; crash recovery required",
@@ -935,7 +978,10 @@ impl WriteSessionState<'_> {
                         let record = pending
                             .object
                             .to_written_proto(batch_id, provisional_ordinal);
+                        let native_record = pending.object.clone();
                         let _ = reply.send(Ok(AppendFinishOutcome {
+                            native_record,
+                            durable_receipt: self.append_receipt(&record),
                             record,
                             replay: true,
                         }));
@@ -1047,6 +1093,7 @@ impl WriteSessionState<'_> {
                 let feed_wait = stream_control
                     .as_ref()
                     .map_or(result.transfer_feed_wait, |control| control.feed_wait());
+                let native_record = result.object.clone();
                 let logical_size = result.object.logical_size_bytes;
                 let replay = result.is_replay();
                 self.append_commit_diagnostics
@@ -1139,7 +1186,12 @@ impl WriteSessionState<'_> {
                                             self.end_reason = remanence_state::tape_log::SessionEndReason::FailedAppend;
                                             self.begin_closing_work();
                                             self.pending_batch = None;
-                                            let _ = reply.send(Err(status_from_selected_write_error(&selected, err)));
+                                            tracing::warn!(%err, "durable append; next context unavailable");
+                                            let record = outcome.committed_objects.iter().find(|r| r.object_id == object_id).cloned().expect("durable append receipt");
+                                            let _ = reply.send(Ok(AppendFinishOutcome {
+                                                native_record,
+                                                durable_receipt: self.append_receipt(&record), record, replay,
+                                            }));
                                             return;
                                         }
                                     };
@@ -1154,7 +1206,8 @@ impl WriteSessionState<'_> {
                                 self.pending_batch = None;
                                 committed
                             }
-                            Err(failure) => {
+                            Err(mut failure) => {
+                                let durable = failure.durable_outcome.take();
                                 let quarantine_identities = failure.requires_identity_quarantine();
                                 let status = failure.status;
                                 self.append_gate.record_failure();
@@ -1168,7 +1221,23 @@ impl WriteSessionState<'_> {
                                         .quarantine_write_admissions_until_restart();
                                 }
                                 self.pending_batch = None;
-                                let _ = reply.send(Err(status));
+                                if let Some(outcome) = durable {
+                                    self.retain_checkpoint_outcome(&outcome);
+                                    let record = outcome
+                                        .committed_objects
+                                        .iter()
+                                        .find(|r| r.object_id == object_id)
+                                        .cloned()
+                                        .expect("durable threshold checkpoint includes append");
+                                    let _ = reply.send(Ok(AppendFinishOutcome {
+                                        native_record,
+                                        durable_receipt: self.append_receipt(&record),
+                                        record,
+                                        replay,
+                                    }));
+                                } else {
+                                    let _ = reply.send(Err(status));
+                                }
                                 return;
                             }
                         }
@@ -1212,6 +1281,8 @@ impl WriteSessionState<'_> {
                     retain_committed_receipt(&mut self.committed_receipts, &response_record);
                 }
                 let _ = reply.send(Ok(AppendFinishOutcome {
+                    native_record,
+                    durable_receipt: self.append_receipt(&response_record),
                     record: response_record,
                     replay,
                 }));
@@ -1471,10 +1542,29 @@ impl WriteSessionState<'_> {
                                 self.pending_batch = None;
                                 let status = status_from_selected_write_error(&selected, err);
                                 if let Some(reply) = reply {
-                                    let _ = reply.send(Err(status));
-                                } else {
-                                    tracing::error!(session_id = %session_id, error = %status, "checkpoint committed but next append context failed");
+                                    let session = session_proto(WriteSessionProtoInput {
+                                        session_id,
+                                        tape_uuid: &tape_uuid,
+                                        target_kind,
+                                        state:
+                                            pb::write_session::State::WriteSessionStateCheckpointed,
+                                        objects_committed: self.objects_committed,
+                                        bytes_committed: self.bytes_committed,
+                                        opened_at_utc: &opened_at_utc,
+                                        last_checkpoint_at_utc: self
+                                            .last_checkpoint_at_utc
+                                            .as_deref(),
+                                        drive_element_address: cfg.wire_bay(bay),
+                                        pending_batch: None,
+                                    });
+                                    send_checkpoint_actor_reply(
+                                        reply,
+                                        session,
+                                        &mut self.committed_receipts,
+                                        trigger,
+                                    );
                                 }
+                                tracing::error!(session_id = %session_id, error = %status, "checkpoint committed but next append context failed");
                                 return;
                             }
                         };
@@ -1539,14 +1629,13 @@ impl WriteSessionState<'_> {
                     tracing::warn!(%error, "provisional tape-log rollback failed; abandonment remains fenced");
                 }
                 let quarantine_identities = failure.requires_identity_quarantine();
-                let durable =
-                    trigger == CheckpointTrigger::Shutdown && failure.durable_outcome.is_some();
+                let durable = failure.durable_outcome.is_some();
                 if durable {
                     if let Some(outcome) = failure.durable_outcome.take() {
                         self.retain_checkpoint_outcome(&outcome);
                     }
                     tracing::warn!(error = %failure.status, session_id = %self.session_id,
-                        "shutdown checkpoint durable; retaining receipts despite host failure");
+                        "checkpoint durable; retaining receipts despite host failure");
                 }
                 let status = failure.status;
                 self.append_gate.record_failure();
@@ -1887,8 +1976,8 @@ pub(super) fn handle_drive_open_write(
     snapshot_misses: &mut u32,
     request: OpenWriteActorRequest,
 ) -> Option<super::actor_runtime::MountedFinish> {
-    // The open may already be in flight when shutdown snapshots mounted owners.
-    // Apply the same cutoff to its bootstrap, suffix proof and admission work.
+    // Direct session fixtures use this entry without the actor dispatch loop.
+    // Both entries bind the same shared cutoff; setting it is idempotent.
     drive.set_command_deadline(cfg.lifecycle.as_ref().map(|l| l.shutdown_deadline.clone()));
     let OpenWriteActorRequest {
         actor,
@@ -2556,6 +2645,11 @@ pub(super) fn handle_drive_open_write(
         }
     }
     let ready = (|| -> Result<(), Status> {
+        if let Some(eod) = admission.ended_tail_eod {
+            checkpoint_lease
+                .record_session_tail_eod(eod)
+                .map_err(status_from_state_error)?;
+        }
         let snapshot = checkpoint_lease.freeze().map_err(status_from_state_error)?;
         if let Some(open) = &snapshot.tape_summary().open_session {
             checkpoint_lease
@@ -2725,6 +2819,7 @@ pub(super) fn handle_drive_open_write(
         tape_committed_object_count,
         pending_batch,
         committed_receipts,
+        append_receipts: Default::default(),
         timer_checkpoint_waiting,
         append_gate: SessionAppendGate::default(),
         append_commit_diagnostics: crate::pool_write::AppendCommitDiagnostics::default(),

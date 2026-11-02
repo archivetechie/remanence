@@ -286,6 +286,9 @@ struct Pending {
     directory_count: u64,
     directory_file: Option<u64>,
     tail_count: u64,
+    tail_possible: u64,
+    tail_synchronized: u64,
+    tail_unsynchronized: bool,
     tail_incomplete: bool,
     tail_torn_prefix: bool,
     sidecar_blocks: u64,
@@ -306,6 +309,9 @@ impl Pending {
             directory_count: 0,
             directory_file: None,
             tail_count: 0,
+            tail_possible: 0,
+            tail_synchronized: 0,
+            tail_unsynchronized: false,
             tail_incomplete: false,
             tail_torn_prefix: false,
             sidecar_blocks: 0,
@@ -564,6 +570,30 @@ impl Fold {
                         {
                             return Err(Fault::Invalid("tail order/group"));
                         }
+                        if file.synchronized_blocks > file.known_blocks
+                            || file.synchronized_filemark
+                                && (file.filemark != TailFilemark::Present
+                                    || file.synchronized_blocks != file.known_blocks
+                                    || file.unknown_blocks != 0)
+                            || p.tail_unsynchronized
+                                && (file.synchronized_blocks != 0 || file.synchronized_filemark)
+                        {
+                            return Err(Fault::Invalid("tail synchronization order"));
+                        }
+                        if file.synchronized_blocks > 0 || file.synchronized_filemark {
+                            p.tail_synchronized = add(
+                                add(p.tail_possible, file.synchronized_blocks)?,
+                                u64::from(file.synchronized_filemark),
+                            )?;
+                        }
+                        p.tail_possible = add(
+                            add(
+                                p.tail_possible,
+                                add(file.known_blocks, file.unknown_blocks)?,
+                            )?,
+                            u64::from(file.filemark != TailFilemark::Absent),
+                        )?;
+                        p.tail_unsynchronized |= !file.synchronized_filemark;
                         add(file.known_blocks, file.unknown_blocks)?;
                         if let TailIdentity::Object(id) = &file.identity {
                             if id.is_empty() || id.len() > 64 {
@@ -679,28 +709,55 @@ impl Fold {
                 self.summary.last_session_end = None;
             }
             Record::SessionEnded(end) => {
-                check_reference(&p, &end.tail)?;
-                validate_session_position(
-                    &self.summary,
-                    end.incarnation,
-                    end.base_media_sequence,
-                    end.cursor,
-                )?;
-                validate_time(&end.ended_at_utc)?;
-                if self
-                    .summary
-                    .open_session
-                    .as_ref()
-                    .is_none_or(|o| o.session_id != end.session_id)
-                    || p.rows != 0
-                    || p.directory_count != 0
-                    || p.tail_count != end.tail_file_count
-                    || p.tail_torn_prefix && end.reason != SessionEndReason::CrashRecovered
-                    || end.crash_ack_audit_sequence.is_some_and(|n| n == 0)
-                    || end.crash_ack_audit_sequence.is_some()
-                        && end.reason != SessionEndReason::CrashRecovered
-                {
-                    return Err(Fault::Invalid("session end transition"));
+                if let Some(eod) = end.proved_eod {
+                    require_empty(&p)?;
+                    validate_session_position(
+                        &self.summary,
+                        end.incarnation,
+                        end.base_media_sequence,
+                        end.cursor,
+                    )?;
+                    let previous = self
+                        .summary
+                        .last_session_end
+                        .as_ref()
+                        .ok_or(Fault::Invalid("tail EOD without ending"))?;
+                    let mut unchanged = end.clone();
+                    unchanged.proved_eod = previous.proved_eod;
+                    if &unchanged != previous
+                        || self.summary.open_session.is_some()
+                        || previous.proved_eod.is_some_and(|old| old != eod)
+                        || eod < add(end.cursor.lba, end.synchronized_tail_blocks)?
+                        || eod > add(end.cursor.lba, end.possible_tail_blocks)?
+                    {
+                        return Err(Fault::Invalid("tail EOD refinement"));
+                    }
+                } else {
+                    check_reference(&p, &end.tail)?;
+                    validate_session_position(
+                        &self.summary,
+                        end.incarnation,
+                        end.base_media_sequence,
+                        end.cursor,
+                    )?;
+                    validate_time(&end.ended_at_utc)?;
+                    if self
+                        .summary
+                        .open_session
+                        .as_ref()
+                        .is_none_or(|o| o.session_id != end.session_id)
+                        || p.rows != 0
+                        || p.directory_count != 0
+                        || p.tail_count != end.tail_file_count
+                        || p.tail_possible != end.possible_tail_blocks
+                        || p.tail_synchronized != end.synchronized_tail_blocks
+                        || p.tail_torn_prefix && end.reason != SessionEndReason::CrashRecovered
+                        || end.crash_ack_audit_sequence.is_some_and(|n| n == 0)
+                        || end.crash_ack_audit_sequence.is_some()
+                            && end.reason != SessionEndReason::CrashRecovered
+                    {
+                        return Err(Fault::Invalid("session end transition"));
+                    }
                 }
                 self.summary.open_session = None;
                 self.summary.last_session_end = Some(end.clone());

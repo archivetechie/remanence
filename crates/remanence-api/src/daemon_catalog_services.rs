@@ -255,8 +255,16 @@ impl pb::catalog_server::Catalog for CatalogService {
             .list_tapes(pool_id, kind)
             .map_err(status_from_state_error)?
             .into_iter()
-            .map(|tape| self.state.tape_with_debt_or_error(tape_to_proto(tape)))
             .collect::<Vec<_>>();
+        let state = self.state.clone();
+        let tapes = tokio::task::spawn_blocking(move || {
+            tapes
+                .into_iter()
+                .map(|tape| state.tape_with_debt_or_error(tape_to_proto(tape)))
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|e| Status::internal(format!("tape debt task: {e}")))?;
         let fences = self
             .state
             .index()?
@@ -317,17 +325,21 @@ impl pb::catalog_server::Catalog for CatalogService {
         authorize_request(&request, AuthPermission::Read)?;
         let request = request.into_inner();
         let tape_uuid = decode_uuid_bytes(request.tape_uuid.as_slice(), "tape_uuid")?;
-        let index = self.state.index()?;
-        let tape = index
-            .get_tape(&tape_uuid)
-            .map_err(|err| Status::internal(err.to_string()))?
-            .ok_or_else(|| Status::not_found("tape not found"))?;
-        let rollups = index
-            .tape_drive_correlation_rollups(&tape_uuid)
-            .map_err(status_from_state_error)?;
-        Ok(Response::new(self.state.tape_with_debt(
-            tape_to_proto_with_rollups(tape, rollups),
-        )?))
+        let state = self.state.clone();
+        let tape = tokio::task::spawn_blocking(move || {
+            let index = state.index()?;
+            let tape = index
+                .get_tape(&tape_uuid)
+                .map_err(|err| Status::internal(err.to_string()))?
+                .ok_or_else(|| Status::not_found("tape not found"))?;
+            let rollups = index
+                .tape_drive_correlation_rollups(&tape_uuid)
+                .map_err(status_from_state_error)?;
+            state.tape_with_debt(tape_to_proto_with_rollups(tape, rollups))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("tape debt task: {e}")))??;
+        Ok(Response::new(tape))
     }
 
     type GetTapeInventoryStream = TapeInventoryItemStream;
@@ -518,7 +530,7 @@ impl pb::catalog_server::Catalog for CatalogService {
         &self,
         request: Request<pb::CloseoutTapeRequest>,
     ) -> Result<Response<pb::OperationRef>, Status> {
-        let actor = authorize_request(&request, AuthPermission::Lifecycle)?;
+        let actor = authorize_request(&request, AuthPermission::OperationControl)?;
         crate::tape_closeout::start(&self.state, actor, request.into_inner()).map(Response::new)
     }
 

@@ -268,9 +268,9 @@ fields!(GroupRef; first_sequence,start_offset,frame_count,byte_count,member_coun
 fields!(Continuation; group,chunk);
 fields!(SessionCursor; partition,lba,next_file);
 fields!(SessionOpened; session_id,incarnation,base_media_sequence,cursor,opened_at_utc);
-fields!(SessionEnded; session_id,incarnation,base_media_sequence,cursor,ended_at_utc,reason,tail,tail_file_count,crash_ack_audit_sequence);
+fields!(SessionEnded; session_id,incarnation,base_media_sequence,cursor,ended_at_utc,reason,tail,tail_file_count,crash_ack_audit_sequence,synchronized_tail_blocks,possible_tail_blocks,proved_eod);
 fields!(ClosedOut; group,incarnation,operation_id,session_id,base_media_sequence,from_w,to_t,epoch_id,sidecar_file_number,check_before,cursor_after,next_file,next_epoch,completed_at_utc);
-fields!(TailFile; tape_file_number,identity,known_blocks,unknown_blocks,filemark);
+fields!(TailFile; tape_file_number,identity,known_blocks,unknown_blocks,filemark,synchronized_blocks,synchronized_filemark);
 enumeration!(SessionEndReason; 0=>CleanClose,1=>Abort,2=>FailedAppend,3=>ClientStall,4=>DriveError,5=>GracefulShutdown,6=>ClientDisconnected,7=>CrashRecovered,8=>CloseoutFailed);
 enumeration!(TailFilemark; 0=>Present,1=>Absent,2=>Unknown);
 impl Wire for TailIdentity {
