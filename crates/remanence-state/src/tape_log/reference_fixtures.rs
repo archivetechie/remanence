@@ -27,6 +27,7 @@ enum Class {
     Complete,
     Torn,
     RecoveryRequired,
+    FoldRejected(&'static str),
 }
 
 struct Case {
@@ -87,6 +88,82 @@ fn last_frame(bytes: &[u8], uuid: [u8; 16]) -> u64 {
         last = Some(frame.offset);
     }
     last.unwrap()
+}
+
+/// Exercise the production session writer, including the empty refinement group.
+fn tail_log(refined: bool) -> Vec<u8> {
+    written(PARITY_OFF, |w| {
+        w.publish_report(&(&record(PARITY_OFF)).into()).unwrap();
+        w.end_session(
+            [9; 16],
+            "2026-11-02T00:02:00Z".into(),
+            SessionEndReason::Abort,
+            None,
+            [
+                Ok(TailFile {
+                    tape_file_number: 2,
+                    identity: TailIdentity::Object("tail-first".into()),
+                    known_blocks: 2,
+                    unknown_blocks: 0,
+                    filemark: TailFilemark::Present,
+                    synchronized_blocks: 2,
+                    synchronized_filemark: true,
+                }),
+                Ok(TailFile {
+                    tape_file_number: 3,
+                    identity: TailIdentity::Object("tail-second".into()),
+                    known_blocks: 4,
+                    unknown_blocks: 0,
+                    filemark: TailFilemark::Present,
+                    synchronized_blocks: 0,
+                    synchronized_filemark: false,
+                }),
+            ],
+        )
+        .unwrap();
+        if refined {
+            w.record_session_tail_eod(11).unwrap();
+            w.open_session([10; 16], "2026-11-02T00:03:00Z".into())
+                .unwrap();
+        }
+    })
+}
+
+/// Invalid semantic candidates must bypass writer preflight. Use the production
+/// frame encoder (including all CRCs), never hand-built wire bytes.
+fn rejected_tail(base: &[u8], open: bool, change_reason: bool) -> Vec<u8> {
+    let mut reader = Cursor::new(base);
+    Header::decode(&mut reader, PARITY_OFF).unwrap();
+    let start = reader.position();
+    let mut decoder = Decoder::at(reader, 1, start);
+    let mut ending = None;
+    let mut sequence = 0;
+    while let Some(frame) = decoder.next_frame().unwrap() {
+        sequence = frame.sequence;
+        if let Record::SessionEnded(end) = frame.record {
+            ending = Some(end);
+        }
+    }
+    let mut end = ending.unwrap();
+    let mut bytes = base.to_vec();
+    if open {
+        let opened = SessionOpened {
+            session_id: [10; 16],
+            incarnation: end.incarnation,
+            base_media_sequence: end.base_media_sequence,
+            cursor: end.cursor,
+            opened_at_utc: "2026-11-02T00:03:00Z".into(),
+        };
+        sequence += 1;
+        super::codec::encode_frame(&mut bytes, sequence, &Record::SessionOpened(opened), &[])
+            .unwrap();
+    }
+    end.proved_eod = Some(if open || change_reason { 11 } else { 8 });
+    if change_reason {
+        end.reason = SessionEndReason::CleanClose;
+    }
+    super::codec::encode_frame(&mut bytes, sequence + 1, &Record::SessionEnded(end), &[]).unwrap();
+    bytes
 }
 
 fn cases() -> Vec<Case> {
@@ -179,7 +256,21 @@ fn cases() -> Vec<Case> {
     // One flipped bit in the final closing frame's structural section.
     let mut damaged = two_objects.clone();
     damaged[last_frame(&two_objects, PARITY_OFF) as usize + PREFIX_LEN] ^= 0x80;
+    let tail = tail_log(false);
     vec![
+        Case { name: "session-tail-refinement-rejected/below-synchronized.remtape", uuid: PARITY_OFF,
+            class: Class::FoldRejected("tail EOD refinement"), about: "Refinement EOD 8 is below the synchronized bound 9.",
+            bytes: rejected_tail(&tail, false, false) },
+        Case { name: "session-tail-refinement-rejected/reason-mismatch.remtape", uuid: PARITY_OFF,
+            class: Class::FoldRejected("tail EOD refinement"), about: "Refinement changes Abort to CleanClose.",
+            bytes: rejected_tail(&tail, false, true) },
+        Case { name: "session-tail-refinement-rejected/session-open.remtape", uuid: PARITY_OFF,
+            class: Class::FoldRejected("tail EOD without ending"), about: "A new SessionOpened clears the previous ending; refinement while open is refused.",
+            bytes: rejected_tail(&tail, true, false) },
+        Case { name: "session-tail-synchronized.remtape", uuid: PARITY_OFF, class: Class::Complete,
+            about: "Two tail files: fully synchronized then accepted only. Cursor 6, synchronized tail 3, possible tail 8; absolute bounds [9,14], proved_eod null.", bytes: tail },
+        Case { name: "session-tail-refined.remtape", uuid: PARITY_OFF, class: Class::Complete,
+            about: "The synchronized log followed by a refinement proving EOD 11 strictly inside [9,14], then SessionOpened for reuse.", bytes: tail_log(true) },
         Case {
             name: "parity-off-two-objects.remtape",
             uuid: PARITY_OFF,
@@ -249,7 +340,7 @@ fn describe(case: &Case, frames_tsv: &mut String, summary_tsv: &mut String) -> S
     let header_len = reader.position();
     let mut decoder = Decoder::at(reader, 1, header_len);
     let mut frames = Vec::new();
-    let (class, tail) = loop {
+    let (mut class, mut tail) = loop {
         match decoder.next_frame() {
             Ok(Some(frame)) => {
                 frames.push((frame.offset, frame.end, frame.sequence, frame.record.tag()))
@@ -277,11 +368,28 @@ fn describe(case: &Case, frames_tsv: &mut String, summary_tsv: &mut String) -> S
             Err(error) => panic!("{}: {error}", case.name),
         }
     };
-    assert!(class == case.class, "{}: decoded {tail}", case.name);
+    assert!(
+        class == case.class
+            || matches!(case.class, Class::FoldRejected(_)) && class == Class::Complete,
+        "{}: decoded {tail}",
+        case.name
+    );
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open_fixture(dir.path(), case.uuid).unwrap();
     std::fs::write(store.path(), &case.bytes).unwrap();
     let inspection = store.inspect_tail().unwrap();
+    if let Class::FoldRejected(fault) = case.class {
+        let (offset, _, sequence, _) = frames.last().unwrap();
+        let expected = format!("tape log recovery required at byte {offset}, sequence Some({sequence}): invalid record: {fault}");
+        assert_eq!(inspection.damage.as_deref(), Some(expected.as_str()));
+        let error = match store.snapshot() {
+            Ok(_) => panic!("{} unexpectedly accepted", case.name),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), expected);
+        tail = expected;
+        class = case.class;
+    }
     assert_eq!(
         inspection.damage.is_some(),
         class != Class::Complete,
@@ -409,6 +517,61 @@ this README, are generated: `cargo test -p remanence-state --lib
 reference_tape_logs` fails if any checked-in byte differs. To regenerate, set
 `TAPE_LOG_FIXTURE_EXPORT_DIR` to an empty directory, run that test, and copy
 the exported files here.
+
+## B9 tail wire layout and fold rules
+
+Records use canonical CBOR maps with ascending unsigned integer keys, definite
+lengths and shortest integer encodings. SessionEnded (tag 19) has 12 fields;
+TailFile (the TailFile continuation chunk) has 7 fields. Existing keys retain
+their meanings. New fields are mandatory, including zero, false and null values:
+
+| Record | Key | Field | CBOR type | Meaning |
+|---|---:|---|---|---|
+| SessionEnded | 9 | synchronized_tail_blocks | unsigned u64 | Durable tail extent in logical blocks, including synchronized filemarks; relative to cursor.lba. |
+| SessionEnded | 10 | possible_tail_blocks | unsigned u64 | Sum of known_blocks + unknown_blocks + one for each non-Absent filemark. |
+| SessionEnded | 11 | proved_eod | unsigned u64 or null | Absolute physical EOD; null for an ordinary ending, set for a refinement. |
+| TailFile | 5 | synchronized_blocks | unsigned u64 | Synchronized prefix of known_blocks. |
+| TailFile | 6 | synchronized_filemark | boolean | Whether the filemark is synchronized. |
+
+`session-tail-synchronized.remtape` exercises every new key: file 2 has
+known_blocks=2, synchronized_blocks=2 and synchronized_filemark=true; file 3
+has known_blocks=4, synchronized_blocks=0 and synchronized_filemark=false.
+Both have unknown_blocks=0 and filemark=Present. The ending has keys 9=3,
+10=8, 11=null. Its cursor.lba=6 makes the absolute bounds [9,14].
+
+Synchronization must form a prefix: synchronized_blocks cannot exceed
+known_blocks. A synchronized filemark requires Present, all known blocks
+synchronized and no unknown blocks. After any file without a synchronized
+filemark, subsequent files may have neither synchronized blocks nor a
+synchronized filemark. Violations report `invalid record: tail synchronization order`.
+The synchronized vector exercises the allowed fully synchronized to accepted-only
+transition. Tail file numbers are contiguous from next_file; the ordinary ending
+binds the continuation group and its exact count and computed bounds.
+
+`session-tail-refined.remtape` repeats that log byte-for-byte, then adds a
+SessionEnded with key 11=11, strictly between 9 and 14. This uses
+`record_session_tail_eod`: the refinement has no preceding continuation frames,
+but retains the original tail GroupRef and every other field of the ending.
+It does not rebind the tail to the empty refinement group. A new SessionOpened
+then demonstrates reuse. The fold requires an empty continuation group, the
+same session position and all original ending fields except proved_eod, no open
+session, and EOD within the inclusive synchronized/possible bounds. An existing
+proof cannot change. SessionOpened clears the prior ending.
+
+The negative vectors use the production frame encoder on writer-produced logs,
+so their CRCs and schema are valid; the fold rejects their semantics. Their exact
+errors (including byte offsets and sequences) appear in each section and in the
+manifest tail column:
+
+- `session-tail-refinement-rejected/below-synchronized.remtape`: EOD 8 < 9.
+- `session-tail-refinement-rejected/reason-mismatch.remtape`: changes reason.
+- `session-tail-refinement-rejected/session-open.remtape`: refinement after a
+  new session opens, when no previous ending remains available to refine.
+
+For rejected files the frame table includes the rejected frame; counters describe
+the validated prefix before it. `reference_tape_logs_production_reader_matches_manifest`
+reads every checked-in vector through the production codec and store fold and
+compares all manifest fields and frame rows, including exact rejection errors.
 ";
 
 fn generate() -> BTreeMap<String, Vec<u8>> {
@@ -443,17 +606,12 @@ fn reference_tape_logs_regenerate_byte_exactly() {
             "export directory must be empty"
         );
         for (name, bytes) in &generated {
-            std::fs::write(directory.join(name), bytes).unwrap();
+            let path = directory.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
         }
     }
-    let mut checked_in = BTreeMap::new();
-    for entry in std::fs::read_dir(root()).unwrap() {
-        let path = entry.unwrap().path();
-        checked_in.insert(
-            path.file_name().unwrap().to_str().unwrap().to_string(),
-            std::fs::read(&path).unwrap(),
-        );
-    }
+    let checked_in = corpus_files(&root());
     assert_eq!(
         checked_in.keys().collect::<Vec<_>>(),
         generated.keys().collect::<Vec<_>>()
@@ -464,4 +622,44 @@ fn reference_tape_logs_regenerate_byte_exactly() {
             "{name} drifted from fixtures/tape-log"
         );
     }
+}
+
+/// Read nested negative-vector directories as well as the top-level corpus.
+fn corpus_files(directory: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    for entry in std::fs::read_dir(directory).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_str().unwrap();
+        if path.is_dir() {
+            for (child, bytes) in corpus_files(&path) {
+                files.insert(format!("{name}/{child}"), bytes);
+            }
+        } else {
+            files.insert(name.to_string(), std::fs::read(&path).unwrap());
+        }
+    }
+    files
+}
+
+/// Decode checked-in bytes, independently of regeneration, through the production
+/// codec and store fold; compare every manifest field and every frame boundary.
+#[test]
+fn reference_tape_logs_production_reader_matches_manifest() {
+    let mut files = corpus_files(&root());
+    let manifest = String::from_utf8(files.remove("MANIFEST.tsv").unwrap()).unwrap();
+    let expected_frames = String::from_utf8(files.remove("FRAMES.tsv").unwrap()).unwrap();
+    files.remove("README.md").unwrap();
+    let mut summary = manifest.lines().next().unwrap().to_string() + "\n";
+    let mut frames = expected_frames.lines().next().unwrap().to_string() + "\n";
+    for mut case in cases() {
+        case.bytes = files.remove(case.name).expect("missing corpus vector");
+        describe(&case, &mut frames, &mut summary);
+    }
+    assert!(
+        files.is_empty(),
+        "unlisted corpus files: {:?}",
+        files.keys()
+    );
+    assert_eq!(summary, manifest);
+    assert_eq!(frames, expected_frames);
 }

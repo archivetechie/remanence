@@ -29,6 +29,172 @@ reference_tape_logs` fails if any checked-in byte differs. To regenerate, set
 `TAPE_LOG_FIXTURE_EXPORT_DIR` to an empty directory, run that test, and copy
 the exported files here.
 
+## B9 tail wire layout and fold rules
+
+Records use canonical CBOR maps with ascending unsigned integer keys, definite
+lengths and shortest integer encodings. SessionEnded (tag 19) has 12 fields;
+TailFile (the TailFile continuation chunk) has 7 fields. Existing keys retain
+their meanings. New fields are mandatory, including zero, false and null values:
+
+| Record | Key | Field | CBOR type | Meaning |
+|---|---:|---|---|---|
+| SessionEnded | 9 | synchronized_tail_blocks | unsigned u64 | Durable tail extent in logical blocks, including synchronized filemarks; relative to cursor.lba. |
+| SessionEnded | 10 | possible_tail_blocks | unsigned u64 | Sum of known_blocks + unknown_blocks + one for each non-Absent filemark. |
+| SessionEnded | 11 | proved_eod | unsigned u64 or null | Absolute physical EOD; null for an ordinary ending, set for a refinement. |
+| TailFile | 5 | synchronized_blocks | unsigned u64 | Synchronized prefix of known_blocks. |
+| TailFile | 6 | synchronized_filemark | boolean | Whether the filemark is synchronized. |
+
+`session-tail-synchronized.remtape` exercises every new key: file 2 has
+known_blocks=2, synchronized_blocks=2 and synchronized_filemark=true; file 3
+has known_blocks=4, synchronized_blocks=0 and synchronized_filemark=false.
+Both have unknown_blocks=0 and filemark=Present. The ending has keys 9=3,
+10=8, 11=null. Its cursor.lba=6 makes the absolute bounds [9,14].
+
+Synchronization must form a prefix: synchronized_blocks cannot exceed
+known_blocks. A synchronized filemark requires Present, all known blocks
+synchronized and no unknown blocks. After any file without a synchronized
+filemark, subsequent files may have neither synchronized blocks nor a
+synchronized filemark. Violations report `invalid record: tail synchronization order`.
+The synchronized vector exercises the allowed fully synchronized to accepted-only
+transition. Tail file numbers are contiguous from next_file; the ordinary ending
+binds the continuation group and its exact count and computed bounds.
+
+`session-tail-refined.remtape` repeats that log byte-for-byte, then adds a
+SessionEnded with key 11=11, strictly between 9 and 14. This uses
+`record_session_tail_eod`: the refinement has no preceding continuation frames,
+but retains the original tail GroupRef and every other field of the ending.
+It does not rebind the tail to the empty refinement group. A new SessionOpened
+then demonstrates reuse. The fold requires an empty continuation group, the
+same session position and all original ending fields except proved_eod, no open
+session, and EOD within the inclusive synchronized/possible bounds. An existing
+proof cannot change. SessionOpened clears the prior ending.
+
+The negative vectors use the production frame encoder on writer-produced logs,
+so their CRCs and schema are valid; the fold rejects their semantics. Their exact
+errors (including byte offsets and sequences) appear in each section and in the
+manifest tail column:
+
+- `session-tail-refinement-rejected/below-synchronized.remtape`: EOD 8 < 9.
+- `session-tail-refinement-rejected/reason-mismatch.remtape`: changes reason.
+- `session-tail-refinement-rejected/session-open.remtape`: refinement after a
+  new session opens, when no previous ending remains available to refine.
+
+For rejected files the frame table includes the rejected frame; counters describe
+the validated prefix before it. `reference_tape_logs_production_reader_matches_manifest`
+reads every checked-in vector through the production codec and store fold and
+compares all manifest fields and frame rows, including exact rejection errors.
+
+## session-tail-refinement-rejected/below-synchronized.remtape
+
+Refinement EOD 8 is below the synchronized bound 9.
+
+- bytes: 1577, SHA-256 c8df67a6dd3b3848a579de97dbc864c407a3b14fb8eb26ceb579c515fe616fe4
+- header: tape UUID a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1, block size 262144, scheme none, 51 bytes
+- tail: tape log recovery required at byte 1418, sequence Some(9): invalid record: tail EOD refinement
+- authoritative prefix: last closed sequence 8, closed end 1418
+- counters: objects 1, next file 2, W 0, T 3, check 0000000000000000 (Empty), next epoch 0, cursor 0:6, sealed false
+
+| sequence | tag | offset | end |
+|---:|---|---:|---:|
+| 1 | Initialized (1) | 51 | 150 |
+| 2 | SessionOpened (18) | 150 | 247 |
+| 3 | PayloadContinuation (2) | 247 | 440 |
+| 4 | PayloadContinuation (2) | 440 | 921 |
+| 5 | Committed (3) | 921 | 1104 |
+| 6 | PayloadContinuation (2) | 1104 | 1181 |
+| 7 | PayloadContinuation (2) | 1181 | 1259 |
+| 8 | SessionEnded (19) | 1259 | 1418 |
+| 9 | SessionEnded (19) | 1418 | 1577 |
+
+## session-tail-refinement-rejected/reason-mismatch.remtape
+
+Refinement changes Abort to CleanClose.
+
+- bytes: 1577, SHA-256 7b3817a46c97a608b59c3eac7cf79fbcae1b560806ac8933f01f8a2756325a2b
+- header: tape UUID a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1, block size 262144, scheme none, 51 bytes
+- tail: tape log recovery required at byte 1418, sequence Some(9): invalid record: tail EOD refinement
+- authoritative prefix: last closed sequence 8, closed end 1418
+- counters: objects 1, next file 2, W 0, T 3, check 0000000000000000 (Empty), next epoch 0, cursor 0:6, sealed false
+
+| sequence | tag | offset | end |
+|---:|---|---:|---:|
+| 1 | Initialized (1) | 51 | 150 |
+| 2 | SessionOpened (18) | 150 | 247 |
+| 3 | PayloadContinuation (2) | 247 | 440 |
+| 4 | PayloadContinuation (2) | 440 | 921 |
+| 5 | Committed (3) | 921 | 1104 |
+| 6 | PayloadContinuation (2) | 1104 | 1181 |
+| 7 | PayloadContinuation (2) | 1181 | 1259 |
+| 8 | SessionEnded (19) | 1259 | 1418 |
+| 9 | SessionEnded (19) | 1418 | 1577 |
+
+## session-tail-refinement-rejected/session-open.remtape
+
+A new SessionOpened clears the previous ending; refinement while open is refused.
+
+- bytes: 1674, SHA-256 c10d1d0c2c233e7e267dc21ba8cca770d116b77586e98d8ed11463eb04a6200c
+- header: tape UUID a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1, block size 262144, scheme none, 51 bytes
+- tail: tape log recovery required at byte 1515, sequence Some(10): invalid record: tail EOD without ending
+- authoritative prefix: last closed sequence 9, closed end 1515
+- counters: objects 1, next file 2, W 0, T 3, check 0000000000000000 (Empty), next epoch 0, cursor 0:6, sealed false
+
+| sequence | tag | offset | end |
+|---:|---|---:|---:|
+| 1 | Initialized (1) | 51 | 150 |
+| 2 | SessionOpened (18) | 150 | 247 |
+| 3 | PayloadContinuation (2) | 247 | 440 |
+| 4 | PayloadContinuation (2) | 440 | 921 |
+| 5 | Committed (3) | 921 | 1104 |
+| 6 | PayloadContinuation (2) | 1104 | 1181 |
+| 7 | PayloadContinuation (2) | 1181 | 1259 |
+| 8 | SessionEnded (19) | 1259 | 1418 |
+| 9 | SessionOpened (18) | 1418 | 1515 |
+| 10 | SessionEnded (19) | 1515 | 1674 |
+
+## session-tail-synchronized.remtape
+
+Two tail files: fully synchronized then accepted only. Cursor 6, synchronized tail 3, possible tail 8; absolute bounds [9,14], proved_eod null.
+
+- bytes: 1418, SHA-256 f3f19a7f510efd462119fc4b7f33e68f35c2876e865c2d373e7ddbbec57926c9
+- header: tape UUID a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1, block size 262144, scheme none, 51 bytes
+- tail: complete
+- authoritative prefix: last closed sequence 8, closed end 1418
+- counters: objects 1, next file 2, W 0, T 3, check 0000000000000000 (Empty), next epoch 0, cursor 0:6, sealed false
+
+| sequence | tag | offset | end |
+|---:|---|---:|---:|
+| 1 | Initialized (1) | 51 | 150 |
+| 2 | SessionOpened (18) | 150 | 247 |
+| 3 | PayloadContinuation (2) | 247 | 440 |
+| 4 | PayloadContinuation (2) | 440 | 921 |
+| 5 | Committed (3) | 921 | 1104 |
+| 6 | PayloadContinuation (2) | 1104 | 1181 |
+| 7 | PayloadContinuation (2) | 1181 | 1259 |
+| 8 | SessionEnded (19) | 1259 | 1418 |
+
+## session-tail-refined.remtape
+
+The synchronized log followed by a refinement proving EOD 11 strictly inside [9,14], then SessionOpened for reuse.
+
+- bytes: 1674, SHA-256 6f8d8f4e4654d96be2f9c953ab305b1f6b49c033781d843f0f8eaee8fc7291a7
+- header: tape UUID a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1, block size 262144, scheme none, 51 bytes
+- tail: complete
+- authoritative prefix: last closed sequence 10, closed end 1674
+- counters: objects 1, next file 2, W 0, T 3, check 0000000000000000 (Empty), next epoch 0, cursor 0:6, sealed false
+
+| sequence | tag | offset | end |
+|---:|---|---:|---:|
+| 1 | Initialized (1) | 51 | 150 |
+| 2 | SessionOpened (18) | 150 | 247 |
+| 3 | PayloadContinuation (2) | 247 | 440 |
+| 4 | PayloadContinuation (2) | 440 | 921 |
+| 5 | Committed (3) | 921 | 1104 |
+| 6 | PayloadContinuation (2) | 1104 | 1181 |
+| 7 | PayloadContinuation (2) | 1181 | 1259 |
+| 8 | SessionEnded (19) | 1259 | 1418 |
+| 9 | SessionEnded (19) | 1418 | 1577 |
+| 10 | SessionOpened (18) | 1577 | 1674 |
+
 ## parity-off-two-objects.remtape
 
 Parity-off tape: Initialized and two Object barriers.
