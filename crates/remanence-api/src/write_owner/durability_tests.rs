@@ -208,6 +208,10 @@ fn selected() -> SelectedTape {
 }
 
 fn setup(root: &Path) -> Arc<Mutex<VirtualWorld>> {
+    setup_with_barcode(root, BARCODE)
+}
+
+fn setup_with_barcode(root: &Path, barcode: &str) -> Arc<Mutex<VirtualWorld>> {
     let mut index = CatalogIndex::open(root.join("state.sqlite")).unwrap();
     index
         .upsert_tape_pool_projection(TapePoolProjectionInput {
@@ -221,7 +225,7 @@ fn setup(root: &Path) -> Arc<Mutex<VirtualWorld>> {
     index
         .provision_tape(ProvisionTapeInput {
             tape_uuid: TAPE,
-            voltag: BARCODE.into(),
+            voltag: barcode.into(),
             block_size: BLOCK,
             parity: ParityConfig::Scheme(scheme()),
             force: false,
@@ -261,7 +265,7 @@ fn setup(root: &Path) -> Arc<Mutex<VirtualWorld>> {
     tape.written_bytes = BLOCK.into();
     tape.durable_frontier = 2;
     let mut world = VirtualWorld::single_drive(LIBRARY, BAY, DRIVE, 0x400, 1);
-    world.put_tape_in_drive(BAY, BARCODE, Some(0x400), tape);
+    world.put_tape_in_drive(BAY, barcode, Some(0x400), tape);
     Arc::new(Mutex::new(world))
 }
 
@@ -408,7 +412,12 @@ async fn open_writer_configured(
         target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
         needs_drive_load: false,
         library_serial: Some(LIBRARY.into()),
-        barcode: Some(BARCODE.into()),
+        barcode: CatalogIndex::open(&cfg.index_path)
+            .unwrap()
+            .get_tape(&TAPE)
+            .unwrap()
+            .unwrap()
+            .voltag,
         source_slot: None,
         drive_uuid: None,
         drive_serial: Some(DRIVE.into()),

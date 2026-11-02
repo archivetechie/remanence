@@ -126,12 +126,12 @@ As the kit user, with the four-barcode allowlist already recorded:
 ```bash
 export FIELD_MIRIA_ATTESTATION="$HOME/miria-exclusion.txt"
 export FIELD_SESSION_EPOCH_ARM=session-epoch-a
-export REM_CHAOS_ENABLED=1 REM_CHAOS_ALLOW_REAL=1
+export REM_FIELD_ALLOW_FAIL=1
 /opt/remfield/current/run.sh plan/session-epoch-a.env
 ```
 
-The chaos variables explicitly arm the one-shot failed-append test in the
-separately compiled field binary. They do not select an epoch policy. Ordinary
+`REM_FIELD_ALLOW_FAIL=1` explicitly arms the one-shot failed-append test in
+the separately compiled field binary. It does not select an epoch policy. Ordinary
 production builds have no field dispatch hook. Each fault requires a durable
 prefix receipt in an open session, then a completed data WRITE for a second
 object whose Finish has been withheld. SIGKILL targets the verified daemon PID.
@@ -140,9 +140,22 @@ The restart closes out that exact UUID. No unexpected complete tail is approved.
 Expect several long reads and sidecar writes, especially for the near-full
 (default approximately 16 GiB) epoch. There is no one-minute pass threshold.
 `rem top` shows closeout debt and its retry reason while work proceeds.
-Stop with Ctrl-C or TERM to `run.sh`. Teardown releases any test hold, cancels
-the stream, attempts Abort, returns allowlisted cartridges, stops the daemon
+Stop with Ctrl-C or TERM to `run.sh`. Teardown stops the helper and waits for daemon-observed stream cancellation
+before releasing a live test hold. It attempts Abort, returns allowlisted
+cartridges, stops the daemon
 and packs evidence. Do not manually unload a busy drive. If a shutdown deadline
 expires, retain the crash evidence and inspect the reported state before reuse.
 The service-manager stop timeout must exceed the 300-second default close
 deadline plus a margin; the kit stop path supplies its own bounded wait.
+
+The kit refuses before device access if `REM_CHAOS_ENABLED`,
+`REM_CHAOS_ALLOW_REAL` or `REM_CHAOS_STATE` is present, even with an empty value.
+The refusal names the variable; clear it deliberately before starting the kit.
+`REM_FIELD_ALLOW_FAIL=1` arms only the field failure and is required by preflight.
+The arm is consumed at object begin and checks the tape UUID and its catalog
+barcode. Its nonce correlates helper/daemon evidence; it is not compared with a
+separate daemon-held nonce or used as an authorization token.
+`gate/holding.json` marks a live hold; `gate/timeout.json` records expiry.
+Kill requires the live marker and refuses expiry. The helper and verifier also
+refuse expiry, retaining the observed gate state in the evidence.
+Dry review packages refuse direct script entry as well as `run.sh`.

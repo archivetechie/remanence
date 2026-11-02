@@ -495,7 +495,7 @@ impl MediaFencedTransport {
             &self.field_identity,
             cdb,
             buf.len(),
-            &result,
+            &result.as_ref().map(Clone::clone),
             started.elapsed(),
         );
         self.verification
@@ -530,10 +530,7 @@ impl MediaFencedTransport {
             &self.field_identity,
             cdb,
             0,
-            &result
-                .as_ref()
-                .map(|_| TransferOutcome::clean(0))
-                .map_err(|e| ScsiError::Io(std::io::Error::other(e.to_string()))),
+            &result.as_ref().map(|_| TransferOutcome::clean(0)),
             started.elapsed(),
         );
         self.verification
@@ -664,7 +661,7 @@ impl MediaFencedTransport {
                     &self.field_identity,
                     cdb,
                     buf.len(),
-                    &result,
+                    &result.as_ref().map(Clone::clone),
                     started.elapsed(),
                 );
                 self.verification
@@ -682,10 +679,7 @@ impl MediaFencedTransport {
                     &self.field_identity,
                     cdb,
                     0,
-                    &result
-                        .as_ref()
-                        .map(|_| TransferOutcome::clean(0))
-                        .map_err(|e| ScsiError::Io(std::io::Error::other(e.to_string()))),
+                    &result.as_ref().map(|_| TransferOutcome::clean(0)),
                     started.elapsed(),
                 );
                 self.verification.dispatch(
@@ -1073,6 +1067,65 @@ mod tests {
         assert!(
             !wrap_map_is_servable(map_epoch, control.write_epoch()),
             "the pre-write map is never served after the fence"
+        );
+    }
+}
+
+/// Raw sense must survive both no-data command paths, before error decoding.
+#[cfg(all(test, feature = "field-kit", target_os = "linux"))]
+#[test]
+fn b8_no_data_trace_preserves_raw_sense() {
+    const CHILD: &str = "REM_B8_TRACE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "handle::tape_io::media_gate::b8_no_data_trace_preserves_raw_sense",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    struct SenseTransport;
+    impl SgTransport for SenseTransport {
+        fn execute_in(&mut self, _: &[u8], _: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
+            panic!("unexpected data-in")
+        }
+        fn execute_out(&mut self, _: &[u8], _: &[u8]) -> Result<TransferOutcome, ScsiError> {
+            panic!("unexpected data-out")
+        }
+        fn execute_none(&mut self, _: &[u8]) -> Result<(), ScsiError> {
+            Err(ScsiError::CheckCondition {
+                bytes_transferred: 0,
+                sense: vec![0x70, 0, 3, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0x11, 0],
+            })
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("commands.jsonl");
+    std::env::set_var("REM_FIELD_TRACE", &path);
+    let mut transport = MediaFencedTransport::new(Box::new(SenseTransport));
+    for opcode in [0x10, 0x11, 0x2b, 0x01] {
+        let cdb = [opcode, 0, 0, 0, 1, 0];
+        if opcode == 0x10 {
+            assert!(transport.dispatch_media_none(&cdb).is_err());
+        } else {
+            assert!(transport.execute_none_nonmedia(&cdb).is_err());
+        }
+    }
+    let rows: Vec<serde_json::Value> = std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 4);
+    for (row, opcode) in rows.iter().zip([0x10, 0x11, 0x2b, 0x01]) {
+        assert_eq!(row["cdb"][0], opcode);
+        assert_eq!(
+            row["sense_raw"],
+            serde_json::json!([0x70, 0, 3, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0x11, 0])
         );
     }
 }

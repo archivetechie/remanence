@@ -1492,9 +1492,8 @@ async fn b8_field_failure_is_after_real_model_dispatch() {
     std::env::set_var("REM_FIELD_GATE_DIR", &gate);
     std::env::set_var("REM_FIELD_TRACE", root.path().join("commands.jsonl"));
     std::env::set_var("REM_FIELD_PROGRESS", root.path().join("progress.jsonl"));
-    std::env::set_var("REM_CHAOS_ENABLED", "1");
-    std::env::set_var("REM_CHAOS_ALLOW_REAL", "1");
-    let world = setup(root.path());
+    std::env::set_var("REM_FIELD_ALLOW_FAIL", "1");
+    let world = setup_with_barcode(root.path(), "AOX032L9");
     let (tx, opened, thread) = open_writer_configured(
         root.path(),
         open_model_library(world.clone()),
@@ -1577,4 +1576,193 @@ async fn b8_field_failure_is_after_real_model_dispatch() {
         serde_json::from_slice(&std::fs::read(gate.join("dispatch.json")).unwrap()).unwrap();
     assert!(proof["trace_offset"].as_u64().unwrap() > 0);
     close_writer(&tx, id, thread).await;
+}
+
+/// Hold a real model WRITE with more slabs queued, then fail ingress before
+/// release. Expiry uses the same actor path and must be rejected by the verifier.
+#[cfg(feature = "field-kit")]
+#[tokio::test]
+async fn b8_field_hold_cancel_and_expiry() {
+    use sha2::{Digest, Sha256};
+    const CHILD: &str = "REM_B8_HOLD_CHILD";
+    let Ok(mode) = std::env::var(CHILD) else {
+        for mode in ["cancel", "expiry"] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "write_owner::tests::durability_tests::b7_tests::b8_field_hold_cancel_and_expiry", "--nocapture"])
+                .env(CHILD, mode).status().unwrap();
+            assert!(status.success(), "{mode}");
+        }
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let gate = root.path().join("gate");
+    std::fs::create_dir(&gate).unwrap();
+    std::env::set_var("REM_FIELD_GATE_DIR", &gate);
+    std::env::set_var("REM_FIELD_TRACE", root.path().join("commands.jsonl"));
+    if mode == "expiry" {
+        std::env::set_var("REM_B8_TEST_HOLD_MS", "100");
+    }
+    let world = setup_with_barcode(root.path(), "AOX032L9");
+    let (tx, opened, thread) = open_writer(root.path(), open_model_library(world)).await;
+    let id = opened.unwrap();
+    append_actor_test_file(
+        &tx,
+        id,
+        root.path().join("seed"),
+        "seed",
+        "seed",
+        b"retained",
+    )
+    .await;
+    let (reply, rx) = oneshot::channel();
+    tx.send(DriveCommand::Checkpoint {
+        session_id: id,
+        trigger: CheckpointTrigger::Explicit,
+        expected_batch_id: None,
+        reply: Some(reply),
+    })
+    .await
+    .unwrap();
+    rx.await.unwrap().unwrap();
+    let before = summary(&state(root.path()), TAPE).unwrap();
+    let nonce = Uuid::new_v4();
+    std::fs::write(
+        gate.join("arm.json"),
+        serde_json::json!({"schema":"rem.field.arm.v1",
+        "tape_uuid":Uuid::from_bytes(TAPE).to_string(),"barcode":"AOX032L9","action":"hold",
+        "nonce":nonce.to_string(),"session_id":id.to_string()})
+        .to_string(),
+    )
+    .unwrap();
+    let payload = vec![2; 8 * 1024 * 1024];
+    let digest: [u8; 32] = Sha256::digest(&payload).into();
+    let size = payload.len() as u64;
+    let manager = crate::io_memory::IoMemoryReservation::new(size).unwrap();
+    let (mut producer, consumer, control) =
+        crate::append_ring::create_append_ring(&manager, size / 2, 75, 25, size).unwrap();
+    // Fill queued slabs and retain the producer without Finish. No producer
+    // task may panic unseen while the actor is settling the failure.
+    producer.push(&payload[..payload.len() / 2]).await.unwrap();
+    let mut producer = Some(producer);
+    control.wait_for_prefill().await.unwrap();
+    let (reply, rx) = oneshot::channel();
+    tx.send(DriveCommand::AppendFinish {
+        session_id: id,
+        source: crate::WriteObjectSource::Streamed(crate::pool_write::StreamedWriteSource::new(
+            consumer,
+            size,
+            digest,
+            control.clone(),
+        )),
+        archive_path: "abandoned".into(),
+        caller_object_id: "abandoned".into(),
+        expected_content_sha256: Some(digest),
+        expected_object_id: None,
+        representation: crate::PoolWriteRepresentation::Plaintext,
+        input_kind: crate::WriteObjectInputKind::LogicalFile,
+        live_write_counter: None,
+        reply,
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(StdDuration::from_secs(5), async {
+        while !gate.join("dispatch.json").exists() {
+            tokio::time::sleep(StdDuration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let proof: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(gate.join("dispatch.json")).unwrap()).unwrap();
+    assert!(gate.join("holding.json").exists());
+    assert!(
+        control.occupancy_bytes() > u64::from(BLOCK),
+        "must have buffered data when cancelled"
+    );
+    if mode == "cancel" {
+        // Same order as OverlapReceiveGuard::drop, without a sandbox socket.
+        control.fail("client disconnected during append");
+        super::super::field_gate::stream_cancelled(id);
+        drop(producer.take());
+        assert!(gate.join("cancelled.json").exists());
+        std::fs::write(gate.join("release"), b"cancel").unwrap();
+    }
+    let result = tokio::time::timeout(StdDuration::from_secs(5), rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(result.is_err(), "abandoned ring returned a receipt");
+    drop(producer);
+    drop(tx);
+    thread.join().unwrap();
+    assert!(!gate.join("holding.json").exists());
+    assert_eq!(gate.join("timeout.json").exists(), mode == "expiry");
+    let trace = std::fs::read(root.path().join("commands.jsonl")).unwrap();
+    let offset = proof["trace_offset"].as_u64().unwrap() as usize;
+    let subsequent = std::str::from_utf8(&trace[offset..]).unwrap();
+    let state = state(root.path());
+    let after = summary(&state, TAPE).unwrap();
+    assert_eq!(after.object_count, 1);
+    // Closeout clears the summary's latest-ending pointer, so inspect the
+    // durable TailFile itself, including the already-closed-out ending.
+    use remanence_state::tape_log::{codec::Decoder, store::Header, Chunk, Record, TailFilemark};
+    use std::io::Seek;
+    let path = state
+        .checkpoint_journal_dir
+        .join(format!("{}.remtape", Uuid::from_bytes(TAPE).simple()));
+    let mut file = std::fs::File::open(path).unwrap();
+    Header::decode(&mut file, TAPE).unwrap();
+    let offset = file.stream_position().unwrap();
+    let mut decoder = Decoder::at(file, 1, offset);
+    let mut tails = 0;
+    while let Some(frame) = decoder.next_frame().unwrap() {
+        if let Record::PayloadContinuation(c) = frame.record {
+            if let Chunk::TailFile(tail) = c.chunk {
+                tails += 1;
+                assert_eq!(
+                    tail.known_blocks * u64::from(BLOCK),
+                    proof["bytes_completed"].as_u64().unwrap(),
+                    "actor dispatched another block from the already-failed ring"
+                );
+                assert_eq!(tail.unknown_blocks, 0);
+                assert_eq!(tail.filemark, TailFilemark::Absent);
+            }
+        }
+    }
+    assert_eq!(tails, 1);
+    // The ending may immediately rebuild closeout. Every later WRITE must be
+    // accounted for by that sidecar's committed cursor advancement.
+    let written: u64 = subsequent
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|row| row["cdb"][0] == 10)
+        .map(|row| row["bytes_transferred"].as_u64().unwrap())
+        .sum();
+    let closeout_bytes = if after.cursor.lba > before.cursor.lba {
+        (after.cursor.lba - before.cursor.lba - 1) * u64::from(BLOCK)
+    } else {
+        0
+    };
+    assert_eq!(written, closeout_bytes, "extra writes outside closeout");
+    if mode == "expiry" {
+        let verifier = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fieldtest/scripts/session-epoch-evidence.py");
+        let output = std::process::Command::new("python3")
+            .arg(verifier)
+            .args([
+                "verify",
+                root.path().to_str().unwrap(),
+                "kill-mid-write",
+                "",
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("field hold expired"));
+        let observed: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.path().join("verify-gate-state.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(observed["timeout"], true);
+    }
 }

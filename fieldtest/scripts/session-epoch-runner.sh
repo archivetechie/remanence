@@ -74,11 +74,14 @@ collect)
   python3 "$scripts/session-epoch-evidence.py" manifest "$evidence" "$mode" "$barcode"
   ;;
 cleanup)
-  # Release the compile-time dispatch hold even if the helper or verifier failed.
-  [[ ! -d $gate ]] || touch "$gate/release"
+  # Cancel ingress before releasing the actor into the failed ring.
   cleanup_rc=0
+  if python3 "$scripts/session-epoch-evidence.py" stop-helper "$evidence" "$io"; then
+    [[ ! -d $gate ]] || touch "$gate/release"
+  else
+    cleanup_rc=1
+  fi
   python3 "$scripts/session-epoch-evidence.py" stop-samplers "$evidence" || cleanup_rc=1
-  python3 "$scripts/session-epoch-evidence.py" stop-helper "$evidence" "$io" || cleanup_rc=1
   if [[ -f $evidence/session.json && ! -f $evidence/after.json ]]; then
     helper_args
     timeout --signal=TERM --kill-after=5s 30s "$io" "${args[@]}" --phase cancel > "$evidence/cleanup.jsonl" 2>&1 || true

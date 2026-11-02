@@ -33,7 +33,18 @@ def process(pid, binary, config):
     assert uid == [str(os.getuid())] * 2, "daemon is not owned by kit user"
     return proc
 
+def gate_state(evidence, operation, require_holding=False):
+    """Retain the gate observation even when refusing stale fault evidence."""
+    gate = evidence / "gate"
+    state = {"holding": (gate / "holding.json").exists(),
+             "timeout": (gate / "timeout.json").exists()}
+    save(evidence / (operation + "-gate-state.json"), state)
+    assert not state["timeout"], "field hold expired: gate/timeout.json exists"
+    assert not require_holding or state["holding"], "field hold is not active: gate/holding.json missing"
+    return state
+
 def verify(evidence, mode, control):
+    gate_state(evidence, "verify")
     before, after = (load(evidence / name) for name in ("before.json", "after.json"))
     assert before["W"] < before["T"] and before["open_session"], "no short checkpoint"
     assert after["W"] == after["T"] == before["T"], "closeout changed committed range"
@@ -171,6 +182,14 @@ def main():
                 else: raise AssertionError("field child did not stop")
             except FileNotFoundError:
                 pass
+        if command == "stop-helper" and (e / "gate/holding.json").exists() and not (e / "kill.json").exists():
+            deadline = time.monotonic() + 5
+            while not (e / "gate/cancelled.json").exists():
+                assert not (e / "gate/timeout.json").exists(), "field hold expired during cleanup"
+                assert time.monotonic() < deadline, "helper stopped but daemon has not acknowledged cancellation; hold not released"
+                time.sleep(.01)
+            cancelled, held = load(e / "gate/cancelled.json"), load(e / "gate/holding.json")
+            assert all(cancelled[k] == held[k] for k in ("pid", "nonce", "tape_uuid")), "cleanup cancellation differs from hold"
     elif command in ("sample", "sample-once"):
         pid = int((e / "daemon.pid").read_text())
         start = time.monotonic_ns()
@@ -189,9 +208,11 @@ def main():
             except FileNotFoundError:
                 return
     elif command in ("wait", "settled"):
+        assert not (e / "gate/timeout.json").exists(), "field hold expired: gate/timeout.json exists"
         target = e / ("prepared.json" if command == "settled" or args and args[0] else "fault.json")
         deadline = time.monotonic() + 14400
         while not target.exists():
+            assert not (e / "gate/timeout.json").exists(), "field hold expired: gate/timeout.json exists"
             pid = int((e / "helper.pid").read_text())
             proc = Path(f"/proc/{pid}/stat")
             assert proc.exists() and proc.read_text().split(") ", 1)[1][0] != "Z", "helper failed; inspect stderr"
@@ -202,8 +223,13 @@ def main():
         pid = int((e / "daemon.pid").read_text())
         assert proof["pid"] == pid
         process(pid, *args)
-        save(e / "kill.json", {"pid":pid,"signal":"SIGKILL","wall_ns":time.time_ns(),"monotonic_ns":time.monotonic_ns()})
+        state = gate_state(e, "kill", require_holding=True)
+        holding = load(e / "gate/holding.json")
+        assert all(holding[key] == proof[key] for key in ("pid", "nonce", "tape_uuid", "object_id")), "live hold differs from dispatch proof"
+        assert not (e / "gate/timeout.json").exists(), "field hold expired before SIGKILL"
+        assert (e / "gate/holding.json").exists(), "field hold ended before SIGKILL"
         os.kill(pid, signal.SIGKILL)
+        save(e / "kill.json", {"pid":pid,"signal":"SIGKILL","wall_ns":time.time_ns(),"monotonic_ns":time.monotonic_ns(),"gate":state})
         for _ in range(100):
             try:
                 process(pid, *args)

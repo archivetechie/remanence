@@ -4,7 +4,7 @@ set -euo pipefail
 scripts="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$scripts/lib.sh"
 [[ ${FIELD_SESSION_EPOCH_ARM:-} == session-epoch-a ]] || { echo 'field leg A is not owner armed' >&2; exit 2; }
-[[ ${REM_CHAOS_ENABLED:-} == 1 && ${REM_CHAOS_ALLOW_REAL:-} == 1 ]] || { echo 'failed-append requires the existing real-device chaos opt-in' >&2; exit 2; }
+[[ ${REM_FIELD_ALLOW_FAIL:-} == 1 ]] || { echo 'failed-append requires REM_FIELD_ALLOW_FAIL=1' >&2; exit 2; }
 fieldtest_init_layout
 out="$(fieldtest_evidence_dir)/session-epoch-preflight"
 mkdir -p "$out"

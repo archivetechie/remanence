@@ -12,6 +12,18 @@ if [[ -z "${FIELDTEST_LIB_SOURCED:-}" ]]; then
   readonly FIELDTEST_LIB_SOURCED=1
 fi
 
+# Refuse at source time, including direct entry points and reentrant children.
+[[ ! -e "$(dirname -- "${BASH_SOURCE[0]}")/../DRY-RUN-NOT-FOR-HARDWARE" ]] || {
+  echo 'refused: dry review package' >&2; exit 2;
+}
+for fieldtest_chaos_key in REM_CHAOS_ENABLED REM_CHAOS_ALLOW_REAL REM_CHAOS_STATE; do
+  if [[ -v $fieldtest_chaos_key ]]; then
+    echo "refused: $fieldtest_chaos_key is present; field kit cannot run with chaos variables" >&2
+    exit 2
+  fi
+done
+unset fieldtest_chaos_key
+
 fieldtest_script_dir() {
   cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd
 }
