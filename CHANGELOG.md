@@ -466,9 +466,13 @@ per-release summaries.
   to attach to a hardware report, and lists the limitations found in field
   testing.
 
-## 0.2.0 — 2026-10-15
+## 0.2.0 — not released
 
-- First release with prebuilt Linux binaries (`remanence-x86_64-linux.tar.gz`, `rem-recover-x86_64-linux-musl.tar.gz`, `SHA256SUMS`) and build provenance attestation.
+Version 0.2.0 was prepared on 2026-10-15 but was never tagged or published.
+The changes below are in the source, as are those under Unreleased; no
+published release contains them.
+
+- Added a release workflow that builds prebuilt Linux binaries (`remanence-x86_64-linux.tar.gz`, `rem-recover-x86_64-linux-musl.tar.gz`, `SHA256SUMS`) with build provenance attestation. No release made with it was published.
 
 - Wording pass over the REM-PARITY text that the recent clarifications touched.
   No requirement changes. Section 17 opens with the damage matrix as it now
