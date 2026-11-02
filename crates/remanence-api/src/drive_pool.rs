@@ -716,6 +716,38 @@ impl DrivePool {
         in_use
     }
 
+    /// Classify ownership under the same lock order as tape reservation. A
+    /// session's post-reply closing guard supersedes its lingering mount entry.
+    pub(crate) fn tape_selection_holds(&self) -> crate::pool_write::TapeSelectionHolds {
+        use crate::pool_write::{TapeSelectionHold, TapeSelectionHolds};
+        let sessions = self.sessions.lock().unwrap();
+        let reservations = self.tape_reservations.lock().unwrap();
+        let workers = self.worker_closing.0.lock().unwrap();
+        let closing = self.closing.0.lock().unwrap();
+        let mut holds = TapeSelectionHolds::default();
+        for tape in sessions
+            .values()
+            .map(|s| s.tape_uuid)
+            .chain(reservations.iter().copied())
+        {
+            holds.0.insert(tape, TapeSelectionHold::LiveWriter);
+        }
+        for ((tape, _), _) in closing.iter() {
+            holds.0.insert(*tape, TapeSelectionHold::Closing);
+        }
+        for ((tape, _), entry) in workers.iter() {
+            holds.0.insert(
+                *tape,
+                if entry.finalization.is_some() {
+                    TapeSelectionHold::Finalizing
+                } else {
+                    TapeSelectionHold::WorkerCloseout
+                },
+            );
+        }
+        holds
+    }
+
     /// Claim and publish the worker hold atomically with tape reservation.
     pub(crate) fn reserve_worker_tape(
         &self,
