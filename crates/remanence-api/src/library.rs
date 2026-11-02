@@ -1901,7 +1901,7 @@ mod tests {
             lifecycle.clone(),
         );
         state.drive_pool = Some(pool.clone());
-        let closing = lifecycle.closing.begin([0x41; 16], key).unwrap();
+        let closing = lifecycle.closing.begin([0x41; 16], key).0;
         let caller = state.clone();
         let mut task = tokio::spawn(async move {
             caller

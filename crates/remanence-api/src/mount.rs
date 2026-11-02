@@ -2609,6 +2609,113 @@ pub(crate) fn register_startup_seated_cartridges(
     }
 }
 
+/// Complete one mounted owner's ending, including every error/reply-loss path.
+async fn shutdown_mounted_session(
+    state: &ApiState,
+    pool: &crate::write_owner::DrivePool,
+    session_id: Uuid,
+    mounted: crate::write_owner::MountedSession,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    let drive = match pool.drive_tx(&mounted.drive_key()) {
+        Ok(drive) => drive,
+        Err(err) => {
+            failures.push(format!(
+                "session {session_id}: drive unavailable for shutdown checkpoint: {err}"
+            ));
+            pool.wait_tape_closeout(mounted.tape_uuid).await;
+            return failures;
+        }
+    };
+    let (checkpoint_tx, checkpoint_rx) = oneshot::channel();
+    if drive
+        .send(crate::write_owner::DriveCommand::Checkpoint {
+            session_id,
+            trigger: crate::write_owner::CheckpointTrigger::Shutdown,
+            expected_batch_id: None,
+            reply: Some(checkpoint_tx),
+        })
+        .await
+        .is_err()
+    {
+        failures.push(format!(
+            "session {session_id}: drive actor unavailable for shutdown checkpoint"
+        ));
+        pool.wait_tape_closeout(mounted.tape_uuid).await;
+        return failures;
+    }
+    match checkpoint_rx.await {
+        Ok(Ok(_)) => {
+            let (close_tx, close_rx) = oneshot::channel();
+            if drive
+                .send(crate::write_owner::DriveCommand::Close {
+                    session_id,
+                    reply: close_tx,
+                })
+                .await
+                .is_err()
+            {
+                failures.push(format!(
+                    "session {session_id}: drive actor unavailable for shutdown close"
+                ));
+                pool.wait_tape_closeout(mounted.tape_uuid).await;
+                return failures;
+            }
+            match close_rx.await {
+                Ok(Ok(_)) => pool.wait_tape_closeout(mounted.tape_uuid).await,
+                Ok(Err(err)) => failures.push(format!(
+                    "session {session_id}: shutdown close failed: {err}"
+                )),
+                Err(_) => failures.push(format!(
+                    "session {session_id}: drive actor dropped shutdown close reply"
+                )),
+            }
+        }
+        Ok(Err(err))
+            if err.code() == tonic::Code::FailedPrecondition
+                && err.message() == "active session is a read session" =>
+        {
+            let (reply, received) = oneshot::channel();
+            if drive
+                .send(crate::write_owner::DriveCommand::CloseRead { session_id, reply })
+                .await
+                .is_err()
+            {
+                failures.push(format!(
+                    "session {session_id}: drive actor unavailable for shutdown read close"
+                ));
+                pool.wait_tape_closeout(mounted.tape_uuid).await;
+                return failures;
+            }
+            match received.await {
+                Ok(Ok(_)) => finish_mounted_session(state, pool, session_id, mounted.clone()),
+                Ok(Err(err)) => failures.push(format!(
+                    "session {session_id}: shutdown read close failed: {err}"
+                )),
+                Err(_) => failures.push(format!(
+                    "session {session_id}: drive actor dropped shutdown read close reply"
+                )),
+            }
+        }
+        Ok(Err(err)) if err.code() == tonic::Code::NotFound => {
+            pool.wait_tape_closeout(mounted.tape_uuid).await;
+            if pool.session(session_id).is_ok() {
+                failures.push(format!(
+                    "session {session_id}: shutdown checkpoint failed: {err}"
+                ));
+            }
+        }
+        Ok(Err(err)) => failures.push(format!(
+            "session {session_id}: shutdown checkpoint failed: {err}"
+        )),
+        Err(_) => failures.push(format!(
+            "session {session_id}: drive actor dropped shutdown checkpoint reply"
+        )),
+    }
+    pool.wait_tape_closeout(mounted.tape_uuid).await;
+    failures
+}
+
 /// Stop admission, close sessions, and settle existing motion while leaving media seated.
 pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> {
     state.begin_shutdown();
@@ -2616,105 +2723,22 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
         return Ok(());
     };
     pool.begin_shutdown();
-    pool.wait_closeouts().await;
     let mut failures = Vec::new();
-    for (_, (session_id, mounted)) in pool.sessions_by_drive() {
-        let drive = match pool.drive_tx(&mounted.drive_key()) {
-            Ok(drive) => drive,
-            Err(err) => {
-                failures.push(format!(
-                    "session {session_id}: drive unavailable for shutdown checkpoint: {err}"
-                ));
-                pool.wait_tape_closeout(mounted.tape_uuid).await;
-                continue;
-            }
-        };
-        let (checkpoint_tx, checkpoint_rx) = oneshot::channel();
-        if drive
-            .send(crate::write_owner::DriveCommand::Checkpoint {
-                session_id,
-                trigger: crate::write_owner::CheckpointTrigger::Shutdown,
-                expected_batch_id: None,
-                reply: Some(checkpoint_tx),
-            })
-            .await
-            .is_err()
-        {
-            failures.push(format!(
-                "session {session_id}: drive actor unavailable for shutdown checkpoint"
-            ));
-            pool.wait_tape_closeout(mounted.tape_uuid).await;
-            continue;
+    let sessions = pool.sessions_by_drive();
+    let mut ending_ids = sessions.values().map(|(id, _)| *id).collect::<HashSet<_>>();
+    let mut endings = tokio::task::JoinSet::new();
+    for (_, (session_id, mounted)) in sessions {
+        let state = state.clone();
+        let pool = pool.clone();
+        endings.spawn(
+            async move { shutdown_mounted_session(&state, &pool, session_id, mounted).await },
+        );
+    }
+    while let Some(result) = endings.join_next().await {
+        match result {
+            Ok(errors) => failures.extend(errors),
+            Err(error) => failures.push(format!("shutdown session worker failed: {error}")),
         }
-        match checkpoint_rx.await {
-            Ok(Ok(_)) => {
-                let (close_tx, close_rx) = oneshot::channel();
-                if drive
-                    .send(crate::write_owner::DriveCommand::Close {
-                        session_id,
-                        reply: close_tx,
-                    })
-                    .await
-                    .is_err()
-                {
-                    failures.push(format!(
-                        "session {session_id}: drive actor unavailable for shutdown close"
-                    ));
-                    pool.wait_tape_closeout(mounted.tape_uuid).await;
-                    continue;
-                }
-                match close_rx.await {
-                    Ok(Ok(_)) => pool.wait_tape_closeout(mounted.tape_uuid).await,
-                    Ok(Err(err)) => failures.push(format!(
-                        "session {session_id}: shutdown close failed: {err}"
-                    )),
-                    Err(_) => failures.push(format!(
-                        "session {session_id}: drive actor dropped shutdown close reply"
-                    )),
-                }
-            }
-            Ok(Err(err))
-                if err.code() == tonic::Code::FailedPrecondition
-                    && err.message() == "active session is a read session" =>
-            {
-                let (reply, received) = oneshot::channel();
-                if drive
-                    .send(crate::write_owner::DriveCommand::CloseRead { session_id, reply })
-                    .await
-                    .is_err()
-                {
-                    failures.push(format!(
-                        "session {session_id}: drive actor unavailable for shutdown read close"
-                    ));
-                    pool.wait_tape_closeout(mounted.tape_uuid).await;
-                    continue;
-                }
-                match received.await {
-                    Ok(Ok(_)) => finish_mounted_session(state, pool, session_id, mounted.clone()),
-                    Ok(Err(err)) => failures.push(format!(
-                        "session {session_id}: shutdown read close failed: {err}"
-                    )),
-                    Err(_) => failures.push(format!(
-                        "session {session_id}: drive actor dropped shutdown read close reply"
-                    )),
-                }
-            }
-            Ok(Err(err)) if err.code() == tonic::Code::NotFound => {
-                pool.wait_tape_closeout(mounted.tape_uuid).await;
-                if pool.session(session_id).is_ok() {
-                    failures.push(format!(
-                        "session {session_id}: shutdown checkpoint failed: {err}"
-                    ));
-                }
-            }
-            Ok(Err(err)) => failures.push(format!(
-                "session {session_id}: shutdown checkpoint failed: {err}"
-            )),
-            Err(_) => failures.push(format!(
-                "session {session_id}: drive actor dropped shutdown checkpoint reply"
-            )),
-        }
-        pool.wait_tape_closeout(mounted.tape_uuid).await;
     }
     for drive_key in pool.drive_keys() {
         let remanence_state::DriveKey::Bay {
@@ -2733,6 +2757,15 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
                         pool.wait_drive_closeout(&drive_key).await;
                         reservation_wait_started = tokio::time::Instant::now();
                         continue;
+                    }
+                    // An opener can finish actor admission after the initial
+                    // session snapshot. Its reservation keeps this handoff visible.
+                    if let Some((id, mounted)) = pool.sessions_by_drive().get(&drive_key).cloned() {
+                        if ending_ids.insert(id) {
+                            failures
+                                .extend(shutdown_mounted_session(state, pool, id, mounted).await);
+                            continue;
+                        }
                     }
                     if err.code() == tonic::Code::NotFound
                         || pool.sessions_by_drive().contains_key(&drive_key)
@@ -2931,23 +2964,22 @@ async fn resolve_and_reserve_actor_mount(
     library_serial: &str,
     tape_uuid: &TapeUuid,
 ) -> Result<(ActorMount, crate::write_owner::DriveReservation), Status> {
-    const ATTEMPTS: usize = 2;
-    for attempt in 0..ATTEMPTS {
+    loop {
         let busy_bays = pool.busy_bays(library_serial);
         let resolved = resolve_actor_mount(state, library_serial, tape_uuid, &busy_bays);
         if resolved.as_ref().is_err_and(|error| {
             error.code() == tonic::Code::FailedPrecondition
                 && (error.message().contains("busy") || error.message().contains("no free drive"))
-        }) && attempt + 1 < ATTEMPTS
-        {
+        }) {
             let specific = resolved.as_ref().err().and_then(|error| {
                 busy_bays
                     .iter()
                     .copied()
                     .find(|bay| error.message() == format!("drive bay 0x{bay:04x} is busy"))
             });
-            pool.wait_busy_closeout(library_serial, specific).await;
-            continue;
+            if pool.wait_busy_closeout(library_serial, specific).await {
+                continue;
+            }
         }
         let plan = resolved.map_err(|error| {
             if error.code() == tonic::Code::FailedPrecondition
@@ -3001,15 +3033,16 @@ async fn resolve_and_reserve_actor_mount(
             Err(err)
                 if err.code() == tonic::Code::FailedPrecondition
                     && err.message().split("; held by: ").next()
-                        == Some(format!("{} is busy", drive_key.label()).as_str())
-                    && attempt + 1 < ATTEMPTS =>
+                        == Some(format!("{} is busy", drive_key.label()).as_str()) =>
             {
-                continue;
+                if pool.wait_busy_closeout(library_serial, Some(bay)).await {
+                    continue;
+                }
+                return Err(err);
             }
             Err(err) => return Err(err),
         }
     }
-    unreachable!("drive reservation attempts are bounded and non-zero")
 }
 
 fn resolve_actor_mount(

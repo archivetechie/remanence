@@ -5,7 +5,7 @@ use remanence_state::tape_log::{
 };
 
 /// Read every native record, including endings later superseded by ClosedOut.
-fn native_records(root: &Path) -> Vec<NativeRecord> {
+pub(super) fn native_records(root: &Path) -> Vec<NativeRecord> {
     let bytes = std::fs::read(
         root.join("journals/tapes")
             .join(format!("{}.remtape", Uuid::from_bytes(TAPE).simple())),
@@ -697,7 +697,7 @@ async fn deferred_close_receipts_survive_lease_and_tail_cleanup_failures() {
 /// Refused commands cannot poison the reason of a subsequent host-side close failure.
 #[tokio::test]
 async fn failed_close_after_stale_timer_or_stray_abort_ends_failed_append_during_shutdown() {
-    for stale_idle in [false, true] {
+    for (stale_idle, hook) in [(false, 9), (true, 9), (false, 10)] {
         let root = tempfile::tempdir().unwrap();
         let world = setup(root.path());
         let lifecycle = DrivePoolLifecycle::default();
@@ -707,7 +707,9 @@ async fn failed_close_after_stale_timer_or_stray_abort_ends_failed_append_during
             selected(),
             |cfg, _| {
                 cfg.lifecycle = Some(lifecycle.clone());
-                cfg.io_memory.epoch_test_action.store(9, Ordering::Relaxed);
+                cfg.io_memory
+                    .epoch_test_action
+                    .store(hook, Ordering::Relaxed);
             },
         )
         .await;
@@ -750,13 +752,25 @@ async fn failed_close_after_stale_timer_or_stray_abort_ends_failed_append_during
         })
         .await
         .unwrap();
-        assert!(received
+        let closed = received
             .await
             .unwrap()
-            .unwrap_err()
-            .message()
-            .contains("injected post-projection failure"));
+            .expect("durable commit must succeed");
+        assert_eq!(closed.session.checkpointed_objects.len(), 1);
+        let receipt = &closed.session.checkpointed_objects[0];
+        assert_eq!(receipt.copies.len(), 1);
+        let info = receipt.append_commit_info.as_ref().unwrap();
+        assert_eq!(info.durability, pb::AppendDurability::Checkpointed as i32);
+        assert!(info.tape_log_sequence.is_some_and(|sequence| sequence > 2));
+        assert_eq!(info.tape_incarnation, Some(1));
         thread.join().unwrap();
+        assert_eq!(
+            lifecycle.ended_writes.lock().unwrap()[&id]
+                .0
+                .checkpointed_objects
+                .len(),
+            1
+        );
         assert!(native_records(root.path()).iter().any(|r| matches!(r, NativeRecord::SessionEnded(end) if end.reason == SessionEndReason::FailedAppend)));
     }
 }

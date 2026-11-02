@@ -73,15 +73,17 @@ pub(super) fn close_write_actor(
     };
 
     let snapshot_started = Instant::now();
-    record_session_close_snapshot(
-        input.index,
-        input.cfg,
-        input.drive,
-        input.drive_uuid.clone(),
-        input.session_id,
-        input.tape_uuid,
-        input.snapshot_misses,
-    );
+    if !input.drive.command_deadline_expired() {
+        record_session_close_snapshot(
+            input.index,
+            input.cfg,
+            input.drive,
+            input.drive_uuid.clone(),
+            input.session_id,
+            input.tape_uuid,
+            input.snapshot_misses,
+        );
+    }
     diagnostics.drive_snapshot = snapshot_started.elapsed();
 
     let mut session = session_proto(WriteSessionProtoInput {
@@ -167,13 +169,11 @@ impl WriteSessionState<'_> {
     fn begin_closing_work(&mut self) {
         if self.closing_work.is_none() {
             if let Some(lifecycle) = &self.cfg.lifecycle {
-                match lifecycle
+                let (guard, error) = lifecycle
                     .closing
-                    .begin(self.tape_uuid, self.cfg.endpoint(self.bay))
-                {
-                    Ok(guard) => self.closing_work = Some(guard),
-                    Err(error) => self.closing_error = Some(error),
-                }
+                    .begin(self.tape_uuid, self.cfg.endpoint(self.bay));
+                self.closing_work = Some(guard);
+                self.closing_error = error;
             }
         }
     }
@@ -412,7 +412,37 @@ impl WriteSessionState<'_> {
         self.drive.clear_append_admission();
     }
 
+    /// Report deadline interruption once even when native ending or tail cleanup fails.
     fn finish_session(&mut self) -> Result<(), Status> {
+        let result = self.finish_session_inner();
+        if self.drive.command_deadline_expired() {
+            let summary = self.checkpoint_lease.freeze().ok();
+            let closeout_due = summary.as_ref().map(|s| s.tape_summary().closeout_due());
+            let finalization_due = self
+                .checkpoint_lease
+                .pending_finalization()
+                .ok()
+                .flatten()
+                .is_some();
+            let tail_files = summary.as_ref().and_then(|s| {
+                s.tape_summary()
+                    .last_session_end
+                    .as_ref()
+                    .map(|end| end.tail_file_count)
+            });
+            tracing::warn!(tape_uuid = %Uuid::from_bytes(self.tape_uuid), session_id = %self.session_id,
+                ?closeout_due, ?tail_files, finalization_due,
+                left_due = if !self.ended_durably { "crash recovery; native ending unavailable" }
+                    else if finalization_due { "accepted finalization" }
+                    else if closeout_due == Some(true) { "closeout and named tail reconciliation" }
+                    else if tail_files.is_some_and(|count| count > 0) { "named tail reconciliation" }
+                    else { "none; ending completed after deadline" },
+                "shutdown close deadline interrupted session");
+        }
+        result
+    }
+
+    fn finish_session_inner(&mut self) -> Result<(), Status> {
         use remanence_state::tape_log::SessionEndReason;
         // A deferred success contains already durable receipts. No host cleanup,
         // lease query, or later publication may turn them into an error.
@@ -455,7 +485,7 @@ impl WriteSessionState<'_> {
             .checkpoint_lease
             .pending_finalization()
             .map_err(status_from_state_error)?;
-        if clean {
+        if clean && !self.drive.command_deadline_expired() {
             let closeout_due = self
                 .checkpoint_lease
                 .freeze()
@@ -493,6 +523,14 @@ impl WriteSessionState<'_> {
                     tracing::warn!(%error, "post-reply closeout failed");
                     self.end_reason = SessionEndReason::CloseoutFailed;
                 }
+            }
+        }
+        if self.drive.command_deadline_expired() {
+            self.end_reason = SessionEndReason::GracefulShutdown;
+            if self.drive.command_completion_unknown() {
+                return Err(Status::unavailable(
+                    "shutdown command completion unknown; crash recovery required",
+                ));
             }
         }
         self.drive.set_media_dispatch_observer(None);
@@ -609,26 +647,33 @@ impl WriteSessionState<'_> {
                 CborValue::Text(mounted.endpoint.encode()),
             );
         }
-        let audit_result = crate::audit_projection::append_and_project_audit(
-            self.index,
-            &self.cfg.audit_dir,
-            true,
-            &self.cfg.audit_append_lock,
-            crate::audit_projection::ProjectedAuditInput {
-                actor: self
-                    .cfg
-                    .mounted()
-                    .map_or(AuditActor::System, |m| m.actor.clone()),
-                source_layer: SourceLayer::Layer5,
-                operation_id: None,
-                session_id: Some(self.session_id),
-                idempotency_key: None,
-                event: AuditEvent::SessionClosed,
-                subject_kind: "write",
-                subject_id: Some(self.session_id.to_string()),
-                detail,
-            },
-        );
+        // The native ending is authority. Optional audit/projection work must
+        // not start another host wait after the shutdown budget is exhausted.
+        let audit_result = if self.drive.command_deadline_expired() {
+            Ok(())
+        } else {
+            crate::audit_projection::append_and_project_audit(
+                self.index,
+                &self.cfg.audit_dir,
+                true,
+                &self.cfg.audit_append_lock,
+                crate::audit_projection::ProjectedAuditInput {
+                    actor: self
+                        .cfg
+                        .mounted()
+                        .map_or(AuditActor::System, |m| m.actor.clone()),
+                    source_layer: SourceLayer::Layer5,
+                    operation_id: None,
+                    session_id: Some(self.session_id),
+                    idempotency_key: None,
+                    event: AuditEvent::SessionClosed,
+                    subject_kind: "write",
+                    subject_id: Some(self.session_id.to_string()),
+                    detail,
+                },
+            )
+            .map(|_| ())
+        };
         if let Some(lifecycle) = &self.cfg.lifecycle {
             let mut session = session_proto(WriteSessionProtoInput {
                 session_id: self.session_id,
@@ -666,6 +711,9 @@ impl WriteSessionState<'_> {
                 .push_back(self.session_id);
         }
         self.pending_batch = None;
+        if self.drive.command_deadline_expired() {
+            return audit_result.map(|_| ());
+        }
         let mut parity = self.parity_session.take();
         let permit = parity.as_mut().and_then(|session| session.permit.take());
         if let Some(intent) = finalization {
@@ -1486,11 +1534,20 @@ impl WriteSessionState<'_> {
                     );
                 }
             }
-            Err(failure) => {
+            Err(mut failure) => {
                 if let Err(error) = self.checkpoint_lease.cancel_staged_report() {
                     tracing::warn!(%error, "provisional tape-log rollback failed; abandonment remains fenced");
                 }
                 let quarantine_identities = failure.requires_identity_quarantine();
+                let durable =
+                    trigger == CheckpointTrigger::Shutdown && failure.durable_outcome.is_some();
+                if durable {
+                    if let Some(outcome) = failure.durable_outcome.take() {
+                        self.retain_checkpoint_outcome(&outcome);
+                    }
+                    tracing::warn!(error = %failure.status, session_id = %self.session_id,
+                        "shutdown checkpoint durable; retaining receipts despite host failure");
+                }
                 let status = failure.status;
                 self.append_gate.record_failure();
                 self.end_reason = remanence_state::tape_log::SessionEndReason::FailedAppend;
@@ -1503,7 +1560,28 @@ impl WriteSessionState<'_> {
                 }
                 self.pending_batch = None;
                 if let Some(reply) = reply {
-                    let _ = reply.send(Err(status));
+                    if durable {
+                        let session = session_proto(WriteSessionProtoInput {
+                            session_id,
+                            tape_uuid: &tape_uuid,
+                            target_kind,
+                            state: pb::write_session::State::WriteSessionStateCheckpointed,
+                            objects_committed: self.objects_committed,
+                            bytes_committed: self.bytes_committed,
+                            opened_at_utc: &opened_at_utc,
+                            last_checkpoint_at_utc: self.last_checkpoint_at_utc.as_deref(),
+                            drive_element_address: cfg.wire_bay(bay),
+                            pending_batch: None,
+                        });
+                        send_checkpoint_actor_reply(
+                            reply,
+                            session,
+                            &mut self.committed_receipts,
+                            trigger,
+                        );
+                    } else {
+                        let _ = reply.send(Err(status));
+                    }
                 } else {
                     tracing::error!(
                         session_id = %session_id,
@@ -1608,8 +1686,14 @@ impl WriteSessionState<'_> {
                     self.retain_checkpoint_outcome(&outcome);
                     self.pending_batch = None;
                 }
-                Err(failure) => {
+                Err(mut failure) => {
                     let quarantine_identities = failure.requires_identity_quarantine();
+                    if let Some(outcome) = failure.durable_outcome.take() {
+                        self.retain_checkpoint_outcome(&outcome);
+                        tracing::warn!(error = %failure.status, session_id = %self.session_id,
+                            "final commit durable; returning receipts despite host failure");
+                    }
+                    let durable = failure.journal_durable && !failure.authority_uncertain;
                     let status = failure.status;
                     self.append_gate.record_failure();
                     self.end_reason = remanence_state::tape_log::SessionEndReason::FailedAppend;
@@ -1621,8 +1705,10 @@ impl WriteSessionState<'_> {
                             .quarantine_write_admissions_until_restart();
                     }
                     self.pending_batch = None;
-                    let _ = reply.send(Err(status));
-                    return false;
+                    if !durable {
+                        let _ = reply.send(Err(status));
+                        return false;
+                    }
                 }
             }
         }
@@ -1801,6 +1887,9 @@ pub(super) fn handle_drive_open_write(
     snapshot_misses: &mut u32,
     request: OpenWriteActorRequest,
 ) -> Option<super::actor_runtime::MountedFinish> {
+    // The open may already be in flight when shutdown snapshots mounted owners.
+    // Apply the same cutoff to its bootstrap, suffix proof and admission work.
+    drive.set_command_deadline(cfg.lifecycle.as_ref().map(|l| l.shutdown_deadline.clone()));
     let OpenWriteActorRequest {
         actor,
         pool_cfg,

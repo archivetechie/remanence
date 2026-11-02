@@ -544,6 +544,7 @@ impl PendingCheckpointBatch {
     }
 }
 
+#[derive(Debug)]
 pub(super) struct BarrierOutcome {
     pub(super) committed_objects: Vec<pb::ObjectRecord>,
     pub(super) object_count: u64,
@@ -584,8 +585,10 @@ pub(super) fn project_checkpoint_authority_bounded(
 pub(super) struct CheckpointBarrierFailure {
     pub(super) status: Status,
     pub(super) journal_durable: bool,
-    /// The append lacks a proven durable journal boundary.
+    /// SQLite contains the durable native commit.
     pub(super) catalog_projected: bool,
+    pub(super) authority_uncertain: bool,
+    pub(super) durable_outcome: Option<Box<BarrierOutcome>>,
 }
 
 impl CheckpointBarrierFailure {
@@ -594,6 +597,8 @@ impl CheckpointBarrierFailure {
             status,
             journal_durable: false,
             catalog_projected: false,
+            authority_uncertain: false,
+            durable_outcome: None,
         }
     }
 
@@ -602,13 +607,16 @@ impl CheckpointBarrierFailure {
             status,
             journal_durable: true,
             catalog_projected: false,
+            authority_uncertain: false,
+            durable_outcome: None,
         }
     }
 
     /// Preserve uncertain journal authority separately from a durable projection failure.
     pub(super) fn uncertain_journal(status: Status) -> Self {
         Self {
-            ..Self::after_journal(status)
+            authority_uncertain: true,
+            ..Self::before_journal(status)
         }
     }
 
@@ -617,11 +625,13 @@ impl CheckpointBarrierFailure {
             status,
             journal_durable: true,
             catalog_projected: true,
+            authority_uncertain: false,
+            durable_outcome: None,
         }
     }
 
     pub(super) fn requires_identity_quarantine(&self) -> bool {
-        self.journal_durable && !self.catalog_projected
+        self.authority_uncertain || (self.journal_durable && !self.catalog_projected)
     }
 }
 
@@ -1007,130 +1017,190 @@ fn perform_checkpoint_barrier_with_rows(
     });
     let filemark_drain = drain_started.elapsed();
     let projection_started = Instant::now();
-    if let Err(err) = journal.complete_report(&record) {
-        if let Some(session) = parity_session.as_deref_mut() {
-            if let Some(mut state) = session.sink_state.take() {
-                state.poison_publication();
+    if drive.command_deadline_expired() {
+        return Err(CheckpointBarrierFailure::before_journal(
+            Status::deadline_exceeded("shutdown close deadline expired before commit"),
+        ));
+    }
+    let mut durable_reference = None;
+    let result = (|| {
+        if let Err(err) = journal.complete_report(&record) {
+            if let Some(session) = parity_session.as_deref_mut() {
+                if let Some(mut state) = session.sink_state.take() {
+                    state.poison_publication();
+                }
+                session.permit = None;
             }
-            session.permit = None;
-        }
-        if err.is_checkpoint_append_durable() {
-            drive.advance_append_commit(captured).map_err(|error| {
-                CheckpointBarrierFailure::after_journal(Status::unavailable(error.to_string()))
-            })?;
-        }
-        return Err(if err.is_checkpoint_append_durable() {
-            CheckpointBarrierFailure::after_journal(Status::internal(format!("checkpoint is durable in the tape log but folding or projection failed; retry after journal replay: {err}")))
-        } else if err.is_checkpoint_append_authority_uncertain() {
-            CheckpointBarrierFailure::uncertain_journal(Status::internal(format!(
+            if err.is_checkpoint_append_durable() {
+                durable_reference = journal.log_reference().ok();
+                drive.advance_append_commit(captured).map_err(|error| {
+                    CheckpointBarrierFailure::after_journal(Status::unavailable(error.to_string()))
+                })?;
+            }
+            return Err(if err.is_checkpoint_append_durable() {
+                CheckpointBarrierFailure::after_journal(Status::internal(format!("checkpoint is durable in the tape log but folding or projection failed; retry after journal replay: {err}")))
+            } else if err.is_checkpoint_append_authority_uncertain() {
+                CheckpointBarrierFailure::uncertain_journal(Status::internal(format!(
                 "checkpoint batch {} journal append failed with durable authority uncertain; close the session and retry only after journal reconciliation: {err}",
                 batch.batch_id,
             )))
-        } else {
-            CheckpointBarrierFailure::before_journal(Status::internal(format!(
+            } else {
+                CheckpointBarrierFailure::before_journal(Status::internal(format!(
                 "checkpoint batch {} tape-log publication failed; physical tail reconciliation is required before retrying {} WRITTEN objects: {err}",
                 batch.batch_id,
                 batch.objects.len(),
             )))
-        });
-    }
-    drive.advance_append_commit(captured).map_err(|error| {
-        CheckpointBarrierFailure::after_journal(Status::unavailable(error.to_string()))
-    })?;
-    if let Some(session) = parity_session.as_deref_mut() {
-        if let Some(state) = session.sink_state.as_mut() {
-            state.acknowledge_publication();
+            });
         }
-    }
-    // WOR's adapter-only crash cut: journal append has fsynced, SQLite has not projected.
-    if let Some(fault) = cfg.mounted().and_then(|m| m.direct_replay_fault.as_ref()) {
-        fault
-            .abort_after_tape_log_append(
-                &record,
-                journal
-                    .log_reference()
-                    .map_err(|e| {
-                        CheckpointBarrierFailure::after_journal(crate::status_from_state_error(e))
-                    })?
-                    .0,
-            )
-            .map_err(|error| {
-                CheckpointBarrierFailure::after_journal(status_from_selected_write_error(
-                    selected,
-                    crate::PoolWriteError::InvalidInput(error),
-                ))
-            })?;
-    }
-    *checkpoint_ordinal = next_ordinal;
-    *tape_committed_object_count = next_committed_count;
-    // Hold a competing SQLite writer only across projection, after journal sync.
-    #[cfg(test)]
-    let projection_lock = if cfg.io_memory.epoch_test_action.load(Ordering::Relaxed) == 10 {
-        let connection = rusqlite::Connection::open(&cfg.index_path).unwrap();
-        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
-        Some(connection)
-    } else {
-        None
-    };
-    let projection = journal
-        .freeze()
-        .and_then(|snapshot| index.project_tape_log(&snapshot));
-    #[cfg(test)]
-    drop(projection_lock);
-    projection.map_err(|err| {
+        durable_reference = journal.log_reference().ok();
+        drive.advance_append_commit(captured).map_err(|error| {
+            CheckpointBarrierFailure::after_journal(Status::unavailable(error.to_string()))
+        })?;
+        if let Some(session) = parity_session.as_deref_mut() {
+            if let Some(state) = session.sink_state.as_mut() {
+                state.acknowledge_publication();
+            }
+        }
+        // WOR's adapter-only crash cut: journal append has fsynced, SQLite has not projected.
+        if let Some(fault) = cfg.mounted().and_then(|m| m.direct_replay_fault.as_ref()) {
+            fault
+                .abort_after_tape_log_append(
+                    &record,
+                    journal
+                        .log_reference()
+                        .map_err(|e| {
+                            CheckpointBarrierFailure::after_journal(crate::status_from_state_error(
+                                e,
+                            ))
+                        })?
+                        .0,
+                )
+                .map_err(|error| {
+                    CheckpointBarrierFailure::after_journal(status_from_selected_write_error(
+                        selected,
+                        crate::PoolWriteError::InvalidInput(error),
+                    ))
+                })?;
+        }
+        *checkpoint_ordinal = next_ordinal;
+        *tape_committed_object_count = next_committed_count;
+        if drive.command_deadline_expired() {
+            return Err(CheckpointBarrierFailure::after_journal(Status::deadline_exceeded(
+                "shutdown close deadline expired after durable commit; projection deferred to replay",
+            )));
+        }
+        // Hold a competing SQLite writer only across projection, after journal sync.
+        #[cfg(test)]
+        let projection_lock = if cfg.io_memory.epoch_test_action.load(Ordering::Relaxed) == 10 {
+            let connection = rusqlite::Connection::open(&cfg.index_path).unwrap();
+            connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+            Some(connection)
+        } else {
+            None
+        };
+        let projection = journal
+            .freeze()
+            .and_then(|snapshot| index.project_tape_log(&snapshot));
+        #[cfg(test)]
+        drop(projection_lock);
+        projection.map_err(|err| {
             tracing::error!(%err, "durable checkpoint awaits SQLite projection through journal replay");
             CheckpointBarrierFailure::after_journal(Status::internal(format!(
                 "checkpoint is durable in the journal but SQLite projection failed; close the session and retry after journal replay: {err}"
             )))
         })?;
-    #[cfg(test)]
-    if cfg.io_memory.epoch_test_action.load(Ordering::Relaxed) == 9 {
-        return Err(CheckpointBarrierFailure::after_projection(
-            Status::internal("injected post-projection failure"),
-        ));
+        #[cfg(test)]
+        if cfg.io_memory.epoch_test_action.load(Ordering::Relaxed) == 9 {
+            return Err(CheckpointBarrierFailure::after_projection(
+                Status::internal("injected post-projection failure"),
+            ));
+        }
+        let sealed_after_write = record.seal_due.is_some();
+        if let Some(trigger) = record.seal_due {
+            let spec = TerminalFinalizeSpec::automatic(selected, pool_cfg, trigger);
+            super::terminal_finalize::decide_live_finalization(
+                index,
+                drive,
+                journal,
+                &record,
+                &spec,
+                selected,
+                parity_session,
+                structural.as_mut().map(|rows| &mut **rows),
+            )
+            .map_err(CheckpointBarrierFailure::after_projection)?;
+        }
+        let journal_projection = projection_started.elapsed();
+        tracing::info!(
+            target: "remanence_write_diag",
+            phase = "checkpoint_barrier",
+            batch_id = %batch.batch_id,
+            tape_uuid = %Uuid::from_bytes(tape_uuid),
+            batch_objects = object_count,
+            batch_logical_bytes = batch.logical_bytes,
+            position_partition = captured.partition,
+            position_lba = captured.lba,
+            position_proof_ok = true,
+            filemark_drain_ms = crate::diagnostics::duration_ms(filemark_drain),
+            journal_projection_ms = crate::diagnostics::duration_ms(journal_projection),
+            "remanence_write_diag",
+        );
+        checkpointed_objects_from_catalog(index, &record, sealed_after_write)
+    })();
+    match result {
+        Ok(committed_objects) => Ok(BarrierOutcome {
+            committed_objects,
+            object_count,
+            logical_bytes: batch.logical_bytes,
+            filemark_drain,
+            journal_projection: projection_started.elapsed(),
+            sealed_after_write: record.seal_due.is_some(),
+            checkpoint_record: record,
+            terminal_checkpoint_record: None,
+        }),
+        Err(mut failure) => {
+            if failure.journal_durable && !failure.authority_uncertain {
+                // These exact objects were staged in `record` and its Committed is
+                // durable. Receipt delivery must not depend on the SQLite projection.
+                let reference = durable_reference;
+                let committed_objects = batch
+                    .objects
+                    .iter()
+                    .zip(&record.payloads)
+                    .map(|(object, payload)| {
+                        let mut receipt = object.object.to_proto();
+                        receipt.metadata_digest =
+                            payload
+                                .object
+                                .metadata_hash
+                                .as_ref()
+                                .map(|hash| pb::Digest {
+                                    algorithm: remanence_state::DIGEST_ALGORITHM_SHA256.into(),
+                                    value: hash.clone(),
+                                });
+                        if let Some(info) = receipt.append_commit_info.as_mut() {
+                            info.tape_log_sequence = reference.map(|r| r.0);
+                            info.tape_incarnation = reference.map(|_| 1);
+                            info.sealed_after_write = Some(record.seal_due.is_some());
+                            info.durability = pb::AppendDurability::Checkpointed as i32;
+                        }
+                        receipt
+                    })
+                    .collect();
+                failure.durable_outcome = Some(Box::new(BarrierOutcome {
+                    committed_objects,
+                    object_count,
+                    logical_bytes: batch.logical_bytes,
+                    filemark_drain,
+                    journal_projection: projection_started.elapsed(),
+                    sealed_after_write: record.seal_due.is_some(),
+                    checkpoint_record: record,
+                    terminal_checkpoint_record: None,
+                }));
+            }
+            Err(failure)
+        }
     }
-    let sealed_after_write = record.seal_due.is_some();
-    if let Some(trigger) = record.seal_due {
-        let spec = TerminalFinalizeSpec::automatic(selected, pool_cfg, trigger);
-        super::terminal_finalize::decide_live_finalization(
-            index,
-            drive,
-            journal,
-            &record,
-            &spec,
-            selected,
-            parity_session,
-            structural.as_mut().map(|rows| &mut **rows),
-        )
-        .map_err(CheckpointBarrierFailure::after_projection)?;
-    }
-    let terminal_checkpoint_record = None;
-    let journal_projection = projection_started.elapsed();
-    tracing::info!(
-        target: "remanence_write_diag",
-        phase = "checkpoint_barrier",
-        batch_id = %batch.batch_id,
-        tape_uuid = %Uuid::from_bytes(tape_uuid),
-        batch_objects = object_count,
-        batch_logical_bytes = batch.logical_bytes,
-        position_partition = captured.partition,
-        position_lba = captured.lba,
-        position_proof_ok = true,
-        filemark_drain_ms = crate::diagnostics::duration_ms(filemark_drain),
-        journal_projection_ms = crate::diagnostics::duration_ms(journal_projection),
-        "remanence_write_diag",
-    );
-    let committed_objects = checkpointed_objects_from_catalog(index, &record, sealed_after_write)?;
-    Ok(BarrierOutcome {
-        committed_objects,
-        object_count,
-        logical_bytes: batch.logical_bytes,
-        filemark_drain,
-        journal_projection,
-        checkpoint_record: record,
-        terminal_checkpoint_record,
-        sealed_after_write,
-    })
 }
 
 pub(super) fn parity_raw_write_fence_reason(error: &str) -> &'static str {
@@ -1571,6 +1641,11 @@ pub(super) fn write_closeout(
                     .as_ref()
                     .map(|s| s.session_id)
             });
+        if drive.command_deadline_expired() {
+            return Err(Status::deadline_exceeded(
+                "shutdown close deadline expired before closeout publication",
+            ));
+        }
         lease
             .publish_closed_out(
                 *progress.id.as_bytes(),

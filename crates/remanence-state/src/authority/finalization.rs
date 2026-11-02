@@ -463,8 +463,12 @@ impl AuthorityFinalization {
                         .to_string(),
                 ));
             }
-            // Native validate_plan binds an automatic OperatorCloseOut to the
-            // tape's durable seal_due; this shape check has no tape summary.
+            // Operator plans always require manual identity, matching the native fold.
+            (TerminalFinalizationTrigger::OperatorCloseOut, None) => {
+                return Err(StateError::JournalReplayFailed(
+                    "operator seal requires manual identity".into(),
+                ));
+            }
             (_, None) => {}
         }
         Ok(())

@@ -350,6 +350,8 @@ pub(in crate::handle) struct MediaFencedTransport {
     writable: bool,
     media_write_dispatch_count: u64,
     observer: Option<Box<dyn MediaDispatchObserver>>,
+    deadline: Option<std::sync::Arc<std::sync::OnceLock<Instant>>>,
+    completion_unknown: bool,
 }
 
 impl MediaFencedTransport {
@@ -366,6 +368,8 @@ impl MediaFencedTransport {
             writable: true,
             media_write_dispatch_count: 0,
             observer: None,
+            deadline: None,
+            completion_unknown: false,
         }
     }
 
@@ -435,6 +439,36 @@ impl MediaFencedTransport {
         self.observer = observer;
     }
 
+    /// Attach the session's shared shutdown deadline; never cancels an issued call.
+    pub(in crate::handle) fn set_command_deadline(
+        &mut self,
+        deadline: Option<std::sync::Arc<std::sync::OnceLock<Instant>>>,
+    ) {
+        self.deadline = deadline;
+        self.completion_unknown = false;
+    }
+
+    pub(in crate::handle) fn deadline_expired(&self) -> bool {
+        self.deadline
+            .as_ref()
+            .and_then(|d| d.get())
+            .is_some_and(|d| Instant::now() >= *d)
+    }
+
+    pub(in crate::handle) fn command_completion_unknown(&self) -> bool {
+        self.completion_unknown
+    }
+
+    fn check_command_deadline(&self) -> Result<(), ScsiError> {
+        if self.deadline_expired() {
+            Err(ScsiError::InvalidInput(
+                "shutdown close deadline expired; no new drive command",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Whether the epoch has been advanced (and a media-modifying CDB
     /// handed to the transport) in the current load.
     pub(in crate::handle) fn media_write_fenced_this_load(&self) -> bool {
@@ -450,6 +484,7 @@ impl MediaFencedTransport {
     ) -> Result<TransferOutcome, ScsiError> {
         let started = Instant::now();
         self.verification.check_cancelled()?;
+        self.check_command_deadline()?;
         let result = self.inner.execute_in(cdb, buf);
         self.verification
             .dispatch(cdb, buf, &result, started.elapsed());
@@ -476,6 +511,7 @@ impl MediaFencedTransport {
         }
         let started = Instant::now();
         self.verification.check_cancelled()?;
+        self.check_command_deadline()?;
         let result = self.inner.execute_none(cdb);
         self.verification
             .dispatch(cdb, &[], &Ok(TransferOutcome::clean(0)), started.elapsed());
@@ -587,6 +623,9 @@ impl MediaFencedTransport {
         self.verification
             .check_cancelled()
             .map_err(MediaDispatchError::Scsi)?;
+        self.check_command_deadline().map_err(|error| {
+            MediaDispatchError::NotDispatched(TapeIoError::InvalidRequest(error))
+        })?;
         if let Some(observer) = self.observer.as_mut() {
             observer
                 .dispatching(cdb, data_out)
@@ -641,6 +680,9 @@ impl MediaFencedTransport {
     }
 
     fn note_error(&mut self, error: &ScsiError, readiness_check: bool) {
+        if self.deadline.is_some() && crate::handle::completion_unknown(error) {
+            self.completion_unknown = true;
+        }
         let unit_attention = matches!(error, ScsiError::CheckCondition { sense, .. }
             if decode_sense(sense).is_some_and(|decoded| decoded.key == 0x06));
         let deferred = matches!(error, ScsiError::CheckCondition { sense, .. }

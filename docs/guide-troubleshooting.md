@@ -339,11 +339,30 @@ stops before issuing UNLOAD. Once UNLOAD has been issued, its MOVE home
 continues, and shutdown waits for it without the 600-second reservation deadline.
 That MOVE retains the configured `changer_not_ready_wait_seconds` magazine/door
 wait even during shutdown. Other reservations retain their 600-second bound.
-The service manager's stop timeout must cover this work and closing every open
-session, plus a margin. A failed MOVE or forced kill can still leave media unthreaded.
+The service manager's stop timeout (systemd `TimeoutStopSec`, for example) must
+exceed `daemon.shutdown_close_deadline_secs` plus one drive command's worst-case
+time, and must also cover any outstanding changer work described above. There
+is no startup probe of the service manager's configuration. A failed MOVE or
+forced kill can still leave media unthreaded.
 
-Graceful shutdown ends every write session and attempts its closeout. A failed
-closeout or drive error can leave an uncovered committed range. The next write
+Graceful shutdown gives every write session the same absolute deadline, starting
+when shutdown begins: `daemon.shutdown_close_deadline_secs` (default 300 seconds,
+zero refused). Sessions finish in parallel. The deadline covers the final barrier,
+`Committed`, and `SessionEnded`. At expiry, no new drive command is issued. An
+already issued command keeps its normal command timeout and is allowed to settle.
+After settlement, the session records `SessionEnded(graceful_shutdown)` with the
+whole uncommitted tail, including an interrupted closeout sidecar, and leaves
+closeout due. No closeout starts at the next shutdown step. Already delivered
+receipts stay valid; a durable commit is never turned into a failed Close by a
+later projection or cleanup error. One warning identifies each interrupted tape
+and session and the work left due.
+
+If command completion is unknown, or the native ending cannot be written, the
+session stays open in the log and the next access takes the crash-recovery row.
+A service-manager timeout that kills the daemon before settlement and the ending
+has the same effect. Complete uncommitted Objects then require the operator's
+`rem tape supersede-tail` acknowledgement; a recorded live ending needs none.
+A failed closeout or drive error can also leave an uncovered committed range. The next write
 open, or `rem tape closeout <tape>`, proves identity, the committed cursor and the
 whole named suffix, then rebuilds and closes that range. A recorded live ending
 needs no supersede acknowledgement. Memory refusal leaves closeout due; it does

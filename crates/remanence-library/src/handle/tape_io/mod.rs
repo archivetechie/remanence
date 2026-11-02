@@ -3442,6 +3442,25 @@ impl super::DriveHandle {
         self.transport.media_write_dispatch_count()
     }
 
+    /// Install the session shutdown budget at every drive dispatch boundary.
+    /// Issued commands retain their transport timeout and are always awaited.
+    pub fn set_command_deadline(
+        &mut self,
+        deadline: Option<std::sync::Arc<std::sync::OnceLock<std::time::Instant>>>,
+    ) {
+        self.transport.set_command_deadline(deadline);
+    }
+
+    /// Whether graceful shutdown has exhausted the session's command budget.
+    pub fn command_deadline_expired(&self) -> bool {
+        self.transport.deadline_expired()
+    }
+
+    /// A transport loss prevents a truthful live ending until crash recovery.
+    pub fn command_completion_unknown(&self) -> bool {
+        self.transport.command_completion_unknown()
+    }
+
     /// Attach or detach the active session's dispatch evidence collector.
     /// The owner must settle outstanding commands before replacing it.
     pub fn set_media_dispatch_observer(

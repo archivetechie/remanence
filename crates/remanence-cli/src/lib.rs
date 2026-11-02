@@ -17320,6 +17320,7 @@ mod tests {
                 checkpoint_max_age_seconds: remanence_state::DEFAULT_CHECKPOINT_MAX_AGE_SECONDS,
                 default_idle_timeout_seconds: 1800,
                 append_ingress_idle_secs: remanence_state::DEFAULT_APPEND_INGRESS_IDLE_SECS,
+                shutdown_close_deadline_secs: remanence_state::DEFAULT_SHUTDOWN_CLOSE_DEADLINE_SECS,
                 drive_idle_unload_seconds: remanence_state::DEFAULT_DRIVE_IDLE_UNLOAD_SECONDS,
                 changer_not_ready_wait_seconds:
                     remanence_state::DEFAULT_CHANGER_NOT_READY_WAIT_SECONDS,
