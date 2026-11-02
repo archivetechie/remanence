@@ -20,24 +20,13 @@
     }
   ],
   "default": {
-    "kept": ["user.mime_type"],
+    "kept": [
+      "user.mime_type"
+    ],
     "dropped": [
       "security.selinux",
       "system.posix_acl_access",
       "trusted.foo"
     ]
-  },
-  "full_fidelity": {
-    "kept": [
-      "security.selinux",
-      "system.posix_acl_access",
-      "trusted.foo",
-      "user.mime_type"
-    ],
-    "dropped": []
-  },
-  "security_widening": {
-    "kept": ["security.selinux", "user.mime_type"],
-    "dropped": ["system.posix_acl_access", "trusted.foo"]
   }
 }

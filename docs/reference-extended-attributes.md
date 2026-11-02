@@ -1,152 +1,249 @@
-<!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-format/src/tar.rs crates/remanence-format/src/writer.rs crates/remanence-cli/src/archive_ingest.rs crates/remanence-stream/src/lib.rs crates/rem-recover/src/main.rs @ 6ed03ef0 -->
+<!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-format/src/layout.rs crates/remanence-cli/src/archive_ingest.rs crates/remanence-cli/src/lib.rs crates/remanence-stream/src/lib.rs crates/rem-recover/src/main.rs @ 625f7044 -->
 # Extended attributes and file metadata
 
-This reference describes which file metadata Remanence preserves in a REM-OBJECT
-object, how that metadata is stored, and how it behaves on restore, including
-a restore made years later with nothing but a standard `tar`. An extended
-attribute (xattr) is a named piece of metadata that a filesystem attaches to a
-file in addition to its content, for example `user.comment`. REM-OBJECT is the
-native stored-object format; the [glossary](reference-glossary.md) defines the
-other terms used here. The format rules live in the REM-OBJECT
-specification (§4.3, §4.7.3, §4.10), and §12.10 describes the restore hazards
-and what a restore must reproduce; recommended restore practice is in the
-[REM Implementation and Operations Guide](../specs/publication/rem-implementation-guide.md), under
-“Restoring onto a host”. This document is the operator's companion to both.
+This reference is for operators and archivists. It describes which file
+metadata a REM-OBJECT object preserves, where that metadata is stored, which
+attributes are captured and restored, and what a restore made with only a
+standard `tar` reproduces. REM-OBJECT is the format of the objects Remanence
+stores. An extended attribute (xattr) is a named piece of metadata that a
+filesystem attaches to a file beside its content, such as `user.comment`; its
+name begins with a namespace (`user.`, `security.`, `system.`, `trusted.`). The
+[glossary](reference-glossary.md) defines the other terms used here.
 
-## What is preserved, and what is deliberately not
+The format rules are in the REM-OBJECT specification: Section 4.3 (the tar
+header fields), Section 4.7.3 (extended-attribute preservation), Section 4.10
+(standard-tool extraction) and Section 12.10 (the hazards of restoring paths,
+links and attributes). Recommended restore practice is in the [REM
+Implementation and Operations
+Guide](../specs/publication/rem-implementation-guide.md), section 4, "Restoring
+onto a host".
 
-A REM-OBJECT object faithfully preserves each file's **content**, its **path**,
-**entry type** (regular file, symlink, hardlink, directory), **symlink
-target**, and — as the one permission fact treated as content — the
-**executable bit**. Optionally it preserves **mtime** and **extended
-attributes**.
+## Preserved metadata
 
-It deliberately does **not** preserve **ownership** (uid/gid), and it does
-not preserve **mode bits beyond the executable bit** (no setuid, setgid, or
-sticky bit). The tar header carries fixed placeholder values for these
-(uid/gid `0`, a normalized mode), and a reader is required to ignore them.
-The reason is that an archive is meant to outlive the system that produced
-it. A numeric owner or a security mode from a host that no longer exists
-describes that host's environment and is not part of the file's content. The
-same reasoning governs extended attributes, below.
+This table describes native REM-OBJECT entries. Wrappers retain the tar
+permission behaviour described under [Restore](#restore).
 
-## Where attributes are stored: the manifest, not the tar headers
+| Metadata | Preserved | Remarks |
+| --- | --- | --- |
+| Content | Always | Each regular file carries its SHA-256. |
+| Path | Always | A clean relative path. |
+| Entry type | Always | Regular file, symbolic link, hard link or directory. |
+| Symbolic link target | Always | Stored as given; it may be absolute or point outside the object. |
+| Executable bit | When supplied | The one permission fact treated as content. `rem archive build` records it. |
+| Modification time | When supplied | Stored in the pax `mtime` record. `rem archive build` records it. |
+| Extended attributes | `user.*` only | See [Capture](#capture). |
+| ACLs, file flags and privileged attributes | Never | These describe the originating host’s security posture. |
+| Ownership (uid, gid, user and group names) | Never | The tar header carries fixed placeholder values, and readers ignore them. |
+| Mode bits other than the executable bit | Never | No setuid, setgid or sticky bit. The header carries a normalized mode, and readers ignore it. |
 
-Extended attributes are stored inside the object's **CBOR manifest**, in a
-per-entry `metadata_preservation_data` map. They are not stored as pax
-`SCHILY.xattr.*` extended-header records. This choice makes the standard-tool
-recovery path (below) safe. The manifest is a file in CBOR, a compact binary
-data format. A generic tar reader does not know the manifest's meaning and
-treats it as one extra file in the archive.
+Ownership and security mode bits are excluded because an archive is meant to
+outlive the system that produced it. A numeric owner or a security mode from a
+host that no longer exists describes that host's environment, not the file's
+content. The same reasoning governs which extended attributes are captured and
+restored. [Why Remanence keeps only user extended
+attributes](why-user-xattrs-only.md) gives the reasons in full, with recipes
+for keeping the other metadata when a collection needs it.
 
-This is the path for every natively representable entry. An entry with a
-non-native file type, or with a single kept attribute value over 4 KiB, or
-with a kept-attribute total over 16 KiB, is instead wrapped: `rem archive
-build` stores it as an ordinary `tar --xattrs` blob (named
-`<path>.remwrap.tar`, itself one regular entry in the outer manifest), and
-the attributes it keeps by policy do appear there as real, filtered
-`SCHILY.xattr.*`/`LIBARCHIVE.xattr.*` pax records. This does not weaken the
-recovery guarantee below — a plain `tar x` on the outer archive does not
-recurse into a nested `.remwrap.tar`, so those attributes still are not
-reapplied by the standard-tool path — but a reader inspecting a wrapped
-entry's bytes directly, rather than restoring through `rem`, finds pax
-xattr records there.
+## Where attributes are stored
+
+Extended attributes are stored inside the object's manifest, in the
+`metadata_preservation_data` map of each entry. The manifest is a file in CBOR,
+a compact binary data format, stored in the object as
+`_remanence/manifest.cbor`. Attributes are not stored as pax `SCHILY.xattr.*`
+extended-header records. A generic tar reader does not know the manifest's
+meaning and extracts it as one extra file, so it applies none of the
+attributes; see [The standard-tool recovery
+path](#the-standard-tool-recovery-path).
+
+That is the path for every entry the manifest can represent natively. An entry
+it cannot represent is packed by `rem archive build` into a wrapper: an
+ordinary tar file, written with `bsdtar -c --format pax` and metadata capture disabled, stored as
+one regular entry named `<path>.remwrap.tar`, with a `<path>.remwrap.idx` index
+beside it unless the build is given `--no-index`. A wrapped directory takes its
+whole subtree into the wrapper. The ingest report's `scan.clusters` names the
+reason for each wrapped entry:
+
+| Reason | Entry |
+| --- | --- |
+| `non-utf8-path` | An entry whose path is not valid UTF-8. |
+| `non-utf8-symlink-target` | A symbolic link whose target is not valid UTF-8. |
+| `unsupported-file-type` | A FIFO, socket or device node. |
+
+Attributes never cause wrapping. Native files and directories carry their
+selected `user.*` attributes in the manifest, including values larger than
+4 KiB. A selected attribute name that cannot be represented as valid UTF-8
+causes an error instead of a wrapper.
+
+Wrappers preserve content and the existing tar permission behaviour. They carry
+no xattrs, ACLs, file flags or Mac metadata. Attributes on entries selected for
+a wrapper, including an explicitly requested blob subtree, are reported as
+not captured. They cannot be attached to individual native manifest entries
+because those entries are inside the wrapper.
 
 ## Capture
 
-Capture is portable by default. `rem archive build` records attributes in the
-`user.` namespace and drops attributes in every other namespace, including
-`security.*`, `system.*`, and `trusted.*`. Dropped names are listed per entry
-in the ingest report, and one stderr warning gives the total count. Attribute
-values are never included in command output. Six built-in macOS housekeeping
-attributes are always discarded silently, so they do not add report noise.
+`rem archive build` captures attributes only in the `user.` namespace, with three selection modes:
 
-Attribute selection is a matter of local policy and is not part of the byte format.
-An ingest ruleset can widen the portable core with a validated namespace
-prefix:
+| Mode | Captured |
+| --- | --- |
+| `portable-core` | All `user.*` attributes. The default. |
+| `denylist` | `user.*` attributes except the names listed with `xattr-drop`. |
+| `allowlist` | Only the `user.*` names listed with `xattr-keep`. |
+
+In every mode, six macOS housekeeping attributes are discarded without being
+reported: `com.apple.quarantine`, `com.apple.metadata:kMDItemWhereFroms`,
+`com.apple.lastuseddate#PS`, `com.apple.FinderInfo`,
+`com.apple.metadata:_kMDItemFinderComment` and
+`com.apple.metadata:kMDItemDownloadedDate`.
+
+The mode is local policy and is not part of the byte format. It is set in an
+ingest ruleset given to `rem archive build --rules <PATH>`, one directive per
+line:
+
+| Directive | Effect |
+| --- | --- |
+| `option xattr-mode MODE` | Selects one of the three modes. |
+| `xattr-drop NAME` | Drops one attribute by name. Without an explicit mode, it selects `denylist`. |
+| `xattr-keep NAME` | Keeps one attribute by name in `allowlist` mode. |
+
+Rules may name only `user.*` attributes. The former `full-fidelity` mode,
+`--full-fidelity-xattrs` flag and `xattr-namespace` ruleset key have been removed;
+using one produces an error explaining the change. Remanence is a long-term
+preservation tool. Security labels, ACLs and file flags describe one host's
+security posture and are not captured for application on a future host.
+
+Attribute values never appear in command output. The build report's `ingest`
+object records `xattr_policy.mode`, `xattr_policy.allowed_prefixes` (always
+`["user."]`), `scan.dropped_xattrs` and `scan.totals.dropped_xattrs`. Dropped
+names are listed per path; the build also prints one warning on standard
+error with the total. The clustered `scan.xattr_drops` view lists the same
+names. No report field records captured privileged attributes.
+
+Objects with any preserved attributes use stream schema `1.1`; those without
+use `1.0`. The manifest schema integer remains `1` in either case.
+
+For example, a ruleset containing the line `xattr-drop user.secret`, applied to
+a directory whose file `notes.txt` carries `user.comment` and `user.secret`,
+prints:
 
 ```text
-xattr-namespace security.
+warning: 1 extended attribute(s) dropped by capture policy; see dropped_xattrs in the ingest report
 ```
 
-The prefix must be one non-empty namespace followed by a dot. The report's
-`xattr_policy.applied_non_core_namespaces` field records such widening, while
-`scan.captured_non_core_xattrs` lists the captured names per entry. Existing
-exact-name policies remain available through `option xattr-mode denylist` plus
-`xattr-drop`, or `option xattr-mode allowlist` plus `xattr-keep`.
+and the build report's `ingest` object contains (trimmed):
 
-For records mandates that require every available namespace, use either
-`option xattr-mode full-fidelity` in a ruleset or the
-`--full-fidelity-xattrs` build flag without a ruleset. Full-fidelity logical
-capture is explicit, is not portable, and still omits the built-in junk names.
-It does not relax restore policy: privileged namespaces remain denied on
-restore unless the restoring operator opts in.
+```text
+"scan": {
+  "dropped_xattrs": {
+    "notes.txt": [
+      "user.secret"
+    ]
+  },
+  "totals": {
+    "dropped_xattrs": 1,
+    "native_entries": 1,
+    ...
+  },
+  ...
+},
+"xattr_policy": {
+  "allowed_prefixes": ["user."],
+  "mode": "denylist"
+}
+```
 
-## Restore, and why it is cautious by default
+The object keeps `user.comment` for `notes.txt`.
 
-Reapplying a stored attribute writes it onto a file on the machine
-performing the restore — a machine that may be entirely different from the
-one that produced the archive. Some attribute namespaces carry privilege or
-access-control meaning: on Linux, `security.capability` grants a binary
-elevated privileges, `security.*` and `system.*` carry SELinux labels and
-POSIX ACLs, and `trusted.*` carries other privileged state. An archive that
-silently reconstituted these on restore would let a cartridge configure the
-security posture of the host that reads it.
+## Restore
 
-Remanence therefore restores conservatively by default:
+Reapplying a stored attribute writes it onto a file on the machine that
+performs the restore, which may be a different machine from the one that
+produced the archive. Some namespaces carry privilege or access-control
+meaning. On Linux, `security.capability` grants a program elevated privileges,
+`security.*` and `system.*` carry SELinux labels and POSIX access control
+lists, and `trusted.*` carries other privileged state. A restore that applied
+these without being asked would let a cartridge configure the security of the
+host that reads it.
 
-- **Allow-list.** Only attributes in the `user.` namespace are applied.
-  Attributes outside it are **skipped and reported by name** (never applied,
-  and their values are never logged). To apply additional namespaces, an
-  operator opts in explicitly, per invocation:
+Restores apply only `user.*` attributes through Remanence's native restore
+code. Every other name in a manifest, including one from an older or foreign
+writer, is skipped and reported by name without its value. There is no
+option to widen this policy. The former `--xattr-namespace` flag is refused
+by every command that previously accepted it, including `rem-recover`.
 
-  ```sh
-  rem archive extract … --xattr-namespace security.
-  ```
+On a standalone drive, `rem get` and `rem tape restore` apply the default and
+have no such option. Through the daemon, `rem get` restores the bytes and
+modification times of the members it reads and applies no extended attributes.
 
-  The flag is repeatable and appends to the allow-list; with no flag, only
-  `user.` is applied. The restore report lists both the attributes that were
-  skipped and any privileged attributes that were applied, so an opt-in's
-  effect is auditable.
+A skipped attribute does not fail the restore. The command prints one warning
+on standard error, and its report lists the skipped names per entry in
+`skipped_xattrs`. The reserved `applied_privileged_xattrs` field is always
+empty. A restore of an object whose file `bin/tool`
+carries `security.capability` prints
+(illustrative):
 
-- **No symlink following.** Attribute writes never traverse a symbolic link
-  at the final path component; they are applied to the restored file itself,
-  never to whatever a link might point at.
+```text
+warning: 1 extended attribute(s) skipped during restore; see skipped_xattrs in the report
+```
 
-- **Errors are surfaced.** A genuine failure to apply an allowed attribute
-  is reported as a failure. Only "this filesystem does not support extended
-  attributes" is treated as a benign skip.
+and its report contains:
 
-The same allow-list, opt-in, and reporting behavior applies to every restore
-surface, including the standalone disaster-recovery tool `rem-recover`.
+```text
+"applied_privileged_xattrs": {},
+"skipped_xattrs": {
+  "bin/tool": [
+    "security.capability"
+  ]
+},
+```
+
+An attribute write never follows a symbolic link at the last path component;
+the attribute is applied to the restored entry itself. A failure to apply an
+allowed attribute is reported as a failure, except when the destination
+filesystem does not support extended attributes, which is treated as a skip.
+
+After native restore, `rem archive extract` unpacks each `.remwrap.tar`,
+unless given `--no-unwrap`, using:
+
+```text
+bsdtar -x -p --no-xattrs --no-acls --no-fflags --no-mac-metadata
+```
+
+`-p` keeps the existing wrapper permission behaviour; the four explicit
+options disable its attribute, ACL, file-flag and Mac metadata effects. A
+wrapper from an older or foreign writer restores content without applying
+any of those records, including `user.*`. `skipped_xattrs` lists attribute
+names; `skipped_metadata` lists ACL and file-flag record names per path. Both
+also appear under `unwrap`. Values are never included.
+
+Before extraction, Remanence checks every header checksum, validates member
+and extension paths (including `X`, `L` and `K` records), and limits each pax
+or long-path header to 1 MiB. Malformed or unsupported wrappers fail before
+extraction. No temporary wrapper copy is made. The other restore commands
+write `.remwrap.tar` and `.remwrap.idx` as ordinary files.
 
 ## The standard-tool recovery path
 
-Because attributes live in the manifest and not in tar-visible headers, a
-recovery performed with a plain `tar` does not reapply any extended attribute.
-This is the long-term fallback that needs no Remanence binary. Such
-a recovery restores the file bytes, the directory structure, symlinks and
-hardlinks, and writes the manifest as one ordinary file
-(`_remanence/manifest.cbor`) containing the attribute data as inert bytes,
-applied to nothing. For a natively represented entry, a `security.capability`
-cannot be reconstituted by `tar`, even with `tar --xattrs`, because there is
-no attribute record in the outer tar stream for it to find. A wrapped entry
-(see above) does carry a real pax record for it, but one level deeper, inside
-a nested `.remwrap.tar` blob that a single non-recursive `tar x` never opens
-— the attribute is present in the archive but still not reapplied. Combined
-with the exclusion of ownership and setuid/setgid mode bits, the
-standard-tool path cannot escalate privilege through file metadata.
+A recovery made with a plain `tar` and no Remanence program reapplies no
+attribute that lives in the manifest, because the outer tar stream has no
+attribute records for those entries. Such a recovery restores the file bytes,
+the directory structure, symbolic links and hard links. It writes the manifest
+as one ordinary file, `_remanence/manifest.cbor`, whose attribute data is inert
+bytes applied to nothing. For a natively represented entry, a
+`security.capability` cannot be reapplied by `tar`, even with `tar --xattrs`,
+because there is no record for it to find.
 
-Responsibility is therefore divided as follows. The recovery path that anyone
-can run with an old, unchanged `tar` cannot reapply privileged metadata. Only
-the Remanence-aware reader can, and that is where the allow-list policy is
-enforced.
+New wrappers carry no attribute, ACL or file-flag records. Older or foreign
+wrappers may contain them. Extracting the outer object leaves each nested
+wrapper as a file; manually unpacking it with a standard tool follows that
+tool's policy. Use the four disabling options above when recovering such a
+wrapper with bsdtar.
 
 ## Published archives
 
-Preserved metadata is stored in the clear inside a plaintext object's
-manifest, readable with any CBOR tool. Attribute values, symlink targets,
-and absolute paths can disclose information about the originating system.
-Before publishing a plaintext archive, review what its objects carry.
-Encrypted REM-OBJECT objects place the manifest inside the authenticated,
-encrypted frame and do not have this exposure.
+The manifest of a plaintext object is stored in the clear and can be read with
+any CBOR tool. Attribute values, symbolic link targets and absolute paths can
+disclose information about the system that produced them; REM-OBJECT
+Section 12.12 lists what a published plaintext object discloses. An encrypted
+object places its manifest inside the authenticated, encrypted envelope, so this
+disclosure does not apply to it.

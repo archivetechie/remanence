@@ -6625,12 +6625,6 @@ fn pool_write_status_maps_nested_input_and_capacity_errors() {
         StreamingError::InvalidInput("bad archive path".to_string()),
     ));
     assert_eq!(invalid.code(), tonic::Code::InvalidArgument);
-    let invalid_prefix = status_from_pool_write_error(PoolWriteError::Streaming(
-        StreamingError::InvalidXattrNamespacePrefix {
-            prefix: "s".to_string(),
-        },
-    ));
-    assert_eq!(invalid_prefix.code(), tonic::Code::InvalidArgument);
 
     let exhausted = status_from_pool_write_error(PoolWriteError::Parity(
         ParityError::ObjectTooLargeForEmptyTape {

@@ -1,75 +1,62 @@
+<!-- code-anchor: Cargo.toml crates/remanence-cli/src/lib.rs crates/remanence-cli/src/archive_ingest.rs crates/rem-recover/src/main.rs @ 625f7044 -->
 # Quickstart
 
-This walkthrough goes from a clean checkout to a verified archive
-round trip on your local disk, then to real hardware. The local part
-needs no tape drive, no library, and no elevated privileges — the native
-object format works against ordinary files, and it is the same code path
-the tape write uses.
+This tutorial is for a newcomer who wants to see Remanence work, from a clean
+checkout to a first tape. In the first part you build Remanence, pack a small
+directory into an object file on your local disk, look inside it, and restore
+it, first in plaintext and then encrypted. That part needs no tape drive and no
+special privileges. The second part writes the same files to a tape in a
+changer library through the daemon, and reads one back.
 
-Commands in the local sections were run as written against the current
-tree; hardware sections are marked. Remanence supports two hardware paths:
-one manually loaded standalone drive operated directly by `rem`, or a changer
-library operated through `rem-daemon`.
+An **object** is the unit Remanence stores: an archive of one or more files.
+On tape, each object is one tape file, the run of blocks between two filemarks
+(the separators the drive records). On local disk, an object is an ordinary
+file, and it holds exactly the bytes that a tape write would store.
 
-<!-- code-anchor: Cargo.toml crates/remanence-cli/Cargo.toml crates/remanence-api/build.rs crates/remanence-cli/src/archive_ingest.rs @ 6ed03ef0 -->
+The page was checked against the source at version 0.2.0. There is no binary
+release yet, so you build from source
+([Releases and versions](status.md#releases-and-versions) has the detail).
+
+## What you need
+
+- A Linux host with `git`, a C compiler and Rust 1.88 or newer.
+  [Installing Remanence](guide-install.md#before-you-start) lists the packages.
+- `bsdtar` (the `libarchive-tools` package on Debian and Ubuntu, `bsdtar` on
+  Fedora). The first part uses it to list an object's contents.
+- Python 3, for one key-file conversion in the encrypted part.
+- For the second part only: a tape library (physical, or a virtual one such as
+  QuadStor), a blank LTO cartridge in one of its slots, and `sudo` on the host.
+
+<!-- code-anchor: Cargo.toml crates/remanence-cli/Cargo.toml @ 625f7044 -->
 ## Build
 
-You need Linux, a C compiler (`build-essential` on Debian/Ubuntu, `gcc` on
-Fedora) and Rust 1.88 or newer (rustup). The protobuf definitions are compiled
-in-process, so `protoc` is not needed:
+Clone the repository, build it, and put the programs on your path for this
+shell:
 
 ```sh
 git clone https://github.com/archivetechie/remanence
 cd remanence
-cargo build --release
+cargo build --release --locked
 export PATH="$PWD/target/release:$PATH"
+rem --version
 ```
 
-That produces four binaries under `target/release/`: `rem` (operator
-CLI), `rem-debug` (break-glass CLI), `rem-daemon` (the service), and
-`rem-recover` (a standalone catalogless disaster-recovery tool — see the
-[CLI reference](reference-cli.md#rem-recover-standalone-recovery)). The
-`export` line puts them on your path for this shell, and the rest of this page
-assumes it.
+The first build takes a while. When it finishes, `rem --version` prints:
 
-One optional cargo feature widens the core surface:
-
-- `--features remanence-cli/linux-udev` enables `rem watch` (hot-plug
-  events); it needs the `pkg-config` and `libudev-dev` system packages.
-
-Foreign-format adapters are separate distributions rather than Cargo features
-of the core repository. See the
-[foreign-format adapter reference](reference-foreign-format-adapters.md).
-
-One program is needed at run time, and the first walkthrough below uses it:
-`bsdtar` (the `libarchive-tools` package on Debian and Ubuntu, `bsdtar` on
-Fedora). `rem archive build` needs it only to build an archive that packs
-files into a `.remwrap.tar` wrapper, and `rem archive extract` only to extract
-a whole object that contains one, unless `--no-unwrap` is given. Extract
-checks for it before it writes anything. Range (`--path`/`--range`) and
-blob-member (`--blob-entry`/`--blob-member`) extracts never need it.
-
-To run the test suite the way CI does (it also needs `bsdtar`):
-
-```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+```text
+rem 0.2.0
 ```
 
-Hardware and large-memory tests are `#[ignore]`d by default and opt in
-through environment variables documented in their test modules. The default
-suite includes the sampled durability property; the full durability matrix is
-also ignored by default. Run it with
-`cargo test -p remanence-api --lib durability -- --ignored` (about 12 minutes).
-See [durability crash suites](architecture-overview.md#durability-crash-suites)
-for coverage and known refusal defects.
+The build made four programs in `target/release/`: `rem` (the operator tool),
+`rem-debug` (the break-glass tool), `rem-daemon` (the service that runs a
+library) and `rem-recover` (a recovery tool for encrypted objects). The rest of
+this page assumes the `export` line is in effect.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/archive_ingest.rs @ 6ed03ef0 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/archive_ingest.rs @ 625f7044 -->
 ## First archive, no tape required
 
-Build a stored object from a directory, look inside it, and restore it.
-Make some input:
+From the checkout directory, make a small directory to archive, with one text
+file and one 100 kB file of random bytes, and change into `demo`:
 
 ```sh
 mkdir -p demo/src/photos
@@ -78,223 +65,370 @@ head -c 100000 /dev/urandom > demo/src/photos/img001.raw
 cd demo
 ```
 
-Build a REM-OBJECT object:
+### Build an object
+
+Build an object from `src`:
 
 ```sh
 rem archive build --inputs src --out demo.rem-object
 ```
 
-The command prints a JSON build report: the object id, the chunk size
-(262144 bytes by default), and one entry per file with its SHA-256, size,
-and position inside the object. This report is what a system that manages the
-archive (an orchestrator) would store; every field in it is also recoverable from the object itself.
+The command writes `demo.rem-object` and prints a build report as one line of
+JSON. Here it is formatted and trimmed to the fields discussed below; your IDs
+and the digest of the random file will differ:
 
-Inspect the object without extracting it:
+```text
+{
+  "body_format": "rem-object-v1",
+  "chunk_size": 262144,
+  "files": [
+    {
+      "file_sha256": "7ca46ed8705ae80e983715aa2d60e4c49c87465c9d9467cafddf02bfadf6fc77",
+      "first_chunk_lba": 1,
+      "path": "notes.txt",
+      "size_bytes": 11,
+      ...
+    },
+    {
+      "file_sha256": "65bb8f512b8b27e965d85e1511c1f4553d871566c4fecdd7cd272b9cccaf98b5",
+      "first_chunk_lba": 2,
+      "path": "photos/img001.raw",
+      "size_bytes": 100000,
+      ...
+    }
+  ],
+  "object_id": "fdb836a0-0b52-4323-be2e-12c384af2bd4",
+  "representation": "plaintext",
+  "stored_size_blocks": 4,
+  "stored_size_bytes": 1048576,
+  ...
+}
+```
+
+The object is laid out in chunks of 256 KiB (`chunk_size`), and each file's
+data starts on a chunk boundary (`first_chunk_lba`). That is why two small
+files make a 1 MiB object of four chunks. Each file carries its SHA-256, so a
+restore can check every file without any host state. A system that manages the
+archive above Remanence, which these pages call an orchestrator, would keep this
+report.
+
+### Look inside it
+
+Read the object's file list back without extracting anything:
 
 ```sh
 rem archive inspect --object demo.rem-object
 ```
 
-Then restore and compare:
+It prints one line of JSON. Formatted and trimmed, it shows the same files,
+read this time from the object itself:
+
+```text
+{
+  "body_format": "rem-object-v1",
+  "files": [
+    {
+      "file_sha256": "7ca46ed8705ae80e983715aa2d60e4c49c87465c9d9467cafddf02bfadf6fc77",
+      "path": "notes.txt",
+      "size_bytes": 11,
+      ...
+    },
+    {
+      "path": "photos/img001.raw",
+      "size_bytes": 100000,
+      ...
+    }
+  ],
+  "object_id": "fdb836a0-0b52-4323-be2e-12c384af2bd4",
+  "representation": "plaintext",
+  "schema_version": "1.0",
+  ...
+}
+```
+
+An object is also a standard POSIX pax archive (the `tar` format POSIX
+defines), so ordinary tar tools can read it without Remanence:
+
+```sh
+bsdtar -tf demo.rem-object
+```
+
+```text
+notes.txt
+photos/img001.raw
+_remanence/manifest.cbor
+```
+
+The last entry is the object's manifest, a CBOR index that records each file's
+position and digest.
+
+### Restore it
+
+Extract the object into a new directory and compare the result with the
+original:
 
 ```sh
 rem archive extract --object demo.rem-object --dest restored
 diff -r src restored && echo identical
 ```
 
-Two properties of the object are worth knowing. First, `demo.rem-object` is a valid POSIX pax tar
-stream padded to fixed-size chunks — `bsdtar -tf demo.rem-object` lists your
-files plus a `_remanence/manifest.cbor` index entry. A tape written by
-Remanence holds exactly these bytes as its object body, so no Remanence
-software is needed to get the data back, which matters for an archive that
-must stay readable for decades. Second, every file's SHA-256 travels with it, so verification
-never depends on host state.
+`extract` prints a JSON report (trimmed here), and `diff` finds no difference:
+
+```text
+{"bytes_written":100011,"dest":"restored","files_written":2,...,"representation":"plaintext",...,"warnings":[]}
+identical
+```
 
 ![Local round trip: rem archive build turns src/ into demo.rem-object, rem archive extract restores it, diff -r confirms the copies are byte-identical, and rem archive inspect reads the object in place](assets/local-roundtrip.svg)
 
-*Fig. 1 — The local round trip: build a rem-object-v1 object from a directory, read it back, and prove the copies identical — the same bytes a tape write stores as the object body.*
+*Fig. 1. The local round trip: build an object from a directory, read it back,
+and check that the copies are identical. A tape write stores these same bytes.*
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-aead/src/lib.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/xwing.rs @ 6ed03ef0 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-aead/src/lib.rs crates/rem-recover/src/main.rs @ 625f7044 -->
 ## The encrypted variant
 
-The encrypted representation wraps the same tar stream in an
-authenticated ChaCha20-Poly1305 envelope. This is the only encrypted
-representation: every
-object gets a fresh data-encryption key, wrapped separately to each
-recipient with HPKE (RFC 9180 Base mode, HKDF-SHA256, ChaCha20-Poly1305)
-running the X-Wing post-quantum/classical hybrid KEM (ML-KEM-768
-combined with X25519). Writers require 2-8 distinct, nonzero recipient epochs in
-ascending slot order.
+An encrypted object wraps the same tar stream in an authenticated envelope.
+Each encrypted object is sealed to between two and eight recipient keys, so
+that losing one private key does not lose the data, and any one of the private
+keys opens it. Each recipient key has a slot number, and a build takes the keys
+in ascending slot order.
 
-Create private REMP and public REMR files with `rem archive recipient keygen`.
-Follow the [encryption steps](guide-standalone-drive.md#encryption) to generate
-`primary.remp`/`primary.remr` and `recovery.remp`/`recovery.remr`, assign the
-recovery public record slot 1, and store the private files safely. Then build:
+### Make two keys
+
+Create a working key and a recovery key:
+
+```sh
+rem archive recipient keygen --out primary.remp --label primary
+rem archive recipient keygen --out recovery.remp --label recovery
+```
+
+Each command prints one line:
+
+```text
+{"epoch_id":"2ec819840bc9679d1f105ddf676ff5e8","label":"primary","observed_endpoints":[],"private":"primary.remp","public":"primary.remr","supported_endpoint_kinds":["library","standalone"]}
+{"epoch_id":"d4ac7d125de6068091d44056102ff9be","label":"recovery","observed_endpoints":[],"private":"recovery.remp","public":"recovery.remr","supported_endpoint_kinds":["library","standalone"]}
+```
+
+Each command wrote a private key file (`.remp`, created with mode 0600) and a
+public recipient file (`.remr`). The `epoch_id` identifies the key. `keygen`
+always writes the public file for slot 0, so the two public files now share a
+slot. A build given both refuses with
+`--recipient epochs must be distinct and in ascending slot order`.
+
+Give the recovery key slot 1. `rem archive recipient derive` prints the slot-1
+public record as JSON, and a short Python script writes it over
+`recovery.remr`:
+
+```sh
+rem archive recipient derive --private-key recovery.remp --slot-index 1 > recovery-public.json
+python3 - <<'KEYS'
+import base64, json
+from pathlib import Path
+record = json.loads(Path("recovery-public.json").read_text())
+Path("recovery.remr").write_bytes(base64.b64decode(record["canonical_public_key_base64"]))
+KEYS
+rem archive recipient inspect --public-key recovery.remr
+```
+
+`inspect` confirms the new slot:
+
+```text
+{"epoch_label":"recovery","observed_endpoints":[],"public_key_bytes":1216,"recipient_epoch_id":"d4ac7d125de6068091d44056102ff9be","slot_index":1,"supported_endpoint_kinds":["library","standalone"]}
+```
+
+In real use, keep the two private files in separate safe places, away from the
+tapes. A lost private file cannot be recovered. The public files can be copied
+freely.
+
+### Build, inspect and restore the encrypted object
+
+Build an encrypted object sealed to both keys, then inspect it:
 
 ```sh
 rem archive build --inputs src --out demo-enc.rem-object \
     --recipient primary.remr --recipient recovery.remr
 rem archive inspect --object demo-enc.rem-object
+```
+
+The build report has the same shape as before, now with
+`"representation":"encrypted"`. The inspection, formatted and trimmed, shows
+the envelope:
+
+```text
+{
+  "encryption": "REMO",
+  "format_version": 2,
+  "keyed": false,
+  "recipient_epochs": [
+    { "epoch_id": "2ec819840bc9679d1f105ddf676ff5e8", "label": "primary" },
+    { "epoch_id": "d4ac7d125de6068091d44056102ff9be", "label": "recovery" }
+  ],
+  "representation": "encrypted",
+  "stored_size_bytes": 1310720,
+  ...
+}
+```
+
+`inspect` needs no key. It checks the envelope's header and lists the
+recipients, but it cannot show the file list, which is inside the encryption.
+
+To restore, give one private key:
+
+```sh
 rem archive extract --object demo-enc.rem-object --dest restored-enc \
     --private-key primary.remp
 diff -r src restored-enc && echo identical
 ```
 
-`inspect` needs no key. It validates the envelope header and key frame and reports
-the ordered `recipient_epochs`, but cannot expose the encrypted manifest.
-The matching REMP file selects its epoch's slot during open.
-
-To rotate recipients, open the existing encrypted object with one current private
-key and reseal it to a new 2-8-recipient set. This example replaces the primary
-key, so first create its successor with
-`rem archive recipient keygen --out primary-rotated.remp --label primary-rotated`,
-which also writes the slot-0 public file `primary-rotated.remr`:
-
-```sh
-rem archive reseal --object demo-enc.rem-object --private-key primary.remp \
-    --recipient primary-rotated.remr recovery.remr \
-    --out demo-rotated.rem-object
+```text
+{"bytes_written":100011,"dest":"restored-enc","encryption":"REMO","files_written":2,...,"representation":"encrypted",...}
+identical
 ```
 
-`reseal` performs a full re-seal: it verifies the new stored digest before
-publishing and never overwrites an existing output. It always emits an encrypted
-envelope.
+Without `--private-key`, `extract` refuses with
+`error: encrypted REM-OBJECT operation requires --private-key`.
 
-For catalogless disaster recovery, use the standalone `rem-recover` binary
-with any matching recipient private key:
+### Recover with rem-recover
+
+`rem-recover` is a separate, small program for the worst case: it opens one
+encrypted object with one private key and needs no daemon, catalog or
+configuration file. Recover the object with the recovery key:
 
 ```sh
 rem-recover --object demo-enc.rem-object --private-key recovery.remp --out recovered
 diff -r src recovered && echo identical
 ```
 
-`rem-recover` needs no daemon, catalog, or config file. It is the
-disaster-recovery path of last resort for an encrypted envelope; a plaintext
-REM-OBJECT remains an ordinary pax archive and can be inspected or extracted
-with `bsdtar`. For streaming and partial retrieval,
-`archive extract-stream` and `archive covering-range` use the same
-`--private-key` epoch-selection contract.
-
-<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_backend.rs @ 4dc2a3c6 -->
-## First physical tape with one drive
-
-No published binary has standalone mode yet, so this section uses the binaries
-built above. Run its commands from the checkout directory. The local walkthrough
-left you in `demo/`, so return to the checkout first:
-
-```sh
-cd ..
-export PATH="$PWD/target/release:$PATH"
+```text
+recovered 2 files (100011 bytes) from REM-OBJECT v2 object 09de23e0-6e38-42e5-b0de-28e6b14a25b5
+skipped_xattrs: {}
+applied_privileged_xattrs: {}
+identical
 ```
 
-Complete the [permissions steps](guide-standalone-drive.md#what-you-need),
-including the persistent `/run/lock/rem` rule, and log in again after joining
-`tape`. After logging in, return to the checkout with `cd remanence` and repeat
-`export PATH="$PWD/target/release:$PATH"`. Never run rem with sudo. No daemon is needed.
+A plaintext object needs no recovery tool at all, because `bsdtar` can extract
+it. To change an encrypted object's recipients later, `rem archive reseal`
+re-seals it to a new set; the [CLI reference](reference-cli.md) describes it.
 
-On a host without `/etc/rem/config.toml`, setup saves your selected drive's
-serial in the home config, which
-[step 1 of the standalone guide](guide-standalone-drive.md#1-set-up-the-drive)
-describes. Insert a blank LTO-9 cartridge, write HOME01 on its
-shell, and run:
+<!-- code-anchor: crates/remanence-cli/src/standalone.rs @ 625f7044 -->
+## A first tape with one drive
 
-```sh
-rem setup
-rem doctor
-rem drives --json
-rem tape init --label HOME01 --generation L9
-rem put "$HOME/Documents"
-rem list
-rem list --tape HOME01 --path-prefix Documents/
-rem get Documents/notes.txt --out restored
-rem tape finalize --acknowledge-tape HOME01
-rem tape verify
-rem tape verify --full
-rem tape restore --list
-rem tape restore --path Documents/notes.txt --out recovered
-```
+If your hardware is one LTO drive with no changer, `rem` operates it directly,
+without the daemon. That path has its own tutorial,
+[Using a standalone LTO drive](guide-standalone-drive.md), which sets up the
+drive, initializes a cartridge, writes and restores files, and finalizes the
+tape. Standalone mode has model-backed tests but has not yet run on a physical
+standalone drive ([tested hardware](status.md#tested-hardware)).
 
-Replace `Documents/notes.txt` with a path from the listing. Use `--generation L6`
-for an LTO-6 cartridge in a compatible drive; supported values are L5–L9 and M8.
-Initialization writes immediately and has no standalone dry run. Used media
-needs `--clobber-data` and the exact `CLOBBER HOME01` confirmation. An LTFS
-cartridge first needs repartitioning: install `mt-st`, find the matching `nstN`
-with `ls /sys/class/scsi_generic/sgN/device/scsi_tape/`. The listing includes
-the node name; use `/dev/<the listed nstN>` (for example `/dev/nst0`). Then run
-`sudo mt -f /dev/nstN stsetoptions can-partitions` and
-`mt -f /dev/nstN mkpartition 0`. This erases the cartridge. Follow
-[step 2](guide-standalone-drive.md#2-initialize-a-cartridge), rerun init, and
-add clobber only if it still reports data at BOT.
+The rest of this page is for a changer library.
 
-Compare your restored file before shelving the tape. Finalization permanently
-closes it to new objects. When verification exits, eject with the drive button
-or `mt -f /dev/nst0 eject` from `mt-st`, using the `nstN` found through the
-sysfs lookup above for this drive. The [standalone guide](guide-standalone-drive.md) covers tape-full continuation,
-second copies, old versions, crash recovery and encryption keys.
-
-<!-- code-anchor: crates/remanence-library/src/discovery.rs crates/remanence-cli/src/lib.rs Makefile @ 6ed03ef0 -->
+<!-- code-anchor: crates/remanence-library/src/discovery.rs crates/remanence-cli/src/lib.rs @ 625f7044 -->
 ## Talking to a library (requires hardware)
 
-From here on you need a tape library — a real chassis or a virtual one
-(the project develops against Quadstor VTL). Two host-side gates must be
-open before any SCSI command works:
+From here on you need a tape library with a blank LTO cartridge in one of its
+slots. The examples use barcode `RMJ101L9` for that cartridge. The barcode is
+the label the changer reads from the cartridge, and its last two characters
+(`L9`) name the LTO generation. Run the commands from the checkout directory.
 
-1. Your user must be in the `tape` group (this gates opening
-   `/dev/sgN`): `sudo usermod -aG tape $USER`, then log in again.
-2. The binary needs `CAP_SYS_RAWIO` (the kernel filters most SCSI
-   opcodes for everyone else): `sudo setcap cap_sys_rawio+ep
-   target/release/rem`. The sections below also run `rem-debug`, and
-   `rem-daemon` when it runs in the foreground rather than under systemd.
-   Give each the capability the same way:
-   `sudo setcap cap_sys_rawio+ep target/release/rem-debug` and
-   `sudo setcap cap_sys_rawio+ep target/release/rem-daemon`.
+### Open the two host gates
 
-Rebuilding drops the capability with the binary's inode, so repeat the
-`setcap` commands after each `cargo build --release`. `make rem-dev`
-rebuilds the debug binary, `target/debug/rem`, and reapplies the capability to
-it in one step; it does not touch the release binaries. If you skip these
-gates, discovery fails with an explicit EPERM hint — see
-[troubleshooting](guide-troubleshooting.md).
+Two separate gates must be open before any SCSI command reaches the hardware.
+Your account must be in the `tape` group, which lets it open the `/dev/sgN`
+device nodes. The binaries need the `CAP_SYS_RAWIO` capability, because the
+kernel filters most tape and changer commands from callers without it. Join
+the group, then log out and back in:
 
-Now discover:
+```sh
+sudo usermod -aG tape "$USER"
+```
+
+After logging in again, change to the checkout directory and repeat the
+`export` line from [Build](#build). Then give `rem` and `rem-daemon` the capability and check
+it:
+
+```sh
+sudo setcap cap_sys_rawio+ep target/release/rem
+sudo setcap cap_sys_rawio+ep target/release/rem-daemon
+getcap target/release/rem target/release/rem-daemon
+```
+
+```text
+target/release/rem cap_sys_rawio=ep
+target/release/rem-daemon cap_sys_rawio=ep
+```
+
+Do not run `rem` with `sudo`. A rebuild replaces the binaries and drops the
+capability, so repeat `setcap` after every `cargo build`. If the checkout is on
+a filesystem mounted `nosuid`, Linux ignores the capability; install the
+binaries as [Installing Remanence](guide-install.md#install-the-binaries)
+describes and use those instead. That page also covers the lock directory and
+the memory-lock limit, which a long-running installation needs.
+
+### Find the library
+
+List the libraries on this host:
 
 ```sh
 rem libraries
 ```
 
-Each line is one library with its serial, model, changer device, and
-shape (drives, slots, IE ports, loaded cartridges). Focus on one, with
-its slot map:
+It prints one line per library: its serial number, the changer's vendor and
+model, its device node, and its shape. The values below are illustrative; yours
+name your own library:
+
+```text
+LIB0001234  HPE MSL3040  /dev/sg5  (2 drives, 40 slots [12 loaded], 0 IE)
+```
+
+`[12 loaded]` counts the slots that hold a cartridge, and `IE` counts the
+import/export ports (mailslots). Discovery is read-only. It sends INQUIRY (the
+identity query every SCSI device answers), reads vital product data pages, and
+asks the changer for its inventory with READ ELEMENT STATUS. It moves nothing.
+Use the serial it printed wherever this page shows `<SERIAL>`.
+
+To see every slot, focus on that library:
 
 ```sh
 rem library <SERIAL> --slots
 ```
 
-Both commands take `--json` for scripting. Discovery is read-only: it
-issues INQUIRY, VPD, and READ ELEMENT STATUS, and moves nothing.
+The output describes the changer and its drives, and ends with one line per
+storage slot (shortened here):
 
-<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-state/src/config.rs @ 1dd451b2 -->
+```text
+...
+Slots:
+  [0x0400] full   RMJ101L9
+  [0x0401] empty
+...
+```
+
+Both commands also take `--json`.
+
+<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-state/src/config.rs crates/remanence-state/src/lock.rs @ 625f7044 -->
 ## Running the daemon (requires hardware)
 
-The daemon needs a config file. Save the following minimal one as
-`/etc/rem/config.toml`; it uses `/var/lib/rem` for state (see the
-[configuration reference](reference-configuration.md) for every key):
+The daemon reads a configuration file. Create the state directory, owned by
+the account that will run the daemon, and save a minimal configuration as
+`/etc/rem/config.toml`. Replace `<SERIAL>` with your library's serial:
 
-```toml
+```sh
+sudo install -d -o "$USER" -m 0700 /var/lib/rem
+sudo install -d /etc/rem
+sudo tee /etc/rem/config.toml > /dev/null <<'TOML'
 [daemon]
 state_dir = "/var/lib/rem"
 default_idle_timeout_seconds = 300
 
 [[libraries]]
-serial = "<SERIAL>"          # from `rem libraries`; the daemon only
-                             # touches libraries listed here
+serial = "<SERIAL>"
 
 [[tape_pools]]
-id = "demo"
+id = "archive"
 
 [[tape_pool_rules]]
-prefix = "DMO"               # barcodes DMO... belong to pool "demo"
-pool_id = "demo"
+prefix = "RMJ"
+pool_id = "archive"
 
 [journal]
 dir = "/var/lib/rem/journal"
@@ -307,24 +441,66 @@ sqlite_path = "/var/lib/rem/rem-state.sqlite"
 
 [cache]
 tape_catalog_dir = "/var/lib/rem/tape-catalog"
+TOML
 ```
 
-Creating `/etc/rem/config.toml` changes how `rem` routes commands on this
+The daemon acts only on the libraries listed under `[[libraries]]`. A **tape
+pool** is a named set of tapes that writes are directed to, and the rule puts
+every cartridge whose barcode begins with `RMJ` into the pool `archive`.
+`default_idle_timeout_seconds` is how long a session may sit idle before the
+daemon ends it. The `[journal]` directory holds the tape logs, the host's
+per-tape record of what has been committed; the section keeps an older name.
+The last three sections place the audit log, the catalog (a SQLite projection
+of the tape logs and the audit log) and a cache. The
+[configuration reference](reference-configuration.md) describes every key.
+
+Creating `/etc/rem/config.toml` also changes how `rem` routes commands on this
 host. Standalone commands then use this file and its state instead of the
 home-mode state under `${XDG_STATE_HOME:-$HOME/.local/state}/rem/`, and shared
 verbs such as `put`, `get`, `tape init` and `tape finalize` take the library
 route. If you also use a standalone drive on this host, read the
 [routing table](reference-cli.md#standalone-drives) first.
 
-Start it in the foreground:
+Start the daemon in the foreground, in its own shell:
 
 ```sh
 rem-daemon --config /etc/rem/config.toml
 ```
 
-It logs JSON to stderr and announces `serving local Layer 5 API on
-unix:/var/lib/rem/rem.sock`. Under systemd, grant the SCSI capability in
-the unit rather than on the binary:
+It writes its log to standard error as JSON lines, and one plain line says
+where it is listening:
+
+```text
+...
+rem-daemon: serving local Layer 5 API on unix:/var/lib/rem/rem.sock
+...
+```
+
+From another shell, as the same account, check that it answers:
+
+```sh
+rem daemon health
+rem daemon version
+```
+
+```text
+status: healthy
+detail: sqlite quick_check=ok
+components:
+  sqlite_index: healthy
+daemon: 0.2.0
+api: v1-draft
+target: x86_64-linux
+```
+
+The `rem` commands that talk to the daemon connect to
+`unix:/var/lib/rem/rem.sock` by default. If your `state_dir` is elsewhere, pass
+`--endpoint unix:<state_dir>/rem.sock`. The socket admits only root and the
+daemon's own account (see `socket_path` in the
+[configuration reference](reference-configuration.md#daemon-required)).
+
+For a service, run the daemon under systemd and grant the capability in the
+unit rather than on the binary:
 
 ```ini
 [Service]
@@ -332,70 +508,134 @@ AmbientCapabilities=CAP_SYS_RAWIO
 CapabilityBoundingSet=CAP_SYS_RAWIO
 ```
 
-Check it from another shell:
-
-```sh
-rem daemon health
-rem daemon version
-rem catalog pools
-```
-
-If your state dir is not `/var/lib/rem`, pass `--endpoint
-unix:<state_dir>/rem.sock` — the CLI default assumes that path. The Unix
-socket admits only root and the daemon's own user (see `socket_path` in the
-[configuration reference](reference-configuration.md#daemon-required)), so run
-these commands as the account that runs the daemon.
-
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-api/src/tape_init.rs @ 6ed03ef0 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-api/src/tape_init.rs crates/remanence-parity/src/lib.rs @ 625f7044 -->
 ## Initializing a tape (requires hardware, writes to media)
 
-A fresh cartridge must be initialized before a pool will accept it:
-Remanence writes the bootstrap block at the beginning of tape, binding a
-new tape UUID to the barcode in the catalog. Initialization is
-destructive by nature, so it runs a safety gauntlet — identity,
-ownership, readiness, and data-presence checks — and refuses anything it
-cannot prove. Start with a dry run, which performs every check and
-writes nothing:
+A cartridge must be initialized before a pool accepts it. Initialization
+writes the bootstrap, the self-describing block at the beginning of the tape,
+which records a new tape UUID, the block size and the parity scheme. The tape
+UUID, not the barcode, is the tape's identity from then on.
+
+`rem tape init` opens the local state directly and takes the same exclusive
+state lock as the daemon, so stop the daemon first (press Ctrl-C in its shell).
+While the daemon runs, init refuses with
+`error: state lock is already held: /var/lib/rem/state.lock`.
+
+Start with a dry run. It moves the cartridge into a free drive and runs every
+check, but writes nothing:
 
 ```sh
-rem tape init DMO001L9 --dry-run
-rem tape init DMO001L9
+rem tape init RMJ101L9 --parity default --dry-run
 ```
 
-Initialization other than the dry run opens the local state directly and takes
-the same exclusive state lock as the daemon (see
-[What ends up on disk](reference-configuration.md#what-ends-up-on-disk)).
-Stop the daemon before you run it, and start it again afterwards; while the
-daemon holds the lock, init refuses.
+```text
+tape init RMJ101L9: dry-run-would-write
+...
+  decision: fresh-init
+```
 
-Batch initialization takes a slot range (`rem tape init
-0x0400..0x0407`). Overrides are deliberately narrow: `--force` only
-covers decisions the gauntlet classifies as force-overridable, and
-`--clobber-data` (for a tape that verifiably holds data) is refused in
-dry-run and batch modes.
+`fresh-init` means the checks found a blank cartridge that may be initialized.
+Now initialize it. `--parity default` selects Remanence's default Reed-Solomon
+parity, which lets a reader rebuild unreadable regions of the tape:
 
-One hardware reality to plan around: the first load of a new LTO-9
-cartridge triggers a one-time media optimization pass in the drive that
-can take an hour or more. `rem tape wait-ready --wait` polls until the
-medium is genuinely usable, and its defaults (2.5h timeout, 30s
-interval) are sized for exactly this.
+```sh
+rem tape init RMJ101L9 --parity default
+```
 
-<!-- code-anchor: crates/remanence-cli/src/rem_debug.rs crates/remanence-cli/src/put.rs @ 244bc6de -->
+The command prints what it wrote. The tape UUID is new each time; the element
+addresses and the serial below are illustrative:
+
+```text
+tape init RMJ101L9: wrote-bootstrap
+  uuid: 5e8f8d3b-0c1a-4d2e-9f60-7a1b2c3d4e5f
+  library: LIB0001234
+  source: 0x0400; drive: 0x0001
+  pool: archive
+  generation: LTO-9
+  capacity_bytes: 18000000000000
+  geometry: block_size=262144 parity=rs-cauchy-gf256-v1
+  decision: fresh-init
+```
+
+The first load of a new LTO-9 cartridge starts a media optimization in the
+drive that can take up to two hours, and it should not be interrupted. If init
+stops with a message that begins `media not ready for tape init on RMJ101L9`,
+leave the cartridge in the drive, wait for it with
+`rem tape wait-ready --barcode RMJ101L9 --wait` (which polls for up to 2.5
+hours by default), and run init again.
+
+Used cartridges need more care: init refuses a tape that holds data unless you
+pass `--clobber-data` and confirm. The [CLI reference](reference-cli.md)
+describes those options.
+
+<!-- code-anchor: crates/remanence-cli/src/put.rs crates/remanence-cli/src/get.rs @ 625f7044 -->
 ## First write to tape (requires hardware, writes to media)
 
-With a running daemon, the normal write is one command — `rem put
-/path/to/files --pool demo` — which goes through the daemon's session
-machinery with its pool policy, fences, and checkpoint durability (see
-the [CLI reference](reference-cli.md#writing-to-tape)). This
-walkthrough instead uses `rem-debug`, which drives the same pool
-machinery directly against hardware without a daemon — useful for a
-first hands-on write, at the cost of the break-glass gauntlet. Note the
-`--allow` flag: the direct tape-path `archive` commands, like the robotics,
-must name the library they may touch. Direct Object writes still require the drive to report
-the loaded cartridge as rewritable; write-protected, WORM, and unknown media
-are refused before MODE SELECT or any tape write. These `rem-debug` commands
-also take the daemon's exclusive state lock, so stop the daemon before running
-them.
+Start the daemon again in its own shell, as before:
+
+```sh
+rem-daemon --config /etc/rem/config.toml
+```
+
+### Put files on the tape
+
+From the checkout directory in your other shell, archive the demo files to the
+pool:
+
+```sh
+rem put demo/src --pool archive
+```
+
+`rem put` walks the directory and makes one object of each regular file. Its
+progress goes to standard error, and the receipt for each committed object to
+standard output. The object and session IDs and the rates below are
+illustrative:
+
+```text
+writing 2 files (97.7 KiB) to pool archive
+  demo/src/notes.txt (11 B) spooled at 0 MiB/s, pending checkpoint
+  demo/src/photos/img001.raw (97.7 KiB) spooled at 24 MiB/s, pending checkpoint
+demo/src/notes.txt  object 3f2a9c1e-7b4d-4e8a-9c61-0d5e2f7a8b93  tape RMJ101L9 file 1  pool archive
+demo/src/photos/img001.raw  object 8b17e4d2-5a6c-4f3b-a0e9-2c7d1b6f4e58  tape RMJ101L9 file 2  pool archive
+session 6c0e3b9a-1d2f-4a7e-8b5c-9f4d2e1a7c36 closed: 2 objects, 97.7 KiB committed
+```
+
+The daemon chose a tape from the pool, mounted it, and wrote each object as one
+tape file after the bootstrap (tape file 0). "Pending checkpoint" means the
+data had reached the daemon but was not yet durable. The receipt lines appear
+only after the session's checkpoint. A checkpoint first sends a barrier, which
+makes the drive write its buffer to the medium and proves the tape position;
+then it writes a durable commit record for each object to the tape log. An
+object with a commit record is **committed**. Its parity may reach the tape
+later, and data that a parity sidecar on tape covers is called **protected**.
+
+### Get a file back
+
+Restore one object by the name `rem put` gave it, which is its archive path,
+and compare it with the original:
+
+```sh
+rem get demo/src/notes.txt --caller-id --pool archive --dest restored-tape
+cmp demo/src/notes.txt restored-tape/demo/src/notes.txt && echo identical
+```
+
+```text
+restoring 1 member (11 B) of object 3f2a9c1e-7b4d-4e8a-9c61-0d5e2f7a8b93 from tape 5e8f8d3b-0c1a-4d2e-9f60-7a1b2c3d4e5f file 1
+  demo/src/notes.txt (11 B) verified at 0 MiB/s
+demo/src/notes.txt  11 B  sha256 7ca46ed8705a  → restored-tape/demo/src/notes.txt
+object 3f2a9c1e-7b4d-4e8a-9c61-0d5e2f7a8b93 restored into restored-tape (1 member, 11 B, all digests verified)
+identical
+```
+
+`--caller-id` tells `rem get` that the argument is the name recorded at put
+time rather than an object UUID. The daemon read the copy from tape, and
+`rem get` checked its SHA-256 against the digest in the catalog before it
+reported success.
+
+### When parity reaches the tape
+
+The paragraphs below describe when the parity for committed data is written to
+tape. You do not need them to finish this tutorial.
 
 Daemon and in-process write sessions keep a short epoch across ordinary
 checkpoint barriers. Standalone `rem put` and pool-selected `rem-debug archive
@@ -437,41 +677,15 @@ A cartridge outside a drive has no open epoch except after a crash, a close that
 leaves the epoch open, or a shutdown that finds the head away from EOD. A fenced
 tape keeps its open epoch until append recovery clears the fence.
 
-```sh
-rem-debug --allow <SERIAL> archive write \
-    --library <SERIAL> --pool demo --file /path/to/payload.bin --json \
-    --recipient primary.remr --recipient recovery.remr \
-    > locator.json
-
-rem-debug --allow <SERIAL> archive verify \
-    --library <SERIAL> --locator "$(cat locator.json)" \
-    --private-key primary.remp \
-    --expected-sha256 "$(sha256sum /path/to/payload.bin | cut -d' ' -f1)"
-
-rem-debug --allow <SERIAL> archive read \
-    --library <SERIAL> --locator "$(cat locator.json)" --out restored.bin \
-    --private-key primary.remp
-```
-
-Replace `/path/to/payload.bin` with the path of the file you want to store; the
-same path appears in the write and verify commands, and `restored.bin` is where
-the read writes its copy.
-
-The locator JSON emitted by `write` pins the object copy to physical
-media and records `format_version: 2` plus the recipient epochs; `verify`
-streams and authenticates the tape object against a digest without restoring
-anything.
-
 ## Where to go next
 
-- [Standalone-drive guide](guide-standalone-drive.md) — the complete
-  one-drive workflow without a changer or daemon.
-- [CLI reference](reference-cli.md) — the full command surface.
-- [Configuration reference](reference-configuration.md) — every config
-  key, default, and environment variable.
-- [Architecture overview](architecture-overview.md) — how the crates
-  fit together and what the write path actually does.
-- [Tape layout reference](reference-tape-layout.md) — what ends up on
-  the cartridge.
-- [Troubleshooting](guide-troubleshooting.md) — the failure modes and
-  what they mean.
+- [Using a standalone LTO drive](guide-standalone-drive.md): the complete
+  one-drive workflow, without a changer or daemon.
+- [CLI reference](reference-cli.md): every command and option.
+- [Configuration reference](reference-configuration.md): every configuration
+  key, default and environment variable.
+- [Architecture overview](architecture-overview.md): how the parts fit together
+  and what the write path does.
+- [On-tape layout reference](reference-tape-layout.md): what ends up on the
+  cartridge.
+- [Troubleshooting](guide-troubleshooting.md): failure modes and what they mean.

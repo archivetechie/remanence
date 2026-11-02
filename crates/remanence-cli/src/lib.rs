@@ -1342,19 +1342,25 @@ enum Command {
 enum TapeLogCommand {
     /// Report the last valid closed boundary and any damage without mutation.
     Inspect {
+        /// Daemon configuration file locating the local tape log.
         #[arg(long)]
         config: PathBuf,
+        /// UUID of the tape log to inspect.
         #[arg(long)]
         tape_uuid: uuid::Uuid,
     },
     /// Archive a damaged suffix and retain an exact validated closed sequence.
     RepairTail {
+        /// Daemon configuration file locating the local tape log.
         #[arg(long)]
         config: PathBuf,
+        /// UUID of the tape log to repair.
         #[arg(long)]
         tape_uuid: uuid::Uuid,
+        /// Retain the validated closed sequence through this number.
         #[arg(long)]
         through_sequence: u64,
+        /// Acknowledge archiving and discarding the corrupt suffix.
         #[arg(long)]
         confirm_discard_corrupt_tail: bool,
         /// Rebuild this tape's projection atomically after repairing below its mark.
@@ -1497,10 +1503,15 @@ enum DaemonClientCommand {
 #[derive(Subcommand, Debug)]
 enum OperationClientCommand {
     /// Watch operation progress until it terminates.
-    Watch { operation_id: String },
+    Watch {
+        /// UUID of the operation to watch.
+        operation_id: String,
+    },
     /// Request cooperative cancellation.
     Cancel {
+        /// UUID of the operation to cancel.
         operation_id: String,
+        /// Request forced cancellation where the operation supports it.
         #[arg(long)]
         force: bool,
     },
@@ -2040,6 +2051,7 @@ impl BotDriveConfigOps for DriveHandle {
     }
 }
 
+/// Read records of unknown size with compression off, then verify restoration.
 fn with_temporary_bot_read_config<D, T>(
     drive: &mut D,
     operation: impl FnOnce(&mut D) -> Result<T, String>,
@@ -2050,25 +2062,16 @@ where
     let current = drive
         .bot_read_config()
         .map_err(|error| format!("read drive config: {error}"))?;
-    if current.max_block_size_bytes < remanence_api::CANONICAL_ADOPTION_BLOCK_SIZE_BYTES {
-        return Err(format!(
-            "drive maximum block size {} is smaller than canonical adoption block size {}",
-            current.max_block_size_bytes,
-            remanence_api::CANONICAL_ADOPTION_BLOCK_SIZE_BYTES
-        ));
-    }
     let configured_for_bot = TapeConfig {
         density_code: None,
-        block_size: BlockSize::Fixed {
-            size_bytes: remanence_api::CANONICAL_ADOPTION_BLOCK_SIZE_BYTES,
-        },
+        block_size: BlockSize::Variable,
         compression: false,
         max_block_size_bytes: current.max_block_size_bytes,
         write_protected: current.write_protected,
         worm: current.worm,
     };
     if let Err(error) = drive.bot_write_config(configured_for_bot) {
-        let primary = format!("configure fixed 1 MiB BOT read: {error}");
+        let primary = format!("configure variable-block BOT read: {error}");
         return match restore_prior_bot_drive_config(drive, current) {
             Ok(()) => Err(primary),
             Err(restore) => Err(format!("{primary}; additionally failed to {restore}")),
@@ -2077,10 +2080,10 @@ where
     let primary = (|| {
         let verified = drive
             .bot_read_config()
-            .map_err(|error| format!("verify fixed 1 MiB BOT read config: {error}"))?;
+            .map_err(|error| format!("verify variable-block BOT read config: {error}"))?;
         if verified.block_size != configured_for_bot.block_size || verified.compression {
             return Err(format!(
-                "drive did not verify fixed 1 MiB/compression-off BOT read config: {verified:?}"
+                "drive did not verify variable-block/compression-off BOT read config: {verified:?}"
             ));
         }
         operation(drive)
@@ -2208,7 +2211,7 @@ fn with_bot_identity_drive<T>(
         .ok_or_else(|| format!("{} has no readable barcode", candidate.label()))?;
     let generation = remanence_api::MediaObservation::label_hint(voltag.as_str())
         .map(|observation| observation.generation)
-        .ok_or_else(|| format!("barcode {voltag:?} has no known LTO generation suffix"))?;
+        .ok_or_else(|| barcode_generation_error(Some(&voltag)))?;
     let mut handle = open_library_handle(library, policy)
         .map_err(|error| format!("opening library: {error}"))?;
     handle
@@ -2234,7 +2237,7 @@ fn with_bot_identity_drive<T>(
             })?;
         if !slot.full || slot.cartridge.as_deref() != Some(voltag.as_str()) {
             return Err(format!(
-                "live inventory no longer binds barcode {voltag:?} to storage element 0x{:04x}",
+                "live inventory no longer binds barcode {voltag} to storage element 0x{:04x}",
                 candidate.element_address
             ));
         }
@@ -2242,7 +2245,7 @@ fn with_bot_identity_drive<T>(
     } else {
         bay.source_slot.ok_or_else(|| {
             format!(
-                "loaded tape {voltag:?} in drive 0x{drive_element:04x} has no exact source/home slot"
+                "loaded tape {voltag} in drive 0x{drive_element:04x} has no exact source/home slot"
             )
         })?
     };
@@ -2340,6 +2343,38 @@ fn run_bot_identity_hardware(
     _expected_home_slot: u16,
 ) -> Result<PhysicalBotIdentityResult, String> {
     Err("BOT identity commands require Linux SG_IO access".to_string())
+}
+
+/// Check every library drive before recording the tape's on-media block size.
+#[cfg(target_os = "linux")]
+fn check_library_bootstrap_block_size(
+    library: &Library,
+    policy: &StaticAllowlist,
+    block_size_bytes: u32,
+) -> Result<(), String> {
+    let mut handle = open_library_handle(library, policy)
+        .map_err(|error| format!("opening library for block-size checks: {error}"))?;
+    let mut limits = Vec::new();
+    for bay in &library.drive_bays {
+        let mut drive = handle
+            .open_drive(bay.element_address, policy)
+            .map_err(|error| format!("open drive for block-size check: {error}"))?;
+        let config = drive
+            .read_config()
+            .map_err(|error| format!("read drive block-size limit: {error}"))?;
+        limits.push((bay.element_address, config.max_block_size_bytes));
+    }
+    remanence_api::validate_bootstrap_adoption_drive_limits(block_size_bytes, limits)
+}
+
+/// Refuse library capability checks where the SG_IO transport is unavailable.
+#[cfg(not(target_os = "linux"))]
+fn check_library_bootstrap_block_size(
+    _library: &Library,
+    _policy: &StaticAllowlist,
+    _block_size_bytes: u32,
+) -> Result<(), String> {
+    Err("library block-size checks require Linux SG_IO access".to_string())
 }
 
 #[derive(Args, Debug)]
@@ -2885,11 +2920,6 @@ struct RemArchiveBuildArgs {
     #[arg(long, value_name = "PATH")]
     rules: Option<PathBuf>,
 
-    /// Capture all xattr namespaces except built-in macOS junk. This is not
-    /// portable and is never the default; restore remains namespace-deny by default.
-    #[arg(long, conflicts_with_all = ["rules", "map"])]
-    full_fidelity_xattrs: bool,
-
     /// Classify inputs and emit the clustered ingest report without writing REM-OBJECT.
     #[arg(long)]
     scan_only: bool,
@@ -2989,15 +3019,6 @@ struct RemArchiveExtractArgs {
     /// Replace existing destination files.
     #[arg(long)]
     overwrite: bool,
-
-    /// Additional xattr namespace prefix to restore; repeatable (`user.` is always allowed).
-    /// Policy skips exit successfully, but emit one stderr warning and are listed in the report.
-    #[arg(
-        long = "xattr-namespace",
-        value_name = "PREFIX",
-        value_parser = remanence_stream::parse_xattr_namespace_prefix
-    )]
-    xattr_namespaces: Vec<String>,
 
     /// Keep `.remwrap.tar` and `.remwrap.idx` entries literal instead of unwrapping.
     #[arg(long)]
@@ -3204,15 +3225,6 @@ struct RemArchiveRestoreArgs {
     /// Replace existing destination files.
     #[arg(long)]
     overwrite: bool,
-
-    /// Additional xattr namespace prefix to restore; repeatable (`user.` is always allowed).
-    /// Policy skips exit successfully, but emit one stderr warning and are listed in the report.
-    #[arg(
-        long = "xattr-namespace",
-        value_name = "PREFIX",
-        value_parser = remanence_stream::parse_xattr_namespace_prefix
-    )]
-    xattr_namespaces: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -3300,7 +3312,7 @@ impl From<RemArchiveBuildArgs> for ArchiveBuildArgs {
             map_sha256: value.map_sha256,
             out: value.out,
             rules: value.rules,
-            full_fidelity_xattrs: value.full_fidelity_xattrs,
+
             scan_only: value.scan_only,
             manifest_out: value.manifest_out,
             no_index: value.no_index,
@@ -3338,7 +3350,7 @@ impl From<RemArchiveExtractArgs> for ArchiveExtractArgs {
             file_size_bytes: value.file_size_bytes,
             range: value.range,
             overwrite: value.overwrite,
-            xattr_namespaces: value.xattr_namespaces,
+
             no_unwrap: value.no_unwrap,
             blob_entry: value.blob_entry,
             blob_member: value.blob_member,
@@ -3430,7 +3442,6 @@ impl From<RemArchiveRestoreArgs> for ArchiveRestoreArgs {
             source: value.source.into(),
             dest: value.dest,
             overwrite: value.overwrite,
-            xattr_namespaces: value.xattr_namespaces,
         }
     }
 }
@@ -3631,11 +3642,6 @@ struct ArchiveBuildArgs {
     #[arg(long, value_name = "PATH")]
     rules: Option<PathBuf>,
 
-    /// Capture all xattr namespaces except built-in macOS junk. This is not
-    /// portable and is never the default; restore remains namespace-deny by default.
-    #[arg(long, conflicts_with_all = ["rules", "map"])]
-    full_fidelity_xattrs: bool,
-
     /// Classify inputs and emit the clustered ingest report without writing REM-OBJECT.
     #[arg(long)]
     scan_only: bool,
@@ -3735,15 +3741,6 @@ struct ArchiveExtractArgs {
     /// Replace existing destination files.
     #[arg(long)]
     overwrite: bool,
-
-    /// Additional xattr namespace prefix to restore; repeatable (`user.` is always allowed).
-    /// Policy skips exit successfully, but emit one stderr warning and are listed in the report.
-    #[arg(
-        long = "xattr-namespace",
-        value_name = "PREFIX",
-        value_parser = remanence_stream::parse_xattr_namespace_prefix
-    )]
-    xattr_namespaces: Vec<String>,
 
     /// Keep `.remwrap.tar` and `.remwrap.idx` entries literal instead of unwrapping.
     #[arg(long)]
@@ -3951,15 +3948,6 @@ struct ArchiveRestoreArgs {
     /// Replace existing destination files.
     #[arg(long)]
     overwrite: bool,
-
-    /// Additional xattr namespace prefix to restore; repeatable (`user.` is always allowed).
-    /// Policy skips exit successfully, but emit one stderr warning and are listed in the report.
-    #[arg(
-        long = "xattr-namespace",
-        value_name = "PREFIX",
-        value_parser = remanence_stream::parse_xattr_namespace_prefix
-    )]
-    xattr_namespaces: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -4206,6 +4194,12 @@ pub fn main_entry_with_registry(registry: ForeignFormatRegistry) -> ExitCode {
         let _ = writeln!(std::io::stderr().lock(), "warning: {message}");
     });
     let args: Vec<_> = std::env::args_os().collect();
+    if let Some(message) =
+        remanence_stream::removed_xattr_flag_message(args.iter().map(|arg| arg.as_os_str()))
+    {
+        eprintln!("error: {message}");
+        return ExitCode::from(2);
+    }
     if let Some(replacement) = development_replacement(&args) {
         eprintln!("error: use `{replacement}`");
         return ExitCode::from(1);
@@ -4232,6 +4226,12 @@ pub fn debug_main_entry_with_registry(registry: ForeignFormatRegistry) -> ExitCo
         let _ = writeln!(std::io::stderr().lock(), "warning: {message}");
     });
     let args: Vec<_> = std::env::args_os().collect();
+    if let Some(message) =
+        remanence_stream::removed_xattr_flag_message(args.iter().map(|arg| arg.as_os_str()))
+    {
+        eprintln!("error: {message}");
+        return ExitCode::from(2);
+    }
     if let Some(replacement) = development_replacement(&args) {
         eprintln!("error: use `{replacement}`");
         return ExitCode::from(1);
@@ -11208,10 +11208,7 @@ fn run_tape_bot_probe(
         Some(generation) => generation,
         None => {
             return print_command_error(
-                format!(
-                    "barcode {:?} has no known LTO generation suffix",
-                    candidate.voltag
-                ),
+                barcode_generation_error(candidate.voltag.as_deref()),
                 &fresh_report,
                 err,
             )
@@ -11282,11 +11279,7 @@ fn run_tape_adopt_bootstrap(
     let observation = match remanence_api::MediaObservation::label_hint(voltag) {
         Some(observation) => observation,
         None => {
-            return print_command_error(
-                format!("barcode {voltag:?} has no known LTO generation suffix"),
-                &fresh_report,
-                err,
-            )
+            return print_command_error(barcode_generation_error(Some(voltag)), &fresh_report, err)
         }
     };
     let generation = observation.generation;
@@ -11335,15 +11328,25 @@ fn run_tape_adopt_bootstrap(
     let payload =
         match adoption.payload.as_ref() {
             Some(payload) if remanence_api::has_canonical_adoption_geometry(payload) => payload,
-            Some(_) => return print_command_error(
-                "valid Bootstrap does not have canonical 1 MiB default parity adoption geometry"
+            Some(payload) if payload.drive_compression => return print_command_error(
+                "bootstrap adoption requires drive compression disabled: this tape was written with drive compression on"
                     .to_string(),
                 &fresh_report,
                 err,
             ),
+            Some(_) => {
+                return print_command_error(
+                    "valid Bootstrap has invalid adoption geometry".to_string(),
+                    &fresh_report,
+                    err,
+                )
+            }
             None => {
                 return print_command_error(
-                    format!("BOT is not adoptable: {:?}", adoption.tail),
+                    format!(
+                        "BOT is not adoptable: {}",
+                        bootstrap_tail_reason(&adoption.tail)
+                    ),
                     &fresh_report,
                     err,
                 )
@@ -11359,6 +11362,11 @@ fn run_tape_adopt_bootstrap(
             &fresh_report,
             err,
         );
+    }
+    if let Err(error) =
+        check_library_bootstrap_block_size(library, &policy, payload.block_size_bytes)
+    {
+        return print_command_error(error, &fresh_report, err);
     }
     let tail = match &adoption.tail {
         remanence_api::BootstrapTailClassification::ExactBootstrapFilemarkEod => {
@@ -11553,6 +11561,34 @@ fn bootstrap_geometry_json(payload: &remanence_parity::BootstrapPayload) -> Valu
         "parity_blocks_per_stripe": payload.scheme.as_ref().map(|scheme| scheme.parity_blocks_per_stripe),
         "stripes_per_neighborhood": payload.scheme.as_ref().map(|scheme| scheme.stripes_per_neighborhood),
     })
+}
+
+/// Use the same plain barcode diagnostic in probe and adoption refusals.
+fn barcode_generation_error(barcode: Option<&str>) -> String {
+    match barcode {
+        Some(barcode) => format!("barcode {barcode} has no known LTO generation suffix"),
+        None => "cartridge has no barcode; its LTO generation cannot be inferred".to_string(),
+    }
+}
+
+/// Explain physical adoption refusals without exposing Rust enum formatting.
+fn bootstrap_tail_reason(tail: &remanence_api::BootstrapTailClassification) -> String {
+    use remanence_api::{BootstrapTailClassification as Tail, BotIdentityClassification as Bot};
+    match tail {
+        Tail::InvalidBot(bot) => match bot {
+            Bot::BlankCheckEod => "blank cartridge at BOT".to_string(),
+            Bot::ValidRemBootstrap { .. } => "Bootstrap tail could not be established".to_string(),
+            Bot::DamagedRemBootstrap { detail } => format!("damaged Bootstrap: {detail}"),
+            Bot::ForeignFormat { name } => format!("foreign format {name}"),
+            Bot::UnrecognizedData => "unrecognized BOT data".to_string(),
+            Bot::ReadError { detail } => format!("BOT read failed: {detail}"),
+        },
+        Tail::ExactBootstrapFilemarkEod => "Bootstrap followed by its filemark and EOD".to_string(),
+        Tail::DataAfterBootstrap => "data follows the Bootstrap".to_string(),
+        Tail::MissingFilemark => "Bootstrap filemark is missing".to_string(),
+        Tail::ExtraFilemark => "an extra filemark follows the Bootstrap".to_string(),
+        Tail::Ambiguous { detail } => format!("Bootstrap tail is ambiguous: {detail}"),
+    }
 }
 
 fn bootstrap_tail_name(tail: &remanence_api::BootstrapTailClassification) -> &'static str {
@@ -12573,7 +12609,7 @@ fn tape_init_readiness_error(
     let state = media_readiness_state_name(&poll.readiness, poll.timed_out);
     let exit_code = tape_init_readiness_exit_code(poll);
     format!(
-        "media not ready for tape init on {voltag} in drive 0x{drive_element:04x}{timeout} media_readiness_state={state} media_readiness_exit_code={exit_code}: {}; leave the tape in the drive and run `rem tape wait-ready` or fieldtest/scripts/09-media-ready.sh before retrying init",
+        "media not ready for tape init on {voltag} in drive 0x{drive_element:04x}{timeout} media_readiness_state={state} media_readiness_exit_code={exit_code}: {}; leave the tape in the drive and run `rem tape wait-ready` before retrying init",
         describe_media_readiness(&poll.readiness)
     )
 }
@@ -13205,7 +13241,7 @@ fn resolve_foreign_format(
 
 /// Build a portable REM-OBJECT object file from local filesystem inputs.
 ///
-/// This is the local-file half of the REM-OBJECT work order: it writes exactly one
+/// This local-file REM-OBJECT writer writes exactly one
 /// REM-OBJECT object byte string to `--out` using the same `BlockSink` contract as
 /// tape writers, but without tape-only filemarks, the BOT bootstrap, or parity
 /// sidecars. REM-PARITY §8: "Every generation-2 bootstrap is Object-count independent:
@@ -13580,12 +13616,6 @@ struct ArchiveBuildInputFile {
 }
 
 fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
-    if args.full_fidelity_xattrs && args.rules.is_some() {
-        return Err("--full-fidelity-xattrs cannot be combined with --rules".to_string());
-    }
-    if args.full_fidelity_xattrs && args.map.is_some() {
-        return Err("--full-fidelity-xattrs cannot be combined with --map".to_string());
-    }
     if args.map.is_some() {
         if args.scan_only {
             return Err("--map cannot be combined with --scan-only".to_string());
@@ -13626,7 +13656,6 @@ fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
         let report = archive_ingest::scan_only_report(
             &args.inputs,
             args.rules.as_deref(),
-            args.full_fidelity_xattrs,
             args.no_index,
             tuning.expect("non-map archive build has scan tuning"),
         )?;
@@ -13677,17 +13706,21 @@ fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
         Some(archive_ingest::materialize_inputs(
             &args.inputs,
             args.rules.as_deref(),
-            args.full_fidelity_xattrs,
             args.no_index,
             tuning.expect("filesystem archive build has scan tuning"),
         )?)
     } else {
         None
     };
-    let inputs = match (&map_plan, &materialized) {
+    let mut inputs = match (&map_plan, &materialized) {
         (Some(plan), _) => plan.inputs.clone(),
         (None, Some(plan)) => plan.inputs.clone(),
         (None, None) => unreachable!("filesystem builds always use the ingest planner"),
+    };
+    let mapped_ingest = if map_plan.is_some() {
+        Some(archive_ingest::capture_mapped_xattrs(&mut inputs)?)
+    } else {
+        None
     };
     if inputs.is_empty() {
         return Err(if args.map.is_some() {
@@ -13796,13 +13829,17 @@ fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
         archive_ingest::write_customer_manifest(manifest_out, &plan.manifest)?;
     }
 
-    Ok(archive_build_report_json(
+    let mut report = archive_build_report_json(
         args,
         &inputs,
         &build,
         materialized.as_ref(),
         map_plan.as_ref().map(|plan| plan.map_sha256),
-    ))
+    );
+    if let Some(ingest) = mapped_ingest {
+        report["ingest"] = serde_json::to_value(ingest).map_err(|error| error.to_string())?;
+    }
+    Ok(report)
 }
 
 fn archive_scan_tuning(args: &ArchiveBuildArgs) -> Result<archive_ingest::ScanTuning, String> {
@@ -13849,27 +13886,20 @@ fn extract_archive_object_file(args: &ArchiveExtractArgs) -> Result<Value, Strin
 fn archive_extract_restore_options(
     args: &ArchiveExtractArgs,
 ) -> remanence_stream::FilesystemRestoreOptions {
-    filesystem_restore_options(args.overwrite, &args.xattr_namespaces)
+    filesystem_restore_options(args.overwrite)
 }
 
 fn archive_restore_options(
     args: &ArchiveRestoreArgs,
 ) -> remanence_stream::FilesystemRestoreOptions {
-    filesystem_restore_options(args.overwrite, &args.xattr_namespaces)
+    filesystem_restore_options(args.overwrite)
 }
 
-fn filesystem_restore_options(
-    overwrite: bool,
-    xattr_namespaces: &[String],
-) -> remanence_stream::FilesystemRestoreOptions {
-    let mut options = remanence_stream::FilesystemRestoreOptions {
+fn filesystem_restore_options(overwrite: bool) -> remanence_stream::FilesystemRestoreOptions {
+    remanence_stream::FilesystemRestoreOptions {
         overwrite,
         ..remanence_stream::FilesystemRestoreOptions::default()
-    };
-    options
-        .xattr_allowed_prefixes
-        .extend(xattr_namespaces.iter().cloned());
-    options
+    }
 }
 
 fn inspect_plaintext_archive_object_file(path: &Path, chunk_size: usize) -> Result<Value, String> {
@@ -13962,13 +13992,7 @@ fn extract_plaintext_archive_object_file(args: &ArchiveExtractArgs) -> Result<Va
         stored_digest,
     };
     let mut value = archive_extract_report_json(&context, &report);
-    attach_unwrap_report(
-        &mut value,
-        &args.dest,
-        args.overwrite,
-        args.no_unwrap,
-        unwrap_plan,
-    )?;
+    attach_unwrap_report(&mut value, args, unwrap_plan)?;
     Ok(value)
 }
 
@@ -14095,28 +14119,34 @@ fn extract_encrypted_archive_object_file(args: &ArchiveExtractArgs) -> Result<Va
         stored_digest: inspected.stored_digest,
     };
     let mut value = archive_extract_report_json(&context, &report);
-    attach_unwrap_report(
-        &mut value,
-        &args.dest,
-        args.overwrite,
-        args.no_unwrap,
-        unwrap_plan,
-    )?;
+    attach_unwrap_report(&mut value, args, unwrap_plan)?;
     Ok(value)
 }
 
 fn attach_unwrap_report(
     value: &mut Value,
-    dest: &Path,
-    overwrite: bool,
-    no_unwrap: bool,
+    args: &ArchiveExtractArgs,
     unwrap_plan: Option<archive_ingest::UnwrapPlan>,
 ) -> Result<(), String> {
-    if no_unwrap {
+    if args.no_unwrap {
         value["unwrap"] = json!({ "enabled": false, "tar_engine": null });
         return Ok(());
     }
-    let report = archive_ingest::unwrap_remwraps(dest, overwrite, unwrap_plan)?;
+    let report = archive_ingest::unwrap_remwraps(&args.dest, args.overwrite, unwrap_plan)?;
+    for (key, accounting) in [
+        ("skipped_xattrs", &report.skipped_xattrs),
+        ("skipped_metadata", &report.skipped_metadata),
+    ] {
+        for (path, names) in accounting {
+            let entry = value[key][path].as_array().cloned().unwrap_or_default();
+            let mut merged = entry
+                .into_iter()
+                .filter_map(|name| name.as_str().map(str::to_owned))
+                .collect::<BTreeSet<_>>();
+            merged.extend(names.iter().cloned());
+            value[key][path] = json!(merged);
+        }
+    }
     value["unwrap"] = serde_json::to_value(report)
         .map_err(|error| format!("serialize unwrap report: {error}"))?;
     value["unwrap"]["enabled"] = json!(true);
@@ -14615,6 +14645,7 @@ fn verify_locator_sha256(
 fn parse_tar_header_size(header: &[u8; 512]) -> Result<u64, String> {
     let field = &header[124..136];
     if field[0] & 0x80 != 0 {
+        // Base-256 size (GNU and libarchive both write it for sizes octal cannot hold).
         let mut value = 0u64;
         for byte in &field[1..] {
             value = value
@@ -14624,13 +14655,7 @@ fn parse_tar_header_size(header: &[u8; 512]) -> Result<u64, String> {
         }
         return Ok(value);
     }
-    let text = field
-        .iter()
-        .copied()
-        .take_while(|byte| *byte != 0 && *byte != b' ')
-        .collect::<Vec<_>>();
-    let text = String::from_utf8_lossy(&text);
-    u64::from_str_radix(text.trim(), 8).map_err(|error| format!("parse tar size {text:?}: {error}"))
+    remanence_format::parse_ustar_octal(field, "size").map_err(|error| error.to_string())
 }
 
 fn read_tar_payload<R: Read>(reader: &mut R, size: u64) -> Result<Vec<u8>, String> {
@@ -15502,7 +15527,7 @@ fn read_archive_build_directory(
 }
 
 fn archive_build_file_spec(input: &ArchiveBuildInputFile) -> RemTarFileSpec {
-    match input.entry_type {
+    let mut spec = match input.entry_type {
         RemTarEntryType::Regular => {
             let mut spec = RemTarFileSpec::new(
                 input.archive_path.clone(),
@@ -15531,9 +15556,16 @@ fn archive_build_file_spec(input: &ArchiveBuildInputFile) -> RemTarFileSpec {
                 .expect("symlink input has link target"),
         ),
         RemTarEntryType::Directory => {
-            RemTarFileSpec::directory(input.archive_path.clone(), input.file_id.clone())
+            let mut spec =
+                RemTarFileSpec::directory(input.archive_path.clone(), input.file_id.clone());
+            spec.xattrs = input.xattrs.clone();
+            spec
         }
+    };
+    if input.entry_type != RemTarEntryType::Hardlink {
+        spec.xattrs = input.xattrs.clone();
     }
+    spec
 }
 
 fn archive_build_streams<'a>(
@@ -17162,6 +17194,119 @@ fn format_warning(w: &DiscoveryWarning) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn removed_xattr_flags_have_no_clap_alias_and_explain_policy() {
+        for flag in ["--full-fidelity-xattrs", "--xattr-namespace"] {
+            for (binary, command) in [
+                ("rem", "build"),
+                ("rem", "extract"),
+                ("rem", "restore"),
+                ("rem-debug", "build"),
+                ("rem-debug", "extract"),
+                ("rem-debug", "restore"),
+            ] {
+                let args = [binary, "archive", command, flag];
+                let error = if binary == "rem" {
+                    Cli::try_parse_from(args).unwrap_err()
+                } else {
+                    DebugCli::try_parse_from(args).unwrap_err()
+                };
+                assert!(error.to_string().contains(flag));
+                let message =
+                    remanence_stream::removed_xattr_flag_message(args.iter().map(OsStr::new))
+                        .unwrap();
+                assert!(
+                    message.contains(flag)
+                        && message.contains("was removed")
+                        && message.contains("only user.*")
+                );
+            }
+        }
+        let error =
+            Cli::try_parse_from(["rem", "restore", "--xattr-namespace", "security."]).unwrap_err();
+        assert!(error.to_string().contains("--xattr-namespace"));
+        assert!(remanence_stream::removed_xattr_flag_message([
+            OsStr::new("--"),
+            OsStr::new("--xattr-namespace")
+        ])
+        .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_user_xattrs_round_trip_in_manifest_without_wrappers() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir_all(source.join("nonempty")).unwrap();
+        fs::create_dir_all(source.join("empty")).unwrap();
+        fs::write(source.join("nonempty/payload"), b"payload").unwrap();
+        for name in ["nonempty", "empty"] {
+            xattr::set(source.join(name), "user.directory", b"directory-value")
+                .expect("user xattrs required");
+        }
+        let object = temp.path().join("object.rem-object");
+        let args = [
+            "rem",
+            "archive",
+            "build",
+            "--inputs",
+            source.to_str().unwrap(),
+            "--out",
+            object.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+        ];
+        let (code, stdout, stderr) = invoke_without_discovery(&args);
+        assert_eq!(code, ExitCode::SUCCESS, "{stderr}");
+        let report: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(report["ingest"]["scan"]["totals"]["wrapped_entries"], 0);
+        assert!(report["ingest"]["tar_engine"].is_null());
+        assert!(!stdout.contains("directory-value"));
+        let native = read_plaintext_archive_object_file(&object, 4096).unwrap().0;
+        assert_eq!(native.global_pax["REMANENCE.schema_version"], "1.1");
+        for name in ["empty/", "nonempty/"] {
+            assert_eq!(
+                native
+                    .entries
+                    .iter()
+                    .find(|entry| entry.path == name)
+                    .unwrap()
+                    .xattrs["user.directory"],
+                b"directory-value"
+            );
+        }
+        let scan = archive_ingest::scan_only_report(
+            &[source],
+            None,
+            false,
+            archive_ingest::ScanTuning::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(scan.scan).unwrap(),
+            report["ingest"]["scan"]
+        );
+        let dest = temp.path().join("out");
+        let (code, _, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "extract",
+            "--object",
+            object.to_str().unwrap(),
+            "--dest",
+            dest.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+        ]);
+        assert_eq!(code, ExitCode::SUCCESS, "{stderr}");
+        for name in ["empty", "nonempty"] {
+            assert_eq!(
+                xattr::get(dest.join(name), "user.directory").unwrap(),
+                Some(b"directory-value".to_vec())
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -17983,6 +18128,98 @@ mod tests {
         );
     }
 
+    /// Both local build and pool-write validation use the CLI's lowercase prefix.
+    #[test]
+    fn recipient_slot_order_refusals_use_lowercase_error_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_, primary, _, _) = write_test_recipient_files(temp.path(), "order", 0x41);
+        let input = temp.path().join("input.txt");
+        let output = temp.path().join("output.rem-object");
+        fs::write(&input, b"payload").unwrap();
+        let (code, _, local_error) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "build",
+            "--inputs",
+            input.to_str().unwrap(),
+            "--out",
+            output.to_str().unwrap(),
+            "--recipient",
+            primary.to_str().unwrap(),
+            "--recipient",
+            primary.to_str().unwrap(),
+        ]);
+        assert_eq!(code, ExitCode::FAILURE);
+        let report = DiscoveryReport {
+            libraries: vec![],
+            unattached_drives: vec![],
+            complete: true,
+            incomplete_evidence: vec![],
+            warnings: vec![],
+        };
+        let args = pool_ops::ArchiveWriteArgs {
+            library: "unused".into(),
+            file: input,
+            pool_id: "unused".into(),
+            archive_path: None,
+            caller_object_id: None,
+            recipients: vec![primary.clone(), primary],
+            json_output: false,
+            config: temp.path().join("must-not-open.toml"),
+        };
+        let mut err = Vec::new();
+        assert_eq!(
+            pool_ops::run_archive_write(&report, &args, &[], &[], &mut Vec::new(), &mut err),
+            ExitCode::FAILURE
+        );
+        let expected = "error: --recipient epochs must be distinct and in ascending slot order\n";
+        assert_eq!(local_error, expected);
+        assert_eq!(String::from_utf8(err).unwrap(), expected);
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn bot_identity_refusals_use_plain_barcodes_and_readable_reasons() {
+        use remanence_api::{
+            BootstrapTailClassification as Tail, BotIdentityClassification as Bot,
+        };
+        assert_eq!(
+            barcode_generation_error(Some("BARCODE")),
+            "barcode BARCODE has no known LTO generation suffix"
+        );
+        assert_eq!(
+            barcode_generation_error(None),
+            "cartridge has no barcode; its LTO generation cannot be inferred"
+        );
+        for (classification, expected) in [
+            (Bot::BlankCheckEod, "blank cartridge at BOT"),
+            (Bot::UnrecognizedData, "unrecognized BOT data"),
+            (
+                Bot::ForeignFormat {
+                    name: "LTFS".into(),
+                },
+                "foreign format LTFS",
+            ),
+            (
+                Bot::DamagedRemBootstrap {
+                    detail: "checksum mismatch".into(),
+                },
+                "damaged Bootstrap: checksum mismatch",
+            ),
+            (
+                Bot::ReadError {
+                    detail: "read denied".into(),
+                },
+                "BOT read failed: read denied",
+            ),
+        ] {
+            assert_eq!(
+                bootstrap_tail_reason(&Tail::InvalidBot(classification)),
+                expected
+            );
+        }
+    }
+
     #[test]
     fn archive_recipient_keygen_build_extract_round_trip() {
         let root = tempfile::tempdir().unwrap();
@@ -18408,27 +18645,13 @@ mod tests {
         let restore = archive.find_subcommand_mut("restore").unwrap();
         let help = command_help(restore.clone());
 
-        assert!(help.contains("--xattr-namespace <PREFIX>"), "{help}");
-        assert!(help.contains("one stderr warning"), "{help}");
-        assert!(help.contains("listed in the report"), "{help}");
+        assert!(!help.contains("--xattr-namespace"), "{help}");
 
         let mut command = Cli::command();
         let archive = command.find_subcommand_mut("archive").unwrap();
         let extract = archive.find_subcommand_mut("extract").unwrap();
         let help = command_help(extract.clone());
-        assert!(help.contains("one stderr warning"), "{help}");
-    }
-
-    #[test]
-    fn archive_build_help_marks_full_fidelity_xattrs_non_portable() {
-        let mut command = Cli::command();
-        let archive = command.find_subcommand_mut("archive").unwrap();
-        let build = archive.find_subcommand_mut("build").unwrap();
-        let help = command_help(build.clone());
-
-        assert!(help.contains("--full-fidelity-xattrs"), "{help}");
-        assert!(help.contains("not portable"), "{help}");
-        assert!(help.contains("never the default"), "{help}");
+        assert!(!help.contains("--xattr-namespace"), "{help}");
     }
 
     #[test]
@@ -18853,12 +19076,7 @@ mod tests {
     #[test]
     fn temporary_bot_config_restores_after_success_and_primary_failure() {
         let prior = bot_test_config(BlockSize::Variable, true);
-        let selected = bot_test_config(
-            BlockSize::Fixed {
-                size_bytes: remanence_api::CANONICAL_ADOPTION_BLOCK_SIZE_BYTES,
-            },
-            false,
-        );
+        let selected = bot_test_config(BlockSize::Variable, false);
         for primary_ok in [true, false] {
             let mut spy = BotConfigSpy {
                 reads: VecDeque::from([Ok(prior), Ok(selected), Ok(prior)]),
@@ -18889,7 +19107,7 @@ mod tests {
     #[test]
     fn temporary_bot_config_restores_after_verification_failure_and_surfaces_restore_failure() {
         let prior = bot_test_config(BlockSize::Variable, true);
-        let wrong = bot_test_config(BlockSize::Variable, false);
+        let wrong = bot_test_config(BlockSize::Fixed { size_bytes: 1024 }, false);
         let mut verification_failure = BotConfigSpy {
             reads: VecDeque::from([Ok(prior), Ok(wrong), Ok(prior)]),
             writes: VecDeque::from([Ok(()), Ok(())]),
@@ -18909,12 +19127,7 @@ mod tests {
             ]
         );
 
-        let selected = bot_test_config(
-            BlockSize::Fixed {
-                size_bytes: remanence_api::CANONICAL_ADOPTION_BLOCK_SIZE_BYTES,
-            },
-            false,
-        );
+        let selected = bot_test_config(BlockSize::Variable, false);
         let mut restore_failure = BotConfigSpy {
             reads: VecDeque::from([Ok(prior), Ok(selected)]),
             writes: VecDeque::from([Ok(()), Err("mode select failed".to_string())]),
@@ -18932,7 +19145,7 @@ mod tests {
         };
         let error = with_temporary_bot_read_config(&mut configure_failure, |_| Ok(()))
             .expect_err("configure failure must still attempt restoration");
-        assert!(error.contains("configure fixed 1 MiB BOT read"));
+        assert!(error.contains("configure variable-block BOT read"));
         assert_eq!(
             configure_failure.calls,
             ["read_config", "write_config", "write_config", "read_config",]
@@ -19228,10 +19441,6 @@ mod tests {
             "--chunk-size",
             "4KiB",
             "--overwrite",
-            "--xattr-namespace",
-            "security.",
-            "--xattr-namespace",
-            "trusted.",
         ]);
 
         match cli.command {
@@ -19247,100 +19456,9 @@ mod tests {
                 assert!(args.first_chunk_lba.is_none());
                 assert!(args.file_size_bytes.is_none());
                 assert!(args.range.is_none());
-                assert_eq!(args.xattr_namespaces, ["security.", "trusted."]);
-                let shared: ArchiveExtractArgs = args.into();
-                assert_eq!(
-                    archive_extract_restore_options(&shared).xattr_allowed_prefixes,
-                    ["user.", "security.", "trusted."]
-                );
             }
             other => panic!("unexpected command: {other:?}"),
         }
-    }
-
-    #[test]
-    fn rem_archive_extract_rejects_broad_or_malformed_xattr_prefixes() {
-        for invalid in ["security", "s", ".", "", "user..", "user.\u{1}"] {
-            let error = match Cli::try_parse_from([
-                "rem",
-                "archive",
-                "extract",
-                "--object",
-                "/tmp/object.rem-object",
-                "--dest",
-                "/tmp/restored",
-                "--xattr-namespace",
-                invalid,
-            ]) {
-                Ok(_) => panic!("xattr prefix {invalid:?} unexpectedly parsed"),
-                Err(error) => error,
-            };
-            let message = error.to_string();
-            assert!(message.contains(&format!("{invalid:?}")), "{message}");
-        }
-
-        assert_eq!(
-            remanence_stream::parse_xattr_namespace_prefix("user.").unwrap(),
-            "user."
-        );
-        assert_eq!(
-            remanence_stream::parse_xattr_namespace_prefix("security.").unwrap(),
-            "security."
-        );
-    }
-
-    #[test]
-    fn archive_restore_plumbs_xattr_policy_for_dump_and_tape() {
-        let cli = Cli::parse_from([
-            "rem",
-            "archive",
-            "restore",
-            "--format",
-            "legacy-example",
-            "--dump",
-            "/tmp/archive.bin",
-            "--dest",
-            "/tmp/restored",
-            "--xattr-namespace",
-            "system.",
-        ]);
-        let RemCommand::Archive {
-            command: RemArchiveCommand::Restore(args),
-        } = cli.command
-        else {
-            panic!("expected dump restore command");
-        };
-        let shared: ArchiveRestoreArgs = args.into();
-        assert_eq!(
-            archive_restore_options(&shared).xattr_allowed_prefixes,
-            ["user.", "system."]
-        );
-
-        let cli = DebugCli::parse_from([
-            "rem-debug",
-            "archive",
-            "restore",
-            "--format",
-            "legacy-example",
-            "--tape",
-            "LIB01",
-            "--bay",
-            "0x0100",
-            "--dest",
-            "/tmp/restored",
-            "--xattr-namespace",
-            "system.",
-        ]);
-        let Command::Archive { command } = cli.command else {
-            panic!("expected tape archive command");
-        };
-        let ArchiveCommand::Restore(args) = *command else {
-            panic!("expected tape restore command");
-        };
-        assert_eq!(
-            archive_restore_options(&args).xattr_allowed_prefixes,
-            ["user.", "system."]
-        );
     }
 
     #[test]
@@ -19376,7 +19494,7 @@ mod tests {
         let stderr = String::from_utf8(err).unwrap();
         assert!(stdout.contains("security.selinux"), "{stdout}");
         assert!(stdout.contains("system.remanence_test"), "{stdout}");
-        assert_eq!(stderr.matches("skipped by namespace policy").count(), 1);
+        assert_eq!(stderr.matches("skipped during restore").count(), 1);
 
         let mut no_warning = Vec::new();
         print_xattr_policy_skip_warning(&BTreeMap::new(), &mut no_warning);
@@ -23147,7 +23265,7 @@ tape_catalog_dir = "{0}/cache/tapes"
             map_sha256: None,
             out: Some(out),
             rules: None,
-            full_fidelity_xattrs: false,
+
             scan_only: false,
             manifest_out: None,
             no_index: false,
@@ -24372,6 +24490,8 @@ tape_catalog_dir = "{0}/cache/tapes"
         fs::write(&zeta_path, zeta_payload).unwrap();
         fs::write(&alpha_path, alpha_payload).unwrap();
         fs::write(&beta_path, beta_payload).unwrap();
+        #[cfg(unix)]
+        xattr::set(&alpha_path, "user.mapped", b"mapped-value").expect("user xattrs required");
         let map_path = temp.path().join("source-map.tsv");
         let rows: Vec<(&str, &Path, &[u8], &str)> = vec![
             (
@@ -24429,7 +24549,11 @@ tape_catalog_dir = "{0}/cache/tapes"
         assert!(out_path.exists());
         let report: serde_json::Value = serde_json::from_str(&stdout).expect("build json");
         assert_eq!(report["map_sha256"], map_hash);
-        assert!(report.get("ingest").is_none());
+        assert_eq!(
+            report["ingest"]["xattr_policy"]["allowed_prefixes"],
+            json!(["user."])
+        );
+        assert!(report["ingest"]["tar_engine"].is_null());
         assert_eq!(
             report["manifest_out"].as_str(),
             Some(manifest_path.to_str().unwrap())
@@ -24473,6 +24597,12 @@ tape_catalog_dir = "{0}/cache/tapes"
         let read = remanence_format::read_rem_tar_object(&mut source, 4096, block_count).unwrap();
         assert_eq!(read.entry("z/zeta.bin").unwrap().data, zeta_payload);
         assert_eq!(read.entry("a.txt").unwrap().data, alpha_payload);
+        #[cfg(unix)]
+        assert_eq!(
+            read.entry("a.txt").unwrap().xattrs["user.mapped"],
+            b"mapped-value"
+        );
+        assert!(!stdout.contains("mapped-value"));
         assert_eq!(read.entry("nested/beta.txt").unwrap().data, beta_payload);
         assert!(files
             .iter()
@@ -25916,7 +26046,6 @@ blob Project/Render Files/
             std::slice::from_ref(&input_dir),
             None,
             false,
-            false,
             archive_ingest::ScanTuning::default(),
         )
         .expect("scan-only does not open regular-file payloads");
@@ -26007,42 +26136,73 @@ blob Project/Render Files/
         );
     }
 
+    /// Plaintext and encrypted whole-object extracts must pass restore policy
+    /// into wrapper extraction and include its skips in the normal report.
+    #[cfg(unix)]
     #[test]
-    fn archive_build_full_fidelity_flag_sets_capture_posture_without_ruleset() {
-        let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-full-fidelity-xattrs")
-            .tempdir()
-            .unwrap();
-        let input = temp.path().join("input.txt");
-        fs::write(&input, b"full fidelity posture").unwrap();
-        let out_path = temp.path().join("full.rem-object");
-
-        let (code, stdout, stderr) = invoke_without_discovery(&[
-            "rem",
-            "archive",
-            "build",
-            "--inputs",
-            input.to_str().unwrap(),
-            "--full-fidelity-xattrs",
-            "--out",
-            out_path.to_str().unwrap(),
-            "--chunk-size",
-            "4KiB",
-            "--object-id",
-            "object-full-xattrs",
-            "--caller-object-id",
-            "caller-full-xattrs",
-            "--manifest-file-id",
-            "manifest-full-xattrs",
-            "--timestamp",
-            "2026-01-01T00:00:00Z",
-        ]);
-
-        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
-        assert!(stderr.is_empty(), "{stderr}");
-        let report: Value = serde_json::from_str(&stdout).expect("build json");
-        assert_eq!(report["ingest"]["xattr_policy"]["mode"], "full-fidelity");
-        assert!(report["ingest"]["ruleset"].is_null());
+    fn archive_extract_wrapper_namespace_policy_is_independent_of_encryption() {
+        for encrypted in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let wrapper = temp.path().join("source.remwrap.tar");
+            fs::write(&wrapper, archive_ingest::wrapper_xattr_fixture(true)).unwrap();
+            let object = temp.path().join("wrapper.rem-object");
+            let (_, primary, recovery, private) =
+                write_test_recipient_files(temp.path(), "wrapper", 0x31);
+            let mut build = vec![
+                "rem",
+                "archive",
+                "build",
+                "--inputs",
+                wrapper.to_str().unwrap(),
+                "--out",
+                object.to_str().unwrap(),
+                "--chunk-size",
+                "4KiB",
+            ];
+            if encrypted {
+                build.extend([
+                    "--recipient",
+                    primary.to_str().unwrap(),
+                    "--recipient",
+                    recovery.to_str().unwrap(),
+                ]);
+            }
+            let (code, _, stderr) = invoke_without_discovery(&build);
+            assert_eq!(code, ExitCode::SUCCESS, "{stderr}");
+            {
+                let dest = temp.path().join("restored");
+                let mut extract = vec![
+                    "rem",
+                    "archive",
+                    "extract",
+                    "--object",
+                    object.to_str().unwrap(),
+                    "--dest",
+                    dest.to_str().unwrap(),
+                    "--chunk-size",
+                    "4KiB",
+                ];
+                if encrypted {
+                    extract.extend(["--private-key", private.to_str().unwrap()]);
+                }
+                let (code, stdout, stderr) = invoke_without_discovery(&extract);
+                {
+                    assert_eq!(code, ExitCode::SUCCESS, "{stderr}");
+                    let report: Value = serde_json::from_str(&stdout).unwrap();
+                    assert_eq!(
+                        report["skipped_xattrs"]["tagged.txt"],
+                        json!([
+                            "security.remanence_test",
+                            "trusted.remanence_test",
+                            "user.keep"
+                        ])
+                    );
+                    assert_eq!(stderr.matches("skipped during restore").count(), 1);
+                    assert!(stderr.contains("3 extended attribute(s)"), "{stderr}");
+                }
+                assert!(!stdout.contains("private-value") && !stderr.contains("private-value"));
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -26095,7 +26255,7 @@ blob Project/Render Files/
         ]);
 
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
-        assert_eq!(stderr.matches("skipped by namespace policy").count(), 1);
+        assert_eq!(stderr.matches("skipped during restore").count(), 1);
         assert!(stderr.contains("1 extended attribute(s)"), "{stderr}");
         assert!(!stdout.contains("sensitive-marker"));
         let report: Value = serde_json::from_str(&stdout).expect("extract json");
@@ -26199,7 +26359,7 @@ blob Project/Render Files/
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
         assert_eq!(
             stderr,
-            "warning: 1 extended attribute(s) dropped by capture namespace policy; see dropped_xattrs in the ingest report\n"
+            "warning: 1 extended attribute(s) dropped by capture policy; see dropped_xattrs in the ingest report\n"
         );
         let report: serde_json::Value = serde_json::from_str(&stdout).expect("build json");
         assert_eq!(report["ingest"]["scan"]["totals"]["dropped_xattrs"], 1);
@@ -26273,7 +26433,7 @@ blob Project/Render Files/
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
         assert_eq!(
             stderr,
-            "warning: 1 extended attribute(s) dropped by capture namespace policy; see dropped_xattrs in the ingest report\n"
+            "warning: 1 extended attribute(s) dropped by capture policy; see dropped_xattrs in the ingest report\n"
         );
         let report: serde_json::Value = serde_json::from_str(&stdout).expect("build json");
         assert_eq!(report["ingest"]["scan"]["totals"]["dropped_xattrs"], 1);
@@ -26287,7 +26447,7 @@ blob Project/Render Files/
     #[cfg(unix)]
     #[test]
     #[ignore = "requires a filesystem that accepts user xattr values larger than 4096 bytes"]
-    fn archive_build_rules_wraps_oversized_xattr() {
+    fn archive_build_preserves_large_xattr_natively() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-cli-rem-object-xattr-large")
             .tempdir()
@@ -26328,16 +26488,12 @@ blob Project/Render Files/
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
         assert!(stderr.is_empty(), "{stderr}");
         let report: serde_json::Value = serde_json::from_str(&stdout).expect("build json");
-        assert_eq!(report["ingest"]["scan"]["totals"]["wrapped_entries"], 1);
-        assert!(report["ingest"]["scan"]["clusters"]
-            .as_array()
+        assert_eq!(report["ingest"]["scan"]["totals"]["wrapped_entries"], 0);
+        assert!(report["ingest"]["tar_engine"].is_null());
+        let object = read_plaintext_archive_object_file(&out_path, 4096)
             .unwrap()
-            .iter()
-            .any(|cluster| cluster["reason"] == "xattr-large"));
-        let files = report["files"].as_array().expect("files array");
-        assert!(files
-            .iter()
-            .any(|file| file["path"] == "large-xattr.txt.remwrap.tar"));
+            .0;
+        assert_eq!(object.entries[0].xattrs["user.large"], large_xattr);
     }
 
     #[test]
@@ -26352,7 +26508,6 @@ blob Project/Render Files/
             &[temp.path().to_path_buf()],
             Some(&deny),
             false,
-            false,
             archive_ingest::ScanTuning::default()
         )
         .unwrap_err()
@@ -26363,7 +26518,6 @@ blob Project/Render Files/
         assert!(archive_ingest::scan_only_report(
             &[temp.path().to_path_buf()],
             Some(&allow),
-            false,
             false,
             archive_ingest::ScanTuning::default()
         )

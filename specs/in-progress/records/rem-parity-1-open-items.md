@@ -40,6 +40,13 @@ that step.
    Section 17 describes. Publication promotion remains gated by TT-5 and the
    other freeze criteria. The items below record what is decided and what
    remains open:
+   - Interim: REM-OBJECT 1.0.0-draft.4, in preparation, changes the ustar
+     header bytes of every REM-OBJECT object (REM-OBJECT §13.7), and the tape
+     images' Objects are written by a REM-OBJECT Builder. The pinned bytes the
+     second implementation re-derives, and the image, damage-matrix, resume
+     and negative values derived from them, are therefore stale under that
+     preparing copy until REM-OBJECT's open item RO-3 regenerates them. The
+     evidence for this criterion is gathered again then (Section 17).
    - The damage matrix has 72 cases: 71 have blind decisions, of which 69
      are pinned. E9, `short-epoch-followed-by-another`, is also pinned; it is
      added later and checked against the second implementation without a
