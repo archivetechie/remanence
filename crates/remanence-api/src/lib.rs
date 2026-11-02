@@ -116,6 +116,7 @@ pub use standalone_write::{MountedWriteResult, StandaloneFinalizeRequest};
 mod object_fault;
 mod object_position;
 pub use object_position::{position_to_object, BotRelativeTapeFile, ObjectPositionOrigin};
+mod closeout_obligation;
 mod closeout_progress;
 mod operations;
 mod pool_selection;

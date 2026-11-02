@@ -7,6 +7,15 @@ per-release summaries.
 <!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/index.rs crates/remanence-library/src/discovery.rs @ 638210f7 -->
 ## Unreleased
 
+- Startup reconstructs closeout and finalization obligations from native logs,
+  retries unavailable resources with capped backoff, and restricts maintenance
+  to configured libraries and drives. Eligible due-closeout tapes are preferred
+  within a pool; capacity includes their sidecar and seal-due tapes receive no
+  further Objects. Catalog, live status and `rem top` expose unprotected bytes,
+  original debt age and overdue state, with an off-drive debt list.
+  `daemon.closeout_alarm_after_secs` defaults to 259200 and must be positive;
+  overdue notification emits one WARN and audit per debt age per daemon run.
+
 - Added `daemon.shutdown_close_deadline_secs` (default 300, nonzero). Graceful
   shutdown ends write sessions in parallel against one deadline, stops new drive
   commands at expiry, settles issued commands, and records the interrupted tail

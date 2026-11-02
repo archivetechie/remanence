@@ -252,6 +252,16 @@ All of these speak gRPC to `rem-daemon` and take `--endpoint` and `--json`.
 | `rem alarms [--all]` / `rem alarms ack <CONDITION_KEY>` | List standing alarms (with `--all`, cleared ones too) or acknowledge one. |
 | `rem audit query --since <RFC3339> --until <RFC3339> [--filter <K=V>]...` | Stream audit-log entries in the half-open interval from `--since` (inclusive) to `--until` (exclusive). Each `--filter` is an exact-match `key=value` filter; repeat it for several fields. `--json` prints one JSON object per entry. |
 
+`rem top` shows unprotected bytes, the UTC time since they became unprotected,
+and `OVERDUE` when their age reaches `daemon.closeout_alarm_after_secs`. Its
+wide drive table adds `unprot bytes` and `since` columns; narrow terminals keep
+these details in the separate debt list. Its
+closeout debt list includes unseated and unavailable tapes, including tapes outside
+the configured library and drive scope. Maintenance operates only within that scope.
+JSON uses `unprotected_bytes` (decimal string), `unprotected_since` (RFC3339 UTC
+or null), `closeout_due`, and `closeout_overdue`; `closeout_debt` contains the
+catalog-shaped tape entries. An unavailable native authority is a read error.
+
 Note: `GetLiveStatus` also carries an advisory `drive_assignments`
 projection (per-bay busy/idle state, keyed `(library_serial, bay)`) for
 an external arbitration client — `rem top` does not render

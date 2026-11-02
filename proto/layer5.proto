@@ -380,6 +380,11 @@ message Drive {
   // Committed ordinals [W,T) awaiting parity on the seated cartridge.
   optional uint64 open_epoch_start = 31;
   optional uint64 open_epoch_end = 32;
+  // Native parity debt; authority read failures fail the entire response.
+  uint64 unprotected_bytes = 33;
+  optional google.protobuf.Timestamp unprotected_since = 34;
+  bool closeout_due = 35;
+  bool closeout_overdue = 36;
 }
 
 // A row of the drive catalog. Field presence here MIRRORS the nullability of
@@ -606,6 +611,8 @@ message GetLiveStatusResponse {
   repeated DriveAssignment drive_assignments = 6;
   uint64 active_tape_io_fence_count = 7;
   repeated TapeIoFence active_tape_io_fences = 8;
+  // All due tapes, including unavailable and unseated cartridges.
+  repeated Tape closeout_debt = 9;
 }
 
 message Slot {
@@ -849,8 +856,13 @@ message Tape {
   // Committed ordinals [W,T) awaiting an on-tape sidecar; both absent when protected.
   optional uint64 open_epoch_start = 20;
   optional uint64 open_epoch_end = 21;
-  // Deferred automatic seal trigger; persists until terminal completion.
+  // Automatic barrier seal trigger; not a removal deferral.
   optional string seal_due = 22;
+  // Native parity debt; authority read failures fail the entire response.
+  uint64 unprotected_bytes = 23;
+  optional google.protobuf.Timestamp unprotected_since = 24;
+  bool closeout_due = 25;
+  bool closeout_overdue = 26;
 }
 
 message FinalizeTapeRequest {

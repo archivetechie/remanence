@@ -8348,7 +8348,7 @@ fn drive_pool_tracks_pending_tape_reservations_for_selection_exclusion() {
 }
 
 #[tokio::test]
-async fn catalog_lists_tapes_and_tape_files() {
+async fn catalog_missing_authority_refuses_tapes_but_lists_projected_files() {
     let service = populated_state().catalog_service();
 
     let tapes = pb::catalog_server::Catalog::list_tapes(
@@ -8362,15 +8362,8 @@ async fn catalog_lists_tapes_and_tape_files() {
         }),
     )
     .await
-    .expect("list tapes")
-    .into_inner();
-    assert_eq!(tapes.tapes.len(), 1);
-    assert_eq!(tapes.tapes[0].tape_uuid, TAPE_UUID.to_vec());
-    assert_eq!(tapes.tapes[0].body_format.as_deref(), Some("rem-object-v1"));
-    assert_eq!(tapes.tapes[0].block_size_bytes, Some(4096));
-    assert_eq!(tapes.tapes[0].last_committed_tape_file, Some(7));
-    assert_eq!(tapes.tapes[0].state, pb::tape::State::TapeStateReady as i32);
-    assert_eq!(tapes.tapes[0].pool_id.as_deref(), Some("camera.copy-a"));
+    .expect_err("catalog-only fixture has no native debt authority");
+    assert_eq!(tapes.code(), tonic::Code::DataLoss);
 
     let filtered_tapes = pb::catalog_server::Catalog::list_tapes(
         &service,
@@ -8383,9 +8376,8 @@ async fn catalog_lists_tapes_and_tape_files() {
         }),
     )
     .await
-    .expect("list tapes by pool")
-    .into_inner();
-    assert_eq!(filtered_tapes.tapes, tapes.tapes);
+    .expect_err("pool filtering cannot invent zero debt");
+    assert_eq!(filtered_tapes.code(), tonic::Code::DataLoss);
 
     let pools = pb::catalog_server::Catalog::list_tape_pools(
         &service,
@@ -8435,9 +8427,8 @@ async fn catalog_lists_tapes_and_tape_files() {
         }),
     )
     .await
-    .expect("get tape")
-    .into_inner();
-    assert_eq!(tape.tape_uuid, TAPE_UUID.to_vec());
+    .expect_err("GetTape also requires native authority");
+    assert_eq!(tape.code(), tonic::Code::DataLoss);
 
     let files = pb::catalog_server::Catalog::list_tape_files(
         &service,

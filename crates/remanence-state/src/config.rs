@@ -19,6 +19,8 @@ pub const DEFAULT_APPEND_RING_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 pub const DEFAULT_APPEND_INGRESS_IDLE_SECS: u64 = 300;
 /// Graceful shutdown budget before stopping new session drive commands.
 pub const DEFAULT_SHUTDOWN_CLOSE_DEADLINE_SECS: u64 = 300;
+/// Age at which uncovered parity debt raises an operator notification.
+pub const DEFAULT_CLOSEOUT_ALARM_AFTER_SECS: u64 = 259200;
 /// Default target size of one restore stream's read reservoir.
 pub const DEFAULT_READ_RESERVOIR_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// Default ranged-read device-position proof cadence.
@@ -155,6 +157,9 @@ pub struct DaemonConfig {
     /// Shared graceful shutdown budget for final barriers and session endings.
     #[serde(default = "default_shutdown_close_deadline_secs")]
     pub shutdown_close_deadline_secs: u64,
+    /// Notify once per debt age when uncovered parity remains this long.
+    #[serde(default = "default_closeout_alarm_after_secs")]
+    pub closeout_alarm_after_secs: u64,
     /// Delay before a seated cartridge in an idle drive is returned home.
     /// Zero keeps idle cartridges seated until eviction or explicit unload.
     /// Graceful shutdown leaves cartridges seated; startup restarts the idle timer.
@@ -477,6 +482,10 @@ const fn default_append_ring_bytes() -> u64 {
     DEFAULT_APPEND_RING_BYTES
 }
 
+const fn default_closeout_alarm_after_secs() -> u64 {
+    DEFAULT_CLOSEOUT_ALARM_AFTER_SECS
+}
+
 const fn default_shutdown_close_deadline_secs() -> u64 {
     DEFAULT_SHUTDOWN_CLOSE_DEADLINE_SECS
 }
@@ -649,6 +658,11 @@ pub fn validate_config(config: &RemConfig) -> Result<(), StateError> {
     if config.daemon.default_idle_timeout_seconds == 0 {
         return Err(StateError::ConfigInvalid(
             "daemon.default_idle_timeout_seconds must be non-zero".to_string(),
+        ));
+    }
+    if config.daemon.closeout_alarm_after_secs == 0 {
+        return Err(StateError::ConfigInvalid(
+            "daemon.closeout_alarm_after_secs must be greater than zero".to_string(),
         ));
     }
     if config.daemon.shutdown_close_deadline_secs == 0 {
@@ -1247,6 +1261,33 @@ tape_catalog_dir = "{0}/cache/tapes"
             panic!("expected configuration validation refusal");
         };
         assert_eq!(message, "daemon.append_ingress_idle_secs must be non-zero");
+    }
+
+    #[test]
+    fn closeout_alarm_default_override_and_zero_refusal() {
+        assert_eq!(
+            parse_config_toml(&valid_config())
+                .unwrap()
+                .daemon
+                .closeout_alarm_after_secs,
+            259200
+        );
+        assert_eq!(
+            parse_config_toml(&with_daemon_lines("closeout_alarm_after_secs = 17\n"))
+                .unwrap()
+                .daemon
+                .closeout_alarm_after_secs,
+            17
+        );
+        let StateError::ConfigInvalid(message) =
+            parse_config_toml(&with_daemon_lines("closeout_alarm_after_secs = 0\n")).unwrap_err()
+        else {
+            panic!("configuration refusal");
+        };
+        assert_eq!(
+            message,
+            "daemon.closeout_alarm_after_secs must be greater than zero"
+        );
     }
 
     /// Shutdown has one nonzero budget, independent of ingress and session idle.

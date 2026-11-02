@@ -87,6 +87,10 @@ pub(crate) fn project_drive(
     pb::Drive {
         open_epoch_start: None,
         open_epoch_end: None,
+        unprotected_bytes: 0,
+        unprotected_since: None,
+        closeout_due: false,
+        closeout_overdue: false,
         // Known here, because the changer just told us: the bay, whether it is
         // fenced, and whatever a host-side INQUIRY managed to resolve.
         element_address: Some(u32::from(bay.element_address)),
@@ -610,6 +614,7 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         .map_err(|error| Status::internal(error.to_string()))??;
         if let Some(pool) = &self.state.drive_pool {
             pool.readiness_wake.notify.notify_one();
+            self.state.closeout_work.wake.notify_one();
         }
         Ok(Response::new(
             crate::daemon_catalog_services::tape_io_fence_to_proto(record),

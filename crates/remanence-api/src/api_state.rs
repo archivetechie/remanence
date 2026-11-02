@@ -58,6 +58,8 @@ pub struct ApiState {
     pub(crate) append_staging_mode: remanence_state::AppendStagingMode,
     pub(crate) append_ingress_idle_secs: u64,
     pub(crate) shutdown_close_deadline_secs: u64,
+    pub(crate) closeout_alarm_after_secs: u64,
+    pub(crate) closeout_work: Arc<crate::closeout_obligation::WorkList>,
     pub(crate) append_ring_bytes: u64,
     pub(crate) append_overlap_min_bytes: u64,
     pub(crate) append_ring_high_pct: u8,
@@ -192,6 +194,7 @@ impl ApiState {
         state.append_staging_mode = config.daemon.append_staging_mode;
         state.append_ingress_idle_secs = config.daemon.append_ingress_idle_secs;
         state.shutdown_close_deadline_secs = config.daemon.shutdown_close_deadline_secs;
+        state.closeout_alarm_after_secs = config.daemon.closeout_alarm_after_secs;
         state.append_ring_bytes = config.daemon.append_ring_bytes;
         state.append_overlap_min_bytes = config.daemon.append_overlap_min_bytes();
         state.append_ring_high_pct = config.daemon.append_ring_high_pct;
@@ -262,6 +265,8 @@ impl ApiState {
             append_staging_mode: remanence_state::AppendStagingMode::default(),
             append_ingress_idle_secs: remanence_state::DEFAULT_APPEND_INGRESS_IDLE_SECS,
             shutdown_close_deadline_secs: remanence_state::DEFAULT_SHUTDOWN_CLOSE_DEADLINE_SECS,
+            closeout_alarm_after_secs: remanence_state::DEFAULT_CLOSEOUT_ALARM_AFTER_SECS,
+            closeout_work: Arc::default(),
             append_ring_bytes: remanence_state::DEFAULT_APPEND_RING_BYTES,
             append_overlap_min_bytes: remanence_state::DEFAULT_APPEND_RING_BYTES,
             append_ring_high_pct: 90,
@@ -515,6 +520,7 @@ impl ApiState {
         state.append_staging_mode = config.daemon.append_staging_mode;
         state.append_ingress_idle_secs = config.daemon.append_ingress_idle_secs;
         state.shutdown_close_deadline_secs = config.daemon.shutdown_close_deadline_secs;
+        state.closeout_alarm_after_secs = config.daemon.closeout_alarm_after_secs;
         state.append_ring_bytes = config.daemon.append_ring_bytes;
         state.append_overlap_min_bytes = config.daemon.append_overlap_min_bytes();
         state.append_ring_high_pct = config.daemon.append_ring_high_pct;
@@ -785,6 +791,7 @@ impl ApiState {
                     response.active_tape_io_fence_count =
                         response.active_tape_io_fences.len() as u64;
                     response.drive_assignments = self.drive_assignments(&response.libraries)?;
+                    self.refresh_closeout_surfaces(&mut response)?;
                     return Ok(response);
                 }
             }
@@ -933,7 +940,10 @@ impl ApiState {
             snapshot_at_utc,
             daemon_epoch: self.daemon_epoch,
             drive_assignments,
+            closeout_debt: Vec::new(),
         };
+        let mut response = response;
+        self.refresh_closeout_surfaces(&mut response)?;
         *self
             .live_status
             .cache

@@ -1238,119 +1238,91 @@ async fn manual_finalize_attempt(
 /// Resume every terminal finalization that was durable when the process
 /// stopped, including accepted manual operations whose callers disconnected.
 pub(crate) fn spawn_startup_terminal_recoveries(state: ApiState) {
-    tokio::spawn(async move {
-        let pool = match state.drive_pool() {
-            Ok(pool) => pool.clone(),
-            Err(error) => {
-                tracing::error!(%error, "cannot own tapes for startup terminal recoveries");
-                return;
-            }
-        };
-        let paths = match remanence_state::TapeAuthority::list_entries(
-            state.checkpoint_journal_dir.as_path(),
-        ) {
-            Ok(paths) => paths,
-            Err(error) => {
-                tracing::error!(%error, "cannot enumerate startup terminal recoveries");
-                return;
-            }
-        };
-        for path in paths {
-            let tape_uuid = match remanence_state::TapeAuthority::entry_tape_uuid(&path) {
-                Ok(tape_uuid) => tape_uuid,
-                Err(error) => {
-                    tracing::error!(path = %path.display(), %error, "invalid checkpoint journal path during startup recovery");
-                    continue;
-                }
-            };
-            if state
-                .index()
-                .and_then(|index| {
-                    index
-                        .tape_io_is_fenced(Some(&tape_uuid), None, None)
-                        .map_err(status_from_state_error)
-                })
-                .unwrap_or(true)
-            {
-                continue;
-            }
-            // A retired identity refuses changed terminal authority. Its
-            // pending intent, if any, stays in its log as history.
-            if state
-                .index()
-                .and_then(|index| index.get_tape(&tape_uuid).map_err(status_from_state_error))
-                .is_ok_and(|tape| tape.is_some_and(|tape| tape.state == "retired"))
-            {
-                tracing::info!(tape_uuid = %Uuid::from_bytes(tape_uuid), "retired tape skipped by startup terminal recovery");
-                continue;
-            }
-            let journal = match remanence_state::TapeAuthority::open(
-                state.checkpoint_journal_dir.as_path(),
-                tape_uuid,
-                state.index_path.as_path(),
-            ) {
-                Ok(journal) => journal,
-                Err(error) => {
-                    tracing::error!(tape_uuid = %Uuid::from_bytes(tape_uuid), %error, "cannot open checkpoint journal during startup recovery");
-                    continue;
-                }
-            };
-            let intent = match journal.pending_finalization() {
-                Ok(intent) => intent,
-                Err(error) => {
-                    tracing::error!(tape_uuid = %Uuid::from_bytes(tape_uuid), %error, "cannot inspect terminal intent during startup recovery");
-                    continue;
-                }
-            };
-            let Some(intent) = intent else {
-                continue;
-            };
-            // Own the exact tape before recovering its pending intent, as every live
-            // terminal owner does. A refused reservation means a live owner,
-            // such as a same-key FinalizeTape, already holds the tape and
-            // drives its pending intent itself.
-            let Ok(tape_reservation) = pool.reserve_tape(tape_uuid) else {
-                tracing::info!(tape_uuid = %Uuid::from_bytes(tape_uuid), "owned tape skipped by startup terminal recovery");
-                continue;
-            };
+    crate::closeout_obligation::spawn(state);
+}
 
-            if intent.manual.is_some() {
-                let reconciled = (|| {
-                    let mut lease = journal.acquire_exclusive_for_terminal_recovery()?;
-                    #[cfg(test)]
-                    run_startup_terminal_lease_hook(tape_uuid);
-                    let index = CatalogIndex::open(state.index_path.as_ref())?;
-                    crate::write_owner::reconcile_manual_terminal_acceptance(
-                        &index, &mut lease, &intent,
-                    )
-                    .map_err(|status| {
-                        remanence_state::StateError::JournalReplayFailed(status.to_string())
-                    })
-                })();
-                match reconciled {
-                    Ok(true) => {}
-                    Ok(false) => continue,
-                    Err(error) => {
-                        tracing::error!(tape_uuid = %Uuid::from_bytes(tape_uuid), %error, "cannot reconcile startup manual acceptance");
-                        continue;
-                    }
-                }
-            }
-            let recovery = if intent.manual.is_some() {
-                recover_manual_terminal_tape(&state, &pool, tape_reservation, &intent).await
-            } else {
-                recover_automatic_terminal_tape(&state, &pool, tape_reservation, tape_uuid).await
-            };
-            if let Err(error) = recovery {
-                tracing::error!(
-                    tape_uuid = %Uuid::from_bytes(tape_uuid),
-                    progress = ?intent.progress,
-                    %error,
-                    "terminal finalization did not complete during startup recovery"
-                );
-            }
+/// Recheck merged debt under native ownership, then reuse the existing actor routes.
+pub(crate) async fn service_closeout_obligation(
+    state: &ApiState,
+    tape_uuid: TapeUuid,
+    incarnation: u64,
+) -> Result<(), Status> {
+    let pool = state.drive_pool()?.clone();
+    let tape_reservation = pool.reserve_tape(tape_uuid)?;
+    let mut index = state.index_write()?;
+    if index
+        .get_tape(&tape_uuid)
+        .map_err(status_from_state_error)?
+        .is_some_and(|t| t.state == "retired")
+    {
+        return Ok(());
+    }
+    if index
+        .tape_io_is_fenced(Some(&tape_uuid), None, None)
+        .map_err(status_from_state_error)?
+    {
+        return Err(Status::failed_precondition(
+            "terminal recovery blocked by active tape-I/O fence",
+        ));
+    }
+    // Resolve only within configured library/drive ownership, before dispatch.
+    let library = resolve_tape_library_serial(state, &pool, &tape_uuid)?;
+    let route = resolve_actor_mount(state, &library, &tape_uuid, &HashSet::new())?;
+    let mount = match &route {
+        ActorMountPlan::Ready(mount) | ActorMountPlan::Evict { mount, .. } => mount,
+    };
+    pool.drive_tx(&mount.drive_key())?;
+    let journal = remanence_state::TapeAuthority::open(
+        state.checkpoint_journal_dir.as_ref(),
+        tape_uuid,
+        state.index_path.as_ref(),
+    )
+    .map_err(status_from_state_error)?;
+    let mut lease = journal
+        .acquire_exclusive_for_terminal_recovery()
+        .map_err(status_from_state_error)?;
+    #[cfg(test)]
+    run_startup_terminal_lease_hook(tape_uuid);
+    let snapshot = lease.freeze().map_err(status_from_state_error)?;
+    let summary = snapshot.tape_summary();
+    if summary.incarnation != incarnation {
+        return Ok(());
+    }
+    let closeout = summary.closeout_due();
+    let finalize = !summary.sealed
+        && (summary.seal_due.is_some()
+            || summary.finalization.as_ref().is_some_and(|p| !p.prepared));
+    let intent =
+        remanence_state::authority::TapeAuthoritySnapshot::finalization(&snapshot).cloned();
+    index
+        .project_tape_log(&snapshot)
+        .map_err(status_from_state_error)?;
+    if let Some(intent) = intent.as_ref().filter(|i| i.manual.is_some()) {
+        if !crate::write_owner::reconcile_manual_terminal_acceptance(&index, &mut lease, intent)? {
+            return Ok(());
         }
-    });
+    }
+    drop(lease);
+    drop(index);
+    if finalize || intent.as_ref().is_some_and(|i| i.manual.is_some()) {
+        if let Some(intent) = intent.as_ref().filter(|i| i.manual.is_some()) {
+            recover_manual_terminal_tape(state, &pool, tape_reservation, intent).await
+        } else {
+            recover_automatic_terminal_tape(state, &pool, tape_reservation, tape_uuid).await
+        }
+    } else if closeout {
+        // closeout_tape takes the same reservation and rechecks under its lease.
+        drop(tape_reservation);
+        closeout_tape(
+            state,
+            tape_uuid,
+            None,
+            crate::closeout_progress::CloseoutProgress::new(Uuid::new_v4(), tape_uuid, None)?,
+        )
+        .await
+    } else {
+        Ok(())
+    }
 }
 
 /// One-shot pause for one tape, taken while startup recovery holds that
@@ -3073,6 +3045,19 @@ fn resolve_actor_mount(
         .iter()
         .find(|library| library.serial == library_serial)
         .ok_or_else(|| Status::not_found(format!("library {library_serial} not found")))?;
+    // Only configured actor drives participate in maintenance or session placement.
+    // A cartridge seated in an excluded drive is not movable by this owner.
+    let mut scoped = library.clone();
+    if let Some(pool) = &state.drive_pool {
+        scoped.drive_bays.retain(|bay| {
+            pool.drive_tx(&crate::drive_pool::DriveKey::new(
+                library_serial,
+                bay.element_address,
+            ))
+            .is_ok()
+        });
+    }
+    let library = &scoped;
     // Validate inventory before a library-wide fence masks a missing cartridge.
     // Ignore reservations here so a readiness owner still yields its fence id.
     resolve_actor_mount_plan_from_library(library, voltag.as_str(), &HashSet::new())?;

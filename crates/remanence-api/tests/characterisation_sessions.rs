@@ -2031,23 +2031,39 @@ async fn closeout_memory_refuses_before_any_drive_command_and_retry_survives_res
         fixture.config.tape_io.read_reservoir_bytes = 1024 * 1024;
         let client = fixture.start().await;
         let before = fixture.world.lock().unwrap().command_log.len();
-        let op = pb::catalog_client::CatalogClient::new(client.channel.clone())
-            .closeout_tape(request.clone())
-            .await
-            .unwrap()
-            .into_inner();
-        let mut watch = pb::daemon_client::DaemonClient::new(client.channel.clone())
-            .watch_operation(pb::GetOperationRequest {
-                operation_id: op.operation_id.clone(),
-            })
-            .await
-            .unwrap()
-            .into_inner();
-        let mut last = None;
-        while let Some(status) = watch.message().await.unwrap() {
-            last = Some(status);
-        }
-        let last = last.unwrap();
+        // B7 may already be servicing this exact tape after startup. Rejoin
+        // the same operator key once that bounded owner releases its claim.
+        let retry_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let (op, last) = loop {
+            let op = pb::catalog_client::CatalogClient::new(client.channel.clone())
+                .closeout_tape(request.clone())
+                .await
+                .unwrap()
+                .into_inner();
+            let mut watch = pb::daemon_client::DaemonClient::new(client.channel.clone())
+                .watch_operation(pb::GetOperationRequest {
+                    operation_id: op.operation_id.clone(),
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            let mut last = None;
+            while let Some(status) = watch.message().await.unwrap() {
+                last = Some(status);
+            }
+            let last = last.unwrap();
+            if last.state == pb::OperationState::Failed as i32
+                && last.error_summary == "tape is already mounted"
+            {
+                assert!(
+                    tokio::time::Instant::now() < retry_deadline,
+                    "maintenance owner must settle: {last:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+            break (op, last);
+        };
         if limited {
             assert_eq!(last.state, pb::OperationState::Failed as i32);
             assert!(last.error_summary.contains("CloseoutMemory:"), "{last:?}");
