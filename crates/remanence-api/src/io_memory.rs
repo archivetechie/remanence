@@ -19,6 +19,31 @@ pub(crate) struct IoMemoryReservation {
 }
 
 impl IoMemoryReservation {
+    /// Reserve the complete checked closeout working set before any media motion.
+    pub(crate) fn reserve_closeout(
+        self: &Arc<Self>,
+        scheme: &remanence_parity::ParityScheme,
+        block_size: u32,
+        extent_count: usize,
+        tape_uuid: [u8; 16],
+    ) -> Result<IoMemoryPermit, tonic::Status> {
+        let bytes = remanence_parity::closeout::EpochAccumulator::working_reservation_bytes(
+            scheme,
+            block_size,
+            extent_count as u64,
+        )
+        .map_err(|e| tonic::Status::internal(e.to_string()))?;
+        self.try_reserve_epoch(
+            bytes,
+            format!("tape {} closeout", uuid::Uuid::from_bytes(tape_uuid)),
+        )
+        .map_err(|available| {
+            tonic::Status::resource_exhausted(format!(
+                "CloseoutMemory: need {bytes} bytes, {available} available; closeout remains due."
+            ))
+        })
+    }
+
     pub(crate) fn new(ceiling: u64) -> Result<Arc<Self>, String> {
         if ceiling == 0 {
             return Err("daemon.io_memory_ceiling must be non-zero".to_string());

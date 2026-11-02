@@ -777,6 +777,15 @@ impl Fold {
                 if p.maps != 0 || p.components != 0 || p.directory_count != 0 {
                     return Err(Fault::Invalid("ordinary commit contains terminal rows"));
                 }
+                if p.objects > 0 && commit.session_id.is_none_or(|id| id == [0; 16]) {
+                    return Err(Fault::Invalid("Object commit requires session id"));
+                }
+                // Every ordinary commit belongs to the currently open owner,
+                // including groups without Objects. Terminal records instead
+                // belong to their accepted plan, checked in their own arms.
+                if commit.session_id != self.summary.open_session.as_ref().map(|o| o.session_id) {
+                    return Err(Fault::Invalid("commit for wrong session"));
+                }
                 check_commit(&mut p, &self.summary, commit)?;
                 p.state.last_ordinary_commit = Some(f.sequence);
                 p.state.last_ordinary_record = Some(commit.clone());
@@ -1153,17 +1162,6 @@ fn apply_row(p: &mut Pending, row: &TapeFileEntry, bot: bool) -> Result<(), Faul
 fn check_commit(p: &mut Pending, previous: &TapeSummary, c: &Committed) -> Result<(), Fault> {
     check_reference(p, &c.group)?;
     validate_time(&c.committed_at_utc)?;
-    if p.objects > 0 && c.session_id.is_none_or(|id| id == [0; 16]) {
-        return Err(Fault::Invalid("Object commit requires session id"));
-    }
-    if p.objects > 0
-        && previous
-            .open_session
-            .as_ref()
-            .is_none_or(|o| c.session_id != Some(o.session_id))
-    {
-        return Err(Fault::Invalid("commit for wrong session"));
-    }
     let s = &mut p.state;
     if s.is_fresh()
         || c.cursor != s.cursor
@@ -1201,7 +1199,10 @@ fn check_commit(p: &mut Pending, previous: &TapeSummary, c: &Committed) -> Resul
             return Err(Fault::Invalid("missing uncovered extents"));
         }
     }
-    if previous.seal_due.is_some() && c.seal_due.is_none() {
+    if c.seal_due == Some(TerminalFinalizationTrigger::OperatorCloseOut) {
+        return Err(Fault::Invalid("operator seal requires manual identity"));
+    }
+    if previous.seal_due.is_some() && c.seal_due != previous.seal_due {
         return Err(Fault::Invalid("lost TerminalFinalizationTrigger"));
     }
     s.check = c.check;
@@ -1248,8 +1249,7 @@ fn validate_plan(
     if prepared && plan.manual.is_none() {
         return Err(Fault::Invalid("automatic plan cannot be provisional"));
     }
-    // A matching durable seal reason authorizes automatic recovery, including
-    // OperatorCloseOut. New operator decisions still require manual identity.
+    // Operator decisions always require manual identity.
     if let Some(m) = &plan.manual {
         if plan.trigger != TerminalFinalizationTrigger::OperatorCloseOut
             || m.operation_id == [0; 16]
@@ -1262,9 +1262,7 @@ fn validate_plan(
         {
             return Err(Fault::Invalid("manual acceptance identity"));
         }
-    } else if plan.trigger == TerminalFinalizationTrigger::OperatorCloseOut
-        && s.seal_due != Some(plan.trigger)
-    {
+    } else if plan.trigger == TerminalFinalizationTrigger::OperatorCloseOut {
         return Err(Fault::Invalid("manual identity absent"));
     }
     if let Some(reason) = s.seal_due {

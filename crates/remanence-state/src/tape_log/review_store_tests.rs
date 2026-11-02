@@ -516,7 +516,9 @@ fn staged_data_sync_precedes_media_and_empty_stage_needs_no_data_sync() {
     let group = lease.prepare().unwrap();
     let staged = lease.stage(group).unwrap();
     assert!(faults.events.lock().unwrap().is_empty());
-    let c = Record::Committed(commit(staged.reference(0), 1, 2, 0));
+    let mut empty = commit(staged.reference(0), 1, 2, 0);
+    empty.session_id = None;
+    let c = Record::Committed(empty);
     staged.complete(&c).unwrap();
     assert_eq!(&faults.events.lock().unwrap()[..], &["append", "fsync"]);
 }

@@ -294,7 +294,6 @@ async fn open_write_session_reserved_for_caller(
         },
     }
 
-    pool.wait_pool_closeout(target.pool_id()).await;
     let pool_cfg = state.pool_config(target.pool_id())?;
     let index = CatalogIndex::open_read_only(state.index_path.as_ref())
         .map_err(|err| Status::internal(err.to_string()))?;
@@ -338,6 +337,9 @@ async fn open_write_session_reserved_for_caller(
             required_pool_id,
         } => {
             select_attempts = 1;
+            // A pinned request must reuse this tape's closing owner. Pool
+            // selection can choose another tape and needs no such wait.
+            pool.wait_tape_closeout(*tape_uuid).await;
             // Own the exact tape before consulting the exceptional post-C
             // admission path. Recovery in this runtime uses the same owner,
             // so it cannot finalize the tape between admission and preflight.
@@ -2623,6 +2625,7 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
                 failures.push(format!(
                     "session {session_id}: drive unavailable for shutdown checkpoint: {err}"
                 ));
+                pool.wait_tape_closeout(mounted.tape_uuid).await;
                 continue;
             }
         };
@@ -2640,6 +2643,7 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
             failures.push(format!(
                 "session {session_id}: drive actor unavailable for shutdown checkpoint"
             ));
+            pool.wait_tape_closeout(mounted.tape_uuid).await;
             continue;
         }
         match checkpoint_rx.await {
@@ -2656,6 +2660,7 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
                     failures.push(format!(
                         "session {session_id}: drive actor unavailable for shutdown close"
                     ));
+                    pool.wait_tape_closeout(mounted.tape_uuid).await;
                     continue;
                 }
                 match close_rx.await {
@@ -2681,10 +2686,11 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
                     failures.push(format!(
                         "session {session_id}: drive actor unavailable for shutdown read close"
                     ));
+                    pool.wait_tape_closeout(mounted.tape_uuid).await;
                     continue;
                 }
                 match received.await {
-                    Ok(Ok(_)) => finish_mounted_session(state, pool, session_id, mounted),
+                    Ok(Ok(_)) => finish_mounted_session(state, pool, session_id, mounted.clone()),
                     Ok(Err(err)) => failures.push(format!(
                         "session {session_id}: shutdown read close failed: {err}"
                     )),
@@ -2708,6 +2714,7 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
                 "session {session_id}: drive actor dropped shutdown checkpoint reply"
             )),
         }
+        pool.wait_tape_closeout(mounted.tape_uuid).await;
     }
     for drive_key in pool.drive_keys() {
         let remanence_state::DriveKey::Bay {
@@ -2722,6 +2729,11 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
             match pool.reserve_drive_for_shutdown(&drive_key) {
                 Ok(reservation) => break Some(reservation),
                 Err(err) => {
+                    if pool.drive_is_closing(&drive_key) {
+                        pool.wait_drive_closeout(&drive_key).await;
+                        reservation_wait_started = tokio::time::Instant::now();
+                        continue;
+                    }
                     if err.code() == tonic::Code::NotFound
                         || pool.sessions_by_drive().contains_key(&drive_key)
                     {
@@ -2757,6 +2769,9 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
     while pool.has_dismounts() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    // Parking releases the bay just before dropping its closing guard. Also
+    // settle that final ownership handoff before the daemon can exit.
+    pool.wait_closeouts().await;
     if failures.is_empty() {
         Ok(())
     } else {
@@ -2918,30 +2933,43 @@ async fn resolve_and_reserve_actor_mount(
 ) -> Result<(ActorMount, crate::write_owner::DriveReservation), Status> {
     const ATTEMPTS: usize = 2;
     for attempt in 0..ATTEMPTS {
-        pool.wait_library_closeouts(library_serial).await;
         let busy_bays = pool.busy_bays(library_serial);
-        let plan =
-            resolve_actor_mount(state, library_serial, tape_uuid, &busy_bays).map_err(|error| {
-                if error.code() == tonic::Code::FailedPrecondition
-                    && (error.message().contains("busy")
-                        || error.message().contains("no free drive"))
-                {
-                    let specific = busy_bays
-                        .iter()
-                        .copied()
-                        .find(|bay| error.message() == format!("drive bay 0x{bay:04x} is busy"));
-                    pool.append_holders(error, |key| {
-                        key.library_serial() == Some(library_serial)
-                            && specific.is_none_or(|bay| key.bay() == Some(bay))
-                    })
-                } else {
-                    error
-                }
-            })?;
+        let resolved = resolve_actor_mount(state, library_serial, tape_uuid, &busy_bays);
+        if resolved.as_ref().is_err_and(|error| {
+            error.code() == tonic::Code::FailedPrecondition
+                && (error.message().contains("busy") || error.message().contains("no free drive"))
+        }) && attempt + 1 < ATTEMPTS
+        {
+            let specific = resolved.as_ref().err().and_then(|error| {
+                busy_bays
+                    .iter()
+                    .copied()
+                    .find(|bay| error.message() == format!("drive bay 0x{bay:04x} is busy"))
+            });
+            pool.wait_busy_closeout(library_serial, specific).await;
+            continue;
+        }
+        let plan = resolved.map_err(|error| {
+            if error.code() == tonic::Code::FailedPrecondition
+                && (error.message().contains("busy") || error.message().contains("no free drive"))
+            {
+                let specific = busy_bays
+                    .iter()
+                    .copied()
+                    .find(|bay| error.message() == format!("drive bay 0x{bay:04x} is busy"));
+                pool.append_holders(error, |key| {
+                    key.library_serial() == Some(library_serial)
+                        && specific.is_none_or(|bay| key.bay() == Some(bay))
+                })
+            } else {
+                error
+            }
+        })?;
         let bay = match &plan {
             ActorMountPlan::Ready(mount) | ActorMountPlan::Evict { mount, .. } => mount.bay,
         };
         let drive_key = crate::drive_pool::DriveKey::new(library_serial.to_string(), bay);
+        pool.wait_drive_closeout(&drive_key).await;
         match pool.reserve_drive(&drive_key) {
             Ok(reservation) => match plan {
                 ActorMountPlan::Ready(mount) => {
@@ -3424,7 +3452,7 @@ pub(crate) async fn closeout_tape(
         .as_ref()
         .map(|pool| pool.reserve_tape(tape_uuid))
         .transpose()?;
-    {
+    let permit = {
         let index = state.index()?;
         let tape = index
             .get_tape(&tape_uuid)
@@ -3464,7 +3492,19 @@ pub(crate) async fn closeout_tape(
         {
             return Ok(());
         }
-    }
+        let summary = snapshot.tape_summary();
+        let scheme = summary
+            .scheme
+            .as_ref()
+            .ok_or_else(|| Status::internal("closeout lacks scheme"))?;
+        state.io_memory.reserve_closeout(
+            scheme,
+            summary.block_size,
+            summary.uncovered.len(),
+            tape_uuid,
+        )?
+    };
+    progress.reserved(permit.bytes());
     let pool = state.drive_pool()?.clone();
     let library_serial = resolve_tape_library_serial(state, &pool, &tape_uuid)?;
     let (mount, _drive) =
@@ -3479,23 +3519,27 @@ pub(crate) async fn closeout_tape(
         changer_move(&pool, &mount.library_serial, slot, mount.bay).await?;
     }
     let (reply, response) = oneshot::channel();
-    drive
-        .send(crate::write_owner::DriveCommand::CloseoutTape {
-            progress,
-            tape_uuid,
-            expected_pool,
-            needs_drive_load: mount.needs_drive_load,
-            library_serial: mount.library_serial.clone(),
-            barcode: mount.barcode.clone(),
-            source_slot: mount.source_slot,
-            drive_serial: mount.drive_serial.clone(),
-            reply,
-        })
-        .await
-        .map_err(|_| Status::unavailable("drive actor is unavailable"))?;
-    let result = response
-        .await
-        .map_err(|_| Status::unavailable("drive actor stopped during closeout"))?;
+    let result = async {
+        drive
+            .send(crate::write_owner::DriveCommand::CloseoutTape {
+                permit,
+                progress,
+                tape_uuid,
+                expected_pool,
+                needs_drive_load: mount.needs_drive_load,
+                library_serial: mount.library_serial.clone(),
+                barcode: mount.barcode.clone(),
+                source_slot: mount.source_slot,
+                drive_serial: mount.drive_serial.clone(),
+                reply,
+            })
+            .await
+            .map_err(|_| Status::unavailable("drive actor is unavailable"))?;
+        response
+            .await
+            .map_err(|_| Status::unavailable("drive actor stopped during closeout"))?
+    }
+    .await;
     if let Some(home_slot) = mount.home_slot {
         let parked = pool.park_cartridge(crate::write_owner::SeatedCartridge {
             bay: mount.bay,
@@ -3554,7 +3598,7 @@ pub(crate) async fn test_mount_for_write(
 
 /// Exercise the real idle timer and eviction removal entry points with model actors.
 #[cfg(test)]
-pub(crate) async fn test_remove_seated_epoch(
+pub(crate) async fn test_remove_seated_cartridge(
     state: &ApiState,
     path: &str,
     seated: crate::write_owner::SeatedCartridge,
@@ -4009,6 +4053,97 @@ mod tests {
             pool,
             drive_rxs,
             changer_rx,
+        }
+    }
+
+    /// An unrelated post-reply owner never blocks an idle drive in the same pool/library.
+    #[tokio::test]
+    async fn unrelated_closing_drive_allows_read_and_same_pool_write_open() {
+        for write in [false, true] {
+            let mut harness = three_bay_two_pool_harness(
+                vec![
+                    drive_bay(0x0101, true, Some("FTA001L9")),
+                    drive_bay(0x0102, true, Some("FTB001L9")),
+                    drive_bay(0x0103, false, None),
+                ],
+                vec![],
+            );
+            harness
+                .state
+                .index_write()
+                .unwrap()
+                .project_tape_pool_membership(POOL_TAPE_B, POOL_A)
+                .unwrap();
+            let key = crate::drive_pool::DriveKey::new("LIB001", 0x0101);
+            let _reservation = harness.pool.reserve_drive(&key).unwrap();
+            harness.pool.record_session(
+                Uuid::new_v4(),
+                crate::write_owner::MountedSession {
+                    bay: 0x0101,
+                    library_serial: "LIB001".into(),
+                    barcode: Some("FTA001L9".into()),
+                    home_slot: None,
+                    tape_uuid: POOL_TAPE_A,
+                    drive_uuid: None,
+                },
+            );
+            let closing = harness.pool.test_begin_closing(POOL_TAPE_A, key);
+            let state = harness.state.clone();
+            let task = tokio::spawn(async move {
+                if write {
+                    open_write_session(
+                        remanence_state::AuditActor::System,
+                        &state,
+                        WriteSessionTarget::Pool {
+                            pool_id: POOL_A.into(),
+                        },
+                        None,
+                    )
+                    .await
+                    .map(|_| ())
+                } else {
+                    open_read_session(
+                        &state,
+                        ReadSessionTarget::Tape {
+                            tape_uuid: POOL_TAPE_B,
+                        },
+                        None,
+                    )
+                    .await
+                    .map(|_| ())
+                }
+            });
+            let command = tokio::time::timeout(
+                Duration::from_secs(2),
+                harness.drive_rxs.get_mut(&0x0102).unwrap().recv(),
+            )
+            .await
+            .expect("idle drive proceeds while closing guard remains held")
+            .unwrap();
+            match command {
+                crate::write_owner::DriveCommand::OpenWrite {
+                    reply, selected, ..
+                } => {
+                    assert!(write);
+                    assert_eq!(selected.tape_uuid, POOL_TAPE_B);
+                    reply.send(write_session_reply(Uuid::new_v4())).unwrap();
+                }
+                crate::write_owner::DriveCommand::OpenRead { reply, .. } => {
+                    assert!(!write);
+                    reply
+                        .send(Ok(pb::ReadSession {
+                            session_id: Uuid::new_v4().as_bytes().to_vec(),
+                            ..Default::default()
+                        }))
+                        .unwrap();
+                }
+                _ => panic!("open command"),
+            }
+            task.await.unwrap().unwrap();
+            assert!(harness
+                .pool
+                .drive_is_closing(&crate::drive_pool::DriveKey::new("LIB001", 0x0101)));
+            drop(closing);
         }
     }
 

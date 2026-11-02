@@ -616,7 +616,8 @@ fn initialized_closes_before_first_object_group() {
         (2, 1, 0, 0)
     );
     assert_eq!(s.last_media_commit, Some(1));
-    let c = commit(log.reference(), 1, 2, 0);
+    let mut c = commit(log.reference(), 1, 2, 0);
+    c.session_id = None;
     log.push(Record::Committed(c), &[]);
     let s = log.summary();
     assert!(!s.is_fresh());
@@ -1122,9 +1123,9 @@ fn manual_plan(reference: GroupRef) -> FinalizationPlan {
     p
 }
 
-/// Automatic operator recovery requires an exact, previously committed obligation.
+/// Operator recovery always requires a manual acceptance identity.
 #[test]
-fn operator_plan_without_manual_identity_requires_durable_operator_seal_due() {
+fn operator_plan_without_manual_identity_is_refused() {
     for due in [
         None,
         Some(TerminalFinalizationTrigger::HardwareEarlyWarning),
@@ -1514,7 +1515,7 @@ fn range_age_advances_to_commit_that_exposed_remaining_bytes() {
     assert_eq!(s.provenance, CheckProvenance::OriginalWrite);
 }
 #[test]
-fn seal_due_reason_can_change_but_cannot_clear_or_admit_new_object() {
+fn seal_due_reason_cannot_change_clear_or_admit_new_object() {
     for (first, next) in [
         (
             TerminalFinalizationTrigger::HardwareEarlyWarning,
@@ -1529,11 +1530,16 @@ fn seal_due_reason_can_change_but_cannot_clear_or_admit_new_object() {
         let mut c = commit(log.reference(), 2, 6, 1);
         c.seal_due = Some(first);
         log.push(Record::Committed(c), &[]);
+        let boundary = log.bytes.len();
         let mut c = commit(log.reference(), 2, 6, 1);
         c.seal_due = Some(next);
         log.push(Record::Committed(c), &[]);
-        assert_eq!(log.summary().seal_due, Some(next));
-        let boundary = log.bytes.len();
+        assert_eq!(
+            fault(fold::classify(&log.bytes).unwrap_err()),
+            Fault::Invalid("lost TerminalFinalizationTrigger")
+        );
+        log.bytes.truncate(boundary);
+        log.seq -= 1;
         log.push(Record::Committed(commit(log.reference(), 2, 6, 1)), &[]);
         assert_eq!(
             fault(fold::classify(&log.bytes).unwrap_err()),

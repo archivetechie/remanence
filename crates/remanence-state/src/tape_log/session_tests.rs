@@ -387,7 +387,14 @@ fn object_commits_require_session_identity_and_typed_triggers_roundtrip() {
         wire::encode(&record, &mut bytes).unwrap();
         assert_eq!(wire::decode(Tag::Committed, &bytes).unwrap(), record);
         log.push(record, &[]);
-        assert_eq!(log.summary().seal_due, Some(trigger));
+        if trigger == TerminalFinalizationTrigger::OperatorCloseOut {
+            assert_eq!(
+                fault(fold::replay(&log.bytes[..]).unwrap_err()),
+                Fault::Invalid("operator seal requires manual identity")
+            );
+        } else {
+            assert_eq!(log.summary().seal_due, Some(trigger));
+        }
     }
 }
 
@@ -445,10 +452,38 @@ fn torn_prefix_wire_and_crash_only_final_geometry() {
             SessionEndReason::CrashRecovered
         };
         log.push(Record::SessionEnded(end), &[]);
-        assert_eq!(
-            fold::replay(log.bytes.as_slice()).is_ok(),
-            mutation == 0,
-            "mutation {mutation}"
-        );
+        let result = fold::replay(log.bytes.as_slice());
+        if mutation == 0 {
+            result.unwrap();
+        } else {
+            assert_eq!(
+                fault(result.unwrap_err()),
+                Fault::Invalid(match mutation {
+                    1..=3 => "crash torn-prefix shape",
+                    4 => "tail order/group",
+                    5 => "session end transition",
+                    _ => unreachable!(),
+                })
+            );
+        }
+    }
+}
+
+/// A stale actor cannot publish even an Object-free ordinary barrier.
+#[test]
+fn object_free_commits_require_current_session_membership() {
+    for id in [None, Some([0; 16]), Some([8; 16]), Some([9; 16])] {
+        let mut log = session(false);
+        let mut c = commit(log.reference(), 1, 2, 0);
+        c.session_id = id;
+        log.push(Record::Committed(c), &[]);
+        if id == Some([9; 16]) {
+            log.summary();
+        } else {
+            assert_eq!(
+                fault(fold::replay(&log.bytes[..]).unwrap_err()),
+                Fault::Invalid("commit for wrong session")
+            );
+        }
     }
 }

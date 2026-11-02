@@ -23463,7 +23463,7 @@ tape_catalog_dir = "{0}/cache/tapes"
             None,
         );
         assert_eq!(code, ExitCode::SUCCESS, "inspect: {err}");
-        assert!(out.contains("\"through_sequence\":\"7\""), "{out}");
+        assert!(out.contains("\"through_sequence\":\"8\""), "{out}");
         assert_eq!(state_tree(root.path()), before, "inspect creates nothing");
 
         stop.send(()).unwrap();

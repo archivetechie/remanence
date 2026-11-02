@@ -5,13 +5,12 @@ use remanence_state::{ProvisionTapeInput, TapeAuthority, TerminalIndexSource};
 
 #[test]
 /// Durable typed reasons survive automatic planning and the native plan validator.
-fn automatic_terminal_plan_preserves_all_five_durable_seal_reasons() {
+fn automatic_terminal_plan_preserves_non_operator_seal_reasons() {
     use remanence_state::TerminalFinalizationTrigger as Trigger;
 
     for trigger in [
         Trigger::ReachedLowWatermark,
         Trigger::HardwareEarlyWarning,
-        Trigger::OperatorCloseOut,
         Trigger::PoolCloseOut,
         Trigger::NoPendingObjectFits,
     ] {

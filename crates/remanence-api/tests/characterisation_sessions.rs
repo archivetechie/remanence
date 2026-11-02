@@ -445,7 +445,7 @@ fn assert_session_closed(fixture: &Harness, session_id: &[u8]) {
 /// A graceful stop checkpoints pending data without motion; a fresh owner proves
 /// the seated tape and rebuilds its partial epoch before accepting another write.
 #[tokio::test]
-async fn graceful_shutdown_restart_proves_seated_open_epoch_and_idle_unloads() {
+async fn graceful_shutdown_restart_proves_closed_session_and_idle_unloads() {
     for other_drive in [false, true] {
         check_graceful_shutdown_restart(other_drive).await;
     }

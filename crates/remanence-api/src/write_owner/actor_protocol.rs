@@ -93,6 +93,7 @@ pub(crate) enum ChangerCommand {
 
 pub(crate) enum DriveCommand {
     CloseoutTape {
+        permit: crate::io_memory::IoMemoryPermit,
         progress: crate::closeout_progress::CloseoutProgress,
         tape_uuid: [u8; 16],
         expected_pool: Option<String>,

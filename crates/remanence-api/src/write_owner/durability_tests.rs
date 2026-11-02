@@ -7,6 +7,9 @@ mod acceptance_finalization;
 #[path = "ingress_deadline_media_tests.rs"]
 mod ingress_deadline_media_tests;
 
+#[path = "b6b_fix_tests.rs"]
+mod b6b_fix_tests;
+
 #[path = "host_record_tests.rs"]
 mod host_record_tests;
 
@@ -361,21 +364,37 @@ async fn open_writer(
 /// Select fixture geometry without changing the normal durability scenario.
 async fn open_writer_with_selection(
     root: &Path,
-    mut library: remanence_library::LibraryHandle,
+    library: remanence_library::LibraryHandle,
     selection: SelectedTape,
 ) -> (
     mpsc::Sender<DriveCommand>,
     Result<Uuid, Status>,
     std::thread::JoinHandle<()>,
 ) {
-    let cfg = config(root, &library);
+    open_writer_configured(root, library, selection, |_, _| {}).await
+}
+
+/// Configure one isolated actor before its native session is opened.
+async fn open_writer_configured(
+    root: &Path,
+    mut library: remanence_library::LibraryHandle,
+    selection: SelectedTape,
+    configure: impl FnOnce(&mut WriteOwnerConfig, &mut TapePoolConfig),
+) -> (
+    mpsc::Sender<DriveCommand>,
+    Result<Uuid, Status>,
+    std::thread::JoinHandle<()>,
+) {
+    let mut cfg = config(root, &library);
+    let mut pool_cfg = pool();
+    configure(&mut cfg, &mut pool_cfg);
     let mut drive = library.open_drive(BAY, &cfg.policy).unwrap();
     let (tx, mut rx) = mpsc::channel(16);
     let actor_tx = tx.clone();
     let (reply, received) = oneshot::channel();
     let request = super::super::actor_runtime::OpenWriteActorRequest {
         actor: AuditActor::System,
-        pool_cfg: pool(),
+        pool_cfg,
         selected: selection,
         target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
         needs_drive_load: false,

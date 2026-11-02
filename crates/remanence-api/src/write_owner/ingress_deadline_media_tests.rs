@@ -7,9 +7,9 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 /// Notify the test only after the body has passed spool/ring backpressure.
-struct StalledBody {
-    messages: VecDeque<Result<pb::AppendObjectMessage, Status>>,
-    waiting: Option<oneshot::Sender<()>>,
+pub(super) struct StalledBody {
+    pub(super) messages: VecDeque<Result<pb::AppendObjectMessage, Status>>,
+    pub(super) waiting: Option<oneshot::Sender<()>>,
 }
 
 impl tokio_stream::Stream for StalledBody {
