@@ -51,12 +51,16 @@ impl Drop for IngressOwnerGuard {
 struct OverlapReceiveGuard {
     task: tokio::task::AbortHandle,
     control: Arc<AppendRingControl>,
+    #[cfg(feature = "field-kit")]
+    session_id: Uuid,
     armed: bool,
 }
 impl Drop for OverlapReceiveGuard {
     fn drop(&mut self) {
         if self.armed {
             self.control.fail("client disconnected during append");
+            #[cfg(feature = "field-kit")]
+            crate::write_owner::field_gate::stream_cancelled(self.session_id);
             self.task.abort();
         }
     }
@@ -600,6 +604,8 @@ impl WriteSessionApi {
         let mut receive_guard = OverlapReceiveGuard {
             task: receive_task.abort_handle(),
             control: control.clone(),
+            #[cfg(feature = "field-kit")]
+            session_id,
             armed: true,
         };
         let result = async {

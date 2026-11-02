@@ -168,7 +168,21 @@ impl WorkList {
             self.wake_tape(tape);
         }
     }
-    /// Explicit operator robotics/refresh wakes only work in that library.
+    #[cfg(test)]
+    pub(crate) fn park_for_test(&self, library: &str) {
+        let key = ([0xa1; 16], 1);
+        self.observe(key, true);
+        self.entries.lock().unwrap().get_mut(&key).unwrap().library = library.into();
+        self.failed(
+            key,
+            &RetryCause::Operator.attach(Status::failed_precondition("write protected")),
+        );
+    }
+    #[cfg(test)]
+    pub(crate) fn parked_for_test(&self) -> bool {
+        self.entries.lock().unwrap().values().all(|r| r.parked)
+    }
+    /// Explicit operator motion wakes only work in that library.
     pub(crate) fn wake_library(&self, library: &str) {
         let tapes: Vec<_> = self
             .entries
@@ -250,7 +264,6 @@ impl RetryCause {
         match error {
             TapeIoError::WriteProtected
             | TapeIoError::DataProtect(_)
-            | TapeIoError::IdentityInvalidated { .. }
             | TapeIoError::MultiPartitionMedium { .. } => Self::Operator,
             _ => Self::Transient,
         }
@@ -367,6 +380,11 @@ fn debt(
 }
 impl ApiState {
     pub(crate) fn tape_with_debt(&self, mut tape: pb::Tape) -> Result<pb::Tape, Status> {
+        // Retired catalog rows outlive their removed native logs. They have no
+        // live debt and must not turn a successful inventory into a CLI error.
+        if tape.state == pb::tape::State::TapeStateRetired as i32 {
+            return Ok(tape);
+        }
         let uuid = crate::catalog_conversion::decode_uuid_bytes(&tape.tape_uuid, "tape_uuid")?;
         let s = summary(self, uuid)?;
         // A missing log is legitimate only before the first native publication.
@@ -927,6 +945,12 @@ mod fix_tests {
             );
             assert!(!transient(&status));
         }
+        assert!(transient(&status_from_pool_write_error(
+            crate::PoolWriteError::TapeIo(TapeIoError::IdentityInvalidated {
+                proved: 1,
+                current: 2
+            })
+        )));
         let fence = crate::status_from_state_error(remanence_state::StateError::from(
             remanence_state::tape_log::store::StoreError::Fenced,
         ));

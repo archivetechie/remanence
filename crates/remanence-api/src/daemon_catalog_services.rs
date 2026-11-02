@@ -593,7 +593,7 @@ impl pb::catalog_server::Catalog for CatalogService {
         )
         .await?;
         let response = match result {
-            crate::write_owner::ManualFinalizeTapeResult::Busy => pb::TapeFinalization {
+            crate::write_owner::ManualFinalizeTapeResult::Busy { operation_id } => pb::TapeFinalization {
                 tape_uuid: tape_uuid.to_vec(),
                 operation_id: None,
                 progress: pb::TapeFinalizationProgress::Unspecified as i32,
@@ -604,8 +604,10 @@ impl pb::catalog_server::Catalog for CatalogService {
                 layout_digest: None,
                 outcome: pb::TapeFinalizationOutcome::Busy as i32,
                 trigger: "operator_close_out".to_string(),
-                detail: "tape has an in-flight owner; no state or media motion occurred"
-                    .to_string(),
+                detail: operation_id.map_or_else(
+                    || "tape has an in-flight owner; no state or media motion occurred".to_string(),
+                    |id| format!("tape is finalizing; watch operation {id}; no state or media motion occurred"),
+                ),
             },
             crate::write_owner::ManualFinalizeTapeResult::Accepted(reply) => {
                 tape_finalization_to_proto(tape_uuid, Some(reply.operation_id), reply.projection)

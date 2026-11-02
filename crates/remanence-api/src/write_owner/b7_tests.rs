@@ -793,7 +793,7 @@ async fn b7_fix_pinned_closeout_and_finalize_wait_for_worker() {
                     )
                     .await
                     .and_then(|result| match result {
-                        ManualFinalizeTapeResult::Busy => {
+                        ManualFinalizeTapeResult::Busy { .. } => {
                             Err(Status::failed_precondition("unexpected Busy"))
                         }
                         _ => Ok(()),
@@ -1108,21 +1108,6 @@ async fn b7_fix2_finalizing_worker_refuses_pinned_read_closeout_and_finalize() {
                 }))
                 .await
                 .unwrap_err(),
-            crate::mount::manual_finalize_tape(
-                &state,
-                crate::mount::ManualFinalizeTapeAdmission {
-                    candidate_operation_id: Uuid::new_v4(),
-                    actor: AuditActor::System,
-                    actor_fingerprint: "test".into(),
-                    idempotency_key: Uuid::new_v4(),
-                    request_fingerprint: [7; 32],
-                    tape_uuid: TAPE,
-                    expected_pool_id: Some(POOL.into()),
-                    reason: "operator".into(),
-                },
-            )
-            .await
-            .unwrap_err(),
         ]
     })
     .await
@@ -1134,6 +1119,47 @@ async fn b7_fix2_finalizing_worker_refuses_pinned_read_closeout_and_finalize() {
         );
         assert!(error.message().contains(&operation.to_string()));
     }
+    let result = tokio::time::timeout(StdDuration::from_secs(1), async {
+        crate::mount::manual_finalize_tape(
+            &state,
+            crate::mount::ManualFinalizeTapeAdmission {
+                candidate_operation_id: Uuid::new_v4(),
+                actor: AuditActor::System,
+                actor_fingerprint: "test".into(),
+                idempotency_key: Uuid::new_v4(),
+                request_fingerprint: [7; 32],
+                tape_uuid: TAPE,
+                expected_pool_id: Some(POOL.into()),
+                reason: "operator".into(),
+            },
+        )
+        .await
+        .unwrap()
+    })
+    .await
+    .expect("finalize admission is prompt");
+    assert_eq!(
+        result,
+        ManualFinalizeTapeResult::Busy {
+            operation_id: Some(operation)
+        }
+    );
+    let rpc = state
+        .catalog_service()
+        .finalize_tape(tonic::Request::new(pb::FinalizeTapeRequest {
+            tape_uuid: TAPE.to_vec(),
+            expected_pool_id: Some(POOL.into()),
+            reason: "operator".into(),
+            idempotency_key: Some(pb::IdempotencyKey {
+                value: Uuid::new_v4().as_bytes().to_vec(),
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(rpc.outcome, pb::TapeFinalizationOutcome::Busy as i32);
+    assert!(rpc.operation_id.is_none()); // The proto reserves this for accepted work.
+    assert!(rpc.detail.contains(&operation.to_string()));
     assert!(drive_rx.try_recv().is_err());
     assert!(changer_rx.try_recv().is_err());
 }
@@ -1365,4 +1391,174 @@ async fn b7_fix2_worker_motion_does_not_wake_parked_media_failure() {
         "own load wake must not survive as another retry"
     );
     state.readiness_shutdown.store(true, Ordering::SeqCst);
+}
+
+/// A completed same-key closeout replays even while a later finalization owns tape.
+#[tokio::test]
+async fn b8_closeout_replay_precedes_finalizing_busy() {
+    let root = tempfile::tempdir().unwrap();
+    due_tape(root.path()).await;
+    let mut state = state(root.path());
+    let request = pb::CloseoutTapeRequest {
+        tape_uuid: TAPE.to_vec(),
+        expected_pool_id: Some(POOL.into()),
+        idempotency_key: Some(pb::IdempotencyKey {
+            value: Uuid::new_v4().as_bytes().to_vec(),
+        }),
+    };
+    let original =
+        crate::tape_closeout::start(&state, AuditActor::System, request.clone()).unwrap();
+    let id = Uuid::from_slice(&original.operation_id).unwrap();
+    // Let the original attempt finish (this state intentionally has no drive).
+    tokio::time::timeout(StdDuration::from_secs(2), async {
+        while state.operations.is_live(&id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    state
+        .operations
+        .register(id, "tape_closeout")
+        .publish_state(pb::OperationState::Succeeded, &[]);
+    let (changer, _rx) = mpsc::channel(1);
+    let pool =
+        DrivePool::new_for_library(LIBRARY, changer, HashMap::new(), Arc::new(HashMap::new()));
+    let (hold, _reservation) = pool.reserve_worker_tape(TAPE).unwrap();
+    hold.finalizing(Uuid::new_v4());
+    state.drive_pool = Some(pool);
+    assert_eq!(
+        crate::tape_closeout::start(&state, AuditActor::System, request.clone()).unwrap(),
+        original
+    );
+    crate::audit_projection::append_operation_audit(
+        &mut state.index_write().unwrap(),
+        state.audit_dir.as_ref(),
+        true,
+        &state.audit_append_lock,
+        crate::audit_projection::OperationAuditInput {
+            actor: AuditActor::System,
+            operation_id: id,
+            operation_kind: "tape_closeout",
+            event: remanence_state::AuditEvent::OperationFinished,
+            subject_kind: "tape",
+            subject_id: Some(Uuid::from_bytes(TAPE).to_string()),
+            idempotency_key: Some(
+                Uuid::from_slice(&request.idempotency_key.as_ref().unwrap().value).unwrap(),
+            ),
+            detail: Default::default(),
+        },
+    )
+    .unwrap();
+    state.operations = Default::default();
+    assert_eq!(
+        crate::tape_closeout::start(&state, AuditActor::System, request).unwrap(),
+        original
+    );
+}
+
+/// Run the real field hook against the model transport in an isolated process:
+/// the seed receipt survives and a post-dispatch failure cannot commit the tail.
+#[cfg(feature = "field-kit")]
+#[tokio::test]
+async fn b8_field_failure_is_after_real_model_dispatch() {
+    const CHILD: &str = "REM_B8_MODEL_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "write_owner::tests::durability_tests::b7_tests::b8_field_failure_is_after_real_model_dispatch", "--nocapture"])
+            .env(CHILD, "1").status().unwrap();
+        assert!(status.success());
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let gate = root.path().join("gate");
+    std::fs::create_dir(&gate).unwrap();
+    std::env::set_var("REM_FIELD_GATE_DIR", &gate);
+    std::env::set_var("REM_FIELD_TRACE", root.path().join("commands.jsonl"));
+    std::env::set_var("REM_FIELD_PROGRESS", root.path().join("progress.jsonl"));
+    std::env::set_var("REM_CHAOS_ENABLED", "1");
+    std::env::set_var("REM_CHAOS_ALLOW_REAL", "1");
+    let world = setup(root.path());
+    let (tx, opened, thread) = open_writer_configured(
+        root.path(),
+        open_model_library(world.clone()),
+        selected(),
+        |_, _| {},
+    )
+    .await;
+    let id = opened.unwrap();
+    append_actor_test_file(
+        &tx,
+        id,
+        root.path().join("seed"),
+        "seed",
+        "seed",
+        b"retained",
+    )
+    .await;
+    let (reply, rx) = oneshot::channel();
+    tx.send(DriveCommand::Checkpoint {
+        session_id: id,
+        trigger: CheckpointTrigger::Explicit,
+        expected_batch_id: None,
+        reply: Some(reply),
+    })
+    .await
+    .unwrap();
+    rx.await.unwrap().unwrap();
+    let before = summary(&state(root.path()), TAPE).unwrap();
+    assert!(before.protected < before.total);
+    std::fs::write(gate.join("arm.json"),serde_json::json!({"schema":"rem.field.arm.v1", "tape_uuid":Uuid::from_bytes(TAPE).to_string(),"barcode":"AOX032L9","action":"fail","nonce":Uuid::new_v4().to_string()}).to_string()).unwrap();
+    let release = std::thread::spawn({
+        let gate = gate.clone();
+        move || {
+            let start = std::time::Instant::now();
+            while !gate.join("dispatch.json").exists() {
+                assert!(
+                    start.elapsed() < StdDuration::from_secs(5),
+                    "no real WRITE completion"
+                );
+                std::thread::sleep(StdDuration::from_millis(10));
+            }
+            let proof: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(gate.join("dispatch.json")).unwrap())
+                    .unwrap();
+            assert!(proof["bytes_completed"].as_u64().unwrap() > 0);
+            assert_eq!(proof["committed"], false);
+            std::fs::write(gate.join("release"), b"fail").unwrap();
+        }
+    });
+    let result = append_actor_test_file_result(
+        &tx,
+        id,
+        root.path().join("abandoned"),
+        "abandoned",
+        "abandoned",
+        &vec![2; BLOCK as usize * 2],
+    )
+    .await;
+    assert!(result.is_err(), "injected append returned a receipt");
+    release.join().unwrap();
+    drop(tx);
+    thread.join().unwrap();
+    let after = summary(&state(root.path()), TAPE).unwrap();
+    assert_eq!(after.total, before.total);
+    assert_eq!(after.object_count, 1);
+    assert!(after.last_session_end.unwrap().tail_file_count > 0);
+    assert!(
+        after.protected < after.total,
+        "dispatch failure leaves explicit closeout debt"
+    );
+    let (tx, opened, thread) = open_writer(root.path(), open_model_library(world)).await;
+    let id = opened.expect("named failed-append tail must recover without acknowledgement");
+    let recovered = summary(&state(root.path()), TAPE).unwrap();
+    assert_eq!(recovered.protected, recovered.total);
+    assert_eq!(recovered.total, before.total);
+    let stages = std::fs::read_to_string(root.path().join("host-stages.jsonl")).unwrap();
+    assert!(stages.contains("checksum"));
+    assert!(stages.contains("native_publication_fsync"));
+    let proof: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(gate.join("dispatch.json")).unwrap()).unwrap();
+    assert!(proof["trace_offset"].as_u64().unwrap() > 0);
+    close_writer(&tx, id, thread).await;
 }

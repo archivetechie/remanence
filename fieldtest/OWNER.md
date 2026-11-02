@@ -105,3 +105,44 @@ back from your own account. Send its sha256 with it.
 - `rm -rf /opt/remfield`
 - `setfacl -x u:remfield /dev/sgN ...`
 - Restart Miria and rescan its devices, as at the end of any window.
+
+### Session epoch field leg A (MSL3040, LL01 LTO-9)
+
+Use a committed **field-kit** package for migration step 3. Dry packages refuse
+hardware use. This plan destroys and reinitializes AOX032L9, AOX036L9, AOX038L9
+and AOX058L9 with default parity, then checks kill, stream abort and failed
+append closeout. It also measures a near-full epoch and a live-close control.
+Use dedicated schema-24/v2 kit state containing only these scratch identities.
+Keep other clients idle. The old catalog and re-init results enter the evidence.
+
+Before running, write a dated, signed text file containing the exact statement
+`Miria has no drive access and will issue no moves`, the serial
+`DEC418146K_LL01`, and today's date (`YYYY-MM-DD`). Confirm that Miria's drive
+access and changer moves really are disabled for this window. The package's
+capability binaries must be root-owned and unwritable by the kit user.
+
+As the kit user, with the four-barcode allowlist already recorded:
+
+```bash
+export FIELD_MIRIA_ATTESTATION="$HOME/miria-exclusion.txt"
+export FIELD_SESSION_EPOCH_ARM=session-epoch-a
+export REM_CHAOS_ENABLED=1 REM_CHAOS_ALLOW_REAL=1
+/opt/remfield/current/run.sh plan/session-epoch-a.env
+```
+
+The chaos variables explicitly arm the one-shot failed-append test in the
+separately compiled field binary. They do not select an epoch policy. Ordinary
+production builds have no field dispatch hook. Each fault requires a durable
+prefix receipt in an open session, then a completed data WRITE for a second
+object whose Finish has been withheld. SIGKILL targets the verified daemon PID.
+The restart closes out that exact UUID. No unexpected complete tail is approved.
+
+Expect several long reads and sidecar writes, especially for the near-full
+(default approximately 16 GiB) epoch. There is no one-minute pass threshold.
+`rem top` shows closeout debt and its retry reason while work proceeds.
+Stop with Ctrl-C or TERM to `run.sh`. Teardown releases any test hold, cancels
+the stream, attempts Abort, returns allowlisted cartridges, stops the daemon
+and packs evidence. Do not manually unload a busy drive. If a shutdown deadline
+expires, retain the crash evidence and inspect the reported state before reuse.
+The service-manager stop timeout must exceed the 300-second default close
+deadline plus a margin; the kit stop path supplies its own bounded wait.

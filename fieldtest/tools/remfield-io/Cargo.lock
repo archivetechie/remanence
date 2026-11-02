@@ -1926,6 +1926,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "remanence-api",
+ "remanence-state",
  "serde",
  "serde_json",
  "sha2",

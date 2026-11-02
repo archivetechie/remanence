@@ -915,10 +915,9 @@ async fn manual_finalize_tape_critical(
                     reply,
                 ));
             }
-            if crate::drive_pool::TapeBusy::from_status(&error).is_some() {
-                return Err(error);
-            }
-            return Ok(crate::write_owner::ManualFinalizeTapeResult::Busy);
+            return Ok(crate::write_owner::ManualFinalizeTapeResult::Busy {
+                operation_id: crate::drive_pool::TapeBusy::from_status(&error).map(|busy| busy.0),
+            });
         }
         Err(error) => return Err(error),
     };
@@ -1353,7 +1352,16 @@ pub(crate) async fn service_closeout_obligation(
         } else {
             recover_automatic_terminal_tape(state, &pool, tape_reservation, tape_uuid).await
         };
-        if let Some(handle) = terminal_handle {
+        // Manual recovery publishes its terminal state itself. Early recovery
+        // refusals and automatic recovery still need this outer publication.
+        if let Some(handle) = terminal_handle.filter(|_| {
+            state.operations.is_live(
+                &intent
+                    .as_ref()
+                    .and_then(|i| i.manual.as_ref())
+                    .map_or_else(Uuid::nil, |m| Uuid::from_bytes(m.operation_id)),
+            ) || intent.as_ref().is_none_or(|i| i.manual.is_none())
+        }) {
             match &result {
                 Ok(()) => {
                     handle.publish_state(pb::OperationState::Succeeded, &[("phase", "complete")])
@@ -5479,7 +5487,10 @@ mod tests {
         .await
         .expect("busy is a typed result");
 
-        assert_eq!(result, crate::write_owner::ManualFinalizeTapeResult::Busy);
+        assert_eq!(
+            result,
+            crate::write_owner::ManualFinalizeTapeResult::Busy { operation_id: None }
+        );
         assert!(
             drive_rx.try_recv().is_err(),
             "busy must issue no drive command"
@@ -6552,6 +6563,34 @@ mod tests {
             "loaded-tape tail moved media"
         );
         drop(reply);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while pool.mounted_tape_uuids().contains(&tape_uuid) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        use tokio_stream::StreamExt;
+        let mut watch = state.operations.watch(&accepted.operation_id).unwrap();
+        let mut terminal = 0;
+        while let Some(status) = watch.next().await {
+            let status = status.unwrap();
+            if status.state == pb::OperationState::Failed as i32
+                || status.state == pb::OperationState::Succeeded as i32
+            {
+                terminal += 1;
+            }
+        }
+        assert_eq!(
+            terminal, 1,
+            "resumed finalization publishes its ending once"
+        );
+        assert_eq!(
+            state
+                .operations
+                .terminal_publications_for_test(&accepted.operation_id),
+            1
+        );
     }
 
     #[tokio::test]

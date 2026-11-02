@@ -1657,6 +1657,8 @@ pub(super) fn write_closeout(
                 "shutdown close deadline expired before closeout publication",
             ));
         }
+        #[cfg(feature = "field-kit")]
+        let publication_started = std::time::Instant::now();
         lease
             .publish_closed_out(
                 *progress.id.as_bytes(),
@@ -1665,6 +1667,13 @@ pub(super) fn write_closeout(
                 super::restore::now_rfc3339().map_err(|e| Status::internal(e.to_string()))?,
             )
             .map_err(crate::status_from_state_error)?;
+        #[cfg(feature = "field-kit")]
+        remanence_library::field_trace::stage(
+            "native_publication_fsync",
+            selected.tape_uuid,
+            encoded.header.epoch_id,
+            publication_started.elapsed(),
+        );
         let cursor = publication
             .cursor
             .ok_or_else(|| Status::internal("closeout lacks cursor"))?;

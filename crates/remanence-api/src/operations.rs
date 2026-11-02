@@ -138,6 +138,18 @@ impl OperationRegistry {
     }
 
     #[cfg(test)]
+    pub(crate) fn terminal_publications_for_test(&self, id: &Uuid) -> usize {
+        self.ops
+            .lock()
+            .unwrap()
+            .get(id)
+            .unwrap()
+            .ring
+            .iter()
+            .filter(|s| is_terminal(s))
+            .count()
+    }
+    #[cfg(test)]
     fn len_for_tests(&self) -> usize {
         self.ops.lock().expect("ops lock").len()
     }

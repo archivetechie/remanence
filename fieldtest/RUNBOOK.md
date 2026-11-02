@@ -513,3 +513,56 @@ on. A refused unsafe operation is a PASS.
 | `FIELD_BUSY_WAIT_S` | `600` | how long `remfield-io` keeps re-trying a session open that a busy drive bay refused, and how long `22-bench-dual.sh` waits for idle bays before its fixture write |
 | `FIELD_BUSY_RETRY_INTERVAL_S` | `5` | seconds between those attempts |
 | `FIELD_ALLOW_LOW_MEMLOCK` | `0` | `1` lets `03-bringup.sh` start the daemon although the locked-memory limit it would inherit is below 1 GiB and not unlimited; for a deliberate low-memory test only |
+
+## Migration step 3: session epoch leg A
+
+Run `run.sh plan/session-epoch-a.env` using OWNER.md's written Miria exclusion,
+capability custody and explicit field/chaos arming. The plan verifies the exact
+four AOX barcodes, discovers LL01, starts the scoped daemon, checks readiness,
+stops it for retirement/re-init with default parity and pool assignment, and
+restarts it before the three fault legs. It then measures the near-full range
+and live control, restores every committed prefix again, exports the actual
+variable-READ filemark/EOD sense vectors, and collects evidence.
+
+`41-session-closeout.sh MODE --barcode BARCODE` supports `kill-mid-write`,
+`abort-mid-object`, `failed-append`, and `measure-full-epoch`. The latter can add
+`--live-control`. `run.sh` sets `FIELD_SESSION_RUN_ID`; manual runs can set a
+unique ID too, and must reuse it for `42-session-evidence.sh`. Historical receipts
+are preserved but excluded from a later run after tape re-initialisation. The first object is checkpointed without closing the session.
+The second object's real WRITE completion publishes a nonce-bound proof and
+holds dispatch before any further write or filemark. Kill verifies executable,
+config, owner, PID and proof before SIGKILL. Abort cancels the stream then calls
+Abort. Failed append releases the owner-armed one-shot refusal after that real
+write; rejection before media is never accepted as fault evidence.
+
+Evidence lives in `evidence/41-session-closeout/<plan-run>/<leg>/`, outside spool/state
+cleanup. `before.json` and `after.json` contain sequence, C, W, T, check, geometry,
+record order, session ending and closeout sidecar details. `receipt.json`,
+`fault.json`, optional `crash-preview.json`/`crash-ack.json`, `closeout.jsonl`,
+`progress.jsonl`, `commands.jsonl`, `host-stages.jsonl`, `verified.json`, `objects-after.json`,
+`memory.jsonl`, `metrics.json` and `manifest.json` retain the causal evidence.
+Binary hashes and kit/source commits accompany library/drive identity snapshots.
+A preview is confirmed only against the injected object's identity and the
+checkpoint sequence. An unexpected tail stops the leg. Named live endings need
+no supersede acknowledgement; crash recovery may need one.
+
+The command trace records bytes, command order, wall/monotonic time, elapsed
+command time and raw CHECK CONDITION sense. `host-stages.jsonl` separately
+records block-checksum CPU time and native publication/fsync elapsed time.
+`metrics.json` separates READ, WRITE, positioning and filemark/barrier time;
+operation phase deltas include queue wait and projection. The live control
+retains checksum time from original writes; rebuilt legs measure it on readback. The separate field progress trace
+includes automatic closeouts, so an explicit CloseoutTape no-op cannot hide the
+preceding worker's reservation peak or duration. RSS/HWM sampling targets the
+actual daemon with a fresh process baseline per leg and another baseline after
+SIGKILL. CLI memory is never substituted. The raw field sense vectors are
+packed under `real-drive-vectors/`; import them into `fixtures/real-hardware`
+only after the owner run, with their source identities and digest provenance.
+No real-drive vectors are manufactured during kit development.
+
+Expected end reasons include `abort`, `failed_append`, `drive_error`,
+`client_disconnected`, `crash_recovered`, `clean_close`, `client_stall`,
+`graceful_shutdown` and `closeout_failed`. Inspect the actual native end rather
+than inferring it from the client error. Use the same closeout idempotency key
+when retrying an interrupted watch. All fault legs are fatal; preserve the first
+failure and use the normal run.sh teardown rather than continuing manually.

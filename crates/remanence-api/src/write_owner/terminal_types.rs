@@ -57,7 +57,7 @@ pub(crate) struct ManualFinalizeTapeActorReply {
 /// outcome when an Object/read owner or another tape reservation is active.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ManualFinalizeTapeResult {
-    Busy,
+    Busy { operation_id: Option<Uuid> },
     Accepted(ManualFinalizeTapeActorReply),
 }
 

@@ -52,7 +52,13 @@ start_daemon() {
   # would otherwise inherit fd 9 and hold the kit lock for its whole life.
   tmux new-session -d -s "$session" -n rem 9>&-
   tmux pipe-pane -o -t "$session":rem "cat >> \"$log_file\""
-  tmux send-keys -t "$session":rem "exec $(printf '%q' "$(fieldtest_rem_daemon_bin)") --config $(printf '%q' "$config")" C-m
+  local field_env="" key
+  # tmux may predate this shell: explicitly carry the owner-armed kit facility.
+  # Ordinary daemon builds do not compile these hooks.
+  for key in REM_FIELD_GATE_DIR REM_FIELD_TRACE REM_FIELD_PROGRESS REM_CHAOS_ENABLED REM_CHAOS_ALLOW_REAL; do
+    if [[ -n ${!key:-} ]]; then field_env+="$(printf '%q' "$key=${!key}") "; fi
+  done
+  tmux send-keys -t "$session":rem "exec env $field_env$(printf '%q' "$(fieldtest_rem_daemon_bin)") --config $(printf '%q' "$config")" C-m
 }
 
 is_socket_live() {

@@ -127,6 +127,27 @@ impl CloseoutProgress {
             .collect()
     }
     pub(crate) fn publish(&self, state: pb::OperationState, error: Option<&str>) {
+        #[cfg(feature = "field-kit")]
+        if let Some(path) = std::env::var_os("REM_FIELD_PROGRESS") {
+            use std::io::Write;
+            if !std::path::PathBuf::from(&path)
+                .with_extension("jsonl.stop")
+                .exists()
+            {
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                {
+                    let _ = writeln!(
+                        file,
+                        "{}",
+                        serde_json::json!({"operation_id":self.id.to_string(), "state":state as i32, "progress":self.fields(), "error":error})
+                    );
+                    let _ = file.sync_data();
+                }
+            }
+        }
         if let Some(handle) = &self.handle {
             let fields = self.fields();
             let pairs: Vec<_> = fields

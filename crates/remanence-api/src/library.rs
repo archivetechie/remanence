@@ -432,6 +432,39 @@ impl LibraryServiceApi {
         Ok(library_serial)
     }
 
+    /// Ensure every failed watch admission releases its exclusive reservation.
+    fn watch_robotics_completion(
+        &self,
+        pool: &crate::write_owner::DrivePool,
+        library: &str,
+        operation: Uuid,
+        action: &crate::write_owner::RoboticsAction,
+    ) -> Result<(), Status> {
+        // Refresh uses only the inventory membership diff; unchanged refreshes
+        // must never unpark a write-protected cartridge.
+        if matches!(action, crate::write_owner::RoboticsAction::Refresh) {
+            return Ok(());
+        }
+        let mut completion = self
+            .state
+            .operations
+            .watch(&operation)
+            .inspect_err(|_| pool.release_library(library))?;
+        let work = self.state.closeout_work.clone();
+        let library = library.to_string();
+        tokio::spawn(async move {
+            use tokio_stream::StreamExt;
+            while let Some(update) = completion.next().await {
+                let Ok(status) = update else { continue };
+                if status.state == pb::OperationState::Succeeded as i32 {
+                    work.wake_library(&library);
+                    break;
+                }
+            }
+        });
+        Ok(())
+    }
+
     async fn dispatch_robotics(
         &self,
         actor: remanence_state::AuditActor,
@@ -495,18 +528,10 @@ impl LibraryServiceApi {
         }
         match changer.try_reserve_owned() {
             Ok(permit) => {
-                let mut completion = self.state.operations.watch(&operation_id)?;
-                let work = self.state.closeout_work.clone();
-                let wake_library = library_serial.clone();
-                tokio::spawn(async move {
-                    use tokio_stream::StreamExt;
-                    while let Some(Ok(status)) = completion.next().await {
-                        if status.state == pb::OperationState::Succeeded as i32 {
-                            work.wake_library(&wake_library);
-                            break;
-                        }
-                    }
-                });
+                self.watch_robotics_completion(&pool, &library_serial, operation_id, &action)
+                    .inspect_err(|error| {
+                        handle.publish_failed(error.message(), &[("phase", "watch")])
+                    })?;
                 tokio::spawn(async move {
                     handle.publish_state(
                         pb::OperationState::Running,
@@ -2058,6 +2083,49 @@ mod tests {
             narrow_element(0x1_0000, "x").unwrap_err().code(),
             tonic::Code::InvalidArgument
         );
+    }
+
+    /// Scheduled successful refreshes do not unpark media; failed watch setup
+    /// releases the library even though dispatch has not reached the changer.
+    #[tokio::test]
+    async fn b8_refresh_does_not_wake_and_watch_error_releases_library() {
+        let state = state_with_snapshot();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let pool = crate::write_owner::DrivePool::new_for_library(
+            "DEC418146K_LL02",
+            tx,
+            HashMap::new(),
+            Arc::new(HashMap::new()),
+        );
+        let service = state.library_service();
+        let library = "DEC418146K_LL02";
+        state.closeout_work.park_for_test(library);
+        for _ in 0..3 {
+            let id = Uuid::new_v4();
+            let handle = state.operations.register(id, "refresh");
+            service
+                .watch_robotics_completion(
+                    &pool,
+                    library,
+                    id,
+                    &crate::write_owner::RoboticsAction::Refresh,
+                )
+                .unwrap();
+            handle.publish_state(pb::OperationState::Succeeded, &[]);
+            tokio::task::yield_now().await;
+            assert!(state.closeout_work.parked_for_test());
+        }
+        pool.reserve_library_exclusive(library).unwrap();
+        let action = crate::write_owner::RoboticsAction::Unload {
+            bay: 1,
+            destination: None,
+        };
+        assert!(service
+            .watch_robotics_completion(&pool, library, Uuid::new_v4(), &action)
+            .is_err());
+        pool.reserve_library_exclusive(library)
+            .expect("watch error leaked reservation");
+        pool.release_library(library);
     }
 
     #[tokio::test]

@@ -5,6 +5,8 @@
 //! write/read session RPCs directly on systems where the field kit cannot rely
 //! on Python gRPC bindings.
 
+mod session_epoch;
+
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
@@ -117,6 +119,7 @@ enum Command {
     WriteMany(WriteManyArgs),
     Read(ReadArgs),
     List(ListArgs),
+    SessionEpoch(session_epoch::Args),
 }
 
 #[derive(Parser, Debug)]
@@ -219,6 +222,7 @@ async fn run(cli: Cli) -> AppResult<()> {
         Command::WriteMany(args) => write_many_command(&cli.endpoint, args, cli.no_wait).await,
         Command::Read(args) => read_command(&cli.endpoint, args, cli.no_wait).await,
         Command::List(args) => list_command(&cli.endpoint, args).await,
+        Command::SessionEpoch(args) => session_epoch::run(&cli.endpoint, args).await,
     }
 }
 

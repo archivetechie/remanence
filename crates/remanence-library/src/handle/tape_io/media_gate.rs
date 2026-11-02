@@ -333,6 +333,8 @@ pub(in crate::handle) struct MediaFencedTransport {
     /// The raw drive transport. Private to this module — that
     /// privacy IS the structural enforcement.
     inner: Box<dyn SgTransport>,
+    #[cfg(feature = "field-kit")]
+    pub(in crate::handle) field_identity: serde_json::Value,
     pub(crate) verification: crate::verification_io::VerificationContext,
     /// The installed durable-fence hook. [`NoCalibrationControl`]
     /// until the load path (P4) installs the real store's fence.
@@ -360,6 +362,8 @@ impl MediaFencedTransport {
     pub(in crate::handle) fn new(inner: Box<dyn SgTransport>) -> Self {
         Self {
             inner,
+            #[cfg(feature = "field-kit")]
+            field_identity: serde_json::Value::Null,
             verification: Default::default(),
             fence: Box::new(NoCalibrationControl),
             fenced_this_load: false,
@@ -486,6 +490,14 @@ impl MediaFencedTransport {
         self.verification.check_cancelled()?;
         self.check_command_deadline()?;
         let result = self.inner.execute_in(cdb, buf);
+        #[cfg(feature = "field-kit")]
+        crate::field_trace::record(
+            &self.field_identity,
+            cdb,
+            buf.len(),
+            &result,
+            started.elapsed(),
+        );
         self.verification
             .dispatch(cdb, buf, &result, started.elapsed());
         if let Ok(outcome) = &result {
@@ -513,6 +525,17 @@ impl MediaFencedTransport {
         self.verification.check_cancelled()?;
         self.check_command_deadline()?;
         let result = self.inner.execute_none(cdb);
+        #[cfg(feature = "field-kit")]
+        crate::field_trace::record(
+            &self.field_identity,
+            cdb,
+            0,
+            &result
+                .as_ref()
+                .map(|_| TransferOutcome::clean(0))
+                .map_err(|e| ScsiError::Io(std::io::Error::other(e.to_string()))),
+            started.elapsed(),
+        );
         self.verification
             .dispatch(cdb, &[], &Ok(TransferOutcome::clean(0)), started.elapsed());
         if let Err(error) = &result {
@@ -636,6 +659,14 @@ impl MediaFencedTransport {
             Some(buf) => {
                 let started = Instant::now();
                 let result = self.inner.execute_out(cdb, buf);
+                #[cfg(feature = "field-kit")]
+                crate::field_trace::record(
+                    &self.field_identity,
+                    cdb,
+                    buf.len(),
+                    &result,
+                    started.elapsed(),
+                );
                 self.verification
                     .dispatch(cdb, buf, &result, started.elapsed());
                 if let Ok(outcome) = &result {
@@ -646,6 +677,17 @@ impl MediaFencedTransport {
             None => {
                 let started = Instant::now();
                 let result = self.inner.execute_none(cdb);
+                #[cfg(feature = "field-kit")]
+                crate::field_trace::record(
+                    &self.field_identity,
+                    cdb,
+                    0,
+                    &result
+                        .as_ref()
+                        .map(|_| TransferOutcome::clean(0))
+                        .map_err(|e| ScsiError::Io(std::io::Error::other(e.to_string()))),
+                    started.elapsed(),
+                );
                 self.verification.dispatch(
                     cdb,
                     &[],
