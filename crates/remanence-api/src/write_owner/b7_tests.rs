@@ -1082,6 +1082,16 @@ async fn b7_fix2_finalizing_worker_refuses_pinned_read_closeout_and_finalize() {
     hold.finalizing(operation);
     let errors = tokio::time::timeout(StdDuration::from_secs(1), async {
         vec![
+            crate::mount::open_write_session(
+                AuditActor::System,
+                &state,
+                crate::mount::WriteSessionTarget::Pool {
+                    pool_id: POOL.into(),
+                },
+                None,
+            )
+            .await
+            .unwrap_err(),
             crate::mount::test_open_write_for_caller(
                 &state,
                 TAPE,
@@ -1764,5 +1774,88 @@ async fn b8_field_hold_cancel_and_expiry() {
         )
         .unwrap();
         assert_eq!(observed["timeout"], true);
+    }
+}
+
+/// A worker's short hold remains selectable while it owns the native lease;
+/// changing that hold to finalization wakes selection and returns typed Busy.
+#[tokio::test]
+async fn b10_pool_joins_worker_closeout_but_not_its_finalization() {
+    for finalizing in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let world = due_tape(root.path()).await;
+        let mut state = state(root.path());
+        state.library_snapshot = Some(library_snapshot_cell(
+            world.lock().unwrap().library_snapshot(),
+        ));
+        let (changer, mut changer_rx) = mpsc::channel(2);
+        let (drive, mut drive_rx) = mpsc::channel(2);
+        let pool = DrivePool::new_for_library(
+            LIBRARY,
+            changer,
+            HashMap::from([(BAY, drive)]),
+            Arc::new(HashMap::from([(BAY, AtomicBool::new(false))])),
+        );
+        state.drive_pool = Some(pool.clone());
+        let (hold, reservation) = pool.reserve_worker_tape(TAPE).unwrap();
+        let authority =
+            TapeAuthority::open(&*state.checkpoint_journal_dir, TAPE, &state.index_path).unwrap();
+        let lease = authority.acquire_exclusive().unwrap();
+        let task_state = state.clone();
+        let mut opening = tokio::spawn(async move {
+            crate::mount::open_write_session(
+                AuditActor::System,
+                &task_state,
+                crate::mount::WriteSessionTarget::Pool {
+                    pool_id: POOL.into(),
+                },
+                None,
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(50), &mut opening)
+                .await
+                .is_err()
+        );
+        assert!(drive_rx.try_recv().is_err());
+        assert!(changer_rx.try_recv().is_err());
+        if finalizing {
+            let operation = Uuid::new_v4();
+            hold.finalizing(operation);
+            let error = tokio::time::timeout(StdDuration::from_secs(2), opening)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(
+                crate::drive_pool::TapeBusy::from_status(&error).unwrap().0,
+                operation
+            );
+            assert!(drive_rx.try_recv().is_err());
+        } else {
+            drop(lease);
+            drop(reservation);
+            drop(hold);
+            match tokio::time::timeout(StdDuration::from_secs(2), drive_rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                DriveCommand::OpenWrite {
+                    selected, reply, ..
+                } => {
+                    assert_eq!(selected.tape_uuid, TAPE);
+                    reply
+                        .send(Err(Status::cancelled("observed chosen tape")))
+                        .unwrap();
+                }
+                _ => panic!("expected write admission"),
+            }
+            assert_eq!(
+                opening.await.unwrap().unwrap_err().code(),
+                tonic::Code::Cancelled
+            );
+        }
     }
 }

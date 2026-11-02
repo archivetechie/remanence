@@ -21,6 +21,44 @@ use super::model::{
     PinnedWriteDisposition, SelectTapeError, SelectedTape, TapeUuid, WritabilityError,
 };
 
+/// Scheduling ownership, distinct from the reservation acquired at admission.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TapeSelectionHold {
+    LiveWriter,
+    Closing,
+    WorkerCloseout,
+    Finalizing,
+}
+impl TapeSelectionHold {
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::LiveWriter => "live writer",
+            Self::Closing => "closing",
+            Self::WorkerCloseout => "worker closeout",
+            Self::Finalizing => "finalizing",
+        }
+    }
+    pub(crate) fn waitable(self) -> bool {
+        matches!(self, Self::Closing | Self::WorkerCloseout)
+    }
+}
+
+/// One ownership snapshot for pool ranking; closeout holds remain candidates.
+#[derive(Default)]
+pub(crate) struct TapeSelectionHolds(
+    pub(crate) std::collections::HashMap<TapeUuid, TapeSelectionHold>,
+);
+impl From<&HashSet<TapeUuid>> for TapeSelectionHolds {
+    fn from(reserved: &HashSet<TapeUuid>) -> Self {
+        Self(
+            reserved
+                .iter()
+                .map(|id| (*id, TapeSelectionHold::LiveWriter))
+                .collect(),
+        )
+    }
+}
+
 /// Select a tape for pool-targeted writes using the configured default policy.
 pub fn select_tape_in_pool(
     state: &CatalogIndex,
@@ -90,34 +128,23 @@ pub(crate) fn select_tape_in_pool_for_write_session_scoped(
     state: &CatalogIndex,
     pool_cfg: &TapePoolConfig,
     object_size: u64,
-    reserved_tape_uuids: &HashSet<TapeUuid>,
+    holds: &TapeSelectionHolds,
     checkpoint_journal_dir: &Path,
     allowed_tape_uuids: &HashSet<TapeUuid>,
 ) -> Result<SelectedTape, SelectTapeError> {
-    match pool_cfg.selection_policy {
-        remanence_state::PoolSelectionPolicyName::CompleteOrFill => {
-            select_tape_in_pool_with_policy_and_batched_eligibility(
-                state,
-                pool_cfg,
-                object_size,
-                reserved_tape_uuids,
-                &CompleteOrFill,
-                checkpoint_journal_dir,
-                Some(allowed_tape_uuids),
-            )
-        }
-        remanence_state::PoolSelectionPolicyName::FillOldest => {
-            select_tape_in_pool_with_policy_and_batched_eligibility(
-                state,
-                pool_cfg,
-                object_size,
-                reserved_tape_uuids,
-                &FillOldest,
-                checkpoint_journal_dir,
-                Some(allowed_tape_uuids),
-            )
-        }
-    }
+    let policy: &dyn PoolSelectionPolicy = match pool_cfg.selection_policy {
+        remanence_state::PoolSelectionPolicyName::CompleteOrFill => &CompleteOrFill,
+        remanence_state::PoolSelectionPolicyName::FillOldest => &FillOldest,
+    };
+    select_tape_in_pool_with_policy_and_eligibility(
+        state,
+        pool_cfg,
+        object_size,
+        holds,
+        policy,
+        Some(checkpoint_journal_dir),
+        Some(allowed_tape_uuids),
+    )
 }
 
 /// Why an operator-pinned tape cannot open a write session.
@@ -348,7 +375,7 @@ pub fn select_tape_in_pool_with_policy(
         state,
         pool_cfg,
         object_size,
-        reserved_tape_uuids,
+        &TapeSelectionHolds::from(reserved_tape_uuids),
         policy,
         None,
         None,
@@ -368,7 +395,7 @@ pub(super) fn select_tape_in_pool_with_policy_and_batched_eligibility(
         state,
         pool_cfg,
         object_size,
-        reserved_tape_uuids,
+        &TapeSelectionHolds::from(reserved_tape_uuids),
         policy,
         Some(checkpoint_journal_dir),
         allowed_tape_uuids,
@@ -379,7 +406,7 @@ pub(super) fn select_tape_in_pool_with_policy_and_eligibility(
     state: &CatalogIndex,
     pool_cfg: &TapePoolConfig,
     object_size: u64,
-    reserved_tape_uuids: &HashSet<TapeUuid>,
+    holds: &TapeSelectionHolds,
     policy: &dyn PoolSelectionPolicy,
     checkpoint_journal_dir: Option<&Path>,
     allowed_tape_uuids: Option<&HashSet<TapeUuid>>,
@@ -413,7 +440,19 @@ pub(super) fn select_tape_in_pool_with_policy_and_eligibility(
     let mut batched_ineligible = Vec::new();
     let mut fenced_skips = Vec::new();
     let mut reserved_tape_count = 0usize;
+    let mut last_written = std::collections::HashMap::new();
     for mut tape in tapes {
+        let tape_uuid = tape_uuid_from_vec(tape.tape_uuid.clone(), pool_id.as_str())?;
+        if allowed_tape_uuids.is_some_and(|allowed| !allowed.contains(&tape_uuid)) {
+            continue;
+        }
+        let hold = holds.0.get(&tape_uuid).copied();
+        let waiting = hold.is_some_and(TapeSelectionHold::waitable);
+        if let Some(hold) = hold.filter(|h| !h.waitable()) {
+            tracing::info!(pool_id, tape_uuid = %Uuid::from_bytes(tape_uuid), reason = hold.reason(), "pool selection skipped tape");
+            reserved_tape_count += 1;
+            continue;
+        }
         match check_writability_preconditions(&tape, object_size) {
             Ok(()) => {}
             Err(WritabilityError::ParityAppendUnsupported { .. })
@@ -430,10 +469,6 @@ pub(super) fn select_tape_in_pool_with_policy_and_eligibility(
         }
         if let Err(error) = check_pool_block_size_precondition(&tape, pool_cfg) {
             reasons.push(error);
-            continue;
-        }
-        let tape_uuid = tape_uuid_from_vec(tape.tape_uuid.clone(), pool_id.as_str())?;
-        if allowed_tape_uuids.is_some_and(|allowed| !allowed.contains(&tape_uuid)) {
             continue;
         }
         let conflicts = state
@@ -453,24 +488,31 @@ pub(super) fn select_tape_in_pool_with_policy_and_eligibility(
             });
             continue;
         }
-        // A reserved tape belongs to a live owner that may hold its exclusive
-        // tape-log lease; drop it before any log peek below.
-        if reserved_tape_uuids.contains(&tape_uuid) {
+        // Ranking observes the durable fold without taking a competing lease.
+        // Actual admission still requires this tape's exclusive reservation.
+        let observed = checkpoint_journal_dir
+            .filter(|_| {
+                checkpoint_journal_tapes
+                    .as_ref()
+                    .is_some_and(|ids| ids.contains(&tape_uuid))
+            })
+            .map(|dir| {
+                remanence_state::TapeAuthority::open(dir, tape_uuid, state.path())?
+                    .observe_summary()
+            })
+            .transpose()?;
+        if waiting && observed.is_none() {
+            tracing::info!(pool_id, tape_uuid = %Uuid::from_bytes(tape_uuid), reason = hold.unwrap().reason(), "pool selection skipped closing tape without durable authority");
             reserved_tape_count += 1;
             continue;
         }
-        if let (Some(checkpoint_journal_dir), Some(checkpoint_journal_tapes)) =
-            (checkpoint_journal_dir, checkpoint_journal_tapes.as_ref())
-        {
+        if checkpoint_journal_dir.is_some() {
             let fresh = tape_is_fresh_for_checkpoint_admission(state, &tape, &tape_uuid)?;
-            let carries_checkpoint = fresh
-                || tape_carries_checkpoint(
-                    state,
-                    checkpoint_journal_dir,
-                    checkpoint_journal_tapes,
-                    tape_uuid,
-                )?;
-            if !carries_checkpoint {
+            if !fresh
+                && observed
+                    .as_ref()
+                    .is_none_or(|s| s.last_ordinary_record.is_none())
+            {
                 batched_ineligible.push(format!(
                     "{} ({})",
                     tape.voltag.as_deref().unwrap_or("<no-voltag>"),
@@ -479,15 +521,9 @@ pub(super) fn select_tape_in_pool_with_policy_and_eligibility(
                 continue;
             }
         }
-        if let Some(dir) = checkpoint_journal_dir.filter(|_| {
-            checkpoint_journal_tapes
-                .as_ref()
-                .is_some_and(|ids| ids.contains(&tape_uuid))
-        }) {
-            let snapshot =
-                remanence_state::TapeAuthority::open(dir, tape_uuid, state.path())?.freeze()?;
-            let summary = snapshot.tape_summary();
+        if let Some(summary) = &observed {
             if summary.sealed || summary.seal_due.is_some() || summary.finalization.is_some() {
+                tracing::info!(pool_id, tape_uuid = %Uuid::from_bytes(tape_uuid), reason = "finalizing", "pool selection skipped tape");
                 reasons.push(WritabilityError::MaintenanceRequired {
                     tape_uuid: Uuid::from_bytes(tape_uuid).to_string(),
                 });
@@ -510,6 +546,16 @@ pub(super) fn select_tape_in_pool_with_policy_and_eligibility(
                     Some(tape.written_extent_lba.unwrap_or(0).max(summary.cursor.lba));
                 tape.highest_protected_ordinal = summary.protected;
                 tape.total_committed_ordinals = summary.total;
+            }
+            if let Some(commit) = &summary.last_ordinary_record {
+                let time = time::OffsetDateTime::parse(
+                    &commit.committed_at_utc,
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .map_err(|e| {
+                    StateError::JournalReplayFailed(format!("invalid commit time: {e}"))
+                })?;
+                last_written.insert(tape_uuid, time);
             }
             if summary.closeout_due() {
                 closeout_overhead.insert(tape_uuid, closeout_charge(summary)?);
@@ -570,6 +616,26 @@ pub(super) fn select_tape_in_pool_with_policy_and_eligibility(
         candidates: &candidates,
         projected_footprint: object_size,
     };
+    // A short hold must not make us leave the most recently written tape.
+    // Once holds settle, retain the configured policy's ordinary ranking.
+    // Capacity in either case includes the outstanding closeout charge.
+    let latest = if candidates
+        .iter()
+        .any(|c| holds.0.get(&c.tape_uuid).is_some_and(|h| h.waitable()))
+    {
+        last_written.values().max()
+    } else {
+        None
+    };
+    let recent = candidates
+        .iter()
+        .filter(|c| latest.is_some() && last_written.get(&c.tape_uuid) == latest)
+        .cloned()
+        .collect::<Vec<_>>();
+    let recent_selection = policy.select(&PoolSelectionContext {
+        candidates: &recent,
+        projected_footprint: object_size,
+    });
     let due = candidates
         .iter()
         .filter(|c| closeout_overhead.contains_key(&c.tape_uuid))
@@ -579,7 +645,9 @@ pub(super) fn select_tape_in_pool_with_policy_and_eligibility(
         candidates: &due,
         projected_footprint: object_size,
     });
-    let selection = if matches!(preferred, Selection::UseTape { .. }) {
+    let selection = if matches!(recent_selection, Selection::UseTape { .. }) {
+        recent_selection
+    } else if matches!(preferred, Selection::UseTape { .. }) {
         preferred
     } else {
         policy.select(&ctx)

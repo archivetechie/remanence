@@ -4679,7 +4679,7 @@ fn write_session_selection_respects_the_physical_library_scope() {
         &index,
         &cfg,
         123,
-        &HashSet::new(),
+        &crate::pool_write::TapeSelectionHolds::default(),
         checkpoint_dir.path(),
         &allowed,
     )

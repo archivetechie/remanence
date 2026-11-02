@@ -305,25 +305,67 @@ async fn open_write_session_reserved_for_caller(
                 located_tapes_in_operated_libraries(state, pool, library_constraint.as_deref())?;
             let mut allowed_tape_uuids = located_tapes.keys().copied().collect::<HashSet<_>>();
             let mut route_error = None;
+            let mut waited_for = None;
             loop {
                 select_attempts = select_attempts.saturating_add(1);
+                let holds = pool.tape_selection_holds();
+                let recheck_scope = waited_for.map(|id| HashSet::from([id]));
                 let selected = match crate::pool_write::select_tape_in_pool_for_write_session_scoped(
                     &index,
                     &pool_cfg,
                     0,
-                    &pool.mounted_tape_uuids(),
+                    &holds,
                     state.checkpoint_journal_dir.as_path(),
-                    &allowed_tape_uuids,
+                    recheck_scope.as_ref().unwrap_or(&allowed_tape_uuids),
                 ) {
                     Ok(selected) => selected,
                     // Reselection must not erase the actionable route/fence
                     // diagnostic when no reachable alternative remains.
                     Err(error) => {
-                        return Err(route_error.unwrap_or_else(|| {
-                            crate::write_owner::status_from_select_tape_error(error)
-                        }))
+                        let reserved = matches!(
+                            error,
+                            crate::SelectTapeError::NoUnreservedWritableTapes { .. }
+                        );
+                        let mut status = crate::write_owner::status_from_select_tape_error(error);
+                        // Preserve B7's watchable Busy when finalization is
+                        // the remaining owner in this pool and physical scope.
+                        for (tape, hold) in &holds.0 {
+                            if reserved
+                                && matches!(hold, crate::pool_write::TapeSelectionHold::Finalizing)
+                                && recheck_scope
+                                    .as_ref()
+                                    .unwrap_or(&allowed_tape_uuids)
+                                    .contains(tape)
+                                && index
+                                    .get_tape(tape)
+                                    .map_err(crate::status_from_state_error)?
+                                    .is_some_and(|t| {
+                                        t.pool_id.as_deref() == Some(pool_cfg.id.as_str())
+                                    })
+                            {
+                                if let Err(busy) = pool.check_finalizing(*tape) {
+                                    status = busy;
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(tape_uuid) = waited_for.take() {
+                            tracing::info!(pool_id = %pool_cfg.id, tape_uuid = %Uuid::from_bytes(tape_uuid), reason = %status, "pool selection skipped tape after closeout; selecting again");
+                            allowed_tape_uuids.remove(&tape_uuid);
+                            route_error = Some(status);
+                            continue;
+                        }
+                        return Err(route_error.unwrap_or(status));
                     }
                 };
+                if let Some(hold) = holds.0.get(&selected.tape_uuid).filter(|h| h.waitable()) {
+                    tracing::info!(pool_id = %pool_cfg.id, tape_uuid = %Uuid::from_bytes(selected.tape_uuid), reason = hold.reason(), "pool selection waiting for tape closeout");
+                    pool.wait_tape_closeout(selected.tape_uuid).await;
+                    // Re-enter the same funnel with only the chosen tape. The
+                    // closeout may have fenced it or consumed its capacity.
+                    waited_for = Some(selected.tape_uuid);
+                    continue;
+                }
                 if let Some(library) = located_tapes.get(&selected.tape_uuid) {
                     if let Err(error) =
                         resolve_actor_mount(state, library, &selected.tape_uuid, &HashSet::new())
@@ -331,6 +373,7 @@ async fn open_write_session_reserved_for_caller(
                         tracing::debug!(tape_uuid = %Uuid::from_bytes(selected.tape_uuid), %error, "pool selection skipped unreachable tape");
                         route_error = Some(error);
                         allowed_tape_uuids.remove(&selected.tape_uuid);
+                        waited_for = None;
                         continue;
                     }
                 }
@@ -356,8 +399,8 @@ async fn open_write_session_reserved_for_caller(
             required_pool_id,
         } => {
             select_attempts = 1;
-            // A pinned request must reuse this tape's closing owner. Pool
-            // selection can choose another tape and needs no such wait.
+            // A pinned request joins the same bounded closeout hold as a
+            // selected pool tape, but cannot reselect if admission changes.
             pool.wait_tape_closeout(*tape_uuid).await;
             // Own the exact tape before consulting the exceptional post-C
             // admission path. Recovery in this runtime uses the same owner,

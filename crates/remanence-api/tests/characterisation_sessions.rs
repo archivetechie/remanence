@@ -2182,3 +2182,6 @@ async fn session_epochs_end_at_close_and_full_epoch_ignores_checkpoint_boundarie
     assert_eq!(full.len(), 1);
     assert_eq!((full[0].1, full[0].2), (0, 6));
 }
+
+#[path = "characterisation/b10_pool.rs"]
+mod b10_pool;
