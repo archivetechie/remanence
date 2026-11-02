@@ -48,6 +48,18 @@ The deterministic CBOR member index written as the last entry of every REM-OBJEC
 (`_remanence/manifest.cbor`). It holds each member's metadata and, for regular files, a
 checksum. A hardlink refers to its primary entry; directories and symlinks have no checksum.
 
+<!-- code-anchor: crates/remanence-cli/src/archive_ingest.rs crates/remanence-stream/src/lib.rs @ f04a0951 -->
+### extended attribute (xattr)
+
+A named value that a filesystem stores with a file, beside its contents, such as
+`user.mime_type`. The part of the name before the first dot is its namespace: on Linux,
+`user.`, `security.`, `trusted.` or `system.`. Remanence captures only `user.*` attributes,
+stores them in the object's manifest and applies them on restore. It reports the names of all
+other attributes at ingest and never applies them. See
+[Extended attributes and file metadata](reference-extended-attributes.md) for the behaviour,
+and [Why Remanence keeps only user extended attributes](why-user-xattrs-only.md) for the
+reasons.
+
 ### bundle
 
 An object built to hold many files, usually small ones, so that they share one tape file, one
