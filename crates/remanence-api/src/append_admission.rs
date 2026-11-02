@@ -448,14 +448,13 @@ pub(crate) fn daemon_admission_error(
             "SessionSuffixContradiction",
             serde_json::json!({"error": error.to_string(), "detail": detail, "partition":partition, "lba":lba, "tape_log_sequence":sequence, "tape_incarnation":incarnation}).to_string(),
         );
-        return tonic::Status::failed_precondition(error.to_string());
+        return crate::closeout_obligation::RetryCause::Operator
+            .attach(tonic::Status::failed_precondition(error.to_string()));
     }
     let detail = error.to_string();
-    if matches!(
-        error,
-        AdmissionError::Io(_) | AdmissionError::SuffixIo { .. }
-    ) {
-        return tonic::Status::unavailable(detail);
+    if let AdmissionError::Io(cause) | AdmissionError::SuffixIo { source: cause, .. } = &error {
+        return crate::closeout_obligation::RetryCause::tape_io(cause)
+            .attach(tonic::Status::unavailable(detail));
     }
     if let Err(e) = index.set_append_recovery_required(tape_uuid, true) {
         return crate::status_from_state_error(e);
@@ -484,7 +483,8 @@ pub(crate) fn daemon_admission_error(
         },
     );
     match audit {
-        Ok(_) => tonic::Status::failed_precondition(detail),
+        Ok(_) => crate::closeout_obligation::RetryCause::Operator
+            .attach(tonic::Status::failed_precondition(detail)),
         Err(e) => e,
     }
 }

@@ -1006,6 +1006,8 @@ fn b7_fix_observer_staging_poison_and_lease_lifetime() {
         authority.observe_summary().unwrap().last_closed_sequence > before.last_closed_sequence
     );
     let mirror = OBSERVED_OWNERS.get().unwrap().lock().unwrap()[authority.path()]
+        .lock()
+        .unwrap()
         .owner
         .upgrade()
         .unwrap();
@@ -1039,7 +1041,10 @@ fn b7_fix_observer_replays_once_per_change_and_rejects_after_durable_failure() {
         authority.observe_summary().unwrap();
     }
     assert_eq!(
-        OBSERVED_OWNERS.get().unwrap().lock().unwrap()[authority.path()].replays,
+        OBSERVED_OWNERS.get().unwrap().lock().unwrap()[authority.path()]
+            .lock()
+            .unwrap()
+            .replays,
         1
     );
     // Same-length corruption must invalidate the cached answer too.
@@ -1051,7 +1056,10 @@ fn b7_fix_observer_replays_once_per_change_and_rejects_after_durable_failure() {
     std::fs::write(authority.path(), bytes).unwrap();
     authority.observe_summary().unwrap();
     assert_eq!(
-        OBSERVED_OWNERS.get().unwrap().lock().unwrap()[authority.path()].replays,
+        OBSERVED_OWNERS.get().unwrap().lock().unwrap()[authority.path()]
+            .lock()
+            .unwrap()
+            .replays,
         2
     );
     let mut writer = authority.acquire_exclusive().unwrap();
@@ -1076,4 +1084,62 @@ fn b7_fix_observer_replays_once_per_change_and_rejects_after_durable_failure() {
         .unwrap_err()
         .to_string()
         .contains("durable fold failed"));
+}
+
+/// A cold replay serializes only its own tape, including concurrent cache misses.
+#[test]
+fn b7_fix2_slow_replay_does_not_block_other_status_or_session_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let slow = TapeAuthority::open_fixture(dir.path(), [0xc1; 16]).unwrap();
+    slow.append(&record([0xc1; 16])).unwrap();
+    let other = TapeAuthority::open_fixture(dir.path(), [0xc2; 16]).unwrap();
+    other
+        .acquire_exclusive()
+        .unwrap()
+        .publish_initialized(
+            record([0xc2; 16]).block_size,
+            None,
+            CommitCursor {
+                partition: 0,
+                lba: 2,
+            },
+        )
+        .unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let observation = slow.observation().unwrap();
+    observation.lock().unwrap().before_replay = Some(Box::new(move || {
+        entered_tx.send(()).unwrap();
+        release_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+    }));
+    let slow = Arc::new(slow);
+    let first = {
+        let slow = slow.clone();
+        std::thread::spawn(move || slow.observe_summary().unwrap())
+    };
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    let second = {
+        let slow = slow.clone();
+        std::thread::spawn(move || slow.observe_summary().unwrap())
+    };
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let independent = std::thread::spawn(move || {
+        other.observe_summary().unwrap();
+        let mut lease = other.acquire_exclusive().unwrap();
+        lease
+            .open_session([3; 16], "2026-11-02T00:00:00Z".into())
+            .unwrap();
+        done_tx.send(()).unwrap();
+    });
+    let result = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+    release_tx.send(()).unwrap();
+    first.join().unwrap();
+    second.join().unwrap();
+    independent.join().unwrap();
+    result.expect("another tape's status and session open must finish during slow replay");
+    assert_eq!(observation.lock().unwrap().replays, 1);
 }

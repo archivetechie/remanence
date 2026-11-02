@@ -1356,6 +1356,7 @@ impl StateHandle {
             tape_uuid,
             &self.paths.sqlite_path,
         )?;
+        authority.check_finalizing()?;
         let lease = authority.acquire_exclusive()?;
         let snapshot = lease.freeze()?;
         if let Some(refusal) = snapshot.tape_summary().closeout_required("retirement") {
@@ -5731,6 +5732,57 @@ pool_id = "camera.copy-a"
         assert_eq!(report.object_copies_rebuilt, 0);
         assert_eq!(report.audit_records_replayed, 0);
         assert_eq!(report.journal_records_replayed, 0);
+    }
+
+    /// Long finalization is refused before native flock acquisition, with the
+    /// operation identity retained in the typed error and no catalog mutation.
+    #[test]
+    fn b7_fix2_retirement_is_busy_with_running_finalization_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).unwrap();
+        let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
+        let tape_uuid = [0xc3; 16];
+        handle
+            .catalog_index()
+            .provision_tape(crate::index::ProvisionTapeInput {
+                tape_uuid,
+                voltag: "BUSY01L9".into(),
+                block_size: 4096,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .unwrap();
+        let authority = crate::TapeAuthority::open(
+            handle.paths.journal_dir.join("tapes"),
+            tape_uuid,
+            &handle.paths.sqlite_path,
+        )
+        .unwrap();
+        let operation_id = uuid::Uuid::new_v4();
+        let operation = authority.finalization_operation(operation_id).unwrap();
+        let lease = authority.acquire_exclusive().unwrap();
+        let before = std::time::Instant::now();
+        let error = handle
+            .retire_tape(crate::index::RetireTapeInput {
+                tape_uuid,
+                reason: "must refuse".into(),
+            })
+            .unwrap_err();
+        assert!(matches!(error, StateError::TapeBusy { operation_id: id } if id == operation_id));
+        assert!(before.elapsed() < std::time::Duration::from_millis(250));
+        assert_ne!(
+            handle
+                .catalog_index()
+                .get_tape(&tape_uuid)
+                .unwrap()
+                .unwrap()
+                .state,
+            "retired"
+        );
+        drop(lease);
+        drop(operation);
+        authority.check_finalizing().unwrap();
     }
 
     #[test]

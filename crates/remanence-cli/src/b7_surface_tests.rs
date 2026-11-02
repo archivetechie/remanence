@@ -138,6 +138,42 @@ async fn b7_fix_top_once_json_reads_held_checkpoint_and_partial_lists_exit_nonze
             }
         }
     }
+    // Retired unreadable/missing logs must not make either one-shot printer fail.
+    let mut index = CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
+    let authority = TapeAuthority::open_fixture(&logs, [1; 16]).unwrap();
+    let lease = authority.acquire_exclusive().unwrap();
+    index.project_tape_log(&lease.freeze().unwrap()).unwrap();
+    drop(lease);
+    for id in [1, 3] {
+        index
+            .retire_tape(remanence_state::RetireTapeInput {
+                tape_uuid: [id; 16],
+                reason: "retired medium".into(),
+            })
+            .unwrap();
+    }
+    std::fs::remove_file(logs.join(format!("{}.remtape", Uuid::from_bytes([1; 16]).simple())))
+        .unwrap();
+    let live = state
+        .library_service()
+        .get_live_status(tonic::Request::new(pb::GetLiveStatusRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(live.closeout_debt.is_empty());
+    for json in [false, true] {
+        let mut output = Vec::new();
+        let result = print_top_response(&live, json, &mut output);
+        assert_eq!(
+            finish_daemon_client_result(
+                result.map_err(DaemonClientError::from),
+                json,
+                &mut Vec::new()
+            ),
+            ExitCode::SUCCESS
+        );
+        assert!(!String::from_utf8(output).unwrap().contains("DEBT?"));
+    }
 }
 
 #[test]

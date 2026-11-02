@@ -2871,13 +2871,16 @@ pub(super) fn validate_write_media_policy(
 ) -> Result<(), Status> {
     if media_policy == WriteMediaPolicy::TerminalAppend {
         return if current_cfg.write_protected {
-            Err(Status::failed_precondition("tape is write-protected"))
+            Err(crate::closeout_obligation::RetryCause::Operator
+                .attach(Status::failed_precondition("tape is write-protected")))
         } else {
             Ok(())
         };
     }
-    crate::pool_write::require_rewritable_object_media(current_cfg)
-        .map_err(|error| Status::failed_precondition(error.to_string()))
+    crate::pool_write::require_rewritable_object_media(current_cfg).map_err(|error| {
+        crate::closeout_obligation::RetryCause::Operator
+            .attach(Status::failed_precondition(error.to_string()))
+    })
 }
 
 pub(crate) fn prepare_drive_for_write(
@@ -2908,13 +2911,17 @@ pub(super) fn prepare_drive_for_write_observing_identity(
 ) -> Result<(), Status> {
     drive.clear_append_admission();
     let prepare_started = Instant::now();
-    drive
-        .reverify_invalidated_state()
-        .map_err(|err| Status::failed_precondition(format!("reverify drive state: {err}")))?;
+    drive.reverify_invalidated_state().map_err(|err| {
+        crate::closeout_obligation::RetryCause::tape_io(&err).attach(Status::failed_precondition(
+            format!("reverify drive state: {err}"),
+        ))
+    })?;
     let rewind_verify_started = Instant::now();
-    drive
-        .rewind()
-        .map_err(|err| Status::internal(format!("rewind before write verify: {err}")))?;
+    drive.rewind().map_err(|err| {
+        crate::closeout_obligation::RetryCause::tape_io(&err).attach(Status::internal(format!(
+            "rewind before write verify: {err}"
+        )))
+    })?;
     let rewind_verify_elapsed = rewind_verify_started.elapsed();
     let identity_generation = drive.identity_generation();
     let verify_started = Instant::now();
@@ -2922,19 +2929,23 @@ pub(super) fn prepare_drive_for_write_observing_identity(
         let mut source = DriveHandleSource(drive);
         verify_tape_identity(&mut source, tape_uuid).map_err(|err| {
             identity_error(&err);
-            Status::failed_precondition(format!("tape identity: {err}"))
+            crate::closeout_obligation::RetryCause::identity(&err)
+                .attach(Status::failed_precondition(format!("tape identity: {err}")))
         })?;
     }
     let verify_elapsed = verify_started.elapsed();
     let rewind_write_started = Instant::now();
-    drive
-        .rewind()
-        .map_err(|err| Status::internal(format!("rewind before write: {err}")))?;
+    drive.rewind().map_err(|err| {
+        crate::closeout_obligation::RetryCause::tape_io(&err)
+            .attach(Status::internal(format!("rewind before write: {err}")))
+    })?;
     let rewind_write_elapsed = rewind_write_started.elapsed();
     let read_config_started = Instant::now();
-    let current_cfg = drive
-        .read_config()
-        .map_err(|err| Status::internal(format!("read drive config before write: {err}")))?;
+    let current_cfg = drive.read_config().map_err(|err| {
+        crate::closeout_obligation::RetryCause::tape_io(&err).attach(Status::internal(format!(
+            "read drive config before write: {err}"
+        )))
+    })?;
     let read_config_elapsed = read_config_started.elapsed();
     validate_write_media_policy(current_cfg, media_policy)?;
     let write_config_started = Instant::now();
@@ -2945,7 +2956,10 @@ pub(super) fn prepare_drive_for_write_observing_identity(
             })?;
     drive
         .bind_identity_generation(identity_generation)
-        .map_err(|err| Status::failed_precondition(format!("tape identity: {err}")))?;
+        .map_err(|err| {
+            crate::closeout_obligation::RetryCause::tape_io(&err)
+                .attach(Status::failed_precondition(format!("tape identity: {err}")))
+        })?;
     let staging_ring_buffers = drive.staging_ring_buffers();
     let effective_batch_blocks = drive.requested_write_batch_blocks().min(
         drive

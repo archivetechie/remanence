@@ -40,6 +40,9 @@ pub(crate) fn start(
         &actor_fingerprint,
         KIND.as_bytes(),
     );
+    if let Some(pool) = &state.drive_pool {
+        pool.check_finalizing(tape)?;
+    }
     let _start = state
         .operations
         .readiness_start

@@ -1552,10 +1552,14 @@ pub(super) fn write_closeout(
         // predecessor again before the first sidecar block can be dispatched.
         drive
             .locate_admitted_append(previous.cursor.lba)
-            .map_err(|e| Status::unavailable(format!("closeout cursor proof: {e}")))?;
-        drive
-            .check_append_admission()
-            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            .map_err(|e| {
+                crate::closeout_obligation::RetryCause::tape_io(&e)
+                    .attach(Status::unavailable(format!("closeout cursor proof: {e}")))
+            })?;
+        drive.check_append_admission().map_err(|e| {
+            crate::closeout_obligation::RetryCause::tape_io(&e)
+                .attach(Status::failed_precondition(e.to_string()))
+        })?;
         let expected_lba = previous
             .cursor
             .lba
@@ -1564,34 +1568,41 @@ pub(super) fn write_closeout(
             .ok_or_else(|| Status::internal("closeout cursor overflow"))?;
         progress.phase("writing_sidecar");
         for block in &encoded.blocks {
-            drive
-                .check_append_admission()
-                .map_err(|e| Status::failed_precondition(e.to_string()))?;
-            let result = drive
-                .write_block(block)
-                .map_err(|e| Status::unavailable(format!("closeout write: {e}")))?;
+            drive.check_append_admission().map_err(|e| {
+                crate::closeout_obligation::RetryCause::tape_io(&e)
+                    .attach(Status::failed_precondition(e.to_string()))
+            })?;
+            let result = drive.write_block(block).map_err(|e| {
+                crate::closeout_obligation::RetryCause::tape_io(&e)
+                    .attach(Status::unavailable(format!("closeout write: {e}")))
+            })?;
             if result.bytes_written as usize != block.len() || result.end_of_medium {
                 return Err(Status::unavailable(
                     "closeout write did not complete a whole block",
                 ));
             }
         }
-        drive
-            .check_append_admission()
-            .map_err(|e| Status::failed_precondition(e.to_string()))?;
-        drive
-            .write_filemarks_immediate(1)
-            .map_err(|e| Status::unavailable(format!("closeout filemark: {e}")))?;
+        drive.check_append_admission().map_err(|e| {
+            crate::closeout_obligation::RetryCause::tape_io(&e)
+                .attach(Status::failed_precondition(e.to_string()))
+        })?;
+        drive.write_filemarks_immediate(1).map_err(|e| {
+            crate::closeout_obligation::RetryCause::tape_io(&e)
+                .attach(Status::unavailable(format!("closeout filemark: {e}")))
+        })?;
         progress.phase("barrier");
-        drive
-            .check_append_admission()
-            .map_err(|e| Status::failed_precondition(e.to_string()))?;
-        let barrier = drive
-            .write_filemarks(0)
-            .map_err(|e| Status::unavailable(format!("closeout barrier: {e}")))?;
-        let position = drive
-            .position()
-            .map_err(|e| Status::unavailable(format!("closeout position: {e}")))?;
+        drive.check_append_admission().map_err(|e| {
+            crate::closeout_obligation::RetryCause::tape_io(&e)
+                .attach(Status::failed_precondition(e.to_string()))
+        })?;
+        let barrier = drive.write_filemarks(0).map_err(|e| {
+            crate::closeout_obligation::RetryCause::tape_io(&e)
+                .attach(Status::unavailable(format!("closeout barrier: {e}")))
+        })?;
+        let position = drive.position().map_err(|e| {
+            crate::closeout_obligation::RetryCause::tape_io(&e)
+                .attach(Status::unavailable(format!("closeout position: {e}")))
+        })?;
         if barrier.end_of_medium
             || position.partition != previous.cursor.partition
             || position.lba != expected_lba
@@ -1667,7 +1678,10 @@ pub(super) fn write_closeout(
                 )
                 .boundary,
             )
-            .map_err(|e| Status::unavailable(e.to_string()))?;
+            .map_err(|e| {
+                crate::closeout_obligation::RetryCause::tape_io(&e)
+                    .attach(Status::unavailable(e.to_string()))
+            })?;
         progress.phase("projecting");
         lease
             .freeze()

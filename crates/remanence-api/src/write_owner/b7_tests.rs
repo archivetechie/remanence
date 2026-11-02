@@ -1057,3 +1057,312 @@ async fn b7_fix_pool_skips_excluded_or_failed_preferred_drive_and_never_evicts_e
         }
     }
 }
+
+/// Long worker ownership refuses exact-tape callers with a watchable typed Busy.
+#[tokio::test]
+async fn b7_fix2_finalizing_worker_refuses_pinned_read_closeout_and_finalize() {
+    use crate::pb::catalog_server::Catalog;
+    let root = tempfile::tempdir().unwrap();
+    let world = due_tape(root.path()).await;
+    let mut state = state(root.path());
+    state.library_snapshot = Some(library_snapshot_cell(
+        world.lock().unwrap().library_snapshot(),
+    ));
+    let (changer, mut changer_rx) = mpsc::channel(2);
+    let (drive, mut drive_rx) = mpsc::channel(2);
+    let pool = DrivePool::new_for_library(
+        LIBRARY,
+        changer,
+        HashMap::from([(BAY, drive)]),
+        Arc::new(HashMap::from([(BAY, AtomicBool::new(false))])),
+    );
+    state.drive_pool = Some(pool.clone());
+    let (hold, _reservation) = pool.reserve_worker_tape(TAPE).unwrap();
+    let operation = Uuid::new_v4();
+    hold.finalizing(operation);
+    let errors = tokio::time::timeout(StdDuration::from_secs(1), async {
+        vec![
+            crate::mount::test_open_write_for_caller(
+                &state,
+                TAPE,
+                POOL,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap_err(),
+            crate::mount::open_read_session(
+                &state,
+                crate::mount::ReadSessionTarget::Tape { tape_uuid: TAPE },
+                None,
+            )
+            .await
+            .unwrap_err(),
+            state
+                .catalog_service()
+                .closeout_tape(tonic::Request::new(pb::CloseoutTapeRequest {
+                    tape_uuid: TAPE.to_vec(),
+                    expected_pool_id: None,
+                    idempotency_key: Some(pb::IdempotencyKey {
+                        value: Uuid::new_v4().as_bytes().to_vec(),
+                    }),
+                }))
+                .await
+                .unwrap_err(),
+            crate::mount::manual_finalize_tape(
+                &state,
+                crate::mount::ManualFinalizeTapeAdmission {
+                    candidate_operation_id: Uuid::new_v4(),
+                    actor: AuditActor::System,
+                    actor_fingerprint: "test".into(),
+                    idempotency_key: Uuid::new_v4(),
+                    request_fingerprint: [7; 32],
+                    tape_uuid: TAPE,
+                    expected_pool_id: Some(POOL.into()),
+                    reason: "operator".into(),
+                },
+            )
+            .await
+            .unwrap_err(),
+        ]
+    })
+    .await
+    .expect("long work must not block callers");
+    for error in errors {
+        assert_eq!(
+            crate::drive_pool::TapeBusy::from_status(&error).unwrap().0,
+            operation
+        );
+        assert!(error.message().contains(&operation.to_string()));
+    }
+    assert!(drive_rx.try_recv().is_err());
+    assert!(changer_rx.try_recv().is_err());
+}
+
+/// Operator wakes happen after its reservation and attempt finish; an early
+/// native-lease refusal still has a Started/Failed pair with the same identity.
+#[tokio::test]
+async fn b7_fix2_operator_wake_order_and_worker_early_failure_audit() {
+    let root = tempfile::tempdir().unwrap();
+    let world = due_tape(root.path()).await;
+    let mut state = state(root.path());
+    state.library_snapshot = Some(library_snapshot_cell(
+        world.lock().unwrap().library_snapshot(),
+    ));
+    let (changer, _changer_rx) = mpsc::channel(2);
+    let (drive, mut drive_rx) = mpsc::channel(2);
+    state.drive_pool = Some(DrivePool::new_for_library(
+        LIBRARY,
+        changer,
+        HashMap::from([(BAY, drive)]),
+        Arc::new(HashMap::from([(BAY, AtomicBool::new(false))])),
+    ));
+    let task = tokio::spawn({
+        let state = state.clone();
+        async move {
+            crate::mount::closeout_tape(
+                &state,
+                TAPE,
+                None,
+                crate::closeout_progress::CloseoutProgress::new(Uuid::new_v4(), TAPE, None)
+                    .unwrap(),
+            )
+            .await
+        }
+    });
+    let command = tokio::time::timeout(StdDuration::from_secs(2), drive_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let DriveCommand::CloseoutTape { reply, .. } = command else {
+        panic!("closeout dispatch")
+    };
+    assert!(
+        tokio::time::timeout(
+            StdDuration::from_millis(30),
+            state.closeout_work.wake.notified()
+        )
+        .await
+        .is_err(),
+        "operator must retain priority until attempt ends"
+    );
+    reply
+        .send(Err(Status::unavailable("operator attempt complete")))
+        .unwrap();
+    task.await.unwrap().unwrap_err();
+    tokio::time::timeout(
+        StdDuration::from_secs(1),
+        state.closeout_work.wake.notified(),
+    )
+    .await
+    .unwrap();
+    let authority = remanence_state::TapeAuthority::open(
+        &*state.checkpoint_journal_dir,
+        TAPE,
+        &state.index_path,
+    )
+    .unwrap();
+    let _lease = authority.acquire_exclusive().unwrap();
+    let error = crate::mount::closeout_worker_attempt(&state, TAPE, None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    let records = FileAuditLog::replay(&*state.audit_dir).unwrap();
+    let failed = records
+        .iter()
+        .rev()
+        .find(|r| r.event == AuditEvent::OperationFailed)
+        .unwrap();
+    let started = records
+        .iter()
+        .filter(|r| {
+            r.operation_id == failed.operation_id && r.event == AuditEvent::OperationStarted
+        })
+        .count();
+    assert_eq!(started, 1);
+    assert!(failed.detail.contains_key("reason"));
+    drop(_lease);
+    let worker = tokio::spawn({
+        let state = state.clone();
+        async move { crate::mount::closeout_worker_attempt(&state, TAPE, None).await }
+    });
+    let command = tokio::time::timeout(StdDuration::from_secs(2), drive_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let DriveCommand::CloseoutTape { reply, .. } = command else {
+        panic!("worker dispatch")
+    };
+    // A terminal audit failure must not replace the actual refusal classification.
+    let saved_audit = root.path().join("saved-audit");
+    std::fs::rename(&*state.audit_dir, &saved_audit).unwrap();
+    std::fs::write(&*state.audit_dir, b"block audit append").unwrap();
+    reply
+        .send(Err(Status::failed_precondition(
+            "write-protected original refusal",
+        )))
+        .unwrap();
+    let error = worker.await.unwrap().unwrap_err();
+    assert_eq!(error.message(), "write-protected original refusal");
+    std::fs::remove_file(&*state.audit_dir).unwrap();
+    std::fs::rename(saved_audit, &*state.audit_dir).unwrap();
+}
+
+/// Retirement removes live debt before reading either a damaged or missing log,
+/// including a loaded drive cached before the retirement.
+#[tokio::test]
+async fn b7_fix2_retired_debt_skips_unreadable_and_missing_logs() {
+    let root = tempfile::tempdir().unwrap();
+    due_tape(root.path()).await;
+    let state = state(root.path());
+    let mut live = pb::GetLiveStatusResponse {
+        libraries: vec![pb::LibraryState {
+            drives: vec![pb::Drive {
+                loaded_tape_uuid: Some(TAPE.to_vec()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    state.refresh_closeout_surfaces(&mut live).unwrap();
+    assert_eq!(live.closeout_debt.len(), 1);
+    state
+        .index_write()
+        .unwrap()
+        .retire_tape(remanence_state::RetireTapeInput {
+            tape_uuid: TAPE,
+            reason: "damaged medium".into(),
+        })
+        .unwrap();
+    let path = state
+        .checkpoint_journal_dir
+        .join(format!("{}.remtape", Uuid::from_bytes(TAPE).simple()));
+    for missing in [false, true] {
+        if missing {
+            std::fs::remove_file(&path).unwrap();
+        } else {
+            std::fs::write(&path, b"corrupt").unwrap();
+        }
+        state.refresh_closeout_surfaces(&mut live).unwrap();
+        assert!(live.closeout_debt.is_empty());
+        let drive = &live.libraries[0].drives[0];
+        assert!(drive.closeout_authority_error.is_none());
+        assert!(drive.unprotected_bytes.is_none());
+    }
+}
+
+/// Model the worker's load and idle dismount as inventory updates while the
+/// attempt runs and after it parks. Neither must create a second dispatch.
+#[tokio::test]
+async fn b7_fix2_worker_motion_does_not_wake_parked_media_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let world = due_tape(root.path()).await;
+    let mut state = state(root.path());
+    let loaded = world.lock().unwrap().library_snapshot();
+    let mut unloaded = loaded.clone();
+    let bay = unloaded
+        .drive_bays
+        .iter_mut()
+        .find(|b| b.element_address == BAY)
+        .unwrap();
+    let barcode = bay.loaded_tape.take().expect("loaded cartridge");
+    bay.loaded = false;
+    let home = bay.source_slot.take().unwrap();
+    let slot = unloaded
+        .slots
+        .iter_mut()
+        .find(|s| s.element_address == home)
+        .unwrap();
+    slot.full = true;
+    slot.cartridge = Some(barcode);
+    let cell = library_snapshot_cell(loaded.clone());
+    state.library_snapshot = Some(cell.clone());
+    let (changer, mut changer_rx) = mpsc::channel(2);
+    let (drive, mut drive_rx) = mpsc::channel(2);
+    let pool = DrivePool::new_for_library(
+        LIBRARY,
+        changer,
+        HashMap::from([(BAY, drive)]),
+        Arc::new(HashMap::from([(BAY, AtomicBool::new(false))])),
+    );
+    state.drive_pool = Some(pool.clone());
+    crate::closeout_obligation::spawn(state.clone());
+    let command = tokio::time::timeout(StdDuration::from_secs(5), drive_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let DriveCommand::CloseoutTape { reply, .. } = command else {
+        panic!("worker closeout")
+    };
+    for library in [unloaded.clone(), loaded] {
+        *cell.write().unwrap() = library_snapshot_cell(library).read().unwrap().clone();
+        tokio::time::sleep(StdDuration::from_millis(1100)).await;
+    }
+    reply
+        .send(Err(Status::failed_precondition(
+            "write-protected cartridge",
+        )))
+        .unwrap();
+    tokio::time::timeout(StdDuration::from_secs(2), async {
+        loop {
+            if let Ok(reservation) = pool.reserve_tape(TAPE) {
+                drop(reservation);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    *cell.write().unwrap() = library_snapshot_cell(unloaded).read().unwrap().clone();
+    tokio::time::sleep(StdDuration::from_millis(2200)).await;
+    assert!(
+        changer_rx.try_recv().is_err(),
+        "own idle dismount must not reload parked failure"
+    );
+    assert!(
+        drive_rx.try_recv().is_err(),
+        "own load wake must not survive as another retry"
+    );
+    state.readiness_shutdown.store(true, Ordering::SeqCst);
+}

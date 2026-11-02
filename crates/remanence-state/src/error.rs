@@ -6,6 +6,12 @@ use std::path::{Path, PathBuf};
 /// Layer 4 state-management failures.
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
+    /// A long finalization owns this tape; clients can watch the named operation.
+    #[error("Busy: tape is finalizing; watch operation {operation_id}")]
+    TapeBusy {
+        /// Running operation identity.
+        operation_id: uuid::Uuid,
+    },
     /// Unwired per-tape authority storage failure, preserving publication outcome.
     #[error(transparent)]
     TapeLog(Box<crate::tape_log::store::StoreError>),

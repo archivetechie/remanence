@@ -979,9 +979,13 @@ pub(crate) fn status_from_pool_write_error(
         PoolWriteError::TerminalCloseRequired { .. } => Status::resource_exhausted(message),
         PoolWriteError::ContentHashMismatch { .. } => Status::failed_precondition(message),
         PoolWriteError::WriteAdmissionConflict(_) => Status::aborted(message),
-        PoolWriteError::ObjectWriteMedia(_) | PoolWriteError::TapeIdentity(_) => {
-            Status::failed_precondition(message)
+        PoolWriteError::ObjectWriteMedia(_) => Status::failed_precondition(message),
+        PoolWriteError::TapeIdentity(crate::pool_write::TapeIdentityError::Io(error)) => {
+            status_from_tape_io_error(error, message)
         }
+        PoolWriteError::TapeIdentity(_) => crate::closeout_obligation::RetryCause::Operator
+            .attach(Status::failed_precondition(message)),
+        PoolWriteError::TapeIo(error) => status_from_tape_io_error(error, message),
         PoolWriteError::CallerObjectIdConflict { .. }
         | PoolWriteError::CallerObjectIdInputKindConflict { .. }
         | PoolWriteError::CallerObjectIdArchivePathConflict { .. }
@@ -997,7 +1001,6 @@ pub(crate) fn status_from_pool_write_error(
         PoolWriteError::PhysicalUsedBytesOverflow { .. }
         | PoolWriteError::CheckpointReconciliation(_)
         | PoolWriteError::Io { .. }
-        | PoolWriteError::TapeIo(_)
         | PoolWriteError::TransferWithSecondary { .. }
         | PoolWriteError::TimeFormat(_) => Status::internal(message),
     }
@@ -1033,8 +1036,14 @@ pub(crate) fn status_from_format_error(err: &FormatError, message: String) -> St
     }
 }
 
+/// Keep typed media refusals distinct from arbitrary transport diagnostics.
+fn status_from_tape_io_error(error: &remanence_library::TapeIoError, message: String) -> Status {
+    crate::closeout_obligation::RetryCause::tape_io(error).attach(Status::internal(message))
+}
+
 pub(crate) fn status_from_parity_error(err: &ParityError, message: String) -> Status {
     match err {
+        ParityError::TapeIo(error) => status_from_tape_io_error(error, message),
         ParityError::ResumeAppend(_) | ParityError::CloseoutCheckMismatch { .. } => {
             Status::failed_precondition(message)
         }
