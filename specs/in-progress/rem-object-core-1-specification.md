@@ -83,7 +83,7 @@ document's section.
 | --- | --- |
 | Status | Review draft |
 | Version | 1.0.0-draft.4 |
-| Date | 2026-09-26 |
+| Date | 2026-11-02 |
 | License | CC-BY-4.0 |
 | Concept DOI (all revisions of this document) | [10.5281/zenodo.21719158](https://doi.org/10.5281/zenodo.21719158) |
 | Reference implementation (informative) | Zenodo concept DOI [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) — software deposit, Apache-2.0 |
@@ -94,6 +94,19 @@ pinned, so what is under review is not whether the design works but whether
 *this text describes it correctly and completely* — an independent
 implementation built from these words alone should produce the published
 vectors, and where it would not, the text is wrong and we want to know.
+
+This preparing copy goes further than the implementation and the pinned
+vectors in one respect. Its rules for stored names and header fields
+(Sections 4.3.1, 4.3.2, 4.6.1, 4.6.6 and 4.6.8) tighten what a Reader accepts
+and change the bytes a Builder writes. Under the three questions below, the
+change would need a new major version once the documents are frozen, because
+some objects that were valid become invalid; it is made before the freeze
+instead. The full-object digests that Section 13 and REM-ENCRYPT §13 pin,
+among them those of REM-OBJECT-TV-P1 and REM-OBJECT-TV-D1, are therefore stale
+for this preparing copy; the layouts, pad values and manifests that Section 13
+pins are not. The candidate vectors of Section 13.7 are specified but not yet
+generated. Appendix D, RO-3, records the implementation and the regeneration
+still to come.
 
 **Comments close on 30 April 2027, and the documents freeze on 31 July 2027**,
 one year after publication. On that date the finality promise below takes
@@ -336,7 +349,7 @@ A single implementation may fill several roles.
   representation.
 - **Consumer**: interprets a decoded manifest (Section 4.7). A **Restoring
   Consumer** additionally materializes entries to a target filesystem; its
-  obligations are stated in Sections 4.7.3 and 12.10.
+  obligations are stated in Sections 4.6.8, 4.7.3 and 12.10.
 
 ### 2.3. Definitions
 
@@ -386,7 +399,11 @@ Byte offsets are zero-based. `KiB` = 2^10 bytes; `MiB` = 2^20 bytes.
 Hexadecimal values are prefixed `0x`. ustar numeric fields are ASCII octal
 (Section 4.3). All other text in the Core format—pax keywords and values,
 paths, and manifest text strings—is UTF-8
-[RFC3629]; pax keywords are additionally restricted to ASCII. The functions
+[RFC3629]; pax keywords are additionally restricted to ASCII. Stored paths
+and symlink targets also contain no control character (Section 4.6.6). A
+name that is not such text is stored under a stand-in, and its original
+bytes are recorded as ASCII hexadecimal in a pax record and as a manifest
+byte string (Section 4.6.8). The functions
 `roundup(x, C)` and `roundup512(x)` denote the smallest multiple of `C`
 (respectively 512) that is greater than or equal to `x`; when `x` is already
 a multiple the result is `x` itself. Equivalently,
@@ -407,8 +424,9 @@ wrap silently (Section 11). PFR denotes partial file restore (Section 6).
 | `MANIFEST_PATH` | `_remanence/manifest.cbor` | Manifest entry path |
 | `RESERVED_PREFIX` | `_remanence` | Reserved path namespace (Section 4.6) |
 | `USTAR_SIZE_MAX` | 0o77777777777 (8 GiB − 1) | Largest size representable in the ustar size field |
-| `PAX_PATH_PLACEHOLDER` | `remanence/pax-path` | ustar name placeholder for pax-backed paths (Section 4.3) |
-| `PAX_LINK_PLACEHOLDER` | `remanence/pax-linkpath` | ustar linkname placeholder for pax-backed link targets (Section 4.6.1) |
+| `PAX_PATH_PLACEHOLDER` | `_remanence/p/` | Prefix of the ustar `name` placeholder of an entry whose path does not fit `name` (Section 4.3.2) |
+| `PAX_LINK_PLACEHOLDER` | `_remanence/l/` | Prefix of the ustar `linkname` placeholder of a symlink whose target does not fit `linkname` (Section 4.6.1) |
+| `STAND_IN_COMPONENT_MAX` | 255 | Longest stored component, in bytes, that a stand-in may produce (Section 4.6.8) |
 | `GLOBAL_HEADER_NAME` | `GlobalHead.0/PaxHeaders/remanence` | ustar name of the global pax header |
 | `PAX_HEADER_NAME` | `PaxHeaders.0/remanence_file` | ustar name of member-entry pax headers |
 | `MANIFEST_PAX_HEADER_NAME` | `PaxHeaders.0/_remanence_manifest` | ustar name of the manifest's pax header |
@@ -569,11 +587,11 @@ Every header is one 512-byte record:
 | 136 | 12 | `mtime` | `00000000000\0` (mtime lives in pax only, Section 4.4.4) |
 | 148 | 8 | `chksum` | Section 4.3.3 |
 | 156 | 1 | `typeflag` | `g`, `x`, `0`, `1`, `2`, or `5` (Section 4.5, Section 4.6) |
-| 157 | 100 | `linkname` | Symlink or hardlink target when it fits in ustar `linkname`; otherwise `PAX_LINK_PLACEHOLDER` (Section 4.6.1); all NUL for other entries |
+| 157 | 100 | `linkname` | Symlink target when it fits in ustar `linkname`, otherwise a placeholder beginning with `PAX_LINK_PLACEHOLDER`; for a hardlink, its primary's `name` (Section 4.6.1); all NUL for other entries |
 | 257 | 6 | `magic` | `ustar\0` |
 | 263 | 2 | `version` | `00` |
-| 265 | 32 | `uname` | `remanence`, NUL-padded |
-| 297 | 32 | `gname` | `remanence`, NUL-padded |
+| 265 | 32 | `uname` | All NUL |
+| 297 | 32 | `gname` | All NUL |
 | 329 | 8 | `devmajor` | All NUL |
 | 337 | 8 | `devminor` | All NUL |
 | 345 | 155 | `prefix` | All NUL (Builders never use `prefix`) |
@@ -589,21 +607,37 @@ The `mode` values by entry type:
 | Directory | `0000755\0` |
 | Pax header record (`g`, `x`) | `0000644\0` |
 
-Octal fields are zero-padded ASCII octal terminated by NUL. When parsing,
-Readers MUST stop a numeric field at the first NUL or space, MUST accept
-surrounding ASCII whitespace, and MUST treat an empty field as zero. The
-`uid`, `gid`, ustar `mtime`, `uname`, and `gname` fields carry the fixed
-values above regardless of metadata-preservation tier. Readers MUST ignore
-these fields.
+The six numeric fields are zero-padded ASCII octal. In `mode`, `uid` and
+`gid` a Builder writes seven octal digits and a NUL, in `size` and `mtime`
+eleven octal digits and a NUL, and in `chksum` the form Section 4.3.3 gives.
+A Builder MUST write every numeric field of every header in exactly this
+form. A Reader MUST accept a numeric field only in this form: the field's
+full number of digits, each `0` to `7`, followed by exactly its terminator.
+A Reader MUST reject any other spelling with `Parse`. Rejected spellings
+include a leading `+` or `-`; a space, tab, newline or NUL before the digits;
+fewer digits padded with NUL; a space in place of the terminating NUL; and a
+base-256 value. The `uid`, `gid`, ustar `mtime`, `uname`, and `gname` fields
+carry the fixed values above regardless of metadata-preservation tier.
+Readers MUST ignore the values of these fields; `uid`, `gid` and `mtime` are
+numeric fields, so their form is checked as above.
 
-*Rationale.* This specification deliberately does not preserve ownership, so a
-root-run standard `tar` extraction cannot apply ownership the format never
-recorded.
+*Rationale.* Standard tar programs do not read other spellings alike. Given a
+leading `+`, a NUL before the digits, or a tab or newline before them, one of
+GNU tar, bsdtar and Python `tarfile` reads a value that another reads
+differently or refuses, so one program could see content that another does
+not. Accepting only the Builder's form means that an object a Reader accepts
+is read the same way by each of them.
+
+*Rationale.* This specification deliberately does not preserve ownership. With
+`uid` and `gid` 0 and both owner names empty, a standard `tar` run as root
+makes root the owner of every file it extracts, rather than giving the files
+to a local account whose name matches a recorded name.
 
 #### 4.3.2. Reader-Ignored Fields; Names and Sizes
 
-Readers MUST NOT base acceptance on `mode`, `uid`, `gid`, ustar `mtime`,
-`uname`, `gname`, `devmajor`, `devminor`, or `version`. Readers MUST honor
+Readers MUST NOT base acceptance on the values of `mode`, `uid`, `gid`, ustar
+`mtime`, `uname`, `gname`, `devmajor`, `devminor`, or `version`; the form of a
+numeric field is checked as Section 4.3.1 requires. Readers MUST honor
 `prefix` when forming a header path from a foreign ustar header
 (`prefix + "/" + name` when `prefix` is non-empty). Conformant Builders leave
 `prefix` empty.
@@ -613,8 +647,15 @@ records (Section 4.4.4). The ustar header nevertheless remains well-formed:
 
 - **Name.** If the effective path is non-empty, at most 100 bytes, and
   consists solely of non-control ASCII, the Builder MUST store it in `name`
-  verbatim; otherwise the Builder MUST store `PAX_PATH_PLACEHOLDER`
-  (`remanence/pax-path`).
+  verbatim. Otherwise the Builder MUST store the entry's path placeholder:
+  `PAX_PATH_PLACEHOLDER` (`_remanence/p/`), the entry's ordinal as eight
+  decimal digits, `-`, and the first 16 lowercase hexadecimal digits of the
+  SHA-256 of the entry's `path` value, followed by `/` for a directory. An
+  entry's ordinal is its zero-based position among the object's member
+  entries in archive order, which is also its index in the manifest's
+  `file_entries`. For example, a first entry with the path
+  `unicode/vidéo.txt` has the placeholder
+  `_remanence/p/00000000-5fbe5dcff4b1f3f2`.
 - **Size.** If the payload length is ≤ `USTAR_SIZE_MAX`, the Builder MUST store
   it in `size`; otherwise the Builder MUST store zero. The pax `size` record is
   always present and authoritative, so files ≥ 8 GiB are fully supported.
@@ -623,13 +664,22 @@ records (Section 4.4.4). The ustar header nevertheless remains well-formed:
   `MANIFEST_PAX_HEADER_NAME` (Section 2.5). They exist for human-readable
   `tar -t` listings; Readers MUST NOT interpret them.
 
+*Rationale.* A placeholder is unique within its object and lies in the
+reserved namespace, which no member path may use (Section 4.6.6). A reader
+that ignores the pax `path` record, as some readers do with a name they
+cannot convert to their locale, therefore still writes every entry to a file
+of its own, and the ordinal leads to the entry's manifest element. A
+placeholder shared by several entries would make such a reader write them
+all to one name and keep only the last.
+
 #### 4.3.3. Checksum
 
 The `chksum` field holds the unsigned sum of all 512 header bytes with the
 eight checksum bytes treated as ASCII spaces (0x20), encoded as six ASCII
 octal digits, a NUL, and a space. Builders MUST emit exactly this encoding.
 Readers MUST verify the unsigned checksum and reject a mismatch with
-`UstarChecksumMismatch`.
+`UstarChecksumMismatch`. A Reader rejects a `chksum` field in any other form
+with `Parse` before it compares the sum (Section 4.3.1).
 
 #### 4.3.4. Typeflags
 
@@ -806,14 +856,21 @@ Each entry is, in order:
 
 For symbolic links, Builders MUST store the target in ustar `linkname` when it
 fits in 100 bytes; otherwise they MUST store it in pax `linkpath` and store
-`PAX_LINK_PLACEHOLDER` (`remanence/pax-linkpath`) in `linkname`. A symlink target is an opaque UTF-8 OS string, not
+the entry's link placeholder in `linkname`: `PAX_LINK_PLACEHOLDER`
+(`_remanence/l/`), the entry's ordinal as eight decimal digits (Section
+4.3.2), `-`, and the first 16 lowercase hexadecimal digits of the SHA-256 of
+the stored target. A symlink target is an opaque UTF-8 OS string, not
 a REM-OBJECT path: it MAY be absolute, contain `..`, or be dangling. Directory
 paths MUST end in `/`.
 
 **Hardlinks.** A hardlink entry records that its path is a second name for the
 bytes of another entry — the **primary** — in the same object. Its target is
-stored exactly as a symlink target is: in `linkname`, or in pax `linkpath`
-with `PAX_LINK_PLACEHOLDER` in `linkname`. Unlike a symlink target, it is
+the primary's stored path (Section 4.6.8). Builders MUST store the primary's
+ustar `name` (Section 4.3.2) in the hardlink's `linkname`, and MUST also store
+the target in pax `linkpath` when that `name` is a path placeholder rather
+than the target itself. A hardlink therefore never uses
+`PAX_LINK_PLACEHOLDER`, and a reader that ignores pax records links it to the
+file it wrote for the primary. Unlike a symlink target, a hardlink target is
 **not** an arbitrary string. It MUST be a canonical relative path (Section
 4.6.6) that resolves, within the same object, to a **regular-file primary
 entry appearing before** the hardlink entry. Of a set of names sharing one
@@ -837,6 +894,8 @@ entry's pax header carries:
 | `REMANENCE.file_id` | REQUIRED | Non-empty opaque UTF-8 stable identifier, unique within the object |
 | `REMANENCE.file_sha256` | Regular entries only | Exactly 64 lowercase hex digits: SHA-256 of the exact payload bytes |
 | `REMANENCE.is_manifest` | Manifest entry only | MUST be `true`; MUST be absent on member entries |
+| `REMANENCE.original_linkpath` | Symlink entries whose stored target differs from the original target | The original target's bytes in lowercase hexadecimal (Section 4.6.8) |
+| `REMANENCE.original_path` | Entries whose stored path differs from the original path | The original path's bytes in lowercase hexadecimal (Section 4.6.8) |
 | `REMANENCE.pad` | Non-empty regular entries, as needed | Alignment filler (Section 4.6.3); value MUST consist solely of ASCII spaces. Zero-payload entries carry no pad record |
 
 Readers MUST verify `REMANENCE.compression` is present and equals `none` on
@@ -939,7 +998,9 @@ was given, not the payload the metadata describes.
 
 For every member entry, Builders MUST enforce:
 
-1. `path` is non-empty UTF-8, contains no NUL and no byte < 0x20.
+1. `path` is non-empty UTF-8 and contains no NUL and no other control
+   character: no C0 control (U+0001–U+001F), no DEL (U+007F) and no C1
+   control (U+0080–U+009F).
 2. `path` is a **canonical relative path**: it does not begin with `/`, does
    not end with `/` unless the entry is a directory, and, after ignoring a
    directory's one required trailing slash, none of its `/`-separated components
@@ -953,18 +1014,25 @@ For every member entry, Builders MUST enforce:
 Readers MUST reject an entry whose effective path violates rules 1–2
 (`InvalidPath`). A traversal-shaped or non-canonical path is nonconformant.
 Rules 3–5 bind the Builder; Verifiers and Consumers catch duplicates via the
-manifest (Section 4.7). Within those rules, paths are byte sequences stored
-verbatim: the format performs no Unicode normalization (NFC and NFD spellings
+manifest (Section 4.7). Within those rules, a path is stored as the bytes
+given, and a name the rules do not admit is stored under a stand-in (Section
+4.6.8): the format performs no Unicode normalization (NFC and NFD spellings
 of the same name are distinct paths), no case folding, and no separator
-translation.
+translation. Other characters, including bidirectional formatting characters
+such as U+200F, are lawful in paths; how a tool displays them is outside this
+document.
 
 *Rationale.* Accepting a traversal-shaped or non-canonical path would push the
 hazard onto every downstream consumer (Section 12.10).
 
 Symlink targets are not entry paths and MUST NOT be validated with the
-canonical-relative-path rule. A target is a pax value: valid UTF-8, no NUL,
-and no byte < 0x20. It may be absolute, contain `..`, or point to a missing
-target; Section 12.10 describes the hazard this creates on restore.
+canonical-relative-path rule. A stored target, whether in pax `linkpath` or in
+`linkname`, is valid UTF-8 with no NUL and no other control character, as
+rule 1 requires of a path. A Reader MUST reject a symlink whose effective
+target breaks this rule (`InvalidPath`), unless the pax record grammar has
+already rejected it (Section 4.4.1). A target may be absolute, contain `..`, or point
+to a missing target; Section 12.10 describes the hazard this creates on
+restore.
 
 #### 4.6.7. Entry Order
 
@@ -976,6 +1044,216 @@ appearing after the manifest entry (`Parse`).
 
 *Rationale.* Such an entry cannot be listed in the manifest, so the object's
 self-description would be silently incomplete.
+
+#### 4.6.8. Stored Names and Original Names
+
+A source filesystem can hold names that this format does not store as text: a
+name whose bytes are not well-formed UTF-8 [RFC3629], or one that contains a
+control character. A Builder stores such an entry as an ordinary entry under
+a readable **stand-in** and records the name's original bytes. A name that is
+already text without a control character is stored exactly as given.
+
+**Terms.** A Builder is given each entry's **original path**, and for a
+symlink its **original target**, as byte strings. The entry's `path` is its
+**stored path**, and a symlink's effective target is its **stored target**. The
+**components** of a name are the byte strings that its `/` (0x2F) bytes
+separate: a name with n `/` bytes has n + 1 components. A path has no empty
+component once a directory's final `/` is set aside (Section 4.6.6 rule 2); a
+target can have empty components, as an absolute target has before its first
+`/`. A **control character** is a C0 control (U+0001–U+001F), DEL (U+007F) or
+a C1 control (U+0080–U+009F).
+
+**Original names.** An original path MUST be non-empty, MUST contain no NUL,
+and MUST be a canonical relative path as Section 4.6.6 rule 2 defines one,
+applied to its bytes; it ends in `/` exactly when the entry is a directory.
+An original target MUST be non-empty and MUST contain no NUL; like a stored
+target, it may be absolute, contain `..`, or be dangling. No two entries in
+one object may share an original path. An original path lies in the reserved
+namespace exactly when its stored path does, so Section 4.6.6 rule 3 binds
+both. A Builder MUST reject an entry whose original names violate these
+rules (`InvalidInput`).
+
+**The stand-in of a component.** Read the component from its first byte.
+Where the bytes at the current position begin a well-formed UTF-8 encoding of
+one character, take that character: if it is a control character, write each
+byte of its encoding as `%HH`; otherwise write the character unchanged. Where
+they do not, write the one byte at the current position as `%HH` and continue
+at the next byte. `HH` is the byte's value as two uppercase hexadecimal
+digits. Each character or `%HH` written is one **unit** of the stand-in. A
+component is **clean** when its stand-in is the component itself, that is,
+when it is well-formed UTF-8 with no control character. Every character other
+than a control character, `%` included, is kept.
+
+For example, the Latin-1 component `caf\xE9.txt` (where `\xE9` denotes the
+byte 0xE9) has the stand-in `caf%E9.txt`, the macOS component `Icon\r`,
+which ends in a carriage return, has `Icon%0D`, and U+0085 in a component
+becomes `%C2%85`. The components `café.txt` and `My%20File.pdf` are clean.
+
+**Stored paths.** Stored paths are assigned over the whole object. Each
+member entry's original path, without a directory's final `/`, is a sequence
+of components. Its first component, its first two components, and so on up
+to the whole sequence, are **nodes**; entries whose paths begin alike share
+those nodes. Two nodes are **siblings** when they differ only in their last
+component. A Builder gives each node one **stored component**, and
+an entry's stored path is the stored components of its nodes joined with
+`/`, followed by `/` for a directory. Within each set of siblings:
+
+1. A clean node's stored component is its component.
+2. A node that is not clean has its stand-in as its stored component, unless
+   the stand-in is longer than `STAND_IN_COMPONENT_MAX` (255) bytes or equals
+   the stand-in of a sibling.
+3. Each remaining node, taken in ascending bytewise order of its original
+   component, receives the first of its names `n_0`, `n_1`, … that is not
+   already the stored component of a sibling.
+
+A node's name `n_i` is formed from its stand-in `s` and its original
+component `c`:
+
+- The **suffix** is `~` followed by the first 16 lowercase hexadecimal digits
+  of `h_i`. `h_0` is the SHA-256 of `c`; for `i` of 1 or more, `h_i` is the
+  SHA-256 of `c`, a NUL byte, and the decimal digits of `i`.
+- The **extension** of `s` is its last `.` and the units after it, when that
+  `.` is not the first unit of `s` and the extension is at most 16 bytes long;
+  otherwise the extension is empty. The **stem** is `s` without its
+  extension.
+- `n_i` is a run of whole units from the start of the stem, then the suffix,
+  then the extension. The run is the longest that keeps `n_i` within 255
+  bytes.
+
+For example, a directory that holds both a clean `caf%E9.txt` and the Latin-1
+`caf\xE9.txt` stores the first unchanged and the second as
+`caf%E9~9c03503956b369f4.txt`. A component of 100 bytes 0xE9 followed by
+`.jpg` has a stand-in of 304 bytes, and is stored as 78 units `%E9`, the
+suffix and `.jpg`: 255 bytes in all.
+
+The stored components of siblings are therefore distinct, and none is empty,
+`.` or `..`, or contains `/`. Stored paths thus satisfy Section 4.6.6 rules
+2 and 4 whenever the original paths satisfy them. A clean component is never
+changed, so an object whose names are all clean is unaffected by this
+section.
+
+**Stored targets.** A symlink's stored target has one component for each
+component of its original target, joined with `/`. To find them, resolve the
+original target lexically against the nodes of the object. Start at the node
+that contains the symlink, or at the object root when the symlink's path has
+one component. Take the target's components in turn: an empty or `.`
+component stays where it is, `..` moves to the containing node, and any other
+component moves to the child node with that original component. Resolution
+stops at an absolute target (one that begins with `/`), at a `..` above the
+object root, or at a component that names no child node, and the components
+from there on reach no node. A component that reaches a node is stored as
+that node's stored component. Every other component, including empty, `.`
+and `..` components, is stored as its stand-in, with no suffix and no
+shortening.
+
+Resolution is by name, through the tree of the object's original paths, and
+does not follow symlinks. A component that names a symlink entry reaches that
+entry's node; when the symlink's own path has no entries below it, the next
+component names no child node, and it and the components after it keep their
+stand-ins. A target that passes through another symlink of the object can
+therefore, after a standard tar has written the stored names, name a different
+entry than its original target named, or nothing.
+
+A target that resolves to an entry of the object without passing through
+another symlink names that entry's stored path, and still resolves
+after a standard tar has written the stored names, even when the entry's
+stored component was suffixed or shortened. A target that stops resolving
+keeps the stored components of the nodes it reached before it stopped; only
+the components from there on are replaced by their stand-ins. An absolute
+target reaches no node, so each of its components is its stand-in. A
+component replaced by its stand-in resolves after such an extraction only if
+the host holds a name spelled as that stand-in. A hardlink's target is its
+primary's stored path (Section 4.6.1), and a hardlink has no original
+target: a Builder is given a hardlink's primary by the primary's original
+path, and stores the primary's stored path as the target.
+
+**Records.** A Builder MUST emit `REMANENCE.original_path` exactly when an
+entry's stored path differs from its original path, and MUST emit
+`REMANENCE.original_linkpath` exactly when a symlink's stored target differs
+from its original target. Each value is the original bytes in lowercase
+hexadecimal, two digits per byte. The entry's manifest element carries the
+same bytes in `original_path` and `original_link_target`, under the same
+conditions (Section 4.7.2). These records and keys do not affect
+`REMANENCE.schema_version` (Section 10). An entry without a record has its
+stored names as its original names.
+
+**Readers.** For an entry with a `REMANENCE.original_path` record, a Reader
+MUST verify that the value is lowercase hexadecimal of even length; that the
+original path it encodes is non-empty, contains no NUL, is a canonical
+relative path and ends in `/` exactly when the entry is a directory; that it
+differs from the stored path; and that it has as many components as the
+stored path.
+Each clean original component MUST appear unchanged as the corresponding
+stored component. Each other original component MUST appear as its stand-in,
+or as its name `n_0` with any 16 lowercase hexadecimal digits in place of the
+suffix's; the suffix sits where `n_0` places it, so a literal `~` elsewhere
+in the name does not move it. A stand-in longer than 255 bytes MUST appear
+in that suffixed form. For a `REMANENCE.original_linkpath` record, a Reader
+MUST verify the same encoding, that the original target is non-empty and
+contains no NUL, that it differs from the stored target, and that the two
+have as many components. Each clean original component of the target MUST appear
+unchanged, and each other one as its stand-in or in the suffixed form above.
+The 255-byte rule for paths does not apply to a target: a target component
+that reaches no node keeps its whole stand-in, however long.
+The record is a violation on an entry that is not a symlink. A Reader MUST
+reject a violation with `InvalidPath`. Whether a component needed a suffix,
+which `i` it received, which target components reach a node, and whether two
+entries share an original path depend on the rest of the object, which a
+Verifier checks. The reserved-namespace rule needs no check of its own: it
+holds for an original path exactly when it holds for the stored path.
+
+**Verifiers.** A Verifier MUST recompute every stored path and stored target
+of the object from the original names that its member entries' pax records
+carry, as this section assigns them, and MUST reject any difference
+(`InvalidPath`). It MUST also reject an object in which two entries share an
+original path (`InvalidPath`). When it compares the manifest with the entries
+(Section 7.4), it MUST reject an entry whose pax records and manifest element
+disagree about an original name, including whether one is present
+(`InvalidPath`).
+
+**Restoring Consumers.** Which names a Restoring Consumer creates, an entry's
+original names or its stored names, is restore policy, which this document
+leaves to the tool and its operator (Sections 1.4 and 1.6). For every entry
+whose original names differ from its stored names, a Restoring Consumer MUST
+report which names it created, its path and, for a symlink, its target,
+naming the entry by its stored path. The collision rule of Section 12.10
+applies to the names it creates.
+
+A Restoring Consumer that takes an entry's original names from its pax
+records MUST confirm them against the entry's element in a manifest it has
+verified (Section 4.7.2, obligation 1) before it reports the entry restored.
+The two MUST hold the same original path, and for a symlink the same original
+target, or both MUST hold none. A Consumer that takes the names from a
+verified manifest, or from a catalog derived from one, needs no pax record.
+While streaming, before the manifest arrives, a Consumer MAY create entries
+under names from the pax records provisionally; it MUST report each entry
+whose names the verified manifest then contradicts as not restored
+(`InvalidPath`). When no verified manifest is available, as when a Reader
+reports `MissingManifest` or works in salvage mode, a Consumer MUST report the
+original names it created from pax records as unconfirmed.
+
+Informative: a Restoring Consumer may create an entry's original bytes where
+the destination can hold them, and its stored names elsewhere; either way it
+must report which it created, as required above. Making the same choice for a
+node wherever it appears keeps every entry below one directory together.
+Building each symlink target from the names created for the nodes it reaches
+(see “Stored targets”), rather than taking the original or the stored target
+whole, keeps a link that reaches an entry without passing through another
+symlink pointing at that entry as restored.
+
+*Rationale.* The stored name is text that standard tar programs restore
+alike, so it is the entry's identity in listings, reports and catalogs. The
+original bytes are recorded twice, as `REMANENCE.file_sha256` duplicates the
+manifest's hash: a streaming restore can use them before the manifest
+arrives, and they survive damage to either copy. Each copy is checked on its
+own by recomputation, and the Verifier and the Restoring Consumer bind the two
+copies to each other, so neither can give an entry a different original name.
+Recomputing the stand-in from the original, rather than trusting the record,
+keeps a crafted record from directing a restore to a name other than the one
+the entry is stored under. Resolving link targets against the object's names
+keeps working, when the stored names are restored, every link whose target
+reaches an entry through those names without passing through another symlink;
+every standard tar restores the stored names.
 
 ### 4.7. The Manifest
 
@@ -1068,6 +1346,8 @@ representation for regular-only objects.
 | `file_sha256` | bytes | Regular entries only: exactly 32 bytes; binary SHA-256 (hex in pax, binary here). A hardlinked name's hash is its primary's, reached via `link_target` |
 | `first_chunk_lba` | unsigned/`null` | Inner `BodyLba`; `null` if and only if `size_bytes` = 0 (so `null` for hardlinks) |
 | `link_target` | text | Symlink entries: the effective target string. Hardlink entries: the primary's in-object path (Section 4.6) |
+| `original_path` | bytes | OPTIONAL; present exactly when the entry's original path differs from `path`, and then the original path's bytes (Section 4.6.8) |
+| `original_link_target` | bytes | OPTIONAL; symlink entries only, present exactly when the original target differs from `link_target`, and then the original target's bytes (Section 4.6.8) |
 | `metadata_preservation_data` | map | Empty, the xattr container of Section 4.7.3, an `ext` container (Section 4.7.5), or both; hardlink entries MUST use an empty map |
 
 Consumer obligations:
@@ -1086,7 +1366,14 @@ Consumer obligations:
    above (`ManifestInvalid`), including the cross-checks: `object_id`,
    `caller_object_id`, and `chunk_size` MUST equal the corresponding global
    header values when both are in hand, and no two `file_entries` elements
-   may share a `path` or a `file_id`.
+   may share a `path` or a `file_id`. Every `original_path` and
+   `original_link_target` MUST satisfy the rules of Section 4.6.8 for
+   original names, and every `path`, and every symlink's `link_target`, MUST
+   be the stored name that Section 4.6.8 assigns from the elements' original
+   names; an element without `original_path` or `original_link_target`
+   contributes its stored name. A Verifier, which checks the entries' own
+   names first, reports a stored name that fails this check as `InvalidPath`
+   (Section 7.4).
 3. A Consumer MUST treat unknown bare keys as **reserved for future revisions
    of this document** and ignore them. This covers top-level and per-entry
    keys, including unknown bare keys within `metadata_preservation_data` and
@@ -1096,8 +1383,8 @@ Consumer obligations:
 
 **Verifier obligation.** A Verifier MUST verify that the manifest and the
 archive entries correspond exactly (Section 7.4). They correspond exactly when
-they have the same paths, entry types, link targets, sizes, hashes where
-present, and chunk geometry, with no extras on either side.
+they have the same paths, original names, entry types, link targets, sizes,
+hashes where present, and chunk geometry, with no extras on either side.
 
 #### 4.7.3. Extended-Attribute Preservation
 
@@ -1293,9 +1580,11 @@ rather than complete it.
 ### 4.9. Builder, Planner, and Reader Obligations
 
 **Builder and Planner.** The Planner computes the entire layout from the file
-*specs* alone, without payload bytes. The specs are the path, file_id, entry
-type, link target where present, size, hash, optional mtime/executable, and
-1.x preservation metadata. The layout is every offset, pad size, manifest
+*specs* alone, without payload bytes. The specs are the original path,
+file_id, entry type, a symlink's original target or a hardlink primary's
+original path, size, hash,
+optional mtime/executable, and 1.x preservation metadata; the stored names
+follow from them (Section 4.6.8). The layout is every offset, pad size, manifest
 byte, and the final block count. The Planner and the Builder MUST share the
 sizing rules that make the planned layout byte-exact. A failed object MUST NOT
 be reported as complete. A Builder MUST fail the object when a block write
@@ -1315,7 +1604,8 @@ A Reader processes the object as follows:
 2. On an all-zero record: require the second EOF record (Section 4.8), run the
    Section 4.5.2 global checks (covers empty objects), and stop. Remaining
    blocks are ignored.
-3. Verify the header checksum (Section 4.3.3).
+3. Verify the form of every numeric field (Section 4.3.1) and the header
+   checksum (Section 4.3.3).
 4. Dispatch on typeflag:
 
    | Typeflag | Reader action | Error |
@@ -1347,7 +1637,12 @@ unsorted or duplicate pax records, the NUL typeflag, `prefix`-formed names,
 missing pax `path` or `size` with ustar fallback, and later `g` headers. It
 rejects the cases in which silent acceptance would misrepresent the object:
 unknown typeflags, an unknown format or major version, non-`none` compression,
-misaligned data, traversal-shaped paths, and checksum mismatches.
+misaligned data, numeric fields not in the Builder's form, traversal-shaped
+paths, stored names that do not follow from their original names, and
+checksum mismatches. The tolerance does not extend to numeric fields: a
+spelling that other tar programs write, such as `000644 \0` or a field ended
+by a space, is rejected like any other spelling but the Builder's (Section
+4.3.1).
 
 ### 4.10. Standard-Tool Extraction (Long-Term Fallback)
 
@@ -1363,13 +1658,23 @@ extracts every payload file byte-correct, recreates hardlinks, symlinks, and
 directories, and also writes one extra file `_remanence/manifest.cbor`. Unknown
 `REMANENCE.*` keywords are ignored by POSIX rule; `REMANENCE.pad` inflates
 only header size, never content; the manifest decodes with any generic CBOR
-tool into self-describingly-named text fields. Stock tar faithfully restores
-absolute or dangling symlinks too; that fidelity is correct but not a safety
-claim (Section 12.10). With all REM-OBJECT-specific metadata lost, a Scanner can still
+tool into self-describingly-named text fields. Stock tar restores absolute or
+dangling symlinks too, with their stored targets; that fidelity is correct but
+not a safety claim (Section 12.10). Stock tar restores each entry under its
+stored name and each symlink with its stored target. An entry stored under a
+stand-in comes back under the stand-in, and its original bytes are in its
+`REMANENCE.original_path` record and in the manifest (Section 4.6.8). A link
+whose target reaches an entry of the object through the object's own names,
+without passing through another symlink, names that entry's stored name, so it
+still resolves; the target components that reach no entry keep their
+stand-ins (Section 4.6.8). With all REM-OBJECT-specific metadata lost, a Scanner can still
 walk the archive using only tar rules — header, `size`, `roundup512(size)`,
-repeat — recovering payload bytes, hardlink relationships, symlink targets,
-directory entries, and names; it loses only chunk addressing (irrelevant when scanning) and
-verification (recoverable from the manifest if its blocks survive).
+repeat — recovering payload bytes, hardlink relationships, stored symlink
+targets, directory entries, and stored names. It loses chunk addressing
+(irrelevant when scanning), verification (recoverable from the manifest if
+its blocks survive), and the original names and targets of entries stored
+under stand-ins, which only the `REMANENCE.original_path` and
+`REMANENCE.original_linkpath` records and the manifest hold.
 Conformance requires demonstrated extraction equality by GNU tar, bsdtar, and
 Python `tarfile` (Section 14).
 
@@ -1510,12 +1815,28 @@ A Core Verifier performs these checks:
 
 - the full restore-mode read of Section 4.9, with every regular entry's
   digest checked;
+- the stored-name check over the whole object, from the entries' pax records
+  (Section 4.6.8);
 - manifest anchor-digest and schema validation (Section 4.7.2);
 - manifest-vs-archive correspondence, as defined below;
 - exact `object_metadata` inventory validation (Section 4.7.6);
+- the unsafe-header report described below;
 - the final-fill zero check (Section 4.8); and
 - a `stored_digest` comparison against the catalog value, when one is
   available.
+
+When one fault fails more than one of these checks, a Verifier MUST report the
+error of the earliest check in this list that the fault fails. A stored name
+that does not follow from its original names, for example, fails the
+stored-name check (`InvalidPath`) before it fails Section 4.7.2 obligation 2
+(`ManifestInvalid`).
+
+*Rationale.* The list follows the order in which the evidence becomes
+available: an entry's own records are read before the manifest, and the
+manifest is anchored before its contents are trusted. The existing vectors
+already follow it. A traversal-shaped path is `InvalidPath` from the read, and
+a manifest tamper with an anchor present is `ManifestDigestMismatch`, although
+the tampered path also no longer corresponds to the archive.
 
 The manifest and the archive correspond when every member entry appears in
 `file_entries` with matching `path` and `entry_type`, and `file_entries` lists
@@ -1525,8 +1846,25 @@ nothing absent from the archive. In addition:
   and `chunk_count`;
 - **hardlink entries** match `link_target`, carry zero/`null` content fields
   and no `file_sha256`, and resolve to a valid regular-file primary
-  (Section 4.6); and
-- **symlink/directory entries** carry zero/`null` content fields.
+  (Section 4.6);
+- **symlink/directory entries** carry zero/`null` content fields; and
+- **every entry** carries the same original path, and a symlink the same
+  original target, in its manifest element as in its pax records, both
+  present or both absent (Section 4.6.8).
+
+**Unsafe-header report.** A Verifier MUST report, as `UnsafeTarHeader`, each
+entry whose ustar header has the setuid (`04000`) or setgid (`02000`) bit set
+in `mode`, or whose effective ownership differs from what Section 4.3.1
+gives: `uid` and `gid` 0, and empty `uname` and `gname`. An entry's effective
+ownership is the value of each of the four pax records `uid`, `gid`, `uname`
+and `gname` that applies to it, the entry's own record taking precedence over
+the merged global records (Section 4.5.2), and otherwise the ustar field. A
+standard `tar` run as root applies these values to the files it writes,
+although a Reader ignores the pax records as unknown keywords (Section
+4.4.3). The report does not make the object invalid, because Section 4.3.2
+forbids basing acceptance on these values. Device, FIFO and other special
+typeflags need no report, because every Reader rejects them (Section
+4.3.4).
 
 REM-ENCRYPT §7.4 defines the keyed and keyless encrypted-copy profiles and
 requires the recovered inner stream to pass this Core profile.
@@ -1664,9 +2002,10 @@ These apply to plaintext copies and to the decrypted inner stream of encrypted
 copies alike.
 
 ```text
-InvalidInput              caller-supplied object/file metadata violates Section 4.6.6 / 4.9
+InvalidInput              caller-supplied object/file metadata violates Section 4.6.6 / 4.6.8 / 4.9
 Layout                    layout arithmetic overflowed or an invariant could not be satisfied
-Parse                     malformed archive structure (octal fields, EOF sequence, missing
+Parse                     malformed archive structure (octal fields not in the Builder's form
+                          of Section 4.3.1, EOF sequence, missing
                           required pax keys, short blocks, entry after the manifest,
                           truncated/overflowing offsets)
 UstarChecksumMismatch     Section 4.3.3 failure
@@ -1674,7 +2013,10 @@ UnsupportedTarTypeflag    Section 4.3.4 rejection
 InvalidHardlinkTarget     hardlink target absent, not a regular-file primary, or not preceding the link (4.6)
 ChunkAlignmentViolation   Section 4.6.3 reader rejection
 ChunkSizeMismatch         stream REMANENCE.chunk_size disagrees with supplied geometry (4.5.2)
-InvalidPath               effective path violates Section 4.6.6 rules 1-2 (reader-side)
+InvalidPath               effective path violates Section 4.6.6 rules 1-2 (reader-side), a
+                          symlink target holds a control character, a stored name does not
+                          follow from its original name, or the pax record and the manifest
+                          give an original name differently (4.6.8)
 TruncatedPayload          EOF inside declared payload, pax body, or padding
 PaxRecordMalformed        Section 4.4.1 grammar violation
 FileDigestMismatch        delivered payload bytes do not hash to REMANENCE.file_sha256 (4.9)
@@ -1683,6 +2025,8 @@ ManifestInvalid           manifest violates the Section 4.7.2 schema or cross-ch
 ManifestDigestMismatch    manifest bytes do not hash to the anchor digest (Section 4.7.2)
 MissingManifest           object EOF reached with no _remanence/manifest.cbor entry (Section 4.9;
                           non-fatal warning in restore mode, rejection for a Verifier per 7.4)
+UnsafeTarHeader           entry header or effective pax ownership that a root-run tar would
+                          apply unsafely (Section 7.4; a Verifier report, never a rejection)
 UnsupportedFeature        unknown format_id, schema major mismatch, non-none compression
                           or encryption
 IncompleteBlockWrite      Section 4.9 Builder failure
@@ -1748,8 +2092,10 @@ media”. REM-ENCRYPT §12.9 describes the envelope-specific bounds.
 Native entry paths cannot represent traversal: Section 4.6.6 forbids absolute
 paths and `.`/`..`/empty components at write time, and Readers reject
 violations (`InvalidPath`), so a conformant entry path is always a clean
-relative path. Symlink targets are different: they are opaque OS strings and
-may be absolute, contain `..`, or be dangling.
+relative path. An original path (Section 4.6.8) is held to the same rule, so
+an entry restored under its original name is also a clean relative path.
+Symlink targets, stored or original, are different: they are opaque OS
+strings and may be absolute, contain `..`, or be dangling.
 
 A restore destination lies outside the object, and a hostile object can aim at
 it. In the classic archive attack, an earlier symlink entry creates
@@ -1769,16 +2115,18 @@ like `C:\x` or `\\host\share\x` as an absolute path, on a drive or on a UNC
 share. Case-folding, such as Windows case-insensitivity, and Unicode
 normalization, such as NFC and NFD, can also collapse two REM-OBJECT-distinct
 entry paths onto one native target. An entry's native destination is the path
-it would occupy on the target filesystem after that filesystem's separator,
-case-folding and Unicode-normalization rules are applied. A Restoring Consumer
+it would occupy on the target filesystem, under the name the Consumer creates
+for it (its original name or its stored name, Section 4.6.8), after that
+filesystem's separator, case-folding and Unicode-normalization rules are
+applied. A Restoring Consumer
 that maps entry paths onto a native filesystem MUST reject or report, never
 silently overwrite, any entry whose native destination collides with a
 destination that another entry in the same object has already produced.
 Framing-layer acceptance of a path is a necessary check, not a sufficient
 safety claim. An inner stream recovered through REM-ENCRYPT is parsed and
 restored under these same rules (REM-ENCRYPT §5.10). Stock tar extraction has
-its own security model. REM-OBJECT's standard-tool fallback is faithful, not
-inherently sandboxed.
+its own security model. REM-OBJECT's standard-tool fallback is faithful to
+the stored names and targets (Section 4.6.8), not inherently sandboxed.
 
 Preserved xattrs are equally untrusted. Attributes such as Linux
 `security.capability`, `security.*`, `trusted.*`, and POSIX ACL attributes can
@@ -1801,7 +2149,10 @@ Publishing a plaintext object discloses, at minimum: every entry path and
 (possibly absolute or dangling) symlink target; the directory tree and
 hardlink topology; file sizes and the file count; `mtime` and `executable`
 values; `file_id`, `object_id`, `caller_object_id`, `write_timestamp`, and
-`chunk_size`; every captured attribute value; and the `object_metadata`
+`chunk_size`; the original bytes of every name stored under a stand-in, in
+`REMANENCE.original_path`, `REMANENCE.original_linkpath` and the manifest's
+`original_path` and `original_link_target`, which can reveal the source
+system's character encoding; every captured attribute value; and the `object_metadata`
 inventory itself, which names the non-`user.` namespaces and extensions
 present (revealing, for example, macOS or Windows origin). The encrypted
 representation seals the manifest inside the REM-ENCRYPT envelope and does
@@ -1810,10 +2161,16 @@ plaintext-disclosure exposure. The Verifier-validated inventory
 (Section 4.7.6) is the intended first-pass screening surface, but does not
 itself bound value-level disclosure. The standard-tool recovery path (Section
 4.10) inherits the host tool's security model, and it restores symlinks
-faithfully. The format's protection there is limited to keeping
-privilege-changing metadata, such as ownership, setuid/setgid mode and
-extended attributes, in a form no standard `tar` applies to target files. It
-is not a sandbox.
+faithfully, with their stored targets. The format's protection there is
+limited to what a conformant Builder writes. It records no owner (Section
+4.3.1), writes no setuid or setgid bit, and keeps extended attributes in the
+manifest, where no standard `tar` applies them to target files. A Reader does
+not reject a header or pax record that carries ownership, or a header with
+such mode bits (Sections 4.3.2 and 4.4.3), so a foreign or hostile object can
+carry them, and a standard `tar` run as root applies them; a Verifier reports
+them (Section 7.4). A member that is itself a tar stream,
+such as a wrapper (Appendix E), is extracted by a second `tar` run under that
+run's rules. It is not a sandbox.
 
 ## 13. Test Vectors
 
@@ -1850,6 +2207,15 @@ that adds it cites it. The archive this section names is never re-cut.
 `specs/README.md` states the release rules for candidate vectors under “How a
 revision is frozen”.
 
+The revision in preparation also changes bytes that the archive pins. Under
+its header rules (Sections 4.3.1, 4.3.2 and 4.6.1) every full-object digest
+the archive holds is stale, among them those that Sections 13.2 and 13.4 and
+REM-ENCRYPT §13 quote, and one Builder case of Section 13.6 no longer holds.
+The layouts, pad values, manifest bytes and `manifest_sha256` values the
+archive pins stand. Sections 13.1 to 13.6 describe the archive as pinned.
+Section 13.7 specifies this revision's candidate vectors, which RO-3
+(Appendix D) generates.
+
 ### 13.1. Plaintext-Stream Positive Vectors
 
 The plaintext suite MUST include at least the vectors in the following table.
@@ -1862,13 +2228,13 @@ the manifests.
 | REM-OBJECT-TV-EMPTY-FILE | An empty file: `chunk_count` 0, absent `first_chunk_lba`, and `null` in the manifest |
 | REM-OBJECT-TV-ONE-BYTE | A one-byte file |
 | REM-OBJECT-TV-BOUNDARY | A chunk-boundary set: payload sizes `chunk_size − 1`, `chunk_size`, `chunk_size + 1`, and one multi-chunk size |
-| REM-OBJECT-TV-PATHS | Pathological paths: a non-ASCII path and a > 100-byte path, both exercising `PAX_PATH_PLACEHOLDER`, and a 100-byte portable path stored inline |
+| REM-OBJECT-TV-PATHS | Pathological paths: a non-ASCII path and a > 100-byte path, both stored under `remanence/pax-path`, the value revision 1.0.0-draft.3 gave `PAX_PATH_PLACEHOLDER` (Section 13.7 gives this revision's form), and a 100-byte portable path stored inline |
 | REM-OBJECT-TV-METADATA | Full metadata: entries with `mtime`, with `executable=true` at mode 0755, and with `executable` unsupplied, which the manifest records as `null` |
 | REM-OBJECT-TV-ORDER | A multi-file object whose entries are not in alphabetical order, pinning caller-order preservation |
 | REM-OBJECT-TV-NONREGULAR | Non-regular entries: a symlink with its target and an empty directory |
-| REM-OBJECT-TV-NONREGULAR | A long link target: a symlink whose target exceeds 100 bytes, exercising `PAX_LINK_PLACEHOLDER` and pax `linkpath` |
+| REM-OBJECT-TV-NONREGULAR | A long link target: a symlink whose target exceeds 100 bytes, exercising pax `linkpath` and `remanence/pax-linkpath`, the value revision 1.0.0-draft.3 gave `PAX_LINK_PLACEHOLDER` (Section 13.7 gives this revision's form) |
 | REM-OBJECT-TV-HARDLINKS | A hardlink, primary and link, restoring to one shared inode |
-| REM-OBJECT-TV-HARDLINKS | A long link target: a hardlink whose target exceeds 100 bytes, exercising `PAX_LINK_PLACEHOLDER` and pax `linkpath` |
+| REM-OBJECT-TV-HARDLINKS | A long link target: a hardlink whose target exceeds 100 bytes, exercising pax `linkpath` and `remanence/pax-linkpath`, the value revision 1.0.0-draft.3 gave `PAX_LINK_PLACEHOLDER` (Section 13.7 gives this revision's form) |
 | REM-OBJECT-TV-MANIFEST | The exact manifest CBOR bytes and `manifest_sha256` for a fixed input set: the canonical-manifest byte-identity vector, the cross-implementation determinism gate of Section 4.7.1 |
 | REM-OBJECT-TV-PORTABLE-CORE-ONLY | A portable-core-only object: `user.` attributes only, an empty `object_metadata`, and `REMANENCE.schema_version` pinned |
 | REM-OBJECT-TV-NONUSER-ATTRIBUTE | An object with a non-`user.` attribute and a correct inventory |
@@ -1933,7 +2299,10 @@ Pinned outputs: the exact full object byte stream; the manifest CBOR bytes;
 ecbf48e48cc11a78b9d6ae9dd7b5e938724ebdb39834a70f17bde17d3eb133da`;
 and `plaintext_digest = stored_digest =
 d59a4a3e4cf2c447c8ed402b109fbb4060ca84dc5b1cebbdc3acb8ca62d8888c`.
-Exact bytes are pinned in the companion archive.
+Exact bytes are pinned in the companion archive. They are the bytes of
+revision 1.0.0-draft.3: under this revision's header rules the
+`plaintext_digest` and `stored_digest` above are stale, while the layout and
+`manifest_sha256` stand, and RO-3 regenerates the object (Section 13.7).
 
 ### 13.3. Encrypted-Object Vectors
 
@@ -1956,7 +2325,10 @@ its manifest is 358 bytes at inner `BodyLba` 3;
 2e2de7f397bcf83237edf308432c4bff0a7922150177851749666e35fe660599`;
 and `stored_digest = plaintext_digest =
 5d07a7aca146a80dfae22f06de976924a6f5c95aceff119b057894a3ab8e1bf5`.
-REM-ENCRYPT §13.2 specifies the encrypted copy.
+REM-ENCRYPT §13.2 specifies the encrypted copy. These values are the bytes of
+revision 1.0.0-draft.3: under this revision's header rules the
+`stored_digest` above is stale, while the layout and `manifest_sha256`
+stand, and RO-3 regenerates the object (Section 13.7).
 
 ### 13.5. Xattr Vectors
 
@@ -2060,6 +2432,100 @@ plaintext copy. Each manifest-tamper vector pins a distinct
 `plaintext_digest`. A restore-report vector reaches EOF without a manifest and
 asserts the typed `MissingManifest` report rather than silent absence.
 
+### 13.7. Candidate Vectors for Stored Names and Header Fields
+
+This revision's header and name rules (Sections 4.3.1, 4.3.2, 4.6.1, 4.6.6,
+4.6.8 and 7.4) change bytes that the archive named in Section 13 holds, and
+need vectors it does not hold. The vectors below are specified as candidates
+for this revision. None is generated yet: RO-3 (Appendix D) generates them
+with the implementation of these rules. They are review-only, like the cases
+of the candidate supplement. Until the revision that adds them is frozen and
+publishes its own archive, they are not conformance vectors, they are not
+copied into or substituted for the archive's, and they are not part of the
+evidence Section 14 requires. The revision that adds them lists them in its
+Sections 13.1 and 13.6.
+
+**Regenerated archive vectors.** Each positive object of the archive, and each
+negative byte vector derived from one, is regenerated with this revision's
+header bytes: every header loses its owner names, and every checksum is
+recomputed. The layout, pad values, manifest bytes and `manifest_sha256` of
+each stay as the archive pins them. No archived object holds a hardlink whose
+primary needs a placeholder and that lacks a pax `linkpath`, the one case in
+which this revision adds a record to an existing input. Their full-object
+digests change, and so do those of the encrypted copies of
+REM-OBJECT-TV-P1 and REM-OBJECT-TV-D1 (REM-ENCRYPT §13). Each Reader-side
+case of Section 13.6 keeps its expected error, because every numeric field it
+writes is in the Builder's form, so the rule of Section 4.3.1 preempts none of
+them. In addition:
+
+- REM-OBJECT-TV-PATHS stores its non-ASCII path and its path over 100 bytes
+  under placeholders of their own, `_remanence/p/00000000-5fbe5dcff4b1f3f2`
+  and `_remanence/p/00000001-0273290d15e68d03`.
+- REM-OBJECT-TV-NONREGULAR stores its long symlink target with the link
+  placeholder `_remanence/l/00000002-d214ceda29503d20`.
+- REM-OBJECT-TV-HARDLINKS stores its long primary path under
+  `_remanence/p/00000002-e500a20cd1e2ce30`, and the hardlink to that primary
+  carries the same name in `linkname`, with the target in pax `linkpath`.
+- The Builder case “Control character in path” of Section 13.6 no longer
+  holds, because a control character in a name is stored under a stand-in
+  (REM-OBJECT-TV-NAMES-CONTROL). It gives way to “NUL in an original path or
+  original target”, which a Builder rejects with `InvalidInput`.
+
+**New positive vectors.**
+
+| Vector | What it pins |
+| --- | --- |
+| REM-OBJECT-TV-NAMES-FILE | A file whose name is not UTF-8: the Latin-1 `caf\xE9.txt`, stored as `caf%E9.txt` with its `REMANENCE.original_path` record and manifest `original_path` |
+| REM-OBJECT-TV-NAMES-DIRECTORY | A directory whose name is not UTF-8, with its own directory entry and two files below it, each carrying its original path |
+| REM-OBJECT-TV-NAMES-CONTROL | Names with control characters: `Icon\r` stored as `Icon%0D`, a name whose DEL becomes `%7F`, and a name whose U+0085 becomes `%C2%85`, beside a clean `My%20File.pdf` that carries no record |
+| REM-OBJECT-TV-NAMES-COLLISION | Colliding stand-ins: a clean `caf%E9.txt` beside the Latin-1 `caf\xE9.txt`, and two stand-ins that collide with each other, each suffixed as Section 4.6.8 assigns |
+| REM-OBJECT-TV-NAMES-LONG | An over-long stand-in: 100 bytes 0xE9 followed by `.jpg`, shortened to 255 bytes with its suffix and extension |
+| REM-OBJECT-TV-NAMES-LINKS | Link targets: a symlink whose original target is not UTF-8, with its `REMANENCE.original_linkpath` record; symlinks to a suffixed and to a shortened stand-in, whose stored targets name those stored components; an absolute target, whose components are all stand-ins; a dangling target below a missing directory, whose components from there on are stand-ins; and a hardlink whose primary is stored under a stand-in |
+| REM-OBJECT-TV-NAMES-LINK-LIMITS | The edges of target resolution: a dangling `d\xE9/missing` beside entries `d\xE9/a` and a clean `d%E9/missing`, stored as `d%E9~39705c1073d43156/missing` because the reached parent keeps its suffixed component; an absolute target and a target below a missing directory, each ending in 100 bytes 0xE9 and `.jpg`, whose last component keeps its 304-byte stand-in; and a target `alias/caf\xE9.txt` through the symlink `alias → target`, beside `target/caf\xE9.txt` and a clean `target/caf%E9.txt`, stored as `alias/caf%E9.txt` because resolution does not follow `alias` |
+
+**New negative vectors, Reader side.** These are byte vectors. Each contains
+exactly one fault and asserts the mapped error.
+
+| Fault | Expected Section 11 error |
+| --- | --- |
+| Each numeric field not in the Builder's form: a leading `+` in `size`, a NUL before the digits of `chksum`, a tab before the digits of `mode`, a leading space in `uid`, a space in place of the NUL in `mtime`, and a base-256 `size` | `Parse` |
+| A device or FIFO typeflag (`3`, `4` or `6`) | `UnsupportedTarTypeflag` |
+| An effective path holding DEL or a C1 control | `InvalidPath` |
+| A symlink target holding DEL | `InvalidPath` |
+| A `REMANENCE.original_path` value that is not lowercase hexadecimal of even length | `InvalidPath` |
+| An original path that is absolute, holds a `..` component, or holds NUL | `InvalidPath` |
+| An original path equal to its stored path | `InvalidPath` |
+| A stored path that its original path does not yield (`cafe.txt` for `caf\xE9.txt`) | `InvalidPath` |
+| A stored target that its original target does not yield (`cafe.txt` for `caf\xE9.txt`) | `InvalidPath` |
+| A `REMANENCE.original_linkpath` record equal to its stored target | `InvalidPath` |
+| A `REMANENCE.original_linkpath` record on an entry that is not a symlink | `InvalidPath` |
+
+**New negative vectors, manifest.**
+
+| Fault | Expected Section 11 error |
+| --- | --- |
+| An `original_path` equal to its element's `path` | `ManifestInvalid` |
+| A `path` that its element's `original_path` does not yield | `ManifestInvalid` |
+| An `original_link_target` on an element that is not a symlink | `ManifestInvalid` |
+
+**New negative vectors, whole object.**
+
+| Fault | Expected Section 11 error |
+| --- | --- |
+| A stand-in suffixed although it neither collides nor exceeds 255 bytes, read by a Verifier | `InvalidPath` |
+| A suffix whose digits are not those Section 4.6.8 assigns, read by a Verifier | `InvalidPath` |
+| A stand-in left unsuffixed beside the clean sibling it collides with: `d%E9/a.txt` from the original `d\xE9/a.txt`, beside a clean `d%E9/b.txt`, read by a Verifier | `InvalidPath` |
+| A symlink to a suffixed stand-in whose stored target is the unsuffixed stand-in, read by a Verifier | `InvalidPath` |
+| A dangling target whose reached, suffixed parent is stored as its plain stand-in (`d%E9/missing` for `d\xE9/missing` beside `d\xE9/a` and a clean `d%E9/missing`), read by a Verifier | `InvalidPath` |
+| An original path that the pax record and the manifest give differently, each valid alone: stored `%E9` with `REMANENCE.original_path` `e9` and no manifest `original_path`, read by a Verifier and restored by a streaming Restoring Consumer | `InvalidPath` |
+
+**Report vectors.** Three Verifier-report vectors are valid objects with an
+entry header that a root-run `tar` would apply unsafely: one with the setuid
+bit in a regular entry's `mode`, one with the owner name `remanence` that
+Builders of earlier revisions wrote, and one whose ustar fields are a
+Builder's but whose pax records give `uid` 65534 and `uname` `nobody`. Each
+asserts the `UnsafeTarHeader` report and acceptance.
+
 ## 14. Conformance
 
 An implementation conforms only for the roles it claims. A conforming Builder
@@ -2089,8 +2555,12 @@ Conformance evidence MUST include:
 
 The `expected.default_restore` fields that Section 13.1 describes as
 informative are not part of this evidence.
-Neither are the cases of the candidate supplement Section 13 describes,
-until the revision that adds them is frozen.
+Neither are the cases of the candidate supplement Section 13 describes, or
+the candidate vectors of Section 13.7, until the revision that adds them is
+frozen. Until then a Builder that follows this preparing copy cannot show
+item 1's byte-exact agreement for the full-object bytes the archive pins,
+which carry the earlier header fields; it can show it for their layouts, pad
+values and manifests (Section 13.7).
 
 The archive SHA-256 in Section 13 identifies one specific version of the
 frozen vector distribution. Changing an existing entry's byte encoding or
@@ -2224,7 +2694,7 @@ framing the stream already provides (self-description, digests).
 Entries are newest first: date · version · kind (erratum / minor / major) ·
 effect on conformance.
 
-- **2026-09-26 — 1.0.0-draft.4 — in preparation.** The preparing copy of the
+- **2026-11-02 — 1.0.0-draft.4 — in preparation.** The preparing copy of the
   next revision. This entry is completed as the revision's changes are made.
   Section 1.6 is added. It states which rules belong in this document and
   points to the REM Implementation and Operations Guide for the rest. A rule
@@ -2355,6 +2825,24 @@ effect on conformance.
   REM-PARITY's “Versioning and Change Policy” section for that document's
   version axes.
 
+  The names and headers change then made Builders write empty owner names,
+  give each entry whose path or symlink target does not fit its ustar field
+  a placeholder of its own, and store a name that is not UTF-8 text free of
+  control characters under a stand-in, with its original bytes recorded
+  (Sections 4.3.1, 4.3.2, 4.6.1 and 4.6.8). Readers now accept numeric header
+  fields only in the form a Builder writes and reject DEL and C1 controls in
+  stored names, Verifiers check every stored name against its original and
+  report setuid and setgid bits and owner fields other than a Builder's
+  (Sections 4.3.1, 4.6.6, 4.6.8 and 7.4), Section 12.12 and Appendix E no
+  longer promise what the format does not do, and Sections 4.10 and 12.10
+  cover original names. Under the Status section's questions this is a
+  Reader-tightening change and a Builder change made before the freeze: some
+  objects that were valid become invalid (question 1), every object a Builder
+  writes now has different header bytes (question 3), and a Reader of an
+  earlier revision still reads the new objects, under their stored names
+  (question 2), so every vector's object bytes are regenerated (Appendix D,
+  RO-3).
+
 - **2026-09-10 — 1.0.0-draft.3 — review-draft errata.** Adds Appendix E,
   an informative description of the capacity cost the alignment rule imposes
   on very small entries and of the `.remwrap.tar` / `.remwrap.idx` wrapper
@@ -2432,6 +2920,16 @@ dependency on an external retrieval path. It would require a reserved object
 identity in this document and classification support in REM-PARITY; it is
 recorded there as RP-3. *Comment invited.*
 
+**RO-3 · Regenerating the vectors for stored names and header fields ·
+accepted.** This revision changes the header bytes of every plaintext object
+(Section 13). The implementation of Sections 4.3.1, 4.3.2, 4.6.1, 4.6.8 and
+7.4 regenerates, as review-only candidates, the positive objects and the
+full-object digests of Sections 13.2 and 13.4 and of REM-ENCRYPT §13, the
+negative byte vectors derived from them, and the other candidates that hold
+objects a Builder wrote, among them REM-PARITY's candidate tape images. It
+also generates the new vectors Section 13.7 lists. Until then the
+published archive pins the bytes of revision 1.0.0-draft.3.
+
 
 ## Appendix E. Packing Many Small Files (Informative)
 
@@ -2464,14 +2962,15 @@ described next.
 
 ### E.2. When It Matters
 
-Two kinds of input meet the cost. The first is a subtree of very small files:
-an application's cache directory, a thumbnail forest, the contents of a
-decommissioned workstation archived beside the masters. The second is a file
-that cannot be represented as a native entry at all: a path or symlink target
-that is not valid UTF-8 (Section 4.6.6), a file type the format does not
-carry (a device node, socket, or FIFO), or extended attributes outside the
-portable set the caller accepts. The convention described next serves
-both.
+The input that meets the cost is a subtree of very small files: an
+application's cache directory, a thumbnail forest, the contents of a
+decommissioned workstation archived beside the masters. A file whose path or
+symlink target is not valid UTF-8, or contains a control character, is no
+reason to wrap: Section 4.6.8 stores it as a native entry under a stand-in.
+Nor are extended attributes, since a wrapper carries none that a native entry
+could not. The convention does not carry device nodes, sockets or FIFOs,
+which the format excludes (Section 1.5). The convention described next
+serves the small files.
 
 ### E.3. The Wrapper Convention
 
@@ -2481,7 +2980,7 @@ For a subtree at canonical relative path `<path>`, the two entries are:
 
 | Entry | Content |
 | --- | --- |
-| `<path>.remwrap.tar` | The subtree as one pax-format tar stream, produced by a tar program, with extended attributes carried in its pax records. |
+| `<path>.remwrap.tar` | The subtree as one pax-format tar stream, produced by a tar program. Its records carry no extended attributes. |
 | `<path>.remwrap.idx` | A JSON document describing the wrapper, with the fields below. |
 
 The index document has three fields:
@@ -2497,7 +2996,7 @@ Each element of `entries` carries:
 | Field | Meaning |
 | --- | --- |
 | `path` | The inner entry's path, rendered as text: valid UTF-8 is kept as is, a backslash is doubled, and control bytes (0x00–0x1F, 0x7F) and bytes that are not valid UTF-8 are written as `\xNN`. An inner file whose name is not valid UTF-8 is therefore still listable. |
-| `kind` | `regular`, `symlink`, `directory`, or `other`. |
+| `kind` | `regular`, `symlink`, `directory`, or `other`. The convention carries no special files (Section E.2), so `other` does not occur in a wrapper that follows it. |
 | `offset` | The byte offset of the inner entry's data within the wrapper's bytes. |
 | `length` | The inner entry's payload length in bytes for a regular entry; `0` otherwise. |
 | `sha256` | The SHA-256 of the inner file's payload bytes, as lowercase hex. Present for regular entries; absent otherwise. |

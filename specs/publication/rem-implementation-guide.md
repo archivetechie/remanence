@@ -462,6 +462,33 @@ REM-OBJECT §15 describes confers no default application on restore.
 Serves REM-OBJECT §4.7.5, Extension Containers; REM-OBJECT §12.10, Path
 Traversal; and REM-OBJECT §15, IANA Considerations.
 
+### 4.7. Restore original names where the host can hold them
+
+REM-OBJECT stores a name that is not UTF-8 text free of control characters
+under a stand-in, and records the name's original bytes (REM-OBJECT §4.6.8).
+Which of the two names a restoring tool creates is the tool's choice; the
+specification leaves it to the tool.
+
+We recommend creating each entry under its original name where the
+destination can hold those bytes, and under its stored name elsewhere. Decide
+component by component, and make the same choice for a directory wherever it
+appears, so that everything below it stays together. Build each symlink target
+from the names created for the entries it reaches, so that a link to an entry
+of the object still resolves after the restore. An operator may ask for the
+stored names instead, for example to avoid recreating a name that contains a
+newline. Take original names from pax records only once they agree with the
+verified manifest, and otherwise report them as unconfirmed.
+
+Whichever names are created, report them. The specification requires the
+report: "For every entry whose original names differ from its stored names, a
+Restoring Consumer MUST report which names it created, its path and, for a
+symlink, its target, naming the entry by its stored path." (REM-OBJECT §4.6.8).
+The stored name suits a report, because it is text without control
+characters.
+
+Serves REM-OBJECT §4.6.8, Stored Names and Original Names, and REM-OBJECT
+§12.10, Path Traversal.
+
 ### In plain terms
 
 The format guarantees that an object's contents match its manifest. The
@@ -485,7 +512,8 @@ been published, leaves a partial object behind or reports one that is wrong.
 We recommend building each object in this order. First validate the options
 (`chunk_size`, `object_id`, `caller_object_id`, `write_timestamp` and the
 manifest entry's `file_id`, `manifest_file_id`) against the constraints of REM-OBJECT §4.2 and §4.5.1,
-and every member specification against REM-OBJECT §4.6.6. Then plan the complete layout from the member specifications
+and every member specification against REM-OBJECT §4.6.6 and against the rules for original names in
+REM-OBJECT §4.6.8. Then plan the complete layout from the member specifications
 alone, which serialises the manifest and computes `manifest_sha256` before any
 payload byte is read. Then emit the global header, each member entry and the
 manifest entry, passing every payload byte through a running SHA-256 check.
@@ -2116,15 +2144,14 @@ a wrapper convention that packs a subtree into one member, at the cost of the
 inner files' individual identity.
 
 We recommend wrapping a subtree only for a stated reason: because an ingest
-rule names it, or because a file in it cannot be represented as a native
-entry. In the second case, that file, or the directory holding it, should be
-wrapped on its own. We recommend not wrapping by size alone. A scan may
-suggest candidates, but the suggestion should change nothing by itself.
-Remanence, for example, follows this rule. Its scan mode suggests a directory
-when at least ninety per cent of at least one hundred files under it cannot
-be represented natively.
+rule names it. A file whose name is not valid UTF-8, or contains a control
+character, is no reason to wrap, because REM-OBJECT stores it as a native
+entry under a stand-in name and records the original bytes (REM-OBJECT
+§4.6.8). We recommend not wrapping by size alone. A scan may suggest
+candidates, but the suggestion should change nothing by itself.
 
-Serves REM-OBJECT Appendix E, Packing Many Small Files (Informative).
+Serves REM-OBJECT Appendix E, Packing Many Small Files (Informative), and
+REM-OBJECT §4.6.8, Stored Names and Original Names.
 
 ### 14.5. Upload to an object store with integrity
 
@@ -2285,6 +2312,15 @@ identity at random.
   On 1 November 2026 the Remanence examples in sections 2.2, 2.4, 6.6, 9.2 and
   10.3 follow its move from two host journals per tape to one append-only log.
   No practice changes.
+
+  On 2 November 2026 sections 4.7, 5.1 and 14.4 follow the stored names of
+  the REM-OBJECT revision in preparation. New section 4.7 recommends restoring
+  original names where the host can hold them, and reporting which names were
+  created. Section 5.1 validates member specifications against the rules for
+  original names too. Section 14.4 no longer recommends wrapping a file whose
+  name cannot be stored as text, because such a file is now stored natively
+  under a stand-in, and it drops the example of Remanence's scan mode, which
+  suggested wrapping for that reason.
 
 - **30 September 2026.** Sixth revision. Section 7.3 gains the practice of a
   full verification: a check of structure alone is not one, and each failed
