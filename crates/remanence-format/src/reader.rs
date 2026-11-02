@@ -14,7 +14,8 @@ use crate::model::{
 };
 use crate::pax::{tar_padding_len, validate_chunk_size};
 use crate::tar::{
-    TYPE_DIRECTORY, TYPE_HARDLINK, TYPE_PAX_EXTENDED, TYPE_PAX_GLOBAL, TYPE_REGULAR, TYPE_SYMLINK,
+    parse_ustar_octal, TYPE_DIRECTORY, TYPE_HARDLINK, TYPE_PAX_EXTENDED, TYPE_PAX_GLOBAL,
+    TYPE_REGULAR, TYPE_SYMLINK,
 };
 
 /// Reader integrity mode for `rem-object-v1` objects.
@@ -484,7 +485,7 @@ where
         verify_checksum(&header)?;
 
         let typeflag = header[156];
-        let header_size = parse_octal(&header[124..136], "size")?;
+        let header_size = parse_ustar_octal(&header[124..136], "size")?;
 
         match typeflag {
             TYPE_PAX_GLOBAL | TYPE_PAX_EXTENDED => {
@@ -662,7 +663,7 @@ fn parse_rem_tar_bytes_with_mode_and_manifest_anchor(
 
         let typeflag = header[156];
         let header_name = header_path(header)?;
-        let header_size = parse_octal(&header[124..136], "size")?;
+        let header_size = parse_ustar_octal(&header[124..136], "size")?;
         offset = offset
             .checked_add(TAR_RECORD_SIZE)
             .ok_or_else(|| FormatError::parse("archive offset overflow"))?;
@@ -1093,7 +1094,7 @@ fn validate_hardlink_reference(
 }
 
 fn verify_checksum(header: &[u8]) -> Result<(), FormatError> {
-    let stored = parse_octal(&header[148..156], "checksum")?;
+    let stored = parse_ustar_octal(&header[148..156], "checksum")?;
     let computed: u64 = header
         .iter()
         .enumerate()
@@ -1119,25 +1120,6 @@ fn nul_terminated(field: &[u8]) -> Result<String, FormatError> {
     std::str::from_utf8(&field[..end])
         .map(str::to_string)
         .map_err(|_| FormatError::parse("ustar header field is not UTF-8"))
-}
-
-fn parse_octal(field: &[u8], name: &str) -> Result<u64, FormatError> {
-    let start = field
-        .iter()
-        .position(|&byte| byte != 0 && byte != b' ')
-        .unwrap_or(field.len());
-    let rest = &field[start..];
-    let end = rest
-        .iter()
-        .position(|&byte| byte == 0 || byte == b' ')
-        .unwrap_or(rest.len());
-    let text = std::str::from_utf8(&rest[..end])
-        .map_err(|_| FormatError::parse(format!("{name} field is not UTF-8")))?;
-    if text.is_empty() {
-        return Ok(0);
-    }
-    u64::from_str_radix(text, 8)
-        .map_err(|_| FormatError::parse(format!("{name} field is not octal")))
 }
 
 fn validate_pax_keyword(key: &str) -> Result<(), FormatError> {
@@ -1571,12 +1553,6 @@ mod tests {
         let mut validated = false;
         validate_global_contract_once(4096, &pax, &mut validated).unwrap();
         assert!(validated);
-    }
-
-    #[test]
-    fn parse_octal_accepts_leading_space_padding() {
-        assert_eq!(parse_octal(b"   644 \0\0", "mode").unwrap(), 0o644);
-        assert_eq!(parse_octal(b"\0\0  17 ", "size").unwrap(), 0o17);
     }
 
     #[test]
@@ -2384,6 +2360,73 @@ mod tests {
         let err = stream_rem_tar_object(&mut source, 512, 1, &mut entries).unwrap_err();
 
         assert!(matches!(err, FormatError::TruncatedPayload));
+    }
+
+    #[test]
+    fn reader_rejects_signed_checksum() {
+        assert_reader_rejects_signed_numeric_field(148, "checksum");
+    }
+
+    #[test]
+    fn reader_rejects_signed_size() {
+        assert_reader_rejects_signed_numeric_field(124, "size");
+    }
+
+    /// Keep values unchanged under the old parser and checksums consistent.
+    fn assert_reader_rejects_signed_numeric_field(offset: usize, name: &str) {
+        let opts = options(4096);
+        let files = [RemTarFile {
+            path: "a.txt",
+            file_id: "file-a",
+            data: b"hello",
+            mtime: None,
+            executable: Some(false),
+        }];
+        let mut sink = VecBlockSink::new();
+        let layout = write_rem_tar_object(&mut sink, &opts, &files).unwrap();
+        let mut source = VecBlockSource::new(sink.blocks.clone());
+        read_rem_tar_object(&mut source, opts.chunk_size, layout.projected_size_blocks).unwrap();
+
+        let header = &mut sink.blocks[0][..512];
+        assert_eq!(header[offset], b'0');
+        header[offset] = b'+';
+        if name == "size" {
+            header[148..156].fill(b' ');
+            let checksum: u64 = header.iter().map(|&byte| u64::from(byte)).sum();
+            header[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+            verify_checksum(header).unwrap();
+        }
+        for mode in [ReadMode::Restore, ReadMode::Salvage] {
+            let mut source = VecBlockSource::new(sink.blocks.clone());
+            let error = read_rem_tar_object_with_mode(
+                &mut source,
+                opts.chunk_size,
+                layout.projected_size_blocks,
+                mode,
+            )
+            .unwrap_err();
+            assert!(matches!(error, FormatError::Parse(_)), "{error}");
+            assert!(
+                error.to_string().contains(&format!("{name} field")),
+                "{error}"
+            );
+
+            let mut source = VecBlockSource::new(sink.blocks.clone());
+            let mut entries = CollectingEntrySink::default();
+            let error = stream_rem_tar_object_with_mode(
+                &mut source,
+                opts.chunk_size,
+                layout.projected_size_blocks,
+                &mut entries,
+                mode,
+            )
+            .unwrap_err();
+            assert!(matches!(error, FormatError::Parse(_)), "{error}");
+            assert!(
+                error.to_string().contains(&format!("{name} field")),
+                "{error}"
+            );
+        }
     }
 
     #[test]

@@ -60,6 +60,7 @@ pub use remanence_format_driver::{
     NormalizedEntry, ObjectFormatMetadata, ProbeConfidence, ProbeResult, ScanReport,
     SourceRequirement, StreamReport,
 };
+pub use tar::parse_ustar_octal;
 pub use writer::{
     write_encrypted_rem_object, write_encrypted_rem_object_from_readers, write_rem_tar_object,
     write_rem_tar_object_from_readers, BodyBlockWriter, EncryptedRemObjectWriteReport,

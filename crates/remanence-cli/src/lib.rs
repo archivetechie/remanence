@@ -14555,6 +14555,7 @@ fn verify_locator_sha256(
 fn parse_tar_header_size(header: &[u8; 512]) -> Result<u64, String> {
     let field = &header[124..136];
     if field[0] & 0x80 != 0 {
+        // Base-256 size (GNU and libarchive both write it for sizes octal cannot hold).
         let mut value = 0u64;
         for byte in &field[1..] {
             value = value
@@ -14564,13 +14565,7 @@ fn parse_tar_header_size(header: &[u8; 512]) -> Result<u64, String> {
         }
         return Ok(value);
     }
-    let text = field
-        .iter()
-        .copied()
-        .take_while(|byte| *byte != 0 && *byte != b' ')
-        .collect::<Vec<_>>();
-    let text = String::from_utf8_lossy(&text);
-    u64::from_str_radix(text.trim(), 8).map_err(|error| format!("parse tar size {text:?}: {error}"))
+    remanence_format::parse_ustar_octal(field, "size").map_err(|error| error.to_string())
 }
 
 fn read_tar_payload<R: Read>(reader: &mut R, size: u64) -> Result<Vec<u8>, String> {
