@@ -1000,6 +1000,11 @@ rem drive load [OPTIONS] --library <LIBRARY> --bay <BAY> <--barcode <BARCODE>|--
 - `--no-wait` returns when LOAD completes, without waiting for the cartridge to become
   ready.
 
+With `--json`, a failed, cancelled, or completion-unknown operation prints a
+`rem.error.v1` error on stderr with `code: "operation_failed"`,
+`details.operation_id`, and `details.state`, and exits 1. Connection failures
+remain `daemon_client_error`.
+
 To load `RMJ101L9` into bay `0x0100` of library `LIB001`:
 
 ```sh
@@ -1013,6 +1018,11 @@ rem drive unload --library <SERIAL> --bay <BAY> [--dest <SLOT>]
 ```
 
 Through the daemon, unload the cartridge in a drive bay to a storage slot and wait for completion. Without `--dest` the cartridge goes back to the source slot the changer recorded for it. `--library` takes a library serial or UUID. Before the cartridge leaves the drive the daemon closes any parity epoch the drive retains and reports `phase=epoch_close` in the operation progress while it does. If the close fails, or does not run (for example because the tape is fenced, the medium is not writable or the drive owner stopped), the daemon logs the reason and removes the cartridge anyway, leaving any open epoch open; the operation can still succeed, and then its progress and its finish audit carry `epoch_close=failed` (a close ran and failed) or `epoch_close=not_attempted` (no close ran) with the reason in `epoch_close_error`. Neither value says an epoch existed. The text output prints a `warning: closing the parity epoch failed on <BARCODE> (<REASON>)` or `warning: no parity epoch close ran on <BARCODE> (<REASON>)` line before the `unloaded` line. The daemon refuses with `failed_precondition` while a session or another operation holds a drive in the library; an empty bay or a full destination fails the operation. Either way the command prints the daemon's message and exits 1. On success it prints the operation and then `unloaded <BARCODE> from bay <BAY> to slot <SLOT>`; with `--json`, the `rem.operation.status.v1` item carries a `location` object with `library_serial`, `bay`, `barcode` and `slot`. A retry sends a new request. `rem-debug unload` is the break-glass form that bypasses the daemon.
+
+With `--json`, a failed, cancelled, or completion-unknown operation prints a
+`rem.error.v1` error on stderr with `code: "operation_failed"`,
+`details.operation_id`, and `details.state`, and exits 1. Connection failures
+remain `daemon_client_error`.
 
 <!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/tape_finalize.rs crates/remanence-cli/src/tape_inventory.rs crates/remanence-cli/src/tape_read_rate.rs @ 625f7044 -->
 ## Tape lifecycle

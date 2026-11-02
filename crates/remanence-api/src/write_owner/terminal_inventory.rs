@@ -308,7 +308,6 @@ pub(crate) fn send_inventory_stream_item(
     item: pb::TapeInventoryStreamItem,
 ) -> Result<(), Status> {
     let mut pending = Ok(item);
-    let started = Instant::now();
     loop {
         if cfg
             .lifecycle
@@ -325,11 +324,6 @@ pub(crate) fn send_inventory_stream_item(
                 return Err(Status::cancelled("terminal inventory receiver closed"))
             }
             Err(mpsc::error::TrySendError::Full(item)) => pending = item,
-        }
-        if started.elapsed() >= std::time::Duration::from_secs(30) {
-            return Err(Status::deadline_exceeded(
-                "terminal inventory consumer stalled",
-            ));
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }

@@ -1974,6 +1974,7 @@ pub(super) fn handle_drive_open_write(
     rx: &mut mpsc::Receiver<DriveCommand>,
     drive: &mut DriveHandle,
     snapshot_misses: &mut u32,
+    admission_work: Option<crate::drive_pool::ClosingGuard>,
     request: OpenWriteActorRequest,
 ) -> Option<super::actor_runtime::MountedFinish> {
     // Direct session fixtures use this entry without the actor dispatch loop.
@@ -2849,6 +2850,8 @@ pub(super) fn handle_drive_open_write(
             tracing::error!(%error, "lost open reply ending failed");
         }
     } else {
+        // The open reply hands live ownership to the session manager.
+        drop(admission_work);
         session_state.run(rx);
     }
     let finish_request = session_state.finish_request.take();

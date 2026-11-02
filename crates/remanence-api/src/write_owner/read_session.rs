@@ -21,6 +21,7 @@ use super::write_session::run_load_calibration_harvest;
 use super::SessionOpenReadinessContext;
 use crate::{pb, status_from_state_error, TapeUuid};
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn handle_drive_open_read(
     bay: u16,
     index: &mut CatalogIndex,
@@ -28,6 +29,7 @@ pub(super) fn handle_drive_open_read(
     rx: &mut mpsc::Receiver<DriveCommand>,
     drive: &mut DriveHandle,
     snapshot_misses: &mut u32,
+    admission_work: Option<crate::drive_pool::ClosingGuard>,
     request: OpenReadActorRequest,
 ) {
     let OpenReadActorRequest {
@@ -209,6 +211,8 @@ pub(super) fn handle_drive_open_read(
         return;
     }
 
+    // The open reply hands live ownership to the session manager.
+    drop(admission_work);
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
             DriveCommand::ReadFile {

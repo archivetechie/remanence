@@ -7,6 +7,9 @@ mod acceptance_finalization;
 #[path = "ingress_deadline_media_tests.rs"]
 mod ingress_deadline_media_tests;
 
+#[path = "b9_fix_tests.rs"]
+mod b9_fix_tests;
+
 #[path = "b9_tests.rs"]
 mod b9_tests;
 
@@ -313,7 +316,7 @@ fn lost_open_reply_ends_the_durable_session() {
     };
     let mut index = CatalogIndex::open(&cfg.index_path).unwrap();
     handle_drive_open_write(
-        BAY, &mut index, &cfg, actor_tx, &mut rx, &mut drive, &mut 0, request,
+        BAY, &mut index, &cfg, actor_tx, &mut rx, &mut drive, &mut 0, None, request,
     );
     let authority = TapeAuthority::open(&cfg.checkpoint_journal_dir, TAPE, index.path()).unwrap();
     let snapshot = authority.freeze().unwrap();
@@ -426,7 +429,7 @@ async fn open_writer_configured(
     let thread = std::thread::spawn(move || {
         let mut index = CatalogIndex::open(&cfg.index_path).unwrap();
         handle_drive_open_write(
-            BAY, &mut index, &cfg, actor_tx, &mut rx, &mut drive, &mut 0, request,
+            BAY, &mut index, &cfg, actor_tx, &mut rx, &mut drive, &mut 0, None, request,
         );
     });
     let opened = received
@@ -595,7 +598,9 @@ async fn read_receipts(
     };
     let thread = std::thread::spawn(move || {
         let mut index = CatalogIndex::open(&cfg.index_path).unwrap();
-        handle_drive_open_read(BAY, &mut index, &cfg, &mut rx, &mut drive, &mut 0, request);
+        handle_drive_open_read(
+            BAY, &mut index, &cfg, &mut rx, &mut drive, &mut 0, None, request,
+        );
     });
     let opened = received.await.expect("read engine replies without panic");
     let session = match opened {

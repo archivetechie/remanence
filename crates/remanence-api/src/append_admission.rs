@@ -230,7 +230,9 @@ pub(crate) fn admit_append_boundary(
                             "SessionSuffixContradiction: EOD outside recorded tail bounds".into(),
                         ));
                     }
-                    ended_tail_eod = Some(eod);
+                    if end.possible_tail_blocks > end.synchronized_tail_blocks {
+                        ended_tail_eod = Some(eod);
+                    }
                 }
                 return Ok(AppendSuffix::default());
             }

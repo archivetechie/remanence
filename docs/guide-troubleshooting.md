@@ -347,10 +347,10 @@ its configured readiness waits and command timeouts. These are additive bounds,
 not one global 600-second deadline. Every drive actor uses the shared cutoff from
 creation, including maintenance on a drive with no prior write session. Shutdown
 waits for actor ownership through issued-command settlement; it interrupts host
-stream backpressure separately. Inventory and read consumers have a 30-second
-idle-send limit and are interrupted when shutdown begins. There
-is no startup probe of the service manager's configuration. A failed MOVE or
-forced kill can still leave media unthreaded.
+stream backpressure separately. Inventory and read sends waiting for consumers
+are interrupted when shutdown begins. There is no startup probe of the service
+manager's configuration. A failed MOVE or forced kill can still leave media
+unthreaded.
 
 Graceful shutdown gives every write session the same absolute deadline, starting
 when shutdown begins: `daemon.shutdown_close_deadline_secs` (default 300 seconds,
@@ -552,7 +552,8 @@ writes and immediate filemarks are possible extents; only successful non-immedia
 filemarks or barriers establish the synchronized lower bound. A failed barrier
 leaves that bound unchanged. Recovery accepts EOD between the synchronized point
 and the end of possible extents, recording its exact position in `SessionEnded`
-before reuse. Lost buffered data therefore needs no supersede acknowledgement.
+before reuse when those bounds differ. An already exact ending adds no refinement
+record. Lost buffered data therefore needs no supersede acknowledgement.
 EOD below the synchronized point or committed cursor remains a contradiction.
 No abandonment filemark is written. A drive error leaves closeout due for a later
 access. A crash with complete uncommitted Objects still requires
