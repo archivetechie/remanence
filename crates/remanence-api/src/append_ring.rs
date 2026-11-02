@@ -102,7 +102,7 @@ impl AppendRingControl {
         self.notify_changed();
     }
 
-    fn fail(&self, message: impl Into<String>) {
+    pub(crate) fn fail(&self, message: impl Into<String>) {
         let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
         if state.failure.is_none() {
             state.failure = Some(message.into());
@@ -399,7 +399,7 @@ pub(crate) fn create_append_ring(
         let ceiling = io_memory.ceiling();
         let held = ceiling.saturating_sub(available);
         Status::resource_exhausted(format!(
-            "append ring reservation of {capacity_bytes} bytes exceeds available io_memory capacity: daemon.io_memory_ceiling={ceiling} bytes, available={available} bytes, held={held} bytes by active append rings, spools, restore reservoirs and retained epochs [{}]", io_memory.retained_diagnostics()
+            "append ring reservation of {capacity_bytes} bytes exceeds available io_memory capacity: daemon.io_memory_ceiling={ceiling} bytes, available={available} bytes, held={held} bytes by active append rings, spools, restore reservoirs and active parity operations [{}]", io_memory.active_parity_diagnostics()
         ))
     })?;
     let slab_bytes_u64 = capacity_bytes.min(APPEND_RING_SLAB_BYTES as u64);

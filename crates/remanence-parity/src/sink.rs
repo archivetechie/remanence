@@ -896,6 +896,25 @@ pub struct ParitySinkSessionState {
 }
 
 impl ParitySinkSessionState {
+    /// Consume a checkpointed session's final accumulator without copying its
+    /// parity payload. The owner proves the suffix and publishes ClosedOut only
+    /// after emitting this deterministic file and completing its media barrier.
+    pub fn into_closeout_sidecar(
+        self,
+    ) -> Result<crate::sidecar::EncodedSidecarTapeFile, ParityError> {
+        if self.poisoned
+            || self.has_uncheckpointed_bundles
+            || !self.pending_sidecars.is_empty()
+            || self.accumulator.covered_end() != self.filemark_map.total_data_ordinals()?
+            || self.current_epoch_start != self.highest_protected_ordinal
+            || self.data_blocks_in_neighborhood == 0
+        {
+            return Err(ParityError::Invariant(
+                "closeout requires the checkpointed uncovered accumulator",
+            ));
+        }
+        self.accumulator.into_sidecar()
+    }
     /// Acknowledge the actor's completed log append, never a media-only barrier.
     pub fn acknowledge_publication(&mut self) {
         self.has_uncheckpointed_bundles = false;

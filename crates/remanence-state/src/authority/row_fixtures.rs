@@ -160,10 +160,36 @@ impl RowAuthority {
     }
     /// Persist an immutable native plan before fixture terminal media motion.
     pub fn prepare_terminal(&mut self, prefix: &TerminalPrefixPlan) -> Result<(), JournalError> {
+        self.prepare_terminal_with_manual_decision(prefix, false)
+    }
+    /// Exercise an accepted manual decision for an existing partial epoch. New
+    /// operator requests at rest are guarded by the API; recovery still honors
+    /// a durable plan regardless of which session originally wrote the data.
+    pub fn prepare_terminal_with_manual_decision(
+        &mut self,
+        prefix: &TerminalPrefixPlan,
+        manual: bool,
+    ) -> Result<(), JournalError> {
         let plan = super::AuthorityFinalization {
             tape_uuid: self.uuid,
-            trigger: TerminalFinalizationTrigger::ReachedLowWatermark,
-            manual: None,
+            trigger: if manual {
+                TerminalFinalizationTrigger::OperatorCloseOut
+            } else {
+                TerminalFinalizationTrigger::ReachedLowWatermark
+            },
+            manual: manual.then(|| {
+                remanence_parity::authority::ManualTerminalFinalizationIdentity {
+                    operation_id: [0x41; 16],
+                    operation_kind: "finalize_tape".into(),
+                    actor_fingerprint: "fixture".into(),
+                    idempotency_key: [0x42; 16],
+                    request_fingerprint: [0x43; 32],
+                    assigned_pool_id: None,
+                    expected_pool_id: None,
+                    assignment_generation: 0,
+                    reason: "accepted manual plan recovery".into(),
+                }
+            }),
             progress: super::TerminalFinalizationProgress::BeforeReplicaA,
             recovery_required: false,
             edition_id: [1; 16],
@@ -185,6 +211,9 @@ impl RowAuthority {
             .map_err(error)?,
         };
         self.owner_mut()?.begin_finalization(&plan).map_err(error)?;
+        if manual {
+            self.owner_mut()?.accept_preparation().map_err(error)?;
+        }
         Ok(())
     }
     fn close_group(&mut self, protected: u64, total: u64) -> Result<(), JournalError> {

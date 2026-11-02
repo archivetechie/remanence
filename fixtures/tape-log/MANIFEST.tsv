@@ -1,7 +1,7 @@
 file	bytes	sha256	tape_uuid	block_size	scheme	frames	last_closed_sequence	closed_end	objects	next_file	w	t	cursor_lba	sealed	tail
-parity-off-two-objects.remtape	1867	f68db2b01939a3eec8285e206a9154b958021784a0f67ecb00754cafc21a5971	a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1	262144	none	7	7	1867	2	3	0	6	10	false	complete
-parity-object-retained-close.remtape	1362	b2307f01fc98ef040c30cc53ec0e9ee7d92253d771ff7d19680bffd6f2db4bdf	a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2	262144	checkpoint-partial-epoch k=8 m=2 S=1	6	6	1362	1	3	3	3	8	false	complete
-sealed-terminal.remtape	3426	fa1984fa072dcb5e4bb15cd5f7c98d90c680b847d54aa41854ede6504f004462	a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3	262144	checkpoint-partial-epoch k=8 m=2 S=1	21	21	3426	1	9	3	3	8220	true	complete
-torn-tail.remtape	2574	0d9669f6f7e708a64b97aecdff408ea082c518e245fd35f6c68815073de9486c	a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1	262144	none	9	7	1867	2	3	0	6	10	false	torn: short_body at byte 2543
-zero-filled-tail.remtape	5963	bc35cc32c73f7251ae5ffea6dd77c52e45615069e00460d9e4d43f6ab1b754ab	a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1	262144	none	7	7	1867	2	3	0	6	10	false	torn: zero_filled at byte 1867
-recovery-required-tail.remtape	1867	502248b03eb93e4e7bb3ad396ab7994199d9935ec10b88425d61d4c646fe1c7b	a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1	262144	none	6	4	1007	1	2	0	3	6	false	recovery required at byte 1683, sequence 7: bad Structural CRC
+parity-off-two-objects.remtape	1964	57bae284836432958ebfd4cc0f5b16c3ad7ab69a00d5a086c7c7148fde911b52	a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1	262144	none	8	8	1964	2	3	0	6	10	false	complete
+parity-object-session-close.remtape	1614	3a160f6fbd99604025dd72360cb853cd3cb7ae5a19c738da9603ab1362b9ac5b	a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2	262144	checkpoint-partial-epoch k=8 m=2 S=1	8	8	1614	1	3	3	3	12	false	complete
+sealed-terminal.remtape	3524	2932aeedea308d9fe344966bc0f67af37a556a70d703d8a68deab9f1552ec33b	a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3	262144	checkpoint-partial-epoch k=8 m=2 S=1	22	22	3524	1	9	3	3	8220	true	complete
+torn-tail.remtape	2671	c03e74bd412f1df303a0b55d9f7ba27e221cfd34ab359f12c0e266b9000483e4	a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1	262144	none	10	8	1964	2	3	0	6	10	false	torn: short_body at byte 2640
+zero-filled-tail.remtape	6060	ea207261f2502f1e6bdba354a46b478cd1fa9a9f1abd01762ecc96c186c99496	a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1	262144	none	8	8	1964	2	3	0	6	10	false	torn: zero_filled at byte 1964
+recovery-required-tail.remtape	1964	a8eb4e9b4ebd5a4d86fe9995768a5636904f5023a9b59977d35e76afebc2980c	a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1	262144	none	7	5	1104	1	2	0	3	6	false	recovery required at byte 1780, sequence 8: bad Structural CRC

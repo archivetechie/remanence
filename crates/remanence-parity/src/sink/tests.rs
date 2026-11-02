@@ -5686,7 +5686,7 @@ fn begin_object_combined_tape_and_spool_shortfall_reports_tape_capacity_first() 
     );
 }
 
-/// Checkpoint and session handoff preserve the same epoch math as uninterrupted writing.
+/// Intra-session sink detach and checked crash rebuild preserve uninterrupted epoch bytes.
 #[test]
 fn checkpoint_handoffs_and_crash_rebuild_preserve_epoch_parity() {
     const BLOCK: u32 = 256 * 1024;
@@ -5698,9 +5698,9 @@ fn checkpoint_handoffs_and_crash_rebuild_preserve_epoch_parity() {
         .map(|i| fixed_block(i + 1, BLOCK))
         .collect::<Vec<_>>();
     let mut reference = None;
-    // All modes use identical multi-block objects; the epoch fills across sessions.
+    // All modes use identical multi-block objects within one logical write session.
     for mode in [
-        "scratch", "carry", "reopen", "rebuild", "orphan", "complete", "torn",
+        "scratch", "manual", "carry", "reopen", "rebuild", "orphan", "complete", "torn",
     ] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("parity.journal");
@@ -5834,7 +5834,9 @@ fn checkpoint_handoffs_and_crash_rebuild_preserve_epoch_parity() {
                 & SIDECAR_DIRECTORY_FLAG_FINAL_PARTIAL_EPOCH,
             0
         );
-        journal.prepare_terminal(&plan).unwrap();
+        journal
+            .prepare_terminal_with_manual_decision(&plan, mode == "manual")
+            .unwrap();
         if matches!(mode, "complete" | "torn") {
             let state = sink.into_session_state().unwrap();
             let snapshot = journal.committed_snapshot_bounded().unwrap();

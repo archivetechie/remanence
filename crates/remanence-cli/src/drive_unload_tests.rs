@@ -23,9 +23,6 @@ struct Bench {
     busy: Option<String>,
     requests: Vec<pb::UnloadDriveRequest>,
     operations: BTreeMap<Vec<u8>, pb::OperationStatus>,
-    /// The epoch-close outcome (`failed` or `not_attempted`) and error a
-    /// removal reports.
-    epoch_close: Option<(&'static str, String)>,
 }
 
 type Shared = Arc<Mutex<Bench>>;
@@ -242,16 +239,7 @@ impl pb::library_service_server::LibraryService for FakeLibrary {
         };
         let id = Uuid::new_v4().as_bytes().to_vec();
         let terminal = match moved {
-            Ok(()) => {
-                let mut done = status(&id, pb::OperationState::Succeeded, "done", "");
-                if let Some((outcome, error)) = &bench.epoch_close {
-                    done.progress
-                        .insert("epoch_close".to_string(), (*outcome).to_string());
-                    done.progress
-                        .insert("epoch_close_error".to_string(), error.clone());
-                }
-                done
-            }
+            Ok(()) => status(&id, pb::OperationState::Succeeded, "done", ""),
             Err(message) => status(&id, pb::OperationState::Failed, "execute", &message),
         };
         bench.operations.insert(id.clone(), terminal);
@@ -480,44 +468,21 @@ fn rem_drive_unload_returns_cartridge_to_its_source_slot_by_default() {
 }
 
 #[test]
-fn rem_drive_unload_warns_when_the_epoch_close_did_not_complete() {
-    for (outcome, error, line) in [
-        (
-            "failed",
-            "write error",
-            "warning: closing the parity epoch failed on ACM003L9 (write error); the cartridge was removed anyway, and any open epoch stays open\n",
-        ),
-        (
-            "not_attempted",
-            "retained epoch blocked by active tape-I/O fence",
-            "warning: no parity epoch close ran on ACM003L9 (retained epoch blocked by active tape-I/O fence); the cartridge was removed anyway, and any open epoch stays open\n",
-        ),
-    ] {
-        let text_bench = bench();
-        text_bench.lock().unwrap().epoch_close = Some((outcome, error.to_string()));
-        let server = serve(text_bench);
-        let (code, out, err) = rem(&server, &["--library", LIBRARY_SERIAL, "--bay", "0x0101"]);
-        assert_eq!(code, ExitCode::SUCCESS, "{err}");
-        assert!(out.contains(&format!("epoch_close: {outcome}")), "{out}");
-        assert!(
-            out.ends_with(&format!(
-                "{line}unloaded ACM003L9 from bay 0x0101 to slot 0x03ea\n"
-            )),
-            "{out}"
-        );
-        let json_bench = bench();
-        json_bench.lock().unwrap().epoch_close = Some((outcome, error.to_string()));
-        let server = serve(json_bench);
-        let (code, out, err) = rem(
-            &server,
-            &["--library", LIBRARY_SERIAL, "--bay", "0x0101", "--json"],
-        );
-        assert_eq!(code, ExitCode::SUCCESS, "{err}");
-        let value: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(value["data"]["state"], "succeeded");
-        assert_eq!(value["data"]["progress"]["epoch_close"], outcome);
-        assert_eq!(value["data"]["progress"]["epoch_close_error"], error);
-    }
+fn rem_drive_unload_reports_only_the_removal() {
+    let server = serve(bench());
+    let (code, out, err) = rem(&server, &["--library", LIBRARY_SERIAL, "--bay", "0x0101"]);
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    assert!(!out.contains("epoch"), "{out}");
+    assert!(out.ends_with("unloaded ACM003L9 from bay 0x0101 to slot 0x03ea\n"));
+    let server = serve(bench());
+    let (code, out, err) = rem(
+        &server,
+        &["--library", LIBRARY_SERIAL, "--bay", "0x0101", "--json"],
+    );
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    let value: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["data"]["state"], "succeeded");
+    assert!(!out.contains("epoch"), "{out}");
 }
 
 #[test]

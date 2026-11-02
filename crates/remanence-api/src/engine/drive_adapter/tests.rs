@@ -4,7 +4,7 @@ use remanence_chaos::model::{
     DeviceRole, ModelTransport, Record, SharedVirtualWorld, VirtualTape, VirtualWorld,
 };
 use remanence_library::{transport::TransferOutcome, ScsiError, TimeoutClass};
-use remanence_state::{AuditEvent, CatalogIndex, FileAuditLog};
+use remanence_state::{authority::TapeAuthorityView, AuditEvent, CatalogIndex, FileAuditLog};
 use std::{
     path::PathBuf,
     time::{Duration, Instant},
@@ -44,7 +44,38 @@ impl Transport {
                         )
                     })
                     .expect("durable session before modifying CDB");
-                assert_eq!(last.event, AuditEvent::SessionOpened);
+                if last.event != AuditEvent::SessionOpened {
+                    // A sealing session ends before its accepted terminal plan runs.
+                    assert_eq!(last.event, AuditEvent::SessionClosed);
+                    let native = path
+                        .parent()
+                        .unwrap()
+                        .join("journals/tapes")
+                        .join(format!("{}.remtape", Uuid::from_bytes(UUID).simple()));
+                    let mut file = std::fs::File::open(native).unwrap();
+                    remanence_state::tape_log::store::Header::decode(&mut file, UUID).unwrap();
+                    let offset = std::io::Seek::stream_position(&mut file).unwrap();
+                    let mut decoder =
+                        remanence_state::tape_log::codec::Decoder::at(file, 1, offset);
+                    let mut fold = remanence_state::tape_log::fold::Fold::new();
+                    while let Some(frame) = decoder.next_frame().unwrap() {
+                        fold.push(&frame).unwrap();
+                    }
+                    let (summary, _) = fold.finish(decoder.tail()).unwrap();
+                    let closeout = records
+                        .iter()
+                        .rev()
+                        .find(|r| {
+                            r.detail.get("operation_kind")
+                                == Some(&ciborium::Value::Text("tape_closeout".into()))
+                        })
+                        .is_some_and(|r| r.event == AuditEvent::OperationStarted);
+                    assert!(
+                        summary.finalization.is_some() || (summary.closeout_due() && closeout),
+                        "post-session writes require an accepted plan or a due closeout operation"
+                    );
+                    assert!(summary.open_session.is_none());
+                }
                 assert_eq!(
                     last.detail.get("endpoint_key"),
                     Some(&ciborium::value::Value::Text(
@@ -611,6 +642,7 @@ fn fresh_state_rollback_refuses_complete_tail_then_explicit_supersede_repairs() 
         );
         let preview = owner
             .supersede_tail(pb::SupersedeTailRequest {
+                observed_tape_log_sequence: None,
                 tape_uuid: UUID.to_vec(),
                 ack_tape_uuid: UUID.to_vec(),
                 confirm_supersede: None,
@@ -621,6 +653,7 @@ fn fresh_state_rollback_refuses_complete_tail_then_explicit_supersede_repairs() 
         assert!(!preview.found.is_empty());
         let completed = owner
             .supersede_tail(pb::SupersedeTailRequest {
+                observed_tape_log_sequence: Some(preview.tape_log_sequence),
                 tape_uuid: UUID.to_vec(),
                 ack_tape_uuid: UUID.to_vec(),
                 confirm_supersede: Some(preview.required_confirmation),
@@ -1250,6 +1283,20 @@ fn idle_close_allows_reopen_and_keeps_claimed_receipts() {
         owner.close_session().unwrap().state,
         pb::write_session::State::WriteSessionStateClosed as i32
     );
+    let authority = remanence_state::TapeAuthority::open(
+        fixture.config.journal.dir.join("tapes"),
+        UUID,
+        &fixture.root.path().join("state.sqlite"),
+    )
+    .unwrap();
+    let snapshot = authority.freeze().unwrap();
+    let end = snapshot.tape_summary().last_session_end.as_ref().unwrap();
+    assert_eq!(
+        end.reason,
+        remanence_state::tape_log::SessionEndReason::ClientStall
+    );
+    assert_eq!(end.tail_file_count, 0);
+    assert!(snapshot.tape_summary().open_session.is_none());
     let next = owner.open_session("default").unwrap();
     assert_ne!(next.session_id, session_id.as_bytes());
     assert_eq!(owner.receipts(), receipts);
@@ -1472,6 +1519,7 @@ fn supersede_requires_mounted_generation_before_any_modifying_command() {
     for confirmation in [None, Some("SUPERSEDE HAND".into())] {
         let error = owner
             .supersede_tail(pb::SupersedeTailRequest {
+                observed_tape_log_sequence: None,
                 tape_uuid: UUID.to_vec(),
                 ack_tape_uuid: UUID.to_vec(),
                 confirm_supersede: confirmation,
@@ -1545,7 +1593,7 @@ fn standalone_terminal_fence_refusals_keep_quarantine_id_and_release_command() {
         assert_eq!(error.to_string(), expected);
         assert_eq!(fixture.commands.lock().unwrap().len(), before);
         // Finish reports the existing fence but still joins and releases the locks.
-        assert!(owner.finish().is_err());
+        owner.finish().unwrap();
         assert!(fixture.reopen().is_ok());
     }
 }

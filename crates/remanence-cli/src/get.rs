@@ -827,6 +827,12 @@ mod tests {
         ) -> Result<Response<pb::OperationRef>, Status> {
             Err(Status::unimplemented("not needed"))
         }
+        async fn closeout_tape(
+            &self,
+            _request: Request<pb::CloseoutTapeRequest>,
+        ) -> Result<Response<pb::OperationRef>, Status> {
+            Err(Status::unimplemented("not needed"))
+        }
         async fn finalize_tape(
             &self,
             _request: Request<pb::FinalizeTapeRequest>,

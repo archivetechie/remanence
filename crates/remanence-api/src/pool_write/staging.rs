@@ -10,10 +10,14 @@ use remanence_library::{
     BlockSink, PipelinedWriteDiagnostics, TapeIoError, TapePosition, WriteBatchOutcome,
     WriteFilemarksOutcome, WriteOutcome,
 };
+#[cfg(test)]
 use remanence_state::CatalogIndex;
 use sha2::{Digest, Sha256};
 
-use super::model::{PoolWriteError, SelectedTape};
+use super::model::PoolWriteError;
+#[cfg(test)]
+use super::model::SelectedTape;
+#[cfg(test)]
 use super::no_parity::{
     record_tape_io_fence_for_transfer_error, tape_io_fence_reason_for_transfer_error,
 };
@@ -851,10 +855,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_faulted_counted_fenced_staged_transfer<S, R>(
-    state: &mut CatalogIndex,
-    fence_cfg: &crate::write_owner::TerminalWriteConfig,
-    selected: &SelectedTape,
+pub(crate) fn run_faulted_counted_staged_transfer<S, R>(
     inner: &mut CountingBlockSink<'_, S>,
     block_size: usize,
     overlap_control: Option<Arc<crate::append_ring::AppendRingControl>>,
@@ -873,22 +874,7 @@ where
             block_size,
             producer,
             tape_write_control,
-            |error| {
-                if overlap_control
-                    .as_ref()
-                    .is_some_and(|control| !control.tape_started())
-                {
-                    return Ok(());
-                }
-                let error = error.to_string();
-                record_tape_io_fence_for_transfer_error(
-                    state,
-                    fence_cfg,
-                    selected,
-                    tape_io_fence_reason_for_transfer_error(&error),
-                    &error,
-                )
-            },
+            |_| Ok(()),
         )?
     };
     inner.stats.record_staging(&outcome.staging_diagnostics);

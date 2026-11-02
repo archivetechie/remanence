@@ -159,6 +159,16 @@ impl TapeSummary {
             && self.finalization.as_ref().is_none_or(|plan| plan.prepared)
     }
 
+    /// Operator refusal derived from native authority while its lease is held.
+    pub fn closeout_required(&self, action: &str) -> Option<String> {
+        self.closeout_due().then(|| {
+            let uuid = uuid::Uuid::from_bytes(self.tape_uuid.expect("initialized debt"));
+            let bytes = u128::from(self.total - self.protected) * u128::from(self.block_size);
+            format!("CloseoutRequired: tape {uuid} has {bytes} unprotected bytes since {}; run rem tape closeout {uuid} before {action}.",
+                self.unprotected_since.as_deref().expect("unprotected range age"))
+        })
+    }
+
     // Clone constant metadata only. Pending extents contain new Objects, while
     // the authoritative deque remains untouched until successful group closure.
     fn pending_copy(&self) -> Self {
@@ -277,6 +287,7 @@ struct Pending {
     directory_file: Option<u64>,
     tail_count: u64,
     tail_incomplete: bool,
+    tail_torn_prefix: bool,
     sidecar_blocks: u64,
 }
 impl Pending {
@@ -296,6 +307,7 @@ impl Pending {
             directory_file: None,
             tail_count: 0,
             tail_incomplete: false,
+            tail_torn_prefix: false,
             sidecar_blocks: 0,
         }
     }
@@ -558,6 +570,15 @@ impl Fold {
                                 return Err(Fault::Invalid("tail Object identity"));
                             }
                         }
+                        if matches!(file.identity, TailIdentity::TornPrefix(_)) {
+                            if file.known_blocks == 0
+                                || file.unknown_blocks != 0
+                                || file.filemark != TailFilemark::Absent
+                            {
+                                return Err(Fault::Invalid("crash torn-prefix shape"));
+                            }
+                            p.tail_torn_prefix = true;
+                        }
                         if file.filemark == TailFilemark::Present
                             && (file.unknown_blocks != 0 || file.known_blocks == 0)
                         {
@@ -674,6 +695,7 @@ impl Fold {
                     || p.rows != 0
                     || p.directory_count != 0
                     || p.tail_count != end.tail_file_count
+                    || p.tail_torn_prefix && end.reason != SessionEndReason::CrashRecovered
                     || end.crash_ack_audit_sequence.is_some_and(|n| n == 0)
                     || end.crash_ack_audit_sequence.is_some()
                         && end.reason != SessionEndReason::CrashRecovered
@@ -1134,10 +1156,11 @@ fn check_commit(p: &mut Pending, previous: &TapeSummary, c: &Committed) -> Resul
     if p.objects > 0 && c.session_id.is_none_or(|id| id == [0; 16]) {
         return Err(Fault::Invalid("Object commit requires session id"));
     }
-    if previous
-        .open_session
-        .as_ref()
-        .is_some_and(|o| c.session_id != Some(o.session_id))
+    if p.objects > 0
+        && previous
+            .open_session
+            .as_ref()
+            .is_none_or(|o| c.session_id != Some(o.session_id))
     {
         return Err(Fault::Invalid("commit for wrong session"));
     }

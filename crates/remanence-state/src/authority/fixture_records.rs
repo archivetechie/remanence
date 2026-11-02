@@ -338,7 +338,7 @@ impl From<&CommitFixture> for super::AuthorityCommit {
             |unit| unit.total_committed_ordinals,
         );
         Self {
-            session_id: Some(record.batch_id),
+            session_id: Some([9; 16]),
             committed_at_utc: "2026-11-02T00:00:00Z".into(),
             protected,
             total,

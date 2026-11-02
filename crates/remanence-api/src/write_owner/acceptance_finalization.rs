@@ -3,7 +3,7 @@
 //! session fixtures, which need crate-private session-engine access.
 //!
 //! Full matrix (including the acceptance failures):
-//! `CARGO_TARGET_DIR=$PWD/target-0-fincuts cargo test -p remanence-api --release
+//! `CARGO_TARGET_DIR=$PWD/target-step3 cargo test -p remanence-api --release
 //! --lib acceptance_finalization -- --ignored --nocapture`
 //! Maximum loss discards buffered tape records, unsynced bytes, and unsynced
 //! names. Torn-append cases keep 1, half, penultimate, or all dirty bytes.
@@ -344,7 +344,14 @@ async fn settled(api: &ApiState) -> Result<pb::TapeFinalization, String> {
     // speed, and the trace runs for about a minute even on an idle host.
     tokio::time::timeout(Duration::from_secs(300), async {
         loop {
-            let value = status(api).await.map_err(|e| e.to_string())?;
+            let value = match status(api).await {
+                Ok(value) => value,
+                Err(error) if error.code() == tonic::Code::NotFound => {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                    continue;
+                }
+                Err(error) => return Err(error.to_string()),
+            };
             if let Some(id) = value
                 .operation_id
                 .as_ref()
@@ -499,8 +506,8 @@ async fn trace_finalization(lose_filemark: Option<(u64, bool)>) -> Session {
     assert!(prefix_plan.parity_map_tape_file_number.is_some());
     assert_eq!(
         prefix_plan.tail_start_tape_file_number - prefix_plan.start_tape_file_number,
-        2,
-        "a short open epoch emits its closing sidecar and final ParityMap"
+        1,
+        "the seed's clean close protected its epoch; manual finalization emits only ParityMap"
     );
     eprintln!(
         "finalization trace: {} cuts; prefix files {}..{}; layout {:?}",

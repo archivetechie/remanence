@@ -85,9 +85,66 @@ impl remanence_state::index::MediaReadinessObserver for ReadinessWake {
     }
 }
 
+/// Actor-owned work after receipt delivery. Subscribers wait without holding a
+/// tape reservation or a host-log lease. The guard ends only after both the
+/// actor's lease and its manager ownership have been released.
+#[derive(Clone, Default)]
+pub(crate) struct ClosingWork(Arc<Mutex<HashMap<TapeUuid, ClosingEntry>>>);
+struct ClosingEntry {
+    pool: String,
+    drive: DriveKey,
+    done: tokio::sync::watch::Receiver<()>,
+}
+pub(crate) struct ClosingGuard {
+    work: ClosingWork,
+    tape: TapeUuid,
+    _done: tokio::sync::watch::Sender<()>,
+}
+impl ClosingWork {
+    pub(crate) fn begin(&self, tape: TapeUuid, pool: String, drive: DriveKey) -> ClosingGuard {
+        let (done, receiver) = tokio::sync::watch::channel(());
+        let old = self.0.lock().unwrap().insert(
+            tape,
+            ClosingEntry {
+                pool,
+                drive,
+                done: receiver,
+            },
+        );
+        assert!(old.is_none(), "two closeouts own one tape");
+        ClosingGuard {
+            work: self.clone(),
+            tape,
+            _done: done,
+        }
+    }
+    async fn wait(&self, matches: impl Fn(&TapeUuid, &ClosingEntry) -> bool) {
+        loop {
+            let pending = self
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(t, e)| matches(t, e))
+                .map(|(_, e)| e.done.clone());
+            let Some(mut done) = pending else {
+                return;
+            };
+            let _ = done.changed().await;
+        }
+    }
+}
+impl Drop for ClosingGuard {
+    fn drop(&mut self) {
+        self.work.0.lock().unwrap().remove(&self.tape);
+    }
+}
+
 /// Shared actor/pool lifecycle maps used by timer-driven close-and-park.
 #[derive(Clone, Default)]
 pub(crate) struct DrivePoolLifecycle {
+    pub(crate) closing: ClosingWork,
+    pub(crate) ended_writes: Arc<Mutex<HashMap<Uuid, (crate::pb::WriteSession, bool)>>>,
     pub(crate) readiness_wake: Arc<ReadinessWake>,
     holders: Arc<Mutex<HashMap<DriveKey, DriveHolder>>>,
     pub(crate) sessions: Arc<Mutex<HashMap<Uuid, MountedSession>>>,
@@ -202,6 +259,8 @@ fn holder_drive_label(drive: &DriveKey, serial: Option<&str>) -> String {
 
 #[derive(Clone)]
 pub(crate) struct DrivePool {
+    closing: ClosingWork,
+    ended_writes: Arc<Mutex<HashMap<Uuid, (crate::pb::WriteSession, bool)>>>,
     pub(crate) readiness_wake: Arc<ReadinessWake>,
     changers: Arc<HashMap<String, mpsc::Sender<ChangerCommand>>>,
     drives: Arc<HashMap<DriveKey, mpsc::Sender<DriveCommand>>>,
@@ -216,6 +275,42 @@ pub(crate) struct DrivePool {
 }
 
 impl DrivePool {
+    pub(crate) fn ended_write(&self, id: Uuid) -> Option<crate::pb::WriteSession> {
+        self.ended_writes
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|(session, _)| session.clone())
+    }
+    pub(crate) fn append_session(&self, id: Uuid) -> Result<MountedSession, Status> {
+        if self
+            .ended_writes
+            .lock()
+            .unwrap()
+            .get(&id)
+            .is_some_and(|(_, sealed)| *sealed)
+        {
+            return Err(crate::write_owner::SessionSealed.into());
+        }
+        self.session(id)
+    }
+    pub(crate) async fn wait_tape_closeout(&self, tape: TapeUuid) {
+        self.closing.wait(|t, _| *t == tape).await;
+    }
+    pub(crate) async fn wait_pool_closeout(&self, pool: &str) {
+        self.closing.wait(|_, e| e.pool == pool).await;
+    }
+    pub(crate) async fn wait_library_closeouts(&self, library: &str) {
+        self.closing
+            .wait(|_, e| e.drive.library_serial() == Some(library))
+            .await;
+    }
+    pub(crate) async fn wait_drive_closeout(&self, drive: &DriveKey) {
+        self.closing.wait(|_, e| &e.drive == drive).await;
+    }
+    pub(crate) async fn wait_closeouts(&self) {
+        self.closing.wait(|_, _| true).await;
+    }
     #[cfg(test)]
     pub(crate) fn new(
         changer: mpsc::Sender<ChangerCommand>,
@@ -261,6 +356,8 @@ impl DrivePool {
     ) -> Self {
         Self {
             changers: Arc::new(changers),
+            closing: lifecycle.closing,
+            ended_writes: lifecycle.ended_writes,
             drives: Arc::new(drives),
             reservations,
             holders: lifecycle.holders,

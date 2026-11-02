@@ -95,9 +95,9 @@ fn cases() -> Vec<Case> {
         w.publish_report(&(&second_record(PARITY_OFF)).into())
             .unwrap();
     });
-    // An Object leaves its epoch open (W 0, T 3). The retained close is a
+    // An Object leaves its epoch open (W 0, T 3). The session closeout is a
     // separate barrier with no Object: its sidecar protects the epoch (W = T).
-    let retained_close = written(PARITY_CLOSE, |w| {
+    let session_close = written(PARITY_CLOSE, |w| {
         let mut object = partial_epoch_parity_record(PARITY_CLOSE);
         object.object_tape_file_bundles[0].entries[0].physical_start_hint = Some(2);
         object.barrier_bundle = None;
@@ -110,14 +110,40 @@ fn cases() -> Vec<Case> {
             CheckProvenance::OriginalWrite,
         ));
         w.publish_report(&report).unwrap();
-        let mut close = partial_epoch_parity_record(PARITY_CLOSE);
-        close.ordinal = 2;
-        close.batch_id = [0x43; 16];
-        close.objects.clear();
-        close.object_tape_file_bundles.clear();
-        close.barrier_bundle.as_mut().unwrap().entries[0].physical_start_hint = Some(6);
-        close.eod_lba = 8;
-        w.publish_report(&(&close).into()).unwrap();
+        let mut close: AuthorityCommit = (&partial_epoch_parity_record(PARITY_CLOSE)).into();
+        let mut publication = close.barrier.take().unwrap();
+        let scheme = report.scheme.as_ref().unwrap();
+        let parity =
+            u64::from(scheme.stripes_per_neighborhood) * u64::from(scheme.parity_blocks_per_stripe);
+        let headers = remanence_parity::sidecar::checked_sidecar_index_capacity_layout(
+            u64::from(report.block_size),
+            parity,
+            report.total,
+        )
+        .unwrap()
+        .block_count;
+        let blocks = 2 * headers + parity + 1;
+        publication.files[0].physical_start_hint = Some(6);
+        publication.files[0].block_count = blocks;
+        publication.cursor = Some(CommitCursor {
+            partition: 0,
+            lba: 7 + blocks,
+        });
+        w.publish_closed_out(
+            [0x43; 16],
+            Some([9; 16]),
+            &publication,
+            "2026-11-02T00:01:00Z".into(),
+        )
+        .unwrap();
+        w.end_session(
+            [9; 16],
+            "2026-11-02T00:02:00Z".into(),
+            SessionEndReason::CleanClose,
+            None,
+            std::iter::empty(),
+        )
+        .unwrap();
     });
     let sealed = written(SEALED, |w| {
         let (record, mut intent, _) = crate::authority::contract_tests::structural_fixture(SEALED);
@@ -162,11 +188,11 @@ fn cases() -> Vec<Case> {
             bytes: two_objects,
         },
         Case {
-            name: "parity-object-retained-close.remtape",
+            name: "parity-object-session-close.remtape",
             uuid: PARITY_CLOSE,
             class: Class::Complete,
-            about: "Parity tape: one Object barrier leaving its epoch open, then a retained close publishing the epoch's sidecar.",
-            bytes: retained_close,
+            about: "Parity tape: one Object barrier leaving its epoch open, then ClosedOut and SessionEnded publishing the epoch's sidecar and clean end.",
+            bytes: session_close,
         },
         Case {
             name: "sealed-terminal.remtape",

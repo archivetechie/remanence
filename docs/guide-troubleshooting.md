@@ -205,7 +205,7 @@ reason, and release command. `rem top`, `rem catalog tapes --json`, and
 unparseable scope still refuses startup.
 
 Checkpoint replay and projection, append recovery, manual-finalize relaunch,
-terminal recovery, readiness reconciliation and automatic waits, retained-epoch
+terminal recovery, readiness reconciliation and automatic waits, session closeout
 handling, and idle dismount leave fenced tapes and drives untouched. Other
 media remain available. Investigate the recorded evidence and verify the medium
 and drive before release:
@@ -334,25 +334,26 @@ tape wait-ready --wait`) send one SSC LOAD when changer inventory shows the
 cartridge in the drive. They record the attempt in the operation before the
 LOAD and send no second one until the drive has reported ready, also across
 a restart. On SIGTERM, SIGINT or SIGHUP, the daemon stops admission, checkpoints
-and closes open sessions, and leaves cartridges seated. A dismount still rebuilding
-parity stops before issuing UNLOAD. Once UNLOAD has been issued, its MOVE home
+and closes open sessions, and leaves cartridges seated. A dismount waiting for closeout
+stops before issuing UNLOAD. Once UNLOAD has been issued, its MOVE home
 continues, and shutdown waits for it without the 600-second reservation deadline.
 That MOVE retains the configured `changer_not_ready_wait_seconds` magazine/door
 wait even during shutdown. Other reservations retain their 600-second bound.
 The service manager's stop timeout must cover this work and closing every open
 session, plus a margin. A failed MOVE or forced kill can still leave media unthreaded.
 
-A seated cartridge can retain an open parity epoch across shutdown. At first use
-after startup, the daemon proves identity and the committed append cursor and
-rebuilds the epoch with the checked kernel. `drive_idle_unload_seconds` returns
-idle cartridges to their recorded source slots on its normal schedule; `0`
-disables that timer. Use `rem drive unload --library <serial> --bay <bay>` before
-stopping the daemon when cartridges must be returned home.
+Graceful shutdown ends every write session and attempts its closeout. A failed
+closeout or drive error can leave an uncovered committed range. The next write
+open, or `rem tape closeout <tape>`, proves identity, the committed cursor and the
+whole named suffix, then rebuilds and closes that range. A recorded live ending
+needs no supersede acknowledgement. Memory refusal leaves closeout due; it does
+not fall back to a different epoch policy. A durable log record remains authority
+when SQLite projection fails; startup replay restores the projection.
 
-Ordinary removal still attempts epoch closing. Contradictions with committed state
-or uncertain append durability fence the tape. Transient close failures record
-`epoch_left_open` without a fence, and removal proceeds. A durable journal commit
-stays closed when SQLite projection fails; startup replay projects it.
+Removal waits for ongoing closeout but does no parity work itself.
+`drive_idle_unload_seconds` returns idle cartridges to their recorded source slots;
+`0` disables that timer. Use `rem drive unload --library <serial> --bay <bay>` before
+stopping the daemon when cartridges must be returned home.
 
 When that LOAD fails, was already spent, or is never sent because changer
 inventory does not show the cartridge in the drive, the fence stays. The
@@ -504,27 +505,43 @@ projection and session detach after transfer; it emits on success or error
 and does not itself assert a commit. Shared checkpoint barriers retain their
 separate diagnostics.
 
-`parity_retention` reports whether the drive actor reserves the open epoch
-between sessions. `reserved_bytes` gives the requested accumulator reservation;
-`retained=true` confirms the grant. `retained=false` with
-`close_reason=io_memory_ceiling` means the barrier emits a short-epoch sidecar.
-The reservation covers the parity shards, CRC capacity, vector headers, codec
-matrix, and inline detached state. The reservation releases when the epoch
-closes or the actor discards it. Ordinary checkpoints keep their barrier cadence.
-Sidecars normally appear when an epoch fills, at finalization, or before
-removal. Standalone commands use the same actor policy: ordinary checkpoints
-retain partial epochs, and explicit owner finish closes the remaining epoch
-without unloading. A fenced removal leaves the
-epoch open until append recovery clears the fence. Removal does not seal the tape.
+A write session owns its parity accumulator until it ends. A checkpoint
+commits data without necessarily closing the epoch. Clean close returns durable
+receipts, then writes the short sidecar, synchronizes it, and records `ClosedOut`
+and `SessionEnded`. The drive and tape stay owned during this work; a following
+access waits. No accumulator or reservation carries into the next session.
 
-A committed tail without a sidecar appears as `[open_epoch_start, open_epoch_end)`
-in catalog and live drive status. It contains fewer than one epoch of data.
-Restore reads that range as unprotected data; verification does not invent a
-missing sidecar or claim parity coverage for it. Shutdown closes a retained
-epoch only at the unchanged write EOD with a matching retained summary. Otherwise
-it dismounts with the epoch open and logs and audits `epoch_left_open`; the next
-append rebuilds the epoch. A failed removal-time close is logged and audited;
-a fenced failure still permits unload.
+`rem tape closeout <uuid-or-barcode>` waits for an idempotent `tape_closeout`
+operation. Its progress phases are `queued`, `proving`, `rebuilding`,
+`writing_sidecar`, `barrier`, `projecting`, and `complete`. Diagnostics bind the
+tape incarnation and log sequence, W/T range, read attempt, elapsed time, and
+current/peak reserved bytes; `source` is `live` or `rebuilt`. Reservations are
+accounting limits, not process RSS. `CloseoutMemory` refuses before drive work.
+
+A committed range without a sidecar remains readable as unprotected data.
+After a durable abort, failed append, or client disconnect, the session's named
+tail authorizes exact suffix proof without operator acknowledgement. No
+abandonment filemark is written. A drive error leaves closeout due for a later
+access. A crash with complete uncommitted Objects still requires
+`rem tape supersede-tail`; confirmation must carry the preview's log sequence.
+`TailPreviewStale` requires a new preview. A crash-torn last file is bound by
+its exact observed block count and SHA-256, then re-proved through EOD.
+
+Rebuild compares the committed range to the original-write check and retries a
+mismatch once after re-proving identity. A second mismatch raises
+`CloseoutCheckMismatch`. Committed extent contradictions raise
+`CloseoutReadContradiction`; a suffix contradicting its named ending raises
+`SessionSuffixContradiction`. A durable live end alone raises no tape-I/O fence.
+An ambiguous native append still stops media work with `AuthorityAmbiguous`.
+Checked resumes retain original-write check provenance. A commit disagreeing
+with the frozen range is refused rather than used for reconstruction.
+
+Manual finalization and retirement refuse a due closeout with `CloseoutRequired`
+and name the closeout command. `CloseoutUnprotectedFinalizationUnavailable`
+refuses finalization when that range cannot be proved; operator acceptance of
+unprotected finalization is not implemented. Cartridge removal performs no parity
+work. Graceful shutdown closes sessions and leaves cartridges seated; its
+bounded shutdown deadline is a subsequent migration step.
 
 The parity `transfer` event adds `write_commands_ms`, the sum of time inside
 raw fixed-block WRITE calls, and `between_writes_ms`, the sum of intervals

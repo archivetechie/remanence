@@ -166,13 +166,27 @@ impl MillionMemberStream {
         let mut payload = Vec::new();
         let record = match self.stage {
             0 => {
-                self.stage = 1;
+                self.stage = 5;
                 init(false)
+            }
+            5 => {
+                self.stage = 1;
+                Record::SessionOpened(SessionOpened {
+                    session_id: [9; 16],
+                    incarnation: 1,
+                    base_media_sequence: 1,
+                    cursor: SessionCursor {
+                        partition: 0,
+                        lba: 2,
+                        next_file: 1,
+                    },
+                    opened_at_utc: "2026-11-02T00:00:00Z".into(),
+                })
             }
             1 => {
                 self.stage = 2;
                 Record::PayloadContinuation(Continuation {
-                    group: 2,
+                    group: 3,
                     chunk: Chunk::FileRow(object(1, 2, None, 3)),
                 })
             }
@@ -201,7 +215,7 @@ impl MillionMemberStream {
                     self.stage = 3;
                 }
                 Record::PayloadContinuation(Continuation {
-                    group: 2,
+                    group: 3,
                     chunk: Chunk::Catalog {
                         tape_file_number: 1,
                         ordinal,
@@ -218,8 +232,8 @@ impl MillionMemberStream {
         self.seq += 1;
         encode_frame(&mut self.frame, self.seq, &record, &payload).unwrap();
         if self.stage == 1 {
-            self.group = GroupDigest::new(2, self.offset + self.frame.len() as u64);
-        } else if self.stage != 4 {
+            self.group = GroupDigest::new(3, self.offset + self.frame.len() as u64);
+        } else if matches!(record, Record::PayloadContinuation(_)) {
             let mut decoder = Decoder::at(self.frame.as_slice(), self.seq, self.offset);
             let frame = decoder.next_frame().unwrap().unwrap();
             self.group.push(&frame).unwrap();

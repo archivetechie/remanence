@@ -512,6 +512,14 @@ impl pb::catalog_server::Catalog for CatalogService {
         }
     }
 
+    async fn closeout_tape(
+        &self,
+        request: Request<pb::CloseoutTapeRequest>,
+    ) -> Result<Response<pb::OperationRef>, Status> {
+        let actor = authorize_request(&request, AuthPermission::Lifecycle)?;
+        crate::tape_closeout::start(&self.state, actor, request.into_inner()).map(Response::new)
+    }
+
     async fn supersede_tail(
         &self,
         request: Request<pb::SupersedeTailRequest>,

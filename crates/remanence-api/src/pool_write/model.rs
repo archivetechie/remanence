@@ -792,12 +792,12 @@ pub enum SelectTapeError {
 #[derive(Debug, Error)]
 pub enum PoolWriteError {
     /// Spool admission reports the retained accumulators sharing its memory budget.
-    #[error("{cause}; retained epochs [{retained_epochs}]")]
+    #[error("{cause}; active parity operations [{active_parity_operations}]")]
     ParitySpoolRefused {
         /// Capacity evidence used by write admission.
         cause: Box<remanence_parity::ParityError>,
         /// Tape identities and drive owners holding retained parity memory.
-        retained_epochs: String,
+        active_parity_operations: String,
     },
     /// Tape selection failed before the write opened.
     #[error(transparent)]

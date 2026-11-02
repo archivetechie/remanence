@@ -118,6 +118,20 @@ impl AuthoritySnapshot {
         self.raw.summary()
     }
 
+    /// Find an operator closeout in the immutable native history. Used only to
+    /// rejoin a retry whose completion audit was lost after the media commit.
+    pub fn has_closeout_operation(&self, operation_id: [u8; 16]) -> Result<bool, StateError> {
+        if let Some(mut decoder) = self.raw.decoder() {
+            while let Some(frame) = decoder.next_row_frame().map_err(StoreError::from)? {
+                if matches!(frame.record, Record::ClosedOut(ref close) if close.operation_id == operation_id)
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Stream the last durable ending's tail without retaining its file list.
     pub fn visit_session_tail(
         &self,
@@ -1410,6 +1424,22 @@ fn prepare_report(
                 bot: plain(0, TapeFileKind::Bootstrap, 1, 0),
             });
             core.append(group.close(&record)?)?;
+            let s = core.summary();
+            let opened = Record::SessionOpened(SessionOpened {
+                session_id: report
+                    .session_id
+                    .ok_or_else(|| invalid("fixture Object has no session"))?,
+                incarnation: s.incarnation,
+                base_media_sequence: s.last_media_commit.unwrap(),
+                cursor: SessionCursor {
+                    partition: s.cursor.partition,
+                    lba: s.cursor.lba,
+                    next_file: s.next_file,
+                },
+                opened_at_utc: report.committed_at_utc.clone(),
+            });
+            let group = core.prepare()?;
+            core.append(group.close(&opened)?)?;
         }
     }
     let s = core.summary();

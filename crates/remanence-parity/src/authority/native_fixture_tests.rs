@@ -71,9 +71,10 @@ impl RowAuthorityBuilder {
 #[derive(Debug)]
 pub(crate) struct RowAuthority(pub(crate) native::RowAuthority, crate::ParityScheme);
 impl RowAuthority {
-    pub(crate) fn prepare_terminal(
+    pub(crate) fn prepare_terminal_with_manual_decision(
         &mut self,
         p: &crate::TerminalPrefixPlan,
+        manual: bool,
     ) -> Result<(), JournalError> {
         let native = host::TerminalPrefixPlan {
             diagnostics: host::ParityMapDiagnostics {
@@ -102,7 +103,9 @@ impl RowAuthority {
                 })
                 .collect(),
         };
-        self.0.prepare_terminal(&native).map_err(error)
+        self.0
+            .prepare_terminal_with_manual_decision(&native, manual)
+            .map_err(error)
     }
     pub(crate) fn committed_snapshot_bounded(&self) -> Result<FrozenFileRows, JournalError> {
         self.0

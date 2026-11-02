@@ -6,7 +6,6 @@ use super::capacity::{
     ensure_selected_tape_has_capacity, parity_capacity_basis_blocks,
     reserve_parity_object_capacity, uuid_text,
 };
-use super::model::require_rewritable_object_media;
 use super::model::{
     parity_post_write_projection_gate, AppendCommitDiagnostics, BatchedNoParityAppendContext,
     CapacityTrackingRawTapeSink, PoolWriteDurability, PoolWriteError, PoolWriteResult,
@@ -25,8 +24,7 @@ use super::prepare::{
 };
 use super::staging::{CountingBlockSink, LiveCounterBlockSink};
 use crate::bytes_to_hex;
-use crate::verify_tape_identity;
-use remanence_library::{BlockSink, DriveHandle, DriveHandleSource};
+use remanence_library::BlockSink;
 use remanence_parity::{
     ParityConfig, ParitySink, ParitySinkSessionState, RawTapeSink, TapeReportPublisher,
 };
@@ -45,6 +43,7 @@ pub(crate) fn write_batched_to_selected_tape_after_replay_check(
     selected: SelectedTape,
     live_write_counter: Option<Arc<crate::DriveByteCounters>>,
     append: BatchedNoParityAppendContext,
+    tail: Option<&crate::write_owner::session_tail::SessionTail>,
 ) -> Result<PoolWriteResult, PoolWriteError> {
     if !matches!(selected.parity_config, ParityConfig::None) {
         return Err(PoolWriteError::InvalidInput(
@@ -61,6 +60,7 @@ pub(crate) fn write_batched_to_selected_tape_after_replay_check(
         live_write_counter,
         false,
         PoolWriteDurability::Batched(append),
+        tail,
     )
 }
 
@@ -81,6 +81,7 @@ pub(crate) fn write_batched_parity_to_selected_tape_after_replay_check(
     selected: SelectedTape,
     io_memory: &Arc<crate::io_memory::IoMemoryReservation>,
     raw_write_attempted: &mut bool,
+    tail: Option<&crate::write_owner::session_tail::SessionTail>,
 ) -> Result<PoolWriteResult, PoolWriteError> {
     let prepare_started = Instant::now();
     ensure_request_pool_matches_config(&request, pool_cfg)?;
@@ -100,6 +101,10 @@ pub(crate) fn write_batched_parity_to_selected_tape_after_replay_check(
         }
     }
     let stored = prepare_stored_object(&prepared, &request.representation)?;
+    if let Some(tail) = tail {
+        tail.object(&prepared.object_uuid.to_string())
+            .map_err(PoolWriteError::InvalidInput)?;
+    }
     let capacity_blocks = parity_capacity_basis_blocks(state, pool_cfg, &selected)?;
     let projected_object_blocks = match &stored {
         PreparedStoredObject::Plaintext | PreparedStoredObject::CanonicalPlaintext => {
@@ -274,6 +279,7 @@ pub(super) fn write_to_selected_tape_with_live_counter_impl(
     live_write_counter: Option<Arc<crate::DriveByteCounters>>,
     check_replay: bool,
     durability: PoolWriteDurability,
+    tail: Option<&crate::write_owner::session_tail::SessionTail>,
 ) -> Result<PoolWriteResult, PoolWriteError> {
     match live_write_counter {
         Some(counter) => {
@@ -288,6 +294,7 @@ pub(super) fn write_to_selected_tape_with_live_counter_impl(
                 selected,
                 check_replay,
                 durability,
+                tail,
             )
         }
         None => write_to_selected_tape_inner(
@@ -299,6 +306,7 @@ pub(super) fn write_to_selected_tape_with_live_counter_impl(
             selected,
             check_replay,
             durability,
+            tail,
         ),
     }
 }
@@ -313,6 +321,7 @@ pub(super) fn write_to_selected_tape_inner<S: BlockSink + ?Sized>(
     selected: SelectedTape,
     check_replay: bool,
     durability: PoolWriteDurability,
+    tail: Option<&crate::write_owner::session_tail::SessionTail>,
 ) -> Result<PoolWriteResult, PoolWriteError> {
     ensure_request_pool_matches_config(&request, pool_cfg)?;
     if check_replay {
@@ -333,6 +342,10 @@ pub(super) fn write_to_selected_tape_inner<S: BlockSink + ?Sized>(
         }
     }
     let stored = prepare_stored_object(&prepared, &request.representation)?;
+    if let Some(tail) = tail {
+        tail.object(&prepared.object_uuid.to_string())
+            .map_err(PoolWriteError::InvalidInput)?;
+    }
     let stored_projected_blocks = stored.projected_size_blocks(&prepared);
     let mut stored_size_bytes = stored_footprint_bytes(&stored, &prepared, selected.block_size)?;
     if matches!(&durability, PoolWriteDurability::Batched(_)) {
@@ -425,38 +438,4 @@ pub(super) fn write_to_selected_tape_inner<S: BlockSink + ?Sized>(
             durability,
         ),
     }
-}
-
-/// Re-establish readiness, removal lock, BOT identity, mode, and the exact
-/// durable append cursor before any post-checkpoint terminal modification.
-pub(crate) fn reprove_checkpoint_boundary(
-    drive: &mut DriveHandle,
-    record: &remanence_state::authority::AuthorityCommit,
-) -> Result<(), PoolWriteError> {
-    drive.clear_append_admission();
-    drive
-        .test_unit_ready()
-        .map_err(|e| PoolWriteError::InvalidInput(e.to_string()))?;
-    drive
-        .prevent_medium_removal()
-        .map_err(|e| PoolWriteError::InvalidInput(e.to_string()))?;
-    drive.rewind()?;
-    let generation = drive.identity_generation();
-    verify_tape_identity(&mut DriveHandleSource(drive), &record.tape_uuid)?;
-    let config = drive.read_config()?;
-    require_rewritable_object_media(config)?;
-    crate::drive_mode::configure_fixed_uncompressed_write(drive, config, record.block_size)?;
-    drive.bind_identity_generation(generation)?;
-    drive.prove_cursor(
-        crate::append_admission::context(
-            record.tape_uuid,
-            record.block_size,
-            record.cursor.partition,
-            record.cursor.lba,
-        )
-        .boundary,
-        record.block_size,
-        generation,
-    )?;
-    Ok(())
 }

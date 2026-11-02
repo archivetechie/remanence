@@ -103,16 +103,19 @@ struct Fixture {
     commands: Arc<Mutex<Vec<u8>>>,
 }
 fn fixture() -> Fixture {
+    fixture_with_size(SIZE)
+}
+fn fixture_with_size(size: u32) -> Fixture {
     let bootstrap = crate::build_tape_bootstrap(
         UUID,
-        SIZE,
+        size,
         remanence_parity::ParityConfig::None,
         "2026-10-23T00:00:00Z",
         "test",
     );
-    let mut block = vec![0; SIZE as usize];
+    let mut block = vec![0; size as usize];
     remanence_parity::bootstrap::write_bootstrap_block(&bootstrap, &mut block).unwrap();
-    let mut tape = VirtualTape::empty(16 * 1024 * 1024, SIZE);
+    let mut tape = VirtualTape::empty(16 * 1024 * 1024, size);
     tape.records = vec![Record::Block(block), Record::Filemark];
     let mut world = VirtualWorld::single_drive("APPEND", 0x100, "APPEND-DRIVE", 0x400, 0);
     world.put_tape_in_drive(0x100, "TAIL", None, tape);
@@ -453,14 +456,17 @@ fn fresh_admission_command_budget_is_explicit() {
 }
 
 fn plain_blocks() -> Vec<Vec<u8>> {
+    plain_blocks_with_size(SIZE)
+}
+fn plain_blocks_with_size(size: u32) -> Vec<Vec<u8>> {
     let mut options = remanence_format::RemTarObjectOptions::new(
         "00000000-0000-4000-8000-000000000001",
         "append-test",
         "2026-10-23T00:00:00Z",
         "00000000-0000-4000-8000-000000000002",
     );
-    options.chunk_size = SIZE as usize;
-    let payload = vec![0x35; SIZE as usize * 8];
+    options.chunk_size = size as usize;
+    let payload = vec![0x35; size as usize * 8];
     let file = remanence_format::RemTarFile {
         path: "payload",
         file_id: "00000000-0000-4000-8000-000000000003",
@@ -756,6 +762,117 @@ fn truncated_global_header_without_closing_filemark_is_torn() {
     assert_eq!(writes(&f.commands.lock().unwrap()), 0);
 }
 
+/// A whole fixed block need not contain the Object identity. A long, valid
+/// caller id precedes it in canonical PAX ordering. Recovery cannot infer which
+/// Object produced this prefix, even though the existing crash rule accepts it.
+#[test]
+fn crash_prefix_can_be_identical_for_distinct_object_identities() {
+    let ids = [
+        "00000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-000000000002",
+    ];
+    let mut first_blocks = Vec::new();
+    for id in ids {
+        let mut options = remanence_format::RemTarObjectOptions::new(
+            id,
+            "caller-".to_owned() + &"x".repeat(8192),
+            "2026-11-02T00:00:00Z",
+            "00000000-0000-4000-8000-000000000003",
+        );
+        options.chunk_size = SIZE as usize;
+        let file = remanence_format::RemTarFile {
+            path: "payload",
+            file_id: "00000000-0000-4000-8000-000000000004",
+            data: b"payload",
+            mtime: None,
+            executable: Some(false),
+        };
+        let mut sink = remanence_library::VecBlockSink::new();
+        remanence_format::write_rem_tar_object(&mut sink, &options, &[file]).unwrap();
+        let first = sink.blocks.remove(0);
+        assert_eq!(first.len(), SIZE as usize);
+        assert!(!first
+            .windows(id.len())
+            .any(|window| window == id.as_bytes()));
+        let mut f = fixture();
+        f.world
+            .lock()
+            .unwrap()
+            .tapes
+            .get_mut("TAIL")
+            .unwrap()
+            .records
+            .push(Record::Block(first.clone()));
+        let _admission = checkpoint(&mut f.drive)
+            .expect("whole-block crash prefix is admitted by the existing suffix rule");
+        assert_eq!(writes(&f.commands.lock().unwrap()), 0);
+        let tail = crate::write_owner::session_tail::SessionTail::new(UUID, SIZE, 1).unwrap();
+        f.drive.locate(2).unwrap();
+        crate::catalogless_restore::scan_append_suffix_observed(
+            &mut f.drive,
+            &UUID,
+            SIZE,
+            2,
+            None,
+            None,
+            true,
+            Some(&tail),
+        )
+        .unwrap();
+        let files: Vec<_> = tail.files().unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(files.len(), 1);
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            files[0].identity,
+            remanence_state::tape_log::TailIdentity::TornPrefix(Sha256::digest(&first).into())
+        );
+        assert_eq!(files[0].known_blocks, 1);
+        f.drive.locate(2).unwrap();
+        super::session_suffix::named_file(&mut f.drive, &UUID, SIZE, &files[0]).unwrap();
+        super::session_suffix::eod(&mut f.drive, SIZE).unwrap();
+        for extra in [Record::Block(vec![0; SIZE as usize]), Record::Filemark] {
+            f.world
+                .lock()
+                .unwrap()
+                .tapes
+                .get_mut("TAIL")
+                .unwrap()
+                .records
+                .push(extra);
+            f.drive.locate(2).unwrap();
+            assert!(
+                super::session_suffix::named_file(&mut f.drive, &UUID, SIZE, &files[0]).is_err()
+            );
+            f.world
+                .lock()
+                .unwrap()
+                .tapes
+                .get_mut("TAIL")
+                .unwrap()
+                .records
+                .pop();
+        }
+        if let Record::Block(bytes) = &mut f
+            .world
+            .lock()
+            .unwrap()
+            .tapes
+            .get_mut("TAIL")
+            .unwrap()
+            .records[2]
+        {
+            bytes[0] ^= 1;
+        }
+        f.drive.locate(2).unwrap();
+        assert!(super::session_suffix::named_file(&mut f.drive, &UUID, SIZE, &files[0]).is_err());
+        first_blocks.push(first);
+    }
+    assert_eq!(
+        first_blocks[0], first_blocks[1],
+        "physical evidence cannot select the missing Object id"
+    );
+}
+
 /// Every open candidate cut is physical truncation, including the header and trailer.
 #[test]
 fn all_plaintext_cuts_are_torn_but_closed_corruption_and_complete_prefix_refuse() {
@@ -872,11 +989,6 @@ fn encrypted_multiblock_cuts_are_torn_and_closed_corrupt_footer_refuses() {
 
 #[test]
 fn unused_fresh_session_abandonment_dispatches_nothing() {
-    let root = tempfile::tempdir().unwrap();
-    let journal = remanence_state::authority::fixtures::AuthorityBuilder::new(root.path(), UUID)
-        .build()
-        .unwrap();
-    let mut lease = journal.acquire_exclusive().unwrap();
     let mut f = fixture();
     let _admission = admit_append_boundary(
         &mut f.drive,
@@ -884,10 +996,10 @@ fn unused_fresh_session_abandonment_dispatches_nothing() {
         context(UUID, SIZE, 0, 0),
     )
     .unwrap();
-    abandon_pending_append(&mut f.drive, &mut lease).unwrap();
     assert_eq!(f.drive.media_write_dispatch_count(), 0);
     f.drive.clear_append_admission();
-    assert!(abandon_pending_append(&mut f.drive, &mut lease).is_err());
+    assert!(f.drive.check_append_admission().is_err());
+    assert_eq!(f.drive.media_write_dispatch_count(), 0);
 }
 
 /// All physical append entry adapters must refuse a bad predecessor or a bad
@@ -930,10 +1042,7 @@ async fn cursor_refusal_matrix_before_any_write() {
                         .unwrap()
                         .records
                         .truncate(1),
-                    "io" => {
-                        *f.fail_read_after.lock().unwrap() =
-                            Some(usize::from(route == "checkpoint"))
-                    }
+                    "io" => *f.fail_read_after.lock().unwrap() = Some(0),
                     "lba" => *f.position_fault.lock().unwrap() = Some((3, 0)),
                     "partition" => *f.position_fault.lock().unwrap() = Some((2, 1)),
                     _ => unreachable!(),
@@ -948,34 +1057,10 @@ async fn cursor_refusal_matrix_before_any_write() {
                         context(UUID, SIZE, 0, 2),
                     )
                     .is_err(),
-                    "checkpoint" => {
-                        let record = remanence_state::authority::AuthorityCommit {
-                            session_id: Some([9; 16]),
-                            committed_at_utc: "2026-11-02T00:00:00Z".into(),
-                            ordinal: 1,
-                            object_count: 0,
-                            protected: 0,
-                            total: 0,
-                            cursor: remanence_state::tape_log::CommitCursor {
-                                partition: 0,
-                                lba: 2,
-                            },
-                            tape_uuid: UUID,
-                            operation_id: [1; 16],
-                            next_file: 1,
-                            block_size: SIZE,
-                            payloads: vec![],
-                            scheme: None,
-                            object_files: vec![],
-                            barrier: None,
-                            finalization: None,
-                            sealed: false,
-                            seal_due: None,
-                            check: None,
-                        };
-                        crate::pool_write::reprove_checkpoint_boundary(&mut f.drive, &record)
-                            .is_err()
-                    }
+                    "checkpoint" => f
+                        .drive
+                        .prove_cursor(boundary, SIZE, f.drive.identity_generation())
+                        .is_err(),
                     "parity" => DriveHandleRawSource::new(&mut f.drive)
                         .prove_cursor(PhysicalPositionHint::new(2), SIZE)
                         .is_err(),
@@ -1166,6 +1251,179 @@ fn filemark_read_sense_and_transfer_matrix() {
                         "valid={valid}, key={key}, ili={ili}, bytes={bytes}: {result:?}"
                     );
                 }
+            }
+        }
+    }
+}
+
+/// The log chooses the suffix row; every allowed physical completion is bounded
+/// by its named commands, and every successful proof returns to committed C.
+#[test]
+fn native_session_suffix_rows_and_unknown_command_frontiers() {
+    use remanence_state::authority::TapeAuthorityView;
+    use remanence_state::tape_log::{SessionEndReason, TailFile, TailFilemark, TailIdentity};
+    const NATIVE_SIZE: u32 = 262144;
+    let object = plain_blocks_with_size(NATIVE_SIZE);
+    for row in ["closed_empty", "live_named", "crash"] {
+        for survivors in 0..=3 {
+            for mark in [false, true] {
+                let mut f = fixture_with_size(NATIVE_SIZE);
+                let root = tempfile::tempdir().unwrap();
+                let index =
+                    remanence_state::CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
+                std::fs::create_dir(root.path().join("tapes")).unwrap();
+                let authority = remanence_state::TapeAuthority::open(
+                    root.path().join("tapes"),
+                    UUID,
+                    index.path(),
+                )
+                .unwrap();
+                let mut lease = authority.acquire_exclusive().unwrap();
+                lease
+                    .publish_initialized(
+                        NATIVE_SIZE,
+                        None,
+                        remanence_parity::CommitCursor {
+                            partition: 0,
+                            lba: 2,
+                        },
+                    )
+                    .unwrap();
+                lease
+                    .open_session([0x61; 16], "2026-11-02T00:00:00Z".into())
+                    .unwrap();
+                if row != "crash" {
+                    let files = if row == "live_named" {
+                        vec![TailFile {
+                            tape_file_number: 1,
+                            identity: TailIdentity::Object(
+                                "00000000-0000-4000-8000-000000000001".into(),
+                            ),
+                            known_blocks: 0,
+                            unknown_blocks: 2,
+                            filemark: TailFilemark::Absent,
+                        }]
+                    } else {
+                        vec![]
+                    };
+                    lease
+                        .end_session(
+                            [0x61; 16],
+                            "2026-11-02T00:00:01Z".into(),
+                            SessionEndReason::FailedAppend,
+                            None,
+                            files.into_iter().map(Ok),
+                        )
+                        .unwrap();
+                }
+                let snapshot = lease.freeze().unwrap();
+                {
+                    let mut world = f.world.lock().unwrap();
+                    let tape = world.tapes.get_mut("TAIL").unwrap();
+                    tape.records
+                        .extend(object[..survivors].iter().cloned().map(Record::Block));
+                    if mark {
+                        tape.records.push(Record::Filemark);
+                    }
+                }
+                let result = admit_append_boundary(
+                    &mut f.drive,
+                    AppendAuthority::Session {
+                        snapshot: &snapshot,
+                        closeout: None,
+                    },
+                    context(UUID, NATIVE_SIZE, 0, 2),
+                );
+                if row == "crash" && mark && survivors == 0 {
+                    let Err(AdmissionError::TailBeyondKnownState { found, .. }) = &result else {
+                        panic!("foreign empty file must require preview: {result:?}");
+                    };
+                    let mut confirmed = context(UUID, NATIVE_SIZE, 0, 2);
+                    confirmed.confirmed_discard = Some(found.clone());
+                    let refusal = admit_append_boundary(
+                        &mut f.drive,
+                        AppendAuthority::Session {
+                            snapshot: &snapshot,
+                            closeout: None,
+                        },
+                        confirmed,
+                    )
+                    .unwrap_err();
+                    assert!(
+                        refusal
+                            .to_string()
+                            .contains("without a session-tail identity"),
+                        "{refusal}"
+                    );
+                }
+                let accepted = !mark
+                    && match row {
+                        "closed_empty" => survivors == 0,
+                        "live_named" => survivors <= 2,
+                        _ => true,
+                    };
+                assert_eq!(
+                    result.is_ok(),
+                    accepted,
+                    "{row} survivors={survivors} mark={mark}: {result:?}"
+                );
+                if let Ok(admission) = result {
+                    assert_eq!(admission.boundary().2, 2);
+                    if row == "crash" {
+                        let files = admission
+                            .recovered_tail
+                            .unwrap()
+                            .files()
+                            .unwrap()
+                            .collect::<Result<Vec<_>, _>>()
+                            .unwrap();
+                        assert_eq!(files.len(), usize::from(survivors > 0));
+                        if survivors > 0 {
+                            assert!(matches!(files[0].identity, TailIdentity::TornPrefix(_)));
+                            assert_eq!(files[0].known_blocks, survivors as u64);
+                        }
+                    }
+                }
+                assert_eq!(writes(&f.commands.lock().unwrap()), 0);
+            }
+        }
+    }
+}
+
+/// Decision 4 admits only exact deterministic sidecar prefixes, including a
+/// header too short to identify itself; neither an extra block nor a second
+/// filemark can be hidden by that alternative.
+#[test]
+fn own_closeout_prefix_consumes_every_block_and_proves_eod() {
+    let encoded = vec![
+        vec![0x31; SIZE as usize],
+        vec![0x32; SIZE as usize],
+        vec![0x33; SIZE as usize],
+    ];
+    for count in 0..=encoded.len() {
+        for mark in [false, true] {
+            for extra in [false, true] {
+                let mut f = fixture();
+                {
+                    let mut world = f.world.lock().unwrap();
+                    let tape = world.tapes.get_mut("TAIL").unwrap();
+                    tape.records
+                        .extend(encoded[..count].iter().cloned().map(Record::Block));
+                    if mark {
+                        tape.records.push(Record::Filemark);
+                    }
+                    if extra {
+                        tape.records.push(Record::Block(vec![0x99; SIZE as usize]));
+                    }
+                }
+                f.drive.locate(2).unwrap();
+                let result = super::session_suffix::own_closeout(&mut f.drive, &encoded, SIZE);
+                assert_eq!(
+                    result.is_ok(),
+                    !extra && (!mark || count == encoded.len()),
+                    "count={count} mark={mark} extra={extra}"
+                );
+                assert_eq!(writes(&f.commands.lock().unwrap()), 0);
             }
         }
     }

@@ -437,6 +437,12 @@ impl LibraryServiceApi {
         let library_serial = self.resolve_library_serial(library_uuid)?;
         let pool = self.state.drive_pool()?.clone();
         let changer = pool.changer_tx(&library_serial)?;
+        for key in pool.drive_keys() {
+            if matches!(&key, crate::drive_pool::DriveKey::Bay { library_serial: serial, .. } if serial == &library_serial)
+            {
+                pool.wait_drive_closeout(&key).await;
+            }
+        }
         pool.reserve_library_exclusive(&library_serial)?;
         let index = match self.state.index() {
             Ok(index) => index,
@@ -498,52 +504,26 @@ impl LibraryServiceApi {
                             pool.drive_tx(&crate::drive_pool::DriveKey::new(&library_serial, bay))
                         {
                             let (reply, received) = tokio::sync::oneshot::channel();
-                            // (outcome, reason): `not_attempted` when no close ran, `failed`
-                            // when it ran and failed. Neither claims an epoch existed: an
-                            // `Err` reply (a fence, an owner that stopped or never started,
-                            // an active session) comes before the close looks.
-                            let close_outcome = if drive
-                                .send(crate::write_owner::DriveCommand::PrepareRemoval {
-                                    reply,
-                                    progress: Some(handle.clone()),
-                                })
+                            let result = if drive
+                                .send(crate::write_owner::DriveCommand::PrepareRemoval { reply })
                                 .await
                                 .is_err()
                             {
-                                Some((
-                                    "not_attempted",
-                                    "drive owner stopped before it could close an epoch"
-                                        .to_string(),
-                                ))
+                                Err(Status::unavailable("drive owner stopped before removal"))
                             } else {
-                                use crate::write_owner::RemovalClose;
-                                match received.await {
-                                    Ok(Ok(RemovalClose::Done)) => None,
-                                    Ok(Ok(RemovalClose::NotAttempted(reason))) => {
-                                        Some(("not_attempted", reason))
-                                    }
-                                    Ok(Ok(RemovalClose::Failed(reason))) => {
-                                        Some(("failed", reason))
-                                    }
-                                    Ok(Err(error)) => {
-                                        Some(("not_attempted", error.message().to_string()))
-                                    }
-                                    Err(_) => Some((
-                                        "not_attempted",
-                                        "drive owner stopped before it answered the epoch close"
-                                            .to_string(),
-                                    )),
-                                }
+                                received.await.unwrap_or_else(|_| {
+                                    Err(Status::unavailable(
+                                        "drive owner stopped before removal acknowledgement",
+                                    ))
+                                })
                             };
-                            if let Some((outcome, reason)) = close_outcome {
-                                tracing::error!(
-                                    outcome,
-                                    %reason,
-                                    "epoch close did not complete; removing cartridge"
+                            if let Err(error) = result {
+                                pool.release_library(&library_serial);
+                                handle.publish_failed(
+                                    error.message(),
+                                    &[("phase", "prepare_removal")],
                                 );
-                                // Removal still proceeds; the operation must say so.
-                                handle.record_note("epoch_close", outcome);
-                                handle.record_note("epoch_close_error", &reason);
+                                return;
                             }
                         }
                     }
@@ -1842,9 +1822,9 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::NotFound);
     }
 
-    /// The robotics RPC returns before epoch closure and publishes that work as progress.
+    /// The robotics RPC returns while the drive exclusion handshake is pending.
     #[tokio::test]
-    async fn robotics_returns_operation_while_epoch_close_waits() {
+    async fn robotics_returns_operation_while_exclusion_handshake_waits() {
         let mut state = state_with_snapshot();
         let (changer_tx, mut changer_rx) = tokio::sync::mpsc::channel(1);
         let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel(1);
@@ -1869,11 +1849,11 @@ mod tests {
             ),
         )
         .await
-        .expect("RPC does not wait for epoch close")
+        .expect("RPC does not wait for exclusion handshake")
         .unwrap()
         .into_inner();
         let id = Uuid::from_slice(&result.operation_id).unwrap();
-        let crate::write_owner::DriveCommand::PrepareRemoval { reply, progress } =
+        let crate::write_owner::DriveCommand::PrepareRemoval { reply } =
             drive_rx.recv().await.unwrap()
         else {
             panic!("removal preparation precedes robotics");
@@ -1889,57 +1869,42 @@ mod tests {
                 .map(String::as_str),
             Some("prepare_removal")
         );
-        progress
-            .unwrap()
-            .publish_state(pb::OperationState::Running, &[("phase", "epoch_close")]);
-        assert_eq!(
-            state
-                .operations
-                .latest(&id)
-                .unwrap()
-                .progress
-                .get("phase")
-                .map(String::as_str),
-            Some("epoch_close")
-        );
-        reply
-            .send(Ok(crate::write_owner::RemovalClose::Done))
-            .unwrap();
+        reply.send(Ok(())).unwrap();
         let crate::write_owner::ChangerCommand::Robotics { handle, .. } =
             changer_rx.recv().await.unwrap()
         else {
-            panic!("robotics follows a closed epoch");
+            panic!("robotics follows the exclusion handshake");
         };
-        assert!(handle.notes().is_empty(), "a clean close leaves no note");
+        assert!(!state
+            .operations
+            .latest(&id)
+            .unwrap()
+            .progress
+            .contains_key("epoch_close"));
+        drop(handle);
         pool.release_library("DEC418146K_LL02");
     }
 
-    /// A failed or abandoned epoch close still removes the cartridge, and the
-    /// operation carries the failure to its terminal status and audit.
+    /// An operator move waits for the post-reply owner before the exclusion
+    /// handshake. The handshake requests no parity work from the drive actor.
     #[tokio::test]
-    async fn robotics_records_an_epoch_close_failure_and_still_removes() {
-        for (close, outcome, expected) in [
-            ("fenced", "not_attempted", "tape is fenced"),
-            ("owner_failed", "not_attempted", "drive actor failed"),
-            ("skipped", "not_attempted", "medium is not writable"),
-            ("failed", "failed", "write error"),
-            (
-                "dropped",
-                "not_attempted",
-                "drive owner stopped before it answered the epoch close",
-            ),
-        ] {
-            let mut state = state_with_snapshot();
-            let (changer_tx, mut changer_rx) = tokio::sync::mpsc::channel(1);
-            let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel(1);
-            let pool = crate::write_owner::DrivePool::new_for_library(
-                "DEC418146K_LL02",
-                changer_tx,
-                HashMap::from([(1, drive_tx)]),
-                Arc::new(HashMap::from([(1, AtomicBool::new(false))])),
-            );
-            state.drive_pool = Some(pool.clone());
-            state
+    async fn operator_removal_waits_for_post_reply_closeout() {
+        let mut state = state_with_snapshot();
+        let (changer_tx, mut changer_rx) = tokio::sync::mpsc::channel(1);
+        let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel(1);
+        let lifecycle = crate::drive_pool::DrivePoolLifecycle::default();
+        let key = crate::drive_pool::DriveKey::new("DEC418146K_LL02", 1);
+        let pool = crate::write_owner::DrivePool::new_with_lifecycle(
+            HashMap::from([("DEC418146K_LL02".into(), changer_tx)]),
+            HashMap::from([(key.clone(), drive_tx)]),
+            Arc::new(HashMap::from([(key.clone(), AtomicBool::new(true))])),
+            lifecycle.clone(),
+        );
+        state.drive_pool = Some(pool.clone());
+        let closing = lifecycle.closing.begin([0x41; 16], "pool".into(), key);
+        let caller = state.clone();
+        let mut task = tokio::spawn(async move {
+            caller
                 .library_service()
                 .dispatch_robotics(
                     remanence_state::AuditActor::System,
@@ -1952,48 +1917,85 @@ mod tests {
                     BTreeMap::new(),
                 )
                 .await
-                .unwrap();
-            let crate::write_owner::DriveCommand::PrepareRemoval { reply, .. } =
-                drive_rx.recv().await.unwrap()
-            else {
-                panic!("removal preparation precedes robotics");
-            };
-            use crate::write_owner::RemovalClose;
-            match close {
-                "fenced" => reply
-                    .send(Err(Status::failed_precondition("tape is fenced")))
-                    .unwrap(),
-                "owner_failed" => reply
-                    .send(Err(Status::internal("drive actor failed")))
-                    .unwrap(),
-                "skipped" => reply
-                    .send(Ok(RemovalClose::NotAttempted(
-                        "medium is not writable".into(),
-                    )))
-                    .unwrap(),
-                "failed" => reply
-                    .send(Ok(RemovalClose::Failed("write error".into())))
-                    .unwrap(),
-                _ => drop(reply),
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut task)
+                .await
+                .is_err()
+        );
+        assert!(drive_rx.try_recv().is_err());
+        assert!(changer_rx.try_recv().is_err());
+        pool.release_library("DEC418146K_LL02");
+        drop(closing);
+        task.await.unwrap().unwrap();
+        let crate::write_owner::DriveCommand::PrepareRemoval { reply } =
+            drive_rx.recv().await.unwrap()
+        else {
+            panic!("exclusion handshake");
+        };
+        reply.send(Ok(())).unwrap();
+        let crate::write_owner::ChangerCommand::Robotics { handle, .. } =
+            changer_rx.recv().await.unwrap()
+        else {
+            panic!("operator removal");
+        };
+        assert!(!state
+            .operations
+            .latest(&handle.op_id_uuid())
+            .unwrap()
+            .progress
+            .contains_key("epoch_close"));
+        assert!(drive_rx.try_recv().is_err());
+        pool.release_library("DEC418146K_LL02");
+    }
+
+    /// Failed exclusion must never authorize robotics.
+    #[tokio::test]
+    async fn robotics_refuses_failed_exclusion_handshake() {
+        let mut state = state_with_snapshot();
+        let (changer_tx, mut changer_rx) = tokio::sync::mpsc::channel(1);
+        let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel(1);
+        let pool = crate::write_owner::DrivePool::new_for_library(
+            "DEC418146K_LL02",
+            changer_tx,
+            HashMap::from([(1, drive_tx)]),
+            Arc::new(HashMap::from([(1, AtomicBool::new(false))])),
+        );
+        state.drive_pool = Some(pool);
+        let op = state
+            .library_service()
+            .dispatch_robotics(
+                remanence_state::AuditActor::System,
+                &[],
+                "unload_drive",
+                crate::write_owner::RoboticsAction::Unload {
+                    bay: 1,
+                    destination: None,
+                },
+                BTreeMap::new(),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+        let crate::write_owner::DriveCommand::PrepareRemoval { reply } =
+            drive_rx.recv().await.unwrap()
+        else {
+            panic!("missing handshake")
+        };
+        reply
+            .send(Err(Status::failed_precondition(
+                "drive has an active session",
+            )))
+            .unwrap();
+        let id = Uuid::from_slice(&op.operation_id).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while state.operations.latest(&id).unwrap().state != pb::OperationState::Failed as i32 {
+                tokio::task::yield_now().await;
             }
-            let crate::write_owner::ChangerCommand::Robotics { handle, .. } =
-                changer_rx.recv().await.unwrap()
-            else {
-                panic!("removal proceeds after a failed epoch close");
-            };
-            let notes = handle.notes();
-            assert_eq!(
-                notes.get("epoch_close").map(String::as_str),
-                Some(outcome),
-                "{close}"
-            );
-            assert_eq!(
-                notes.get("epoch_close_error").map(String::as_str),
-                Some(expected),
-                "{close}"
-            );
-            pool.release_library("DEC418146K_LL02");
-        }
+        })
+        .await
+        .unwrap();
+        assert!(changer_rx.try_recv().is_err());
     }
 
     #[tokio::test]

@@ -15,7 +15,7 @@ pub(crate) fn supersede_mounted_tail(
     identity_generation: u64,
     acknowledge: &str,
     actor: AuditActor,
-    confirm: impl FnOnce(&str, &[String]) -> Result<(), String>,
+    confirm: impl FnOnce(&str, &[String], u64) -> Result<(), String>,
 ) -> Result<Vec<String>, tonic::Status> {
     use crate::append_admission::{
         admit_append_boundary, context, AdmissionError, AppendAuthority,
@@ -120,6 +120,8 @@ pub(crate) fn supersede_mounted_tail(
     let last = lease
         .latest_commit()
         .map_err(crate::status_from_state_error)?;
+    let snapshot = lease.freeze().map_err(crate::status_from_state_error)?;
+    let sequence = snapshot.log_reference().0;
     let make_context = || {
         let mut ctx = context(
             tape_uuid,
@@ -132,8 +134,9 @@ pub(crate) fn supersede_mounted_tail(
     };
     let authority = || {
         last.as_ref()
-            .map_or(AppendAuthority::Fresh, |_| AppendAuthority::Checkpoint {
-                eod: make_context().boundary,
+            .map_or(AppendAuthority::Fresh, |_| AppendAuthority::Session {
+                snapshot: &snapshot,
+                closeout: None,
             })
     };
     drive
@@ -157,16 +160,16 @@ pub(crate) fn supersede_mounted_tail(
             Ok(_) if repaired_tail => (Vec::new(), Vec::new(), false),
             Ok(_) => return Err(failure("no foreign tail requires superseding".into())),
         };
-    confirm(&format!("SUPERSEDE {label}"), &found).map_err(failure)?;
+    confirm(&format!("SUPERSEDE {label}"), &found, sequence).map_err(failure)?;
     let mut ctx = make_context();
     ctx.confirmed_discard = Some(found.clone());
     ctx.allow_missing_bootstrap_filemark = missing_filemark;
-    let _admission =
+    let mut admission =
         admit_append_boundary(drive, authority(), ctx).map_err(|e| failure(e.to_string()))?;
     drive
         .bind_identity_generation(identity_generation)
         .map_err(|e| failure(e.to_string()))?;
-    crate::audit_projection::append_and_project_audit(
+    let audit = crate::audit_projection::append_and_project_audit(
         index,
         &cfg.audit_dir,
         true,
@@ -181,6 +184,46 @@ pub(crate) fn supersede_mounted_tail(
             subject_kind: "tape",
             subject_id: Some(uuid.clone()),
             detail: BTreeMap::from([
+                (
+                    "tape_incarnation".into(),
+                    ciborium::Value::Integer(snapshot.tape_summary().incarnation.into()),
+                ),
+                (
+                    "tape_log_sequence".into(),
+                    ciborium::Value::Integer(sequence.into()),
+                ),
+                (
+                    "cursor".into(),
+                    ciborium::Value::Text(format!(
+                        "{}:{}:{}",
+                        snapshot.tape_summary().cursor.partition,
+                        snapshot.tape_summary().cursor.lba,
+                        snapshot.tape_summary().next_file
+                    )),
+                ),
+                (
+                    "session_id".into(),
+                    snapshot
+                        .tape_summary()
+                        .open_session
+                        .as_ref()
+                        .map_or(ciborium::Value::Null, |s| {
+                            ciborium::Value::Text(uuid::Uuid::from_bytes(s.session_id).to_string())
+                        }),
+                ),
+                (
+                    "tail_digest".into(),
+                    ciborium::Value::Text(
+                        admission
+                            .recovered_tail
+                            .as_ref()
+                            .map(|tail| tail.digest())
+                            .transpose()
+                            .map_err(|e| Status::internal(e.to_string()))?
+                            .map(|hash| crate::hex_encoding::hex_lower(&hash))
+                            .unwrap_or_default(),
+                    ),
+                ),
                 (
                     "action".into(),
                     ciborium::Value::Text("supersede_tail".into()),
@@ -205,6 +248,21 @@ pub(crate) fn supersede_mounted_tail(
         },
     )?;
     let result = (|| {
+        if let Some(open) = &snapshot.tape_summary().open_session {
+            let tail = admission
+                .recovered_tail
+                .take()
+                .ok_or_else(|| "missing crash tail proof".to_string())?;
+            lease
+                .end_session(
+                    open.session_id,
+                    super::restore::now_rfc3339().map_err(|e| e.to_string())?,
+                    remanence_state::tape_log::SessionEndReason::CrashRecovered,
+                    Some(audit.sequence),
+                    tail.files().map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
+        }
         // READ POSITION proves the retained boundary before the synchronous
         // recovery filemark advances it. Do not LOCATE merely to compare its
         // requested argument with itself.
@@ -230,9 +288,6 @@ pub(crate) fn supersede_mounted_tail(
                 env!("CARGO_PKG_VERSION"),
             );
             crate::tape_init::write_tape_bootstrap(&mut sink, &bootstrap)
-                .map_err(|e| e.to_string())?;
-        } else {
-            remanence_library::BlockSink::write_filemarks(&mut sink, 1)
                 .map_err(|e| e.to_string())?;
         }
         if let remanence_parity::ParityConfig::Scheme(scheme) = &parity {
@@ -271,7 +326,12 @@ pub(crate) fn supersede_mounted_tail(
             remanence_state::TapeIoFenceInput {
                 tape_uuid,
                 barcode: tape.voltag,
-                reason: "supersede_tail_failed".into(),
+                reason: if lease.ensure_abandonment_allowed().is_err() {
+                    "AuthorityAmbiguous"
+                } else {
+                    "supersede_tail_failed"
+                }
+                .into(),
                 evidence_json: Some(serde_json::json!({"error":error}).to_string()),
             },
             drive

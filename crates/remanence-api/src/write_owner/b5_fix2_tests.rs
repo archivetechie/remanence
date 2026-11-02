@@ -257,12 +257,9 @@ async fn cancelled_read_open_parks_audits_close_and_idle_returns_home() {
     .await
     .unwrap();
     let (reply, received) = oneshot::channel();
-    tx.send(DriveCommand::PrepareRemoval {
-        reply,
-        progress: None,
-    })
-    .await
-    .unwrap();
+    tx.send(DriveCommand::PrepareRemoval { reply })
+        .await
+        .unwrap();
     received.await.unwrap().unwrap();
     let parked = pool.parked_at(&key).expect("cancelled open parked");
     assert_eq!(parked.seated.tape_uuid, Some(tape_uuid));

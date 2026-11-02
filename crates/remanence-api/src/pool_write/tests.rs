@@ -1763,7 +1763,7 @@ fn parity_spool_shortfall_is_rejected_before_object_tape_motion() {
     .expect_err("completed parity epoch exceeds the atomic spool budget");
     assert!(error
         .to_string()
-        .contains("retained epochs [tape 01 drive A]"));
+        .contains("active parity operations [tape 01 drive A]"));
     assert!(
         std::error::Error::source(&error).is_none(),
         "the display already includes the capacity cause"
@@ -2077,6 +2077,7 @@ fn batched_parity_post_motion_projection_failure_sets_dirty_after_retryable_spoo
         selected.clone(),
         &short_memory,
         &mut raw_write_attempted,
+        None,
     )
     .expect_err("atomic spool shortfall must reject before Object motion");
     assert!(
@@ -2112,6 +2113,7 @@ fn batched_parity_post_motion_projection_failure_sets_dirty_after_retryable_spoo
         selected.clone(),
         &ample_memory,
         &mut raw_write_attempted,
+        None,
     )
     .expect("the same retained session accepts a later retry");
     assert!(!result.is_replay());
@@ -2169,6 +2171,7 @@ fn batched_parity_post_motion_projection_failure_sets_dirty_after_retryable_spoo
         selected,
         &ample_memory,
         &mut raw_write_attempted,
+        None,
     )
     .expect_err("post-motion projection failure is injected");
     assert!(

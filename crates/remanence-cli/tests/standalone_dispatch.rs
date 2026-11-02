@@ -1198,8 +1198,8 @@ fn prepared_source_mutations_never_report_false_success() {
         assert_ne!(code, ExitCode::SUCCESS, "{output}");
         if bytes.len() > 1024 {
             assert!(
-                !f.index().list_active_tape_io_fences().unwrap().is_empty(),
-                "streamed mutation must fence"
+                f.index().list_active_tape_io_fences().unwrap().is_empty(),
+                "a durable live ending names the streamed mutation without a fence"
             );
         }
         let envelope = VersionFixture::envelope(&output);
@@ -1344,51 +1344,12 @@ fn media_failure_after_first_commit_keeps_the_written_receipt() {
     *f.fail_after_path.lock().unwrap() = None;
     let before = f.writes();
     let (code, output, _) = f.run(&["put", first.to_str().unwrap()], true);
-    assert_ne!(
+    assert_eq!(
         code,
         ExitCode::SUCCESS,
-        "all-skip invocation must report active fence"
-    );
-    assert!(
-        VersionFixture::envelope(&output)["result"]["summary"]["failed"]["error"]
-            .as_str()
-            .unwrap()
-            .contains("fence")
+        "a durable live ending permits an all-skip retry: {output}"
     );
     assert_eq!(f.writes(), before);
-    let fences = f.index().list_active_tape_io_fences().unwrap();
-    assert!(
-        fences.len() >= 2,
-        "exercise shared and mount-level fences: {fences:?}"
-    );
-    let listed = f.ok(&["tape", "quarantine", "list"]);
-    for fence in fences {
-        assert_eq!(
-            fence.endpoint,
-            Some(remanence_library::DriveKey::Standalone {
-                drive_serial: "HOME-DRIVE".into(),
-            })
-        );
-        assert!(
-            listed["active_fences"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|entry| {
-                    entry["quarantine_id"] == fence.quarantine_id
-                        && !entry["endpoint_key"].is_null()
-                }),
-            "{listed}"
-        );
-        f.ok(&[
-            "tape",
-            "quarantine",
-            "release",
-            &fence.quarantine_id,
-            "--ack",
-            "inspected",
-        ]);
-    }
     assert!(f.index().list_active_tape_io_fences().unwrap().is_empty());
 }
 

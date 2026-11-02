@@ -294,6 +294,7 @@ async fn open_write_session_reserved_for_caller(
         },
     }
 
+    pool.wait_pool_closeout(target.pool_id()).await;
     let pool_cfg = state.pool_config(target.pool_id())?;
     let index = CatalogIndex::open_read_only(state.index_path.as_ref())
         .map_err(|err| Status::internal(err.to_string()))?;
@@ -428,7 +429,14 @@ async fn open_write_session_reserved_for_caller(
     let mut changer_move_ms = 0.0;
     if let Some(slot) = mount.source_slot {
         let changer_started = Instant::now();
-        changer_move_for_caller(pool, &mount.library_serial, slot, mount.bay, caller_gone).await?;
+        changer_move_for_caller(
+            pool,
+            &mount.library_serial,
+            slot,
+            mount.bay,
+            caller_gone.clone(),
+        )
+        .await?;
         changer_move_ms = crate::diagnostics::duration_ms(changer_started.elapsed());
     }
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -501,6 +509,15 @@ async fn open_write_session_reserved_for_caller(
         },
     );
     drive_reservation.disarm();
+    // The critical task outlives its RPC handler. Receiving the actor reply here
+    // is not evidence that the caller still exists to receive the session ID.
+    if caller_gone
+        .as_ref()
+        .is_some_and(|gone| gone.load(std::sync::atomic::Ordering::SeqCst))
+    {
+        disconnect_write_session(state, session_id).await?;
+        return Err(Status::cancelled("write session open caller disconnected"));
+    }
     Ok(session)
 }
 
@@ -560,6 +577,7 @@ async fn tape_inventory_critical(
     stream_tx: mpsc::Sender<Result<pb::TapeInventoryStreamItem, Status>>,
 ) -> Result<(), Status> {
     let pool = state.drive_pool()?.clone();
+    pool.wait_tape_closeout(tape_uuid).await;
     let _tape_reservation = pool.reserve_tape(tape_uuid)?;
     let index = CatalogIndex::open_read_only(state.index_path.as_ref())
         .map_err(|error| Status::internal(error.to_string()))?;
@@ -651,6 +669,7 @@ async fn verify_tape_index_critical(
     progress: crate::tape_verification::Progress,
 ) -> Result<pb::TapeIndexVerification, Status> {
     let pool = state.drive_pool()?.clone();
+    pool.wait_tape_closeout(tape_uuid).await;
     let _tape_reservation = pool.reserve_tape(tape_uuid)?;
     let index = CatalogIndex::open_read_only(state.index_path.as_ref())
         .map_err(|error| Status::internal(error.to_string()))?;
@@ -853,9 +872,10 @@ async fn manual_finalize_tape_critical(
     state: &ApiState,
     admission: ManualFinalizeTapeAdmission,
     reply: &oneshot::Sender<Result<crate::write_owner::ManualFinalizeTapeResult, Status>>,
-    ready_wait: Duration,
+    _ready_wait: Duration,
 ) -> Result<crate::write_owner::ManualFinalizeTapeResult, Status> {
     let pool = state.drive_pool()?.clone();
+    pool.wait_tape_closeout(admission.tape_uuid).await;
     let tape_reservation = match pool.reserve_tape(admission.tape_uuid) {
         Ok(reservation) => reservation,
         Err(error)
@@ -876,51 +896,7 @@ async fn manual_finalize_tape_critical(
         .map_err(|error| Status::internal(error.to_string()))?;
     let (tape, mut actor_request) =
         prepare_manual_finalize_request(&index, admission, |pool_id| state.pool_config(pool_id))?;
-    let pending_intent = remanence_state::TapeAuthority::open(
-        state.checkpoint_journal_dir.as_path(),
-        actor_request.tape_uuid,
-        state.index_path.as_path(),
-    )
-    .and_then(|j| j.pending_finalization())
-    .map_err(crate::status_from_state_error)?;
-    let prefix = if pending_intent.is_none()
-        && tape.scheme_id.is_some()
-        && tape.highest_protected_ordinal < tape.total_committed_ordinals
-    {
-        let mut deadline = None;
-        let prefix = loop {
-            if reply.is_closed() {
-                return Err(Status::cancelled(
-                    "finalization request dropped before acceptance",
-                ));
-            }
-            match plan_epoch_finalization(
-                state,
-                &pool,
-                &actor_request,
-                tape_reservation.clone(),
-                || reply.is_closed(),
-            )
-            .await
-            {
-                Ok(prefix) => break prefix,
-                Err(refusal) => {
-                    crate::readiness_wait::wait_after_refusal(
-                        state,
-                        reply,
-                        refusal.clone(),
-                        ready_wait,
-                        &mut deadline,
-                    )
-                    .await
-                    .map_err(|_| refusal)?;
-                }
-            }
-        };
-        Some(prefix)
-    } else {
-        None
-    };
+    let prefix = None;
     if reply.is_closed() {
         return Err(Status::cancelled(
             "finalization request dropped before acceptance",
@@ -1306,14 +1282,6 @@ pub(crate) fn spawn_startup_terminal_recoveries(state: ApiState) {
                 tracing::info!(tape_uuid = %Uuid::from_bytes(tape_uuid), "retired tape skipped by startup terminal recovery");
                 continue;
             }
-            // Own the exact tape before touching its log, as every live
-            // terminal owner does. A refused reservation means a live owner,
-            // such as a same-key FinalizeTape, already holds the tape and
-            // drives its pending intent itself.
-            let Ok(tape_reservation) = pool.reserve_tape(tape_uuid) else {
-                tracing::info!(tape_uuid = %Uuid::from_bytes(tape_uuid), "owned tape skipped by startup terminal recovery");
-                continue;
-            };
             let journal = match remanence_state::TapeAuthority::open(
                 state.checkpoint_journal_dir.as_path(),
                 tape_uuid,
@@ -1335,6 +1303,15 @@ pub(crate) fn spawn_startup_terminal_recoveries(state: ApiState) {
             let Some(intent) = intent else {
                 continue;
             };
+            // Own the exact tape before recovering its pending intent, as every live
+            // terminal owner does. A refused reservation means a live owner,
+            // such as a same-key FinalizeTape, already holds the tape and
+            // drives its pending intent itself.
+            let Ok(tape_reservation) = pool.reserve_tape(tape_uuid) else {
+                tracing::info!(tape_uuid = %Uuid::from_bytes(tape_uuid), "owned tape skipped by startup terminal recovery");
+                continue;
+            };
+
             if intent.manual.is_some() {
                 let reconciled = (|| {
                     let mut lease = journal.acquire_exclusive_for_terminal_recovery()?;
@@ -1620,6 +1597,7 @@ async fn open_read_session_critical(
 ) -> Result<pb::ReadSession, Status> {
     let pool = state.drive_pool()?.clone();
     let tape_uuid = target.tape_uuid();
+    pool.wait_tape_closeout(tape_uuid).await;
     let _tape_reservation = pool.reserve_tape(tape_uuid)?;
     let (mount, drive_reservation) = match target {
         ReadSessionTarget::Tape { .. } => {
@@ -1733,7 +1711,7 @@ pub(crate) async fn append_finish(
     request: AppendFinishRequest,
 ) -> Result<pb::ObjectRecord, Status> {
     let pool = state.drive_pool()?.clone();
-    let mounted = pool.session(session_id)?;
+    let mounted = pool.append_session(session_id)?;
     let drive = pool.drive_tx(&mounted.drive_key())?;
     let live_write_counter = mounted
         .drive_uuid
@@ -1776,7 +1754,7 @@ pub(crate) async fn append_streamed(
     expected_content_sha256: [u8; 32],
 ) -> Result<crate::write_owner::AppendFinishOutcome, Status> {
     let pool = state.drive_pool()?.clone();
-    let mounted = pool.session(session_id)?;
+    let mounted = pool.append_session(session_id)?;
     let drive = pool.drive_tx(&mounted.drive_key())?;
     let live_write_counter = mounted
         .drive_uuid
@@ -1808,6 +1786,9 @@ pub(crate) async fn get_write_session(
     session_id: Uuid,
 ) -> Result<pb::WriteSession, Status> {
     let pool = state.drive_pool()?.clone();
+    if let Some(ended) = pool.ended_write(session_id) {
+        return Ok(ended);
+    }
     let mounted = pool.session(session_id)?;
     let drive = pool.drive_tx(&mounted.drive_key())?;
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -1818,9 +1799,10 @@ pub(crate) async fn get_write_session(
         })
         .await
         .map_err(|_| Status::internal("drive actor unavailable"))?;
-    reply_rx
+    let result = reply_rx
         .await
-        .map_err(|_| Status::internal("drive actor dropped reply"))?
+        .map_err(|_| Status::internal("drive actor dropped reply"))?;
+    result.or_else(|error| pool.ended_write(session_id).ok_or(error))
 }
 
 pub(crate) async fn checkpoint_write_session(
@@ -1860,6 +1842,31 @@ impl SessionDisposition {
     }
 }
 
+/// End a known disconnected owner, retaining drive work through native publication.
+pub(crate) async fn disconnect_write_session(
+    state: &ApiState,
+    session_id: Uuid,
+) -> Result<(), Status> {
+    let pool = state.drive_pool()?;
+    let mounted = match pool.session(session_id) {
+        Ok(mounted) => mounted,
+        Err(error) => return pool.ended_write(session_id).map(|_| ()).ok_or(error),
+    };
+    let drive = pool.drive_tx(&mounted.drive_key())?;
+    let (reply, ended) = oneshot::channel();
+    drive
+        .send(crate::write_owner::DriveCommand::DisconnectWrite { session_id, reply })
+        .await
+        .map_err(|_| {
+            Status::unavailable("drive actor unavailable during disconnected session cleanup")
+        })?;
+    ended.await.map_err(|_| {
+        Status::unavailable("drive actor stopped during disconnected session cleanup")
+    })??;
+    pool.wait_tape_closeout(mounted.tape_uuid).await;
+    Ok(())
+}
+
 pub(crate) async fn close_write_session(
     state: &ApiState,
     session_id: Uuid,
@@ -1897,7 +1904,10 @@ async fn close_write_like_critical(
 ) -> Result<pb::WriteSession, Status> {
     let abort = disposition.is_abort();
     let pool = state.drive_pool()?.clone();
-    let mounted = pool.session(session_id)?;
+    let mounted = match pool.session(session_id) {
+        Ok(mounted) => mounted,
+        Err(error) => return pool.ended_write(session_id).ok_or(error),
+    };
     let drive = pool.drive_tx(&mounted.drive_key())?;
     let (reply_tx, reply_rx) = oneshot::channel();
     let close_started = Instant::now();
@@ -1933,7 +1943,7 @@ async fn close_write_like_critical(
         .saturating_add(actor_reply.diagnostics.session_audit_projection);
     let actor_unattributed = actor_close_elapsed.saturating_sub(actor_attributed);
     let finish_started = Instant::now();
-    finish_mounted_session(&state, &pool, session_id, mounted);
+    // The actor releases ownership after its post-reply closeout and end record.
     let finish_elapsed = finish_started.elapsed();
     let close_elapsed = close_started.elapsed();
     tracing::info!(
@@ -2604,6 +2614,7 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
         return Ok(());
     };
     pool.begin_shutdown();
+    pool.wait_closeouts().await;
     let mut failures = Vec::new();
     for (_, (session_id, mounted)) in pool.sessions_by_drive() {
         let drive = match pool.drive_tx(&mounted.drive_key()) {
@@ -2648,7 +2659,7 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
                     continue;
                 }
                 match close_rx.await {
-                    Ok(Ok(_)) => finish_mounted_session(state, pool, session_id, mounted),
+                    Ok(Ok(_)) => pool.wait_tape_closeout(mounted.tape_uuid).await,
                     Ok(Err(err)) => failures.push(format!(
                         "session {session_id}: shutdown close failed: {err}"
                     )),
@@ -2680,6 +2691,14 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
                     Err(_) => failures.push(format!(
                         "session {session_id}: drive actor dropped shutdown read close reply"
                     )),
+                }
+            }
+            Ok(Err(err)) if err.code() == tonic::Code::NotFound => {
+                pool.wait_tape_closeout(mounted.tape_uuid).await;
+                if pool.session(session_id).is_ok() {
+                    failures.push(format!(
+                        "session {session_id}: shutdown checkpoint failed: {err}"
+                    ));
                 }
             }
             Ok(Err(err)) => failures.push(format!(
@@ -2899,6 +2918,7 @@ async fn resolve_and_reserve_actor_mount(
 ) -> Result<(ActorMount, crate::write_owner::DriveReservation), Status> {
     const ATTEMPTS: usize = 2;
     for attempt in 0..ATTEMPTS {
+        pool.wait_library_closeouts(library_serial).await;
         let busy_bays = pool.busy_bays(library_serial);
         let plan =
             resolve_actor_mount(state, library_serial, tape_uuid, &busy_bays).map_err(|error| {
@@ -3339,6 +3359,7 @@ pub(crate) async fn supersede_tail(
         let tape_uuid =
             crate::catalog_conversion::decode_uuid_bytes(&request.tape_uuid, "tape_uuid")?;
         let pool = state.drive_pool()?.clone();
+        pool.wait_tape_closeout(tape_uuid).await;
         let _tape_reservation = pool.reserve_tape(tape_uuid)?;
         let library_serial = resolve_tape_library_serial(&state, &pool, &tape_uuid)?;
         let (mount, _drive_reservation) =
@@ -3387,146 +3408,106 @@ pub(crate) async fn supersede_tail(
     .map_err(|e| Status::internal(e.to_string()))?
 }
 
-/// Ownership follows each dispatched planning command until its physical work ends.
-/// The last owner schedules cleanup before releasing the tape and drive leases.
-pub(crate) struct PlanningOwnership {
-    state: Option<ApiState>,
-    runtime: tokio::runtime::Handle,
-    seated: Option<crate::write_owner::SeatedCartridge>,
-    parked: std::sync::Mutex<Option<crate::write_owner::ParkedCartridge>>,
-    _drive: Option<crate::write_owner::DriveReservation>,
-    _tape: Option<std::sync::Arc<crate::write_owner::TapeReservation>>,
-}
-
-/// A completed command transfers its lease with its reply, without a release race.
-pub(crate) struct PlanningResult<T> {
-    result: Result<T, Status>,
-    _ownership: std::sync::Arc<PlanningOwnership>,
-}
-
-impl<T> PlanningResult<T> {
-    pub(crate) fn into_result(self) -> Result<T, Status> {
-        self.result
-    }
-}
-
-impl PlanningOwnership {
-    pub(crate) fn complete<T>(
-        self: std::sync::Arc<Self>,
-        result: Result<T, Status>,
-    ) -> PlanningResult<T> {
-        PlanningResult {
-            result,
-            _ownership: self,
-        }
-    }
-
-    /// Publish the new physical location before replying or releasing ownership.
-    pub(crate) fn moved(&self) {
-        if let (Some(state), Some(seated)) = (&self.state, &self.seated) {
-            let pool = state.drive_pool().expect("planning owns a drive pool");
-            let parked = pool
-                .parked_at(&seated.drive_key())
-                .filter(|p| p.seated.tape_uuid == seated.tape_uuid)
-                .unwrap_or_else(|| pool.park_cartridge(seated.clone()));
-            *self.parked.lock().unwrap() = Some(parked);
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn model() -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self {
-            state: None,
-            runtime: tokio::runtime::Handle::current(),
-            seated: None,
-            parked: std::sync::Mutex::new(None),
-            _drive: None,
-            _tape: None,
-        })
-    }
-}
-
-impl Drop for PlanningOwnership {
-    fn drop(&mut self) {
-        if let (Some(state), Some(parked)) = (&self.state, self.parked.lock().unwrap().take()) {
-            let _entered = self.runtime.enter();
-            schedule_idle_dismount(state.clone(), parked);
-        }
-    }
-}
-
-/// Plan terminal metadata under exact-tape ownership without writing a barrier close.
-async fn plan_epoch_finalization(
+/// Maintenance owns the exact tape and drive through the closeout barrier and
+/// publication; a disconnected operation watcher does not release ownership.
+pub(crate) async fn closeout_tape(
     state: &ApiState,
-    pool: &crate::write_owner::DrivePool,
-    request: &crate::write_owner::ManualFinalizeTapeActorRequest,
-    tape: std::sync::Arc<crate::write_owner::TapeReservation>,
-    cancelled: impl Fn() -> bool,
-) -> Result<remanence_parity::TerminalPrefixPlan, Status> {
-    let library = resolve_tape_library_serial(state, pool, &request.tape_uuid)?;
-    let (mount, reservation) =
-        resolve_and_reserve_actor_mount(state, pool, &library, &request.tape_uuid).await?;
-    let ownership = std::sync::Arc::new(PlanningOwnership {
-        state: Some(state.clone()),
-        runtime: tokio::runtime::Handle::current(),
-        seated: mount
-            .home_slot
-            .map(|home_slot| crate::write_owner::SeatedCartridge {
-                bay: mount.bay,
-                library_serial: mount.library_serial.clone(),
-                barcode: mount.barcode.clone(),
-                home_slot,
-                tape_uuid: Some(request.tape_uuid),
-                prior_session_id: None,
-            }),
-        parked: std::sync::Mutex::new(None),
-        _drive: Some(reservation),
-        _tape: Some(tape),
-    });
-    if let Some(slot) = mount.source_slot {
-        // Robotics reserves every drive in this library. Holding this drive
-        // and this tape excludes robotics and a competing mount of the source.
-        let changer = pool.changer_tx(&mount.library_serial)?;
-        let (reply, received) = oneshot::channel();
-        changer
-            .send(crate::write_owner::ChangerCommand::PlanningMove {
-                src: slot,
-                dst: mount.bay,
-                ownership: ownership.clone(),
-                reply,
-            })
-            .await
-            .map_err(|_| Status::unavailable("changer actor is unavailable"))?;
-        received
-            .await
-            .map_err(|_| Status::unavailable("changer actor stopped during planning"))?
-            .into_result()?;
-    } else {
-        ownership.moved();
+    tape_uuid: [u8; 16],
+    expected_pool: Option<String>,
+    progress: crate::closeout_progress::CloseoutProgress,
+) -> Result<(), Status> {
+    if let Some(pool) = &state.drive_pool {
+        pool.wait_tape_closeout(tape_uuid).await;
     }
-    if cancelled() {
-        return Err(Status::cancelled(
-            "finalization request dropped before acceptance",
-        ));
+    let _tape = state
+        .drive_pool
+        .as_ref()
+        .map(|pool| pool.reserve_tape(tape_uuid))
+        .transpose()?;
+    {
+        let index = state.index()?;
+        let tape = index
+            .get_tape(&tape_uuid)
+            .map_err(crate::status_from_state_error)?
+            .ok_or_else(|| Status::not_found("tape not found"))?;
+        if expected_pool
+            .as_deref()
+            .is_some_and(|p| tape.pool_id.as_deref() != Some(p))
+        {
+            return Err(Status::failed_precondition(
+                "CloseoutTape expected_pool_id does not match the tape's assigned pool",
+            ));
+        }
+        let authority = remanence_state::TapeAuthority::open(
+            state.checkpoint_journal_dir.as_ref(),
+            tape_uuid,
+            index.path(),
+        )
+        .map_err(crate::status_from_state_error)?;
+        let lease = authority
+            .acquire_exclusive()
+            .map_err(crate::status_from_state_error)?;
+        let snapshot = lease.freeze().map_err(crate::status_from_state_error)?;
+        progress.bind(snapshot.tape_summary(), "rebuilt");
+        drop(index);
+        progress.audit(
+            &mut state.index_write()?,
+            &state.audit_dir,
+            &state.audit_append_lock,
+            remanence_state::AuditEvent::OperationStarted,
+            None,
+        )?;
+        if snapshot
+            .has_closeout_operation(*progress.id.as_bytes())
+            .map_err(crate::status_from_state_error)?
+            || !snapshot.tape_summary().closeout_due()
+        {
+            return Ok(());
+        }
     }
+    let pool = state.drive_pool()?.clone();
+    let library_serial = resolve_tape_library_serial(state, &pool, &tape_uuid)?;
+    let (mount, _drive) =
+        resolve_and_reserve_actor_mount(state, &pool, &library_serial, &tape_uuid).await?;
+    pool.set_internal_holder(
+        &mount.drive_key(),
+        mount.drive_serial.as_deref(),
+        "tape_closeout",
+    );
     let drive = pool.drive_tx(&mount.drive_key())?;
-    let (reply, received) = oneshot::channel();
+    if let Some(slot) = mount.source_slot {
+        changer_move(&pool, &mount.library_serial, slot, mount.bay).await?;
+    }
+    let (reply, response) = oneshot::channel();
     drive
-        .send(crate::write_owner::DriveCommand::PlanFinalization {
-            request: request.clone(),
+        .send(crate::write_owner::DriveCommand::CloseoutTape {
+            progress,
+            tape_uuid,
+            expected_pool,
             needs_drive_load: mount.needs_drive_load,
+            library_serial: mount.library_serial.clone(),
             barcode: mount.barcode.clone(),
             source_slot: mount.source_slot,
             drive_serial: mount.drive_serial.clone(),
-            ownership: ownership.clone(),
             reply,
         })
         .await
         .map_err(|_| Status::unavailable("drive actor is unavailable"))?;
-    received
+    let result = response
         .await
-        .map_err(|_| Status::unavailable("drive actor stopped during epoch close"))?
-        .into_result()
+        .map_err(|_| Status::unavailable("drive actor stopped during closeout"))?;
+    if let Some(home_slot) = mount.home_slot {
+        let parked = pool.park_cartridge(crate::write_owner::SeatedCartridge {
+            bay: mount.bay,
+            library_serial: mount.library_serial,
+            barcode: mount.barcode,
+            home_slot,
+            tape_uuid: Some(tape_uuid),
+            prior_session_id: None,
+        });
+        schedule_idle_dismount(state.clone(), parked);
+    }
+    result
 }
 
 /// Run the full pinned write open, as a handler would, with a caller-gone
@@ -4116,6 +4097,7 @@ mod tests {
                     supersede_tail(
                         &state,
                         pb::SupersedeTailRequest {
+                            observed_tape_log_sequence: None,
                             tape_uuid: POOL_TAPE_A.to_vec(),
                             ..Default::default()
                         },
@@ -4418,6 +4400,54 @@ mod tests {
             session_id: session_id.as_bytes().to_vec(),
             ..Default::default()
         })
+    }
+
+    /// A dropped handler cannot strand the session returned to its detached task.
+    #[tokio::test]
+    async fn cancelled_open_handler_dispatches_disconnect_after_actor_reply() {
+        let mut harness =
+            three_bay_two_pool_harness(vec![drive_bay(0x0101, true, Some("FTA001L9"))], vec![]);
+        let caller = spawn_pool_open(&harness.state, POOL_A);
+        let (_, reply) = expect_open_write(harness.drive_rxs.get_mut(&0x0101).unwrap()).await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        let id = Uuid::new_v4();
+        reply.send(write_session_reply(id)).unwrap();
+        let command = tokio::time::timeout(
+            Duration::from_secs(5),
+            harness.drive_rxs.get_mut(&0x0101).unwrap().recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let crate::write_owner::DriveCommand::DisconnectWrite { session_id, reply } = command
+        else {
+            panic!("detached open must end the session it could not deliver");
+        };
+        assert_eq!(session_id, id);
+        let mounted = harness.pool.session(id).unwrap();
+        harness.pool.finish_session(id, mounted);
+        reply
+            .send(Ok(crate::write_owner::CloseWriteActorReply {
+                session: pb::WriteSession {
+                    session_id: id.as_bytes().to_vec(),
+                    ..Default::default()
+                },
+                diagnostics: Default::default(),
+            }))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(lease) = harness.pool.reserve_tape(POOL_TAPE_A) {
+                    drop(lease);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(harness.pool.session(id).is_err());
     }
 
     /// Two pool opens on different pools in flight together: while the first

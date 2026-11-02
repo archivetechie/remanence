@@ -38,6 +38,7 @@ pub fn write_object_to_pool(
         selected,
         false,
         PoolWriteDurability::PerObject,
+        None,
     )
 }
 
@@ -79,5 +80,6 @@ pub(crate) fn write_to_selected_tape_with_live_counter(
         live_write_counter,
         true,
         PoolWriteDurability::PerObject,
+        None,
     )
 }

@@ -233,6 +233,9 @@ impl Drop for Client {
 }
 
 impl Client {
+    fn reader(&self) -> pb::read_session_service_client::ReadSessionServiceClient<Channel> {
+        pb::read_session_service_client::ReadSessionServiceClient::new(self.channel.clone())
+    }
     fn writer(&self) -> pb::write_session_service_client::WriteSessionServiceClient<Channel> {
         pb::write_session_service_client::WriteSessionServiceClient::new(self.channel.clone())
     }
@@ -482,18 +485,34 @@ async fn check_graceful_shutdown_restart(other_drive: bool) {
             session_id: session.session_id.clone(),
         })
         .await
-        .unwrap_err();
+        .unwrap()
+        .into_inner();
     assert_eq!(
-        closed.code(),
-        tonic::Code::NotFound,
-        "shutdown releases the session"
+        closed.state,
+        pb::write_session::State::WriteSessionStateClosed as i32,
+        "shutdown retains the completed session and its receipts"
     );
     assert_session_closed(&fixture, &session.session_id);
+    let authority = remanence_state::TapeAuthority::open(
+        fixture.config.journal.dir.join("tapes"),
+        UUID,
+        &fixture.config.index.sqlite_path,
+    )
+    .unwrap();
+    use remanence_state::authority::TapeAuthorityView;
+    let native = authority.freeze().unwrap();
+    let end = native.tape_summary().last_session_end.as_ref().unwrap();
+    assert_eq!(
+        end.reason,
+        remanence_state::tape_log::SessionEndReason::GracefulShutdown
+    );
+    assert_eq!(end.tail_file_count, 0);
+    assert!(end.crash_ack_audit_sequence.is_none());
     let index = CatalogIndex::open(&fixture.config.index.sqlite_path).unwrap();
     let tape = index.get_tape(&UUID).unwrap().unwrap();
-    assert!(
-        tape.highest_protected_ordinal < tape.total_committed_ordinals,
-        "shutdown leaves the partial epoch open"
+    assert_eq!(
+        tape.highest_protected_ordinal, tape.total_committed_ordinals,
+        "graceful shutdown closes the session-owned partial epoch"
     );
     let cursor = tape.written_extent_lba.unwrap();
     drop(client);
@@ -540,8 +559,8 @@ async fn check_graceful_shutdown_restart(other_drive: bool) {
         );
         assert!(commands.iter().any(|c| c[0] == 0x34), "READ POSITION proof");
         assert!(
-            locates.contains(&2),
-            "cold open reads the committed Object range"
+            !locates.contains(&2),
+            "a closed session epoch needs no committed Object readback"
         );
         assert_eq!(locates.last(), Some(&(cursor - 1)));
         let last_locate = commands.iter().rposition(|c| c[0] == 0x92).unwrap();
@@ -737,6 +756,10 @@ async fn abort_keeps_checkpointed_data_and_hides_uncommitted_object() {
 /// Raw transport evidence supplements the world model; it never supplies RPC outcomes.
 #[derive(Default)]
 struct Injection {
+    held_barrier: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
     load_delay: Duration,
     waiting_until: Option<Instant>,
     waiting_commands: Vec<u8>,
@@ -746,6 +769,7 @@ struct Injection {
     corrected_eod: usize,
     corrected_filemark: usize,
     lose_write_reply: bool,
+    lose_sidecar_reply: bool,
     lost_write_replies: usize,
     commands: Vec<Vec<u8>>,
 }
@@ -835,7 +859,15 @@ impl SgTransport for Transport {
         self.before(cdb)?;
         let outcome = self.inner.execute_out(cdb, buf)?;
         let mut injection = self.injection.lock().unwrap();
-        if cdb[0] == 0x0a && injection.lose_write_reply {
+        let sidecar = cdb[0] == 0x0a
+            && injection.lose_sidecar_reply
+            && remanence_parity::sidecar::parse_sidecar_header_block(
+                buf.get(..BLOCK as usize).unwrap_or(buf),
+                &UUID,
+            )
+            .is_ok();
+        if cdb[0] == 0x0a && (injection.lose_write_reply || sidecar) {
+            injection.lose_sidecar_reply = false;
             injection.lose_write_reply = false;
             injection.lost_write_replies += 1;
             return Err(ScsiError::TransportError {
@@ -850,6 +882,13 @@ impl SgTransport for Transport {
     }
     fn execute_none(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
         self.before(cdb)?;
+        if cdb[0] == 0x10 && cdb[1] & 1 == 0 && cdb[2..5] == [0, 0, 0] {
+            let held = self.injection.lock().unwrap().held_barrier.take();
+            if let Some((entered, release)) = held {
+                let _ = entered.send(());
+                let _ = release.recv();
+            }
+        }
         self.inner.execute_none(cdb)?;
         if (cdb[0] == 0x1b && cdb[4] & 1 != 0)
             || (cdb[0] == 0xa5 && u16::from_be_bytes([cdb[6], cdb[7]]) == BAY)
@@ -1428,6 +1467,7 @@ async fn check_finalized_access(restart: bool) {
         pb::TapeFinalizationOutcome::Finalized as i32,
         "{finalized:?}"
     );
+
     if !restart {
         client.assert_object(&object, b"finalized bytes").await;
     }
@@ -1442,6 +1482,27 @@ async fn check_finalized_access(restart: bool) {
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     client.state.shutdown_drive_pool().await.unwrap();
     drop(client);
+    // Native inspection owns a lease only after the actor has released it.
+    {
+        use remanence_state::authority::TapeAuthorityView;
+        let authority = remanence_state::TapeAuthority::open(
+            fixture.config.journal.dir.join("tapes"),
+            UUID,
+            &fixture.config.index.sqlite_path,
+        )
+        .unwrap();
+        let commit = authority.latest_commit().unwrap().unwrap();
+        let plan = commit.finalization.unwrap();
+        assert!(plan.manual.is_some());
+        let entries = &plan.terminal_prefix.unwrap().sidecar_directory_entries;
+        assert!(!entries.is_empty());
+        assert!(
+            entries.iter().all(|e| e.flags
+                & remanence_parity::SIDECAR_DIRECTORY_FLAG_FINAL_PARTIAL_EPOCH
+                == 0),
+            "ordinary closeout preceded the manual decision"
+        );
+    }
     if restart {
         let client = fixture.start().await;
         client.assert_object(&object, b"finalized bytes").await;
@@ -1543,4 +1604,562 @@ async fn committed_cursor_reopen_with_and_without_kernel_residual() {
         client.assert_object(&second, b"after cursor proof").await;
         client.state.shutdown_drive_pool().await.unwrap();
     }
+}
+
+/// Explicit closeout joins a failed writer's ownership, repairs only committed
+/// debt, and binds retries to the original operation without further media work.
+#[tokio::test]
+async fn closeout_due_noop_idempotency_and_wrong_pool() {
+    let fixture = Harness::new(true);
+    let client = fixture.start().await;
+    let mut catalog = pb::catalog_client::CatalogClient::new(client.channel.clone());
+    let mut daemon = pb::daemon_client::DaemonClient::new(client.channel.clone());
+    let request = |key: uuid::Uuid, pool: &str| pb::CloseoutTapeRequest {
+        tape_uuid: UUID.to_vec(),
+        expected_pool_id: Some(pool.into()),
+        idempotency_key: Some(pb::IdempotencyKey {
+            value: key.as_bytes().to_vec(),
+        }),
+    };
+    async fn completed(
+        daemon: &mut pb::daemon_client::DaemonClient<Channel>,
+        op: &pb::OperationRef,
+    ) -> pb::OperationStatus {
+        let mut watch = daemon
+            .watch_operation(pb::GetOperationRequest {
+                operation_id: op.operation_id.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let last = tokio::time::timeout(Duration::from_secs(30), async {
+            let mut last = None;
+            while let Some(status) = watch.message().await.unwrap() {
+                last = Some(status);
+            }
+            last.unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(last.state, pb::OperationState::Succeeded as i32, "{last:?}");
+        last
+    }
+    let before = fixture.world.lock().unwrap().command_log.len();
+    let noop = catalog
+        .closeout_tape(request(uuid::Uuid::new_v4(), "archive"))
+        .await
+        .unwrap()
+        .into_inner();
+    completed(&mut daemon, &noop).await;
+    assert_eq!(
+        fixture.world.lock().unwrap().command_log.len(),
+        before,
+        "nothing due means no media commands"
+    );
+    assert_eq!(
+        catalog
+            .closeout_tape(request(uuid::Uuid::new_v4(), "other"))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    let session = client.open().await;
+    let committed = client
+        .append(&session, "protected-by-closeout", b"committed bytes")
+        .await;
+    client.checkpoint(&session).await;
+    fixture.injection.lock().unwrap().lose_write_reply = true;
+    client
+        .try_append(&session, "abandoned-by-drive", b"unknown completion")
+        .await
+        .unwrap_err();
+    let key = uuid::Uuid::new_v4();
+    let op = catalog
+        .closeout_tape(request(key, "archive"))
+        .await
+        .unwrap()
+        .into_inner();
+    let status = completed(&mut daemon, &op).await;
+    for field in [
+        "tape_uuid",
+        "tape_incarnation",
+        "tape_log_sequence",
+        "w",
+        "t",
+        "attempt",
+        "unprotected_bytes",
+        "started_at_utc",
+        "elapsed_ms",
+        "reserved_bytes",
+        "peak_reserved_bytes",
+        "source",
+        "already_protected",
+    ] {
+        assert!(
+            status.progress.contains_key(field),
+            "missing {field}: {status:?}"
+        );
+    }
+    assert_eq!(status.progress["source"], "rebuilt");
+    assert_eq!(status.progress["phase"], "complete");
+    let authority = remanence_state::TapeAuthority::open(
+        fixture.config.journal.dir.join("tapes"),
+        UUID,
+        &fixture.config.index.sqlite_path,
+    )
+    .unwrap();
+    use remanence_state::authority::TapeAuthorityView;
+    let snapshot = authority.freeze().unwrap();
+    assert!(!snapshot.tape_summary().closeout_due());
+    assert!(snapshot.tape_summary().open_session.is_none());
+    let ended = remanence_state::FileAuditLog::replay(&fixture.config.audit.dir).unwrap();
+    assert!(ended
+        .iter()
+        .any(|record| record.session_id.map(|id| id.as_bytes().to_vec())
+            == Some(session.session_id.clone())
+            && record.detail.get("end_reason")
+                == Some(&ciborium::Value::Text("drive_error".into()))));
+    assert!(snapshot
+        .has_closeout_operation(*uuid::Uuid::from_slice(&op.operation_id).unwrap().as_bytes())
+        .unwrap());
+    assert!(CatalogIndex::open(&fixture.config.index.sqlite_path)
+        .unwrap()
+        .list_active_tape_io_fences()
+        .unwrap()
+        .is_empty());
+    let before = fixture.world.lock().unwrap().command_log.len();
+    let retry = catalog
+        .closeout_tape(request(key, "archive"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(retry.operation_id, op.operation_id);
+    completed(&mut daemon, &retry).await;
+    assert_eq!(fixture.world.lock().unwrap().command_log.len(), before);
+    client.assert_object(&committed, b"committed bytes").await;
+    client.state.shutdown_drive_pool().await.unwrap();
+}
+
+/// The close receipt is early, but ownership remains exclusive until native
+/// closeout and the end record settle. Following access waits without retrying.
+#[tokio::test]
+async fn post_reply_closeout_holds_drive_and_log_until_end() {
+    for access in ["write", "read", "shutdown", "idle", "eviction"] {
+        let mut fixture = Harness::new(true);
+        if access == "idle" {
+            fixture.config.daemon.drive_idle_unload_seconds = 1;
+        }
+        if access == "eviction" {
+            let other = [0x36; 16];
+            let parity = ParityConfig::None;
+            let mut index = CatalogIndex::open(&fixture.config.index.sqlite_path).unwrap();
+            index
+                .provision_tape(ProvisionTapeInput {
+                    tape_uuid: other,
+                    voltag: "CHAR02L9".into(),
+                    block_size: BLOCK,
+                    parity: parity.clone(),
+                    force: false,
+                })
+                .unwrap();
+            index.project_tape_pool_membership(other, "other").unwrap();
+            let payload = remanence_api::build_tape_bootstrap(
+                other,
+                BLOCK,
+                parity,
+                "2026-11-02T00:00:00Z",
+                "characterisation",
+            );
+            let mut block = vec![0; BLOCK as usize];
+            write_bootstrap_block(&payload, &mut block).unwrap();
+            let mut tape = VirtualTape::empty(18_000_000_000_000, BLOCK);
+            tape.records = vec![Record::Block(block), Record::Filemark];
+            tape.written_bytes = u64::from(BLOCK);
+            fixture
+                .world
+                .lock()
+                .unwrap()
+                .put_tape_in_slot(0x401, "CHAR02L9", tape);
+        }
+        let client = fixture.start().await;
+        let session = client.open().await;
+        client.append(&session, "held", b"a short epoch").await;
+        client.checkpoint(&session).await;
+        let (entered, at_barrier) = tokio::sync::oneshot::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        fixture.injection.lock().unwrap().held_barrier = Some((entered, gate));
+        tokio::time::timeout(Duration::from_secs(5), client.close(&session))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), at_barrier)
+            .await
+            .unwrap()
+            .unwrap();
+        let authority = remanence_state::TapeAuthority::open(
+            fixture.config.journal.dir.join("tapes"),
+            UUID,
+            &fixture.config.index.sqlite_path,
+        )
+        .unwrap();
+        assert!(
+            authority.acquire_exclusive().is_err(),
+            "post-reply actor still owns tape log"
+        );
+        let channel = client.channel.clone();
+        let state = client.state.clone();
+        let model = fixture.world.clone();
+        let commands_before_release = model.lock().unwrap().command_log.len();
+        let mut following = tokio::spawn(async move {
+            match access {
+                "write" | "eviction" => {
+                    let mut writer =
+                        pb::write_session_service_client::WriteSessionServiceClient::new(channel);
+                    let mut request = open_request(if access == "eviction" {
+                        "other"
+                    } else {
+                        "archive"
+                    });
+                    if access == "eviction" {
+                        let Some(pb::open_write_session_request::Target::TapeTarget(target)) =
+                            request.target.as_mut()
+                        else {
+                            unreachable!()
+                        };
+                        target.tape_uuid = vec![0x36; 16];
+                    }
+                    let next = writer
+                        .open_write_session(request)
+                        .await
+                        .unwrap()
+                        .into_inner();
+                    writer
+                        .close_write_session(pb::CloseWriteSessionRequest {
+                            session_id: next.session_id,
+                            ..Default::default()
+                        })
+                        .await
+                        .unwrap();
+                }
+                "read" => {
+                    let mut reader =
+                        pb::read_session_service_client::ReadSessionServiceClient::new(channel);
+                    let next = reader
+                        .open_read_session(pb::OpenReadSessionRequest {
+                            target: Some(pb::open_read_session_request::Target::TapeTarget(
+                                tape_target("archive"),
+                            )),
+                            ..Default::default()
+                        })
+                        .await
+                        .unwrap()
+                        .into_inner();
+                    reader
+                        .close_read_session(pb::CloseReadSessionRequest {
+                            session_id: next.session_id,
+                            ..Default::default()
+                        })
+                        .await
+                        .unwrap();
+                }
+                "idle" => {
+                    while model.lock().unwrap().drive_bays[&BAY].is_some() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+                _ => state.shutdown_drive_pool().await.unwrap(),
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut following)
+                .await
+                .is_err(),
+            "{access} waits for closeout"
+        );
+        if access == "idle" {
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            assert!(fixture.world.lock().unwrap().drive_bays[&BAY].is_some());
+            assert!(!following.is_finished());
+        }
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), following)
+            .await
+            .unwrap_or_else(|_| panic!("{access} finishes after closeout"))
+            .unwrap();
+        client.state.shutdown_drive_pool().await.unwrap();
+        if access == "idle" {
+            assert!(
+                fixture.world.lock().unwrap().command_log[commands_before_release..]
+                    .iter()
+                    .all(|c| c.opcode != 0x0a),
+                "removal never writes parity"
+            );
+        }
+        use remanence_state::authority::TapeAuthorityView;
+        let snapshot = authority.freeze().unwrap();
+        assert!(!snapshot.tape_summary().closeout_due());
+        assert!(snapshot.tape_summary().open_session.is_none());
+    }
+}
+
+/// A lost full-epoch sidecar reply cannot commit its preceding Object; a lost
+/// post-reply short-sidecar reply cannot retract already delivered receipts.
+#[tokio::test]
+async fn failed_sidecar_names_both_full_epoch_and_post_reply_tails() {
+    use remanence_state::authority::TapeAuthorityView;
+    use remanence_state::tape_log::{SessionEndReason, TailFilemark, TailIdentity};
+    for full_epoch in [false, true] {
+        let fixture = Harness::new(true);
+        let client = fixture.start().await;
+        let session = client.open().await;
+        fixture.injection.lock().unwrap().lose_sidecar_reply = true;
+        if full_epoch {
+            client
+                .try_append(&session, "failed-full", &vec![0x5a; 7 * BLOCK as usize])
+                .await
+                .unwrap_err();
+        } else {
+            client
+                .append(&session, "short-closeout", b"durable receipt")
+                .await;
+            let close = client.close(&session).await;
+            assert_eq!(close.checkpointed_objects.len(), 1);
+        }
+        // The ordered Get reply follows the actor's end and ownership cleanup.
+        client
+            .writer()
+            .get_write_session(pb::GetWriteSessionRequest {
+                session_id: session.session_id.clone(),
+            })
+            .await
+            .unwrap();
+        client.state.shutdown_drive_pool().await.unwrap();
+        let authority = remanence_state::TapeAuthority::open(
+            fixture.config.journal.dir.join("tapes"),
+            UUID,
+            &fixture.config.index.sqlite_path,
+        )
+        .unwrap();
+        let snapshot = authority.freeze().unwrap();
+        let summary = snapshot.tape_summary();
+        assert!(summary.open_session.is_none());
+        assert_eq!(summary.object_count, u64::from(!full_epoch));
+        assert_eq!(summary.closeout_due(), !full_epoch);
+        assert_eq!(
+            summary.last_session_end.as_ref().unwrap().reason,
+            if full_epoch {
+                SessionEndReason::DriveError
+            } else {
+                SessionEndReason::CloseoutFailed
+            }
+        );
+        let mut files = Vec::new();
+        snapshot
+            .visit_session_tail(&mut |file| {
+                files.push(file.clone());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(files.len(), if full_epoch { 2 } else { 1 });
+        if full_epoch {
+            assert!(matches!(files[0].identity, TailIdentity::Object(_)));
+            assert_eq!(files[0].filemark, TailFilemark::Present);
+        }
+        let sidecar = files.last().unwrap();
+        assert!(matches!(sidecar.identity, TailIdentity::Sidecar(_)));
+        assert!(sidecar.unknown_blocks > 0);
+        assert_eq!(sidecar.filemark, TailFilemark::Absent);
+        assert!(CatalogIndex::open(&fixture.config.index.sqlite_path)
+            .unwrap()
+            .list_active_tape_io_fences()
+            .unwrap()
+            .is_empty());
+        assert_eq!(fixture.injection.lock().unwrap().lost_write_replies, 1);
+    }
+}
+
+/// Explicit maintenance reserves its complete rebuild workspace before LOAD,
+/// readiness, identity reads, or any other drive command.
+#[tokio::test]
+async fn closeout_memory_refuses_before_any_drive_command_and_retry_survives_restart() {
+    let mut fixture = Harness::new(true);
+    let client = fixture.start().await;
+    let session = client.open().await;
+    client.append(&session, "memory-prefix", b"committed").await;
+    client.checkpoint(&session).await;
+    fixture.injection.lock().unwrap().lose_write_reply = true;
+    client
+        .try_append(&session, "memory-failure", b"unknown")
+        .await
+        .unwrap_err();
+    client.state.shutdown_drive_pool().await.unwrap();
+    drop(client);
+    {
+        let paths = remanence_state::StatePaths::from_config(
+            fixture.root.join("config.toml"),
+            &fixture.config,
+        );
+        let mut state =
+            remanence_state::StateHandle::open_with_config(paths, fixture.config.clone()).unwrap();
+        let error = state
+            .retire_tape(remanence_state::RetireTapeInput {
+                tape_uuid: UUID,
+                reason: "must close out first".into(),
+            })
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("CloseoutRequired:"), "{text}");
+        assert!(text.contains("run rem tape closeout"), "{text}");
+        assert!(text.contains("before retirement"), "{text}");
+    }
+    let key = uuid::Uuid::new_v4();
+    let request = pb::CloseoutTapeRequest {
+        tape_uuid: UUID.to_vec(),
+        expected_pool_id: Some("archive".into()),
+        idempotency_key: Some(pb::IdempotencyKey {
+            value: key.as_bytes().to_vec(),
+        }),
+    };
+    let mut operation = None;
+    for (attempt, limited) in [true, false, false].into_iter().enumerate() {
+        fixture.config.daemon.io_memory_ceiling = if limited {
+            1024 * 1024
+        } else {
+            64 * 1024 * 1024
+        };
+        fixture.config.daemon.append_ring_bytes = 1024 * 1024;
+        fixture.config.tape_io.read_reservoir_bytes = 1024 * 1024;
+        let client = fixture.start().await;
+        let before = fixture.world.lock().unwrap().command_log.len();
+        let op = pb::catalog_client::CatalogClient::new(client.channel.clone())
+            .closeout_tape(request.clone())
+            .await
+            .unwrap()
+            .into_inner();
+        let mut watch = pb::daemon_client::DaemonClient::new(client.channel.clone())
+            .watch_operation(pb::GetOperationRequest {
+                operation_id: op.operation_id.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let mut last = None;
+        while let Some(status) = watch.message().await.unwrap() {
+            last = Some(status);
+        }
+        let last = last.unwrap();
+        if limited {
+            assert_eq!(last.state, pb::OperationState::Failed as i32);
+            assert!(last.error_summary.contains("CloseoutMemory:"), "{last:?}");
+            assert_eq!(fixture.world.lock().unwrap().command_log.len(), before);
+        } else {
+            assert_eq!(last.state, pb::OperationState::Succeeded as i32, "{last:?}");
+        }
+        if attempt == 2 {
+            assert_eq!(
+                fixture.world.lock().unwrap().command_log.len(),
+                before,
+                "durable retry does no media work after restart"
+            );
+        }
+        if let Some(previous) = &operation {
+            assert_eq!(&op.operation_id, previous);
+        }
+        operation = Some(op.operation_id);
+        client.state.shutdown_drive_pool().await.unwrap();
+    }
+}
+
+/// Each ended session protects its own short range; a checkpoint within one
+/// session does not split the full-epoch bytes or reset its accumulator.
+#[tokio::test]
+async fn session_epochs_end_at_close_and_full_epoch_ignores_checkpoint_boundaries() {
+    use remanence_state::authority::TapeAuthorityView;
+    fn sidecars(fixture: &Harness) -> Vec<(u64, u64, u64, Vec<Vec<u8>>)> {
+        let world = fixture.world.lock().unwrap();
+        world.tapes[BARCODE]
+            .records
+            .split(|r| matches!(r, Record::Filemark))
+            .filter_map(|file| {
+                let blocks: Vec<_> = file
+                    .iter()
+                    .filter_map(|r| match r {
+                        Record::Block(b) => Some(b.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                let header =
+                    remanence_parity::sidecar::parse_sidecar_header_block(blocks.first()?, &UUID)
+                        .ok()?;
+                Some((
+                    header.epoch_id,
+                    header.protected_ordinal_start,
+                    header.protected_ordinal_end_exclusive,
+                    blocks,
+                ))
+            })
+            .collect()
+    }
+    let fixture = Harness::new(true);
+    let client = fixture.start().await;
+    for n in 0..2 {
+        let session = client.open().await;
+        client
+            .append(&session, &format!("short-{n}"), b"one block")
+            .await;
+        client.close(&session).await;
+        // Following access serializes with the post-reply owner.
+        let reader = client
+            .reader()
+            .open_read_session(pb::OpenReadSessionRequest {
+                target: Some(pb::open_read_session_request::Target::TapeTarget(
+                    tape_target("archive"),
+                )),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        client
+            .reader()
+            .close_read_session(pb::CloseReadSessionRequest {
+                session_id: reader.session_id,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let authority = remanence_state::TapeAuthority::open(
+            fixture.config.journal.dir.join("tapes"),
+            UUID,
+            &fixture.config.index.sqlite_path,
+        )
+        .unwrap();
+        let summary = authority.freeze().unwrap();
+        assert_eq!(
+            summary.tape_summary().protected,
+            summary.tape_summary().total
+        );
+        assert!(summary.tape_summary().open_session.is_none());
+        assert_eq!(sidecars(&fixture).len(), n + 1);
+    }
+    let shorts = sidecars(&fixture);
+    assert_eq!((shorts[0].0, shorts[0].1, shorts[0].2), (0, 0, 3));
+    assert_eq!((shorts[1].0, shorts[1].1, shorts[1].2), (1, 3, 6));
+    client.state.shutdown_drive_pool().await.unwrap();
+
+    let seed = Harness::new(true);
+    let client = seed.start().await;
+    let session = client.open().await;
+    for n in 0..2 {
+        client
+            .append(&session, &format!("full-{n}"), b"one block")
+            .await;
+        client.checkpoint(&session).await;
+        assert_eq!(sidecars(&seed).len(), usize::from(n == 1));
+    }
+    client.close(&session).await;
+    client.state.shutdown_drive_pool().await.unwrap();
+    let full = sidecars(&seed);
+    assert_eq!(full.len(), 1);
+    assert_eq!((full[0].1, full[0].2), (0, 6));
 }
