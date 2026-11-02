@@ -1,301 +1,537 @@
 # Importing and recovering Remanence tapes
 
-This guide explains what Remanence does when it meets a tape that its local
-catalog knows nothing about, and what an operator does about it. Typical cases
-are a catalog lost in a host failure, a cartridge returning from an offsite
-vault to a replacement host, and a cartridge moving from one Remanence site to
-another. The guide covers how Remanence recognizes such a tape without writing
-to it, what it records, what it deliberately does not record, how an
-interrupted write is recovered, and the commands to run.
+This guide is for the operator of a tape library who holds a Remanence
+cartridge that the local catalog does not know. Typical cases are a catalog
+lost in a host failure, a cartridge returning from an offsite vault to a
+replacement host, and a cartridge moving from one Remanence site to another.
+The guide shows how to identify such a tape without writing to it, how to
+record its identity in the catalog, and how to find out what it holds. It also
+says which tapes cannot be imported this way, and what to do with them instead.
 
-A few terms are used throughout. A **tape file** is the stretch of a tape
-between two **filemarks**, the separator marks a drive records on the medium.
-**BOT** is the beginning of tape and **EOD** the end of recorded data. A
-**block** is the fixed-size record the drive reads and writes, 1 MiB here. An
-**Object** is the unit Remanence stores: one archive holding one or more files
-and a manifest, written in the REM-OBJECT format. The **catalog** is the SQLite
-database in which a Remanence installation records which tapes and Objects it
-knows. **Parity** is extra data written to the tape so that damaged blocks can
-be reconstructed. More terms are in the [glossary](reference-glossary.md).
+A few terms recur. A **tape file** is the run of blocks between two filemarks,
+the separators a drive records on the medium. A **block** is the fixed-size
+record the drive reads and writes; its size is chosen when the tape is
+initialized. **BOT** is the beginning of tape and **EOD** the end of recorded
+data. The first tape file is the **bootstrap**, which records the tape UUID and
+how the tape was written. An **object** is the unit Remanence stores: one tape
+file that holds an archive of files. The **tape log** is the host's record of
+what was committed to one tape, kept in the state directory, and the
+**catalog** is the SQLite database that Remanence rebuilds from the tape logs
+and the audit log. [Concepts](concepts.md) introduces these terms in order, and
+the [glossary](reference-glossary.md) has the rest.
 
-## The short version
+## How import works
 
-A Remanence tape carries its own identity card. The first record on the tape,
-called the **bootstrap**, says which tape this is and how it was written. A
-Remanence installation also keeps a local SQLite catalog, which works like the
-site's card index: it records which tapes and Objects that site knows about.
+The bootstrap works like an identity card that travels with the cartridge. The
+catalog is the site's card index: it records which tapes and objects this site
+knows. Losing the catalog, or moving a cartridge to another site, removes the
+card-index entry and leaves the identity card on the tape. **Adoption** reads
+the identity card and creates a minimal local record for the tape. It does not
+initialize the tape and writes nothing to it.
 
-Moving a cartridge to another site, or losing the SQLite database, removes the
-card-index entry but leaves the identity card on the tape. **Adoption** reads
-that on-tape identity and creates a minimal, conservative local record for the
-tape. It does not initialize the tape and does not write anything to it.
+Import happens in three separate stages:
 
-Import and recovery happen in three separate stages:
-
-| Stage | What Remanence learns | What it does not assume |
-|---|---|---|
-| Probe | Whether BOT holds a valid Remanence bootstrap, with the tape UUID and geometry | That the local catalog is correct, or that the rest of the tape is healthy |
-| Adopt | The tape's identity, barcode, pool, geometry, and a conservative lifecycle state | Which Objects are present, or whether they were committed |
-| Inventory and verify | The contents and the structural evidence readable from the terminal indexes or from a scan starting at BOT. A full verification also reads every protected data block and parity shard | That a read-only inventory has rebuilt the site's writable catalog |
+| Stage | Command | What Remanence learns | What it does not assume |
+| --- | --- | --- | --- |
+| Probe | `rem-debug tape bot-probe` | Whether BOT holds a valid Remanence bootstrap, with the tape UUID and geometry. | That the catalog is correct, or that the rest of the tape is healthy. |
+| Adopt | `rem-debug tape adopt-bootstrap` | The tape's identity, barcode, pool and geometry, and a lifecycle state taken from what follows the bootstrap. | Which objects are on the tape, or whether they were committed. |
+| Inventory and verify | `rem tape inventory`, `rem tape verify-index` | The contents, read from the terminal index or from a walk from BOT. A full verification also reads every protected data block and parity shard. | That an inventory has rebuilt the catalog. |
 
 The stages are separate so that Remanence can recognize and inspect a cartridge
-without inventing a history for it. The **terminal indexes** are three copies of
-the complete Object inventory, written at the end of a tape when it is
-finalized. A finalized tape normally offers a fast read of them. A complete scan from the
-beginning of the tape is needed only when terminal discovery finds no usable
-replica, as on a partially written tape or one whose terminal indexes are
-unreadable. A finalization that was interrupted can leave replica A, or A and B,
-usable.
+without inventing a history for it. The **terminal index** is the list of every
+object on the tape, written three times (replicas A, B and C) at the end of the
+tape when it is finalized. A finalized tape offers a fast read of it. A walk
+from BOT is needed only when no replica can be used, as on a tape that was never
+finalized or one whose replicas cannot be read.
 
-Remanence does not turn tape-only inventory rows into the ordinary Object,
-copy, and file catalog. `rebuild-catalog-from-journals` replays surviving host
-audit logs and per-tape logs; it does not read a terminal index or a BOT
-scan. A site that holds only a cartridge can identify and inspect it, but
-Remanence does not yet import its contents into the catalog.
+Two limits shape the rest of this guide. The first is that adoption records
+identity only. Remanence does not turn the rows of a tape-only inventory into
+ordinary catalog entries: `rem rebuild-catalog-from-journals` rebuilds the
+catalog from surviving tape logs and the audit log, and it reads neither a
+terminal index nor a walk. A site that holds only the cartridge can identify it
+and inspect it, and it can restore files from it in a standalone drive, but it
+cannot import the tape's objects into its catalog. The second limit is that
+adoption accepts only tapes written with 1 MiB blocks and the default parity
+scheme, which Remanence's own defaults do not produce. [Which tapes can be
+adopted](#which-tapes-can-be-adopted) explains the rule and the alternatives.
 
-## What “foreign tape” means
+## What "foreign tape" means
 
-“Foreign” can describe two quite different situations:
+"Foreign" can describe quite different cartridges, and only some of them are
+handled here:
 
-| Cartridge | Supported by this workflow? | Correct path |
-|---|---:|---|
-| A Remanence tape written at another site | Partly | Probe and adopt its identity, then inventory and verify. Ordinary catalog import additionally needs the source site's host journals |
-| A Remanence tape whose local SQLite row was lost | Yes | The same probe-and-adopt workflow |
-| A Remanence tape with a damaged or unreadable bootstrap | No | Do not adopt; preserve the cartridge for a deeper recovery procedure |
-| An LTFS, tar, or other non-Remanence tape | No | Use a separately supplied, read-only foreign-format adapter |
-| A blank tape | No | Initialize it as new media |
+| Cartridge | Handled by this guide? | What to do |
+| --- | --- | --- |
+| A Remanence tape whose catalog row was lost, on a host whose state directory survived | Not needed | Rebuild the catalog from the tape logs ([Rebuild the catalog](#rebuild-the-catalog-from-the-tape-logs)). This works for every geometry. |
+| A Remanence tape written at another site | Identity only | Probe and adopt it, then inventory and verify it. Its objects can be listed, and restored in a standalone drive, but not imported into this catalog. |
+| A Remanence tape with a geometry other than 1 MiB blocks and default parity | No | See [Which tapes can be adopted](#which-tapes-can-be-adopted). |
+| A Remanence tape with a damaged or unreadable bootstrap | No | Do not adopt it. [Damaged tapes](guide-damaged-tapes.md) describes `rem-debug tape recovery-report`, which reads such a tape with values you supply. |
+| An LTFS, tar or other non-Remanence tape | No | Stock Remanence includes no parser for other formats. [Foreign-format adapters](reference-foreign-format-adapters.md) describes the read-only adapter interface that separately versioned distributions can use. |
+| A blank tape | No | Initialize it as new media with `rem tape init`. |
 
-The supported case is a cartridge that is foreign to this installation but
-native to Remanence. The adoption command recognizes the identity already on
-the tape. It does not convert another tape format into Remanence.
+Adoption recognizes an identity that is already on the tape. It never converts
+another format into a Remanence tape, relabels a cartridge, overrides a retired
+identity, or makes an already written tape writable without its real tape log.
 
-Stock Remanence includes no parser for LTFS, tar, or other
-formats. Its core exposes the adapter interface, and separately versioned
-distributions may link read-only adapters. [Foreign-format
-adapters](reference-foreign-format-adapters.md) describes that path and what is
-currently available.
+For example, site A writes a Remanence tape and sends it to an offsite vault.
+Site B later receives the cartridge without site A's state directory. Site B
+can probe and adopt the bootstrap identity, then inventory and verify the tape.
+It can restore files from the tape in a standalone drive, which needs no
+catalog. Site B cannot turn the inventory into catalog entries, so `rem list`
+and `rem get` on site B do not know the tape's objects. An LTFS cartridge in
+the same shipment is rejected by the stock tools as a foreign or unrecognized
+format.
 
-Adoption restores identity only. It does not tell the site's catalog about the
-tape's Objects, files, committed prefix, terminal indexes, or finalization
-history.
+For a transfer between sites, the destination must support the tape's bootstrap
+and on-tape format versions. Its configuration also needs a pool rule that maps
+the barcode to a configured pool. Adoption does not decrypt or restore objects,
+and encrypted objects still need their private keys. A WORM (write-once)
+cartridge is safe for this read-only identity step, but Remanence does not write
+ordinary objects to WORM media.
 
-For example, Site A writes a Remanence tape and sends it to an offsite vault.
-Site B later receives the cartridge without Site A's SQLite catalog. Site B can
-probe and adopt the bootstrap identity, then inventory and verify the terminal
-indexes. If Site A also sent its audit and per-tape logs, Site B can
-rebuild the ordinary catalog from those host records. With the cartridge alone,
-Site B can inspect the tape but cannot import its inventory rows as ordinary
-catalog entries. An LTFS cartridge in the same shipment needs a distribution
-with an LTFS adapter. The stock Remanence tools reject it as unrecognized or
-unsupported.
+<!-- code-anchor: crates/remanence-api/src/tape_init.rs crates/remanence-state/src/state.rs crates/remanence-state/src/config.rs crates/remanence-cli/src/lib.rs crates/remanence-cli/src/standalone.rs @ 625f7044 -->
+## Which tapes can be adopted
 
-## How Object names are recovered when the terminal indexes are damaged
+`rem-debug tape adopt-bootstrap` accepts a bootstrap only when all of these
+hold:
 
-A healthy finalized tape carries its complete Object inventory in each of the
-three terminal replicas. If all three are unusable, Remanence scans every
-tape file from the beginning, splitting them at the filemarks. The scan can
-show that an Object-shaped tape file is complete, but the position of a tape
-file does not reveal the Object's name.
+- the tape UUID is an RFC 4122 version 4 UUID;
+- the block size is 1 MiB (1048576 bytes);
+- the parity scheme is the default for 1 MiB blocks: `rs-cauchy-gf256-v1` with
+  128 data blocks and 4 parity blocks per stripe, and 128 stripes per
+  neighborhood;
+- the bootstrap records drive compression off.
 
-Inventory and full verification therefore use the host per-tape log, when
-one survives. The closing Object commit is fsynced (forced to stable storage)
-only after its body and trailing filemark are durable.
-During the BOT scan, Remanence replays that log without loading every
-Object row into memory. It accepts a name only when all of these facts agree:
+The probe reports whether a tape meets this rule in its
+`canonical_adoption_geometry` field. Adoption checks the rule twice, in the
+command and again when the catalog records the identity, and the rule applies
+to every drive in a library.
 
-- the log is for the same tape UUID and fixed block size;
-- its committed prefix is present in the measured tape layout;
-- every logged Object names the same tape-file number and block count that
-  the physical scan measured; and
-- log rows and measured Objects match one to one throughout that committed
-  prefix.
+Remanence's own defaults produce a different tape. In a library, `rem tape
+init` takes the block size from the tape's pool, which is 256 KiB unless the
+pool's `block_size` key says otherwise, and it writes no parity unless it is
+given `--parity default`. A home-mode pool uses 256 KiB blocks and the parity
+scheme `custom:128,4,1`. A tape initialized with any of these defaults cannot
+be adopted by `adopt-bootstrap`. The probe reports
+`"canonical_adoption_geometry": false` for it, and adoption stops with:
 
-Each Object is then classified as follows:
+```text
+error: valid Bootstrap does not have canonical 1 MiB default parity adoption geometry
+```
 
-| Classification | Meaning |
-|---|---|
-| `Recovered` | The Object tape file is physically complete, and an exact fsynced log row supplied its Object identifier. |
-| `Unknown` | The Object tape file is physically complete, but no trustworthy local identity source covers it. |
-| `Incomplete` | EOD was reached before the Object's trailing filemark. Remanence never applies a checkpoint name to it. |
+If cartridges may later move to another site, give them the adoptable geometry
+when you initialize them. For the cartridge `RMJ101L9`:
 
-After a crash, a complete Object can lie physically beyond the last fsynced
-checkpoint. It is reported as `Unknown` and is not promoted to `Recovered`. A
-corrupt log, or one whose geometry conflicts with the tape, stops the
-operation with a data-loss error and is not ignored.
+```sh
+rem tape init RMJ101L9 --block-size 1MiB --parity default
+```
 
-A tape from another installation normally has no per-tape log at the
-receiving site, and Remanence does not create one because an inventory was
-requested. If all its indexes are invalid, complete Object candidates are
-therefore reported as `Unknown`. Transferring the matching per-tape log
-preserves the exact Object names. Without it, the names come from deeper
-REM-OBJECT inspection or from operator recovery. In either case these results
-are inspection evidence and do not populate the writable SQLite catalog.
+Setting `block_size = "1MiB"` in the pool's `[[tape_pools]]` table makes 1 MiB
+the block size of every initialization in that pool; `--parity default` must
+still be given on each `tape init`. The
+[configuration reference](reference-configuration.md) describes the key.
 
-In plain terms, adoption records the native tape's identity, geometry, pool,
-and a cautious lifecycle state. It does not rewrite the tape, decrypt or
-restore Objects, or invent file and index records.
+Remanence has no command that adopts a tape of another geometry into a
+library's catalog. What you can do depends on what survives:
 
-## When to use it
+- If this host's state directory survived, or you can restore it from a backup,
+  and only the catalog was lost or damaged, you do not need adoption. Stop the
+  daemon and rebuild the catalog ([Rebuild the catalog](#rebuild-the-catalog-from-the-tape-logs)).
+  The rebuild recreates the tape's row and its objects from the audit log and
+  the tape log, whatever the tape's geometry.
+- To see what the tape holds without a catalog, load it into a drive and run
+  `rem-debug tape recovery-report` on the drive's device
+  ([Inspect a tape without the catalog](#inspect-a-tape-without-the-catalog)).
+  The report never reads or writes the catalog.
+- To restore files, read the tape in a standalone drive, one that is not inside
+  a library. There, `rem tape restore` lists and restores objects from the
+  terminal index, or from a scan, without any catalog, and `rem tape adopt`
+  records the identity of a tape of any valid geometry in that host's catalog.
+  [Recovery on another machine](guide-standalone-drive.md#recovery-on-another-machine)
+  shows the commands. The standalone commands refuse a drive that belongs to a
+  library, with `device is not an unattached drive; library operations go
+  through the daemon`.
 
-Typical cases are:
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-api/src/tape_init.rs @ 625f7044 -->
+## How the commands treat the tape
 
-- the rebuildable SQLite catalog was lost, while the cartridges and the durable
-  audit or journal material survived;
-- an offsite or vault cartridge returned to a replacement host;
-- a cartridge is being transferred between Remanence sites;
-- a cartridge unknown to the local catalog must be identified before
-  terminal-index inventory or a catalog rebuild.
-
-Adoption is not a way to relabel a cartridge, override a retired identity,
-turn a foreign format into a Remanence format, or make an already-written tape
-writable without recovering its real catalog authority.
-
-For a transfer between sites, the destination must support the tape's
-bootstrap and on-tape format version. Its configuration also needs a pool rule
-that maps the barcode to an existing pool. Adoption does not decrypt or restore
-Objects, and encrypted Objects still need their recovery keys. A WORM
-(write-once) cartridge is safe for this read-only identity step but cannot be
-used for ordinary Object writes. A cartridge in LTFS, tar, or another foreign
-format needs a format-specific adapter and import pipeline, and adoption never
-converts it into a Remanence tape.
-
-## Safety model
-
-The workflow reads the tape twice:
+Both commands read the tape and neither writes to it, but they read it in
+different ways:
 
 1. `bot-probe` is advisory. It resolves one exact barcode in one configured
-   library, checks its exact home slot, opens one read-compatible drive, and
-   reads BOT with exactly one `LOCATE(0)` (position to the start of the tape)
-   and at most one `READ`.
-2. `adopt-bootstrap` does not rely on the earlier probe. It takes the
-   exclusive `StateHandle` (the lock on the local state directory), performs
-   fresh discovery, checks the barcode, library, home slot, and selected drive
-   again, and rereads the bootstrap and its immediate physical tail under the
-   same drive handle.
+   library, checks that the cartridge sits in the home slot you name, moves it
+   into one drive that can read its generation, and reads BOT with exactly one
+   LOCATE to block 0 (the SCSI command that positions the tape at a block
+   address) and at most one READ. It does not consult the catalog.
+2. `adopt-bootstrap` does not rely on the earlier probe. It takes the exclusive
+   state lock, runs a fresh discovery, checks the barcode, library, home slot and
+   drive again, and rereads the bootstrap and what immediately follows it under
+   the same drive handle. The UUID you pass is compared with the UUID from this
+   fresh read, not with discovery or catalog data.
 
-Both commands temporarily select fixed 1 MiB blocks with drive compression
-disabled. They verify that setting, restore and verify the drive's previous
-mode, and park the cartridge in the exact expected home slot. A failure to
-restore or park fails the command. Neither command writes tape data,
-filemarks, or a new bootstrap.
+Both commands set the drive to fixed 1 MiB blocks with compression off for the
+read, check that the drive accepted the setting, and afterwards restore and
+check the drive's previous mode. They then return the cartridge to the exact
+home slot. A failure to restore the mode or to return the cartridge fails the
+command, and no catalog change is made. Before reading, both wait for the drive
+to report the cartridge ready, for up to 9,000 seconds (2.5 hours), because a
+first load of LTO-9 media can take an hour or more while the drive optimizes
+it.
 
-The adoption read accepts only an RFC 4122 version 4 UUID and the canonical
-1 MiB default-parity bootstrap geometry with compression disabled. The
-expected UUID argument is compared with the UUID from this fresh BOT read, not
-with discovery or catalog data.
+The state lock is a local advisory lock on the state directory, and the daemon
+holds it for its whole lifetime, so adoption refuses to run beside a running
+daemon with `state lock is already held`. The lock excludes only cooperating
+Remanence processes. It is not a SCSI reservation, so it cannot stop other
+robotics or tape software from moving the same cartridge. Stop the daemon before
+you probe or adopt, and stop every other system that could move or use the same
+cartridge or drive.
 
-`StateHandle` and the daemon use the same local advisory state lock, and the
-daemon holds it for its whole lifetime. The lock excludes another cooperating
-Remanence daemon or offline state command. It is not a SCSI persistent
-reservation, so it cannot exclude unrelated robotics or tape software. Stop the
-daemon before importing, and stop every other system that could move or use the
-same cartridge or drive.
+## Probe the tape
 
-## Commands
+To probe the cartridge `RMJ101L9` in slot `0x0400` of library `LIB0001234`:
 
-First collect advisory identity evidence:
-
-```text
-rem-debug --allow LIBRARY_SERIAL \
-  tape bot-probe BARCODE \
-  --library LIBRARY_SERIAL \
-  --expected-home-slot 0x0401 \
-  --json
+```sh
+rem-debug --allow LIB0001234 tape bot-probe RMJ101L9 \
+  --library LIB0001234 --expected-home-slot 0x0400 --json
 ```
 
-The placeholders are:
+Replace the three values with your own. `LIB0001234` is the library's serial:
+`rem libraries` prints it, and the same value goes to `--allow` (the libraries
+this invocation may operate) and to `--library`. `RMJ101L9` is the cartridge's
+barcode and `0x0400` the element address of the storage slot that holds it;
+`rem library LIB0001234 --slots` lists both. The address may be given in hex or
+decimal.
 
-- `LIBRARY_SERIAL`: the serial number of the tape library that holds the
-  cartridge. `rem libraries` lists the libraries on the host with their
-  serials. The same value is given to `--allow` and to `--library`.
-- `BARCODE`: the barcode label of the cartridge, as shown by `rem library
-  LIBRARY_SERIAL --slots`.
-- `0x0401`: an example. Use the element address of the storage slot in which
-  the cartridge currently sits, taken from the same `rem library
-  LIBRARY_SERIAL --slots` listing. The command returns the cartridge to that
-  slot when it finishes.
-
-For a valid native bootstrap, note the reported `tape_uuid` and confirm the
-reported library, barcode, source slot, drive, compression flags, and geometry.
-Then perform the authoritative adoption. The command generates its own
-operation UUID, so the caller does not need to create or keep an operation
-receipt.
+The probe prints one line of JSON in schema `rem.tape.bot-probe.v1`. Formatted,
+for a tape written with the adoptable geometry, it looks like this (the values
+are illustrative):
 
 ```text
-rem-debug --allow LIBRARY_SERIAL \
-  tape adopt-bootstrap BARCODE \
-  --library LIBRARY_SERIAL \
-  --expected-home-slot 0x0401 \
-  --expected-existing-tape-uuid TAPE_UUID_FROM_PROBE \
-  --json
+{
+  "schema": "rem.tape.bot-probe.v1",
+  "ok": true,
+  "physical_disposition": "bootstrap_valid",
+  "library_serial": "LIB0001234",
+  "library_revision": "1.0",
+  "barcode": "RMJ101L9",
+  "source_slot": 1024,
+  "drive_element": 1,
+  "drive_serial": "HU2345BCD6",
+  "configured_drive_compression": false,
+  "bootstrap_drive_compression": false,
+  "tape_uuid": "5e8f8d3b-0c1a-4d2e-9f60-7a1b2c3d4e5f",
+  "geometry": {
+    "block_size_bytes": 1048576,
+    "drive_compression": false,
+    "no_parity": false,
+    "scheme_id": "rs-cauchy-gf256-v1",
+    "data_blocks_per_stripe": 128,
+    "parity_blocks_per_stripe": 4,
+    "stripes_per_neighborhood": 128
+  },
+  "canonical_adoption_geometry": true,
+  "detail": null
+}
 ```
 
-`LIBRARY_SERIAL`, `BARCODE`, and the home slot are the same values as for the
-probe. `TAPE_UUID_FROM_PROBE` is the `tape_uuid` field of the probe's JSON
-output. Adoption compares it with the UUID in its own fresh read of BOT, and
-refuses if they differ.
+Element addresses are printed in decimal: `source_slot` 1024 is `0x0400`. Check
+that `library_serial`, `barcode` and `source_slot` are the ones you expected,
+that `canonical_adoption_geometry` is true, and note the `tape_uuid`. The other
+values of `physical_disposition` mean:
 
-The probe emits schema `rem.tape.bot-probe.v1`. Its important fields are
-`physical_disposition`, `library_serial`, `library_revision`, `barcode`,
-`source_slot`, `drive_element`, `drive_serial`, `configured_drive_compression`,
-`bootstrap_drive_compression`, `tape_uuid`, `geometry`,
-`canonical_adoption_geometry`, and `detail`.
+| `physical_disposition` | What the probe found | Next step |
+| --- | --- | --- |
+| `bootstrap_valid` | A checksum-valid Remanence bootstrap whose recorded block size matches the record read. `tape_uuid` and `geometry` are filled in. | Adopt it if `canonical_adoption_geometry` is true; otherwise see [Which tapes can be adopted](#which-tapes-can-be-adopted). |
+| `bootstrap_damaged` | The bootstrap's magic number is present, but its framing or checksum fails, its UUID is not version 4, or its recorded block size differs from the record read. `detail` says which. | Do not adopt it. See [Damaged tapes](guide-damaged-tapes.md). |
+| `foreign_format` | BOT matched a known non-Remanence format, which `detail` names. | Do not adopt it. Read it with a foreign-format adapter. |
+| `unrecognized_data` | BOT holds data with no signature Remanence recognizes. | Do not adopt it. |
+| `blank_check_eod` | The drive reported blank media at BOT. | Initialize it as a new tape if you mean to use it. |
+| `read_error` | Positioning or reading BOT failed, so the identity is unknown. `detail` gives the error. | Check the drive and the cartridge, then probe again. |
 
-Adoption emits schema `rem.tape.adopt-bootstrap.v1`. In addition to physical
-identity and geometry it reports `physical_tail`, `newly_adopted`,
-`operation_id`, `idempotency_fingerprint`, and the resulting identity-only
-`catalog` projection, which includes the state, pool, and assignment
-generation.
+## Adopt the tape
 
-## What adoption creates
+To adopt the tape, give the same library, barcode and home slot, and the
+`tape_uuid` from the probe:
 
-A successful first adoption fsyncs a `TapeIdentityAdopted` audit record before
-it projects the SQLite row. The row contains the exact tape UUID, barcode,
-canonical geometry, configuration-derived pool, lifecycle state, and assignment
-generation. It creates no tape-file, Object-copy, catalog-unit, wrap-map,
-committed-prefix, session, fence, or finalization authority.
+```sh
+rem-debug --allow LIB0001234 tape adopt-bootstrap RMJ101L9 \
+  --library LIB0001234 --expected-home-slot 0x0400 \
+  --expected-existing-tape-uuid 5e8f8d3b-0c1a-4d2e-9f60-7a1b2c3d4e5f --json
+```
 
-The lifecycle state is deliberately conservative:
+Take the UUID from the probe's output, not from an old catalog. Adoption refuses
+if its own read of BOT finds a different UUID. The command generates its own
+operation UUID, so there is no receipt to create or keep.
 
-- exactly `Bootstrap → one filemark → EOD` becomes `ready`. This is an
-  identity-only bootstrap tape with no later physical content;
-- data after the bootstrap, a missing or extra filemark, or an unreadable tail
-  after a valid bootstrap becomes `recovery_required`.
+Adoption prints one line of JSON in schema `rem.tape.adopt-bootstrap.v1`. It
+repeats the probe's identity fields and adds what the adoption did. Formatted
+and trimmed, with illustrative values:
 
-`recovery_required` does not mean the identity is damaged. It means the
-identity was recovered, but the tape has more, different, or uncertain physical
-content that must be inventoried before normal use.
+```text
+{
+  "schema": "rem.tape.adopt-bootstrap.v1",
+  "ok": true,
+  "physical_disposition": "bootstrap_adopted",
+  "physical_tail": "exact_bootstrap_filemark_eod",
+  "newly_adopted": true,
+  "operation_id": "c41f7a2e-9b3d-4e61-a8f5-2d7c0b9e1a34",
+  "idempotency_fingerprint": "5f6ab7e1adf13040b0f95c3c1109e88c1ae4b7379a536afc4f4ea092b136485b",
+  "barcode": "RMJ101L9",
+  "tape_uuid": "5e8f8d3b-0c1a-4d2e-9f60-7a1b2c3d4e5f",
+  ...
+  "catalog": {
+    "tape_uuid": "5e8f8d3b-0c1a-4d2e-9f60-7a1b2c3d4e5f",
+    "voltag": "RMJ101L9",
+    "kind": "data",
+    "pool_id": "archive",
+    "state": "ready",
+    "assignment_generation": 1,
+    "geometry": { ... }
+  }
+}
+```
+
+`physical_tail` describes what adoption found right after the bootstrap, and it
+decides the state the tape is given in the catalog:
+
+| `physical_tail` | What follows the bootstrap | Catalog state |
+| --- | --- | --- |
+| `exact_bootstrap_filemark_eod` | One filemark, then EOD: the tape holds nothing but its bootstrap. | `ready` |
+| `data_after_bootstrap` | A data record, either in place of the bootstrap's filemark or after it. | `recovery_required` |
+| `missing_filemark` | EOD straight after the bootstrap, without its filemark. | `recovery_required` |
+| `extra_filemark` | A second filemark after the bootstrap's filemark. | `recovery_required` |
+| `ambiguous` | The next boundary could not be proved. | `recovery_required` |
+
+`recovery_required` does not mean that the identity is damaged. It means the
+identity was recovered, and the tape has more, different or uncertain content
+that must be inventoried before the tape is used. Writes accept only tapes in
+state `ready`, so a `recovery_required` tape is kept out of write service.
+
+`pool_id` comes from this site's configuration: the `[[tape_pool_rules]]` entry
+with the longest prefix that matches the barcode, as for any other tape. Check
+that the cartridge was returned to its slot and that the `catalog` state is the
+one you expected.
+
+## What adoption records
+
+A first adoption writes a `TapeIdentityAdopted` record to the audit log and
+forces it to stable storage (fsync) before it writes the catalog row. The row
+holds the tape UUID, barcode, geometry, pool, lifecycle state and assignment
+generation. Adoption creates no tape-file rows, no object copies, no committed
+position, no session and no finalization record. For a tape that holds exactly
+a bootstrap, that is enough to use it as an empty Remanence cartridge. For any
+other tape, the catalog knows which tape it is and nothing about its contents.
+
+## Running adoption again
+
+Each run of `adopt-bootstrap` generates a new operation UUID. A repeat run
+against a tape that is already adopted succeeds without a second audit record
+when the catalog row is still the identity-only row that adoption made: the same
+UUID, barcode, geometry, pool, assignment generation and state, with no tape
+files, objects, open session, active fence or finalization. Its output then
+reports `"physical_disposition": "bootstrap_already_adopted"` and
+`"newly_adopted": false`.
+
+If the process stops after the audit record is written and before the catalog
+row, the next run replays the audit record and completes the row. Once writes or
+lifecycle changes have changed the row, a new adoption is refused and does not
+roll the state back.
+
+## After adoption
+
+For a tape reported `ready`, there is nothing more to do; it is an empty
+cartridge in its pool.
+
+For a `recovery_required` tape, start the daemon and read the tape's contents
+through it:
+
+```sh
+rem tape inventory --tape-uuid 5e8f8d3b-0c1a-4d2e-9f60-7a1b2c3d4e5f --json
+rem tape verify-index --tape-uuid 5e8f8d3b-0c1a-4d2e-9f60-7a1b2c3d4e5f --json
+```
+
+Both commands take the tape UUID; neither accepts a barcode, and neither has a
+depth option.
+
+`rem tape inventory` is the quick check. It reads the bootstrap at BOT and the
+terminal index replicas at the end of the tape, in a fixed fallback order. When
+a replica is usable, it reads that replica's list of objects and reads no
+object data. It does not walk the tape between the bootstrap and the terminal
+index, so it does not prove that the middle of the tape matches the list. If no
+replica is usable, it reports that explicitly and falls back to a walk from BOT,
+which measures every tape file and reads selected blocks of each object.
+
+A walk can run for hours, so the inventory's event stream
+(`rem.tape.inventory.stream.v1`) announces `bot_recovery_started` before it
+begins. It then reports one `bot_recovery_progress` event after each tape file,
+with the tape-file number, the partition and logical block address (LBA), the
+object candidates found so far and the elapsed milliseconds. The human output
+shows the same facts on `bot_recovery:` and `bot_recovery_progress:` lines.
+Cancellation is checked at each of these points and stops before the next tape
+file is read. Use a daemon and a CLI from the same build to get these events. A
+walk can also start on a tape whose three replicas are intact, when something
+was written after them; [Damaged
+tapes](guide-damaged-tapes.md#the-terminal-index-is-damaged-or-is-not-where-it-was-expected)
+explains why and how to read what the walk reports.
+
+`rem tape verify-index` is the full check. It reads every data block that a
+parity sidecar protects and every parity shard, checks each against the
+sidecar's index, and reports each failure by its address. It also measures the
+tape files before the terminal index and checks the terminal structures. For a
+full 18 TB LTO-9 cartridge written with parity, at the half-height drive's
+native 300 MB/s, reading the bytes alone takes 60,000 seconds, or 16 hours and
+40 minutes, and repositioning adds to that. [Full
+verification](guide-full-verification.md) explains its output and how to
+estimate its duration.
+
+Inventory rows are inspection evidence, and the inventory does not add them to
+the catalog. Remanence does not create a tape log from an inventory either, so a
+`recovery_required` tape adopted from another site stays in that state, out of
+write service.
+
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-state/src/state.rs crates/remanence-state/src/tape_log/projection.rs @ 625f7044 -->
+## Rebuild the catalog from the tape logs
+
+When this host's own state directory holds the tape logs and the audit log, the
+catalog can be rebuilt from them, and no adoption is needed. The same applies
+after you restore the state directory from a backup. The tape logs live in the
+directory named by the `dir` key of the configuration's `[journal]` table; the
+command keeps its older name.
+
+Stop the daemon, restore the state directory to its configured locations if it
+came from a backup, and run:
+
+```sh
+rem rebuild-catalog-from-journals --config /etc/rem/config.toml
+```
+
+`/etc/rem/config.toml` is the daemon's configuration file and the default for
+`--config`. The rebuild takes the state lock, so it refuses to run beside a
+running daemon. It replaces every row it can derive and leaves the tape logs and
+the audit log unchanged. It prints a summary of the form below (illustrative
+counts):
+
+```text
+rebuild-catalog-from-journals ok
+  tapes: 3
+  tape files: 214
+  object copies: 211
+  audit records: 1840
+  tape logs: 3
+```
+
+Warnings go to standard error. A line that begins
+`WARN audit-replay-divergence:` names an audit record that could not be
+replayed cleanly, or a value on which the audit log and the catalog's earlier
+contents disagreed, and ends `ledger value applied`: the audit log's value was
+used. A rebuild in a state directory without an
+`authority-format` marker refuses with `invalid config: projection rebuild
+requires an existing authority-format marker`.
+
+<!-- code-anchor: crates/remanence-cli/src/recovery_report.rs crates/remanence-cli/src/lib.rs @ 625f7044 -->
+## Inspect a tape without the catalog
+
+`rem-debug tape recovery-report` reads a tape without the catalog, the daemon
+or any host state. It finds the bootstrap at a block size of 256 KiB, 512 KiB or
+1 MiB, selects a terminal index replica or walks the tape, and checks each
+object it finds. It works on a tape of any geometry, adopted or not. It does not
+load the cartridge itself, so load it first and unload it afterwards, with the
+daemon stopped. To read `RMJ101L9` from slot `0x0400` in the drive at bay
+`0x0001`:
+
+```sh
+rem-debug --allow LIB0001234 load LIB0001234 --slot 0x0400 --bay 0x0001
+rem-debug tape recovery-report /dev/sg6 --json
+rem-debug --allow LIB0001234 unload LIB0001234 --bay 0x0001
+```
+
+`/dev/sg6` stands for the drive's SCSI generic device, which
+`rem library LIB0001234` lists beside each drive bay. `unload` returns the
+cartridge to the slot it came from unless you give `--dest`. Without `--json`,
+the report prints one `object tape-file N ...` line for each object it found,
+with its map and verification status, then a `totals:` line and
+`result: verified` or `result: failed`. If the bootstrap itself cannot be read,
+the report needs the tape UUID, block size and parity scheme from your records;
+[Damaged tapes](guide-damaged-tapes.md#the-bootstrap-is-unreadable) explains
+how to supply them.
+
+<!-- code-anchor: crates/remanence-parity/src/bot_recovery.rs crates/remanence-state/src/authority/bot_recovery.rs crates/remanence-cli/src/tape_inventory.rs @ 625f7044 -->
+## How object names are recovered when the terminal index is damaged
+
+A healthy finalized tape carries its complete list of objects in each of its
+three replicas. If all three are unusable, the walk from BOT can show that a
+tape file is a complete object, but a tape file's position does not reveal the
+object's name.
+
+The walk therefore uses this host's tape log for the tape, when one exists. The
+tape log's commit record for an object is forced to stable storage only after
+the object's body and trailing filemark are durable on tape. During the walk,
+Remanence replays the log without loading every object row into memory. It
+accepts a name only when all of these agree:
+
+- the log is for the same tape UUID and fixed block size;
+- the log's committed tape files are all present in the measured tape;
+- every logged object names the tape-file number and block count that the walk
+  measured;
+- log rows and measured objects match one to one across the committed tape
+  files.
+
+Each object candidate is then printed on a `bot_object:` line with one of three
+states:
+
+| State | Meaning |
+| --- | --- |
+| `recovered` | The object's tape file is physically complete, and an exact row of the tape log supplied its object identifier. |
+| `unknown` | The object's tape file is physically complete, but no trustworthy record supplies its identity. |
+| `incomplete` | EOD was reached before the object's trailing filemark. No name from the tape log is applied to it. |
+
+After a crash, a complete object can lie on tape beyond the last commit the tape
+log recorded. It is reported as `unknown` and is not promoted to `recovered`. A
+corrupt tape log, or one whose geometry conflicts with the tape, stops the
+operation with a data-loss error rather than being ignored.
+
+A tape from another site has no tape log on the receiving host, and Remanence
+does not create one because an inventory was requested. If all its replicas are
+invalid, its complete objects are therefore reported as `unknown`, and
+`rem-debug tape recovery-report` reports them as `<identity unavailable>`. Each
+object still records its own identifier inside it, and `rem tape restore --scan`
+on a standalone drive reads it from there. In either case the results are
+inspection evidence and do not enter the catalog.
 
 ## Crash recovery and retries
 
-### Interrupted Object writes are retried whole
+This section is background for an operator whose own host was interrupted while
+writing or finalizing a tape. It also explains why a cartridge from another site
+cannot be appended to after it is adopted.
 
-An Object is one complete REM-OBJECT tar stream, possibly holding many
+### Interrupted object writes are retried whole
+
+An object is one complete REM-OBJECT tar stream, possibly holding many
 separately named and checksummed files. Remanence writes the filemark only after
-all of the Object's blocks have been written, so a power cut never leaves “part
-one, filemark, part two”. Members inside a bundle have no tape filemarks between
+all of the object's blocks have been written, so a power cut never leaves "part
+one, filemark, part two". Members inside a bundle have no tape filemarks between
 them.
 
 If the host stops while writing the body, the tail may hold some physical
-blocks but has no committed Object delimiter and no catalog entry. On an open,
-parity-off, rewritable tape, the last durable per-tape log records the
-EOD after the previous complete Object. After a restart, a new write session
-positions at that checkpoint EOD, and the caller sends the interrupted Object
+blocks but has no committed object delimiter and no catalog entry. On an open,
+parity-off, rewritable tape, the last durable tape log records the
+EOD after the previous complete object. After a restart, a new write session
+positions at that checkpoint EOD, and the caller sends the interrupted object
 again from byte zero. The rewrite replaces the uncommitted tail, and only the
 completed retry gets a filemark and enters the catalog. A stock tar
-implementation therefore still sees one complete tar stream for the Object, not
+implementation therefore still sees one complete tar stream for the object, not
 two pieces that need Remanence-specific joining.
 
 This cannot be done in place on WORM media, where the incomplete tail cannot be
-erased. Remanence admits ordinary Object sessions only when the drive reports
+erased. Remanence admits ordinary object sessions only when the drive reports
 `NotWorm`; `Worm` and `Unknown` are both refused before the drive mode is
 changed. Read-only adoption and recovery are safe on WORM, and terminal-index
 finalization has its own append-only recovery path for WORM. Remanence does not
-implement WORM Object ingest.
+implement WORM object ingest.
 
-The caller keeps the source until `CheckpointSession` reports the Object
+The caller keeps the source until `CheckpointSession` reports the object
 committed. Resuming a session is not the recovery method. An interrupted
-session is abandoned, and every Object that was not checkpointed is replayed in
+session is abandoned, and every object that was not checkpointed is replayed in
 full with the same caller id, input kind, content digest, archived logical-file
 path, and copy intent. Copy intent is plaintext versus encrypted and, for
 encrypted copies, the exact ordered recipient epoch ids. If the catalog already
@@ -304,25 +540,25 @@ holds that exact request, the retry reads back the matching committed copy
 refused. For a canonical REM-OBJECT, the bytes already bind every member path,
 so the outer `archive_path` is not part of the replay identity.
 
-The canonical append surface creates an Object and its first copy as one
+The canonical append surface creates an object and its first copy as one
 checkpointed operation. Media completion can come before the checkpoint and
 catalog commit, which is why an interrupted, uncommitted tail can exist and must
-be rewritten whole. The surface does not attach another copy to an Object UUID
+be rewritten whole. The surface does not attach another copy to an object UUID
 that is already cataloged outside the exact pool and caller replay key; that
 conflict is refused before any tape motion. A daemon-wide claim holds the pool
-and caller key and the canonical Object UUID from admission, before any motion,
+and caller key and the canonical object UUID from admission, before any motion,
 through the checkpoint. Two drive actors therefore cannot both write the same
 identity.
 
 The one-shot direct writer follows the same rule under the exclusive state
-lock. Before it selects a tape, it replays every per-tape log in the
-configured journal root, not only the log of the tape it might select,
-and resolves an exact committed retry from host state alone. A committed retry
-therefore needs no writable tape and moves no cartridge. This also covers the
-case where tape A has a durable checkpoint but SQLite has not yet recorded the
-Object identity: a retry cannot select tape B and write the same identity again.
-The drive-bound writer repeats the reconciliation and replay check. It takes
-the pool policy, journal root, and memory ceiling
+lock. Before it selects a tape, it replays every tape log in the configured
+tape-log directory (`journal.dir`), not only the log of the tape it might
+select, and resolves an exact committed retry from host state alone. A
+committed retry therefore needs no writable tape and moves no cartridge. This
+also covers the case where tape A has a durable checkpoint but SQLite has not
+yet recorded the object identity: a retry cannot select tape B and write the
+same identity again. The drive-bound writer repeats the reconciliation and
+replay check. It takes the pool policy, tape-log directory, and memory ceiling
 from the locked operator configuration, not from its caller. Host-only
 encrypted replay reports the committed ordered epoch ids. The host catalog does
 not keep the authenticated on-tape labels, so those labels are reported as
@@ -330,12 +566,12 @@ unknown instead of being copied from the new retry request.
 
 If log publication fails with uncertain authority, Remanence poisons the writer
 and requires physical-tail reconciliation before retrying the affected WRITTEN
-Objects. A later process must reconcile the log before admitting a retry. A
+objects. A later process must reconcile the log before admitting a retry. A
 validated closed group is projected into the catalog. A torn trailing frame
 is not treated as committed. If the log is durable but projection failed,
-replay repairs SQLite without writing the Object again.
+replay repairs SQLite without writing the object again.
 
-This mechanism depends on the host per-tape log of an open tape. A
+This mechanism depends on the host tape log of an open tape. A
 cartridge arriving from another installation does not gain safe append
 authority just because its bootstrap can be adopted. Transfer the matching host
 tape logs when they are available. Otherwise keep the cartridge out of ordinary
@@ -345,26 +581,27 @@ position.
 
 A drive or transport failure can leave the completion of the last command
 uncertain. Remanence then fences that tape and does not assume how much was
-written. The whole-Object rule still applies, but an operator must first
-reconcile or release the fence using the recorded evidence. The end-to-end
-recovery drill on a virtual tape library exercises an abrupt daemon loss after a
-completed write-command boundary. It does not emulate the volatile-cache
+written. The whole-object rule still applies, but an operator must first
+reconcile or release the fence using the recorded evidence. The project's
+end-to-end recovery test on a virtual tape library exercises an abrupt daemon
+loss after a completed write command. It does not emulate the volatile-cache
 behavior of any particular physical drive.
 
 ### Finalization recovery
 
 When a tape is finalized, the writer closes the open parity epoch and writes
-the three terminal replicas, A, B, and C, with a separation extent (a control file
-with a header, zero-filled interior records, and a footer) between each pair.
-If the per-tape log proves that replica C completed its synchronizing barrier, all three full indexes are
-already on tape. A restart then completes the remaining bookkeeping without
-loading, locating, reading, or writing the cartridge. That bookkeeping is the
-sealed log record, the SQLite projection and the audit entries. It applies to
-automatic finalization and to an operator-requested close-out.
+the three terminal replicas, A, B, and C, with a separation extent (a control
+file with a header, zero-filled interior records, and a footer) between each
+pair. If the tape log proves that replica C completed its synchronizing
+barrier, all three full indexes are already on tape. A restart then completes
+the remaining bookkeeping without loading, locating, reading, or writing the
+cartridge. That bookkeeping is the sealed log record, the SQLite projection and
+the audit entries. It applies to automatic finalization and to an
+operator-requested close-out.
 
-During finalization the per-tape log records the decision, immutable plan and
+During finalization the tape log records the decision, immutable plan and
 barrier-proved component progress. An ordinary write session cannot append an
-Object after the first durable finalization transition. Recovery validates the
+object after the first durable finalization transition. Recovery validates the
 plan and projects durable progress before any terminal media motion.
 
 If the operation was already classified `recovery_required`, that state stays
@@ -377,8 +614,8 @@ the tape.
 The same restart repairs missing completion records in the append-only audit
 log. It records one tape-sealed event and, for a manual close-out, one
 operation-finished event. An event written before the crash is reused and not
-duplicated. Both records are always flushed to stable storage. Only one daemon or
-offline state owner can use a state directory at a time, so another process
+duplicated. Both records are always flushed to stable storage. Only one daemon
+or offline state owner can use a state directory at a time, so another process
 cannot race that decision.
 
 Before the replica C boundary, a failed or uncertain component is recorded
@@ -387,129 +624,58 @@ ordinary `finalizing`. It reconciles the next physical component first. A host
 metadata failure after a proved replica C therefore causes no needless tape
 motion, while genuinely uncertain media stays fenced.
 
-### Adoption retries
-
-If the process stops after the audit append but before the SQLite projection,
-the next invocation replays the audit record and repairs the missing
-projection. One operation UUID cannot be rebound to a different tape or to
-changed facts.
-
-Each retry by the caller gets a newly generated operation UUID. After the audit
-replay, the command returns an `already adopted` no-op only when the current
-row is still the same identity-only row: the same UUID, barcode, geometry, pool,
-assignment generation, and tail-derived state, with no Object, file, prefix, or
-finalization authority, no open session, no active fence, and no active media
-authority. No second adoption audit record is needed. Once writes or lifecycle
-changes have evolved the row, re-adoption is refused and does not roll the state
-back.
-
-## After adoption
-
-For a tape reported `ready` because it holds exactly a bootstrap, the catalog
-has enough identity to treat it as an empty native cartridge. It still has no
-invented Object history.
-
-For `recovery_required`, keep the tape out of write service. Start the daemon
-under controlled ownership and inspect the terminal indexes through its API:
-
-```text
-rem tape inventory --tape-uuid TAPE_UUID --json
-rem tape verify-index --tape-uuid TAPE_UUID --json
-```
-
-`TAPE_UUID` is the `tape_uuid` reported by the probe and the adoption. Both
-commands accept the same arguments, and neither has a depth option.
-
-**Inventory** is the quick check. It reads the bootstrap at BOT and the terminal
-replicas at the end of the tape. When a terminal replica is usable, it reads
-that replica's payload (normally replica C's), reads no Object data, and does
-not measure the tape's whole prefix, so it does not prove that the middle of
-the tape matches what the replicas describe. It tries the terminal replicas in
-the defined fallback order. If none survives, it falls back to BOT recovery,
-which is reported explicitly, walks the tape from BOT, measures the prefix, and
-reads selected Object blocks.
-
-**Full verification** (`verify-index`) is a separate operation. It reads every
-data block that a sidecar protects and every parity shard, checks each against
-its sidecar's index, and reports each failure by its address. It also measures
-and validates the physical prefix and the terminal structures. A check of
-structure and metadata alone, which reads no data block or parity shard, is not
-a full verification (REM-PARITY Section 2.2). On a tape written with parity, full verification reads every
-protected data block and parity shard, so it takes at least those bytes divided by
-the drive's sustained read rate. For a full 18 TB LTO-9 cartridge at the half-height
-drive's native rate of 300 MB/s, that is 18 × 10^12 bytes ÷ 300 × 10^6 bytes
-per second = 60,000 seconds, or 16 hours 40 minutes. Repositioning adds to this.
-[Full verification](guide-full-verification.md) gives the formula for the
-additional time and explains when the same check is useful as a periodic audit
-of the whole archive.
-
-An inventory that finds all indexes invalid can run for hours, so its stream
-announces `bot_recovery_started` before the full BOT walk. It then emits one
-`bot_recovery_progress` event after every complete tape file, with the
-tape-file number, the partition and LBA position, the candidates found so far,
-and the elapsed milliseconds. Human-readable output shows the same facts as
-`bot_recovery:` and `bot_recovery_progress:` lines. Cancellation is checked at
-each of these boundaries and stops before the next tape file is read. These are
-additional event types in `rem.tape.inventory.stream.v1`. Use a daemon and CLI
-from the same build to get the BOT progress events.
-
-The walk can start even on a tape whose three terminal replicas are intact. A
-tape file written after the terminal suffix, or a second terminal suffix, moves
-EOD past the EOD planned by the layout, so that layout is not used. The
-exception is a later suffix whose own replicas validate: its footer supplies its
-own layout, and no walk is needed (REM-PARITY Section 8.4). [Damaged
-tapes](guide-damaged-tapes.md) explains why a tape with intact replicas can
-still be walked and how to read what the walk reports.
-
-Stop the daemon again before changing host state. Restore any surviving
-per-tape logs and audit material to their configured locations, then
-rebuild the SQLite projection offline when appropriate:
-
-```text
-rem rebuild-catalog-from-journals --config /path/to/config.toml
-```
-
-`/path/to/config.toml` is the daemon's configuration file, by default
-`/etc/rem/config.toml`.
-
-Streamed inventory rows are not committed catalog entries unless the inventory
-summary and the subsequent recovery or rebuild procedure say they are.
-
-A successful adoption means “we now know exactly which tape this is”. It does
-not mean “this tape is ready for new writes”. A `recovery_required` tape stays
-out of normal write use until the inventory, the commit history, and the local
-catalog agree.
-
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-state/src/state.rs crates/remanence-state/src/index.rs crates/remanence-state/src/lock.rs @ 625f7044 -->
 ## Refusals to expect
 
-The commands refuse to proceed for any of these reasons: an ambiguous barcode,
-a wrong library or home slot, a UUID mismatch, a damaged or non-v4 bootstrap
-identity, a foreign or unrecognized format, noncanonical geometry, enabled
-compression, active media-readiness ownership, a conflict between barcode and
-pool, a conflict with any tape kind, a retired identity, or an existing row
-that carries file, Object, prefix, finalization, open-session, active-fence, or
-other evolved authority. Failures of physical readiness, mode restoration, and
-exact parking also prevent any catalog change.
+Each refusal is printed on standard error after `error:`, and the command
+exits with status 1. No refusal changes the catalog. Values in capitals stand
+for the ones in your command or on your tape. The messages from the catalog
+begin with `tape provisioning conflict:`, print a barcode as `Some("BARCODE")`,
+and print a tape UUID as 32 hex digits without hyphens (`HEX`).
 
-## Practical import checklist
+| Message | What it means | What to do |
+| --- | --- | --- |
+| `state lock is already held: PATH` | The daemon, or another offline command, holds the state directory. | Stop the daemon and wait for other offline commands to finish. |
+| `barcode "BARCODE" was not found in configured discovered libraries` | No configured library reports that barcode. | Check the barcode and the library's configuration; `rem library SERIAL --slots` lists the slots. |
+| `barcode "BARCODE" is ambiguous; pass --library or an element address` | More than one place in the library holds that barcode. | Remove the duplicate cartridge, then run again. |
+| `barcode ... has no known LTO generation suffix` | The barcode does not end in a media code such as `L9`, so no compatible drive can be chosen. | Use a cartridge whose barcode ends in its media code. |
+| `command expected home slot 0xEXPECTED, but live inventory resolved 0xACTUAL` | The cartridge is not in the slot you named. | Check `rem library SERIAL --slots` and give the slot that holds it. |
+| `media in drive 0xBAY is not ready: ...` | The drive did not report the cartridge ready before the wait ended. | Check the drive and the cartridge before trying again. |
+| `tape adopt-bootstrap is blocked by active media-readiness fence ID ...` | An earlier readiness wait left a fence on the drive or the cartridge. | Inspect it with `rem tape quarantine show ID`, as the message says. |
+| `valid Bootstrap does not have canonical 1 MiB default parity adoption geometry` | The tape's block size or parity scheme is not the adoptable one, or its bootstrap records drive compression on. | See [Which tapes can be adopted](#which-tapes-can-be-adopted). |
+| `BOT is not adoptable: InvalidBot(...)` | The fresh read found no valid bootstrap; the text in parentheses gives the classification. | Probe the tape again and follow the table for its `physical_disposition`. |
+| `command expected tape UUID UUID, but BOT contains UUID` | The tape's UUID is not the one you passed. | Probe again and pass the UUID it reports. |
+| `tape provisioning conflict: bootstrap barcode Some("BARCODE") does not match any locked tape_pool_rule` | No `[[tape_pool_rules]]` entry matches the barcode. | Add a rule for it to the configuration. |
+| `tape provisioning conflict: bootstrap barcode Some("BARCODE") derives unconfigured pool "POOL"` | The matching rule names a pool that has no `[[tape_pools]]` table. | Configure that pool. |
+| `tape provisioning conflict: Bootstrap identity HEX is retired; retired identities are permanent` | This catalog retired the tape's identity. | A retired identity cannot be adopted again. |
+| `tape provisioning conflict: Bootstrap UUID HEX and barcode Some("BARCODE") resolve to different catalog identities` | The catalog knows the UUID and the barcode as two different tapes. | Resolve the existing rows before adopting. |
+| `tape provisioning conflict: Bootstrap identity HEX barcode Some("BARCODE") conflicts with existing KIND catalog row` | The catalog already has a row for this tape that adoption did not make, or one that has changed since. | Do not adopt again; the existing row is the tape's authority. |
 
-1. Stop the daemon, robotics, backup software, and any other drive owner.
-2. Confirm the target library is configured and the cartridge barcode appears
-   exactly once.
-3. Record the exact storage (home) slot element address and make sure the
-   destination is usable.
-4. Run `bot-probe`. Require `bootstrap_valid`, canonical geometry, compression
-   off, and the expected library, barcode, and home-slot evidence.
-5. Take the UUID from the probe's output, not from a stale catalog.
-6. Run `adopt-bootstrap` with that UUID and the same library and home slot, and
-   review the internally generated operation UUID in the JSON result.
-7. Confirm the cartridge was parked and inspect the returned catalog state.
-8. If the state is `recovery_required`, start the daemon under exclusive
-   controlled ownership, keep the tape out of write service, and run terminal
-   inventory and verification.
-9. Stop the daemon again before restoring transferred journals or running the
-   offline catalog rebuild. If no host journals survived, do not rebuild from
-   the inventory. Keep the tape read-only, because Remanence does not import
-   tape-only inventory rows into the catalog.
-10. Resume the daemon or normal site operations only after ownership and the
-    recovered catalog authority are reconciled.
+A failure to restore the drive's mode or to return the cartridge to its home
+slot also stops the command before any catalog change. The message then begins
+with `restore prior drive config:` or `park tape from drive`.
+
+## Checklist
+
+1. Stop the daemon, robotics, backup software and any other owner of the drives.
+2. Confirm that the library is configured and that the barcode appears exactly
+   once, and note the element address of the cartridge's slot.
+3. Confirm that a `[[tape_pool_rules]]` entry maps the barcode to a configured
+   pool.
+4. Run `bot-probe`. Require `bootstrap_valid`, `canonical_adoption_geometry`
+   true, and the library, barcode and slot you expected. For any other result,
+   do not adopt; follow [Which tapes can be adopted](#which-tapes-can-be-adopted)
+   or [Damaged tapes](guide-damaged-tapes.md).
+5. Run `adopt-bootstrap` with the UUID from the probe's output and the same
+   library and slot.
+6. Confirm that the cartridge is back in its slot, and read the `catalog` state
+   in the output.
+7. If the state is `recovery_required`, start the daemon and run
+   `rem tape inventory`, then `rem tape verify-index` if you need the full
+   check. The tape stays out of write service.
+8. If this host's state directory, or a backup of it, holds the tape's tape log,
+   stop the daemon again and rebuild the catalog from it. If there is no tape
+   log, do not try to build one from the inventory: restore what you need with
+   the catalog-less tools and keep the tape out of write service.
+9. Return the library to normal operation once the cartridges and the catalog
+   agree.
