@@ -5,7 +5,8 @@ directory holds the guides and references for people who install it, run it,
 or want to understand how it works: how to build and try it, how a tape is laid
 out, what each command does, and what to do when something goes wrong.
 
-If you are new, read the [quickstart](guide-quickstart.md) and then the
+If you are new, read [Concepts](concepts.md) first, then the
+[quickstart](guide-quickstart.md) and the
 [architecture overview](architecture-overview.md). The format specifications,
 their plain-language companion, and the REM Implementation and Operations Guide
 are in [../specs/publication](../specs/publication). The root
