@@ -20,6 +20,9 @@ onto a host".
 
 ## Preserved metadata
 
+This table describes native REM-OBJECT entries. Wrappers retain the tar
+permission behaviour described under [Restore](#restore).
+
 | Metadata | Preserved | Remarks |
 | --- | --- | --- |
 | Content | Always | Each regular file carries its SHA-256. |
@@ -28,7 +31,8 @@ onto a host".
 | Symbolic link target | Always | Stored as given; it may be absolute or point outside the object. |
 | Executable bit | When supplied | The one permission fact treated as content. `rem archive build` records it. |
 | Modification time | When supplied | Stored in the pax `mtime` record. `rem archive build` records it. |
-| Extended attributes | By capture policy | See [Capture](#capture). |
+| Extended attributes | `user.*` only | See [Capture](#capture). |
+| ACLs, file flags and privileged attributes | Never | These describe the originating host’s security posture. |
 | Ownership (uid, gid, user and group names) | Never | The tar header carries fixed placeholder values, and readers ignore them. |
 | Mode bits other than the executable bit | Never | No setuid, setgid or sticky bit. The header carries a normalized mode, and readers ignore it. |
 
@@ -51,7 +55,7 @@ path](#the-standard-tool-recovery-path).
 
 That is the path for every entry the manifest can represent natively. An entry
 it cannot represent is packed by `rem archive build` into a wrapper: an
-ordinary tar file, written with `bsdtar -c --format pax --xattrs`, stored as
+ordinary tar file, written with `bsdtar -c --format pax` and metadata capture disabled, stored as
 one regular entry named `<path>.remwrap.tar`, with a `<path>.remwrap.idx` index
 beside it unless the build is given `--no-index`. A wrapped directory takes its
 whole subtree into the wrapper. The ingest report's `scan.clusters` names the
@@ -59,27 +63,30 @@ reason for each wrapped entry:
 
 | Reason | Entry |
 | --- | --- |
-| `xattr` | A directory that carries a kept attribute. |
-| `xattr-large` | A file or directory with a kept attribute value over 4 KiB, or with kept values over 16 KiB in total. |
-| `xattr-name` | A file or directory with an attribute name that is not valid UTF-8. |
 | `non-utf8-path` | An entry whose path is not valid UTF-8. |
 | `non-utf8-symlink-target` | A symbolic link whose target is not valid UTF-8. |
 | `unsupported-file-type` | A FIFO, socket or device node. |
 
-Inside a wrapper, the attributes that the capture policy keeps appear as real
-pax records, `SCHILY.xattr.*` and `LIBARCHIVE.xattr.*`. The build removes the
-records of attributes the policy drops from the wrapper before it is stored.
+Attributes never cause wrapping. Native files and directories carry their
+selected `user.*` attributes in the manifest, including values larger than
+4 KiB. A selected attribute name that cannot be represented as valid UTF-8
+causes an error instead of a wrapper.
+
+Wrappers preserve content and the existing tar permission behaviour. They carry
+no xattrs, ACLs, file flags or Mac metadata. Attributes on entries selected for
+a wrapper, including an explicitly requested blob subtree, are reported as
+not captured. They cannot be attached to individual native manifest entries
+because those entries are inside the wrapper.
 
 ## Capture
 
-`rem archive build` captures attributes by a policy with four modes:
+`rem archive build` captures attributes only in the `user.` namespace, with three selection modes:
 
 | Mode | Captured |
 | --- | --- |
-| `portable-core` | Attributes in the `user.` namespace, plus any namespace added with `xattr-namespace`. The default. |
-| `denylist` | Every attribute except the names listed with `xattr-drop`. |
-| `allowlist` | Only the names listed with `xattr-keep`. |
-| `full-fidelity` | Every namespace. Not portable, and never the default. |
+| `portable-core` | All `user.*` attributes. The default. |
+| `denylist` | `user.*` attributes except the names listed with `xattr-drop`. |
+| `allowlist` | Only the `user.*` names listed with `xattr-keep`. |
 
 In every mode, six macOS housekeeping attributes are discarded without being
 reported: `com.apple.quarantine`, `com.apple.metadata:kMDItemWhereFroms`,
@@ -93,38 +100,38 @@ line:
 
 | Directive | Effect |
 | --- | --- |
-| `option xattr-mode MODE` | Selects one of the four modes. |
-| `xattr-namespace PREFIX` | Adds a namespace to the `portable-core` set. `PREFIX` is one non-empty namespace followed by a dot, such as `security.`. |
+| `option xattr-mode MODE` | Selects one of the three modes. |
 | `xattr-drop NAME` | Drops one attribute by name. Without an explicit mode, it selects `denylist`. |
 | `xattr-keep NAME` | Keeps one attribute by name in `allowlist` mode. |
 
-`rem archive build --full-fidelity-xattrs` selects `full-fidelity` without a
-ruleset; it is refused together with `--rules` or `--map`. Full-fidelity
-capture does not change restore policy: privileged namespaces are still not
-applied on restore unless the restoring operator adds them. In every mode,
-attributes of symbolic links are not captured.
+Rules may name only `user.*` attributes. The former `full-fidelity` mode,
+`--full-fidelity-xattrs` flag and `xattr-namespace` ruleset key have been removed;
+using one produces an error explaining the change. Remanence is a long-term
+preservation tool. Security labels, ACLs and file flags describe one host's
+security posture and are not captured for application on a future host.
 
 Attribute values never appear in command output. The build report's `ingest`
-object records the policy and, per entry, the names that were dropped or
-captured outside `user.`: `xattr_policy.mode`, `xattr_policy.allowed_prefixes`,
-`xattr_policy.applied_non_core_namespaces`, `scan.dropped_xattrs`,
-`scan.captured_non_core_xattrs` and `scan.totals.dropped_xattrs`. When a name
-is dropped, the build also prints one warning on standard error with the
-total.
+object records `xattr_policy.mode`, `xattr_policy.allowed_prefixes` (always
+`["user."]`), `scan.dropped_xattrs` and `scan.totals.dropped_xattrs`. Dropped
+names are listed per path; the build also prints one warning on standard
+error with the total. The clustered `scan.xattr_drops` view lists the same
+names. No report field records captured privileged attributes.
+
+Objects with any preserved attributes use stream schema `1.1`; those without
+use `1.0`. The manifest schema integer remains `1` in either case.
 
 For example, a ruleset containing the line `xattr-drop user.secret`, applied to
 a directory whose file `notes.txt` carries `user.comment` and `user.secret`,
 prints:
 
 ```text
-warning: 1 extended attribute(s) dropped by capture namespace policy; see dropped_xattrs in the ingest report
+warning: 1 extended attribute(s) dropped by capture policy; see dropped_xattrs in the ingest report
 ```
 
 and the build report's `ingest` object contains (trimmed):
 
 ```text
 "scan": {
-  "captured_non_core_xattrs": {},
   "dropped_xattrs": {
     "notes.txt": [
       "user.secret"
@@ -138,8 +145,7 @@ and the build report's `ingest` object contains (trimmed):
   ...
 },
 "xattr_policy": {
-  "allowed_prefixes": [],
-  "applied_non_core_namespaces": [],
+  "allowed_prefixes": ["user."],
   "mode": "denylist"
 }
 ```
@@ -157,14 +163,11 @@ lists, and `trusted.*` carries other privileged state. A restore that applied
 these without being asked would let a cartridge configure the security of the
 host that reads it.
 
-Restores therefore apply only the `user.` namespace by default. An attribute in
-any other namespace is skipped and reported by name, and its value is not
-logged. `rem archive extract`, `rem restore` and `rem-recover` accept
-`--xattr-namespace PREFIX`, repeatable, to apply further namespaces in that run:
-
-```sh
-rem archive extract --object demo.rem-object --dest restored --xattr-namespace security.
-```
+Restores apply only `user.*` attributes through Remanence's native restore
+code. Every other name in a manifest, including one from an older or foreign
+writer, is skipped and reported by name without its value. There is no
+option to widen this policy. The former `--xattr-namespace` flag is refused
+by every command that previously accepted it, including `rem-recover`.
 
 On a standalone drive, `rem get` and `rem tape restore` apply the default and
 have no such option. Through the daemon, `rem get` restores the bytes and
@@ -172,13 +175,13 @@ modification times of the members it reads and applies no extended attributes.
 
 A skipped attribute does not fail the restore. The command prints one warning
 on standard error, and its report lists the skipped names per entry in
-`skipped_xattrs`, and any privileged attributes that an opt-in applied in
-`applied_privileged_xattrs`. A restore of an object whose file `bin/tool`
-carries `security.capability`, run without `--xattr-namespace`, prints
+`skipped_xattrs`. The reserved `applied_privileged_xattrs` field is always
+empty. A restore of an object whose file `bin/tool`
+carries `security.capability` prints
 (illustrative):
 
 ```text
-warning: 1 extended attribute(s) skipped by namespace policy; see skipped_xattrs in the report
+warning: 1 extended attribute(s) skipped during restore; see skipped_xattrs in the report
 ```
 
 and its report contains:
@@ -197,16 +200,25 @@ the attribute is applied to the restored entry itself. A failure to apply an
 allowed attribute is reported as a failure, except when the destination
 filesystem does not support extended attributes, which is treated as a skip.
 
-Wrapped entries follow a different path. After the native restore,
-`rem archive extract` unpacks each `.remwrap.tar` with
-`bsdtar -x -p --xattrs`, unless it is given `--no-unwrap`. That step applies
-the attribute records the wrapper carries, which are the ones the capture
-policy kept, and the namespace policy of the restore does not filter them. A
-wrapper built under `portable-core` therefore restores only `user.` attributes,
-while a wrapper built with a widened namespace or with `full-fidelity` capture
-can restore privileged attributes when the restoring account is allowed to set
-them. The other restore commands do not unpack wrappers; they write the
-`.remwrap.tar` and `.remwrap.idx` files as ordinary files.
+After native restore, `rem archive extract` unpacks each `.remwrap.tar`,
+unless given `--no-unwrap`, using:
+
+```text
+bsdtar -x -p --no-xattrs --no-acls --no-fflags --no-mac-metadata
+```
+
+`-p` keeps the existing wrapper permission behaviour; the four explicit
+options disable its attribute, ACL, file-flag and Mac metadata effects. A
+wrapper from an older or foreign writer restores content without applying
+any of those records, including `user.*`. `skipped_xattrs` lists attribute
+names; `skipped_metadata` lists ACL and file-flag record names per path. Both
+also appear under `unwrap`. Values are never included.
+
+Before extraction, Remanence checks every header checksum, validates member
+and extension paths (including `X`, `L` and `K` records), and limits each pax
+or long-path header to 1 MiB. Malformed or unsupported wrappers fail before
+extraction. No temporary wrapper copy is made. The other restore commands
+write `.remwrap.tar` and `.remwrap.idx` as ordinary files.
 
 ## The standard-tool recovery path
 
@@ -219,13 +231,11 @@ bytes applied to nothing. For a natively represented entry, a
 `security.capability` cannot be reapplied by `tar`, even with `tar --xattrs`,
 because there is no record for it to find.
 
-A wrapped entry does carry real pax attribute records, one level deeper, inside
-the nested `.remwrap.tar`. A single `tar x` of the outer object does not open
-the nested file, so those attributes are present in the archive and still not
-applied. Combined with the exclusion of ownership and of setuid and setgid mode
-bits, this means that the standard-tool path cannot raise privilege through
-file metadata. Only a Remanence-aware reader can reapply privileged
-attributes, and that reader applies the namespace policy described above.
+New wrappers carry no attribute, ACL or file-flag records. Older or foreign
+wrappers may contain them. Extracting the outer object leaves each nested
+wrapper as a file; manually unpacking it with a standard tool follows that
+tool's policy. Use the four disabling options above when recovering such a
+wrapper with bsdtar.
 
 ## Published archives
 

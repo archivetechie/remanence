@@ -42,18 +42,16 @@ struct Args {
     /// Replace existing destination members.
     #[arg(long)]
     overwrite: bool,
-
-    /// Additional xattr namespace prefix to restore; repeatable (`user.` is always allowed).
-    /// Policy skips exit successfully, but emit one stderr warning and are listed in the summary.
-    #[arg(
-        long = "xattr-namespace",
-        value_name = "PREFIX",
-        value_parser = remanence_stream::parse_xattr_namespace_prefix
-    )]
-    xattr_namespaces: Vec<String>,
 }
 
 fn main() -> ExitCode {
+    let args: Vec<_> = std::env::args_os().collect();
+    if let Some(message) =
+        remanence_stream::removed_xattr_flag_message(args.iter().map(|arg| arg.as_os_str()))
+    {
+        eprintln!("error: {message}");
+        return ExitCode::from(2);
+    }
     match recover(&Args::parse()) {
         Ok(summary) => {
             let stdout = std::io::stdout();
@@ -250,15 +248,11 @@ fn recover(args: &Args) -> RecoveryResult<RecoverySummary> {
 
 /// Build the shared filesystem restore policy for catalogless recovery.
 fn recovery_restore_options(args: &Args) -> FilesystemRestoreOptions {
-    let mut options = FilesystemRestoreOptions {
+    FilesystemRestoreOptions {
         overwrite: args.overwrite,
         include_manifest: false,
         ..FilesystemRestoreOptions::default()
-    };
-    options
-        .xattr_allowed_prefixes
-        .extend(args.xattr_namespaces.iter().cloned());
-    options
+    }
 }
 
 /// Chooses the target filesystem for authenticated plaintext staging.
@@ -349,9 +343,7 @@ fn validation_failure(error: FormatError) -> RecoveryFailure {
 
 fn restore_failure(error: StreamingError) -> RecoveryFailure {
     match error {
-        StreamingError::Io { .. }
-        | StreamingError::InvalidInput(_)
-        | StreamingError::InvalidXattrNamespacePrefix { .. } => {
+        StreamingError::Io { .. } | StreamingError::InvalidInput(_) => {
             RecoveryFailure::io(format!("restore plaintext members: {error}"))
         }
         StreamingError::Format(
@@ -417,7 +409,6 @@ impl RemTarEntrySink for DiscardEntrySink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
     use remanence_aead::{seal_to_vec, EnvelopeSealOptions, SealOptions};
     use remanence_format::{
         write_rem_tar_object, write_rem_tar_object_from_readers, RemTarFile, RemTarFileSpec,
@@ -482,7 +473,6 @@ mod tests {
             out: out.clone(),
             staging_dir: None,
             overwrite: false,
-            xattr_namespaces: Vec::new(),
         })
         .unwrap();
         assert_eq!(summary.format_version, 2);
@@ -498,7 +488,6 @@ mod tests {
             out: temp.path().join("wrong-out"),
             staging_dir: None,
             overwrite: false,
-            xattr_namespaces: Vec::new(),
         })
         .err()
         .unwrap();
@@ -522,7 +511,6 @@ mod tests {
             out: temp.path().join("damaged-out"),
             staging_dir: None,
             overwrite: false,
-            xattr_namespaces: Vec::new(),
         })
         .expect_err("damaged recipient slot must fail authenticated unwrap");
         assert_eq!(damaged_error.kind, RecoveryFailureKind::Object);
@@ -538,7 +526,6 @@ mod tests {
             out: temp.path().join("ambiguous-out"),
             staging_dir: None,
             overwrite: false,
-            xattr_namespaces: Vec::new(),
         })
         .expect_err("matching epoch with wrong seed must fail authenticated unwrap");
         assert_eq!(ambiguous_error.kind, RecoveryFailureKind::Object);
@@ -625,7 +612,6 @@ mod tests {
             out: out.clone(),
             staging_dir: None,
             overwrite: false,
-            xattr_namespaces: Vec::new(),
         })
         .unwrap();
 
@@ -645,47 +631,7 @@ mod tests {
         let warnings = String::from_utf8(warnings).unwrap();
         assert!(report.contains("system.remanence_test"), "{report}");
         assert!(!report.contains("must-not-be-logged"), "{report}");
-        assert_eq!(warnings.matches("skipped by namespace policy").count(), 1);
-    }
-
-    #[test]
-    fn parses_shared_xattr_namespace_policy() {
-        let args = Args::parse_from([
-            "rem-recover",
-            "--object",
-            "object.rem-object",
-            "--private-key",
-            "recovery.remp",
-            "--out",
-            "restored",
-            "--xattr-namespace",
-            "system.",
-            "--xattr-namespace",
-            "security.",
-        ]);
-
-        assert_eq!(args.xattr_namespaces, ["system.", "security."]);
-        assert_eq!(
-            recovery_restore_options(&args).xattr_allowed_prefixes,
-            ["user.", "system.", "security."]
-        );
-        assert!(Args::try_parse_from([
-            "rem-recover",
-            "--object",
-            "object.rem-object",
-            "--private-key",
-            "recovery.remp",
-            "--out",
-            "restored",
-            "--xattr-namespace",
-            "system",
-        ])
-        .is_err());
-
-        let help = Args::command().render_long_help().to_string();
-        assert!(help.contains("--xattr-namespace <PREFIX>"), "{help}");
-        assert!(help.contains("one stderr warning"), "{help}");
-        assert!(help.contains("listed in the summary"), "{help}");
+        assert_eq!(warnings.matches("skipped during restore").count(), 1);
     }
 
     #[test]
@@ -717,7 +663,7 @@ mod tests {
         assert!(stdout.contains("system.posix_acl_access"), "{stdout}");
         assert!(stdout.contains("security.selinux"), "{stdout}");
         assert!(stdout.contains("system.remanence_test"), "{stdout}");
-        assert_eq!(stderr.matches("skipped by namespace policy").count(), 1);
+        assert_eq!(stderr.matches("skipped during restore").count(), 1);
 
         let no_skips = RecoverySummary {
             skipped_xattrs: BTreeMap::new(),
@@ -782,10 +728,20 @@ mod tests {
             out: temp.path().join("out"),
             staging_dir: None,
             overwrite: false,
-            xattr_namespaces: Vec::new(),
         })
         .expect_err("truncated envelope must fail");
 
         assert_eq!(error.kind, RecoveryFailureKind::Object);
+    }
+    #[test]
+    fn removed_namespace_flag_is_refused() {
+        let error =
+            Args::try_parse_from(["rem-recover", "--xattr-namespace", "security."]).unwrap_err();
+        assert!(error.to_string().contains("--xattr-namespace"));
+        let message = remanence_stream::removed_xattr_flag_message([std::ffi::OsStr::new(
+            "--xattr-namespace",
+        )])
+        .unwrap();
+        assert!(message.contains("was removed") && message.contains("only user.*"));
     }
 }
