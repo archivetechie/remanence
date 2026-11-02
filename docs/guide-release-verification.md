@@ -18,8 +18,9 @@ second part describes the checks a binary release will support.
 
 The archive holds the objects, tape images and expected results that the
 three format specifications are tested against. What ties it to the project
-is its SHA-256 digest, which the specifications themselves quote:
-REM-OBJECT §13, REM-ENCRYPT §13 and REM-PARITY §17 each name
+is its SHA-256 digest, which the specifications themselves quote. Their
+test-vector sections (REM-OBJECT §13 "Test Vectors", REM-ENCRYPT §13
+"Envelope Test Vectors" and REM-PARITY §17) each name
 `remanence-test-vectors.tar` with the digest
 `77be73e780e9ff2c265c8357b6ba684b4c69800213820ae1331850f742b1d83d`. The
 [versioning register](versioning-register.md#19-the-conformance-vector-archives)
