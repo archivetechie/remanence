@@ -61,9 +61,9 @@ SCSI generic driver (the `/dev/sgN` devices). It discovers libraries and
 standalone drives, identifies each one by serial number, and moves cartridges.
 In a build with the optional `linux-udev` feature, `rem watch` reports hot-plug
 events; the daemon does not subscribe to them. The daemon acts only on the
-libraries named in its configuration file. Direct standalone commands bind the current `/dev/sgN` path
-to a drive serial that the operator has authorized, and they refuse to write
-unless discovery proves that no changer owns the drive.
+libraries named in its configuration file. Direct standalone commands bind the
+current `/dev/sgN` path to a drive serial that the operator has authorized, and
+they refuse to write unless discovery proves that no changer owns the drive.
 
 ### Writing and reading tape
 
@@ -71,8 +71,8 @@ Tape input and output use fixed-size blocks and run as a pipeline through a
 staging ring, a set of host buffers that keeps several SCSI commands in flight.
 Write sessions and read-session opens return position proofs: real READ
 POSITION results (the drive's report of where the tape is) rather than
-computed positions. This
-pipeline is the only path that writes or reads object data. Reads are served
+computed positions. This pipeline is the only path that writes or reads object
+data. Reads are served
 through a host-RAM read reservoir that supports ranged access, so a
 partial-file restore does not have to stream a whole object. Full verification
 uses its own strict batch reader, which issues the same fixed-block commands
@@ -126,8 +126,8 @@ ownership, readiness and data-presence checks before it writes, and suspect
 media can be quarantined. `rem` also runs initialization, put and get with
 checkpoints, finalization, verification, adoption and catalogless restore
 directly against one manually loaded standalone drive. In that mode, called
-home mode, it keeps its state under the user's home directory and needs no
-daemon. Building, inspecting and extracting objects work on local files with no
+home mode, it keeps its state under `${XDG_STATE_HOME:-$HOME/.local/state}/rem`
+and needs no daemon. Building, inspecting and extracting objects work on local files with no
 tape hardware. A separate `rem-recover` binary decrypts and extracts an
 encrypted object with no daemon, catalog or configuration file. A plaintext
 object is an ordinary pax archive that `bsdtar` can read.
