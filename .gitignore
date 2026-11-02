@@ -64,3 +64,4 @@ fuzz/corpus/
 
 # Isolated Cargo build directories alongside target/.
 /target-*/
+.gstack/
