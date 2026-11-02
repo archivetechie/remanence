@@ -58,9 +58,10 @@ schemes.
 
 Remanence sends SCSI commands to drives and changers itself, through the Linux
 SCSI generic driver (the `/dev/sgN` devices). It discovers libraries and
-standalone drives, identifies each one by serial number, moves cartridges, and
-watches for hot-plug events. The daemon acts only on the libraries named in its
-configuration file. Direct standalone commands bind the current `/dev/sgN` path
+standalone drives, identifies each one by serial number, and moves cartridges.
+In a build with the optional `linux-udev` feature, `rem watch` reports hot-plug
+events; the daemon does not subscribe to them. The daemon acts only on the
+libraries named in its configuration file. Direct standalone commands bind the current `/dev/sgN` path
 to a drive serial that the operator has authorized, and they refuse to write
 unless discovery proves that no changer owns the drive.
 
@@ -297,6 +298,6 @@ archive when they report them.
 The formats are the part that has to last the planning horizon of 10 to 20
 years. They have specifications, pinned vectors, formal proofs over their cores,
 and a clean-room recovery drill: a reader written from the specifications alone,
-without the source, though not by an independent organisation. The software
+without the source, though not by an independent organization. The software
 around them is younger than the formats it implements. Restore and verify real
 material on your own hardware before relying on either.
