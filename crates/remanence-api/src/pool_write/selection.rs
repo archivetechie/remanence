@@ -294,6 +294,12 @@ pub fn admit_pinned_tape_for_write_session(
         }
     }
     if !host_only_after_replica_c {
+        check_pool_block_size_precondition(&tape, pool_cfg).map_err(|reason| {
+            PinnedTapeError::NotWritable {
+                tape_uuid: uuid_text,
+                reason,
+            }
+        })?;
         let conflicts = state.tape_io_admission_conflicts(&tape_uuid, tape.voltag.as_deref())?;
         if let Some(conflict) = conflicts.first() {
             return Err(PinnedTapeError::Fenced {
@@ -403,10 +409,11 @@ pub(super) fn select_tape_in_pool_with_policy_and_eligibility(
     // the policy ranks only the tapes that pass it (design §6 boundary).
     let mut reasons = Vec::new();
     let mut eligible = Vec::new();
+    let mut closeout_overhead = std::collections::HashMap::new();
     let mut batched_ineligible = Vec::new();
     let mut fenced_skips = Vec::new();
     let mut reserved_tape_count = 0usize;
-    for tape in tapes {
+    for mut tape in tapes {
         match check_writability_preconditions(&tape, object_size)
             .and_then(|_| check_pool_block_size_precondition(&tape, pool_cfg))
         {
@@ -422,6 +429,10 @@ pub(super) fn select_tape_in_pool_with_policy_and_eligibility(
                 reasons.push(err);
                 continue;
             }
+        }
+        if let Err(error) = check_pool_block_size_precondition(&tape, pool_cfg) {
+            reasons.push(error);
+            continue;
         }
         let tape_uuid = tape_uuid_from_vec(tape.tape_uuid.clone(), pool_id.as_str())?;
         if allowed_tape_uuids.is_some_and(|allowed| !allowed.contains(&tape_uuid)) {
@@ -470,6 +481,39 @@ pub(super) fn select_tape_in_pool_with_policy_and_eligibility(
                 continue;
             }
         }
+        if let Some(dir) = checkpoint_journal_dir.filter(|_| {
+            checkpoint_journal_tapes
+                .as_ref()
+                .is_some_and(|ids| ids.contains(&tape_uuid))
+        }) {
+            let snapshot =
+                remanence_state::TapeAuthority::open(dir, tape_uuid, state.path())?.freeze()?;
+            let summary = snapshot.tape_summary();
+            if summary.sealed || summary.seal_due.is_some() || summary.finalization.is_some() {
+                continue;
+            }
+            if summary.incarnation > 0 {
+                let (block, parity) = super::capacity::selected_tape_geometry(&tape, &pool_id)?;
+                if block != summary.block_size
+                    || (match &parity {
+                        remanence_parity::ParityConfig::Scheme(s) => Some(s),
+                        remanence_parity::ParityConfig::None => None,
+                    }) != summary.scheme.as_ref()
+                {
+                    reasons.push(super::capacity::missing_geometry(
+                        "catalog geometry disagrees with native authority",
+                    ));
+                    continue;
+                }
+                tape.written_extent_lba =
+                    Some(tape.written_extent_lba.unwrap_or(0).max(summary.cursor.lba));
+                tape.highest_protected_ordinal = summary.protected;
+                tape.total_committed_ordinals = summary.total;
+            }
+            if summary.closeout_due() {
+                closeout_overhead.insert(tape_uuid, closeout_charge(summary)?);
+            }
+        }
         eligible.push(tape);
     }
     if eligible.is_empty() {
@@ -494,7 +538,15 @@ pub(super) fn select_tape_in_pool_with_policy_and_eligibility(
     let mut ranked = Vec::with_capacity(eligible.len());
     for (index, tape) in eligible.into_iter().enumerate() {
         match tape_fit_state_from_record(&tape, pool_cfg, pool_id.as_str(), index as u64) {
-            Ok(candidate) => ranked.push((tape, candidate)),
+            Ok(mut candidate) => {
+                if let Some(charge) = closeout_overhead.get(&candidate.tape_uuid) {
+                    let Some(used) = candidate.used_bytes.checked_add(*charge) else {
+                        continue;
+                    };
+                    candidate.used_bytes = used;
+                }
+                ranked.push((tape, candidate));
+            }
             Err(err) => reasons.push(err),
         }
     }
@@ -517,7 +569,21 @@ pub(super) fn select_tape_in_pool_with_policy_and_eligibility(
         candidates: &candidates,
         projected_footprint: object_size,
     };
-    match policy.select(&ctx) {
+    let due = candidates
+        .iter()
+        .filter(|c| closeout_overhead.contains_key(&c.tape_uuid))
+        .cloned()
+        .collect::<Vec<_>>();
+    let preferred = policy.select(&PoolSelectionContext {
+        candidates: &due,
+        projected_footprint: object_size,
+    });
+    let selection = if matches!(preferred, Selection::UseTape { .. }) {
+        preferred
+    } else {
+        policy.select(&ctx)
+    };
+    match selection {
         Selection::UseTape { tape_uuid } => {
             let selected = ranked
                 .into_iter()
@@ -574,4 +640,27 @@ pub(super) fn tape_carries_checkpoint(
     remanence_state::TapeAuthority::open(checkpoint_journal_dir, tape_uuid, index.path())?
         .latest_commit()
         .map(|record| record.is_some())
+}
+
+/// Exact ordinary closeout sidecar charge, including its filemark. The fixed
+/// parity rows include zero-padded stripes, just as the shared emitter does.
+fn closeout_charge(s: &remanence_state::tape_log::fold::TapeSummary) -> Result<u64, StateError> {
+    let scheme = s.scheme.as_ref().expect("closeout has parity");
+    let parity =
+        u64::from(scheme.stripes_per_neighborhood) * u64::from(scheme.parity_blocks_per_stripe);
+    let layout = remanence_parity::sidecar::checked_sidecar_index_capacity_layout(
+        u64::from(s.block_size),
+        parity,
+        s.total - s.protected,
+    )
+    .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?;
+    layout
+        .block_count
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(parity))
+        .and_then(|n| n.checked_add(2))
+        .and_then(|n| n.checked_mul(u64::from(s.block_size)))
+        .ok_or_else(|| {
+            StateError::JournalReplayFailed("closeout capacity charge overflows u64".into())
+        })
 }

@@ -192,19 +192,52 @@ fn render_top(frame: &mut Frame<'_>, state: &TopState) {
                     .map_or(0, |live| live.active_tape_io_fences.len().min(5) as u16),
             ),
             Constraint::Length(7),
+            Constraint::Length(
+                2 + state
+                    .live
+                    .as_ref()
+                    .map_or(0, |l| l.closeout_debt.len() as u16),
+            ),
             Constraint::Min(7),
             Constraint::Length(if state.help { 4 } else { 2 }),
         ])
         .split(area);
 
     render_header(frame, chunks[0], state);
+    let debt = state
+        .live
+        .as_ref()
+        .map(|live| {
+            live.closeout_debt
+                .iter()
+                .map(|t| {
+                    format!(
+                        "{} {} bytes since {} {}",
+                        bytes_to_uuid_text(&t.tape_uuid),
+                        t.unprotected_bytes,
+                        crate::timestamp_value(t.unprotected_since.as_ref()),
+                        if t.closeout_overdue { "OVERDUE" } else { "" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    frame.render_widget(
+        Paragraph::new(debt).block(
+            Block::default()
+                .title("Closeout debt (all tapes)")
+                .borders(Borders::ALL),
+        ),
+        chunks[2],
+    );
     render_pinned_band(frame, chunks[1], state);
     if state.show_slots {
-        render_slot_grid(frame, chunks[2], state);
+        render_slot_grid(frame, chunks[3], state);
     } else {
-        render_collapsed_slots(frame, chunks[2], state);
+        render_collapsed_slots(frame, chunks[3], state);
     }
-    render_footer(frame, chunks[3], state);
+    render_footer(frame, chunks[4], state);
 }
 
 #[cfg(feature = "tui")]
@@ -307,7 +340,7 @@ fn render_pinned_band(frame: &mut Frame<'_>, area: Rect, state: &TopState) {
                 .iter()
                 .map(|drive| {
                     let badges = drive_badges(drive);
-                    Row::new(vec![
+                    let mut cells = vec![
                         Cell::from(
                             drive
                                 .element_address
@@ -339,36 +372,62 @@ fn render_pinned_band(frame: &mut Frame<'_>, area: Rect, state: &TopState) {
                         Cell::from(mib_per_second(
                             drive.tape_io_effective_feed_bytes_per_second,
                         )),
-                        Cell::from(badges),
-                    ])
+                        Cell::from(drive.unprotected_bytes.to_string()),
+                        Cell::from(
+                            crate::timestamp_value(drive.unprotected_since.as_ref())
+                                .as_str()
+                                .unwrap_or(DASH)
+                                .to_string(),
+                        ),
+                        Cell::from(format!(
+                            "{} {}",
+                            badges,
+                            if drive.closeout_overdue {
+                                "OVERDUE"
+                            } else {
+                                ""
+                            }
+                        )),
+                    ];
+                    if area.width < 120 {
+                        cells.drain(7..9);
+                    }
+                    Row::new(cells)
                 })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(6),
-            Constraint::Length(14),
-            Constraint::Length(11),
-            Constraint::Length(8),
-            Constraint::Length(12),
-            Constraint::Length(9),
-            Constraint::Length(9),
-            Constraint::Min(8),
-        ],
-    )
-    .header(Row::new(vec![
-        Cell::from("bay"),
-        Cell::from("serial"),
-        Cell::from("barcode"),
-        Cell::from("age"),
-        Cell::from("state"),
-        Cell::from("win MB/s"),
-        Cell::from("avg MB/s"),
-        Cell::from("badges"),
-    ]))
-    .block(
+    // Narrow terminals retain the rate columns; full debt details remain in
+    // the separate list for seated and unseated tapes.
+    let mut widths = vec![
+        Constraint::Length(6),
+        Constraint::Length(14),
+        Constraint::Length(11),
+        Constraint::Length(8),
+        Constraint::Length(12),
+        Constraint::Length(9),
+        Constraint::Length(9),
+        Constraint::Length(12),
+        Constraint::Length(20),
+        Constraint::Min(8),
+    ];
+    let mut headers = vec![
+        "bay",
+        "serial",
+        "barcode",
+        "age",
+        "state",
+        "win MB/s",
+        "avg MB/s",
+        "unprot bytes",
+        "since",
+        "badges",
+    ];
+    if area.width < 120 {
+        widths.drain(7..9);
+        headers.drain(7..9);
+    }
+    let table = Table::new(rows, widths).header(Row::new(headers)).block(
         Block::default()
             .title(title)
             .title_bottom(pending_parity)
@@ -515,6 +574,7 @@ mod tests {
 
     fn sample_response() -> pb::GetLiveStatusResponse {
         pb::GetLiveStatusResponse {
+            closeout_debt: Vec::new(),
             active_tape_io_fence_count: 0,
             active_tape_io_fences: Vec::new(),
             libraries: vec![pb::LibraryState {
@@ -616,6 +676,40 @@ mod tests {
         assert!(text.contains("CLN001"));
         assert!(text.contains("1m23s"));
         assert!(text.contains("parity pending [128,131)"));
+    }
+
+    #[test]
+    fn b7_tui_lists_unseated_overdue_debt() {
+        let response = pb::GetLiveStatusResponse {
+            closeout_debt: vec![pb::Tape {
+                tape_uuid: vec![1; 16],
+                unprotected_bytes: 786432,
+                closeout_due: true,
+                closeout_overdue: true,
+                unprotected_since: Some(prost_types::Timestamp {
+                    seconds: 0,
+                    nanos: 0,
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let state = TopState {
+            live: Some(response),
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(160, 24)).unwrap();
+        terminal.draw(|f| render_top(f, &state)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("Closeout debt"));
+        assert!(text.contains("OVERDUE"));
+        assert!(text.contains("786432"));
     }
 
     #[test]

@@ -136,3 +136,24 @@ wire and mandatory on confirmation. Preview returns the required value in
 `SupersedeTailResponse.tape_log_sequence = 4`. A stale value refuses with
 `TailPreviewStale`. `GetWriteSession` retains the ended session's durable receipts;
 there is no `SessionEndedDetails` status extension.
+
+## Closeout obligation surfaces
+
+Regenerate consumer bindings for `Tape` tags 23–26 and `Drive` tags 33–36:
+`uint64 unprotected_bytes`, optional Timestamp `unprotected_since`,
+`bool closeout_due`, and `bool closeout_overdue`, respectively. Zero bytes and
+false flags are determined values; missing or unreadable authority fails the
+read. `unprotected_since` is absent exactly when unprotected bytes are zero.
+An accepted finalization plan may own the uncovered range, making ordinary
+`closeout_due` false while bytes and their age remain visible.
+
+`GetLiveStatusResponse.closeout_debt = 9` contains catalog `Tape` entries for
+all uncovered ranges and pending seal triggers, including unseated and unavailable
+tapes and tapes outside the daemon's configured scope. An empty list means no
+uncovered ranges or pending seal triggers. The
+worker operates only within configured library and drive ownership.
+
+CLI catalog/live/top JSON uses `unprotected_bytes` as a decimal string,
+`unprotected_since` as RFC3339 UTC or null, and the two boolean flags. Existing
+open-epoch and seal-trigger fields retain their meanings. There is no additional
+session receipt message or status extension; poll `GetWriteSession`.

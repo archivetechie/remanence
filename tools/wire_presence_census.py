@@ -190,6 +190,26 @@ def main() -> int:
         type_name = SCALAR_TYPES.get(field.type, {11: "message", 14: "enum"}.get(field.type, "?"))
         rows.append((key, type_name, kind, reason))
 
+    # B7 publishes these exact field numbers and presence semantics. A rename,
+    # tag reuse or lost Timestamp presence must not pass as a generic new field.
+    expected = {
+        **{f"{message}.{name}": (start + offset, kind)
+           for message, start in (("Tape", 23), ("Drive", 33))
+           for offset, (name, kind) in enumerate((
+               ("unprotected_bytes", "decided-plain"),
+               ("unprotected_since", "message"),
+               ("closeout_due", "decided-plain"),
+               ("closeout_overdue", "decided-plain")))},
+        "GetLiveStatusResponse.closeout_debt": (9, "repeated"),
+    }
+    actual = {f"{message}.{field.name}":
+              (field.number, verdict_for(field, f"{message}.{field.name}", ledger)[0])
+              for message, field in walk(fds)}
+    mismatches = [key for key, contract in expected.items() if actual.get(key) != contract]
+    if mismatches:
+        print("closeout surface contract mismatch: " + ", ".join(mismatches), file=sys.stderr)
+        return 1
+
     total = len(rows)
     if args.list or args.unexamined:
         for key, type_name, kind, reason in sorted(rows):

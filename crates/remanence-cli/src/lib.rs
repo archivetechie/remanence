@@ -7412,6 +7412,10 @@ fn tape_json(tape: &pb::Tape) -> Value {
         "seal_due": tape.seal_due,
         "open_epoch_start": tape.open_epoch_start.map(|value| value.to_string()),
         "open_epoch_end": tape.open_epoch_end.map(|value| value.to_string()),
+        "unprotected_bytes": tape.unprotected_bytes.to_string(),
+        "unprotected_since": timestamp_value(tape.unprotected_since.as_ref()),
+        "closeout_due": tape.closeout_due,
+        "closeout_overdue": tape.closeout_overdue,
         "kind": tape.kind,
         "scheme_id": tape.scheme_id,
         "assignment_generation": tape.assignment_generation,
@@ -7538,6 +7542,12 @@ fn drive_live_json(drive: &pb::Drive) -> Value {
         "loaded_tape_uuid": drive.loaded_tape_uuid.as_deref().map(bytes_to_uuid_text),
         "loaded_tape_barcode": drive.loaded_tape_barcode,
         "mount_age_seconds": drive.mount_age_seconds,
+        "open_epoch_start": drive.open_epoch_start.map(|v| v.to_string()),
+        "open_epoch_end": drive.open_epoch_end.map(|v| v.to_string()),
+        "unprotected_bytes": drive.unprotected_bytes.to_string(),
+        "unprotected_since": timestamp_value(drive.unprotected_since.as_ref()),
+        "closeout_due": drive.closeout_due,
+        "closeout_overdue": drive.closeout_overdue,
         "status": drive_status_name(drive.status),
         "drive_uuid": drive.drive_uuid.as_deref().map(bytes_to_uuid_text),
         "catalog_state": drive_catalog_state_name(drive.catalog_state),
@@ -7610,6 +7620,7 @@ fn print_live_status_json(
         "active_tape_io_fence_count": response.active_tape_io_fence_count,
         "active_tape_io_fences": response.active_tape_io_fences.iter().map(proto_fence_json).collect::<Vec<_>>(),
         "libraries": response.libraries.iter().map(library_state_json).collect::<Vec<_>>(),
+        "closeout_debt": response.closeout_debt.iter().map(tape_json).collect::<Vec<_>>(),
         "operations": response.operations.iter().map(|operation| {
             json!({
                 "operation_id": bytes_to_uuid_text(&operation.operation_id),
@@ -7639,6 +7650,16 @@ fn print_live_status_text(
     for fence in &response.active_tape_io_fences {
         let _ = writeln!(out, "{}", proto_fence_json(fence));
     }
+    for tape in &response.closeout_debt {
+        let _ = writeln!(
+            out,
+            "debt {} unprotected_bytes={} unprotected_since={} {}",
+            bytes_to_uuid_text(&tape.tape_uuid),
+            tape.unprotected_bytes,
+            timestamp_value(tape.unprotected_since.as_ref()),
+            if tape.closeout_overdue { "OVERDUE" } else { "" }
+        );
+    }
     for library in &response.libraries {
         let serial = library
             .library
@@ -7654,7 +7675,7 @@ fn print_live_status_text(
             let tape = or_dash(drive.loaded_tape_barcode.as_deref());
             let _ = writeln!(
                 out,
-                "  bay {bay} serial={serial} tape_barcode={tape} mount_age_s={mount_age} state={state} read={read} write={write} epoch={epoch} ring={ring} gap_p95_us={gap_p95} feed_window_Bps={window_feed} feed_session_avg_Bps={session_feed}",
+                "  bay {bay} serial={serial} tape_barcode={tape} mount_age_s={mount_age} state={state} read={read} write={write} epoch={epoch} ring={ring} gap_p95_us={gap_p95} feed_window_Bps={window_feed} feed_session_avg_Bps={session_feed} unprotected_bytes={unprotected} unprotected_since={since} {overdue}",
                 // Every one of these is a dash when it was never determined.
                 // This line is the one an operator pastes into a bug report, so
                 // it is the last place that should round "unknown" down to 0.
@@ -7671,6 +7692,9 @@ fn print_live_status_text(
                 window_feed = or_dash_display(drive.tape_io_window_feed_bytes_per_second),
                 session_feed = or_dash_display(drive.tape_io_effective_feed_bytes_per_second),
                 mount_age = or_dash_display(drive.mount_age_seconds),
+                unprotected = drive.unprotected_bytes,
+                since = timestamp_value(drive.unprotected_since.as_ref()),
+                overdue = if drive.closeout_overdue { "OVERDUE" } else { "" },
             );
         }
     }
@@ -17321,6 +17345,7 @@ mod tests {
                 default_idle_timeout_seconds: 1800,
                 append_ingress_idle_secs: remanence_state::DEFAULT_APPEND_INGRESS_IDLE_SECS,
                 shutdown_close_deadline_secs: remanence_state::DEFAULT_SHUTDOWN_CLOSE_DEADLINE_SECS,
+                closeout_alarm_after_secs: remanence_state::DEFAULT_CLOSEOUT_ALARM_AFTER_SECS,
                 drive_idle_unload_seconds: remanence_state::DEFAULT_DRIVE_IDLE_UNLOAD_SECONDS,
                 changer_not_ready_wait_seconds:
                     remanence_state::DEFAULT_CHANGER_NOT_READY_WAIT_SECONDS,
@@ -18602,6 +18627,58 @@ mod tests {
     }
 
     #[test]
+    fn b7_catalog_live_top_json_and_unseated_debt() {
+        let tape = pb::Tape {
+            tape_uuid: vec![1; 16],
+            unprotected_bytes: 786432,
+            unprotected_since: Some(prost_types::Timestamp {
+                seconds: 0,
+                nanos: 0,
+            }),
+            closeout_due: true,
+            closeout_overdue: true,
+            ..Default::default()
+        };
+        let json = tape_json(&tape);
+        assert_eq!(json["unprotected_bytes"], "786432");
+        assert_eq!(json["unprotected_since"], "1970-01-01T00:00:00Z");
+        assert_eq!(json["closeout_due"], true);
+        assert_eq!(json["closeout_overdue"], true);
+        let drive = drive_live_json(&pb::Drive {
+            unprotected_bytes: tape.unprotected_bytes,
+            unprotected_since: tape.unprotected_since,
+            closeout_due: true,
+            closeout_overdue: true,
+            ..Default::default()
+        });
+        for key in [
+            "unprotected_bytes",
+            "unprotected_since",
+            "closeout_due",
+            "closeout_overdue",
+        ] {
+            assert_eq!(json[key], drive[key]);
+        }
+        let response = pb::GetLiveStatusResponse {
+            closeout_debt: vec![tape],
+            ..Default::default()
+        };
+        let mut text = Vec::new();
+        print_live_status_text(&response, &mut text).unwrap();
+        let text = String::from_utf8(text).unwrap();
+        assert!(text.contains("OVERDUE"));
+        assert!(text.contains("786432"));
+        let mut json = Vec::new();
+        print_live_status_json(&response, &mut json).unwrap();
+        let json = String::from_utf8(json).unwrap();
+        assert!(json.contains("closeout_debt"));
+        assert!(json.contains("786432"));
+        let empty = tape_json(&pb::Tape::default());
+        assert_eq!(empty["unprotected_bytes"], "0");
+        assert!(empty["unprotected_since"].is_null());
+    }
+
+    #[test]
     fn tape_json_names_verification_state_and_digest() {
         let tape = pb::Tape {
             last_verification_state: Some(pb::TapeIndexVerificationState::VerifiedComplete as i32),
@@ -19698,6 +19775,7 @@ mod tests {
 
     fn sample_live_status_response() -> pb::GetLiveStatusResponse {
         pb::GetLiveStatusResponse {
+            closeout_debt: Vec::new(),
             active_tape_io_fence_count: 0,
             active_tape_io_fences: Vec::new(),
             libraries: vec![pb::LibraryState {

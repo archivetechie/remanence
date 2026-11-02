@@ -231,3 +231,11 @@ ReleaseTapeIoFenceRequest.acknowledgment  required; the handler refuses an empty
 
 CloseoutTapeRequest.tape_uuid required; decode_uuid_bytes refuses empty or non-16-byte values before dispatch
 SupersedeTailResponse.tape_log_sequence every preview and confirmation names the observed native log sequence; zero is the real empty-log generation
+
+# Closeout debt, native authority reads fail rather than inventing zero.
+Tape.unprotected_bytes  derived from a durable native summary; zero/false is known absence of debt or predicate, unreadable authority fails the read; vacant drives have no debt
+Tape.closeout_due  derived from a durable native summary; zero/false is known absence of debt or predicate, unreadable authority fails the read; vacant drives have no debt
+Tape.closeout_overdue  derived from a durable native summary; zero/false is known absence of debt or predicate, unreadable authority fails the read; vacant drives have no debt
+Drive.unprotected_bytes  derived from a durable native summary; zero/false is known absence of debt or predicate, unreadable authority fails the read; vacant drives have no debt
+Drive.closeout_due  derived from a durable native summary; zero/false is known absence of debt or predicate, unreadable authority fails the read; vacant drives have no debt
+Drive.closeout_overdue  derived from a durable native summary; zero/false is known absence of debt or predicate, unreadable authority fails the read; vacant drives have no debt

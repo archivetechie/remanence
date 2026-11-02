@@ -137,9 +137,27 @@ pub(crate) fn replay_checkpoint_journal_projections_with_audit(
         let projected = (|| -> Result<_, remanence_state::StateError> {
             journal.reconcile_restart(mark)?;
             let snapshot = journal.freeze()?;
-            index.project_tape_log(&snapshot)?;
-            Ok(snapshot)
+            if let Err(error) = index.project_tape_log(&snapshot) {
+                if matches!(
+                    &error,
+                    remanence_state::StateError::Index { .. }
+                        | remanence_state::StateError::Io { .. }
+                        | remanence_state::StateError::DiskFull(_)
+                ) && (snapshot.tape_summary().closeout_due()
+                    || snapshot.tape_summary().seal_due.is_some()
+                    || snapshot.tape_summary().finalization.is_some())
+                {
+                    tracing::warn!(tape_uuid = %Uuid::from_bytes(tape_uuid), %error,
+                        "startup projection deferred; native closeout obligation retained");
+                    return Ok(None);
+                }
+                return Err(error);
+            }
+            Ok(Some(snapshot))
         })();
+        if matches!(projected, Ok(None)) {
+            continue;
+        }
         if let Err(error) = projected {
             let classified = match &error {
                 remanence_state::StateError::TapeLog(e) if e.is_below_projection() => {

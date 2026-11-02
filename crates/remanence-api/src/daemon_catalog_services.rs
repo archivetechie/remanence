@@ -255,8 +255,8 @@ impl pb::catalog_server::Catalog for CatalogService {
             .list_tapes(pool_id, kind)
             .map_err(status_from_state_error)?
             .into_iter()
-            .map(tape_to_proto)
-            .collect::<Vec<_>>();
+            .map(|tape| self.state.tape_with_debt(tape_to_proto(tape)))
+            .collect::<Result<Vec<_>, _>>()?;
         let fences = self
             .state
             .index()?
@@ -325,7 +325,9 @@ impl pb::catalog_server::Catalog for CatalogService {
         let rollups = index
             .tape_drive_correlation_rollups(&tape_uuid)
             .map_err(status_from_state_error)?;
-        Ok(Response::new(tape_to_proto_with_rollups(tape, rollups)))
+        Ok(Response::new(self.state.tape_with_debt(
+            tape_to_proto_with_rollups(tape, rollups),
+        )?))
     }
 
     type GetTapeInventoryStream = TapeInventoryItemStream;

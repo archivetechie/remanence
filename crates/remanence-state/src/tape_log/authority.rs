@@ -335,6 +335,10 @@ fn stream_reports(
     }
     Ok(())
 }
+/// Weak observers do not extend a writer's lease or grant append authority.
+type ObservedOwners = std::collections::HashMap<std::path::PathBuf, Weak<Mutex<Lease>>>;
+static OBSERVED_OWNERS: std::sync::OnceLock<Mutex<ObservedOwners>> = std::sync::OnceLock::new();
+
 /// Factory for the per-tape authority backend.
 #[derive(Debug)]
 pub struct TapeAuthority {
@@ -445,10 +449,40 @@ impl TapeAuthority {
     pub fn acquire_for_tail_reconciliation(&self) -> Result<TapeAuthorityLease, StateError> {
         self.wrap_lease(self.store.acquire_for_tail_reconciliation()?)
     }
+    /// Observe only the last durable fold, including while a local actor owns
+    /// its lease. This is a display/scheduling observation, never an admission
+    /// capability. Other processes still require the ordinary shared snapshot.
+    pub fn observe_summary(&self) -> Result<TapeSummary, StateError> {
+        let owner = OBSERVED_OWNERS
+            .get_or_init(Mutex::default)
+            .lock()
+            .map_err(|_| invalid("authority observer registry poisoned"))?
+            .get(self.store.path())
+            .and_then(Weak::upgrade);
+        if let Some(owner) = owner {
+            // Publications hold this mutex only across native host I/O, never
+            // drive commands. Wait for their durable outcome rather than turn
+            // ordinary fsync contention into a transient status-read failure.
+            let core = owner
+                .lock()
+                .map_err(|_| invalid("authority owner panicked"))?;
+            core.check()?;
+            Ok(core.summary().clone())
+        } else {
+            Ok(self.store.snapshot()?.summary().clone())
+        }
+    }
     fn wrap_lease(&self, lease: Lease) -> Result<TapeAuthorityLease, StateError> {
+        let core = Arc::new(Mutex::new(lease));
+        let mut owners = OBSERVED_OWNERS
+            .get_or_init(Mutex::default)
+            .lock()
+            .map_err(|_| invalid("authority observer registry poisoned"))?;
+        owners.retain(|_, owner| owner.strong_count() > 0);
+        owners.insert(self.store.path().to_owned(), Arc::downgrade(&core));
         Ok(TapeAuthorityLease {
             uuid: self.store.header.tape_uuid,
-            core: Arc::new(Mutex::new(lease)),
+            core,
             structural: None,
             scope: Scope::Idle,
             pending: None,
