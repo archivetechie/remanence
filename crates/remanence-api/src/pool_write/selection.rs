@@ -414,9 +414,7 @@ pub(super) fn select_tape_in_pool_with_policy_and_eligibility(
     let mut fenced_skips = Vec::new();
     let mut reserved_tape_count = 0usize;
     for mut tape in tapes {
-        match check_writability_preconditions(&tape, object_size)
-            .and_then(|_| check_pool_block_size_precondition(&tape, pool_cfg))
-        {
+        match check_writability_preconditions(&tape, object_size) {
             Ok(()) => {}
             Err(WritabilityError::ParityAppendUnsupported { .. })
                 if checkpoint_journal_dir.is_some() =>
@@ -490,6 +488,9 @@ pub(super) fn select_tape_in_pool_with_policy_and_eligibility(
                 remanence_state::TapeAuthority::open(dir, tape_uuid, state.path())?.freeze()?;
             let summary = snapshot.tape_summary();
             if summary.sealed || summary.seal_due.is_some() || summary.finalization.is_some() {
+                reasons.push(WritabilityError::MaintenanceRequired {
+                    tape_uuid: Uuid::from_bytes(tape_uuid).to_string(),
+                });
                 continue;
             }
             if summary.incarnation > 0 {
@@ -644,14 +645,20 @@ pub(super) fn tape_carries_checkpoint(
 
 /// Exact ordinary closeout sidecar charge, including its filemark. The fixed
 /// parity rows include zero-padded stripes, just as the shared emitter does.
-fn closeout_charge(s: &remanence_state::tape_log::fold::TapeSummary) -> Result<u64, StateError> {
-    let scheme = s.scheme.as_ref().expect("closeout has parity");
+pub(crate) fn closeout_charge(
+    s: &remanence_state::tape_log::fold::TapeSummary,
+) -> Result<u64, StateError> {
+    let scheme = s.scheme.as_ref().ok_or_else(|| {
+        StateError::JournalReplayFailed("closeout charge lacks parity scheme".into())
+    })?;
     let parity =
         u64::from(scheme.stripes_per_neighborhood) * u64::from(scheme.parity_blocks_per_stripe);
     let layout = remanence_parity::sidecar::checked_sidecar_index_capacity_layout(
         u64::from(s.block_size),
         parity,
-        s.total - s.protected,
+        s.total.checked_sub(s.protected).ok_or_else(|| {
+            StateError::JournalReplayFailed("closeout protected range exceeds total".into())
+        })?,
     )
     .map_err(|e| StateError::JournalReplayFailed(e.to_string()))?;
     layout
@@ -663,4 +670,28 @@ fn closeout_charge(s: &remanence_state::tape_log::fold::TapeSummary) -> Result<u
         .ok_or_else(|| {
             StateError::JournalReplayFailed("closeout capacity charge overflows u64".into())
         })
+}
+
+#[cfg(test)]
+mod b7_fix_tests {
+    use super::*;
+    #[test]
+    fn b7_fix_closeout_charge_checks_geometry_and_range() {
+        let mut summary = remanence_state::tape_log::fold::TapeSummary::default();
+        assert!(closeout_charge(&summary)
+            .unwrap_err()
+            .to_string()
+            .contains("lacks parity"));
+        summary.scheme = Some(remanence_parity::ParityScheme {
+            id: remanence_parity::SchemeId::new_static("b7-test"),
+            data_blocks_per_stripe: 4,
+            parity_blocks_per_stripe: 1,
+            stripes_per_neighborhood: 1,
+        });
+        summary.protected = 1;
+        assert!(closeout_charge(&summary)
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds total"));
+    }
 }

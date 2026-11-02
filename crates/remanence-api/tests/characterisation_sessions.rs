@@ -1720,9 +1720,28 @@ async fn closeout_due_noop_idempotency_and_wrong_pool() {
             == Some(session.session_id.clone())
             && record.detail.get("end_reason")
                 == Some(&ciborium::Value::Text("drive_error".into()))));
-    assert!(snapshot
-        .has_closeout_operation(*uuid::Uuid::from_slice(&op.operation_id).unwrap().as_bytes())
-        .unwrap());
+    // A worker may win the closeout hold after the failed write. The operator
+    // then waits and succeeds as already protected, without publishing a second
+    // media proof under its own operation ID. Require the actual native proof
+    // and its terminal worker audit in that case, not merely a zero-debt view.
+    let proof = snapshot
+        .tape_summary()
+        .last_closeout_record
+        .as_ref()
+        .expect("committed debt has a native closeout proof");
+    assert!(snapshot.has_closeout_operation(proof.operation_id).unwrap());
+    let operator_id = *uuid::Uuid::from_slice(&op.operation_id).unwrap().as_bytes();
+    if proof.operation_id != operator_id {
+        assert_eq!(status.progress["already_protected"], "true");
+        assert_eq!(status.progress["reserved_bytes"], "0");
+        assert!(
+            ended.iter().any(|record| {
+                record.operation_id.map(|id| *id.as_bytes()) == Some(proof.operation_id)
+                    && record.event == remanence_state::AuditEvent::OperationFinished
+            }),
+            "worker's native closeout proof must have a finished audit operation"
+        );
+    }
     assert!(CatalogIndex::open(&fixture.config.index.sqlite_path)
         .unwrap()
         .list_active_tape_io_fences()
@@ -2031,39 +2050,23 @@ async fn closeout_memory_refuses_before_any_drive_command_and_retry_survives_res
         fixture.config.tape_io.read_reservoir_bytes = 1024 * 1024;
         let client = fixture.start().await;
         let before = fixture.world.lock().unwrap().command_log.len();
-        // B7 may already be servicing this exact tape after startup. Rejoin
-        // the same operator key once that bounded owner releases its claim.
-        let retry_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let (op, last) = loop {
-            let op = pb::catalog_client::CatalogClient::new(client.channel.clone())
-                .closeout_tape(request.clone())
-                .await
-                .unwrap()
-                .into_inner();
-            let mut watch = pb::daemon_client::DaemonClient::new(client.channel.clone())
-                .watch_operation(pb::GetOperationRequest {
-                    operation_id: op.operation_id.clone(),
-                })
-                .await
-                .unwrap()
-                .into_inner();
-            let mut last = None;
-            while let Some(status) = watch.message().await.unwrap() {
-                last = Some(status);
-            }
-            let last = last.unwrap();
-            if last.state == pb::OperationState::Failed as i32
-                && last.error_summary == "tape is already mounted"
-            {
-                assert!(
-                    tokio::time::Instant::now() < retry_deadline,
-                    "maintenance owner must settle: {last:?}"
-                );
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                continue;
-            }
-            break (op, last);
-        };
+        let op = pb::catalog_client::CatalogClient::new(client.channel.clone())
+            .closeout_tape(request.clone())
+            .await
+            .unwrap()
+            .into_inner();
+        let mut watch = pb::daemon_client::DaemonClient::new(client.channel.clone())
+            .watch_operation(pb::GetOperationRequest {
+                operation_id: op.operation_id.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let mut last = None;
+        while let Some(status) = watch.message().await.unwrap() {
+            last = Some(status);
+        }
+        let last = last.unwrap();
         if limited {
             assert_eq!(last.state, pb::OperationState::Failed as i32);
             assert!(last.error_summary.contains("CloseoutMemory:"), "{last:?}");

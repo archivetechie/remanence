@@ -583,6 +583,18 @@ impl ApiState {
         crate::mount::shutdown_drive_pool(self).await
     }
 
+    /// Inject inventory without starting device actors in cross-crate contract tests.
+    #[cfg(feature = "test-support")]
+    pub fn with_test_inventory(mut self, report: remanence_library::DiscoveryReport) -> Self {
+        self.library_snapshot = Some(Arc::new(std::sync::RwLock::new(Arc::new(
+            crate::live_status::LibrarySnapshot {
+                report,
+                captured_at: OffsetDateTime::now_utc(),
+            },
+        ))));
+        self
+    }
+
     /// Return the daemon service implementation.
     pub fn daemon_service(&self) -> DaemonService {
         DaemonService {

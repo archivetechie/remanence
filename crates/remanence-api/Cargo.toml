@@ -49,6 +49,8 @@ tonic-prost-build.workspace = true
 
 [features]
 default = []
+# In-process inventory injection for cross-crate RPC/printer regressions.
+test-support = []
 
 [dev-dependencies]
 remanence-parity = { path = "../remanence-parity", features = ["fixtures"] }

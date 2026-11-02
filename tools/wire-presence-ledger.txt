@@ -232,10 +232,8 @@ ReleaseTapeIoFenceRequest.acknowledgment  required; the handler refuses an empty
 CloseoutTapeRequest.tape_uuid required; decode_uuid_bytes refuses empty or non-16-byte values before dispatch
 SupersedeTailResponse.tape_log_sequence every preview and confirmation names the observed native log sequence; zero is the real empty-log generation
 
-# Closeout debt, native authority reads fail rather than inventing zero.
-Tape.unprotected_bytes  derived from a durable native summary; zero/false is known absence of debt or predicate, unreadable authority fails the read; vacant drives have no debt
-Tape.closeout_due  derived from a durable native summary; zero/false is known absence of debt or predicate, unreadable authority fails the read; vacant drives have no debt
-Tape.closeout_overdue  derived from a durable native summary; zero/false is known absence of debt or predicate, unreadable authority fails the read; vacant drives have no debt
-Drive.unprotected_bytes  derived from a durable native summary; zero/false is known absence of debt or predicate, unreadable authority fails the read; vacant drives have no debt
-Drive.closeout_due  derived from a durable native summary; zero/false is known absence of debt or predicate, unreadable authority fails the read; vacant drives have no debt
-Drive.closeout_overdue  derived from a durable native summary; zero/false is known absence of debt or predicate, unreadable authority fails the read; vacant drives have no debt
+# B7 fix: Tape 23/25/26 and Drive 33/35/36 are now optional (no plain-scalar
+# ledger exception). Native zero/false is present; unknown authority is absent
+# with closeout_authority_error at 27/37. Timestamp 24/34 is absent for zero or
+# unknown debt. Vacant drives have no debt fields. closeout_retry_reason 28/38
+# is optional and does not alter the native debt predicate. Census pins these.

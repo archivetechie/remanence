@@ -255,8 +255,8 @@ impl pb::catalog_server::Catalog for CatalogService {
             .list_tapes(pool_id, kind)
             .map_err(status_from_state_error)?
             .into_iter()
-            .map(|tape| self.state.tape_with_debt(tape_to_proto(tape)))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|tape| self.state.tape_with_debt_or_error(tape_to_proto(tape)))
+            .collect::<Vec<_>>();
         let fences = self
             .state
             .index()?

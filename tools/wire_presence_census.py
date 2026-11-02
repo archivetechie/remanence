@@ -196,10 +196,12 @@ def main() -> int:
         **{f"{message}.{name}": (start + offset, kind)
            for message, start in (("Tape", 23), ("Drive", 33))
            for offset, (name, kind) in enumerate((
-               ("unprotected_bytes", "decided-plain"),
+               ("unprotected_bytes", "optional"),
                ("unprotected_since", "message"),
-               ("closeout_due", "decided-plain"),
-               ("closeout_overdue", "decided-plain")))},
+               ("closeout_due", "optional"),
+               ("closeout_overdue", "optional"),
+               ("closeout_authority_error", "optional"),
+               ("closeout_retry_reason", "optional")))},
         "GetLiveStatusResponse.closeout_debt": (9, "repeated"),
     }
     actual = {f"{message}.{field.name}":

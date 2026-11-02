@@ -16,7 +16,7 @@ use std::{
     fs,
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
     time::{Duration, Instant},
 };
 
@@ -376,6 +376,7 @@ impl Store {
         Ok(Lease {
             store: current,
             _lock: lock,
+            observation: Arc::new(RwLock::new(Ok(snapshot.summary.clone()))),
             fold,
             plan_base: snapshot.plan_base,
             tail: snapshot.tail,
@@ -661,6 +662,7 @@ pub struct Lease {
     store: Store,
     _lock: Flock<File>,
     fold: Fold,
+    observation: Arc<RwLock<Result<TapeSummary, String>>>,
     plan_base: super::snapshot::PlanBase,
     tail: Tail,
     fenced: bool,
@@ -669,6 +671,10 @@ pub struct Lease {
     publication_observer: Option<PublicationObserver>,
 }
 impl Lease {
+    /// Display mirror owns neither the lease nor the flock.
+    pub(super) fn observation(&self) -> Arc<RwLock<Result<TapeSummary, String>>> {
+        self.observation.clone()
+    }
     pub(crate) fn repair_pending(&self) -> bool {
         self.repair_pending
     }
@@ -1063,6 +1069,16 @@ impl Staged<'_> {
     /// trial, then append that one frame and fsync. Closer preflight does not
     /// rescan payloads; one post-sync pass advances the retained authoritative fold.
     pub fn complete(mut self, closer: &Record) -> Result<(), StoreError> {
+        let observation = self.lease.observation.clone();
+        let _panic = ObservationPanicGuard(observation.clone());
+        let result = self.complete_inner(closer);
+        if matches!(&result, Err(StoreError::AfterDurable(_))) {
+            *observation.write().unwrap_or_else(|p| p.into_inner()) =
+                Err("authority durable fold failed".into());
+        }
+        result
+    }
+    fn complete_inner(&mut self, closer: &Record) -> Result<(), StoreError> {
         if matches!(closer, Record::PayloadContinuation(_)) {
             return Err(StoreError::Refused("closing record required"));
         }
@@ -1122,6 +1138,11 @@ impl Staged<'_> {
         })();
         folded.map_err(|error| StoreError::AfterDurable(Box::new(StoreError::Codec(error))))?;
         self.lease.fenced = false;
+        *self
+            .lease
+            .observation
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = Ok(self.lease.summary().clone());
         Ok(())
     }
 }
@@ -1375,5 +1396,16 @@ mod hex_bytes {
                 .map_err(serde::de::Error::custom)?;
         }
         Ok(bytes)
+    }
+}
+
+/// Unwinding a native publication must never leave a readable stale mirror.
+struct ObservationPanicGuard(Arc<RwLock<Result<TapeSummary, String>>>);
+impl Drop for ObservationPanicGuard {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            *self.0.write().unwrap_or_else(|p| p.into_inner()) =
+                Err("authority owner panicked".into());
+        }
     }
 }

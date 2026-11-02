@@ -972,3 +972,108 @@ fn session_owner_terminal_plan_keeps_closed_out_media_base() {
         base.cursor
     );
 }
+
+/// Display readers see the durable prefix during staging, then the next fold;
+/// actual poison still fails, and an observer never extends the writer flock.
+#[test]
+fn b7_fix_observer_staging_poison_and_lease_lifetime() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = [0xb7; 16];
+    let authority = TapeAuthority::open_fixture(dir.path(), id).unwrap();
+    let mut writer = authority.acquire_exclusive().unwrap();
+    let report: AuthorityCommit = (&record(id)).into();
+    writer
+        .publish_initialized(
+            report.block_size,
+            None,
+            CommitCursor {
+                partition: 0,
+                lba: 2,
+            },
+        )
+        .unwrap();
+    writer
+        .open_session([9; 16], "2026-11-02T00:00:00Z".into())
+        .unwrap();
+    let before = authority.observe_summary().unwrap();
+    writer.stage_report(&report).unwrap();
+    assert_eq!(
+        format!("{:?}", authority.observe_summary().unwrap()),
+        format!("{before:?}")
+    );
+    writer.complete_report(&report).unwrap();
+    assert!(
+        authority.observe_summary().unwrap().last_closed_sequence > before.last_closed_sequence
+    );
+    let mirror = OBSERVED_OWNERS.get().unwrap().lock().unwrap()[authority.path()]
+        .owner
+        .upgrade()
+        .unwrap();
+    drop(writer);
+    let writer = authority.acquire_exclusive().unwrap();
+    assert!(
+        mirror.read().unwrap().is_ok(),
+        "old display snapshot can outlive a lease without retaining flock"
+    );
+    let core = writer.core.clone();
+    assert!(std::thread::spawn(move || {
+        let _guard = core.lock().unwrap();
+        panic!("owner panic");
+    })
+    .join()
+    .is_err());
+    assert!(authority
+        .observe_summary()
+        .unwrap_err()
+        .to_string()
+        .contains("panicked"));
+}
+
+#[test]
+fn b7_fix_observer_replays_once_per_change_and_rejects_after_durable_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = [0xb8; 16];
+    let authority = TapeAuthority::open_fixture(dir.path(), id).unwrap();
+    authority.append(&record(id)).unwrap();
+    for _ in 0..20 {
+        authority.observe_summary().unwrap();
+    }
+    assert_eq!(
+        OBSERVED_OWNERS.get().unwrap().lock().unwrap()[authority.path()].replays,
+        1
+    );
+    // Same-length corruption must invalidate the cached answer too.
+    let bytes = std::fs::read(authority.path()).unwrap();
+    let mut corrupt = bytes.clone();
+    corrupt[0] ^= 1;
+    std::fs::write(authority.path(), corrupt).unwrap();
+    assert!(authority.observe_summary().is_err());
+    std::fs::write(authority.path(), bytes).unwrap();
+    authority.observe_summary().unwrap();
+    assert_eq!(
+        OBSERVED_OWNERS.get().unwrap().lock().unwrap()[authority.path()].replays,
+        2
+    );
+    let mut writer = authority.acquire_exclusive().unwrap();
+    writer
+        .set_publication_observer(crate::tape_log::store::PublicationObserver(Arc::new(
+            |_, _, durable| {
+                if durable {
+                    Err(io::Error::other("after durable fold failure"))
+                } else {
+                    Ok(())
+                }
+            },
+        )))
+        .unwrap();
+    let report: AuthorityCommit = (&crate::checkpoint::tests::second_record(id)).into();
+    assert!(writer
+        .publish_report(&report)
+        .unwrap_err()
+        .is_checkpoint_append_durable());
+    assert!(authority
+        .observe_summary()
+        .unwrap_err()
+        .to_string()
+        .contains("durable fold failed"));
+}

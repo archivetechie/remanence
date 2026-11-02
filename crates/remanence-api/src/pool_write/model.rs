@@ -583,6 +583,12 @@ pub enum PinnedWriteDisposition {
 /// Hard writability precondition failure for one tape candidate.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum WritabilityError {
+    /// Native terminal work excludes Object admission.
+    #[error("tape {tape_uuid} is sealed, seal-due or finalizing; maintenance must complete before Object admission")]
+    MaintenanceRequired {
+        /// Stable tape identity for the operator.
+        tape_uuid: String,
+    },
     /// The tape is not in the provisioned write-ready state.
     #[error("tape is not ready for writing: state={state:?}")]
     NotReady {
@@ -730,7 +736,7 @@ pub enum SelectTapeError {
         pool_id: String,
     },
     /// The pool contains tapes, but all fail hard writability preconditions.
-    #[error("pool {pool_id} has no writable tapes ({reasons_len} rejection(s))", reasons_len = reasons.len())]
+    #[error("pool {pool_id} has no writable tapes ({reasons_len} rejection(s)): {detail}", reasons_len = reasons.len(), detail = reasons.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))]
     NoWritableTapes {
         /// Requested pool id.
         pool_id: String,

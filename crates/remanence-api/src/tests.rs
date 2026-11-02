@@ -8362,8 +8362,11 @@ async fn catalog_missing_authority_refuses_tapes_but_lists_projected_files() {
         }),
     )
     .await
-    .expect_err("catalog-only fixture has no native debt authority");
-    assert_eq!(tapes.code(), tonic::Code::DataLoss);
+    .unwrap()
+    .into_inner();
+    assert_eq!(tapes.tapes.len(), 1);
+    assert!(tapes.tapes[0].closeout_authority_error.is_some());
+    assert_eq!(tapes.tapes[0].unprotected_bytes, None);
 
     let filtered_tapes = pb::catalog_server::Catalog::list_tapes(
         &service,
@@ -8376,8 +8379,9 @@ async fn catalog_missing_authority_refuses_tapes_but_lists_projected_files() {
         }),
     )
     .await
-    .expect_err("pool filtering cannot invent zero debt");
-    assert_eq!(filtered_tapes.code(), tonic::Code::DataLoss);
+    .unwrap()
+    .into_inner();
+    assert_eq!(filtered_tapes.tapes, tapes.tapes);
 
     let pools = pb::catalog_server::Catalog::list_tape_pools(
         &service,
