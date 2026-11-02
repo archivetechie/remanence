@@ -141,7 +141,25 @@ pub fn hold_shared(authority: &TapeAuthority) -> Result<SharedFixtureLease, Stat
 /// Observe a publication from a synchronous test transport callback. This probe
 /// does not acquire a second lock while the test actor owns its writer lease.
 pub fn has_publication(authority: &TapeAuthority) -> bool {
-    authority.path().exists()
+    let bytes = match std::fs::read(authority.path()) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(e) => panic!("read fixture publication: {e}"),
+    };
+    let mut input = std::io::Cursor::new(bytes);
+    crate::tape_log::store::Header::decode(
+        &mut input,
+        TapeAuthority::entry_tape_uuid(authority.path()).expect("fixture uuid"),
+    )
+    .expect("fixture header");
+    let offset = input.position();
+    let mut decoder = crate::tape_log::codec::Decoder::at(input, 1, offset);
+    while let Some(frame) = decoder.next_row_frame().expect("fixture frame") {
+        if matches!(frame.record, crate::tape_log::Record::Committed(_)) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Locate a structural fixture without duplicating the selected backend's naming rule.

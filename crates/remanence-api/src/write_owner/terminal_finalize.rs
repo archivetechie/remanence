@@ -2012,6 +2012,9 @@ pub(super) fn complete_terminal_finalization_host_only(
         .map_err(|error| Status::internal(format!("build final C authority: {error}")))?;
     let final_record =
         remanence_state::authority::complete_commit(remanence_state::authority::AuthorityCommit {
+            session_id: None,
+            committed_at_utc: super::restore::now_rfc3339()
+                .map_err(|e| Status::internal(e.to_string()))?,
             ordinal: previous
                 .ordinal
                 .checked_add(1)

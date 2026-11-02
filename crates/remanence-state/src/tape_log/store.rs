@@ -1063,10 +1063,7 @@ impl Staged<'_> {
     /// trial, then append that one frame and fsync. Closer preflight does not
     /// rescan payloads; one post-sync pass advances the retained authoritative fold.
     pub fn complete(mut self, closer: &Record) -> Result<(), StoreError> {
-        if matches!(
-            closer,
-            Record::Initialized(_) | Record::PayloadContinuation(_)
-        ) {
+        if matches!(closer, Record::PayloadContinuation(_)) {
             return Err(StoreError::Refused("closing record required"));
         }
         let bytes = self.group.encode(closer, &[])?;
@@ -1178,13 +1175,10 @@ impl GroupWriter {
     pub fn sequence(&self) -> u64 {
         self.sequence
     }
-    /// Add one Initialized or continuation frame. Payloads should use modest
+    /// Add one provisional continuation frame. Payloads should use modest
     /// chunks (normally 1 MiB); logical items may span any number of chunks.
     pub fn push(&mut self, record: &Record, payload: &[u8]) -> Result<(), StoreError> {
-        if !matches!(
-            record,
-            Record::Initialized(_) | Record::PayloadContinuation(_)
-        ) {
+        if !matches!(record, Record::PayloadContinuation(_)) {
             return Err(StoreError::Refused("provisional frame required"));
         }
         let bytes = self.encode(record, payload)?;
@@ -1211,10 +1205,7 @@ impl GroupWriter {
     /// Pair a provisional spool with a known metadata closer. Media callers use
     /// stage(self), run their barrier, then complete with its newly proved closer.
     pub fn close(self, record: &Record) -> Result<PreparedGroup, StoreError> {
-        if matches!(
-            record,
-            Record::Initialized(_) | Record::PayloadContinuation(_)
-        ) {
+        if matches!(record, Record::PayloadContinuation(_)) {
             return Err(StoreError::Refused("closing record required"));
         }
         Ok(PreparedGroup {

@@ -55,7 +55,7 @@ fn process_fence_survives_loss_of_best_effort_fence_file() {
     assert!(matches!(reopened.acquire(false), Err(StoreError::Fenced)));
     let authority = crate::TapeAuthority::open_fixture(dir.path(), UUID).unwrap();
     authority.reconcile_restart(0).unwrap();
-    assert_eq!(reopened.acquire(false).unwrap().summary().barrier_count, 2);
+    assert_eq!(reopened.acquire(false).unwrap().summary().barrier_count, 3);
 }
 
 #[test]
@@ -153,7 +153,7 @@ fn closer_can_first_observe_seal_due_at_the_media_barrier() {
     let group = lease.prepare().unwrap();
     let staged = lease.stage(group).unwrap();
     // This proof only exists after staging. It was absent from retained authority.
-    let reason = SealDueReason::HardwareEarlyWarning;
+    let reason = TerminalFinalizationTrigger::HardwareEarlyWarning;
     let mut c = commit(staged.reference(0), 2, 6, 1);
     c.seal_due = Some(reason);
     staged.complete(&Record::Committed(c)).unwrap();
@@ -240,7 +240,7 @@ fn staged_prefix_and_closer_are_written_one_frame_per_call() {
 }
 
 #[test]
-fn unverified_check_reaches_the_compatibility_report_unchanged() {
+fn original_write_check_reaches_the_compatibility_report_unchanged() {
     use crate::authority::TapeAuthorityView;
     // Seed the native cold-rebuild fixture, then visit through the B2 adapter.
     let dir = tempfile::tempdir().unwrap();
@@ -255,7 +255,8 @@ fn unverified_check_reaches_the_compatibility_report_unchanged() {
     .unwrap();
     let mut lease = store.acquire(true).unwrap();
     let mut group = lease.prepare().unwrap();
-    group.push(&init(true), &[]).unwrap();
+    lease.append(group.close(&init(true)).unwrap()).unwrap();
+    group = lease.prepare().unwrap();
     let row = object(1, 2, Some(0), 3);
     group
         .push(
@@ -283,8 +284,7 @@ fn unverified_check_reaches_the_compatibility_report_unchanged() {
         .unwrap();
     let mut c = commit(group.reference(0), 2, 6, 1);
     c.check = CheckValue(7);
-    c.provenance = CheckProvenance::UnverifiedRebuild;
-    c.unverified_end = Some(3);
+    c.provenance = CheckProvenance::OriginalWrite;
     lease
         .append(group.close(&Record::Committed(c)).unwrap())
         .unwrap();
@@ -296,7 +296,7 @@ fn unverified_check_reaches_the_compatibility_report_unchanged() {
         .visit_commits(&mut |report| {
             assert_eq!(
                 report.check,
-                Some((CheckValue(7), CheckProvenance::UnverifiedRebuild))
+                Some((CheckValue(7), CheckProvenance::OriginalWrite))
             );
             seen += 1;
             Ok(())
@@ -404,7 +404,7 @@ fn durable_ambiguity_fence_refuses_a_new_process_and_clear_failure_stays_fenced(
     assert!(matches!(store.acquire(false), Err(StoreError::Fenced)));
     faults.fail.store(0, SeqCst);
     store.clear_ambiguity().unwrap();
-    assert_eq!(store.acquire(false).unwrap().summary().barrier_count, 2);
+    assert_eq!(store.acquire(false).unwrap().summary().barrier_count, 3);
 }
 
 #[test]
@@ -436,25 +436,24 @@ fn stage_data_sync_failure_rolls_back_before_media_without_fencing() {
         );
         let store = store(dir.path());
         let mut lease = store.acquire(true).unwrap();
-        if !fresh {
+        if fresh {
+            lease.append(bot_group(&lease)).unwrap();
+        } else {
             append_object(&mut lease);
         }
         let frozen = lease.snapshot().unwrap();
         let before = std::fs::read(store.path()).ok();
         let mut group = lease.prepare().unwrap();
-        if fresh {
-            group.push(&init(false), &[]).unwrap();
-        } else {
-            group
-                .push(
-                    &Record::PayloadContinuation(Continuation {
-                        group: group.sequence(),
-                        chunk: Chunk::FileRow(object(2, 6, None, 3)),
-                    }),
-                    &[],
-                )
-                .unwrap();
-        }
+        let summary = lease.summary();
+        group
+            .push(
+                &Record::PayloadContinuation(Continuation {
+                    group: group.sequence(),
+                    chunk: Chunk::FileRow(object(summary.next_file, summary.cursor.lba, None, 3)),
+                }),
+                &[],
+            )
+            .unwrap();
         faults.fail.store(7, SeqCst);
         let mut media_calls = 0;
         let error = match lease.stage(group) {
@@ -494,29 +493,23 @@ fn staged_data_sync_precedes_media_and_empty_stage_needs_no_data_sync() {
     );
     let store = store(dir.path());
     let mut lease = store.acquire(true).unwrap();
-    let mut group = lease.prepare().unwrap();
-    group.push(&init(false), &[]).unwrap();
+    let group = lease.prepare().unwrap();
     let staged = lease.stage(group).unwrap();
-    assert_eq!(faults.events.lock().unwrap().last().unwrap(), "fdatasync");
+    assert!(!faults
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| e == "fdatasync"));
     assert!(
         !store.path().exists(),
         "synced provisional initialization is not authority"
     );
     faults.events.lock().unwrap().push("media".into());
-    let c = Record::Committed(commit(staged.reference(0), 1, 2, 0));
-    staged.complete(&c).unwrap();
+    staged.complete(&init(false)).unwrap();
     assert_eq!(
         &faults.events.lock().unwrap()[..],
-        &[
-            "append",
-            "append",
-            "fdatasync",
-            "media",
-            "append",
-            "fsync",
-            "rename",
-            "directory"
-        ]
+        &["append", "media", "append", "fsync", "rename", "directory"]
     );
     faults.events.lock().unwrap().clear();
     let group = lease.prepare().unwrap();

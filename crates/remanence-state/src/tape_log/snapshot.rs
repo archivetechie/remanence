@@ -324,6 +324,44 @@ impl Snapshot {
     pub fn captured_end(&self) -> u64 {
         self.captured_end
     }
+    /// Stream the latest end's named tail from this validated frozen prefix.
+    /// The bounded summary holds only its group reference, never these files.
+    pub fn visit_last_session_tail(
+        &self,
+        mut visitor: impl FnMut(&TailFile) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        let Some(end) = &self.summary.last_session_end else {
+            return Ok(());
+        };
+        let Some(file) = &self.file else {
+            return Ok(());
+        };
+        // The frozen-prefix validation proved this offset and count. Seek
+        // directly to the named group without rescanning the tape's history.
+        let mut decoder = Decoder::at(
+            PrefixReader {
+                file: file.clone(),
+                position: end.tail.start_offset,
+                end: self.summary.closed_end,
+            },
+            end.tail.first_sequence,
+            end.tail.start_offset,
+        );
+        for _ in 0..end.tail.frame_count {
+            let frame = decoder
+                .next_row_frame()?
+                .ok_or(StoreError::Refused("session tail missing frame"))?;
+            let Record::PayloadContinuation(Continuation {
+                chunk: Chunk::TailFile(file),
+                ..
+            }) = &frame.record
+            else {
+                return Err(StoreError::Refused("session tail has non-tail frame"));
+            };
+            visitor(file)?;
+        }
+        Ok(())
+    }
     /// Run a structural pass over the already validated closed prefix, skipping
     /// catalog bytes. Directory/prefix planning rows are not durable media rows.
     pub fn visit_file_rows(
@@ -341,10 +379,7 @@ impl Snapshot {
         while let Some(frame) = decoder.next_row_frame()? {
             if frame.offset >= group_end {
                 while let Some(close) = boundary.next_row_frame()? {
-                    if !matches!(
-                        close.record,
-                        Record::Initialized(_) | Record::PayloadContinuation(_)
-                    ) {
+                    if !matches!(close.record, Record::PayloadContinuation(_)) {
                         plan = matches!(
                             close.record,
                             Record::FinalizationPrepared(_) | Record::FinalizationDecided(_)
@@ -458,10 +493,7 @@ impl Snapshot {
             .ok_or(StoreError::Refused(
                 super::store::PROJECTION_MARK_NOT_CLOSING,
             ))?;
-        if matches!(
-            frame.record,
-            Record::Initialized(_) | Record::PayloadContinuation(_)
-        ) {
+        if matches!(frame.record, Record::PayloadContinuation(_)) {
             return Err(StoreError::Refused(
                 super::store::PROJECTION_MARK_NOT_CLOSING,
             ));

@@ -105,12 +105,12 @@ fn commit(reference: GroupRef, next_file: u64, lba: u64, objects: u64) -> Commit
         total: 3,
         check: CheckValue::EMPTY,
         provenance: CheckProvenance::Empty,
-        unverified_end: None,
         next_epoch: 0,
         next_file,
         object_count: objects,
         batch_id: [8; 16],
         session_id: Some([9; 16]),
+        committed_at_utc: "2026-11-02T00:00:00Z".into(),
         seal_due: None,
     }
 }
@@ -172,7 +172,7 @@ impl MillionMemberStream {
             1 => {
                 self.stage = 2;
                 Record::PayloadContinuation(Continuation {
-                    group: 1,
+                    group: 2,
                     chunk: Chunk::FileRow(object(1, 2, None, 3)),
                 })
             }
@@ -201,7 +201,7 @@ impl MillionMemberStream {
                     self.stage = 3;
                 }
                 Record::PayloadContinuation(Continuation {
-                    group: 1,
+                    group: 2,
                     chunk: Chunk::Catalog {
                         tape_file_number: 1,
                         ordinal,
@@ -217,7 +217,9 @@ impl MillionMemberStream {
         };
         self.seq += 1;
         encode_frame(&mut self.frame, self.seq, &record, &payload).unwrap();
-        if self.stage != 4 {
+        if self.stage == 1 {
+            self.group = GroupDigest::new(2, self.offset + self.frame.len() as u64);
+        } else if self.stage != 4 {
             let mut decoder = Decoder::at(self.frame.as_slice(), self.seq, self.offset);
             let frame = decoder.next_frame().unwrap().unwrap();
             self.group.push(&frame).unwrap();
@@ -252,6 +254,8 @@ impl Read for MillionMemberStream {
 #[allow(dead_code)]
 pub fn semantic_report() -> remanence_state::authority::AuthorityCommit {
     remanence_state::authority::AuthorityCommit {
+        session_id: Some([9; 16]),
+        committed_at_utc: "2026-11-02T00:00:00Z".into(),
         ordinal: 1,
         object_count: 1,
         protected: 0,

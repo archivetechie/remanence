@@ -237,10 +237,9 @@ macro_rules! enumeration {
         fn get(r:&mut dyn Read)->io::Result<Self> { match u64::get(r)? {$($n=>Ok(Self::$variant),)+_=>Err(invalid())} }
     }};
 }
-enumeration!(CheckProvenance; 0=>Empty,1=>OriginalWrite,2=>UnverifiedRebuild);
+enumeration!(CheckProvenance; 0=>Empty,1=>OriginalWrite);
 enumeration!(TapeFileKind; 0=>Object,1=>ParitySidecar,2=>Bootstrap,3=>ParityMap,4=>TapeIndexReplica,5=>IndexSeparationExtent);
 enumeration!(TerminalTailComponentKind; 4=>TapeIndexReplica,5=>IndexSeparationExtent);
-enumeration!(SealDueReason; 0=>HardwareEarlyWarning,1=>ReachedLowWatermark);
 enumeration!(TerminalFinalizationTrigger; 0=>ReachedLowWatermark,1=>HardwareEarlyWarning,2=>OperatorCloseOut,3=>PoolCloseOut,4=>NoPendingObjectFits);
 
 // Mandatory maps, keys in declaration order. A duplicate, unknown or reordered
@@ -267,7 +266,40 @@ fields!(ObjectRecoveryRow; tape_file_number,stored_block_count,object_id,represe
 fields!(Initialized; tape_uuid,incarnation,group,block_size,scheme,bot);
 fields!(GroupRef; first_sequence,start_offset,frame_count,byte_count,member_count,digest);
 fields!(Continuation; group,chunk);
-fields!(Committed; group,cursor,protected,total,check,provenance,unverified_end,next_epoch,next_file,object_count,batch_id,session_id,seal_due);
+fields!(SessionCursor; partition,lba,next_file);
+fields!(SessionOpened; session_id,incarnation,base_media_sequence,cursor,opened_at_utc);
+fields!(SessionEnded; session_id,incarnation,base_media_sequence,cursor,ended_at_utc,reason,tail,tail_file_count,crash_ack_audit_sequence);
+fields!(ClosedOut; group,incarnation,operation_id,session_id,base_media_sequence,from_w,to_t,epoch_id,sidecar_file_number,check_before,cursor_after,next_file,next_epoch,completed_at_utc);
+fields!(TailFile; tape_file_number,identity,known_blocks,unknown_blocks,filemark);
+enumeration!(SessionEndReason; 0=>CleanClose,1=>Abort,2=>FailedAppend,3=>ClientStall,4=>DriveError,5=>GracefulShutdown,6=>ClientDisconnected,7=>CrashRecovered,8=>CloseoutFailed);
+enumeration!(TailFilemark; 0=>Present,1=>Absent,2=>Unknown);
+impl Wire for TailIdentity {
+    fn put(&self, w: &mut dyn Write) -> io::Result<()> {
+        head(w, 4, 2)?;
+        match self {
+            Self::Object(id) => {
+                0u8.put(w)?;
+                id.put(w)
+            }
+            Self::Sidecar(hash) => {
+                1u8.put(w)?;
+                hash.put(w)
+            }
+        }
+    }
+    fn get(r: &mut dyn Read) -> io::Result<Self> {
+        if expect(r, 4)? != 2 {
+            return Err(invalid());
+        }
+        match u8::get(r)? {
+            0 => Ok(Self::Object(Wire::get(r)?)),
+            1 => Ok(Self::Sidecar(Wire::get(r)?)),
+            _ => Err(invalid()),
+        }
+    }
+}
+
+fields!(Committed; group,cursor,protected,total,check,provenance,next_epoch,next_file,object_count,batch_id,session_id,seal_due,committed_at_utc);
 fields!(SidecarEpochDirectoryEntry; tape_file_number,epoch_id,protected_ordinal_start,protected_ordinal_end_exclusive,sidecar_total_block_count,sidecar_header_block_count,parity_shard_block_count,canonical_metadata_hash,flags);
 fields!(TerminalTailComponentPlan; kind,ordinal,planned_tape_file_number,planned_start_lba,record_count);
 fields!(TerminalTailLayout; partition,block_size,components,expected_eod_lba);
@@ -364,6 +396,11 @@ impl Wire for Chunk {
                 ordinal.put(w)?;
                 last.put(w)
             }
+            Self::TailFile(row) => {
+                head(w, 4, 2)?;
+                3u8.put(w)?;
+                row.put(w)
+            }
             Self::PlanDirectory(row) => {
                 head(w, 4, 2)?;
                 2u8.put(w)?;
@@ -381,6 +418,7 @@ impl Wire for Chunk {
                 last: Wire::get(r)?,
             }),
             (2, 2) => Ok(Self::PlanDirectory(Wire::get(r)?)),
+            (2, 3) => Ok(Self::TailFile(Wire::get(r)?)),
             _ => Err(invalid()),
         }
     }
@@ -388,6 +426,9 @@ impl Wire for Chunk {
 pub(super) fn encode(record: &Record, w: &mut dyn Write) -> io::Result<()> {
     match record {
         Record::Initialized(v) => v.put(w),
+        Record::SessionOpened(v) => v.put(w),
+        Record::SessionEnded(v) => v.put(w),
+        Record::ClosedOut(v) => v.put(w),
         Record::PayloadContinuation(v) => v.put(w),
         Record::Committed(v) => v.put(w),
         Record::FinalizationDecided(v) | Record::FinalizationPrepared(v) => v.put(w),
@@ -425,6 +466,9 @@ pub(super) fn decode(tag: Tag, bytes: &[u8]) -> Result<Record, Fault> {
     let result = (|| -> io::Result<Record> {
         Ok(match tag {
             Tag::Initialized => Record::Initialized(Wire::get(&mut r)?),
+            Tag::SessionOpened => Record::SessionOpened(Wire::get(&mut r)?),
+            Tag::SessionEnded => Record::SessionEnded(Wire::get(&mut r)?),
+            Tag::ClosedOut => Record::ClosedOut(Wire::get(&mut r)?),
             Tag::PayloadContinuation => Record::PayloadContinuation(Wire::get(&mut r)?),
             Tag::Committed => Record::Committed(Wire::get(&mut r)?),
             Tag::FinalizationDecided => Record::FinalizationDecided(Box::new(Wire::get(&mut r)?)),

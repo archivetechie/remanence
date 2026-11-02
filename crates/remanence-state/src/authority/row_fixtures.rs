@@ -144,10 +144,11 @@ impl RowAuthority {
             return Err(error("unclosed structural fixture claims"));
         }
         if self.owner.is_none() {
-            return self
-                .authority
-                .freeze()
-                .map_err(error)?
+            let snapshot = self.authority.freeze().map_err(error)?;
+            if snapshot.raw.tail() != crate::tape_log::codec::Tail::Complete {
+                return Err(error("unclosed structural fixture claims"));
+            }
+            return snapshot
                 .into_file_rows()
                 .ok_or_else(|| error("missing parity rows"));
         }
@@ -389,6 +390,8 @@ impl RowAuthority {
             .transpose()?
             .unwrap_or(1);
         let report = super::AuthorityCommit {
+            session_id: Some([9; 16]),
+            committed_at_utc: "2026-11-02T00:00:00Z".into(),
             ordinal: summary
                 .checkpoint_ordinal
                 .checked_add(1)
@@ -414,8 +417,7 @@ impl RowAuthority {
             finalization: None,
             sealed: false,
             seal_due: None,
-            check: (total > protected)
-                .then_some((CheckValue(0), CheckProvenance::UnverifiedRebuild)),
+            check: (total > protected).then_some((CheckValue(0), CheckProvenance::OriginalWrite)),
         };
         self.owner_mut()?.publish_report(&report).map_err(error)?;
         self.pending.clear();

@@ -47,7 +47,7 @@ use crate::error::StateError;
 use crate::{DriveKey, LabelProvenance, MediaObservation};
 
 /// Current Layer 4 SQLite schema version.
-pub const SCHEMA_VERSION: u32 = 23;
+pub const SCHEMA_VERSION: u32 = 24;
 
 #[path = "tape_log/projection.rs"]
 mod tape_log_projection;
@@ -1376,7 +1376,7 @@ impl CatalogIndex {
         let version: u32 = conn
             .query_row("pragma user_version", [], |r| r.get(0))
             .map_err(|e| sqlite_error("read sqlite user_version", e))?;
-        if (1..=22).contains(&version) {
+        if (1..SCHEMA_VERSION).contains(&version) {
             return Err(StateError::IndexMigrationFailed(
                 crate::authority_layout::RESET_REQUIRED.into(),
             ));
@@ -1390,7 +1390,7 @@ impl CatalogIndex {
         })
     }
 
-    /// Read the schema-22 predecessor only inside declared reset admission.
+    /// Read structurally compatible schema-22/23 predecessors only for declared reset admission.
     /// This capability cannot mutate or migrate the predecessor catalog.
     pub(crate) fn open_reset_source(path: &Path) -> Result<Self, StateError> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -1399,7 +1399,7 @@ impl CatalogIndex {
         let version: u32 = conn
             .query_row("pragma user_version", [], |r| r.get(0))
             .map_err(|e| sqlite_error("read reset source version", e))?;
-        if version != 22 {
+        if !(22..SCHEMA_VERSION).contains(&version) {
             validate_schema(&conn)?;
         } else {
             validate_unsigned_structural_schema(&conn)?;
@@ -10653,7 +10653,7 @@ fn project_checkpoint_tape_seal_tx(
     tx: &rusqlite::Transaction<'_>,
     tape_uuid: [u8; 16],
     sealed_after_write: bool,
-    seal_due: Option<crate::checkpoint::SealDueReason>,
+    seal_due: Option<crate::checkpoint::TerminalFinalizationTrigger>,
     updated_at_utc: &str,
 ) -> Result<(), StateError> {
     if !sealed_after_write {
@@ -13115,7 +13115,7 @@ fn validate_schema(conn: &Connection) -> Result<(), StateError> {
     let current = conn
         .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
         .map_err(|err| sqlite_error("read sqlite user_version", err))?;
-    if (1..=22).contains(&current) {
+    if (1..SCHEMA_VERSION).contains(&current) {
         return Err(StateError::IndexMigrationFailed(
             crate::authority_layout::RESET_REQUIRED.into(),
         ));
@@ -13128,9 +13128,9 @@ fn validate_schema(conn: &Connection) -> Result<(), StateError> {
             "sqlite user_version {current} is newer than supported {SCHEMA_VERSION}"
         )));
     }
-    Err(StateError::IndexMigrationFailed(format!(
-        "sqlite user_version {current} predates the unsigned structural-index schema {SCHEMA_VERSION}; ordinary startup will not rewrite it in place. To retain the catalog, restore or rebuild it with schema-{SCHEMA_VERSION}-compatible tooling; to intentionally discard a schema-16/17 catalog, use the catalog reset-preflight/reset funnel with an empty preserve list and an exact complete erase allowlist; older shapes require matching older tooling"
-    )))
+    Err(StateError::IndexMigrationFailed(
+        crate::authority_layout::RESET_REQUIRED.into(),
+    ))
 }
 
 fn migrate(conn: &Connection) -> Result<(), StateError> {
@@ -13170,6 +13170,7 @@ fn migrate(conn: &Connection) -> Result<(), StateError> {
 /// Add verification projection fields without replaying historical backfills.
 fn migrate_verification_columns(conn: &Connection) -> Result<(), StateError> {
     ensure_column(conn, "tapes", "seal_due", "seal_due text")?;
+    ensure_column(conn, "tapes", "unprotected_since", "unprotected_since text")?;
     ensure_column(
         conn,
         "tapes",
@@ -13195,7 +13196,7 @@ fn migrate_inner(conn: &Connection) -> Result<(), StateError> {
     let current = conn
         .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
         .map_err(|err| sqlite_error("read sqlite user_version", err))?;
-    if (1..=22).contains(&current) {
+    if (1..SCHEMA_VERSION).contains(&current) {
         return Err(StateError::IndexMigrationFailed(
             crate::authority_layout::RESET_REQUIRED.into(),
         ));
@@ -13212,12 +13213,12 @@ fn migrate_inner(conn: &Connection) -> Result<(), StateError> {
             .map_err(|e| sqlite_error("install replay cursors", e))?;
         return validate_unsigned_structural_schema(conn);
     }
-    // Every schema from 1 through 22 was refused above, so only an
+    // Every predecessor schema was refused above, so only an
     // unversioned database remains: it is either empty or not a catalog.
     if database_has_user_tables(conn)? {
-        return Err(StateError::IndexMigrationFailed(format!(
-            "sqlite user_version {current} predates the unsigned structural-index schema {SCHEMA_VERSION}; ordinary startup will not rewrite it in place. To retain the catalog, restore or rebuild it with schema-{SCHEMA_VERSION}-compatible tooling; to intentionally discard a schema-16/17 catalog, use the catalog reset-preflight/reset funnel with an empty preserve list and an exact complete erase allowlist; older shapes require matching older tooling"
-        )));
+        return Err(StateError::IndexMigrationFailed(
+            crate::authority_layout::RESET_REQUIRED.into(),
+        ));
     }
 
     conn.execute_batch(MINIMUM_SCHEMA)
@@ -14239,11 +14240,11 @@ mod tests {
     fn checkpoint_seal_due_replay_and_legacy_fallback() {
         use crate::checkpoint::{
             CommitFixture, ObjectProjectionFixture, ObjectRecoveryFixture,
-            ObjectRecoveryFixtureRepresentation, SealDueReason,
+            ObjectRecoveryFixtureRepresentation, TerminalFinalizationTrigger,
         };
         for reason in [
-            SealDueReason::HardwareEarlyWarning,
-            SealDueReason::ReachedLowWatermark,
+            TerminalFinalizationTrigger::HardwareEarlyWarning,
+            TerminalFinalizationTrigger::ReachedLowWatermark,
         ] {
             let root = tempfile::tempdir().unwrap();
             let uuid = [0x64; 16];
@@ -14317,14 +14318,7 @@ mod tests {
             // A catalog from the old build has no journal obligation, but the
             // final checkpoint still resolves its preserved cache fallback.
             let mut terminal = structured_terminal_checkpoint(&record);
-            terminal.terminal_finalization.as_mut().unwrap().trigger = match reason {
-                SealDueReason::HardwareEarlyWarning => {
-                    TerminalFinalizationTrigger::HardwareEarlyWarning
-                }
-                SealDueReason::ReachedLowWatermark => {
-                    TerminalFinalizationTrigger::ReachedLowWatermark
-                }
-            };
+            terminal.terminal_finalization.as_mut().unwrap().trigger = reason;
             index.project_checkpoint_record(&terminal).unwrap();
             index.rebuild_from_authoritative_sources(&[], &[]).unwrap();
             record.seal_due = Some(reason);

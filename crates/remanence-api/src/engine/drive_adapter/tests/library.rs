@@ -173,6 +173,8 @@ fn wor_checkpoint_child() {
         }
         mode @ ("mismatch" | "publish-failure") => {
             let mut owner = library_owner(&fixture, state, "wor-object").unwrap();
+            owner.open_session("default").unwrap();
+            let before_object = fixture.commands.lock().unwrap().len();
             let mut request = request;
             if mode == "mismatch" {
                 request.caller_object_id = "different-object".into();
@@ -201,10 +203,7 @@ fn wor_checkpoint_child() {
                 error.pool_write_error.as_ref().unwrap().to_string()
             );
             if mode == "mismatch" {
-                assert!(!fixture
-                    .commands
-                    .lock()
-                    .unwrap()
+                assert!(!fixture.commands.lock().unwrap()[before_object..]
                     .iter()
                     .any(|c| matches!(c[0], 0x0a | 0x10 | 0x19)));
             }

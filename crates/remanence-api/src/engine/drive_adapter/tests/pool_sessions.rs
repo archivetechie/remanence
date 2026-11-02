@@ -702,38 +702,72 @@ fn encrypted_first_epoch_journals_parity_state_and_replays() {
 }
 
 #[test]
-fn bootstrap_before_first_barrier_has_no_log_or_projected_bot() {
-    let (f, state) = Fixture::with_parity(scheme(8));
-    let mut actor = f.owner(state);
-    actor.open_session("default").unwrap();
-    assert!(
-        !remanence_state::TapeAuthority::exists(f.config.journal.dir.join("tapes"), UUID).unwrap()
-    );
-    let tape = f.index().get_tape(&UUID).unwrap().unwrap();
-    assert_eq!(tape.total_committed_ordinals, 0);
-    assert_eq!(tape.last_committed_tape_file, None);
-    actor.finish().unwrap();
-    assert!(
-        !remanence_state::TapeAuthority::exists(f.config.journal.dir.join("tapes"), UUID).unwrap()
-    );
-    assert!(f.index().list_tape_files(&UUID).unwrap().is_empty());
-    let mut restarted = f.owner(f.reopen().unwrap());
-    restarted
-        .write_checkpointed(f.request("after-abandoned-bootstrap"))
-        .unwrap();
-    restarted.finish().unwrap();
-    assert!(
-        remanence_state::TapeAuthority::exists(f.config.journal.dir.join("tapes"), UUID).unwrap()
-    );
-    assert_eq!(
-        checkpoint(&f)
-            .replay()
-            .unwrap()
+fn bootstrap_open_commits_bot_before_objects_in_both_parity_modes() {
+    for parity_enabled in [false, true] {
+        let (f, state) = if parity_enabled {
+            Fixture::with_parity(scheme(8))
+        } else {
+            Fixture::new(false)
+        };
+        let mut actor = f.owner(state);
+        assert!(
+            !remanence_state::TapeAuthority::exists(f.config.journal.dir.join("tapes"), UUID)
+                .unwrap()
+        );
+        actor.open_session("default").unwrap();
+        assert!(
+            remanence_state::TapeAuthority::exists(f.config.journal.dir.join("tapes"), UUID)
+                .unwrap()
+        );
+        let tape = f.index().get_tape(&UUID).unwrap().unwrap();
+        assert_eq!(tape.total_committed_ordinals, 0);
+        assert_eq!(tape.highest_protected_ordinal, 0);
+        assert_eq!(tape.last_committed_tape_file, Some(0));
+        let commands = f.commands.lock().unwrap();
+        let modifying: Vec<_> = commands
             .iter()
-            .map(|r| r.objects.len())
-            .sum::<usize>(),
-        1
-    );
+            .filter(|c| matches!(c[0], 0x0a | 0x10))
+            .collect();
+        assert_eq!(
+            modifying.len(),
+            3,
+            "BOT block, filemark, synchronous barrier"
+        );
+        assert_eq!(modifying[0][0], 0x0a);
+        assert_eq!(modifying[1][0], 0x10);
+        assert_eq!(&modifying[2][..5], &[0x10, 0, 0, 0, 0]);
+        drop(commands);
+        actor.finish().unwrap();
+        let summary = checkpoint(&f).authority_summary().unwrap();
+        assert_eq!(
+            summary.cursor,
+            Some(remanence_parity::CommitCursor {
+                partition: 0,
+                lba: 2
+            })
+        );
+        assert_eq!(summary.checkpoint_ordinal, 0);
+        assert_eq!(summary.object_count, 0);
+
+        assert_eq!(f.index().list_tape_files(&UUID).unwrap().len(), 1);
+        let before = command_count(&f);
+        let mut restarted = f.owner(f.reopen().unwrap());
+        restarted.open_session("default").unwrap();
+        no_modifications(&f, before);
+        restarted
+            .write_checkpointed(f.request("after-bootstrap"))
+            .unwrap();
+        restarted.finish().unwrap();
+        assert_eq!(
+            checkpoint(&f)
+                .replay()
+                .unwrap()
+                .iter()
+                .map(|r| r.objects.len())
+                .sum::<usize>(),
+            1
+        );
+    }
 }
 
 #[test]
@@ -904,5 +938,161 @@ fn retained_close_prefix_and_component_publication_failures_poison_release_and_f
         );
         files.observe(None);
         drop(registration);
+    }
+}
+
+/// Kill the actual owner process at either side of the BOT durability barrier.
+/// Only the injected virtual transport is used; save its BOT for restart proof.
+struct BootstrapCrashTransport {
+    inner: ModelTransport,
+    world: SharedVirtualWorld,
+    manifest: PathBuf,
+    after_barrier: bool,
+}
+impl SgTransport for BootstrapCrashTransport {
+    fn execute_in(
+        &mut self,
+        cdb: &[u8],
+        bytes: &mut [u8],
+    ) -> std::result::Result<TransferOutcome, ScsiError> {
+        self.inner.execute_in(cdb, bytes)
+    }
+    fn execute_out(
+        &mut self,
+        cdb: &[u8],
+        bytes: &[u8],
+    ) -> std::result::Result<TransferOutcome, ScsiError> {
+        self.inner.execute_out(cdb, bytes)
+    }
+    fn execute_none(&mut self, cdb: &[u8]) -> std::result::Result<(), ScsiError> {
+        if matches!(cdb[0], 0x1e | 0x16 | 0x17) {
+            return Ok(());
+        }
+        if cdb.starts_with(&[0x10, 0, 0, 0, 0]) {
+            if self.after_barrier {
+                self.inner.execute_none(cdb)?;
+            }
+            let world = self.world.lock().unwrap();
+            let records = &world.tapes["HAND"].records;
+            let [Record::Block(bot), Record::Filemark] = records.as_slice() else {
+                panic!("crash cut must contain exactly BOT and its filemark")
+            };
+            std::fs::write(self.manifest.with_extension("bot"), bot).unwrap();
+            std::process::exit(86);
+        }
+        self.inner.execute_none(cdb)
+    }
+    fn set_timeout_for(&mut self, class: TimeoutClass) {
+        self.inner.set_timeout_for(class);
+    }
+}
+
+#[test]
+#[ignore = "subprocess helper for bootstrap_barrier_crashes_recover_without_publishing_initialized"]
+fn bootstrap_barrier_crash_child() {
+    let manifest = PathBuf::from(std::env::var_os("REM_B6A_BOOTSTRAP_MANIFEST").unwrap());
+    let parity = std::env::var("REM_B6A_PARITY").unwrap() == "true";
+    let (f, state) = Fixture::new(parity);
+    std::fs::write(&manifest, serde_json::to_vec(&f.config).unwrap()).unwrap();
+    let mut actor = MountedDrive::with_transport(
+        state,
+        Path::new(DEVICE),
+        &StaticAllowlist::new([SERIAL]),
+        Box::new(BootstrapCrashTransport {
+            inner: ModelTransport::new(f.world.clone(), DeviceRole::Drive { bay: BAY }),
+            world: f.world.clone(),
+            manifest,
+            after_barrier: std::env::var("REM_B6A_AFTER_BARRIER").unwrap() == "true",
+        }),
+        f.root.path(),
+        Some(UUID),
+    )
+    .unwrap();
+    actor.open_session("default").unwrap();
+    panic!("bootstrap crash cut was not reached");
+}
+
+#[test]
+fn bootstrap_barrier_crashes_recover_without_publishing_initialized() {
+    for parity in [false, true] {
+        for after_barrier in [false, true] {
+            let (f, state) = Fixture::new(parity);
+            drop(state);
+            let manifest = f.root.path().join("bootstrap-crash.json");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "engine::drive_adapter::tests::pool_sessions::bootstrap_barrier_crash_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("REM_B6A_BOOTSTRAP_MANIFEST", &manifest)
+                .env("REM_B6A_PARITY", parity.to_string())
+                .env("REM_B6A_AFTER_BARRIER", after_barrier.to_string())
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(86),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let config: remanence_state::RemConfig =
+                serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+            let bot = std::fs::read(manifest.with_extension("bot")).unwrap();
+            assert!(!remanence_state::TapeAuthority::exists(
+                config.journal.dir.join("tapes"),
+                UUID
+            )
+            .unwrap());
+            f.world
+                .lock()
+                .unwrap()
+                .tapes
+                .get_mut("HAND")
+                .unwrap()
+                .records = vec![Record::Block(bot), Record::Filemark];
+            let mut state = StateHandle::open_with_config(
+                remanence_state::StatePaths::from_config(
+                    config.daemon.state_dir.join("config.toml"),
+                    &config,
+                ),
+                config.clone(),
+            )
+            .unwrap();
+            // Existing crash recovery quarantines the orphaned mounted write;
+            // neither a completed BOT nor a completed barrier invents authority.
+            let mount = OperatorMount::with_transport(
+                Path::new(DEVICE),
+                &StaticAllowlist::new([SERIAL]),
+                Box::new(Transport {
+                    inner: ModelTransport::new(f.world.clone(), DeviceRole::Drive { bay: BAY }),
+                    commands: f.commands.clone(),
+                    fault: f.fault.clone(),
+                    evidence: None,
+                    last_opcode: None,
+                }),
+                &mut state,
+                f.root.path(),
+            )
+            .unwrap();
+            mount.finish().unwrap();
+            let fences = state.catalog_index().list_active_tape_io_fences().unwrap();
+            assert_eq!(fences.len(), 1);
+            assert_eq!(fences[0].reason, "standalone_write_lost_by_restart");
+            assert!(state
+                .catalog_index()
+                .non_terminal_sessions()
+                .unwrap()
+                .is_empty());
+            assert!(!remanence_state::TapeAuthority::exists(
+                config.journal.dir.join("tapes"),
+                UUID
+            )
+            .unwrap());
+            no_modifications(&f, 0);
+            drop(state);
+            std::fs::remove_dir_all(&config.daemon.state_dir).unwrap();
+        }
     }
 }

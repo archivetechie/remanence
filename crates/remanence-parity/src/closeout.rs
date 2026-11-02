@@ -398,7 +398,7 @@ pub fn rebuild_uncovered(
     unreachable!("two attempts return")
 }
 
-/// One shared read pass, also used for pre-cut-over UnverifiedRebuild authority.
+/// One shared read pass; its caller compares the original-write check.
 /// Only the checked entry point may claim agreement with original-write bytes.
 pub(crate) fn rebuild_uncovered_once(
     tape_uuid: [u8; 16],

@@ -149,7 +149,6 @@ pub(super) fn checked_epoch_rebuild(
     }
     let check = match previous.check {
         Some((check, remanence_parity::CheckProvenance::OriginalWrite)) => Some(check),
-        Some((_, remanence_parity::CheckProvenance::UnverifiedRebuild)) => None,
         _ => {
             return Err(Status::failed_precondition(
                 "open epoch lacks durable check provenance",
@@ -936,6 +935,10 @@ fn perform_checkpoint_barrier_with_rows(
         .transpose()?
         .unwrap_or(base.next_file);
     let draft = remanence_state::authority::AuthorityCommit {
+        session_id: journal.bound_session_id(),
+        committed_at_utc: super::restore::now_rfc3339().map_err(|e| {
+            CheckpointBarrierFailure::before_journal(Status::internal(e.to_string()))
+        })?,
         ordinal: next_ordinal,
         object_count: next_committed_count,
         tape_uuid,
@@ -1127,6 +1130,10 @@ fn perform_checkpoint_barrier_with_rows(
     }
     let mut record =
         remanence_state::authority::complete_commit(remanence_state::authority::AuthorityCommit {
+            session_id: journal.bound_session_id(),
+            committed_at_utc: super::restore::now_rfc3339().map_err(|e| {
+                CheckpointBarrierFailure::before_journal(Status::internal(e.to_string()))
+            })?,
             ordinal: next_ordinal,
             object_count: next_committed_count,
             tape_uuid,
@@ -1182,11 +1189,24 @@ fn perform_checkpoint_barrier_with_rows(
         .as_ref()
         .and_then(|session| session.sink_state.as_ref())
         .map(|state| state.commit_check());
-    record.seal_due = seal_reason.map(|reason| match reason {
-        crate::pool_write::TapeSealReason::HardwareEarlyWarning => {
-            remanence_state::SealDueReason::HardwareEarlyWarning
-        }
-        _ => remanence_state::SealDueReason::ReachedLowWatermark,
+    record.seal_due = base.seal_due.or_else(|| {
+        seal_reason.map(|reason| match reason {
+            crate::pool_write::TapeSealReason::ReachedLowWatermark => {
+                remanence_state::TerminalFinalizationTrigger::ReachedLowWatermark
+            }
+            crate::pool_write::TapeSealReason::HardwareEarlyWarning => {
+                remanence_state::TerminalFinalizationTrigger::HardwareEarlyWarning
+            }
+            crate::pool_write::TapeSealReason::OperatorCloseOut => {
+                remanence_state::TerminalFinalizationTrigger::OperatorCloseOut
+            }
+            crate::pool_write::TapeSealReason::PoolCloseOut => {
+                remanence_state::TerminalFinalizationTrigger::PoolCloseOut
+            }
+            crate::pool_write::TapeSealReason::NoPendingObjectFits => {
+                remanence_state::TerminalFinalizationTrigger::NoPendingObjectFits
+            }
+        })
     });
     let filemark_drain = drain_started.elapsed();
     let projection_started = Instant::now();
@@ -1291,26 +1311,9 @@ fn perform_checkpoint_barrier_with_rows(
         tracing::info!(tape_uuid = %Uuid::from_bytes(tape_uuid), ?seal_reason,
             "terminal seal is due; removal leaves finalization to the next write session or explicit finalize");
     }
-    let terminal_checkpoint_record = if let Some(reason) =
-        seal_reason.filter(|_| allow_finalization)
+    let terminal_checkpoint_record = if let Some(trigger) =
+        record.seal_due.filter(|_| allow_finalization)
     {
-        let trigger = match reason {
-            crate::pool_write::TapeSealReason::ReachedLowWatermark => {
-                remanence_state::TerminalFinalizationTrigger::ReachedLowWatermark
-            }
-            crate::pool_write::TapeSealReason::HardwareEarlyWarning => {
-                remanence_state::TerminalFinalizationTrigger::HardwareEarlyWarning
-            }
-            crate::pool_write::TapeSealReason::OperatorCloseOut => {
-                remanence_state::TerminalFinalizationTrigger::OperatorCloseOut
-            }
-            crate::pool_write::TapeSealReason::PoolCloseOut => {
-                remanence_state::TerminalFinalizationTrigger::PoolCloseOut
-            }
-            crate::pool_write::TapeSealReason::NoPendingObjectFits => {
-                remanence_state::TerminalFinalizationTrigger::NoPendingObjectFits
-            }
-        };
         if trigger == remanence_state::TerminalFinalizationTrigger::OperatorCloseOut {
             return Err(CheckpointBarrierFailure::after_projection(
                 Status::internal(

@@ -3762,7 +3762,7 @@ fn harness_reset_schema22_predecessor_then_admit_write_and_read() {
     assert_eq!(code, ExitCode::SUCCESS, "{err}");
     assert!(config.daemon.state_dir.join("authority-format").exists());
     let mut state = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap();
-    assert_eq!(state.catalog_index().schema_version().unwrap(), 23);
+    assert_eq!(state.catalog_index().schema_version().unwrap(), 24);
     drop(state);
     assert!(!config.journal.dir.join("checkpoints").exists());
     f.new_tape("AFTERRESET");

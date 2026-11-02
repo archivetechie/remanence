@@ -1056,7 +1056,7 @@ fn automatic_terminal_media_completion_closes_audit_without_a_false_fence() {
     .build()
     .unwrap();
     let mut checkpoint = journal.last().unwrap().unwrap();
-    checkpoint.seal_due = Some(remanence_state::SealDueReason::ReachedLowWatermark);
+    checkpoint.seal_due = Some(remanence_state::TerminalFinalizationTrigger::ReachedLowWatermark);
     fixture
         .index()
         .project_checkpoint_record(&checkpoint)

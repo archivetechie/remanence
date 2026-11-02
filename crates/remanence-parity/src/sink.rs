@@ -871,7 +871,6 @@ pub struct ParitySinkSessionState {
     neighborhood_idx: u64,
     current_epoch_start: u64,
     data_blocks_in_neighborhood: u64,
-    unverified_rebuild: bool,
     pending_sidecars: Vec<PendingSidecar>,
     highest_protected_ordinal: u64,
     block_size: Option<usize>,
@@ -912,11 +911,7 @@ impl ParitySinkSessionState {
         }
         (
             self.accumulator.check_value(),
-            if self.unverified_rebuild {
-                crate::CheckProvenance::UnverifiedRebuild
-            } else {
-                crate::CheckProvenance::OriginalWrite
-            },
+            crate::CheckProvenance::OriginalWrite,
         )
     }
 
@@ -1035,9 +1030,6 @@ pub struct ParitySink<'a> {
     /// math: `stripe_index = n % S`, `row = n / S`. Resets to
     /// 0 at every neighborhood boundary.
     data_blocks_in_neighborhood: u64,
-
-    /// Whether the current epoch contains legacy unverified readback.
-    unverified_rebuild: bool,
 
     /// Completed-epoch sidecars whose parity has been computed but whose tape
     /// files cannot be emitted until the active object is closed, or until
@@ -1217,7 +1209,6 @@ impl<'a> ParitySink<'a> {
             neighborhood_idx: self.neighborhood_idx,
             current_epoch_start: self.current_epoch_start,
             data_blocks_in_neighborhood: self.data_blocks_in_neighborhood,
-            unverified_rebuild: self.unverified_rebuild,
             pending_sidecars: self.pending_sidecars,
             highest_protected_ordinal: self.highest_protected_ordinal,
             block_size: self.block_size,
@@ -1386,7 +1377,6 @@ impl<'a> ParitySink<'a> {
             neighborhood_idx: state.neighborhood_idx,
             current_epoch_start: state.current_epoch_start,
             data_blocks_in_neighborhood: state.data_blocks_in_neighborhood,
-            unverified_rebuild: state.unverified_rebuild,
             pending_sidecars: state.pending_sidecars,
             highest_protected_ordinal: state.highest_protected_ordinal,
             block_size: state.block_size,
@@ -1607,7 +1597,11 @@ impl<'a> ParitySink<'a> {
         sink.last_data_lba = actual_append_position.lba;
         sink.last_physical_lba = actual_append_position.lba;
         sink.load_resume_live_epoch(resume_seed.resume_result)?;
-        sink.unverified_rebuild = sink.data_blocks_in_neighborhood > 0 && !original_write_verified;
+        if sink.data_blocks_in_neighborhood > 0 && !original_write_verified {
+            return Err(ParityError::Invariant(
+                "open epoch lacks original-write check",
+            ));
+        }
         Ok(sink)
     }
 
@@ -1640,7 +1634,6 @@ impl<'a> ParitySink<'a> {
             neighborhood_idx: 0,
             current_epoch_start: 0,
             data_blocks_in_neighborhood: 0,
-            unverified_rebuild: false,
             pending_sidecars: Vec::new(),
             highest_protected_ordinal: 0,
             block_size: None,
@@ -3158,7 +3151,6 @@ impl<'a> ParitySink<'a> {
             .checked_add(real_data as u64)
             .ok_or(ParityError::Invariant("sidecar protected range overflows"))?;
         let data_shard_crc64s = std::mem::take(&mut self.accumulator.current_epoch_data_crc64s);
-        self.unverified_rebuild = false;
         self.pending_sidecars.push(PendingSidecar {
             epoch_id: self.neighborhood_idx,
             block_size: self.block_size_bytes,

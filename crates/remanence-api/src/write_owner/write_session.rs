@@ -1771,7 +1771,7 @@ pub(super) fn handle_drive_open_write(
         };
         (lease, None)
     };
-    let durable_checkpoint_records =
+    let mut durable_checkpoint_records =
         match project_checkpoint_authority_bounded(index, &checkpoint_lease) {
             Ok(records) => records,
             Err(err) => {
@@ -2130,7 +2130,7 @@ pub(super) fn handle_drive_open_write(
     let objects_committed = 0u64;
     let bytes_committed = 0u64;
     let last_checkpoint_at_utc = None;
-    let last_durable_checkpoint = durable_checkpoint_records.last().cloned();
+    let mut last_durable_checkpoint = durable_checkpoint_records.last().cloned();
     if cfg.mounted().is_none() {
         if let Err(status) = record_session_event(
             index,
@@ -2184,6 +2184,7 @@ pub(super) fn handle_drive_open_write(
     if had_retained_epoch && carried.is_none() {
         cfg.io_memory.record_epoch_discard();
     }
+    let bootstrap_dispatch_before = drive.media_write_dispatch_count();
     let mut parity_session = if let Some(authority) = parity_authority {
         if let Some(epoch) = carried {
             Some(ParityActorSession {
@@ -2229,6 +2230,89 @@ pub(super) fn handle_drive_open_write(
     } else {
         None
     };
+    checkpoint_lease.bind_session(*session_id.as_bytes());
+    if durable_checkpoint_records.is_empty() {
+        let bootstrap = (|| -> Result<(), Status> {
+            if parity_session.is_none() {
+                drive
+                    .locate_admitted_append(0)
+                    .map_err(|e| Status::unavailable(format!("locate fresh BOT: {e}")))?;
+                let identity = remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION"));
+                crate::pool_write::write_no_parity_bootstrap(
+                    &mut DriveHandleSink(drive),
+                    tape_uuid,
+                    selected.block_size,
+                    &identity,
+                )
+                .map_err(|e| status_from_selected_write_error(&selected, e))?;
+            }
+            let barrier = drive
+                .write_filemarks(0)
+                .map_err(|e| Status::unavailable(format!("bootstrap barrier failed: {e}")))?;
+            if barrier.end_of_medium {
+                return Err(Status::failed_precondition(
+                    "bootstrap barrier reached end of medium",
+                ));
+            }
+            let position = drive
+                .position()
+                .map_err(|e| Status::unavailable(format!("bootstrap barrier position: {e}")))?;
+            let cursor = remanence_parity::CommitCursor {
+                partition: position.partition,
+                lba: position.lba,
+            };
+            checkpoint_lease
+                .publish_initialized(
+                    selected.block_size,
+                    parity_session.as_ref().map(|p| p.scheme.clone()),
+                    cursor,
+                )
+                .map_err(status_from_state_error)?;
+            drive
+                .advance_append_commit(
+                    crate::append_admission::context(
+                        tape_uuid,
+                        selected.block_size,
+                        cursor.partition,
+                        cursor.lba,
+                    )
+                    .boundary,
+                )
+                .map_err(|e| {
+                    Status::failed_precondition(format!("bootstrap append boundary: {e}"))
+                })?;
+            if let Some(state) = parity_session.as_mut().and_then(|p| p.sink_state.as_mut()) {
+                state.acknowledge_publication();
+            }
+            durable_checkpoint_records =
+                project_checkpoint_authority_bounded(index, &checkpoint_lease)
+                    .map_err(status_from_state_error)?;
+            last_durable_checkpoint = durable_checkpoint_records.last().cloned();
+            Ok(())
+        })();
+        if let Err(status) = bootstrap {
+            let status = if drive.media_write_dispatch_count() == bootstrap_dispatch_before {
+                status
+            } else if cfg.mounted().is_some() {
+                super::mounted_commands::fence_failed_write(index, cfg, status)
+            } else {
+                let error = status.to_string();
+                fence_failed_parity_raw_write(
+                    index,
+                    cfg,
+                    &selected,
+                    "fresh_bootstrap",
+                    None,
+                    None,
+                    &error,
+                    status,
+                )
+                .0
+            };
+            let _ = reply.send(Err(status));
+            return None;
+        }
+    }
     let next_batched_append = if parity_session.is_none() {
         match crate::pool_write::first_batched_append_context(
             index,

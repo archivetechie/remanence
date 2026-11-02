@@ -2905,7 +2905,8 @@ async fn partial_epoch_checkpoint_projects_replays_and_first_post_checkpoint_sho
     let bootstrap_files = bootstrap_index
         .list_tape_files(&tape_uuid)
         .expect("list freshly projected BOT bootstrap");
-    assert!(bootstrap_files.is_empty());
+    assert_eq!(bootstrap_files.len(), 1);
+    assert_eq!(bootstrap_files[0].tape_file_number, 0);
     drop(bootstrap_index);
 
     let first = append_actor_test_file(
@@ -7026,7 +7027,7 @@ async fn induced_append_and_read_failures_persist_session_snapshots() {
         .provision_tape(ProvisionTapeInput {
             tape_uuid,
             voltag: "FAIL002L9".to_string(),
-            block_size: 4096,
+            block_size: 262144,
             parity: ParityConfig::None,
             force: false,
         })
@@ -7057,14 +7058,14 @@ async fn induced_append_and_read_failures_persist_session_snapshots() {
         written_by_version: "test".to_string(),
         written_at: "2026-07-18T00:00:00Z".to_string(),
         sequence: 0,
-        block_size_bytes: 4096,
+        block_size_bytes: 262144,
         drive_compression: false,
     };
-    let mut bootstrap_block = vec![0u8; 4096];
+    let mut bootstrap_block = vec![0u8; 262144];
     write_bootstrap_block(&bootstrap, &mut bootstrap_block).expect("encode bootstrap");
-    let mut tape = VirtualTape::empty(64 * 1024 * 1024, 4096);
+    let mut tape = VirtualTape::empty(64 * 1024 * 1024, 262144);
     tape.records = vec![Record::Block(bootstrap_block), Record::Filemark];
-    tape.written_bytes = 4096;
+    tape.written_bytes = 262144;
     let mut world =
         VirtualWorld::single_drive("LIB-INDUCED-FAIL", 0x0100, "DRV-INDUCED-FAIL", 0x0400, 1);
     world.put_tape_in_drive(0x0100, "FAIL002L9", Some(0x0400), tape);
@@ -7102,13 +7103,13 @@ async fn induced_append_and_read_failures_persist_session_snapshots() {
         .expect("read open reply")
         .expect("open read session");
     let read_session_id = Uuid::from_slice(&read_session.session_id).expect("read session UUID");
-    let (chunk_tx, mut chunk_rx) = crate::read_core::read_stream_channel(4096);
+    let (chunk_tx, mut chunk_rx) = crate::read_core::read_stream_channel(262144);
     drive_tx
         .send(DriveCommand::ReadFile {
             session_id: read_session_id,
             object_id: Uuid::new_v4().to_string(),
             file_id: Vec::new(),
-            stream_chunk_bytes: 4096,
+            stream_chunk_bytes: 262144,
             chunk_tx,
         })
         .await
@@ -7141,7 +7142,7 @@ async fn induced_append_and_read_failures_persist_session_snapshots() {
         watermark_low: 0.9,
         watermark_high: 0.95,
         capacity_cap_bytes: None,
-        block_size_bytes: 4096,
+        block_size_bytes: 262144,
         min_object_size_bytes: 0,
     };
     // A live actor observes the RPC release through its existing catalog connection.
@@ -7171,7 +7172,7 @@ async fn induced_append_and_read_failures_persist_session_snapshots() {
                     standalone_endpoint: None,
                     pool_id: "failure-test".into(),
                     tape_uuid,
-                    block_size: 4096,
+                    block_size: 262144,
                     parity_config: ParityConfig::None,
                 },
                 target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
@@ -7234,7 +7235,7 @@ async fn induced_append_and_read_failures_persist_session_snapshots() {
                 standalone_endpoint: None,
                 pool_id: "failure-test".to_string(),
                 tape_uuid,
-                block_size: 4096,
+                block_size: 262144,
                 parity_config: ParityConfig::None,
             },
             target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
@@ -12716,7 +12717,7 @@ pub(crate) async fn check_seated_parity_sessions(
             .unwrap();
             assert_eq!(
                 journal.last().unwrap().unwrap().seal_due,
-                Some(remanence_state::SealDueReason::HardwareEarlyWarning)
+                Some(remanence_state::TerminalFinalizationTrigger::HardwareEarlyWarning)
             );
             let before = CatalogIndex::open(&state.paths().sqlite_path)
                 .unwrap()

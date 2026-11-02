@@ -693,13 +693,6 @@ pub(crate) fn selected_tape_seal_reason_at_barrier(
     let tape = state.get_tape(&selected.tape_uuid)?.ok_or_else(|| {
         PoolWriteError::MissingTapeGeometry("selected tape row is missing".into())
     })?;
-    if let Some(reason) = tape.seal_due.as_deref() {
-        return Ok(Some(if reason == "hardware_early_warning" {
-            TapeSealReason::HardwareEarlyWarning
-        } else {
-            TapeSealReason::ReachedLowWatermark
-        }));
-    }
     let raw_capacity = tape_capacity_bytes(&tape)
         .map_err(|err| PoolWriteError::MissingTapeGeometry(err.to_string()))?;
     let capacity = effective_tape_pool_capacity_bytes(pool_cfg, raw_capacity)

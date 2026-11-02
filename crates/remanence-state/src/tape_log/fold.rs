@@ -23,6 +23,8 @@ pub struct UncoveredExtent {
     pub tape_file_number: u64,
     /// Physical LBA corresponding to first.
     pub start_lba: u64,
+    /// Time of the commit that first exposed these still-uncovered bytes.
+    pub committed_at_utc: String,
 }
 /// Constant-size finalization state; diagnostics/catalog/directory stay in the log.
 #[derive(Clone, Debug)]
@@ -74,10 +76,14 @@ pub struct TapeSummary {
     pub total: u64,
     /// Check over [W,T).
     pub check: CheckValue,
-    /// Check origin, explicitly unverified after cold rebuild.
+    /// Original-write check provenance.
     pub provenance: CheckProvenance,
-    /// End of the rebuilt prefix that still lacks comparison with prior authority.
-    pub unverified_end: Option<u64>,
+    /// Commit time of the earliest still-uncovered ordinal.
+    pub unprotected_since: Option<String>,
+    /// Bounded active session metadata.
+    pub open_session: Option<SessionOpened>,
+    /// Bounded last end metadata and tail reference (never tail files).
+    pub last_session_end: Option<SessionEnded>,
     /// Next actual sidecar ID.
     pub next_epoch: u64,
     /// Next physical file number.
@@ -95,7 +101,7 @@ pub struct TapeSummary {
     /// Ordinary checkpoint barriers, excluding terminal media barriers.
     pub ordinary_count: u64,
     /// Outstanding seal obligation.
-    pub seal_due: Option<SealDueReason>,
+    pub seal_due: Option<TerminalFinalizationTrigger>,
     /// Durable replica C followed by Sealed.
     pub sealed: bool,
     /// At most E positive-size intersections with [W,T).
@@ -119,7 +125,9 @@ impl Default for TapeSummary {
             total: 0,
             check: CheckValue::EMPTY,
             provenance: CheckProvenance::Empty,
-            unverified_end: None,
+            unprotected_since: None,
+            open_session: None,
+            last_session_end: None,
             next_epoch: 0,
             next_file: 0,
             object_count: 0,
@@ -153,7 +161,9 @@ impl TapeSummary {
             total: self.total,
             check: self.check,
             provenance: self.provenance,
-            unverified_end: self.unverified_end,
+            unprotected_since: self.unprotected_since.clone(),
+            open_session: self.open_session.clone(),
+            last_session_end: self.last_session_end.clone(),
             next_epoch: self.next_epoch,
             next_file: self.next_file,
             object_count: self.object_count,
@@ -250,6 +260,9 @@ struct Pending {
     directory: Sha256,
     directory_count: u64,
     directory_file: Option<u64>,
+    tail_count: u64,
+    tail_incomplete: bool,
+    sidecar_blocks: u64,
 }
 impl Pending {
     fn new(summary: &TapeSummary, sequence: u64, offset: u64) -> Self {
@@ -266,6 +279,9 @@ impl Pending {
             directory: Sha256::new(),
             directory_count: 0,
             directory_file: None,
+            tail_count: 0,
+            tail_incomplete: false,
+            sidecar_blocks: 0,
         }
     }
     fn reference(&self) -> GroupRef {
@@ -361,11 +377,7 @@ impl Fold {
         let mut decoder = Decoder::at(reader, self.next_sequence, self.summary.closed_end);
         while let Some(frame) = decoder.next_frame()? {
             if trial.summary.last_closed_sequence >= self.next_sequence
-                || (!closed
-                    && !matches!(
-                        frame.record,
-                        Record::Initialized(_) | Record::PayloadContinuation(_)
-                    ))
+                || (!closed && !matches!(frame.record, Record::PayloadContinuation(_)))
             {
                 return Err(invalid("candidate must contain one closed group"));
             }
@@ -436,6 +448,7 @@ impl Fold {
         let lower = state.protected;
         trim(&mut state, lower);
         state.uncovered.extend(new_extents);
+        state.unprotected_since = state.uncovered.front().map(|e| e.committed_at_utc.clone());
         self.summary = state;
     }
     fn apply(&mut self, f: &Frame<'_>) -> Result<(), Fault> {
@@ -494,8 +507,10 @@ impl Fold {
                     return Err(Fault::Invalid("BOT row"));
                 }
                 apply_row(&mut p, &init.bot, true)?;
-                p.group.push(f)?;
-                self.pending = Some(p);
+                media_commit(&mut p.state, f.sequence)?;
+                p.state.last_closed_sequence = f.sequence;
+                p.state.closed_end = f.end;
+                self.publish_media(p.state);
                 return Ok(());
             }
             Record::PayloadContinuation(c) => {
@@ -508,7 +523,34 @@ impl Fold {
                 if c.group != p.group.reference.first_sequence {
                     return Err(Fault::GroupMismatch);
                 }
+                if p.tail_count > 0 && !matches!(c.chunk, Chunk::TailFile(_)) {
+                    return Err(Fault::Invalid("mixed tail and media group"));
+                }
                 match &c.chunk {
+                    Chunk::TailFile(file) => {
+                        if p.rows != 0
+                            || p.directory_count != 0
+                            || p.catalog.is_some()
+                            || p.tail_incomplete
+                            || self.summary.open_session.is_none()
+                            || file.tape_file_number != add(self.summary.next_file, p.tail_count)?
+                        {
+                            return Err(Fault::Invalid("tail order/group"));
+                        }
+                        add(file.known_blocks, file.unknown_blocks)?;
+                        if let TailIdentity::Object(id) = &file.identity {
+                            if id.is_empty() || id.len() > 64 {
+                                return Err(Fault::Invalid("tail Object identity"));
+                            }
+                        }
+                        if file.filemark == TailFilemark::Present
+                            && (file.unknown_blocks != 0 || file.known_blocks == 0)
+                        {
+                            return Err(Fault::Invalid("tail filemark without known data"));
+                        }
+                        p.tail_incomplete = file.filemark != TailFilemark::Present;
+                        p.tail_count = add(p.tail_count, 1)?;
+                    }
                     Chunk::FileRow(row) => {
                         if p.directory_count > 0 {
                             return Err(Fault::Invalid("file row after plan directory"));
@@ -567,8 +609,7 @@ impl Fold {
             }
             _ => {}
         }
-        if self.summary.last_ordinary_commit.is_none() && !matches!(f.record, Record::Committed(_))
-        {
+        if self.summary.is_fresh() {
             return Err(Fault::TerminalFirst);
         }
         let mut p = self
@@ -578,7 +619,117 @@ impl Fold {
         if p.catalog.is_some() {
             return Err(Fault::Invalid("closing incomplete catalog"));
         }
+        if p.tail_count > 0 && !matches!(f.record, Record::SessionEnded(_)) {
+            return Err(Fault::Invalid("tail requires SessionEnded"));
+        }
         match &f.record {
+            Record::SessionOpened(open) => {
+                require_empty(&p)?;
+                validate_session_position(
+                    &self.summary,
+                    open.incarnation,
+                    open.base_media_sequence,
+                    open.cursor,
+                )?;
+                validate_time(&open.opened_at_utc)?;
+                if open.session_id == [0; 16]
+                    || self.summary.open_session.is_some()
+                    || self.summary.finalization.is_some()
+                    || self.summary.protected != self.summary.total && self.summary.scheme.is_some()
+                {
+                    return Err(Fault::Invalid("session open transition"));
+                }
+                self.summary.open_session = Some(open.clone());
+                self.summary.last_session_end = None;
+            }
+            Record::SessionEnded(end) => {
+                check_reference(&p, &end.tail)?;
+                validate_session_position(
+                    &self.summary,
+                    end.incarnation,
+                    end.base_media_sequence,
+                    end.cursor,
+                )?;
+                validate_time(&end.ended_at_utc)?;
+                if self
+                    .summary
+                    .open_session
+                    .as_ref()
+                    .is_none_or(|o| o.session_id != end.session_id)
+                    || p.rows != 0
+                    || p.directory_count != 0
+                    || p.tail_count != end.tail_file_count
+                    || end.crash_ack_audit_sequence.is_some_and(|n| n == 0)
+                    || end.crash_ack_audit_sequence.is_some()
+                        && end.reason != SessionEndReason::CrashRecovered
+                {
+                    return Err(Fault::Invalid("session end transition"));
+                }
+                self.summary.open_session = None;
+                self.summary.last_session_end = Some(end.clone());
+            }
+            Record::ClosedOut(close) => {
+                check_reference(&p, &close.group)?;
+                validate_time(&close.completed_at_utc)?;
+                let s = &self.summary;
+                let responsible = s
+                    .open_session
+                    .as_ref()
+                    .map(|o| o.session_id)
+                    .or_else(|| s.last_session_end.as_ref().map(|e| e.session_id));
+                if close.incarnation != s.incarnation
+                    || close.operation_id == [0; 16]
+                    || close.base_media_sequence != s.last_media_commit.unwrap_or(0)
+                    || close.session_id.is_some_and(|id| Some(id) != responsible)
+                    || s.open_session.is_some() && close.session_id != responsible
+                    || s.finalization.is_some()
+                    || s.scheme.is_none()
+                    || s.protected == s.total
+                    || close.from_w != s.protected
+                    || close.to_t != s.total
+                    || close.check_before != s.check
+                    || s.provenance != CheckProvenance::OriginalWrite
+                    || close.epoch_id != s.next_epoch
+                    || close.sidecar_file_number != s.next_file
+                    || p.rows != 1
+                    || p.objects != 0
+                    || p.maps != 0
+                    || p.components != 0
+                    || p.directory_count != 0
+                    || p.state.protected != s.total
+                    || p.state.total != s.total
+                    || close.cursor_after != p.state.cursor
+                    || close.next_file != p.state.next_file
+                    || close.next_epoch != p.state.next_epoch
+                    || close.next_epoch != add(s.next_epoch, 1)?
+                {
+                    return Err(Fault::Invalid("closeout range/check/epoch/extent/session"));
+                }
+                let scheme = s.scheme.as_ref().unwrap();
+                let parity = u64::from(scheme.stripes_per_neighborhood)
+                    * u64::from(scheme.parity_blocks_per_stripe);
+                let index = remanence_parity::sidecar::checked_sidecar_index_capacity_layout(
+                    u64::from(s.block_size),
+                    parity,
+                    s.total - s.protected,
+                )
+                .map_err(|_| Fault::Invalid("closeout sidecar geometry"))?;
+                let expected = add(
+                    add(
+                        index.block_count.checked_mul(2).ok_or(Fault::Overflow)?,
+                        parity,
+                    )?,
+                    1,
+                )?;
+                if p.sidecar_blocks != expected {
+                    return Err(Fault::Invalid("closeout sidecar extent"));
+                }
+                p.state.check = CheckValue::EMPTY;
+                p.state.provenance = CheckProvenance::Empty;
+                p.state.last_session_end = None;
+                media_commit(&mut p.state, f.sequence)?;
+                self.publish_media(p.state);
+            }
             Record::Committed(commit) => {
                 if self.summary.finalization.is_some() {
                     return Err(Fault::Invalid(
@@ -646,7 +797,6 @@ impl Fold {
                 check_commit(&mut p, &self.summary, commit)?;
                 if p.state.check != self.summary.check
                     || p.state.provenance != self.summary.provenance
-                    || p.state.unverified_end != self.summary.unverified_end
                 {
                     return Err(Fault::Invalid("component changed check"));
                 }
@@ -873,6 +1023,7 @@ fn apply_row(p: &mut Pending, row: &TapeFileEntry, bot: bool) -> Result<(), Faul
                     end,
                     tape_file_number: row.tape_file_number,
                     start_lba: add(s.cursor.lba, first - s.total)?,
+                    committed_at_utc: String::new(),
                 });
                 s.total = end;
             } else {
@@ -890,6 +1041,7 @@ fn apply_row(p: &mut Pending, row: &TapeFileEntry, bot: bool) -> Result<(), Faul
             });
         }
         TapeFileKind::ParitySidecar => {
+            p.sidecar_blocks = add(p.sidecar_blocks, row.block_count)?;
             let end = row
                 .protected_ordinal_end_exclusive
                 .ok_or(Fault::Invalid("sidecar coverage"))?;
@@ -961,6 +1113,17 @@ fn apply_row(p: &mut Pending, row: &TapeFileEntry, bot: bool) -> Result<(), Faul
 }
 fn check_commit(p: &mut Pending, previous: &TapeSummary, c: &Committed) -> Result<(), Fault> {
     check_reference(p, &c.group)?;
+    validate_time(&c.committed_at_utc)?;
+    if p.objects > 0 && c.session_id.is_none_or(|id| id == [0; 16]) {
+        return Err(Fault::Invalid("Object commit requires session id"));
+    }
+    if previous
+        .open_session
+        .as_ref()
+        .is_some_and(|o| c.session_id != Some(o.session_id))
+    {
+        return Err(Fault::Invalid("commit for wrong session"));
+    }
     let s = &mut p.state;
     if s.is_fresh()
         || c.cursor != s.cursor
@@ -977,9 +1140,7 @@ fn check_commit(p: &mut Pending, previous: &TapeSummary, c: &Committed) -> Resul
     if c.protected > c.total || (s.scheme.is_some() && c.total - c.protected >= s.epoch_blocks()) {
         return Err(Fault::Invalid("uncovered range exceeds epoch"));
     }
-    if s.scheme.is_none()
-        && (c.protected != 0 || !s.uncovered.is_empty() || c.unverified_end.is_some())
-    {
+    if s.scheme.is_none() && (c.protected != 0 || !s.uncovered.is_empty()) {
         return Err(Fault::Invalid("parity-off state"));
     }
     if s.scheme.is_none() || c.total == c.protected {
@@ -1000,22 +1161,14 @@ fn check_commit(p: &mut Pending, previous: &TapeSummary, c: &Committed) -> Resul
             return Err(Fault::Invalid("missing uncovered extents"));
         }
     }
-    match (c.provenance, c.unverified_end) {
-        (CheckProvenance::UnverifiedRebuild, Some(end)) if c.protected < end && end <= c.total => {}
-        (CheckProvenance::Empty | CheckProvenance::OriginalWrite, None) => {}
-        _ => return Err(Fault::Invalid("unverified range/provenance")),
-    }
-    if let Some(end) = previous.unverified_end.filter(|end| c.protected < *end) {
-        if c.unverified_end.is_none_or(|next| next < end) {
-            return Err(Fault::Invalid("unverified rebuild promoted"));
-        }
-    }
     if previous.seal_due.is_some() && c.seal_due.is_none() {
-        return Err(Fault::Invalid("lost SealDueReason"));
+        return Err(Fault::Invalid("lost TerminalFinalizationTrigger"));
     }
     s.check = c.check;
     s.provenance = c.provenance;
-    s.unverified_end = c.unverified_end;
+    for extent in &mut s.uncovered {
+        extent.committed_at_utc = c.committed_at_utc.clone();
+    }
     s.seal_due = c.seal_due;
     Ok(())
 }
@@ -1071,12 +1224,7 @@ fn validate_plan(
         return Err(Fault::Invalid("manual identity absent"));
     }
     if let Some(reason) = s.seal_due {
-        let trigger = match reason {
-            SealDueReason::HardwareEarlyWarning => {
-                TerminalFinalizationTrigger::HardwareEarlyWarning
-            }
-            SealDueReason::ReachedLowWatermark => TerminalFinalizationTrigger::ReachedLowWatermark,
-        };
+        let trigger = reason;
         if plan.manual.is_none() && plan.trigger != trigger {
             return Err(Fault::Invalid("automatic trigger lost seal reason"));
         }
@@ -1140,4 +1288,33 @@ fn plan_identity(plan: &FinalizationPlan) -> Result<[u8; 32], Fault> {
         prefix_end
     );
     Ok(digest(&out.0))
+}
+
+/// Validate bounded UTC diagnostics without ordering them by wall clock.
+fn validate_time(value: &str) -> Result<(), Fault> {
+    if value.len() > 64 {
+        return Err(Fault::Invalid("UTC timestamp"));
+    }
+    let parsed = time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+        .map_err(|_| Fault::Invalid("UTC timestamp"))?;
+    if parsed.offset() != time::UtcOffset::UTC {
+        return Err(Fault::Invalid("UTC timestamp"));
+    }
+    Ok(())
+}
+fn validate_session_position(
+    s: &TapeSummary,
+    incarnation: u64,
+    sequence: u64,
+    cursor: SessionCursor,
+) -> Result<(), Fault> {
+    if incarnation != s.incarnation
+        || Some(sequence) != s.last_media_commit
+        || cursor.partition != s.cursor.partition
+        || cursor.lba != s.cursor.lba
+        || cursor.next_file != s.next_file
+    {
+        return Err(Fault::Invalid("session incarnation/sequence/cursor"));
+    }
+    Ok(())
 }

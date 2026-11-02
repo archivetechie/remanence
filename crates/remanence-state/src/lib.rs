@@ -47,7 +47,7 @@ pub use calibration::{
     VolumeCalibrationState, VolumeMediaWriteFence, WritePathTrust, CALIBRATION_CONTROL_FILENAME,
 };
 pub use checkpoint::{
-    CheckpointBoundedReplayMetrics, ManualTerminalFinalizationIdentity, SealDueReason,
+    CheckpointBoundedReplayMetrics, ManualTerminalFinalizationIdentity,
     TerminalFinalizationComponent, TerminalFinalizationComponentKind, TerminalFinalizationLayout,
     TerminalFinalizationProgress, TerminalFinalizationTrigger, TerminalIndexAuthorityReplayMetrics,
     TerminalIndexAuthoritySummary,

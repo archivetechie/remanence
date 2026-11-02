@@ -11,7 +11,7 @@ pub use crate::tape_log::{
     TerminalIndexAuthoritySummary,
 };
 pub use remanence_parity::authority::{
-    ManualTerminalFinalizationIdentity, SealDueReason, TerminalFinalizationTrigger,
+    ManualTerminalFinalizationIdentity, TerminalFinalizationTrigger,
 };
 
 #[cfg(test)]

@@ -292,7 +292,7 @@ impl<R: Read> Decoder<R> {
         }
         let tag =
             Tag::try_from(u16::from_le_bytes(prefix[2..4].try_into().unwrap())).map_err(fail)?;
-        if (tag as u16) >= 16 {
+        if matches!(tag, Tag::FinalizationPlanned | Tag::UnprotectedAccepted) {
             return Err(fail(Fault::ReservedTag(tag)));
         }
         if seq != self.expected {
@@ -478,7 +478,7 @@ fn validate_short_prefix(prefix: &[u8; PREFIX_LEN], n: usize, expected: u64) -> 
         // Every currently valid non-reserved tag fits in its low byte. Thus a
         // partial tag is decidable too, without guessing a missing high byte.
         let tag = Tag::try_from(u16::from_le_bytes(prefix[2..4].try_into().unwrap()))?;
-        if tag as u16 >= 16 {
+        if matches!(tag, Tag::FinalizationPlanned | Tag::UnprotectedAccepted) {
             return Err(Fault::ReservedTag(tag));
         }
     }
