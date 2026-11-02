@@ -101,9 +101,9 @@ The release workflow, `.github/workflows/release.yml`, builds and publishes a
 binary release when a version tag is pushed. Before it publishes, it requires
 the tag to be annotated, signed and verified by GitHub, to name a commit in
 the history of `main` whose CI run succeeded, and to match the workspace
-version. It repeats the formatting, lint and test checks, builds the four
-programs as static Linux binaries, unpacks the archive on a clean runner, and
-runs each binary in an otherwise empty root directory. [Installing
+version. It repeats the formatting, lint and test checks and builds the four
+programs as static Linux binaries. It then unpacks the archive on a clean
+runner and runs each binary in an otherwise empty root directory. [Installing
 Remanence](guide-install.md#when-a-binary-release-is-published) lists the
 files such a release carries.
 

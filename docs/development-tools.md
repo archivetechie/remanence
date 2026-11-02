@@ -124,10 +124,11 @@ The drill checks the tape at the beginning of tape (BOT) before it writes:
 | `--report <PATH.json>` | Where the JSON report is written. It must not name the device, an existing path must be a regular file, and its directory must exist. |
 
 The report has `report_version` 1. It records the tape UUID, block size,
-payload size, separation profile, whether drive compression was verified off,
-the damage plan, the injected and observed fault positions, the scan, the
-number of reconstructed blocks, the object verification, `expectations_met`,
-`expectation_failures`, the time of each phase, and `success`. The program
+payload size and separation profile, and whether drive compression was
+verified off. It then records the damage plan, the injected and observed fault
+positions, the scan, the number of reconstructed blocks, the object
+verification, `expectations_met`, `expectation_failures`, the time of each
+phase, and `success`. The program
 prints one summary line that starts with `freeze-drill passed:` or
 `freeze-drill failed:` and names the report.
 
@@ -157,13 +158,15 @@ medium.
 
 The report has the schema `rem.tape.terminal-index-drill.v1`. It names the
 injection mechanism and the exact positions, as logical block addresses
-(LBAs), that it made unreadable or replaced, and records the terminal layout, the fast inventory, any recovery
-from BOT, the full verification, any reconciliation, `expectations_met`,
-`expectation_failures` and `success`. In its `full_verify` object, `outcome`
-says what the terminal index did and `complete` says what the whole tape did.
-`"outcome": "verified_complete"` with `"complete": false` means the terminal
-index validated and the protected content did not; `complete` is `true` only
-when both did. [Full verification](guide-full-verification.md) explains the
+(LBAs), that it made unreadable or replaced. It records the terminal layout,
+the fast inventory, any recovery from BOT, the full verification, any
+reconciliation, `expectations_met`, `expectation_failures` and `success`.
+
+In the report's `full_verify` object, `outcome` says what the terminal index
+did and `complete` says what the whole tape did. An `outcome` of
+`"verified_complete"` with `complete` set to `false` means the terminal index
+validated and the protected content did not; `complete` is `true` only when
+both did. [Full verification](guide-full-verification.md) explains the
 same distinction for `rem tape verify-index`.
 
 ## dev write-dump-to-tape
