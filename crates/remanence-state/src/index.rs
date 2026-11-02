@@ -11009,8 +11009,12 @@ fn validate_terminal_finalization_input(
                     .to_string(),
             ));
         }
-        // Automatic recovery can preserve a durable OperatorCloseOut reason
-        // without accepting a new operator operation. Native authority gates it.
+        // Operator plans always require manual identity, matching the native fold.
+        (TerminalFinalizationTrigger::OperatorCloseOut, None) => {
+            return Err(StateError::JournalReplayFailed(
+                "operator seal requires manual identity".into(),
+            ));
+        }
         (_, None) => {}
     }
     if matches!(input.outcome, TerminalFinalizationOutcome::Finalized)
@@ -15059,6 +15063,22 @@ mod tests {
             outcome,
             updated_at_utc: Some("2026-08-09T00:00:00Z".to_string()),
         }
+    }
+
+    /// Projection shape cannot admit the automatic operator plan rejected by the fold.
+    #[test]
+    fn automatic_operator_finalization_projection_requires_manual_identity() {
+        let mut input = terminal_projection(
+            [1; 16],
+            TerminalFinalizationProgress::AfterReplicaC,
+            TerminalFinalizationOutcome::Finalized,
+        );
+        validate_terminal_finalization_input(&input).unwrap();
+        input.operation_id = None;
+        let error = validate_terminal_finalization_input(&input).unwrap_err();
+        assert!(
+            matches!(error, StateError::JournalReplayFailed(message) if message == "operator seal requires manual identity")
+        );
     }
 
     fn written_bootstrap_state() -> FileRowsState {

@@ -123,13 +123,7 @@ pub async fn serve(
         None
     };
 
-    let unix_shutdown = shutdown_future(shutdown_rx);
-    let shutdown_state = state.clone();
-    tokio::spawn(async move {
-        shutdown.await;
-        shutdown_state.begin_shutdown();
-        let _ = shutdown_tx.send(true);
-    });
+    let unix_shutdown = shutdown_future(shutdown_rx.clone());
 
     let unix_state = state.clone();
     let mut unix_server = tokio::spawn(async move {
@@ -178,49 +172,96 @@ pub async fn serve(
         None
     };
 
-    let mut result: Result<(), Box<dyn std::error::Error + Send + Sync>> =
-        if let Some(mut tcp_server) = tcp_server {
-            tokio::select! {
-                unix_join = &mut unix_server => match unix_join {
-                    Ok(Ok(())) => match tcp_server.await {
-                        Ok(Ok(())) => Ok(()),
-                        Ok(Err(err)) => Err(Box::new(err)),
-                        Err(err) => Err(Box::new(err)),
-                    },
-                    Ok(Err(err)) => {
-                        tcp_server.abort();
-                        Err(Box::new(err))
-                    }
-                    Err(err) => {
-                        tcp_server.abort();
-                        Err(Box::new(err))
-                    }
-                },
-                tcp_join = &mut tcp_server => match tcp_join {
-                    Ok(Ok(())) => match unix_server.await {
-                        Ok(Ok(())) => Ok(()),
-                        Ok(Err(err)) => Err(Box::new(err)),
-                        Err(err) => Err(Box::new(err)),
-                    },
-                    Ok(Err(err)) => {
-                        unix_server.abort();
-                        Err(Box::new(err))
-                    }
-                    Err(err) => {
-                        unix_server.abort();
-                        Err(Box::new(err))
-                    }
-                },
-            }
-        } else {
-            match unix_server.await {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(err)) => Err(Box::new(err)),
-                Err(err) => Err(Box::new(err)),
-            }
-        };
+    // Mark the absolute cutoff at the signal, independently of gRPC draining.
+    // The serve task remains the sole owner of drive-pool shutdown.
+    let unix_abort = unix_server.abort_handle();
+    let tcp_abort = tcp_server.as_ref().map(|server| server.abort_handle());
+    let shutdown_state = state.clone();
+    let mut shutdown_task = tokio::spawn(async move {
+        shutdown.await;
+        shutdown_state.begin_shutdown();
+        let _ = shutdown_tx.send(true);
+    });
 
-    if let Err(err) = state.shutdown_drive_pool().await {
+    let server_result = async {
+        let result: Result<(), Box<dyn std::error::Error + Send + Sync>> =
+            if let Some(mut tcp_server) = tcp_server {
+                tokio::select! {
+                    unix_join = &mut unix_server => match unix_join {
+                        Ok(Ok(())) => match tcp_server.await {
+                            Ok(Ok(())) => Ok(()),
+                            Ok(Err(err)) => Err(Box::new(err)),
+                            Err(err) => Err(Box::new(err)),
+                        },
+                        Ok(Err(err)) => {
+                            tcp_server.abort();
+                            Err(Box::new(err))
+                        }
+                        Err(err) => {
+                            tcp_server.abort();
+                            Err(Box::new(err))
+                        }
+                    },
+                    tcp_join = &mut tcp_server => match tcp_join {
+                        Ok(Ok(())) => match unix_server.await {
+                            Ok(Ok(())) => Ok(()),
+                            Ok(Err(err)) => Err(Box::new(err)),
+                            Err(err) => Err(Box::new(err)),
+                        },
+                        Ok(Err(err)) => {
+                            unix_server.abort();
+                            Err(Box::new(err))
+                        }
+                        Err(err) => {
+                            unix_server.abort();
+                            Err(Box::new(err))
+                        }
+                    },
+                }
+            } else {
+                match unix_server.await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(err)) => Err(Box::new(err)),
+                    Err(err) => Err(Box::new(err)),
+                }
+            };
+
+        result
+    };
+    tokio::pin!(server_result);
+    let mut result = tokio::select! {
+        joined = &mut shutdown_task => {
+            joined.map_err(io::Error::other)?;
+            Ok(())
+        },
+        served = &mut server_result => {
+            shutdown_task.abort();
+            served
+        }
+    };
+    // A server failure also starts shutdown. Re-entry never extends the cutoff.
+    state.begin_shutdown();
+    let deadline = state
+        .shutdown_close_deadline()
+        .unwrap_or_else(std::time::Instant::now);
+    let abort_unix = unix_abort.clone();
+    let abort_tcp = tcp_abort.clone();
+    let cancel_servers = tokio::spawn(async move {
+        tokio::time::sleep_until(deadline.into()).await;
+        abort_unix.abort();
+        if let Some(tcp) = abort_tcp {
+            tcp.abort();
+        }
+    });
+    // Ingress observes the same deadline and wakes blocked overlap consumers.
+    // Dedicated actor threads retain issued commands until the transport settles.
+    let pool_result = state.shutdown_drive_pool().await;
+    cancel_servers.abort();
+    unix_abort.abort();
+    if let Some(tcp) = tcp_abort {
+        tcp.abort();
+    }
+    if let Err(err) = pool_result {
         let message = match result {
             Ok(()) => format!("drive-pool shutdown failed: {err}"),
             Err(server_err) => {

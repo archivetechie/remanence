@@ -7,6 +7,14 @@ per-release summaries.
 <!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/index.rs crates/remanence-library/src/discovery.rs @ 638210f7 -->
 ## Unreleased
 
+- Added `daemon.shutdown_close_deadline_secs` (default 300, nonzero). Graceful
+  shutdown ends write sessions in parallel against one deadline, stops new drive
+  commands at expiry, settles issued commands, and records the interrupted tail
+  when completion and native authority are known. Closeout stays due for the next
+  access. Service stop timeouts must exceed this budget plus one command's
+  worst-case time. Final Close retains and returns durable receipts even if
+  projection or later host work fails.
+
 - Write sessions now own their parity epochs through ending. Checkpoints keep
   an epoch only within the same session; clean close returns durable receipts,
   then closes the short epoch while retaining the drive and tape lease.

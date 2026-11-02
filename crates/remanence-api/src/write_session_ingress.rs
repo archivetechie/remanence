@@ -272,6 +272,7 @@ impl WriteSessionApi {
         S: Stream<Item = Result<pb::AppendObjectMessage, Status>> + Unpin + Send + 'static,
     {
         let mut ingress = AppendIngressDeadline::new(self.state.append_ingress_idle_secs);
+        ingress.shutdown = self.state.drive_pool.clone();
         let first = next_append_message(&mut stream, &mut ingress, None)
             .await?
             .ok_or_else(|| Status::invalid_argument("append stream is empty"))?;
@@ -770,6 +771,7 @@ impl WriteSessionApi {
 pub(crate) struct AppendIngressDeadline {
     idle: Duration,
     remaining: Duration,
+    shutdown: Option<crate::drive_pool::DrivePool>,
 }
 
 impl AppendIngressDeadline {
@@ -778,6 +780,7 @@ impl AppendIngressDeadline {
         Self {
             idle,
             remaining: idle,
+            shutdown: None,
         }
     }
 
@@ -807,9 +810,18 @@ where
         return Err(ingress.expired(session_id));
     }
     let started = tokio::time::Instant::now();
-    let received = tokio::time::timeout(ingress.remaining, stream.next())
-        .await
-        .map_err(|_| ingress.expired(session_id))?;
+    let received = tokio::select! {
+        biased;
+        () = async {
+            if let Some(pool) = &ingress.shutdown {
+                pool.wait_shutdown_deadline().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => return Err(Status::deadline_exceeded("ShutdownCloseDeadline: append ingress stopped for graceful shutdown")),
+        received = tokio::time::timeout(ingress.remaining, stream.next()) =>
+            received.map_err(|_| ingress.expired(session_id))?,
+    };
     ingress.remaining = ingress.remaining.saturating_sub(started.elapsed());
     match received {
         Some(Ok(message)) => {

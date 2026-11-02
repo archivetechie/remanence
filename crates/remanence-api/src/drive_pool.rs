@@ -89,35 +89,42 @@ impl remanence_state::index::MediaReadinessObserver for ReadinessWake {
 /// tape reservation or a host-log lease. The guard ends only after both the
 /// actor's lease and its manager ownership have been released.
 #[derive(Clone, Default)]
-pub(crate) struct ClosingWork(Arc<Mutex<HashMap<TapeUuid, ClosingEntry>>>);
+pub(crate) struct ClosingWork(Arc<Mutex<HashMap<(TapeUuid, Uuid), ClosingEntry>>>);
 struct ClosingEntry {
     drive: DriveKey,
     done: tokio::sync::watch::Receiver<()>,
 }
 pub(crate) struct ClosingGuard {
     work: ClosingWork,
-    tape: TapeUuid,
+    key: (TapeUuid, Uuid),
     _done: tokio::sync::watch::Sender<()>,
 }
 impl ClosingWork {
-    pub(crate) fn begin(&self, tape: TapeUuid, drive: DriveKey) -> Result<ClosingGuard, Status> {
+    /// Even an invariant violation must remain visible until its owner releases
+    /// the native lease and mounted session. Never replace the original owner.
+    pub(crate) fn begin(&self, tape: TapeUuid, drive: DriveKey) -> (ClosingGuard, Option<Status>) {
         let (done, receiver) = tokio::sync::watch::channel(());
         let mut entries = self.0.lock().unwrap();
-        if entries.contains_key(&tape) {
-            return Err(Status::failed_precondition("two closeouts own one tape"));
-        }
+        let error = entries
+            .keys()
+            .any(|(t, _)| *t == tape)
+            .then(|| Status::failed_precondition("two closeouts own one tape"));
+        let key = (tape, Uuid::new_v4());
         entries.insert(
-            tape,
+            key,
             ClosingEntry {
                 drive,
                 done: receiver,
             },
         );
-        Ok(ClosingGuard {
-            work: self.clone(),
-            tape,
-            _done: done,
-        })
+        (
+            ClosingGuard {
+                work: self.clone(),
+                key,
+                _done: done,
+            },
+            error,
+        )
     }
     pub(crate) fn drive_is_closing(&self, drive: &DriveKey) -> bool {
         self.0
@@ -133,7 +140,7 @@ impl ClosingWork {
                 .lock()
                 .unwrap()
                 .iter()
-                .find(|(t, e)| matches(t, e))
+                .find(|((t, _), e)| matches(t, e))
                 .map(|(_, e)| e.done.clone());
             let Some(mut done) = pending else {
                 return;
@@ -144,7 +151,7 @@ impl ClosingWork {
 }
 impl Drop for ClosingGuard {
     fn drop(&mut self) {
-        self.work.0.lock().unwrap().remove(&self.tape);
+        self.work.0.lock().unwrap().remove(&self.key);
     }
 }
 
@@ -159,6 +166,8 @@ pub(crate) struct DrivePoolLifecycle {
     pub(crate) sessions: Arc<Mutex<HashMap<Uuid, MountedSession>>>,
     pub(crate) parked: Arc<Mutex<ParkedState>>,
     pub(crate) shutting_down: Arc<AtomicBool>,
+    pub(crate) shutdown_deadline: Arc<std::sync::OnceLock<std::time::Instant>>,
+    pub(crate) shutdown_notify: Arc<tokio::sync::Notify>,
     pub(crate) cut_changer_wait: Arc<AtomicBool>,
     pub(crate) dismounts: Arc<Mutex<HashMap<DriveKey, usize>>>,
     pub(crate) timer_park_tx: Option<mpsc::UnboundedSender<ParkedCartridge>>,
@@ -283,6 +292,8 @@ pub(crate) struct DrivePool {
     tape_reservations: Arc<Mutex<HashSet<TapeUuid>>>,
     pub(crate) parked: Arc<Mutex<ParkedState>>,
     shutting_down: Arc<AtomicBool>,
+    pub(crate) shutdown_deadline: Arc<std::sync::OnceLock<std::time::Instant>>,
+    pub(crate) shutdown_notify: Arc<tokio::sync::Notify>,
     cut_changer_wait: Arc<AtomicBool>,
     dismounts: Arc<Mutex<HashMap<DriveKey, usize>>>,
 }
@@ -290,7 +301,7 @@ pub(crate) struct DrivePool {
 impl DrivePool {
     #[cfg(test)]
     pub(crate) fn test_begin_closing(&self, tape: TapeUuid, drive: DriveKey) -> ClosingGuard {
-        self.closing.begin(tape, drive).unwrap()
+        self.closing.begin(tape, drive).0
     }
 
     pub(crate) fn ended_write(&self, id: Uuid) -> Option<crate::pb::WriteSession> {
@@ -318,23 +329,23 @@ impl DrivePool {
     pub(crate) fn drive_is_closing(&self, drive: &DriveKey) -> bool {
         self.closing.drive_is_closing(drive)
     }
-    /// A busy resolver retries after one relevant owner finishes. Other closing
-    /// drives can keep working once that release makes a mount possible.
-    pub(crate) async fn wait_busy_closeout(&self, library: &str, bay: Option<u16>) {
+    /// Wait for every relevant closing owner, then let mount resolution retry.
+    pub(crate) async fn wait_busy_closeout(&self, library: &str, bay: Option<u16>) -> bool {
+        let matches = |_: &TapeUuid, entry: &ClosingEntry| {
+            entry.drive.library_serial() == Some(library)
+                && bay.is_none_or(|bay| entry.drive.bay() == Some(bay))
+        };
         let pending = self
             .closing
             .0
             .lock()
             .unwrap()
-            .values()
-            .find(|entry| {
-                entry.drive.library_serial() == Some(library)
-                    && bay.is_none_or(|bay| entry.drive.bay() == Some(bay))
-            })
-            .map(|entry| entry.done.clone());
-        if let Some(mut done) = pending {
-            let _ = done.changed().await;
+            .iter()
+            .any(|((t, _), e)| matches(t, e));
+        if pending {
+            self.closing.wait(matches).await;
         }
+        pending
     }
     pub(crate) async fn wait_drive_closeout(&self, drive: &DriveKey) {
         self.closing.wait(|_, e| &e.drive == drive).await;
@@ -397,6 +408,8 @@ impl DrivePool {
             tape_reservations: Arc::new(Mutex::new(HashSet::new())),
             parked: lifecycle.parked,
             shutting_down: lifecycle.shutting_down,
+            shutdown_deadline: lifecycle.shutdown_deadline,
+            shutdown_notify: lifecycle.shutdown_notify,
             cut_changer_wait: lifecycle.cut_changer_wait,
             dismounts: lifecycle.dismounts,
         }
@@ -748,6 +761,19 @@ impl DrivePool {
         }
     }
 
+    /// Wake ingress at the common shutdown cutoff, including receivers that
+    /// started before shutdown. Register before checking to avoid lost wakeups.
+    pub(crate) async fn wait_shutdown_deadline(&self) {
+        loop {
+            let notified = self.shutdown_notify.notified();
+            if let Some(deadline) = self.shutdown_deadline.get() {
+                tokio::time::sleep_until((*deadline).into()).await;
+                return;
+            }
+            notified.await;
+        }
+    }
+
     pub(crate) fn begin_shutdown(&self) {
         let _motion = self.dismounts.lock().unwrap();
         self.shutting_down.store(true, Ordering::SeqCst);
@@ -1060,5 +1086,50 @@ pub(crate) mod tests {
         drop(reservation_b);
         pool.reserve_drive(&key_a)
             .expect("library A guard releases its drives");
+    }
+    /// Duplicate ownership must remain waitable even if the original owner exits first.
+    #[tokio::test]
+    async fn duplicate_closing_owner_stays_visible_until_both_release() {
+        let work = ClosingWork::default();
+        let tape = [42; 16];
+        let (first, error) = work.begin(tape, DriveKey::new("A", 1));
+        assert!(error.is_none());
+        let (second, error) = work.begin(tape, DriveKey::new("A", 2));
+        assert_eq!(error.unwrap().message(), "two closeouts own one tape");
+        let waiting = work.clone();
+        let waiter = tokio::spawn(async move { waiting.wait(|t, _| *t == tape).await });
+        drop(first);
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        assert!(work.drive_is_closing(&DriveKey::new("A", 2)));
+        drop(second);
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// Busy resolution waits for all matching owners, without joining another library.
+    #[tokio::test]
+    async fn busy_closeout_wait_covers_every_relevant_owner() {
+        let pool = test_pool();
+        let first = pool.test_begin_closing([1; 16], DriveKey::new("LIB-A", 1));
+        let second = pool.test_begin_closing([2; 16], DriveKey::new("LIB-A", 2));
+        let unrelated = pool.test_begin_closing([3; 16], DriveKey::new("LIB-B", 1));
+        let waiting = pool.clone();
+        let waiter = tokio::spawn(async move { waiting.wait_busy_closeout("LIB-A", None).await });
+        tokio::task::yield_now().await;
+        drop(first);
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        drop(second);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert!(!pool.wait_busy_closeout("LIB-A", None).await);
+        drop(unrelated);
     }
 }

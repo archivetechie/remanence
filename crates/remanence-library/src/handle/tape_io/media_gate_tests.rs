@@ -624,6 +624,14 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
             },
         ),
         (
+            "remanence-api/src/write_owner/b6c_tests.rs",
+            DispatchPolicy::Exact {
+                execute_out: 1,
+                execute_none: 1,
+                why: "B6c deadline/settlement forwarder holds or fails in-memory ModelTransport commands; no hardware transport",
+            },
+        ),
+        (
             "remanence-api/src/write_owner/b6b_fix_tests.rs",
             DispatchPolicy::Exact {
                 execute_out: 1,

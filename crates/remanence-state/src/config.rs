@@ -17,6 +17,8 @@ pub const DEFAULT_IO_MEMORY_CEILING_BYTES: u64 = 24 * 1024 * 1024 * 1024;
 pub const DEFAULT_APPEND_RING_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// Default limit on client inactivity while receiving an append stream.
 pub const DEFAULT_APPEND_INGRESS_IDLE_SECS: u64 = 300;
+/// Graceful shutdown budget before stopping new session drive commands.
+pub const DEFAULT_SHUTDOWN_CLOSE_DEADLINE_SECS: u64 = 300;
 /// Default target size of one restore stream's read reservoir.
 pub const DEFAULT_READ_RESERVOIR_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// Default ranged-read device-position proof cadence.
@@ -150,6 +152,9 @@ pub struct DaemonConfig {
     /// Client inactivity limit; counts only waits for append messages, excluding backpressure.
     #[serde(default = "default_append_ingress_idle_secs")]
     pub append_ingress_idle_secs: u64,
+    /// Shared graceful shutdown budget for final barriers and session endings.
+    #[serde(default = "default_shutdown_close_deadline_secs")]
+    pub shutdown_close_deadline_secs: u64,
     /// Delay before a seated cartridge in an idle drive is returned home.
     /// Zero keeps idle cartridges seated until eviction or explicit unload.
     /// Graceful shutdown leaves cartridges seated; startup restarts the idle timer.
@@ -472,6 +477,10 @@ const fn default_append_ring_bytes() -> u64 {
     DEFAULT_APPEND_RING_BYTES
 }
 
+const fn default_shutdown_close_deadline_secs() -> u64 {
+    DEFAULT_SHUTDOWN_CLOSE_DEADLINE_SECS
+}
+
 const fn default_append_ingress_idle_secs() -> u64 {
     DEFAULT_APPEND_INGRESS_IDLE_SECS
 }
@@ -640,6 +649,11 @@ pub fn validate_config(config: &RemConfig) -> Result<(), StateError> {
     if config.daemon.default_idle_timeout_seconds == 0 {
         return Err(StateError::ConfigInvalid(
             "daemon.default_idle_timeout_seconds must be non-zero".to_string(),
+        ));
+    }
+    if config.daemon.shutdown_close_deadline_secs == 0 {
+        return Err(StateError::ConfigInvalid(
+            "daemon.shutdown_close_deadline_secs must be non-zero".to_string(),
         ));
     }
     if config.daemon.append_ingress_idle_secs == 0 {
@@ -1233,6 +1247,25 @@ tape_catalog_dir = "{0}/cache/tapes"
             panic!("expected configuration validation refusal");
         };
         assert_eq!(message, "daemon.append_ingress_idle_secs must be non-zero");
+    }
+
+    /// Shutdown has one nonzero budget, independent of ingress and session idle.
+    #[test]
+    fn shutdown_close_deadline_default_override_and_zero_refusal() {
+        let config = parse_config_toml(&valid_config()).unwrap();
+        assert_eq!(config.daemon.shutdown_close_deadline_secs, 300);
+        let config =
+            parse_config_toml(&with_daemon_lines("shutdown_close_deadline_secs = 17\n")).unwrap();
+        assert_eq!(config.daemon.shutdown_close_deadline_secs, 17);
+        let error = parse_config_toml(&with_daemon_lines("shutdown_close_deadline_secs = 0\n"))
+            .unwrap_err();
+        let StateError::ConfigInvalid(message) = error else {
+            panic!("configuration refusal expected");
+        };
+        assert_eq!(
+            message,
+            "daemon.shutdown_close_deadline_secs must be non-zero"
+        );
     }
 
     /// Serialization retains a fully populated typed configuration and loader validation.

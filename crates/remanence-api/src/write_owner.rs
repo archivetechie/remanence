@@ -81,7 +81,10 @@ fn send_checkpoint_actor_reply(
     committed_receipts: &mut Vec<pb::ObjectRecord>,
     trigger: CheckpointTrigger,
 ) {
-    if trigger == CheckpointTrigger::Append {
+    if matches!(
+        trigger,
+        CheckpointTrigger::Append | CheckpointTrigger::Shutdown
+    ) {
         let _ = reply.send(Ok(CheckpointActorReply {
             session,
             committed_objects: committed_receipts.clone(),

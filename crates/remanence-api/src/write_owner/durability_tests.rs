@@ -7,6 +7,9 @@ mod acceptance_finalization;
 #[path = "ingress_deadline_media_tests.rs"]
 mod ingress_deadline_media_tests;
 
+#[path = "b6c_tests.rs"]
+mod b6c_tests;
+
 #[path = "b6b_fix_tests.rs"]
 mod b6b_fix_tests;
 
