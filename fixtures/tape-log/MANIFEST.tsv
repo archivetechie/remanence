@@ -1,6 +1,6 @@
 file	bytes	sha256	tape_uuid	block_size	scheme	frames	last_closed_sequence	closed_end	objects	next_file	w	t	cursor_lba	sealed	tail
 parity-off-two-objects.remtape	1964	57bae284836432958ebfd4cc0f5b16c3ad7ab69a00d5a086c7c7148fde911b52	a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1	262144	none	8	8	1964	2	3	0	6	10	false	complete
-parity-object-session-close.remtape	1614	3a160f6fbd99604025dd72360cb853cd3cb7ae5a19c738da9603ab1362b9ac5b	a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2	262144	checkpoint-partial-epoch k=8 m=2 S=1	8	8	1614	1	3	3	3	12	false	complete
+parity-object-session-close.remtape	1620	7cdc8a92f1180f7cc2abdf02970bbbfd5cf4cde538295f5352186775910cd98e	a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2	262144	checkpoint-partial-epoch k=8 m=2 S=1	8	8	1620	1	3	3	3	12	false	complete
 sealed-terminal.remtape	3524	2932aeedea308d9fe344966bc0f67af37a556a70d703d8a68deab9f1552ec33b	a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3	262144	checkpoint-partial-epoch k=8 m=2 S=1	22	22	3524	1	9	3	3	8220	true	complete
 torn-tail.remtape	2671	c03e74bd412f1df303a0b55d9f7ba27e221cfd34ab359f12c0e266b9000483e4	a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1	262144	none	10	8	1964	2	3	0	6	10	false	torn: short_body at byte 2640
 zero-filled-tail.remtape	6060	ea207261f2502f1e6bdba354a46b478cd1fa9a9f1abd01762ecc96c186c99496	a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1	262144	none	8	8	1964	2	3	0	6	10	false	torn: zero_filled at byte 1964

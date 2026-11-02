@@ -1458,20 +1458,12 @@ fn frontend_returns_committed_receipt_beside_post_projection_failure() {
         }),
         client: MountedCommands::new(tx, UUID, endpoint),
     };
-    let error = owner
+    let (receipt, reason) = owner
         .put_path_version_with_policy(fixture.request("committed-before-failure"), false)
-        .unwrap_err();
-    let crate::MountError::Committed {
-        receipt,
-        reason,
-        failure,
-    } = error
-    else {
-        panic!("missing durable receipt: {error}");
-    };
+        .expect("durable commit succeeds")
+        .unwrap();
     assert_eq!(reason, "new");
     assert_eq!(receipt.object.caller_object_id, "committed-before-failure");
-    assert!(failure.to_string().contains("post-projection"), "{failure}");
     assert_eq!(owner.receipts().len(), 1);
     let _ = owner.finish();
     assert!(fixture.reopen().is_ok());
@@ -1518,17 +1510,14 @@ fn projection_busy_returns_committed_receipt_on_native_replay() {
         }),
         client: MountedCommands::new(tx, UUID, endpoint),
     };
-    let error = owner
+    let receipt = owner
         .put_path_version_with_policy(fixture.request("committed-before-failure"), false)
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("SQLite projection failed"),
-        "{error}"
+        .expect("durable native commit returns its receipt despite projection failure");
+    assert_eq!(
+        receipt.unwrap().0.object.caller_object_id,
+        "committed-before-failure"
     );
-    assert!(
-        owner.receipts().is_empty(),
-        "catalog cannot supply a receipt before projection replay"
-    );
+    assert_eq!(owner.receipts().len(), 1);
     let _ = owner.finish();
     let state = fixture.reopen().unwrap();
     let mut owner = fixture.owner(state);

@@ -60,7 +60,11 @@ pub(crate) use terminal_types::*;
 #[derive(Debug)]
 pub(crate) struct AppendFinishOutcome {
     pub(crate) record: pb::ObjectRecord,
+    /// Exact append-native identity and representation, retained through its reply.
+    pub(crate) native_record: crate::PoolWriteObjectRecord,
     pub(crate) replay: bool,
+    /// Owned by this append reply; batch receipt claims cannot consume it.
+    pub(crate) durable_receipt: std::sync::Arc<std::sync::Mutex<Option<pb::ObjectRecord>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

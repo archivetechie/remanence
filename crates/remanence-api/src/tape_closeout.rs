@@ -46,19 +46,6 @@ pub(crate) fn start(
         .lock()
         .map_err(|_| Status::internal("operation admission lock poisoned"))?;
     let mut index = state.index_write()?;
-    let row = index
-        .get_tape(&tape)
-        .map_err(crate::status_from_state_error)?
-        .ok_or_else(|| Status::not_found("tape not found"))?;
-    if request
-        .expected_pool_id
-        .as_deref()
-        .is_some_and(|p| row.pool_id.as_deref() != Some(p))
-    {
-        return Err(Status::failed_precondition(
-            "CloseoutTape expected_pool_id does not match the tape's assigned pool",
-        ));
-    }
     let existing = index
         .idempotency_scope_record(&actor_fingerprint, KIND, key)
         .map_err(crate::status_from_state_error)?;
@@ -88,6 +75,27 @@ pub(crate) fn start(
         let handle = state.operations.register(id, KIND);
         handle.publish_state(pb::OperationState::Succeeded, &[("phase", "complete")]);
         return Ok(response);
+    }
+    if state
+        .readiness_shutdown
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err(Status::unavailable(
+            "daemon shutdown; maintenance admission closed",
+        ));
+    }
+    let row = index
+        .get_tape(&tape)
+        .map_err(crate::status_from_state_error)?
+        .ok_or_else(|| Status::not_found("tape not found"))?;
+    if request
+        .expected_pool_id
+        .as_deref()
+        .is_some_and(|p| row.pool_id.as_deref() != Some(p))
+    {
+        return Err(Status::failed_precondition(
+            "CloseoutTape expected_pool_id does not match the tape's assigned pool",
+        ));
     }
     if let Some(pool) = &state.drive_pool {
         pool.check_finalizing(tape)?;

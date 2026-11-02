@@ -2803,7 +2803,7 @@ const fn manual_finalize_progress_name(
 /// terminal plan. Try its exact suffix before interpreting bytes as a partially
 /// written plan; an open crash owner never takes this alternative.
 fn admit_ended_tail_for_terminal(
-    checkpoint: &remanence_state::TapeAuthorityLease,
+    checkpoint: &mut remanence_state::TapeAuthorityLease,
     drive: &mut DriveHandle,
     selected: &SelectedTape,
     first_lba: u64,
@@ -2835,7 +2835,14 @@ fn admit_ended_tail_for_terminal(
         },
         ctx,
     ) {
-        Ok(admission) => Ok(Some(admission)),
+        Ok(admission) => {
+            if let Some(eod) = admission.ended_tail_eod {
+                checkpoint
+                    .record_session_tail_eod(eod)
+                    .map_err(crate::status_from_state_error)?;
+            }
+            Ok(Some(admission))
+        }
         Err(crate::append_admission::AdmissionError::SessionSuffixContradiction { .. }) => Ok(None),
         Err(error) => Err(Status::failed_precondition(error.to_string())),
     }

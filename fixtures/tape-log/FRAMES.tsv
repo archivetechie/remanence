@@ -14,7 +14,7 @@ parity-object-session-close.remtape	4	PayloadContinuation	2	506	987
 parity-object-session-close.remtape	5	Committed	3	987	1171
 parity-object-session-close.remtape	6	PayloadContinuation	2	1171	1277
 parity-object-session-close.remtape	7	ClosedOut	17	1277	1462
-parity-object-session-close.remtape	8	SessionEnded	19	1462	1614
+parity-object-session-close.remtape	8	SessionEnded	19	1462	1620
 sealed-terminal.remtape	1	Initialized	1	84	216
 sealed-terminal.remtape	2	SessionOpened	18	216	313
 sealed-terminal.remtape	3	PayloadContinuation	2	313	506

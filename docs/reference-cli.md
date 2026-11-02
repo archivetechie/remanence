@@ -1217,6 +1217,32 @@ Without `--dry-run` the first line is
 standard error by a `warning:` line naming the objects that lost their last committed copy.
 An identity that is already retired prints `... is already retired; no change`.
 
+### rem tape closeout
+
+```bash
+rem tape closeout <tape-uuid|barcode> [--expected-pool <pool-id>] \
+  [--idempotency-key <uuid>] [--endpoint <url>] [--json]
+```
+
+Close the current unprotected parity range on one exact tape, then watch the
+operation to a terminal state. The identifier is a tape UUID or an exact barcode;
+a barcode matching more than one data tape is refused. Use the UUID to disambiguate.
+`--expected-pool` checks the assigned pool before fresh work. Matching retries
+rejoin the original operation even if that pool assignment subsequently changed.
+OperationControl authorization is required (operator, orchestrator or admin).
+
+Supply a non-nil `--idempotency-key` for a retry. If omitted, the command generates
+one and prints it to stderr **before connecting or sending the RPC**; retain it
+and repeat the same tape and expected-pool arguments with that key after a lost
+response. JSON mode prints a preliminary stderr JSON object with `idempotency_key`.
+
+Success prints the terminal operation (JSON on stdout with `--json`) and exits 0.
+Failures print to stderr and exit 1. JSON terminal failures include
+`code = "operation_failed"` and `details.operation_id` and
+`details.state`. Connection failures use `daemon_client_error` without a
+terminal operation state. Argument parsing failures exit 2. Each JSON message is
+one line, including the generated-key message preceding any error.
+
 ### rem tape finalize (library)
 
 Finalize one exact tape through the daemon.

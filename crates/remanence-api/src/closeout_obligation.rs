@@ -28,6 +28,7 @@ pub(crate) struct WorkList {
 }
 struct Retry {
     attempt: usize,
+    media_failures: usize,
     next: Instant,
     running: bool,
     library: String,
@@ -89,6 +90,7 @@ impl WorkList {
         if due {
             entries.entry(key).or_insert(Retry {
                 attempt: 0,
+                media_failures: 0,
                 next: Instant::now(),
                 running: false,
                 library: "unlocated".into(),
@@ -107,6 +109,7 @@ impl WorkList {
             for retry in entries.values_mut() {
                 retry.woken |= retry.running;
                 retry.parked = false;
+                retry.media_failures = 0;
                 retry.next = now;
             }
         }
@@ -144,9 +147,26 @@ impl WorkList {
             if !transient && self.warned.lock().unwrap().insert((key, error.code())) {
                 tracing::warn!(tape_uuid = %Uuid::from_bytes(key.0), %error, "closeout needs operator; waiting for wake");
             }
-            r.parked = !transient;
+            let media = error
+                .metadata()
+                .get("remanence-retry")
+                .is_some_and(|c| c == "media")
+                && crate::readiness_wait::ReadinessFence::from_status(error).is_none()
+                && crate::drive_pool::TapeBusy::from_status(error).is_none();
+            if media {
+                r.media_failures = r.media_failures.saturating_add(1);
+            }
+            r.parked = !transient || r.media_failures >= 3;
             r.readiness = crate::readiness_wait::ReadinessFence::from_status(error).map(|f| f.0);
-            r.reason = Some(reason);
+            r.reason = Some(if media {
+                format!(
+                    "{}media fault ({}/3 attempts): {reason}",
+                    if r.parked { "parked: " } else { "" },
+                    r.media_failures
+                )
+            } else {
+                reason
+            });
         }
     }
     /// Record the wake synchronously, including during an in-flight attempt.
@@ -156,6 +176,7 @@ impl WorkList {
             if *tape == uuid {
                 retry.woken |= retry.running;
                 retry.parked = false;
+                retry.media_failures = 0;
                 retry.next = Instant::now();
                 retry.readiness = None;
             }
@@ -198,6 +219,7 @@ impl WorkList {
     }
     fn succeeded(&self, key: Key) {
         if let Some(retry) = self.entries.lock().unwrap().get_mut(&key) {
+            retry.media_failures = 0;
             retry.reason = None;
             retry.parked = false;
             retry.readiness = None;
@@ -242,6 +264,7 @@ impl WorkList {
             r.running = false;
             r.next = if r.woken {
                 r.parked = false;
+                r.media_failures = 0;
                 Instant::now()
             } else {
                 Instant::now() + backoff(r.attempt)
@@ -257,11 +280,35 @@ impl WorkList {
 pub(crate) enum RetryCause {
     Transient,
     Operator,
+    Media,
 }
 impl RetryCause {
     pub(crate) fn tape_io(error: &remanence_library::TapeIoError) -> Self {
         use remanence_library::TapeIoError;
         match error {
+            TapeIoError::CheckCondition(remanence_library::ScsiError::CheckCondition {
+                sense,
+                ..
+            })
+            | TapeIoError::CheckConditionWithResidue {
+                source: remanence_library::ScsiError::CheckCondition { sense, .. },
+                ..
+            } if remanence_scsi::sense::decode_sense(sense)
+                .is_some_and(|s| matches!(s.key, 3 | 4)) =>
+            {
+                Self::Media
+            }
+            TapeIoError::PartialBatchUncommittable {
+                sense: Some(sense), ..
+            } if remanence_scsi::sense::decode_sense(sense)
+                .is_some_and(|s| matches!(s.key, 3 | 4)) =>
+            {
+                Self::Media
+            }
+            TapeIoError::GoodWriteTripwire { cause, .. } => Self::tape_io(cause),
+            TapeIoError::WriteFailureWithPositionError { write_error, .. } => {
+                Self::tape_io(write_error)
+            }
             TapeIoError::WriteProtected
             | TapeIoError::DataProtect(_)
             | TapeIoError::MultiPartitionMedium { .. } => Self::Operator,
@@ -280,6 +327,7 @@ impl RetryCause {
             match self {
                 Self::Transient => "transient",
                 Self::Operator => "operator",
+                Self::Media => "media",
             }
             .parse()
             .unwrap(),
@@ -617,6 +665,10 @@ fn alarm(state: &ApiState, key: Key, s: &TapeSummary) -> Result<(), Status> {
         ),
     ];
     tracing::warn!(tape_uuid = %Uuid::from_bytes(key.0), detail = ?fields, "CloseoutOverdue");
+    let _admission = state.operations.readiness_start.lock().unwrap();
+    if state.readiness_shutdown.load(Ordering::Acquire) {
+        return Ok(());
+    }
     crate::audit_projection::append_operation_audit(
         &mut state.index_write()?,
         &state.audit_dir,
@@ -709,12 +761,23 @@ pub(crate) fn spawn(state: ApiState) {
             // Full native replay is for discovery, not the retry clock. Keep
             // large cold logs off the one-second dispatch polling path.
             if wake || Instant::now() >= next_scan {
-                if let Err(error) = scan(&state) {
+                let scan_state = state.clone();
+                if let Err(error) = tokio::task::spawn_blocking(move || scan(&scan_state))
+                    .await
+                    .unwrap_or_else(|e| Err(Status::internal(format!("closeout scan task: {e}"))))
+                {
                     tracing::warn!(%error, "closeout work-list scan failed; retrying");
                 }
                 next_scan = Instant::now() + Duration::from_secs(60);
             }
-            for key in state.closeout_work.claim(Instant::now(), false) {
+            let claimed = {
+                let _admission = state.operations.readiness_start.lock().unwrap();
+                if state.readiness_shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+                state.closeout_work.claim(Instant::now(), false)
+            };
+            for key in claimed {
                 let state = state.clone();
                 let attempt = Attempt {
                     work: state.closeout_work.clone(),
@@ -737,7 +800,10 @@ pub(crate) fn spawn(state: ApiState) {
                         .is_ok_and(|t| t.is_none_or(|t| t.state == "retired"))
                     {
                         state.closeout_work.forget(key.0);
-                    } else if let Ok(s) = summary(&state, key.0) {
+                    } else if let Ok(Ok(s)) = {
+                        let state = state.clone();
+                        tokio::task::spawn_blocking(move || summary(&state, key.0)).await
+                    } {
                         state.closeout_work.observe(
                             key,
                             s.incarnation == key.1
@@ -873,6 +939,57 @@ mod tests {
 
 #[cfg(test)]
 mod fix_tests {
+    /// Typed medium/hardware causes share a budget; text and contention cannot reset it.
+    #[test]
+    fn b9_media_faults_park_after_three_attempts_and_wake() {
+        use remanence_library::{ScsiError, TapeIoError};
+        let work = WorkList::default();
+        let key = ([0xb9; 16], 1);
+        work.observe(key, true);
+        for (n, sense_key) in [3, 4, 3].into_iter().enumerate() {
+            assert_eq!(
+                work.claim(Instant::now() + Duration::from_secs(1000), false),
+                vec![key]
+            );
+            let mut sense = vec![0; 18];
+            sense[0] = 0x70;
+            sense[2] = sense_key;
+            sense[7] = 10;
+            let cause =
+                RetryCause::tape_io(&TapeIoError::CheckCondition(ScsiError::CheckCondition {
+                    sense,
+                    bytes_transferred: 0,
+                }));
+            work.failed(
+                key,
+                &cause.attach(Status::unavailable(format!("different diagnostic {n}"))),
+            );
+            work.finish(key);
+            assert_eq!(work.entries.lock().unwrap()[&key].parked, n == 2);
+            if n < 2 {
+                assert_eq!(
+                    work.claim(Instant::now() + Duration::from_secs(1000), false),
+                    vec![key]
+                );
+                work.failed(
+                    key,
+                    &Status::unavailable("no free drive; held by: medium failure"),
+                );
+                work.finish(key);
+            }
+        }
+        assert!(work
+            .claim(Instant::now() + Duration::from_secs(10000), false)
+            .is_empty());
+        assert!(work
+            .reason(key.0)
+            .unwrap()
+            .contains("parked: media fault (3/3 attempts)"));
+        work.wake_tape(key.0);
+        assert_eq!(work.claim(Instant::now(), false), vec![key]);
+        assert_eq!(work.entries.lock().unwrap()[&key].media_failures, 0);
+    }
+
     use super::*;
     #[test]
     fn b7_fix_operator_failures_wait_for_wake_and_one_attempt_per_library() {

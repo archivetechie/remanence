@@ -54,10 +54,10 @@ Parity-off tape: Initialized and two Object barriers.
 
 Parity tape: one Object barrier leaving its epoch open, then ClosedOut and SessionEnded publishing the epoch's sidecar and clean end.
 
-- bytes: 1614, SHA-256 3a160f6fbd99604025dd72360cb853cd3cb7ae5a19c738da9603ab1362b9ac5b
+- bytes: 1620, SHA-256 7cdc8a92f1180f7cc2abdf02970bbbfd5cf4cde538295f5352186775910cd98e
 - header: tape UUID a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2, block size 262144, scheme checkpoint-partial-epoch k=8 m=2 S=1, 84 bytes
 - tail: complete
-- authoritative prefix: last closed sequence 8, closed end 1614
+- authoritative prefix: last closed sequence 8, closed end 1620
 - counters: objects 1, next file 3, W 3, T 3, check 0000000000000000 (Empty), next epoch 1, cursor 0:12, sealed false
 
 | sequence | tag | offset | end |
@@ -69,7 +69,7 @@ Parity tape: one Object barrier leaving its epoch open, then ClosedOut and Sessi
 | 5 | Committed (3) | 987 | 1171 |
 | 6 | PayloadContinuation (2) | 1171 | 1277 |
 | 7 | ClosedOut (17) | 1277 | 1462 |
-| 8 | SessionEnded (19) | 1462 | 1614 |
+| 8 | SessionEnded (19) | 1462 | 1620 |
 
 ## sealed-terminal.remtape
 

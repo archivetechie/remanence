@@ -218,6 +218,8 @@ pub(super) fn handle_drive_open_read(
                 stream_chunk_bytes,
                 chunk_tx,
             } => {
+                chunk_tx
+                    .set_shutdown_signal(cfg.lifecycle.as_ref().map(|l| l.shutting_down.clone()));
                 if requested != session_id {
                     let _ =
                         chunk_tx.blocking_send(Err(Status::not_found("read session not found")));
@@ -278,6 +280,8 @@ pub(super) fn handle_drive_open_read(
                 stream_chunk_bytes,
                 chunk_tx,
             } => {
+                chunk_tx
+                    .set_shutdown_signal(cfg.lifecycle.as_ref().map(|l| l.shutting_down.clone()));
                 if requested != session_id {
                     let _ =
                         chunk_tx.blocking_send(Err(Status::not_found("read session not found")));

@@ -216,7 +216,7 @@ pub(crate) fn handle_drive_tape_inventory(
     let outcome = {
         let mut source = DriveHandleRawSource::new(drive);
         read_terminal_index_inventory_streamed(&mut source, &tape_uuid, block_size, |event| {
-            send_inventory_stream_item(stream_tx, terminal_inventory_event_to_proto(event))
+            send_inventory_stream_item(cfg, stream_tx, terminal_inventory_event_to_proto(event))
                 .map_err(|error| error.message().to_string())
         })
         .map_err(status_from_terminal_inventory_read_error)?
@@ -238,20 +238,25 @@ pub(crate) fn handle_drive_tape_inventory(
                         block_size,
                         recovery.reason,
                     );
-                    if send_inventory_stream_item(stream_tx, item).is_ok() {
+                    if send_inventory_stream_item(cfg, stream_tx, item).is_ok() {
                         ScanWalkControl::Continue
                     } else {
                         ScanWalkControl::Abort
                     }
                 },
                 |object| {
-                    send_inventory_stream_item(stream_tx, bot_recovered_object_to_proto(object))
-                        .map_err(|error| error.message().to_string())
+                    send_inventory_stream_item(
+                        cfg,
+                        stream_tx,
+                        bot_recovered_object_to_proto(object),
+                    )
+                    .map_err(|error| error.message().to_string())
                 },
             )
             .map_err(status_from_bot_structural_recovery_error)?
         };
         send_inventory_stream_item(
+            cfg,
             stream_tx,
             pb::TapeInventoryStreamItem {
                 item: Some(pb::tape_inventory_stream_item::Item::Summary(Box::new(
@@ -264,6 +269,7 @@ pub(crate) fn handle_drive_tape_inventory(
     let mut summary = terminal_inventory_to_proto(tape_uuid, outcome);
     prepared.append_provenance(&mut summary.detail);
     send_inventory_stream_item(
+        cfg,
         stream_tx,
         pb::TapeInventoryStreamItem {
             item: Some(pb::tape_inventory_stream_item::Item::Summary(Box::new(
@@ -297,12 +303,36 @@ pub(crate) fn status_from_terminal_inventory_read_error(
 }
 
 pub(crate) fn send_inventory_stream_item(
+    cfg: &WriteOwnerConfig,
     stream_tx: &mpsc::Sender<Result<pb::TapeInventoryStreamItem, Status>>,
     item: pb::TapeInventoryStreamItem,
 ) -> Result<(), Status> {
-    stream_tx
-        .blocking_send(Ok(item))
-        .map_err(|_| Status::cancelled("terminal inventory receiver closed"))
+    let mut pending = Ok(item);
+    let started = Instant::now();
+    loop {
+        if cfg
+            .lifecycle
+            .as_ref()
+            .is_some_and(|l| l.shutting_down.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            return Err(Status::cancelled(
+                "terminal inventory interrupted by shutdown",
+            ));
+        }
+        match stream_tx.try_send(pending) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err(Status::cancelled("terminal inventory receiver closed"))
+            }
+            Err(mpsc::error::TrySendError::Full(item)) => pending = item,
+        }
+        if started.elapsed() >= std::time::Duration::from_secs(30) {
+            return Err(Status::deadline_exceeded(
+                "terminal inventory consumer stalled",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 pub(crate) fn terminal_inventory_event_to_proto(

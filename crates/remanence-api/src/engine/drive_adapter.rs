@@ -278,7 +278,7 @@ impl MountedDrive {
     pub fn append(&mut self, request: crate::WriteObjectToPoolRequest) -> Result<pb::ObjectRecord> {
         self.client
             .append_outcome(request)
-            .map(|(record, _)| record)
+            .map(|(record, _, _)| record)
     }
     pub fn checkpoint(&mut self) -> Result<pb::WriteSession> {
         self.client.checkpoint()
@@ -606,7 +606,7 @@ impl MountedCommands {
     pub fn append_outcome(
         &mut self,
         mut request: crate::WriteObjectToPoolRequest,
-    ) -> Result<(pb::ObjectRecord, bool)> {
+    ) -> Result<(pb::ObjectRecord, crate::PoolWriteObjectRecord, bool)> {
         self.refresh_session()?;
         let (session_id, pool) = self
             .session
@@ -655,19 +655,44 @@ impl MountedCommands {
                 return Err(error);
             }
         };
-        // Even an automatic barrier retains its receipts until this checkpoint.
-        self.checkpoint()?;
-        let record = self
+        // Claim the batch, but retain this append's own durable outcome even if
+        // session teardown or a different caller has already claimed the batch.
+        let checkpoint = self.checkpoint();
+        let record = appended
+            .durable_receipt
+            .lock()
+            .expect("append receipt lock")
+            .clone();
+        let record = match record {
+            Some(record) => record,
+            None => {
+                checkpoint?;
+                return Err(ActorFailure::from(Status::internal(
+                    "append produced no durable receipt",
+                )));
+            }
+        };
+        if !self
             .receipts
             .iter()
-            .find(|r| r.object_id == appended.record.object_id)
-            .cloned();
-        record
-            .map(|record| (record, appended.replay))
-            .ok_or_else(|| {
-                ActorFailure::from(Status::internal("append produced no durable receipt"))
-            })
+            .any(|old| old.object_id == record.object_id)
+        {
+            self.receipts.push(record.clone());
+        }
+        let mut native = appended.native_record;
+        if let Some(info) = &record.append_commit_info {
+            for copy in &mut native.copies {
+                if copy.tape_uuid.as_slice() == info.tape_uuid
+                    && Some(copy.tape_file_number) == info.tape_file_number
+                {
+                    copy.tape_log_sequence = info.tape_log_sequence;
+                    copy.tape_incarnation = info.tape_incarnation;
+                }
+            }
+        }
+        Ok((record, native, appended.replay))
     }
+
     /// Claim all committed receipts, including earlier automatic barriers.
     pub fn checkpoint(&mut self) -> Result<pb::WriteSession> {
         self.refresh_session()?;
@@ -859,39 +884,7 @@ pub(crate) fn put_version(
     )? {
         Err(version) => Ok(Err(version)),
         Ok((request, reason)) => {
-            let pool = request.pool_id.clone();
-            let caller = request.caller_object_id.clone();
-            let previously_claimed = client.receipts.len();
-            match write_checkpointed(client, state, request) {
-                Ok(receipt) => Ok(Ok((receipt, reason))),
-                Err(crate::MountError::Committed {
-                    receipt, failure, ..
-                }) => Err(crate::MountError::Committed {
-                    receipt,
-                    reason,
-                    failure,
-                }),
-                Err(failure) => {
-                    if let Some(record) = client.receipts[previously_claimed..]
-                        .iter()
-                        .find(|r| r.caller_object_id.as_deref() == Some(caller.as_str()))
-                    {
-                        let receipt = crate::standalone_write::receipt(
-                            state.catalog_index(),
-                            record.clone(),
-                            &pool,
-                            false,
-                        )?;
-                        Err(crate::MountError::Committed {
-                            receipt: Box::new(receipt),
-                            reason,
-                            failure: Box::new(failure),
-                        })
-                    } else {
-                        Err(failure)
-                    }
-                }
-            }
+            write_checkpointed(client, state, request).map(|receipt| Ok((receipt, reason)))
         }
     }
 }
@@ -933,53 +926,8 @@ pub(crate) fn write_checkpointed(
             }
         })?;
     }
-    let caller = request.caller_object_id.clone();
-    let (record, replay) = match client.append_outcome(request) {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            // A terminal suffix or context renewal may fail after CP publication.
-            // The pre-append replay guard proved this caller had no prior object;
-            // the invocation's state lock excludes another catalog writer.
-            if let Ok(Some(native)) = state
-                .catalog_index()
-                .get_native_object_by_pool_and_caller_object_id(&pool, &caller)
-            {
-                if native.copies.iter().any(|copy| {
-                    copy.status == "committed"
-                        && copy.pool_id.as_deref() == Some(pool.as_str())
-                        && copy.tape_uuid == client.tape_uuid
-                }) {
-                    if let Ok(mut record) =
-                        crate::catalog_conversion::object_record_to_proto(native)
-                    {
-                        if let Some(info) = record.append_commit_info.as_mut() {
-                            info.durability = pb::AppendDurability::Checkpointed as i32;
-                        }
-                        if !client
-                            .receipts
-                            .iter()
-                            .any(|old| old.object_id == record.object_id)
-                        {
-                            client.receipts.push(record.clone());
-                        }
-                        let receipt = crate::standalone_write::receipt(
-                            state.catalog_index(),
-                            record,
-                            &pool,
-                            false,
-                        )?;
-                        return Err(MountError::Committed {
-                            receipt: Box::new(receipt),
-                            reason: "new",
-                            failure: Box::new(MountError::Actor(error)),
-                        });
-                    }
-                }
-            }
-            return Err(MountError::Actor(error));
-        }
-    };
-    crate::standalone_write::receipt(state.catalog_index(), record, &pool, replay)
+    let (_record, native, replay) = client.append_outcome(request).map_err(MountError::Actor)?;
+    Ok(crate::MountedWriteResult::committed(native, replay))
 }
 
 /// Poll only the actor's channel completion, including when thread creation fails

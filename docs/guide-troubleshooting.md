@@ -340,8 +340,15 @@ continues, and shutdown waits for it without the 600-second reservation deadline
 That MOVE retains the configured `changer_not_ready_wait_seconds` magazine/door
 wait even during shutdown. Other reservations retain their 600-second bound.
 The service manager's stop timeout (systemd `TimeoutStopSec`, for example) must
-exceed `daemon.shutdown_close_deadline_secs` plus one drive command's worst-case
-time, and must also cover any outstanding changer work described above. There
+cover `daemon.shutdown_close_deadline_secs` plus command settlement (TapeIo permits
+900 seconds), **plus up to 600 seconds per configured drive**, since ordinary
+reservation waits run sequentially. Outstanding changer UNLOAD/MOVE work adds
+its configured readiness waits and command timeouts. These are additive bounds,
+not one global 600-second deadline. Every drive actor uses the shared cutoff from
+creation, including maintenance on a drive with no prior write session. Shutdown
+waits for actor ownership through issued-command settlement; it interrupts host
+stream backpressure separately. Inventory and read consumers have a 30-second
+idle-send limit and are interrupted when shutdown begins. There
 is no startup probe of the service manager's configuration. A failed MOVE or
 forced kill can still leave media unthreaded.
 
@@ -350,9 +357,10 @@ when shutdown begins: `daemon.shutdown_close_deadline_secs` (default 300 seconds
 zero refused). Sessions finish in parallel. The deadline covers the final barrier,
 `Committed`, and `SessionEnded`. At expiry, no new drive command is issued. An
 already issued command keeps its normal command timeout and is allowed to settle.
-After settlement, the session records `SessionEnded(graceful_shutdown)` with the
-whole uncommitted tail, including an interrupted closeout sidecar, and leaves
-closeout due. No closeout starts at the next shutdown step. Already delivered
+After settlement, the session records `SessionEnded` with the whole uncommitted
+tail, including an interrupted closeout sidecar, and leaves closeout due. The
+ending preserves a failed append, drive error or failed closeout; otherwise it
+records `graceful_shutdown`. No closeout starts at the next shutdown step. Already delivered
 receipts stay valid; a durable commit is never turned into a failed Close by a
 later projection or cleanup error. One warning identifies each interrupted tape
 and session and the work left due.
@@ -539,8 +547,14 @@ accounting limits, not process RSS. `CloseoutMemory` refuses before drive work.
 
 A committed range without a sidecar remains readable as unprotected data.
 After a durable abort, failed append, or client disconnect, the session's named
-tail authorizes exact suffix proof without operator acknowledgement. No
-abandonment filemark is written. A drive error leaves closeout due for a later
+tail authorizes suffix proof without operator acknowledgement. Accepted buffered
+writes and immediate filemarks are possible extents; only successful non-immediate
+filemarks or barriers establish the synchronized lower bound. A failed barrier
+leaves that bound unchanged. Recovery accepts EOD between the synchronized point
+and the end of possible extents, recording its exact position in `SessionEnded`
+before reuse. Lost buffered data therefore needs no supersede acknowledgement.
+EOD below the synchronized point or committed cursor remains a contradiction.
+No abandonment filemark is written. A drive error leaves closeout due for a later
 access. A crash with complete uncommitted Objects still requires
 `rem tape supersede-tail`; confirmation must carry the preview's log sequence.
 `TailPreviewStale` requires a new preview. A crash-torn last file is bound by
@@ -560,7 +574,7 @@ and name the closeout command. `CloseoutUnprotectedFinalizationUnavailable`
 refuses finalization when that range cannot be proved; operator acceptance of
 unprotected finalization is not implemented. Cartridge removal performs no parity
 work. Graceful shutdown closes sessions and leaves cartridges seated; its
-bounded shutdown deadline is a subsequent migration step.
+shared shutdown deadline covers maintenance as well as write sessions.
 
 The parity `transfer` event adds `write_commands_ms`, the sum of time inside
 raw fixed-block WRITE calls, and `between_writes_ms`, the sum of intervals
@@ -823,3 +837,10 @@ journal leases before publishing the refusal, so an immediate retry or replay
 does not race that cleanup. Lock refusals log at WARN
 with the operation and write-session context. Check the session and tape ids
 and allow the holder to close before retrying. Do not delete a held lock file.
+
+Persistent typed medium or hardware failures in closeout maintenance receive
+three attempts with the existing backoff, then park the tape. Debt views and
+`rem top` show `parked: media fault (3/3 attempts)` with the diagnostic cause.
+Diagnostic text changes do not reset the budget; ordinary contention does not
+consume it. Readiness-fence clearance, barcode membership changes and operator
+actions wake the tape and reset the budget. Unrecognized failures remain transient.

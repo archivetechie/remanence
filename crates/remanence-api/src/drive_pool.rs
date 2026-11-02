@@ -199,6 +199,7 @@ impl Drop for ClosingGuard {
 #[derive(Clone, Default)]
 pub(crate) struct DrivePoolLifecycle {
     pub(crate) closing: ClosingWork,
+    pub(crate) actor_work: ClosingWork,
     pub(crate) ended_writes: Arc<Mutex<HashMap<Uuid, (crate::pb::WriteSession, bool)>>>,
     pub(crate) ended_write_order: Arc<Mutex<std::collections::VecDeque<Uuid>>>,
     pub(crate) readiness_wake: Arc<ReadinessWake>,
@@ -323,6 +324,7 @@ fn holder_drive_label(drive: &DriveKey, serial: Option<&str>) -> String {
 pub(crate) struct DrivePool {
     closing: ClosingWork,
     worker_closing: ClosingWork,
+    actor_work: ClosingWork,
     ended_writes: Arc<Mutex<HashMap<Uuid, (crate::pb::WriteSession, bool)>>>,
     pub(crate) readiness_wake: Arc<ReadinessWake>,
     changers: Arc<HashMap<String, mpsc::Sender<ChangerCommand>>>,
@@ -384,7 +386,7 @@ impl DrivePool {
         Ok(())
     }
     pub(crate) fn drive_is_closing(&self, drive: &DriveKey) -> bool {
-        self.closing.drive_is_closing(drive)
+        self.closing.drive_is_closing(drive) || self.actor_work.drive_is_closing(drive)
     }
     /// Wait for every relevant closing owner, then let mount resolution retry.
     pub(crate) async fn wait_busy_closeout(&self, library: &str, bay: Option<u16>) -> bool {
@@ -406,9 +408,12 @@ impl DrivePool {
     }
     pub(crate) async fn wait_drive_closeout(&self, drive: &DriveKey) {
         self.closing.wait(|_, e| &e.drive == drive).await;
+        self.actor_work.wait(|_, e| &e.drive == drive).await;
     }
     pub(crate) async fn wait_closeouts(&self) {
         self.closing.wait(|_, _| true).await;
+        self.actor_work.wait(|_, _| true).await;
+        self.worker_closing.wait(|_, _| true).await;
     }
     #[cfg(test)]
     pub(crate) fn new(
@@ -456,6 +461,7 @@ impl DrivePool {
         Self {
             changers: Arc::new(changers),
             closing: lifecycle.closing,
+            actor_work: lifecycle.actor_work,
             worker_closing: ClosingWork::default(),
             ended_writes: lifecycle.ended_writes,
             drives: Arc::new(drives),
@@ -715,6 +721,12 @@ impl DrivePool {
         &self,
         tape: TapeUuid,
     ) -> Result<(ClosingGuard, TapeReservation), Status> {
+        let _admission = self.dismounts.lock().unwrap();
+        if self.is_shutting_down() {
+            return Err(Status::unavailable(
+                "daemon shutdown; maintenance admission closed",
+            ));
+        }
         let mut closing = None;
         let reservation = self.reserve_tape_with_after_insert(tape, |_| {
             closing = Some(
@@ -927,9 +939,19 @@ impl DrivePool {
         if self.drive_is_closing(drive) {
             return Err(Status::unavailable("drive is completing session closeout"));
         }
+        let work = {
+            let _admission = self.dismounts.lock().unwrap();
+            if self.is_shutting_down() {
+                return Err(Status::unavailable(
+                    "daemon shutdown; maintenance admission closed",
+                ));
+            }
+            self.actor_work.begin([0; 16], drive.clone()).0
+        };
         let tx = self.drive_tx(drive)?;
         let (reply, rx) = oneshot::channel();
         tx.send(DriveCommand::PollHealth {
+            ownership: Some(work),
             drive_uuid,
             trigger: "manual",
             session_id: None,
@@ -950,10 +972,23 @@ impl DrivePool {
         if self.drive_is_closing(drive) {
             return Ok(());
         }
+        let work = {
+            let _admission = self.dismounts.lock().unwrap();
+            if self.is_shutting_down() {
+                return Err(Status::unavailable(
+                    "daemon shutdown; maintenance admission closed",
+                ));
+            }
+            self.actor_work.begin([0; 16], drive.clone()).0
+        };
         let tx = self.drive_tx(drive)?;
         let (reply, rx) = oneshot::channel();
-        tx.blocking_send(DriveCommand::Heartbeat { drive_uuid, reply })
-            .map_err(|_| Status::unavailable("drive actor is unavailable"))?;
+        tx.blocking_send(DriveCommand::Heartbeat {
+            ownership: Some(work),
+            drive_uuid,
+            reply,
+        })
+        .map_err(|_| Status::unavailable("drive actor is unavailable"))?;
         rx.blocking_recv()
             .map_err(|_| Status::unavailable("drive actor stopped"))?
     }

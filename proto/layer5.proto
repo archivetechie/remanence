@@ -16,9 +16,10 @@
 //   - "Object" identity is by Remanence-assigned object UUID. The orchestrator's
 //     own identifier rides as `caller_object_id` (an opaque string) and is
 //     stored with the REM-OBJECT identity metadata.
-//   - Idempotency: fields are reserved on state-changing RPCs. Until per-RPC
-//     replay is implemented, non-empty keys fail fast with UNIMPLEMENTED rather
-//     than being silently accepted.
+//   - Idempotency: Catalog.CloseoutTape and Catalog.FinalizeTape implement
+//     required idempotency keys and request replay. Other RPC key fields remain
+//     reserved: non-empty keys fail fast with UNIMPLEMENTED until implemented.
+//     Endpoint-specific key requirements below are normative.
 //   - Pagination: list RPCs return a `next_page_token`; opaque to clients.
 //   - Cancellation: long-running operations return an `operation_id`; cancel
 //     via Daemon.CancelOperation.

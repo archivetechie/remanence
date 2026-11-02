@@ -404,9 +404,9 @@ struct Observation {
     owner: Weak<SummaryMirror>,
     finalization: Option<uuid::Uuid>,
     cached: Option<(LogChange, TapeSummary)>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fixtures"))]
     replays: usize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fixtures"))]
     before_replay: Option<Box<dyn FnOnce() + Send>>,
 }
 /// Linux inode change notification: includes in-place writes and replacements,
@@ -576,12 +576,12 @@ impl TapeAuthority {
                 return Ok(summary.clone());
             }
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "fixtures"))]
         if let Some(hook) = entry.before_replay.take() {
             hook();
         }
         let summary = self.store.snapshot()?.summary().clone();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "fixtures"))]
         {
             entry.replays += 1;
         }
@@ -589,6 +589,16 @@ impl TapeAuthority {
         entry.cached =
             (log_change(self.store.path())? == change).then(|| (change, summary.clone()));
         Ok(summary)
+    }
+    /// Fixture-only gate inside the per-tape cold replay guard.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn before_next_observation_replay(&self, hook: impl FnOnce() + Send + 'static) {
+        self.observation().unwrap().lock().unwrap().before_replay = Some(Box::new(hook));
+    }
+    /// Fixture-only count of actual scans, excluding coalesced observations.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn observation_replay_count(&self) -> usize {
+        self.observation().unwrap().lock().unwrap().replays
     }
     /// Publish a watchable operation while the caller retains tape ownership.
     pub fn finalization_operation(
@@ -642,7 +652,7 @@ impl TapeAuthority {
         };
         entry.owner = Arc::downgrade(&lease.observation());
         entry.cached = None;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "fixtures"))]
         {
             entry.replays = 0;
         }
@@ -722,14 +732,28 @@ impl TapeAuthorityLease {
             let s = core.summary();
             let mut group = core.prepare()?;
             let mut count = 0u64;
+            let mut possible_tail_blocks = 0u64;
+            let mut synchronized_tail_blocks = 0u64;
             for tail in tails {
+                let tail = tail?;
+                if tail.synchronized_blocks > 0 || tail.synchronized_filemark {
+                    synchronized_tail_blocks = possible_tail_blocks
+                        .checked_add(tail.synchronized_blocks)
+                        .and_then(|n| n.checked_add(u64::from(tail.synchronized_filemark)))
+                        .ok_or_else(|| invalid("session tail overflow"))?;
+                }
+                possible_tail_blocks = possible_tail_blocks
+                    .checked_add(tail.known_blocks)
+                    .and_then(|n| n.checked_add(tail.unknown_blocks))
+                    .and_then(|n| n.checked_add(u64::from(tail.filemark != TailFilemark::Absent)))
+                    .ok_or_else(|| invalid("session tail overflow"))?;
                 count = count
                     .checked_add(1)
                     .ok_or_else(|| invalid("session tail count overflow"))?;
                 group.push(
                     &Record::PayloadContinuation(Continuation {
                         group: group.sequence(),
-                        chunk: Chunk::TailFile(tail?),
+                        chunk: Chunk::TailFile(tail),
                     }),
                     &[],
                 )?;
@@ -750,12 +774,35 @@ impl TapeAuthorityLease {
                 tail: group.reference(0),
                 tail_file_count: count,
                 crash_ack_audit_sequence,
+                synchronized_tail_blocks,
+                possible_tail_blocks,
+                proved_eod: None,
             });
             core.append(group.close(&record)?)?;
             Ok(())
         })?;
         self.session_id = None;
         Ok(())
+    }
+
+    /// Refine an ended tail with its proved physical EOD before any reuse.
+    /// This is metadata on the same ending, retaining its original tail binding.
+    pub fn record_session_tail_eod(&mut self, eod: u64) -> Result<(), StateError> {
+        self.ensure_abandonment_allowed()?;
+        self.with_store(|core| {
+            let mut end = core
+                .summary()
+                .last_session_end
+                .clone()
+                .ok_or_else(|| invalid("tail EOD without session ending"))?;
+            if end.proved_eod == Some(eod) {
+                return Ok(());
+            }
+            end.proved_eod = Some(eod);
+            let group = core.prepare()?;
+            core.append(group.close(&Record::SessionEnded(end))?)?;
+            Ok(())
+        })
     }
 
     /// Publish a successfully barriered ordinary short sidecar. Finalization

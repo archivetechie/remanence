@@ -1265,8 +1265,10 @@ fn session_tail_snapshot_streams_only_the_last_closed_end() {
         tape_file_number: 1,
         identity: TailIdentity::Object("abandoned".into()),
         known_blocks: 3,
+        synchronized_blocks: 3,
         unknown_blocks: 1,
         filemark: TailFilemark::Unknown,
+        synchronized_filemark: false,
     };
     group
         .push(
@@ -1287,6 +1289,9 @@ fn session_tail_snapshot_streams_only_the_last_closed_end() {
         tail: group.reference(0),
         tail_file_count: 1,
         crash_ack_audit_sequence: None,
+        synchronized_tail_blocks: 3,
+        possible_tail_blocks: 5,
+        proved_eod: None,
     };
     lease
         .append(group.close(&Record::SessionEnded(end)).unwrap())

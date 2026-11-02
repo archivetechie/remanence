@@ -750,8 +750,10 @@ fn session_owner_streamed_end_preserves_tail_and_rejects_wrong_closeout_owner() 
         tape_file_number: 2,
         identity: TailIdentity::Object("abandoned".into()),
         known_blocks: 2,
+        synchronized_blocks: 2,
         unknown_blocks: 4,
         filemark: TailFilemark::Absent,
+        synchronized_filemark: false,
     };
     let sequence = writer.log_reference().unwrap().0;
     let error = writer
@@ -1142,4 +1144,67 @@ fn b7_fix2_slow_replay_does_not_block_other_status_or_session_open() {
     independent.join().unwrap();
     result.expect("another tape's status and session open must finish during slow replay");
     assert_eq!(observation.lock().unwrap().replays, 1);
+}
+
+/// EOD refinement is bounded by synchronized evidence and retains the tail's original binding.
+#[test]
+fn b9_ended_tail_eod_refinement_is_durable_and_bounded() {
+    for eod in [6, 7, 8, 9, 10, 11] {
+        let (_dir, authority, mut writer, _) = session_owner_fixture();
+        writer
+            .end_session(
+                [9; 16],
+                "2026-11-02T00:01:00Z".into(),
+                SessionEndReason::Abort,
+                None,
+                [Ok(TailFile {
+                    tape_file_number: 2,
+                    identity: TailIdentity::Object("abandoned".into()),
+                    known_blocks: 4,
+                    unknown_blocks: 0,
+                    filemark: TailFilemark::Present,
+                    synchronized_blocks: 2,
+                    synchronized_filemark: false,
+                })],
+            )
+            .unwrap();
+        let before = writer.freeze().unwrap();
+        let result = writer.record_session_tail_eod(eod);
+        assert_eq!(result.is_ok(), (8..=11).contains(&eod));
+        if result.is_ok() {
+            let after = writer.freeze().unwrap();
+            let end = after.tape_summary().last_session_end.as_ref().unwrap();
+            assert_eq!(end.proved_eod, Some(eod));
+            assert_eq!(
+                end.tail,
+                before
+                    .tape_summary()
+                    .last_session_end
+                    .as_ref()
+                    .unwrap()
+                    .tail
+            );
+            let mut tails = 0;
+            after
+                .visit_session_tail(&mut |_| {
+                    tails += 1;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(tails, 1);
+            assert!(writer.record_session_tail_eod(eod + 1).is_err());
+            drop(writer);
+            assert_eq!(
+                authority
+                    .freeze()
+                    .unwrap()
+                    .tape_summary()
+                    .last_session_end
+                    .as_ref()
+                    .unwrap()
+                    .proved_eod,
+                Some(eod)
+            );
+        }
+    }
 }

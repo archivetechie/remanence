@@ -768,13 +768,19 @@ impl ApiState {
     }
 
     pub(crate) async fn live_status_response(&self) -> Result<pb::GetLiveStatusResponse, Status> {
-        self.live_status_response_inner(true)
+        let state = self.clone();
+        tokio::task::spawn_blocking(move || state.live_status_response_inner(true))
+            .await
+            .map_err(|e| Status::internal(format!("live status task: {e}")))?
     }
 
     pub(crate) async fn fresh_live_status_response(
         &self,
     ) -> Result<pb::GetLiveStatusResponse, Status> {
-        self.live_status_response_inner(false)
+        let state = self.clone();
+        tokio::task::spawn_blocking(move || state.live_status_response_inner(false))
+            .await
+            .map_err(|e| Status::internal(format!("live status task: {e}")))?
     }
 
     pub(crate) fn live_status_response_inner(

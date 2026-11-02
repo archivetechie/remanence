@@ -20,6 +20,8 @@ struct Evidence {
     spool: File,
     count: u64,
     next_file: u64,
+    synchronized_file: u64,
+    synchronized_blocks: u64,
     current: Option<TailFile>,
     next_object: Option<String>,
     block_size: u32,
@@ -44,6 +46,8 @@ impl SessionTail {
             spool: tempfile::tempfile()?,
             count: 0,
             next_file,
+            synchronized_file: next_file,
+            synchronized_blocks: 0,
             current: None,
             next_object: None,
             block_size,
@@ -68,6 +72,8 @@ impl SessionTail {
             known_blocks: blocks,
             unknown_blocks: 0,
             filemark,
+            synchronized_blocks: blocks,
+            synchronized_filemark: filemark == TailFilemark::Present,
         })
     }
 
@@ -81,6 +87,16 @@ impl SessionTail {
             .next_file
             .checked_add(1)
             .ok_or_else(|| std::io::Error::other("observed tail file overflow"))?;
+        e.synchronized_file = if file.synchronized_filemark {
+            e.next_file
+        } else {
+            file.tape_file_number
+        };
+        e.synchronized_blocks = if file.synchronized_filemark {
+            0
+        } else {
+            file.synchronized_blocks
+        };
         e.current = Some(file);
         Ok(())
     }
@@ -110,6 +126,8 @@ impl SessionTail {
         e.spool.rewind()?;
         e.count = 0;
         e.next_file = next_file;
+        e.synchronized_file = next_file;
+        e.synchronized_blocks = 0;
         e.current = None;
         e.next_object = None;
         e.stopped = false;
@@ -141,11 +159,22 @@ impl SessionTail {
         Ok(TailFiles {
             spool,
             remaining: e.count,
+            synchronized_file: e.synchronized_file,
+            synchronized_blocks: e.synchronized_blocks,
         })
     }
 }
 
 impl Evidence {
+    /// Synchronization covers all accepted preceding files, including spooled ones.
+    fn synchronize(&mut self) {
+        self.synchronized_file = self.next_file;
+        self.synchronized_blocks = self
+            .current
+            .as_ref()
+            .filter(|f| f.filemark != TailFilemark::Present)
+            .map_or(0, |f| f.known_blocks);
+    }
     fn flush_current(&mut self) -> std::io::Result<()> {
         if self.spool_failed {
             return Err(std::io::Error::other("session tail spool failed"));
@@ -223,6 +252,8 @@ impl MediaDispatchObserver for SessionTail {
                     known_blocks: 0,
                     unknown_blocks: 0,
                     filemark: TailFilemark::Absent,
+                    synchronized_blocks: 0,
+                    synchronized_filemark: false,
                 });
             }
             let file = e.current.as_mut().ok_or_else(invalid)?;
@@ -255,6 +286,8 @@ impl MediaDispatchObserver for SessionTail {
         if cdb[0] == 0x10 && cdb[2..5] == [0, 0, 0] {
             if result.is_err() {
                 e.stopped = true;
+            } else if cdb[1] & 1 == 0 {
+                e.synchronize();
             }
             return;
         }
@@ -282,6 +315,9 @@ impl MediaDispatchObserver for SessionTail {
                 Some(next) => e.next_file = next,
                 None => e.stopped = true,
             }
+            if cdb[1] & 1 == 0 {
+                e.synchronize();
+            }
         } else {
             e.stopped = true;
         }
@@ -291,6 +327,8 @@ impl MediaDispatchObserver for SessionTail {
 pub(crate) struct TailFiles {
     spool: File,
     remaining: u64,
+    synchronized_file: u64,
+    synchronized_blocks: u64,
 }
 impl Iterator for TailFiles {
     type Item = Result<TailFile, StateError>;
@@ -301,6 +339,17 @@ impl Iterator for TailFiles {
         self.remaining -= 1;
         Some(
             read_file(&mut self.spool)
+                .map(|mut file| {
+                    file.synchronized_blocks = if file.tape_file_number < self.synchronized_file {
+                        file.known_blocks
+                    } else if file.tape_file_number == self.synchronized_file {
+                        self.synchronized_blocks.min(file.known_blocks)
+                    } else {
+                        0
+                    };
+                    file.synchronized_filemark = file.tape_file_number < self.synchronized_file;
+                    file
+                })
                 .map_err(|e| StateError::JournalReplayFailed(format!("session tail spool: {e}"))),
         )
     }
@@ -377,12 +426,47 @@ fn read_file(r: &mut File) -> std::io::Result<TailFile> {
         known_blocks,
         unknown_blocks,
         filemark,
+        synchronized_blocks: 0,
+        synchronized_filemark: false,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Immediate marks and failed barriers never promote the buffered suffix.
+    #[test]
+    fn b9_tail_synchronization_covers_spooled_files_only_after_success() {
+        for barrier in [false, true] {
+            let mut tail = SessionTail::new([1; 16], 512, 1).unwrap();
+            for n in 0..3 {
+                tail.object(&format!("o{n}")).unwrap();
+                let write = [0x0a, 1, 0, 0, 1, 0];
+                tail.dispatching(&write, Some(&[0; 512])).unwrap();
+                tail.settled(&write, &Ok(Some(TransferOutcome::clean(512))));
+                let mark = [0x10, u8::from(n != 0), 0, 0, 1, 0];
+                tail.dispatching(&mark, None).unwrap();
+                tail.settled(&mark, &Ok(None));
+            }
+            let sync = [0x10, 0, 0, 0, 0, 0];
+            tail.dispatching(&sync, None).unwrap();
+            tail.settled(
+                &sync,
+                &if barrier {
+                    Ok(None)
+                } else {
+                    Err(ScsiError::InvalidInput("failed WFM(0)"))
+                },
+            );
+            for (i, file) in tail.files().unwrap().enumerate() {
+                let file = file.unwrap();
+                assert_eq!(file.known_blocks, 1);
+                assert_eq!(file.synchronized_blocks, u64::from(i == 0 || barrier));
+                assert_eq!(file.synchronized_filemark, i == 0 || barrier);
+            }
+        }
+    }
 
     #[test]
     fn completed_files_stream_and_unknown_last_command_stops_writes() {
