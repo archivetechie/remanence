@@ -1080,8 +1080,7 @@ pub struct ParitySink<'a> {
     /// with the usual post-data-write position.
     ///
     /// Used by [`Self::finish`] to report `data_area_end_lba`
-    /// truthfully when a neighborhood closes exactly (codex
-    /// idref=30bf15c0 Medium): on an exact boundary the inner
+    /// truthfully when a neighborhood closes exactly: on an exact boundary the inner
     /// physical position is past the parity tail, but the
     /// logical end of user data is here.
     last_data_lba: u64,
@@ -2436,7 +2435,7 @@ impl<'a> ParitySink<'a> {
                 "ParitySink::finish called while an object is active; call finish_object first",
             ));
         }
-        // Per codex idref=30bf15c0 (Medium #1): `data_area_end_lba`
+        // `data_area_end_lba`
         // is the LBA where user data ENDED (= the next LBA after
         // the last user data block), NOT the post-parity physical
         // cursor. We tracked that during every successful

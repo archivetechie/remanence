@@ -1374,7 +1374,8 @@ rem-debug --allow <SERIAL> tape adopt-bootstrap [OPTIONS] --expected-existing-ta
 - `--json` is required.
 
 The command holds the exclusive state handle, runs fresh discovery, verifies the exact UUID,
-home slot and library and the canonical 1 MiB default-parity geometry, restores the drive
+home slot and library, checks that the block size the bootstrap records is one every drive in
+the library supports and that the tape was written with drive compression off, restores the drive
 mode, parks the medium, then records a durable `TapeIdentityAdopted` event and an
 identity-only catalog row. A tape with exactly bootstrap, filemark and EOD becomes `ready`;
 every other tail after a valid bootstrap becomes `recovery_required`. The command generates

@@ -176,7 +176,7 @@ pub enum BlockSize {
 /// [`DriveHandle::space`](super::super::DriveHandle::space)
 /// rejects `SequentialFilemarks` at the API boundary so it never
 /// reaches the wire — but the variant remains in the enum for
-/// SSC-vocabulary parity. Codex 20:00 catch.
+/// SSC-vocabulary parity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpaceKind {
     /// Skip N blocks (positive = forward, negative = backward).
@@ -336,10 +336,9 @@ pub struct WriteUnpositionedOutcome {
 /// having to re-decode sense or re-position. Mirrors
 /// [`WriteOutcome`] for symmetry.
 ///
-/// Codex 20:17 (idref=6e9b56d9 High) caught the earlier shape
-/// where `write_filemarks` returned only `TapePosition` and
-/// silently mapped EW to Err, leading to caller retries that
-/// would double-write filemarks.
+/// Early warning must be returned as a successful outcome: the filemarks
+/// are committed, and treating it as an error could cause retries that
+/// write duplicate filemarks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriteFilemarksOutcome {
     /// True iff sense indicated approaching end-of-medium —
@@ -817,9 +816,9 @@ pub struct TapeConfig {
     /// Block-size mode: [`BlockSize::Variable`] or [`BlockSize::Fixed`].
     pub block_size: BlockSize,
     /// Whether the drive's hardware compression is enabled. `false`
-    /// is the rem-chunked-v1 default — pre-compressed data
-    /// (zstd-seekable) doesn't compress further and the wasted CPU
-    /// matters at LTO line rate. See `docs/pfr-reference.md` §6.3.
+    /// is required by Remanence's write path. REM-OBJECT Section 1.5
+    /// defines uncompressed objects; REM-PARITY Section 16.3 requires
+    /// drive compression off to preserve block-to-media correspondence.
     pub compression: bool,
     /// Drive-reported maximum logical block size in bytes. Set by
     /// `read_config()` from the device's **READ BLOCK LIMITS**
@@ -828,7 +827,7 @@ pub struct TapeConfig {
     /// Ignored by `write_config()` (the drive's own cap always
     /// wins). Useful for variable-block READ buffer sizing.
     ///
-    /// Note (codex 19:57 follow-up): the **reported** RBL value
+    /// The **reported** RBL value
     /// is not always the same as the **supported** maximum. IBM
     /// Table 78 documents the field value as `0x80_0000` (8 MiB)
     /// on LTO-9 hardware, and Note 15 says larger no-encryption
@@ -928,13 +927,13 @@ mod tests {
     }
 
     #[test]
-    fn tape_config_chunked_v1_default_shape() {
-        // The rem-chunked-v1 default per pfr-reference.md §6.3:
-        // variable-block, compression off. max_block_size_bytes is
+    fn tape_config_variable_block_compression_off_shape() {
+        // Variable-block mode permits reading records before their size is known.
+        // Compression stays off per REM-PARITY §16.3; REM-OBJECT §1.5
+        // performs no object compression. max_block_size_bytes is
         // a drive-reported value; tests construct a representative
         // unencrypted-cartridge LTO-9 cap of 0xFFFFFF per IBM
-        // LTO SCSI Reference §4.11 (codex 03706ad5 caught the
-        // earlier off-by-one 16 MiB literal).
+        // LTO SCSI Reference §4.11.
         let c = TapeConfig {
             density_code: None,
             block_size: BlockSize::Variable,

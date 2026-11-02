@@ -43,8 +43,7 @@ pub enum ScsiError {
     /// the partial-transfer count to surface a faithful
     /// `WriteOutcome::bytes_written` / `read_block` length to the
     /// caller. Always 0 for `execute_none` (no data phase).
-    /// Codex bb10e63f flagged the earlier sense-only variant as
-    /// lossy on the WRITE-EOM path.
+    /// Preserves the partial transfer count on the WRITE-EOM path.
     #[cfg(target_os = "linux")]
     #[error("SCSI check condition (bytes_transferred={bytes_transferred}): sense={sense:02x?}")]
     CheckCondition {

@@ -141,35 +141,22 @@ pub(crate) fn validate_bootstrap_endpoint_evidence(
     Ok(())
 }
 
-/// Library adoption retains its established canonical geometry; standalone
-/// adoption records any validated on-tape geometry, including parity-off.
+/// Adoption records validated on-tape geometry, including parity-off, for
+/// both library and standalone endpoints. The caller checks drive limits.
 pub(crate) fn validate_bootstrap_adoption_geometry(
-    endpoint: &crate::DriveKey,
+    _endpoint: &crate::DriveKey,
     block_size: u32,
     parity: &remanence_parity::ParityConfig,
 ) -> Result<(), StateError> {
-    if matches!(endpoint, crate::DriveKey::Bay { .. }) {
-        if block_size != 1024 * 1024
-            || parity
-                != &remanence_parity::ParityConfig::Scheme(
-                    remanence_parity::default_scheme_for_block_size(1024 * 1024),
-                )
-        {
-            return Err(StateError::TapeProvisionConflict(
-                "bootstrap adoption requires canonical 1 MiB default parity geometry".into(),
-            ));
-        }
-    } else {
-        if block_size == 0 || !block_size.is_multiple_of(512) {
-            return Err(StateError::TapeProvisionConflict(
-                "invalid standalone bootstrap block size".into(),
-            ));
-        }
-        if let remanence_parity::ParityConfig::Scheme(scheme) = parity {
-            scheme
-                .validate()
-                .map_err(|e| StateError::TapeProvisionConflict(e.to_string()))?;
-        }
+    if block_size == 0 || !block_size.is_multiple_of(512) {
+        return Err(StateError::TapeProvisionConflict(
+            "invalid bootstrap block size".into(),
+        ));
+    }
+    if let remanence_parity::ParityConfig::Scheme(scheme) = parity {
+        scheme
+            .validate()
+            .map_err(|e| StateError::TapeProvisionConflict(e.to_string()))?;
     }
     Ok(())
 }
@@ -3697,6 +3684,103 @@ pool_id = "camera.copy-a"
                 .tape_uuid,
             vec![2; 16]
         );
+    }
+
+    /// Persist recorded library geometry through live adoption, reopen and audit rebuild.
+    #[test]
+    fn bootstrap_adoption_preserves_recorded_library_geometry() {
+        let mut custom = remanence_parity::default_scheme_for_block_size(512 * 1024);
+        custom.stripes_per_neighborhood = 1;
+        for (block_size, parity) in [
+            (256 * 1024, ParityConfig::None),
+            (
+                256 * 1024,
+                ParityConfig::Scheme(remanence_parity::default_scheme_for_block_size(256 * 1024)),
+            ),
+            (
+                1024 * 1024,
+                ParityConfig::Scheme(remanence_parity::default_scheme_for_block_size(1024 * 1024)),
+            ),
+            (512 * 1024, ParityConfig::Scheme(custom)),
+        ] {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let config_path = temp.path().join("config.toml");
+            fs::write(&config_path, config_text(temp.path())).expect("write config");
+            let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+            let mut input = adoption_input(Uuid::new_v4());
+            input.block_size = block_size;
+            input.parity = parity;
+            let outcome = handle
+                .adopt_bootstrap_identity(
+                    input.clone(),
+                    adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
+                )
+                .expect("adopt recorded geometry");
+            assert_eq!(outcome.state, AdoptedTapeState::Ready);
+            let tape = handle.index.get_tape(&input.tape_uuid).unwrap().unwrap();
+            assert_eq!(tape.block_size, Some(u64::from(block_size)));
+            match &input.parity {
+                ParityConfig::None => {
+                    assert!(tape.scheme_id.is_none());
+                    assert!(tape.data_blocks_per_stripe.is_none());
+                    assert!(tape.parity_blocks_per_stripe.is_none());
+                    assert!(tape.stripes_per_neighborhood.is_none());
+                }
+                ParityConfig::Scheme(scheme) => {
+                    assert_eq!(tape.scheme_id.as_deref(), Some(scheme.id.as_str()));
+                    assert_eq!(
+                        tape.data_blocks_per_stripe,
+                        Some(u32::from(scheme.data_blocks_per_stripe))
+                    );
+                    assert_eq!(
+                        tape.parity_blocks_per_stripe,
+                        Some(u32::from(scheme.parity_blocks_per_stripe))
+                    );
+                    assert_eq!(
+                        tape.stripes_per_neighborhood,
+                        Some(scheme.stripes_per_neighborhood)
+                    );
+                }
+            }
+            let records = FileAuditLog::replay(&handle.paths.audit_dir).expect("read audit");
+            drop(handle);
+            let mut reopened = StateHandle::open_from_config_file(&config_path).expect("reopen");
+            reopened
+                .index
+                .rebuild_from_authoritative_sources(&records, &[])
+                .expect("rebuild adoption from audit");
+            let rebuilt = reopened.index.get_tape(&input.tape_uuid).unwrap().unwrap();
+            assert_eq!(rebuilt, tape);
+        }
+    }
+
+    /// Both recorded and effective compression must stay off at the durable boundary.
+    #[test]
+    fn bootstrap_adoption_refuses_compression_with_unchanged_message() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).expect("write config");
+        let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+        for (recorded, configured) in [(true, false), (false, true), (true, true)] {
+            let mut input = adoption_input(Uuid::new_v4());
+            input.block_size = 256 * 1024;
+            input.parity = ParityConfig::None;
+            let mut evidence =
+                adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod);
+            evidence.bootstrap_drive_compression = recorded;
+            evidence.configured_drive_compression = configured;
+            let error = handle
+                .adopt_bootstrap_identity(input.clone(), evidence)
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "tape provisioning conflict: bootstrap adoption requires drive compression disabled"
+            );
+            assert!(handle.index.get_tape(&input.tape_uuid).unwrap().is_none());
+        }
+        assert!(FileAuditLog::replay(&handle.paths.audit_dir)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

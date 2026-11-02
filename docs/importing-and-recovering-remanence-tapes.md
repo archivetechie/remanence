@@ -51,9 +51,9 @@ catalog from surviving tape logs and the audit log, and it reads neither a
 terminal index nor a walk. A site that holds only the cartridge can identify it
 and inspect it, and it can restore files from it in a standalone drive, but it
 cannot import the tape's objects into its catalog. The second limit is that
-adoption accepts only tapes written with 1 MiB blocks and the default parity
-scheme, which Remanence's own defaults do not produce. [Which tapes can be
-adopted](#which-tapes-can-be-adopted) explains the rule and the alternatives.
+adoption requires every drive in the library to support the tape's recorded
+block size, and the bootstrap must record drive compression off. [Which tapes
+can be adopted](#which-tapes-can-be-adopted) explains the rule and the alternatives.
 
 ## What "foreign tape" means
 
@@ -64,7 +64,7 @@ handled here:
 | --- | --- | --- |
 | A Remanence tape whose catalog row was lost, on a host whose state directory survived | Not needed | Rebuild the catalog from the tape logs ([Rebuild the catalog](#rebuild-the-catalog-from-the-tape-logs)). This works for every geometry. |
 | A Remanence tape written at another site | Identity only | Probe and adopt it, then inventory and verify it. Its objects can be listed, and restored in a standalone drive, but not imported into this catalog. |
-| A Remanence tape with a geometry other than 1 MiB blocks and default parity | No | See [Which tapes can be adopted](#which-tapes-can-be-adopted). |
+| A Remanence tape whose block size a library drive cannot support, or whose bootstrap records compression on | No | See [Which tapes can be adopted](#which-tapes-can-be-adopted). |
 | A Remanence tape with a damaged or unreadable bootstrap | No | Do not adopt it. [Damaged tapes](guide-damaged-tapes.md) describes `rem-debug tape recovery-report`, which reads such a tape with values you supply. |
 | An LTFS, tar or other non-Remanence tape | No | Stock Remanence includes no parser for other formats. [Foreign-format adapters](reference-foreign-format-adapters.md) describes the read-only adapter interface that separately versioned distributions can use. |
 | A blank tape | No | Initialize it as new media with `rem tape init`. |
@@ -96,43 +96,27 @@ ordinary objects to WORM media.
 hold:
 
 - the tape UUID is an RFC 4122 version 4 UUID;
-- the block size is 1 MiB (1048576 bytes);
-- the parity scheme is the default for 1 MiB blocks: `rs-cauchy-gf256-v1` with
-  128 data blocks and 4 parity blocks per stripe, and 128 stripes per
-  neighborhood;
+- the recorded block size is valid and every drive in the library supports it;
+- the recorded parity scheme is valid, including no parity;
 - the bootstrap records drive compression off.
 
-The probe reports whether a tape meets this rule in its
-`canonical_adoption_geometry` field. Adoption checks the rule twice, in the
-command and again when the catalog records the identity, and the rule applies
-to every drive in a library.
+The probe reports valid geometry with compression off in its
+`canonical_adoption_geometry` field. Adoption checks the recorded geometry in
+the command and again when the catalog records the identity; the command also
+checks the block-size limit of every drive in the library. The probe's field
+does not establish that every library drive supports the block size.
 
-Remanence's own defaults produce a different tape. In a library, `rem tape
+Remanence's own defaults produce adoptable geometry. In a library, `rem tape
 init` takes the block size from the tape's pool, which is 256 KiB unless the
 pool's `block_size` key says otherwise, and it writes no parity unless it is
 given `--parity default`. A home-mode pool uses 256 KiB blocks and the parity
-scheme `custom:128,4,1`. A tape initialized with any of these defaults cannot
-be adopted by `adopt-bootstrap`. The probe reports
-`"canonical_adoption_geometry": false` for it, and adoption stops with:
+scheme `custom:128,4,1`. These geometries can all be adopted when every library
+drive supports the recorded block size. Adoption records the tape's own
+geometry; the destination pool's initialization defaults do not replace it.
+The [configuration reference](reference-configuration.md) describes the pool
+block-size key.
 
-```text
-error: valid Bootstrap does not have canonical 1 MiB default parity adoption geometry
-```
-
-If cartridges may later move to another site, give them the adoptable geometry
-when you initialize them. For the cartridge `RMJ101L9`:
-
-```sh
-rem tape init RMJ101L9 --block-size 1MiB --parity default
-```
-
-Setting `block_size = "1MiB"` in the pool's `[[tape_pools]]` table makes 1 MiB
-the block size of every initialization in that pool; `--parity default` must
-still be given on each `tape init`. The
-[configuration reference](reference-configuration.md) describes the key.
-
-Remanence has no command that adopts a tape of another geometry into a
-library's catalog. What you can do depends on what survives:
+Adoption records identity only. Other recovery options depend on what survives:
 
 - If this host's state directory survived, or you can restore it from a backup,
   and only the catalog was lost or damaged, you do not need adoption. Stop the
@@ -169,7 +153,7 @@ different ways:
    the same drive handle. The UUID you pass is compared with the UUID from this
    fresh read, not with discovery or catalog data.
 
-Both commands set the drive to fixed 1 MiB blocks with compression off for the
+Both commands set the drive to variable-block mode with compression off for the
 read, check that the drive accepted the setting, and afterwards restore and
 check the drive's previous mode. They then return the cartridge to the exact
 home slot. A failure to restore the mode or to return the cartridge fails the
@@ -642,7 +626,9 @@ and print a tape UUID as 32 hex digits without hyphens (`HEX`).
 | `command expected home slot 0xEXPECTED, but live inventory resolved 0xACTUAL` | The cartridge is not in the slot you named. | Check `rem library SERIAL --slots` and give the slot that holds it. |
 | `media in drive 0xBAY is not ready: ...` | The drive did not report the cartridge ready before the wait ended. | Check the drive and the cartridge before trying again. |
 | `tape adopt-bootstrap is blocked by active media-readiness fence ID ...` | An earlier readiness wait left a fence on the drive or the cartridge. | Inspect it with `rem tape quarantine show ID`, as the message says. |
-| `valid Bootstrap does not have canonical 1 MiB default parity adoption geometry` | The tape's block size or parity scheme is not the adoptable one, or its bootstrap records drive compression on. | See [Which tapes can be adopted](#which-tapes-can-be-adopted). |
+| `bootstrap adoption requires drive compression disabled: this tape was written with drive compression on` | The bootstrap records drive compression on. Remanence writes with drive compression off and cannot adopt such a tape. | See [Which tapes can be adopted](#which-tapes-can-be-adopted). |
+| `valid Bootstrap has invalid adoption geometry` | The bootstrap records an invalid block size or parity scheme. | See [Which tapes can be adopted](#which-tapes-can-be-adopted). |
+| `drive 0xBAY maximum block size MAX is smaller than Bootstrap block size SIZE` | A library drive cannot use the tape's recorded block size. | Use a library whose drives all support that size. |
 | `BOT is not adoptable: InvalidBot(...)` | The fresh read found no valid bootstrap; the text in parentheses gives the classification. | Probe the tape again and follow the table for its `physical_disposition`. |
 | `command expected tape UUID UUID, but BOT contains UUID` | The tape's UUID is not the one you passed. | Probe again and pass the UUID it reports. |
 | `tape provisioning conflict: bootstrap barcode Some("BARCODE") does not match any locked tape_pool_rule` | No `[[tape_pool_rules]]` entry matches the barcode. | Add a rule for it to the configuration. |

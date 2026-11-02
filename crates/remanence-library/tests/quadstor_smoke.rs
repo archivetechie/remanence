@@ -68,8 +68,7 @@ fn open_transport(path: &PathBuf) -> Box<dyn SgTransport> {
     // open_rw, not open: the smoke tests issue state-changing
     // CDBs (REWIND, MODE SENSE, WRITE) that need RW access.
     // LinuxSgTransport::open is reserved for read-only discovery
-    // paths and may open O_RDONLY internally — codex 20:30
-    // (idref=8915b570 Medium) caught the wrong constructor.
+    // paths and may open O_RDONLY internally.
     Box::new(
         LinuxSgTransport::open_rw(path).unwrap_or_else(|e| panic!("failed to open {path:?}: {e}")),
     )

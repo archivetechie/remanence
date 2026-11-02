@@ -244,7 +244,7 @@ pub fn execute_in(
     // after a partial data transfer (ILI on short read, EOM on write
     // — see IBM LTO SCSI Reference §4.12.1 / Table 17), and Layer 3a
     // needs the partial count. If resid is out of range we clamp to 0
-    // rather than synthesise a fake count. Codex bb10e63f.
+    // rather than synthesise a fake count.
     if (hdr.status & 0xFE) == STATUS_CHECK_CONDITION {
         let bytes_transferred = if hdr.resid < 0 || (hdr.resid as i64) > (dxfer_len as i64) {
             0
