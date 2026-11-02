@@ -1,449 +1,331 @@
-<!-- code-anchor: specs/publication tools/check_spec_versioning.py @ 6ed03ef0 -->
-# How These Formats Change — and What Never Does
+<!-- code-anchor: specs/publication specs/in-progress tools/check_spec_versioning.py .github/workflows/ci.yml @ 311cc6c3 -->
+# How the formats change
 
-*A plain-language companion to the versioning and revision policy of the
-Remanence format specifications. This document is informative. The policy
-itself lives in each specification's "Status of This Document" section
-(or ["Versioning and Change Policy"](../specs/in-progress/rem-parity-1-specification.md#versioning-and-change-policy)
-in the REM-PARITY preparing copy) and
-its Section 10 (or 8.1.1) versioning machinery; where this text and a
-specification disagree, the specification wins.*
+This page is for a reviewer of the Remanence format specifications, and for anyone who may
+one day read a Remanence tape without Remanence. It explains in plain language how the
+specifications may change, which changes are forbidden, and how each kind of change is
+numbered. The page is informative. The policy itself is in each specification: in the "Status
+of This Document" section of REM-OBJECT and REM-ENCRYPT, and in the "Versioning and Change
+Policy" section of the REM-PARITY revision in preparation. Where this page and a
+specification disagree, the specification is correct. The
+[versioning register](versioning-register.md) lists every versioned value, one entry each.
 
-## Why this page exists
+## Where the specifications stand
 
-An archive format makes an unusual promise. Most software promises to work
-today; an archive format promises that something written today will still be
-readable by someone else, on other equipment, a very long time from now.
+There are three format specifications. REM-OBJECT defines an archived object, REM-ENCRYPT
+defines the encrypted form of an object, and REM-PARITY defines how objects and their parity
+are laid out on a tape. All three are **review drafts**: published for comment, and not yet
+final. Comments close on 30 April 2027, and the documents **freeze** on 31 July 2027. The
+promises on this page take effect at the freeze. Until then a review finding can still change
+what goes on tape, so material written during the review window should be treated as
+re-writable, as the [status page](status.md) explains.
 
-That promise immediately raises an awkward question. Specifications are
-written by people, and people make mistakes. What happens when we find a
-typo? What happens when a sentence turns out to be ambiguous? What happens
-when someone needs a feature the format does not have? If the answer is
-"the specification never changes, ever", then the first typo we find lives
-forever, and the format can never grow. If the answer is "we change it when
-we need to", then the promise is worthless, because nobody can rely on a
-document that might mean something different next year.
+Each specification has two copies in the repository. The copy under `specs/publication/` is
+the published review text, and it is the one that governs. The copy under `specs/in-progress/`
+is the **preparing copy**: the next revision, assembled while review items are resolved, and
+not normative until it is published. For REM-PARITY the difference matters. The published
+copy describes an earlier tape layout, while current software writes and reads only the layout
+that the preparing copy describes. The status page explains
+[what that means for tapes written today](status.md#the-rem-parity-publication-copy).
 
-The resolution is to say, precisely and in advance, **which kinds of change
-are allowed, which are forbidden, and how each kind is labelled** — so that
-a reader holding any revision of the document knows exactly what may differ
-in any other revision. That set of rules is the versioning policy. This page
-explains it slowly, with examples. A companion page,
-[versioning-register.md](versioning-register.md), then lists every versioned
-component individually — one entry each, same questions answered every
-time.
+## Why a format needs a change policy
 
-## An analogy to hold on to: the building code
+An archive format makes an unusual promise. Most software promises to work today. An archive
+format promises that something written today can be read by someone else, on other equipment,
+decades from now.
 
-A building code changes every few years. And yet a house built legally in
-1990 does not become illegal when the 2020 edition of the code comes out.
-Everyone understands this without thinking about it: the house was built
-under the rules in force at the time, and it stays legal. New editions of
-the code bind new construction, not old houses.
+That promise raises a difficulty. Specifications are written by people, and people make
+mistakes. A typo will be found, a sentence will turn out to be ambiguous, and someone will
+need a feature the format lacks. If a specification may never change, the typo stays forever
+and the format cannot grow. If it may change whenever someone needs it to, nobody can rely on
+it, because the document might mean something different next year.
 
-Our formats work the same way:
+The way out is to say in advance which changes are allowed, which are forbidden, and how each
+kind is labelled. A reader holding any revision then knows what can differ in any other. That
+set of rules is the versioning policy.
 
-- A **tape** is like a house. Once written, it is built. Nothing we publish
-  later can make it retroactively wrong.
-- A **specification** is like the building code. It says what a correctly
-  built tape looks like.
-- A **reader** — the software that reads tapes back — is like a building
-  inspector. It examines a tape and decides what it holds.
+## An analogy: the building code
 
-The whole policy is about keeping three promises among those three parties.
-Everything else is detail.
+A building code is revised every few years, yet a house built legally in 1990 does not become
+illegal when the 2020 edition appears. It was built under the rules in force at the time, and
+new editions bind new construction, not old houses.
+
+The formats work the same way. A tape is like a house: once it is written, nothing published
+later can make it wrong. A specification is like the building code: it says what a correctly
+built tape looks like. A reader, the software that reads tapes back, is like a building
+inspector that examines a tape and decides what it holds. The policy is a set of promises
+among these three.
 
 ## The three promises
 
-**Promise one: a valid tape stays valid forever.** No future revision of any
-specification will ever declare an existing tape wrong. The house stays
-legal. This is the promise that makes the format archival at all.
+The first promise is that a valid tape stays valid. No later revision of a specification will
+declare an existing tape wrong. Without this promise the formats would be no use for an
+archive.
 
-**Promise two: newer readers read older tapes.** Software built from any
-future revision of the specification will read every tape written under any
-earlier revision, correctly. An inspector trained on this year's code
-still understands last decade's house.
+The second promise is that newer readers read older tapes. Software built from any later
+revision reads every tape written under an earlier one, correctly.
 
-**Promise three: older readers are never fooled by newer tapes.** This one
-is subtler, and it is where most format policies go wrong, so it deserves a
-story.
+The third promise is that older readers are never misled by newer tapes. It needs an example.
+Suppose that in 2032 the format gains a small optional feature, and a tape is written with it.
+In 2035 someone reads that tape with software built in 2030, which has never heard of the
+feature. Three things could happen:
 
-Suppose in 2032 the format gains a small optional feature, and a tape is
-written using it. In 2035 someone reads that tape with software built in
-2030 — software that has never heard of the feature. What happens?
+1. The old reader reads the tape correctly anyway and skips the part it does not understand.
+   This is called reading through. The formats are built to allow it: most new features go in
+   places that a reader is required to ignore when it does not recognise them.
+2. The old reader cannot use the tape, and says so clearly: the tape uses feature number 2,
+   which this software does not implement. The operator knows what is wrong and what to fetch.
+3. The old reader is confused. It misreads the tape, or it reports a healthy tape as blank or
+   damaged.
 
-There are three possibilities, and only two are acceptable:
+The policy forbids the third outcome. For an archive, a false report of damage does real harm
+because people believe it: a good tape is set aside or discarded because an old reader failed
+to understand it. Most of the rules about which changes are allowed exist to prevent this
+outcome.
 
-1. The old reader reads the tape correctly anyway, simply skipping over the
-   part it does not understand. This is called *reading through*, and the
-   format is deliberately built to make it possible: most new features are
-   carried in places old readers are instructed to ignore.
-2. The old reader cannot use the tape — but it says so clearly: "this tape
-   uses feature number 2, which I do not implement; obtain newer software."
-   The person standing at the drive knows exactly what is wrong and exactly
-   what to do.
-3. The old reader gets confused. It misreads the tape, or worse, reports
-   that the tape is blank or damaged when it is actually fine.
+## Three kinds of change
 
-The third outcome is the one we forbid absolutely. For an archive, a false
-"this tape is damaged" is close to the worst thing software can say,
-because people believe it. A perfectly good tape gets set aside, or
-discarded, because an old inspector condemned a house it merely failed to
-understand. Every rule in the policy about what changes are allowed comes
-down to preventing outcome three.
+Every revision of a specification is classified by three questions, asked in order. The first
+answer that applies decides the kind of change and how it is numbered.
 
-## The three kinds of change
+1. Does an existing tape or object become invalid, or does the meaning of anything already
+   written change? Then the change is a new major version.
+2. Would a reader built from an earlier revision lose the ability to recognise a newer tape
+   and refuse it cleanly? Then it is also a new major version.
+3. Does anything an implementation must do change, or is a new value assigned in one of the
+   specification's registries (the tables of assigned values described below)? Then it is a
+   minor revision, and it is allowed only under the conditions below.
 
-With the promises in place, every possible change to a specification falls
-into one of three kinds. They are checked in order, and the first one that
-applies decides how the change is labelled and published.
+Any other change is an erratum.
 
-### Errata — fixing the text without changing the rules
+### Errata: correcting the text
 
-An erratum corrects the document, not the format. A typo. A broken
-cross-reference. A sentence that two people read two ways, rewritten so it
-can only be read the one way that every existing implementation already
-behaves.
+An erratum corrects the document, not the format: a typo, a broken cross-reference, or an
+ambiguous sentence rewritten so that it can only be read the way conformant implementations
+already behave. After an erratum, no tape or object changes status and no software has to
+change. If a correction would make any implementation behave differently, it is not an
+erratum, however small the edit. Errata change the third number of the version, so 1.0.0
+becomes 1.0.1. In the analogy, an erratum is a reprint of the code book that fixes a misprint.
 
-The test for an erratum is strict: after the correction, **no tape changes
-status and no software has to change**. If fixing a sentence would oblige
-any implementation to behave differently, it is not an erratum, no matter
-how small the edit looks.
+The policy names one exception openly. A correction to the change-policy text itself is
+published as an erratum and flagged in the revision history as a policy correction. Without
+this exception, a defect in the policy's own wording could never be fixed. The flag makes
+every such correction visible to anyone who reads the history.
 
-Errata change the third number of the version: 1.0.0 becomes 1.0.1, then
-1.0.2. In the building-code analogy, this is reprinting the code book
-because page 40 had a misprint. Nobody's house is affected; no inspector
-changes their checklist.
+### Minor revisions: adding with care
 
-There is one special case, stated openly. If the *policy text itself* —
-the very rules this page describes — needs correcting, the correction is
-published as an erratum and flagged in the revision history as a **policy
-correction**. A policy that cannot correct its own wording would be frozen
-together with any defect in it, so the escape hatch is written down, kept
-narrow, and every use of it is labelled where anyone can see it — the
-revision histories show exactly when the rules themselves were touched, and
-why.
+A minor revision may add to the format, for example a new optional field or a newly approved
+encryption algorithm. It changes the middle number, so 1.0.x becomes 1.1.0. The policy allows
+a minor revision only if all three of these conditions hold:
 
-### Minor revisions — adding, carefully
+1. every tape written under an earlier revision of the same major version stays valid;
+2. a reader built from an earlier revision still reads correctly every tape that uses only the
+   features it knows, even a tape written yesterday by new software;
+3. when that reader meets a feature it does not implement, it recognises the tape and refuses
+   it with a typed error naming the unimplemented value, and it never misreads the tape or
+   mistakes it for damage.
 
-A minor revision may add to the format. A new optional field. A new
-recorded detail. A new algorithm choice for encryption. Minor revisions
-change the middle number: 1.0.x becomes 1.1.0.
+A minor revision whose new value older readers must refuse says so in its revision-history
+entry, so that nobody is surprised by it.
 
-But "adding" is only safe under conditions, and the policy states three.
-A minor revision is allowed only if:
+How can old software name a feature that did not exist when it was written? It does not need
+to know the feature, only where to look. Each format fixes in advance a few fields, at known
+positions, that hold feature numbers. An old reader can always read such a field, even when
+the value is new to it, and report the number: suite 2, not implemented here. Each
+specification also keeps a **registry** for these fields: a permanent table of every value
+ever assigned, with its meaning and the revision that defined it. The software reports the
+number, and a person looks it up in the registry of a later revision.
 
-1. **Every existing tape stays valid.** (Promise one, restated.)
-2. **Older readers still read everything they could read before** — a tape
-   that uses only the features an older reader knows about is read
-   perfectly by it, even if that tape was written yesterday by brand-new
-   software. New software must not sprinkle tapes with things that break
-   old readers for no reason.
-3. **When an older reader does meet a feature it lacks, it recognises the
-   situation and refuses cleanly** — with an error that names the
-   unimplemented value it found — rather than misreading anything or
-   mistaking the tape for a damaged one. Outcome two from the story above,
-   never outcome three.
+Two cases show how the conditions decide changes that look alike.
 
-A fair question at this point: how can old software name a feature that did
-not exist when the software was written? It cannot, and it does not need
-to. What the format fixes in advance is not the features but the *places
-where feature numbers live* — a handful of fields at known positions, set
-aside on day one. An old reader always knows where to look and what kind of
-number it is looking at, even when it has never seen the particular value.
-So it reports the number: "algorithm 2, not implemented here." The number
-alone is enough, because every specification carries a registry — a
-permanent table mapping each value ever assigned to its meaning and to the
-document revision that defined it. The software names the number; the
-registry, looked up later by a person, turns the number into a name. This
-is also the real reason the block-size case (below) must be a major: a tape
-at an unknown block size offers the old reader no field it can read at all,
-so there is no number to report, and no clean refusal is possible.
+A new encryption algorithm is allowed as a minor revision. REM-ENCRYPT records which
+key-derivation and encryption algorithms an object uses in a one-byte field, `suite_id`, and
+its registry has one value today, `0x01`. Suppose a later revision approves a second suite.
+Older software cannot open objects sealed with it, because nobody can read through
+cryptography they do not implement. The change is allowed anyway, because of how the failure
+happens. The suite number is stored unencrypted in the object's header, and REM-ENCRYPT
+requires a reader that meets an unassigned value to refuse the object with the error
+`InvalidSuite`. Nothing is misread, nothing is mistaken for damage, and the operator knows
+what software to obtain. All three conditions hold, and REM-ENCRYPT classifies such an
+assignment as a minor revision.
 
-Two real examples show how these conditions decide cases that look similar
-on the surface but are opposites underneath.
+A new block size is not allowed as a minor revision. A tape is written in fixed-size blocks,
+and REM-PARITY allows three sizes: 256 KiB, 512 KiB and 1 MiB. A reader that finds a tape
+without its catalog learns the block size by reading the
+[bootstrap](reference-glossary.md#bootstrap), the block at the start of every tape that
+describes it, at each of the three sizes in turn. If a revision added a fourth size, an old
+reader would try its three sizes, find nothing, and report that the tape has no bootstrap. To
+that reader, a tape at an unknown block size looks the same as a blank or destroyed one, so it
+cannot refuse the tape by name. That is the third outcome. The change fails the second
+question and could only be made in a new major version, which is why REM-PARITY declares the
+three sizes frozen for the life of its current major version.
 
-**Example that is allowed: a new encryption algorithm.** REM-ENCRYPT keeps
-a small table of approved algorithm combinations, each with a number.
-Suppose a future revision approves a new one, number 2. Objects encrypted
-with algorithm 2 cannot be opened by older software — you cannot "read
-through" cryptography you do not implement; that is the entire point of
-cryptography. So is this forbidden? No, because of how the failure happens.
-The envelope of an encrypted object states its algorithm number in plain
-sight, and the specification requires old readers to respond to an unknown
-number with a specific, named error: this object uses algorithm 2, which
-this software does not implement. Nothing is misread. Nothing is mistaken
-for damage. The operator knows exactly what to fetch. All three conditions
-hold, so approving a new algorithm is a minor revision — with one extra
-duty: because old readers genuinely cannot open the new objects, the
-revision must say so prominently in its revision history, so nobody is
-surprised.
+### Major versions: a new format beside the old one
 
-**Example that is forbidden as a minor: a new block size.** Tapes are
-written in fixed-size blocks, and REM-PARITY permits exactly three sizes.
-A reader that finds an unlabelled tape discovers its block size by simply
-trying each of the three. Now suppose a revision added a fourth size and a
-tape was written with it. An old reader tries its three sizes, finds
-nothing it recognises, and reports: no data found. It does not say "this
-tape uses a block size I do not know" — it *cannot* say that, because from
-where it stands an unreadable tape and a tape at an unknown block size look
-identical. That is outcome three: a healthy tape condemned as blank. The
-third condition fails, so a new block size can never be a minor revision.
-If it is ever truly needed, it must be the next kind of change.
+A major version is for changes that would break a promise: changing what an existing field
+means, removing something, or any change that would leave old readers misled instead of
+refusing cleanly, such as the fourth block size. A major version does not modify the existing
+format. It is a separate document defining a new format, and the old document stays in force
+for every tape written under it. In the analogy, the code for timber houses is not amended to
+cover steel towers. A separate steel code is written, and both stay on the shelf.
 
-### Major versions — a new format beside the old one
+A new major format also announces itself differently in the stored bytes. Each format begins
+with identifying bytes. A REM-PARITY bootstrap starts with fixed magic bytes followed by its
+`schema_major` number. A plaintext object starts with a header that names its format
+identifier, `rem-object-v1`. An encrypted object starts with the magic `REMO`, followed shortly
+by its `format_version`. A new major version changes these: a new `schema_major` or magic, a
+new format identifier such as `rem-object-v2`, or a new `format_version`. A reader of the old
+major sees bytes it does not recognise and refuses them, so it is not misled.
 
-A major version is for changes that break the promises: changing what an
-existing field means, removing something, or anything (like the fourth
-block size) that would leave old readers fooled rather than cleanly
-refusing.
-
-The policy's answer to such changes is blunt: they do not modify the
-existing format at all. They create a **new format that lives alongside the
-old one**, with its own specification document and its own marks on the
-wire. The family name stays, and the version count continues: the new
-document begins at 2.0.0, and the major number travels with the name
-everywhere — in the title, in the filename, in the archive record, and in
-the wire marks themselves — so the two documents can never be confused.
-The old specification remains in force, permanently, for every tape
-written under it. In the analogy: you do not amend the timber-frame building code to
-cover steel high-rises; you write a steel code, and both codes stay on the
-shelf, each governing its own buildings.
-
-The "own name on the wire" part matters. Every tape and object begins with
-identifying marks — magic bytes, format identifiers, a major number — and a
-new major format uses new marks. So an old reader meeting a new-format tape
-does not get subtly confused; it sees marks it does not recognise and says
-so. Even at the moment of the biggest possible change, outcome three is
-prevented.
-
-One practical note: a single program is allowed to implement two majors at
-once — the same binary can read both old-format and new-format tapes, the
-way one inspector can be certified under two codes. Each format's rules
-apply to the tapes written under it.
+One program may implement two major versions at once, in the way one inspector can be
+certified under two codes. It then follows each major's rules for the tapes and objects
+written under that major.
 
 ## Reading a version number
 
-Every document's version has three parts, always: **major.minor.errata**.
+A specification's version always has three parts, major.minor.erratum:
 
-- **1.0.0** — the first published revision of the 1.0 line.
-- **1.0.1** — the same rules, better text.
-- **1.1.0** — the format gained something, under the three conditions.
-- **2.0.0** — a different format, in a separate document, coexisting with
-  version 1 rather than replacing it.
+- 1.0.0 is the first revision of the 1.0 line;
+- 1.0.1 has the same rules as 1.0.0, in better text;
+- 1.1.0 adds to the format under the three conditions;
+- 2.0.0 would be the first revision of a different format, in a separate document beside
+  version 1.
 
-A revision still open for public comment carries a `-draft.N` suffix on that
-three-part core — it names the revision it anticipates and orders before it,
-without being that revision yet. All three specifications are there today,
-open for comment and each becoming 1.0.0 only once it is frozen; the `-draft.N`
-number climbs independently per document as review produces text changes.
-Those numbers name the published revisions; see
-[versioning-register.md](versioning-register.md#18-the-specification-documents)
-for current values and [specs/in-progress/README.md](../specs/in-progress/README.md)
-for revisions in preparation.
+A revision published for review before it is frozen carries a suffix `-draft.N` on that core,
+for example 1.0.0-draft.3. It names the revision it anticipates, and sorts before it. The
+draft number rises separately in each document as review changes its text. Entry 18 of the
+register gives the
+[current version of each document](versioning-register.md#18-the-specification-documents).
 
-The document's title and filename carry only the major line ("REM-PARITY
-Format", file `rem-parity-1-specification.md`), so filenames never churn
-with small revisions; the full three-part number lives in the document's
-own header table.
+A document's title carries its version line, 1.0, and its file name carries only the major
+number, as in `rem-parity-1-specification.md`. File names therefore do not change with small
+revisions. The full three-part version is in the status table at the head of each document.
 
-## The test vectors — evidence that never moves
+<a id="the-test-vectors--evidence-that-never-moves"></a>
 
-Alongside the specifications we publish **test vectors**: a pinned archive
-of worked examples. It contains complete miniature tape images — healthy
-ones, and ones with deliberate damage at recorded positions — together
-with the answers a correct implementation must produce for each: what is
-recovered, what is reported, which checksums result. This is what
-"conformant" means in practice. It is not our opinion of your software; it
-is whether your software, given these inputs, produces these answers.
+## The test vectors never change
 
-The archive is published with a checksum of its own, and every document
-that relies on it quotes that checksum. Anyone can therefore confirm they
-hold exactly the material the specifications mean — not a near copy, not a
-newer copy, the bytes themselves.
+Beside the specifications the project publishes **test vectors**: worked examples, with the
+answers a correct implementation must give. The archive `remanence-test-vectors.tar` holds
+small complete objects and tape images, some healthy and some damaged at recorded positions,
+each with its expected result: what is recovered, which error is reported, which checksums
+come out. An implementation conforms when it produces those answers from those inputs.
 
-Vectors get one rule of their own, and it is the strictest in the whole
-policy: **a published vector archive is never changed and never replaced.**
-It is the permanent evidence of what its revision meant. If a later
-revision could quietly amend the worked examples, then "conformant" would
-quietly change meaning with it, and every implementation ever tested
-against the old examples would hold a claim that no longer says anything.
-So the rule runs one way only: a future revision that needs new examples —
-say, for a newly assigned feature — publishes an *additional* archive with
-its own checksum and cites it separately. The old archive keeps anchoring
-the old revision, forever, and nothing that quotes its checksum ever needs
-updating.
+The archive is identified by its SHA-256 digest, and every specification that relies on it
+quotes the digest. Anyone can check that they hold exactly the bytes the specifications mean.
 
-The same rule settles disagreements. When an implementation and a vector
-disagree, the vector wins — unless the *specification text* is shown to
-contradict the vector, in which case something deeper is wrong and the
-revision process above decides what kind of correction is required. What
-is never done is "fixing" a vector to match the software that failed it.
-An anchor you may drag when it inconveniences you is not an anchor.
+The vectors have the strictest rule in the policy: a published vector archive is never
+changed and never replaced. If a later revision could amend the examples, "conformant" would
+change meaning with them, and every implementation tested against the old examples would hold
+a claim that no longer said anything. A revision that needs new examples publishes an
+additional archive, a supplement with its own name and digest, and cites it separately.
+Changing the expected result of an existing entry needs at least a minor revision, and an
+erratum may not alter any entry (REM-OBJECT §14).
 
-And if a published example itself turns out to be wrong — the recorded
-answer does not follow from the specification text? The archive still does
-not change. The text, not the example, is the fixed point. A revision
-records the defective entry in its revision history and publishes a
-corrected example in its own archive; the wrong entry stays where it is,
-marked superseded, the way a journal publishes a correction citing last
-year's issue rather than rewriting it. A visibly wrong vector on the
-record is harmless; a silently repaired one would put every past
-conformance claim in doubt.
+When an implementation disagrees with a vector, the implementation is presumed wrong, because
+the vectors are the text's published answers. If the text itself turns out to contradict a
+vector, the text is the fixed point, and the change policy decides what kind of correction the
+text or the vectors need. A vector is never edited to match software that failed it.
 
-Does correcting an example strip conformance from software that passed the
-old one? No, because conformance was never to the examples. It is to the
-text of a named revision; the examples are how you test it, and a
-defective example means the test was faulty, not the definition. Software
-that followed the text was conformant all along — it had been failing a
-broken test — and software that matched the defective answer never was:
-the correction exposes that rather than causing it, and the revision
-history names the entry so anyone can check whether a past validation
-leaned on it. Where the old answer was defensible because the text itself
-was ambiguous, that is handled as an ambiguity, not a defect — the
-clarifying revision changes an obligation, so it is at least a minor, and
-a claim of conformance to the earlier revision remains true as a statement
-about that revision.
+One consequence can look like an error. The published archive contains REM-PARITY tape images
+whose bootstraps carry `schema_major` 1, at `schema_minor` values 2 and 3, because they were
+generated for the earlier tape layout. They are correct examples of that layout, which the
+published REM-PARITY copy describes, and current software rejects them because it reads only
+`schema_major` 2. The vectors for the layout in the preparing copy exist as review-only
+candidates. They are kept apart from the published archive until that revision is frozen and
+publishes an archive of its own.
 
-Gaps in coverage are the simplest case of all. If we later realise the
-examples never tested some behaviour, the fix is purely additive: a
-supplement archive with new examples and its own checksum, cited by the
-revision that adds it, while everything already published stays untouched.
-If the untested behaviour was already required by the text, nothing any
-implementation must do has changed — the test simply exists now — so the
-supplement rides with an erratum. If writing the test shows the text never
-actually decided the behaviour, that is an ambiguity to settle, and at
-least a minor. Either way, an implementation that fails a new test was
-already failing the text; the gap was hiding it, which is exactly why
-filling gaps is when quiet defects tend to surface.
+## A tape does not record which revision wrote it
 
-One consequence is worth knowing so it does not look like an error: a
-vector archive can legitimately contain examples with different wire
-values — the current archive holds bootstrap images at feature generations
-2 and 3, because the format advanced while the examples were being
-generated. Each is a correct example of what it shows. The registry, not
-the archive, says which values are current
-([the register](versioning-register.md) lists every one).
+Nothing on a tape says "written under revision 1.0.0". The specifications leave it out on
+purpose, because a reader never needs it. The second promise means that any later reader reads
+any older tape. The conditions on minor revisions mean that an older reader either reads a
+newer tape correctly or refuses it, naming the value it lacks. In every case what matters is
+which features a tape uses, and the tape announces those itself. Which edition of the text its
+writer had is never needed. Houses are not stamped with the edition of the building code
+either; what matters is the wiring found in the wall.
 
-## The tape does not know which document wrote it — on purpose
+What a tape carries instead are a few small numbers in its stored bytes, each naming a feature
+generation. The bootstrap carries `schema_major` and `schema_minor`. A plaintext object
+carries its format identifier, its stream schema version and its manifest schema version. An
+encrypted object carries its `format_version`, `suite_id` and `wrap_suite`. Each
+specification's registry lists every value of these fields that has been assigned, with its
+meaning and the revision that defined it.
 
-Here is the part that surprises people, and the reason it should not.
+The registry connects a stored number to the text without any arithmetic between the two.
+There is no rule such as "revision 1.1 means value 4". A revision assigns a new value only when
+it changes what can be stored, and it names itself in the registry row when it does. Most
+revisions, every erratum among them, assign nothing.
 
-Nothing on a tape records "I was written under specification revision
-1.0.0." We considered it, and rejected it, for a simple reason: **you never
-need it to read the tape.** Promise two says any future reader reads any
-older tape, and the conditions on minor revisions say any older reader
-handles any newer tape correctly or refuses it cleanly by feature name. In
-every case, what you need to know is *which features the tape uses* — and
-those are announced by the tape itself — never *which edition of the text
-its writer happened to have on the shelf*. Houses are not stamped with the
-edition of the code they were built under either; what matters is the
-wiring you actually find in the wall.
+## A found cartridge
 
-What the tape carries instead are a few small **wire numbers**, each
-announcing a feature generation. For the tape layout there is a pair of
-numbers in every bootstrap block (the tape's self-description block); for
-objects there is a format identifier and a couple of small schema fields;
-for encryption there are the algorithm numbers described earlier. Each
-specification contains a **registry** for its numbers: a table listing every
-value ever assigned, what it means on the wire, and which document revision
-defined it.
+The formats are designed around one scenario. A few cartridges turn up that were never
+migrated with the rest. The system that wrote them was retired years ago, and nobody kept its
+catalog.
 
-The registry is the bridge between the two worlds. It is how a wire number
-leads you to text, without the two ever being arithmetically linked. There
-is no rule like "document 1.1 means wire value 4". A document revision
-assigns a new wire value only when it actually changes what can appear on
-tape, and it writes itself into the registry row when it does. Most
-revisions of a document — every erratum, and any minor that only adjusts
-obligations — assign nothing at all.
+1. Reader software, built from whatever revision is current by then, loads a tape and finds
+   the bootstrap. The second promise says this works whichever revision wrote the tape.
+2. The bootstrap describes the tape's structure, and its numbers name the feature generations
+   in use. The reader either understands them all and reads the tape, or names what it lacks.
+3. A person who wants to check the tape against the text uses the registry in the current
+   revision, which names the revision that defined each value found on the tape.
+4. That person retrieves the exact text of that revision. Each specification has a reserved
+   concept DOI (a Digital Object Identifier, a permanent citation that resolves to an archived
+   record), and the policy is to deposit every published revision under it with a DOI of its
+   own. No revision has been deposited yet. Until the first deposits are published, a revision
+   is identified by its version string and the repository commit that holds it.
+5. The specifications are written so that a tape's arithmetic can be checked from the text
+   alone, and the test vectors let that person check their own tools against known-good
+   material. Once the deposits exist, none of these steps depends on the project still
+   existing.
 
-## The found-cartridge walkthrough
+The specifications therefore have DOIs of their own, separate from the software's. The code is
+useful, but the promises are carried by the documents, and each revision is to have its own
+permanent record so that a citation such as "REM-PARITY 1.0.0" names one exact text.
 
-Put it all together with the scenario the formats are designed around: a
-few cartridges turn up that were never migrated with the rest. The archive
-system that wrote them was retired years ago, and nobody kept its catalog.
-What happens?
+## Three documents, and how they cite each other
 
-1. The reader software — built from whatever revision is then current —
-   loads the tape and finds a bootstrap block. Promise two says this works
-   regardless of which revision wrote the tape.
-2. The bootstrap announces the tape's structure, and its wire numbers
-   announce the feature generations in use. The reader either understands
-   everything (and reads the tape), or names precisely what it lacks.
-3. Suppose a human wants to go deeper — to check the tape against the
-   actual specification text. The registry in the current document tells
-   them which revision defined each wire value they are seeing.
-4. Every published revision of every document is archived with a **DOI** —
-   a Digital Object Identifier, the same permanent-citation system used by
-   scientific journals. A DOI is like an ISBN that also promises the
-   content is stored, unchanged, by an archival service. Each document has
-   one DOI naming the document as a whole (all revisions) and one per
-   revision. A new major version, being a separate document, starts a
-   separate DOI series of its own — deliberately, so that someone holding a
-   generation-1 tape who follows the generation-1 document's DOI always
-   lands on text that governs their tape, and is never silently redirected
-   across a compatibility break. The reader resolves the DOI and holds
-   the exact frozen text.
-5. The specification, by design, contains everything needed to verify the
-   tape's mathematics from the text alone, and the published test vectors
-   let them check their tools against known-good material. None of this
-   requires us to still exist.
+There are three specifications because they describe three layers that can be used apart.
+REM-OBJECT defines an object, which can be stored on any medium. REM-ENCRYPT defines the
+encrypted form of an object. REM-PARITY defines a tape layout and treats the objects it holds
+as opaque bytes. Each document has its own version and its own registries.
 
-Step 4 is also why the specifications are archived *separately* from the
-software. The code is useful; but the promise is carried by the documents,
-and they get their own permanent records so that citing "REM-PARITY 1.0.0"
-means one exact, immutable text.
-
-## Why three documents, and how they refer to each other
-
-There are three specifications — the object format, the encryption profile,
-and the tape/parity format — because they answer at different rates and can
-fail independently. Each carries its own version and its own registries.
-
-They do cite each other, and the citations are written to survive
-revisions. Each reference says, in effect: "version 1.0 *or any later 1.x
-revision* — interchangeable for our purposes, because of the promises
-above — and for the record, this text was published against revision
-1.0.0." The first half means a small revision in one document never forces
-paper churn in the other two. The second half preserves the historical
-fact of exactly which text sat beside which.
+The documents cite each other in a form that survives revisions. A citation reads, in effect,
+"version 1.0 or any later 1.x revision; this revision was published against 1.0.0". The first
+half means that a small revision of one document never forces a revision of the others,
+because the promises make any 1.x revision as good as another for the citing document. The
+second half records which text sat beside which.
 
 ## Who keeps these promises
 
-No standards body stands behind any of this. There is no ISO number and no
-RFC; the same people wrote the specifications and the software, and the
-promises above are our own undertaking. We say that plainly in every
-document, because the words "final" and "frozen" usually imply a committee
-somewhere, and here there is none.
+No standards body has reviewed or adopted the specifications. There is no ISO number and no
+RFC. The same people wrote the specifications and the software, so the promises are the
+project's own undertaking, and each specification says so. The words "final" and "frozen"
+usually imply a committee somewhere, and here there is none.
 
-What we offer instead of authority is checkability. The promises are narrow
-enough to test: the conformance vectors are published and pinned by
-checksum, and the arithmetic in the specifications can be re-derived from
-the text alone, so the central claims never rest on trusting us.
+What the project offers instead is that the promises can be checked. The test vectors are
+published and identified by their digest, and the arithmetic in the specifications can be
+re-derived from the text alone. A reader does not have to trust the project to test its
+central claims.
 
-The documents themselves are held to the same standard. Prose that must
-stay consistent across three specifications will drift if consistency
-depends on care alone — that is true of documentation everywhere — so it
-does not depend on care here. An automated check runs on every change to
-the documents: the change policy must read identically in all three,
-every version number in a document must agree with itself, revision
-histories must stay in order, and every appendix cross-reference must
-resolve. Section 1 of each specification must also contain exactly one
-statement of what it covers, in the same words in all three (the published
-revisions that predate it excepted). If any of that slips, the
-build fails before a reader ever sees the inconsistency.
+The documents are also checked by machine, because prose kept consistent by hand across three
+documents drifts. On every push, the repository's continuous integration runs
+`tools/check_spec_versioning.py`. It fails the build if the change-policy text differs between
+the three specifications, if a document's version strings disagree with each other, if the
+vector-archive digest is quoted differently anywhere, if a revision history is out of order,
+or if a section or appendix reference does not resolve. It also checks that each
+specification's statement of what it covers reads the same in all three, except in the
+published revisions that predate that statement, and that a version string recorded as
+deposited is never reused for different bytes.
 
 ## In plain terms
 
-The specification is a rule book; a tape is a thing built under it. We
-promise that nothing built legally ever becomes illegal, that future
-inspectors will always understand old buildings, and that old inspectors
-will never condemn a new building they merely fail to understand — the
-worst they will ever say is "this uses something newer than I am; here is
-its name." Small reprints fix words and change nothing else. Additions are
-allowed only when they cannot fool anyone. Anything bigger becomes a new
-rule book with a new name, and the old one stays in force for its own
-buildings forever. The buildings are never stamped with a rule-book
-edition; instead, every feature on them is listed in a registry that names
-the edition which introduced it, and every edition is permanently on file
-where anyone can retrieve it.
+A specification is a rule book, and a tape is something built under it. The project promises
+that nothing built legally becomes illegal, that future inspectors will understand old
+buildings, and that old inspectors will never condemn a new building they do not understand.
+The most an old inspector will say is "this uses something newer than I know, and here is its
+number". Reprints fix wording and change nothing else. Additions are allowed only when they
+cannot mislead anyone. Anything larger is a new rule book, and the old one stays in force for
+its own buildings. Buildings are not stamped with an edition of the rule book; each feature
+they use is listed in a registry that names the edition that introduced it. These promises
+take effect when the review drafts freeze on 31 July 2027.
