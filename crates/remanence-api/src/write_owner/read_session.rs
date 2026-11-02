@@ -159,8 +159,49 @@ pub(super) fn handle_drive_open_read(
         daemon_epoch,
     );
     if reply.send(Ok(open_reply)).is_err() {
-        // No changer reservation or MOVE is owned here. Leave the cartridge
-        // seated; a drive-only compensation would strand it unthreaded.
+        // As on ordinary close, leave the tape seated and let idle dismount
+        // own UNLOAD plus MOVE. No session was registered by the lost caller.
+        record_session_close_snapshot(
+            index,
+            cfg,
+            drive,
+            drive_uuid.clone(),
+            session_id,
+            tape_uuid,
+            snapshot_misses,
+        );
+        if let Err(error) = record_session_event(
+            index,
+            cfg,
+            SessionAuditInput {
+                session_id,
+                session_kind: "read",
+                event: AuditEvent::SessionClosed,
+                tape_uuid: Some(tape_uuid),
+                library_serial: Some(library_serial.clone()),
+                drive_bay: Some(bay),
+                drive_uuid,
+                drive_serial,
+                abort_reason: Some("read open reply receiver disappeared".into()),
+            },
+        ) {
+            tracing::error!(bay, %error, "failed to audit cancelled read open close");
+        }
+        if let (Some(lifecycle), Some(home_slot)) = (&cfg.lifecycle, source_slot) {
+            let parked = lifecycle.park_cartridge(crate::drive_pool::SeatedCartridge {
+                bay,
+                library_serial,
+                barcode,
+                home_slot,
+                tape_uuid: Some(tape_uuid),
+                prior_session_id: Some(session_id),
+            });
+            if let Some(sender) = &lifecycle.timer_park_tx {
+                if sender.send(parked).is_err() {
+                    tracing::error!(bay, "cancelled read open could not arm idle dismount");
+                }
+            }
+        }
         tracing::warn!(
             bay,
             "read open reply receiver disappeared; cartridge stays seated"

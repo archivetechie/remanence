@@ -145,8 +145,15 @@ elif [[ -n "$failed" ]]; then
 fi
 if [[ -n "$failed" || -n "$interrupted" ]]; then
   echo "run.sh: === diagnostics ($reason)"
-  "$scripts/33-diag-capture.sh" --note "run.sh teardown: $reason" ||
+  # Teardown ignores TERM, so use SIGKILL to enforce this last diagnostic
+  # deadline and always reach the daemon stop that returns cartridges home.
+  diag_rc=0
+  timeout --foreground --signal=KILL 300 "$scripts/33-diag-capture.sh" --note "run.sh teardown: $reason" || diag_rc=$?
+  if (( diag_rc == 124 || diag_rc == 137 )); then
+    fieldtest_evidence_record run teardown-diagnostics WARN "diagnostics cut after the 300s deadline; continuing to daemon stop"
+  elif (( diag_rc != 0 )); then
     echo "run.sh: diagnostics capture failed (continuing)"
+  fi
 fi
 echo "run.sh: === returning cartridges and stopping the daemon"
 "$scripts/03-bringup.sh" --stop || echo "run.sh: 03-bringup.sh --stop failed; check the library and the daemon by hand"

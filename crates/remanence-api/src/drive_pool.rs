@@ -117,6 +117,11 @@ impl Drop for DismountGuard {
 }
 
 impl DrivePoolLifecycle {
+    /// Register seated media even when no caller received its new session.
+    pub(crate) fn park_cartridge(&self, seated: SeatedCartridge) -> ParkedCartridge {
+        park_cartridge(&self.parked, seated)
+    }
+
     /// Serialize the final pre-UNLOAD decision with shutdown admission.
     pub(crate) fn begin_dismount(&self, key: &DriveKey) -> Result<DismountGuard, Status> {
         let mut active = self.dismounts.lock().unwrap();
@@ -148,6 +153,25 @@ impl DrivePoolLifecycle {
             ..Self::default()
         }
     }
+}
+
+/// Share parked generations between actor compensation and ordinary closes.
+fn park_cartridge(parked: &Mutex<ParkedState>, seated: SeatedCartridge) -> ParkedCartridge {
+    let mut state = parked.lock().unwrap_or_else(|err| err.into_inner());
+    if let Some(parked) = state.by_drive.get(&seated.drive_key()) {
+        if parked.seated == seated {
+            return parked.clone();
+        }
+    }
+    state.next_generation = state.next_generation.wrapping_add(1).max(1);
+    let parked = ParkedCartridge {
+        seated,
+        generation: state.next_generation,
+    };
+    state
+        .by_drive
+        .insert(parked.seated.drive_key(), parked.clone());
+    parked
 }
 
 /// Render the reservation identity consistently for pool and actor updates.
@@ -568,21 +592,7 @@ impl DrivePool {
     }
 
     pub(crate) fn park_cartridge(&self, seated: SeatedCartridge) -> ParkedCartridge {
-        let mut state = self.parked.lock().unwrap_or_else(|err| err.into_inner());
-        if let Some(parked) = state.by_drive.get(&seated.drive_key()) {
-            if parked.seated == seated {
-                return parked.clone();
-            }
-        }
-        state.next_generation = state.next_generation.wrapping_add(1).max(1);
-        let parked = ParkedCartridge {
-            seated,
-            generation: state.next_generation,
-        };
-        state
-            .by_drive
-            .insert(parked.seated.drive_key(), parked.clone());
-        parked
+        park_cartridge(&self.parked, seated)
     }
 
     pub(crate) fn parked_at(&self, drive: &DriveKey) -> Option<ParkedCartridge> {

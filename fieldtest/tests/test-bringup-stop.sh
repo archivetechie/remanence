@@ -44,7 +44,7 @@ args = sys.argv[1:]
 mode = os.environ["INVENTORY_MODE"]
 with open(os.environ["EVENTS_FILE"], "a") as events:
     events.write(json.dumps(args) + "\\n")
-if mode in ("hang-top", "hang-phase") or (mode == "hang-unload" and args[0] == "drive"):
+if mode == "hang-top" or (mode in ("hang-phase", "hang-unload") and args[0] == "drive"):
     with open(os.environ["REMFIELD_HOME"] + "/hung-pids", "a") as pids:
         pids.write(str(os.getpid()) + "\\n")
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -60,6 +60,8 @@ if args[0] == "top":
         sys.exit(0)
     print(open(os.environ["TOP_FIXTURE"]).read())
 elif args[:2] == ["drive", "unload"]:
+    if mode == "slow-bays":
+        time.sleep(1.3)
     assert args[args.index("--library") + 1] == "SELECTED", args
     assert "--dest" not in args, args
     bay = args[args.index("--bay") + 1]
@@ -93,8 +95,12 @@ if foreground:
     args.pop(0)
 assert args[0] == "--signal=KILL", args
 limit = int(args[1])
-assert limit in (60, 1080, 1140), args
+with open(os.environ["REMFIELD_HOME"] + "/timeouts", "a") as log:
+    log.write(str(limit) + "\\n")
+assert limit in (60, 1080, 2220, 3300), args
 mode = os.environ["INVENTORY_MODE"]
+if mode == "slow-bays":
+    args[1] = "4" if args[2] == "bash" else "2"
 if mode == "hang-phase":
     if args[2] == "bash":
         args[1] = "1"
@@ -114,22 +120,38 @@ os.execv("/usr/bin/timeout", ["timeout", *(["--foreground"] if foreground else [
              ("graceful", "08", "PASS", "no-close"),
              ("graceful", "08", "PASS", "hang-top"),
              ("graceful", "08", "PASS", "hang-unload"),
-             ("graceful", "08", "PASS", "hang-phase")]
+             ("graceful", "08", "PASS", "hang-phase"),
+             ("graceful", "08", "PASS", "slow-bays"),
+             ("graceful", None, "PASS", "default-300"),
+             ("graceful", None, "PASS", "default-7"),
+             ("graceful", None, "PASS", "default-legacy")]
     for mode, timeout, status, inventory_mode in cases:
         home = root / f"{mode}-{inventory_mode}"
         home.mkdir()
         ready = home / "ready"
-        (home / "config.toml").write_text("[daemon]\ndefault_idle_timeout_seconds = 120\n")
+        config = "[daemon]\ndefault_idle_timeout_seconds = 120\n"
+        if inventory_mode != "default-legacy":
+            config += f"changer_not_ready_wait_seconds = {7 if inventory_mode == 'default-7' else 300}\n"
+        (home / "config.toml").write_text(config)
         (home / "state").mkdir()
         (home / "state/selected-library").write_text("SELECTED\n")
         (home / "allowlist.txt").write_text("ALLOW1\nALLOW2 # test failure\nCLN:CLN001\n")
         (home / "bin").mkdir()
         (home / "bin/rem").symlink_to(rem)
         events = home / "events"
-        env = dict(os.environ, REMFIELD_HOME=str(home), FIELDTEST_LOCK_HELD="1",
-                   REMFIELD_STOP_TIMEOUT_SECONDS=timeout, STOP_MODE=mode,
-                   TOP_FIXTURE=str(scripts.parent / "tests/fixtures/stop-top.json"),
+        fixture = scripts.parent / "tests/fixtures/stop-top.json"
+        if inventory_mode == "slow-bays":
+            payload = json.loads(fixture.read_text())
+            for library in payload["data"]["libraries"]:
+                library["drives"] = [drive for drive in library["drives"] if drive.get("element_address") != 258]
+            fixture = home / "top.json"
+            fixture.write_text(json.dumps(payload))
+        env = dict(os.environ, REMFIELD_HOME=str(home), FIELDTEST_LOCK_HELD="1", STOP_MODE=mode,
+                   TOP_FIXTURE=str(fixture),
                    READY_FILE=str(ready), EVENTS_FILE=str(events), INVENTORY_MODE=inventory_mode, PATH=f"{bin_dir}:{os.environ['PATH']}")
+        env.pop("REMFIELD_STOP_TIMEOUT_SECONDS", None)
+        if timeout is not None:
+            env["REMFIELD_STOP_TIMEOUT_SECONDS"] = timeout
         process = subprocess.Popen([str(daemon), "--config", str(home / "config.toml")], env=env)
         try:
             deadline = time.monotonic() + 5
@@ -148,29 +170,42 @@ os.execv("/usr/bin/timeout", ["timeout", *(["--foreground"] if foreground else [
             assert sequence[-1] == "TERM", sequence
             calls = [json.loads(line) for line in sequence[:-1]]
             unloads = [call for call in calls if call[:2] == ["drive", "unload"]]
-            if inventory_mode in ("valid", "busy", "failed-close", "no-close", "hang-unload"):
+            if inventory_mode in ("valid", "busy", "failed-close", "no-close", "hang-unload", "slow-bays") or inventory_mode.startswith("default-"):
                 expected = ["256", "256", "256", "258", "260"] if inventory_mode == "busy" else ["256", "258", "260"]
+                if inventory_mode == "slow-bays":
+                    expected = ["256", "260"]
                 assert [call[call.index("--bay") + 1] for call in unloads] == expected, calls
                 unload_records = [row for row in records if row["test_id"].startswith("stop-unload-")]
                 expected_status = ["PASS", "WARN", "PASS"]
+                if inventory_mode == "slow-bays":
+                    expected_status = ["PASS", "PASS"]
+                    assert (home / "timeouts").read_text().splitlines() == ["60", "2220", "1080", "1080"]
                 if inventory_mode in ("failed-close", "no-close"):
                     expected_status[0] = "WARN"
                 if inventory_mode == "hang-unload":
                     expected_status = ["WARN"] * 3
                 assert [row["status"] for row in unload_records] == expected_status, unload_records
-                assert "bay 258" in unload_records[1]["summary"]
+                if inventory_mode != "slow-bays":
+                    assert "bay 258" in unload_records[1]["summary"]
                 assert all(Path(row["detail_path"]).is_file() for row in unload_records)
-                if inventory_mode != "hang-unload":
+                if inventory_mode not in ("hang-unload", "slow-bays"):
                     assert "injected unload refusal" in Path(unload_records[1]["detail_path"]).read_text()
+            elif inventory_mode == "hang-phase":
+                assert len(unloads) == 1, calls
+                assert any(row["test_id"] == "stop-unload-phase" and row["status"] == "WARN" for row in records), records
             else:
                 assert not unloads, calls
                 assert any(row["test_id"] in ("stop-inventory", "stop-unload-phase") and row["status"] == "WARN" for row in records), records
             record = next(row for row in records if row["test_id"] == "stop")
             assert record["status"] == status, record
             assert record["duration_seconds"] >= 2, record
+            expected_timeout = int(timeout) if timeout is not None else {"default-300": 420, "default-7": 127, "default-legacy": 720}[inventory_mode]
+            assert record["timeout_seconds"] == expected_timeout, record
             if status == "WARN":
                 assert "rem top --once" in record["summary"]
-                assert "rem tape quarantine list" in record["summary"]
+                assert "unthreaded in its drive" in record["summary"]
+                assert "library's front panel" in record["summary"]
+                assert "manual LOAD may be needed" in record["summary"]
                 assert process.returncode == -9
             else:
                 assert process.returncode == 0
@@ -178,5 +213,10 @@ os.execv("/usr/bin/timeout", ["timeout", *(["--foreground"] if foreground else [
             if process.poll() is None:
                 process.kill()
                 process.wait()
+    # Exercise the actual generator, not a copy of its TOML text.
+    subprocess.run(["bash", "-c", 'source "$1/lib.sh"; fieldtest_write_config "$2/config.toml" SELECTED',
+                    "test-config", str(scripts), str(root)], env=dict(os.environ, REMFIELD_HOME=str(root)), check=True)
+    import tomllib
+    assert tomllib.loads((root / "config.toml").read_text())["daemon"]["changer_not_ready_wait_seconds"] == 300
 print("PASS: stop unloads only selected allowlisted media before TERM; failures warn; graceful and forced waits are evidenced")
 PY
