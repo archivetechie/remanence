@@ -113,6 +113,18 @@ pub struct AuthoritySnapshot {
     finalization: Option<AuthorityFinalization>,
 }
 impl AuthoritySnapshot {
+    /// Native session and media authority at this immutable log prefix.
+    pub fn tape_summary(&self) -> &TapeSummary {
+        self.raw.summary()
+    }
+
+    /// Stream the last durable ending's tail without retaining its file list.
+    pub fn visit_session_tail(
+        &self,
+        visitor: &mut dyn FnMut(&TailFile) -> Result<(), StateError>,
+    ) -> Result<(), StateError> {
+        bridge(|v| self.raw.visit_last_session_tail(v), visitor)
+    }
     /// Validated closing log sequence and incarnation, distinct from barrier count.
     pub fn log_reference(&self) -> (u64, u64) {
         (self.raw.summary().last_closed_sequence, 1)
@@ -449,6 +461,146 @@ pub struct TapeAuthorityLease {
     read_cache: Arc<Mutex<Option<Snapshot>>>,
 }
 impl TapeAuthorityLease {
+    /// Publish the proved session boundary before the first object dispatch.
+    /// The store preflights the transition and poisons ambiguous publication.
+    pub fn open_session(
+        &mut self,
+        session_id: [u8; 16],
+        opened_at_utc: String,
+    ) -> Result<(), StateError> {
+        self.ensure_abandonment_allowed()?;
+        self.with_store(|core| {
+            let s = core.summary();
+            let record = Record::SessionOpened(SessionOpened {
+                session_id,
+                incarnation: s.incarnation,
+                base_media_sequence: s
+                    .last_media_commit
+                    .ok_or_else(|| invalid("session before bootstrap"))?,
+                cursor: SessionCursor {
+                    partition: s.cursor.partition,
+                    lba: s.cursor.lba,
+                    next_file: s.next_file,
+                },
+                opened_at_utc,
+            });
+            let group = core.prepare()?;
+            core.append(group.close(&record)?)?;
+            Ok(())
+        })?;
+        self.session_id = Some(session_id);
+        Ok(())
+    }
+
+    /// End a settled session with the exact dispatched suffix, streamed into a
+    /// disk-backed group. No media command is issued by authority publication.
+    pub fn end_session(
+        &mut self,
+        session_id: [u8; 16],
+        ended_at_utc: String,
+        reason: SessionEndReason,
+        crash_ack_audit_sequence: Option<u64>,
+        tails: impl IntoIterator<Item = Result<TailFile, StateError>>,
+    ) -> Result<(), StateError> {
+        self.ensure_abandonment_allowed()?;
+        self.with_store(|core| {
+            let s = core.summary();
+            let mut group = core.prepare()?;
+            let mut count = 0u64;
+            for tail in tails {
+                count = count
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("session tail count overflow"))?;
+                group.push(
+                    &Record::PayloadContinuation(Continuation {
+                        group: group.sequence(),
+                        chunk: Chunk::TailFile(tail?),
+                    }),
+                    &[],
+                )?;
+            }
+            let record = Record::SessionEnded(SessionEnded {
+                session_id,
+                incarnation: s.incarnation,
+                base_media_sequence: s
+                    .last_media_commit
+                    .ok_or_else(|| invalid("session before bootstrap"))?,
+                cursor: SessionCursor {
+                    partition: s.cursor.partition,
+                    lba: s.cursor.lba,
+                    next_file: s.next_file,
+                },
+                ended_at_utc,
+                reason,
+                tail: group.reference(0),
+                tail_file_count: count,
+                crash_ack_audit_sequence,
+            });
+            core.append(group.close(&record)?)?;
+            Ok(())
+        })?;
+        self.session_id = None;
+        Ok(())
+    }
+
+    /// Publish a successfully barriered ordinary short sidecar. Finalization
+    /// continues to publish its planned sidecar through TerminalPrefix.
+    pub fn publish_closed_out(
+        &mut self,
+        operation_id: [u8; 16],
+        session_id: Option<[u8; 16]>,
+        publication: &FilePublication,
+        completed_at_utc: String,
+    ) -> Result<(), StateError> {
+        self.ensure_abandonment_allowed()?;
+        self.with_store(|core| {
+            let s = core.summary();
+            if !matches!(publication.purpose, FilePurpose::Sidecars(_))
+                || publication.protected != s.total
+                || publication.total != s.total
+            {
+                return Err(invalid("closeout publication purpose/range"));
+            }
+            let mut group = core.prepare()?;
+            for row in &publication.files {
+                group.push(
+                    &Record::PayloadContinuation(Continuation {
+                        group: group.sequence(),
+                        chunk: Chunk::FileRow(row.clone()),
+                    }),
+                    &[],
+                )?;
+            }
+            let record = Record::ClosedOut(ClosedOut {
+                group: group.reference(0),
+                incarnation: s.incarnation,
+                operation_id,
+                session_id,
+                base_media_sequence: s
+                    .last_media_commit
+                    .ok_or_else(|| invalid("closeout before bootstrap"))?,
+                from_w: s.protected,
+                to_t: s.total,
+                epoch_id: s.next_epoch,
+                sidecar_file_number: s.next_file,
+                check_before: s.check,
+                cursor_after: publication
+                    .cursor
+                    .ok_or_else(|| invalid("closeout lacks barrier cursor"))?,
+                next_file: s
+                    .next_file
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("closeout file overflow"))?,
+                next_epoch: s
+                    .next_epoch
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("closeout epoch overflow"))?,
+                completed_at_utc,
+            });
+            core.append(group.close(&record)?)?;
+            Ok(())
+        })
+    }
     /// Bind Object publications to their owning actor session (no session record yet).
     pub fn bind_session(&mut self, session_id: [u8; 16]) {
         self.session_id = Some(session_id);
@@ -939,9 +1091,20 @@ fn latest_report(s: &TapeSummary, header: &Header) -> Result<Option<AuthorityCom
         };
         return Ok(Some(report_summary(&c, 0, header)));
     }
-    Ok(s.last_ordinary_record
-        .as_ref()
-        .map(|c| report_summary(c, s.ordinary_count, header)))
+    Ok(s.last_ordinary_record.as_ref().map(|c| {
+        let mut report = report_summary(c, s.ordinary_count, header);
+        // A closeout advances the checkpoint's physical boundary without an
+        // Object checkpoint. Keep that boundary even after accepting a terminal
+        // plan; later terminal components must not replace the plan's base.
+        if let Some(close) = &s.last_closeout_record {
+            report.cursor = close.cursor_after;
+            report.next_file = close.next_file;
+            report.protected = close.to_t;
+            report.total = close.to_t;
+            report.check = None;
+        }
+        report
+    }))
 }
 fn report_summary(c: &Committed, sequence: u64, header: &Header) -> AuthorityCommit {
     AuthorityCommit {

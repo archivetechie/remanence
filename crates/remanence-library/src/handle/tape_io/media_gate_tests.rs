@@ -887,3 +887,144 @@ fn fixed_ili_information_is_signed_and_only_current_data_sense() {
         assert_eq!(super::ili_signed_information(&sense), expected);
     }
 }
+
+/// Evidence observer used to pin the request/settlement boundary independently
+/// from the handle's later position proof and error mapping.
+type DispatchEvent = (Vec<u8>, Option<usize>, Option<bool>);
+
+#[derive(Clone, Default)]
+struct DispatchEvidence {
+    events: std::sync::Arc<std::sync::Mutex<Vec<DispatchEvent>>>,
+    refuse: bool,
+}
+impl super::MediaDispatchObserver for DispatchEvidence {
+    fn dispatching(&mut self, cdb: &[u8], data: Option<&[u8]>) -> Result<(), TapeIoError> {
+        if self.refuse {
+            return Err(TapeIoError::OperationFailed(
+                "tail evidence unavailable".into(),
+            ));
+        }
+        self.events
+            .lock()
+            .unwrap()
+            .push((cdb.to_vec(), data.map(<[u8]>::len), None));
+        Ok(())
+    }
+    fn settled(&mut self, cdb: &[u8], result: &Result<Option<TransferOutcome>, ScsiError>) {
+        self.events
+            .lock()
+            .unwrap()
+            .push((cdb.to_vec(), None, Some(result.is_ok())));
+    }
+}
+
+#[test]
+fn dispatch_evidence_covers_every_writer_and_barrier_route() {
+    for route in 0..8 {
+        let (mut drive, _, log) = fenced_drive(4);
+        let evidence = DispatchEvidence::default();
+        drive.set_media_dispatch_observer(Some(Box::new(evidence.clone())));
+        let bytes = vec![0x55; 512];
+        match route {
+            0 => {
+                drive.write_block(&bytes).unwrap();
+            }
+            1 => {
+                drive.write_block_unpositioned(&bytes).unwrap();
+            }
+            2 => {
+                drive.write_block_batch(&bytes, 512).unwrap();
+            }
+            3 => {
+                drive
+                    .write_block_batch_pipelined(&bytes, 512, &read_write::build_write_fixed_cdb(1))
+                    .unwrap();
+            }
+            4 => {
+                drive.write_filemarks(1).unwrap();
+            }
+            5 => {
+                drive.write_filemarks_immediate(1).unwrap();
+            }
+            6 => {
+                drive.write_filemarks_pipelined(1).unwrap();
+            }
+            7 => {
+                drive.write_filemarks(0).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let events = evidence.events.lock().unwrap();
+        assert_eq!(events.len(), 2, "route {route}");
+        assert_eq!(events[0].0, events[1].0);
+        assert_eq!(events[0].1, (route < 4).then_some(512));
+        assert_eq!(events[0].2, None);
+        assert_eq!(events[1].2, Some(true));
+        assert_eq!(opcode_count(&log, if route < 4 { 0x0a } else { 0x10 }), 1);
+        assert_eq!(drive.media_write_dispatch_count(), 1);
+    }
+}
+
+#[test]
+fn dispatch_evidence_refusal_precedes_transport_and_detach_stops_observation() {
+    let (mut drive, _, log) = fenced_drive(0);
+    let evidence = DispatchEvidence {
+        refuse: true,
+        ..Default::default()
+    };
+    drive.set_media_dispatch_observer(Some(Box::new(evidence.clone())));
+    assert!(drive
+        .write_block_unpositioned(&[0; 64])
+        .unwrap_err()
+        .to_string()
+        .contains("tail evidence unavailable"));
+    assert_eq!(opcode_count(&log, 0x0a), 0);
+    assert_eq!(drive.media_write_dispatch_count(), 0);
+    assert!(evidence.events.lock().unwrap().is_empty());
+    drive.set_media_dispatch_observer(None);
+    drive.write_block_unpositioned(&[0; 64]).unwrap();
+    assert_eq!(opcode_count(&log, 0x0a), 1);
+    assert!(evidence.events.lock().unwrap().is_empty());
+}
+
+/// Complete the fixture command, then lose its response. The evidence must
+/// report uncertainty even though the command reached the underlying transport.
+struct LostDispatchResponse<T>(T);
+impl<T: SgTransport> SgTransport for LostDispatchResponse<T> {
+    fn execute_in(&mut self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
+        self.0.execute_in(cdb, buf)
+    }
+    fn execute_out(&mut self, cdb: &[u8], buf: &[u8]) -> Result<TransferOutcome, ScsiError> {
+        self.0.execute_out(cdb, buf)?;
+        Err(ScsiError::Io(std::io::Error::other(
+            "completed response lost",
+        )))
+    }
+    fn execute_none(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
+        self.0.execute_none(cdb)?;
+        Err(ScsiError::Io(std::io::Error::other(
+            "completed response lost",
+        )))
+    }
+}
+
+#[test]
+fn dispatch_evidence_preserves_lost_block_filemark_and_barrier_responses() {
+    for route in 0..3 {
+        let (transport, log) = RecordingTransport::new(seeded_fixture(2));
+        let (mut drive, _) = fenced_drive_over(Box::new(LostDispatchResponse(transport)));
+        let evidence = DispatchEvidence::default();
+        drive.set_media_dispatch_observer(Some(Box::new(evidence.clone())));
+        let result = match route {
+            0 => drive.write_block_unpositioned(&[0; 64]).map(|_| ()),
+            1 => drive.write_filemarks_immediate(1),
+            _ => drive.write_filemarks(0).map(|_| ()),
+        };
+        assert!(result.is_err());
+        let events = evidence.events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].2, None);
+        assert_eq!(events[1].2, Some(false));
+        assert_eq!(opcode_count(&log, if route == 0 { 0x0a } else { 0x10 }), 1);
+    }
+}

@@ -42,8 +42,8 @@ use crate::transport::TimeoutClass;
 
 use media_gate::MediaDispatchError;
 pub use media_gate::{
-    wrap_map_is_servable, InMemoryCalibrationControl, MediaWriteFence, MediaWriteFenceError,
-    NoCalibrationControl,
+    wrap_map_is_servable, InMemoryCalibrationControl, MediaDispatchObserver, MediaWriteFence,
+    MediaWriteFenceError, NoCalibrationControl,
 };
 pub use model::{
     BlockSize, ComputedPosition, DevicePositionProof, PipelinedReadDiagnostics,
@@ -3440,6 +3440,15 @@ impl super::DriveHandle {
     /// distinguishes an input refusal from an uncertain write after a checkpoint.
     pub fn media_write_dispatch_count(&self) -> u64 {
         self.transport.media_write_dispatch_count()
+    }
+
+    /// Attach or detach the active session's dispatch evidence collector.
+    /// The owner must settle outstanding commands before replacing it.
+    pub fn set_media_dispatch_observer(
+        &mut self,
+        observer: Option<Box<dyn MediaDispatchObserver>>,
+    ) {
+        self.transport.set_dispatch_observer(observer);
     }
 
     /// Whether the media-write fence has run — and therefore a
