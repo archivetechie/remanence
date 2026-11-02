@@ -182,14 +182,37 @@ detection exists but does not use that field.
 
 ## Known limitations found in field testing
 
-The October 2026 test session on an HPE MSL3040 library with LTO-9 drives ran
-the library paths end to end: plaintext and encrypted writes and reads,
-multi-object writes, repeated appends, an overnight soak, and recovery after a
-killed write, a refused wrong tape, a retired and re-initialized cartridge and a
-catalog rebuild. A restore running beside a write session on another pool
-completed normally, and a concurrent restore and append against two pools on two
-drives ran at an aggregate of about 218 MB/s. The findings below come from that
-session.
+The October 2026 test sessions, held between 26 and 31 October on an HPE
+MSL3040 library with LTO-9 drives, ran the library paths end to end: plaintext
+and encrypted writes and reads, multi-object writes, repeated appends, an
+overnight soak, and recovery after a killed write, a refused wrong tape, a
+retired and re-initialized cartridge and a catalog rebuild. A restore running
+beside a write session on another pool completed normally, and a concurrent
+restore and append against two pools on two drives ran at an aggregate of about
+218 MB/s.
+
+The sessions also covered the following:
+
+- Partial-file restore. Byte ranges read from the start, the middle and the end
+  of 4 GiB and 32 GiB objects, and from members of a 40-file object, matched
+  their sources.
+- Finalization and full verification. A parity tape holding thirty 1 GiB
+  objects was finalized, and `rem tape verify-index` read every protected data
+  block and parity shard and reported `verified_complete`. Ten of its objects
+  were then restored one by one with matching digests. Tapes without parity,
+  the largest holding 681 GB, were finalized and verified in the same way.
+- Cancelling a verification. One full verification was cancelled during its
+  walk and another during its protected pass. Each stopped at the next tape
+  command, released the drive without a fence and recorded no verdict.
+- Library operations. Robot moves between slots, `rem drive unload`, a changer
+  move that waited while a magazine was open and completed once it was closed,
+  a drive cleaning with a cleaning cartridge, and read-only diagnostics,
+  TapeAlert and drive-stewardship reads of every drive.
+- The per-tape log. The last session, on 31 October, repeated the write, read,
+  append, killed-write, wrong-tape, catalog-rebuild and finalization legs with
+  the per-tape log that current software keeps.
+
+The findings below come from these sessions.
 
 ### Robot moves wait while a drive becomes ready
 
@@ -263,7 +286,7 @@ failure in either is not by itself evidence of a regression.
 | Hardware | Evidence and limits |
 |---|---|
 | QuadStor virtual tape library (VTL) | Library integration and failure-recovery tests. A VTL configuration that exposes a drive without a changer is pending qualification; it does not establish real standalone-drive support. |
-| HPE MSL3040 with LTO-9 drives | Physical library reads, writes and recovery testing. The October 2026 session covered reads and writes with SHA-256 read-back, recovery after a daemon killed during a write, a refused overwrite of a written tape, retire and rebind, and an overnight soak. Physical test time is episodic. |
+| HPE MSL3040 with LTO-9 drives | Physical library reads, writes and recovery testing. The October 2026 sessions covered reads and writes with SHA-256 read-back, encrypted round trips, partial-file restore, recovery after a daemon killed during a write, a refused overwrite of a written tape, retire and rebind, a catalog rebuild, finalization and full verification of tapes with and without parity, cancelled verifications, robot moves, a wait for an open magazine, drive cleaning, and an overnight soak. Physical test time is episodic. |
 | HP Ultrium 7 | INQUIRY and VPD (vital product data) captures for discovery and identity. These captures do not establish media read or write coverage. |
 | Real hardware below LTO-7 | No testing. That `--generation` accepts L5 and L6 is not a hardware qualification. |
 | Autoloader | No testing. |
