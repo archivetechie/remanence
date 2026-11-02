@@ -1766,10 +1766,9 @@ rem archive build [OPTIONS]
   `--encrypt` flag.
 - `--rules <PATH>` applies an ingest ruleset for blob and exclude policy;
   `--manifest-out <PATH>` (requires `--rules`) writes the member manifest JSON.
-- `--full-fidelity-xattrs` captures all extended-attribute namespaces except built-in macOS
-  metadata. It is not portable, is never the default, and cannot be combined with `--rules`
-  or `--map`. By default capture keeps `user.*` attributes, reports other dropped names per
-  entry, and emits one warning with the drop count.
+- Capture preserves only `user.*` extended attributes natively. Other namespaces
+  are reported by name and count, without values. See [Extended attributes and
+  file metadata](reference-extended-attributes.md) for ruleset selection and wrappers.
 - `--scan-only` classifies the inputs and prints the ingest report without writing an
   object.
 - `--no-index` skips the generated `.remwrap.idx` siblings of blob wrappers.
@@ -1907,9 +1906,8 @@ rem restore [OPTIONS] --object <PATH> --dest <DIR>
   a blob wrapper (REM-OBJECT Core Format Appendix E describes the wrapper and the range read
   this performs). `--blob-member` cannot be combined with `--path` or `--range`.
 - `--overwrite` replaces existing files.
-- `--xattr-namespace <PREFIX>` restores an additional extended-attribute namespace besides
-  `user.`; repeat it for several. Skips by policy still exit 0, emit one warning, and are
-  listed in the report.
+- Restore applies only manifest `user.*` attributes. Other names are skipped and
+  reported; no option widens this policy.
 - `--no-unwrap` keeps wrapper entries literal.
 - `--chunk-size <BYTES>` is the block and chunk size of a plaintext object. Default
   `256KiB`.
@@ -2076,7 +2074,7 @@ rem archive recover [OPTIONS] --format <ID> --dest <DIR>
 - `--format <ID>` names the adapter.
 - `--dump <PATH>` is the dump file; `rem` requires it.
 - `--dest <DIR>` (on `restore` and `recover`) is the destination; `restore` also takes
-  `--overwrite` and `--xattr-namespace <PREFIX>`.
+  `--overwrite`. Restore applies only `user.*` attributes.
 
 `probe` identifies a dump without streaming it, `scan` catalogs its normalized entries,
 `restore` restores it into a directory, and `recover` recovers a damaged dump into sparse
@@ -2097,7 +2095,8 @@ An adapter distribution supplies the accepted ids and the parser code; see the
 
 When `rem archive build` wraps a subtree (REM-OBJECT Appendix E), it creates the
 `.remwrap.tar` member by running the system tar program with `-c` and
-`--format pax --xattrs`, and records the program, its version and the exact create and
+`--format pax --no-xattrs --no-acls --no-fflags --no-mac-metadata`, and records
+the program, its version and the exact create and
 extract argument lists in the index's `tar_engine` field. That program is `bsdtar`, and only
 wrappers need it. `rem archive build`, with or without `--scan-only`, looks for it once the
 plan holds a wrapper. A whole-object `rem archive extract` looks for it before writing
@@ -2556,7 +2555,7 @@ Recover the plaintext members of one encrypted object file, with nothing else.
 
 ```text
 rem-recover --object <PATH> --private-key <PATH> --out <DIR>
-            [--staging-dir <DIR>] [--overwrite] [--xattr-namespace <PREFIX>]...
+            [--staging-dir <DIR>] [--overwrite]
 ```
 
 - `--object <PATH>` is the complete stored object.
@@ -2565,8 +2564,8 @@ rem-recover --object <PATH> --private-key <PATH> --out <DIR>
 - `--staging-dir <DIR>` holds the temporary plaintext. Default: inside `--out` when that
   directory already exists, otherwise next to it; never `/tmp`.
 - `--overwrite` replaces existing destination members.
-- `--xattr-namespace <PREFIX>` restores an additional extended-attribute namespace besides
-  `user.`; repeat it for several.
+- Restore applies only manifest `user.*` attributes. Other names are skipped and
+  reported; no option widens this policy.
 
 `rem-recover` is a separate crate and binary (`crates/rem-recover`), for the case where the
 daemon, the catalog and the configuration are unavailable or not trusted. It parses the

@@ -7,6 +7,11 @@ per-release summaries.
 <!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/index.rs crates/remanence-library/src/discovery.rs @ 638210f7 -->
 ## Unreleased
 
+- Remanence now captures and restores only `user.*` extended attributes; namespace
+  widening and full-fidelity options are removed, and wrappers apply no xattrs,
+  ACLs or file flags. Long-term preservation must not reapply one host’s security
+  posture on a different system.
+
 - Host commit authority now uses one per-tape log at
   `journal_dir/tapes/<lowercase-simple-uuid>.remtape`, for tapes with or without
   parity. The layout marker is `state_dir/authority-format` and the catalog

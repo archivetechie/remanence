@@ -2910,11 +2910,6 @@ struct RemArchiveBuildArgs {
     #[arg(long, value_name = "PATH")]
     rules: Option<PathBuf>,
 
-    /// Capture all xattr namespaces except built-in macOS junk. This is not
-    /// portable and is never the default; restore remains namespace-deny by default.
-    #[arg(long, conflicts_with_all = ["rules", "map"])]
-    full_fidelity_xattrs: bool,
-
     /// Classify inputs and emit the clustered ingest report without writing REM-OBJECT.
     #[arg(long)]
     scan_only: bool,
@@ -3014,15 +3009,6 @@ struct RemArchiveExtractArgs {
     /// Replace existing destination files.
     #[arg(long)]
     overwrite: bool,
-
-    /// Additional xattr namespace prefix to restore; repeatable (`user.` is always allowed).
-    /// Policy skips exit successfully, but emit one stderr warning and are listed in the report.
-    #[arg(
-        long = "xattr-namespace",
-        value_name = "PREFIX",
-        value_parser = remanence_stream::parse_xattr_namespace_prefix
-    )]
-    xattr_namespaces: Vec<String>,
 
     /// Keep `.remwrap.tar` and `.remwrap.idx` entries literal instead of unwrapping.
     #[arg(long)]
@@ -3229,15 +3215,6 @@ struct RemArchiveRestoreArgs {
     /// Replace existing destination files.
     #[arg(long)]
     overwrite: bool,
-
-    /// Additional xattr namespace prefix to restore; repeatable (`user.` is always allowed).
-    /// Policy skips exit successfully, but emit one stderr warning and are listed in the report.
-    #[arg(
-        long = "xattr-namespace",
-        value_name = "PREFIX",
-        value_parser = remanence_stream::parse_xattr_namespace_prefix
-    )]
-    xattr_namespaces: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -3325,7 +3302,7 @@ impl From<RemArchiveBuildArgs> for ArchiveBuildArgs {
             map_sha256: value.map_sha256,
             out: value.out,
             rules: value.rules,
-            full_fidelity_xattrs: value.full_fidelity_xattrs,
+
             scan_only: value.scan_only,
             manifest_out: value.manifest_out,
             no_index: value.no_index,
@@ -3363,7 +3340,7 @@ impl From<RemArchiveExtractArgs> for ArchiveExtractArgs {
             file_size_bytes: value.file_size_bytes,
             range: value.range,
             overwrite: value.overwrite,
-            xattr_namespaces: value.xattr_namespaces,
+
             no_unwrap: value.no_unwrap,
             blob_entry: value.blob_entry,
             blob_member: value.blob_member,
@@ -3455,7 +3432,6 @@ impl From<RemArchiveRestoreArgs> for ArchiveRestoreArgs {
             source: value.source.into(),
             dest: value.dest,
             overwrite: value.overwrite,
-            xattr_namespaces: value.xattr_namespaces,
         }
     }
 }
@@ -3656,11 +3632,6 @@ struct ArchiveBuildArgs {
     #[arg(long, value_name = "PATH")]
     rules: Option<PathBuf>,
 
-    /// Capture all xattr namespaces except built-in macOS junk. This is not
-    /// portable and is never the default; restore remains namespace-deny by default.
-    #[arg(long, conflicts_with_all = ["rules", "map"])]
-    full_fidelity_xattrs: bool,
-
     /// Classify inputs and emit the clustered ingest report without writing REM-OBJECT.
     #[arg(long)]
     scan_only: bool,
@@ -3760,15 +3731,6 @@ struct ArchiveExtractArgs {
     /// Replace existing destination files.
     #[arg(long)]
     overwrite: bool,
-
-    /// Additional xattr namespace prefix to restore; repeatable (`user.` is always allowed).
-    /// Policy skips exit successfully, but emit one stderr warning and are listed in the report.
-    #[arg(
-        long = "xattr-namespace",
-        value_name = "PREFIX",
-        value_parser = remanence_stream::parse_xattr_namespace_prefix
-    )]
-    xattr_namespaces: Vec<String>,
 
     /// Keep `.remwrap.tar` and `.remwrap.idx` entries literal instead of unwrapping.
     #[arg(long)]
@@ -3976,15 +3938,6 @@ struct ArchiveRestoreArgs {
     /// Replace existing destination files.
     #[arg(long)]
     overwrite: bool,
-
-    /// Additional xattr namespace prefix to restore; repeatable (`user.` is always allowed).
-    /// Policy skips exit successfully, but emit one stderr warning and are listed in the report.
-    #[arg(
-        long = "xattr-namespace",
-        value_name = "PREFIX",
-        value_parser = remanence_stream::parse_xattr_namespace_prefix
-    )]
-    xattr_namespaces: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -4231,6 +4184,12 @@ pub fn main_entry_with_registry(registry: ForeignFormatRegistry) -> ExitCode {
         let _ = writeln!(std::io::stderr().lock(), "warning: {message}");
     });
     let args: Vec<_> = std::env::args_os().collect();
+    if let Some(message) =
+        remanence_stream::removed_xattr_flag_message(args.iter().map(|arg| arg.as_os_str()))
+    {
+        eprintln!("error: {message}");
+        return ExitCode::from(2);
+    }
     if let Some(replacement) = development_replacement(&args) {
         eprintln!("error: use `{replacement}`");
         return ExitCode::from(1);
@@ -4257,6 +4216,12 @@ pub fn debug_main_entry_with_registry(registry: ForeignFormatRegistry) -> ExitCo
         let _ = writeln!(std::io::stderr().lock(), "warning: {message}");
     });
     let args: Vec<_> = std::env::args_os().collect();
+    if let Some(message) =
+        remanence_stream::removed_xattr_flag_message(args.iter().map(|arg| arg.as_os_str()))
+    {
+        eprintln!("error: {message}");
+        return ExitCode::from(2);
+    }
     if let Some(replacement) = development_replacement(&args) {
         eprintln!("error: use `{replacement}`");
         return ExitCode::from(1);
@@ -13555,12 +13520,6 @@ struct ArchiveBuildInputFile {
 }
 
 fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
-    if args.full_fidelity_xattrs && args.rules.is_some() {
-        return Err("--full-fidelity-xattrs cannot be combined with --rules".to_string());
-    }
-    if args.full_fidelity_xattrs && args.map.is_some() {
-        return Err("--full-fidelity-xattrs cannot be combined with --map".to_string());
-    }
     if args.map.is_some() {
         if args.scan_only {
             return Err("--map cannot be combined with --scan-only".to_string());
@@ -13601,7 +13560,6 @@ fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
         let report = archive_ingest::scan_only_report(
             &args.inputs,
             args.rules.as_deref(),
-            args.full_fidelity_xattrs,
             args.no_index,
             tuning.expect("non-map archive build has scan tuning"),
         )?;
@@ -13652,17 +13610,21 @@ fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
         Some(archive_ingest::materialize_inputs(
             &args.inputs,
             args.rules.as_deref(),
-            args.full_fidelity_xattrs,
             args.no_index,
             tuning.expect("filesystem archive build has scan tuning"),
         )?)
     } else {
         None
     };
-    let inputs = match (&map_plan, &materialized) {
+    let mut inputs = match (&map_plan, &materialized) {
         (Some(plan), _) => plan.inputs.clone(),
         (None, Some(plan)) => plan.inputs.clone(),
         (None, None) => unreachable!("filesystem builds always use the ingest planner"),
+    };
+    let mapped_ingest = if map_plan.is_some() {
+        Some(archive_ingest::capture_mapped_xattrs(&mut inputs)?)
+    } else {
+        None
     };
     if inputs.is_empty() {
         return Err(if args.map.is_some() {
@@ -13771,13 +13733,17 @@ fn build_archive_object_file(args: &ArchiveBuildArgs) -> Result<Value, String> {
         archive_ingest::write_customer_manifest(manifest_out, &plan.manifest)?;
     }
 
-    Ok(archive_build_report_json(
+    let mut report = archive_build_report_json(
         args,
         &inputs,
         &build,
         materialized.as_ref(),
         map_plan.as_ref().map(|plan| plan.map_sha256),
-    ))
+    );
+    if let Some(ingest) = mapped_ingest {
+        report["ingest"] = serde_json::to_value(ingest).map_err(|error| error.to_string())?;
+    }
+    Ok(report)
 }
 
 fn archive_scan_tuning(args: &ArchiveBuildArgs) -> Result<archive_ingest::ScanTuning, String> {
@@ -13824,27 +13790,20 @@ fn extract_archive_object_file(args: &ArchiveExtractArgs) -> Result<Value, Strin
 fn archive_extract_restore_options(
     args: &ArchiveExtractArgs,
 ) -> remanence_stream::FilesystemRestoreOptions {
-    filesystem_restore_options(args.overwrite, &args.xattr_namespaces)
+    filesystem_restore_options(args.overwrite)
 }
 
 fn archive_restore_options(
     args: &ArchiveRestoreArgs,
 ) -> remanence_stream::FilesystemRestoreOptions {
-    filesystem_restore_options(args.overwrite, &args.xattr_namespaces)
+    filesystem_restore_options(args.overwrite)
 }
 
-fn filesystem_restore_options(
-    overwrite: bool,
-    xattr_namespaces: &[String],
-) -> remanence_stream::FilesystemRestoreOptions {
-    let mut options = remanence_stream::FilesystemRestoreOptions {
+fn filesystem_restore_options(overwrite: bool) -> remanence_stream::FilesystemRestoreOptions {
+    remanence_stream::FilesystemRestoreOptions {
         overwrite,
         ..remanence_stream::FilesystemRestoreOptions::default()
-    };
-    options
-        .xattr_allowed_prefixes
-        .extend(xattr_namespaces.iter().cloned());
-    options
+    }
 }
 
 fn inspect_plaintext_archive_object_file(path: &Path, chunk_size: usize) -> Result<Value, String> {
@@ -14077,18 +14036,10 @@ fn attach_unwrap_report(
         value["unwrap"] = json!({ "enabled": false, "tar_engine": null });
         return Ok(());
     }
-    let report = archive_ingest::unwrap_remwraps(
-        &args.dest,
-        args.overwrite,
-        unwrap_plan,
-        &archive_extract_restore_options(args).xattr_allowed_prefixes,
-    )?;
+    let report = archive_ingest::unwrap_remwraps(&args.dest, args.overwrite, unwrap_plan)?;
     for (key, accounting) in [
         ("skipped_xattrs", &report.skipped_xattrs),
-        (
-            "applied_privileged_xattrs",
-            &report.applied_privileged_xattrs,
-        ),
+        ("skipped_metadata", &report.skipped_metadata),
     ] {
         for (path, names) in accounting {
             let entry = value[key][path].as_array().cloned().unwrap_or_default();
@@ -15480,7 +15431,7 @@ fn read_archive_build_directory(
 }
 
 fn archive_build_file_spec(input: &ArchiveBuildInputFile) -> RemTarFileSpec {
-    match input.entry_type {
+    let mut spec = match input.entry_type {
         RemTarEntryType::Regular => {
             let mut spec = RemTarFileSpec::new(
                 input.archive_path.clone(),
@@ -15509,9 +15460,16 @@ fn archive_build_file_spec(input: &ArchiveBuildInputFile) -> RemTarFileSpec {
                 .expect("symlink input has link target"),
         ),
         RemTarEntryType::Directory => {
-            RemTarFileSpec::directory(input.archive_path.clone(), input.file_id.clone())
+            let mut spec =
+                RemTarFileSpec::directory(input.archive_path.clone(), input.file_id.clone());
+            spec.xattrs = input.xattrs.clone();
+            spec
         }
+    };
+    if input.entry_type != RemTarEntryType::Hardlink {
+        spec.xattrs = input.xattrs.clone();
     }
+    spec
 }
 
 fn archive_build_streams<'a>(
@@ -17140,6 +17098,119 @@ fn format_warning(w: &DiscoveryWarning) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn removed_xattr_flags_have_no_clap_alias_and_explain_policy() {
+        for flag in ["--full-fidelity-xattrs", "--xattr-namespace"] {
+            for (binary, command) in [
+                ("rem", "build"),
+                ("rem", "extract"),
+                ("rem", "restore"),
+                ("rem-debug", "build"),
+                ("rem-debug", "extract"),
+                ("rem-debug", "restore"),
+            ] {
+                let args = [binary, "archive", command, flag];
+                let error = if binary == "rem" {
+                    Cli::try_parse_from(args).unwrap_err()
+                } else {
+                    DebugCli::try_parse_from(args).unwrap_err()
+                };
+                assert!(error.to_string().contains(flag));
+                let message =
+                    remanence_stream::removed_xattr_flag_message(args.iter().map(OsStr::new))
+                        .unwrap();
+                assert!(
+                    message.contains(flag)
+                        && message.contains("was removed")
+                        && message.contains("only user.*")
+                );
+            }
+        }
+        let error =
+            Cli::try_parse_from(["rem", "restore", "--xattr-namespace", "security."]).unwrap_err();
+        assert!(error.to_string().contains("--xattr-namespace"));
+        assert!(remanence_stream::removed_xattr_flag_message([
+            OsStr::new("--"),
+            OsStr::new("--xattr-namespace")
+        ])
+        .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_user_xattrs_round_trip_in_manifest_without_wrappers() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir_all(source.join("nonempty")).unwrap();
+        fs::create_dir_all(source.join("empty")).unwrap();
+        fs::write(source.join("nonempty/payload"), b"payload").unwrap();
+        for name in ["nonempty", "empty"] {
+            xattr::set(source.join(name), "user.directory", b"directory-value")
+                .expect("user xattrs required");
+        }
+        let object = temp.path().join("object.rem-object");
+        let args = [
+            "rem",
+            "archive",
+            "build",
+            "--inputs",
+            source.to_str().unwrap(),
+            "--out",
+            object.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+        ];
+        let (code, stdout, stderr) = invoke_without_discovery(&args);
+        assert_eq!(code, ExitCode::SUCCESS, "{stderr}");
+        let report: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(report["ingest"]["scan"]["totals"]["wrapped_entries"], 0);
+        assert!(report["ingest"]["tar_engine"].is_null());
+        assert!(!stdout.contains("directory-value"));
+        let native = read_plaintext_archive_object_file(&object, 4096).unwrap().0;
+        assert_eq!(native.global_pax["REMANENCE.schema_version"], "1.1");
+        for name in ["empty/", "nonempty/"] {
+            assert_eq!(
+                native
+                    .entries
+                    .iter()
+                    .find(|entry| entry.path == name)
+                    .unwrap()
+                    .xattrs["user.directory"],
+                b"directory-value"
+            );
+        }
+        let scan = archive_ingest::scan_only_report(
+            &[source],
+            None,
+            false,
+            archive_ingest::ScanTuning::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(scan.scan).unwrap(),
+            report["ingest"]["scan"]
+        );
+        let dest = temp.path().join("out");
+        let (code, _, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "extract",
+            "--object",
+            object.to_str().unwrap(),
+            "--dest",
+            dest.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+        ]);
+        assert_eq!(code, ExitCode::SUCCESS, "{stderr}");
+        for name in ["empty", "nonempty"] {
+            assert_eq!(
+                xattr::get(dest.join(name), "user.directory").unwrap(),
+                Some(b"directory-value".to_vec())
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -18475,27 +18546,13 @@ mod tests {
         let restore = archive.find_subcommand_mut("restore").unwrap();
         let help = command_help(restore.clone());
 
-        assert!(help.contains("--xattr-namespace <PREFIX>"), "{help}");
-        assert!(help.contains("one stderr warning"), "{help}");
-        assert!(help.contains("listed in the report"), "{help}");
+        assert!(!help.contains("--xattr-namespace"), "{help}");
 
         let mut command = Cli::command();
         let archive = command.find_subcommand_mut("archive").unwrap();
         let extract = archive.find_subcommand_mut("extract").unwrap();
         let help = command_help(extract.clone());
-        assert!(help.contains("one stderr warning"), "{help}");
-    }
-
-    #[test]
-    fn archive_build_help_marks_full_fidelity_xattrs_non_portable() {
-        let mut command = Cli::command();
-        let archive = command.find_subcommand_mut("archive").unwrap();
-        let build = archive.find_subcommand_mut("build").unwrap();
-        let help = command_help(build.clone());
-
-        assert!(help.contains("--full-fidelity-xattrs"), "{help}");
-        assert!(help.contains("not portable"), "{help}");
-        assert!(help.contains("never the default"), "{help}");
+        assert!(!help.contains("--xattr-namespace"), "{help}");
     }
 
     #[test]
@@ -19233,10 +19290,6 @@ mod tests {
             "--chunk-size",
             "4KiB",
             "--overwrite",
-            "--xattr-namespace",
-            "security.",
-            "--xattr-namespace",
-            "trusted.",
         ]);
 
         match cli.command {
@@ -19252,100 +19305,9 @@ mod tests {
                 assert!(args.first_chunk_lba.is_none());
                 assert!(args.file_size_bytes.is_none());
                 assert!(args.range.is_none());
-                assert_eq!(args.xattr_namespaces, ["security.", "trusted."]);
-                let shared: ArchiveExtractArgs = args.into();
-                assert_eq!(
-                    archive_extract_restore_options(&shared).xattr_allowed_prefixes,
-                    ["user.", "security.", "trusted."]
-                );
             }
             other => panic!("unexpected command: {other:?}"),
         }
-    }
-
-    #[test]
-    fn rem_archive_extract_rejects_broad_or_malformed_xattr_prefixes() {
-        for invalid in ["security", "s", ".", "", "user..", "user.\u{1}"] {
-            let error = match Cli::try_parse_from([
-                "rem",
-                "archive",
-                "extract",
-                "--object",
-                "/tmp/object.rem-object",
-                "--dest",
-                "/tmp/restored",
-                "--xattr-namespace",
-                invalid,
-            ]) {
-                Ok(_) => panic!("xattr prefix {invalid:?} unexpectedly parsed"),
-                Err(error) => error,
-            };
-            let message = error.to_string();
-            assert!(message.contains(&format!("{invalid:?}")), "{message}");
-        }
-
-        assert_eq!(
-            remanence_stream::parse_xattr_namespace_prefix("user.").unwrap(),
-            "user."
-        );
-        assert_eq!(
-            remanence_stream::parse_xattr_namespace_prefix("security.").unwrap(),
-            "security."
-        );
-    }
-
-    #[test]
-    fn archive_restore_plumbs_xattr_policy_for_dump_and_tape() {
-        let cli = Cli::parse_from([
-            "rem",
-            "archive",
-            "restore",
-            "--format",
-            "legacy-example",
-            "--dump",
-            "/tmp/archive.bin",
-            "--dest",
-            "/tmp/restored",
-            "--xattr-namespace",
-            "system.",
-        ]);
-        let RemCommand::Archive {
-            command: RemArchiveCommand::Restore(args),
-        } = cli.command
-        else {
-            panic!("expected dump restore command");
-        };
-        let shared: ArchiveRestoreArgs = args.into();
-        assert_eq!(
-            archive_restore_options(&shared).xattr_allowed_prefixes,
-            ["user.", "system."]
-        );
-
-        let cli = DebugCli::parse_from([
-            "rem-debug",
-            "archive",
-            "restore",
-            "--format",
-            "legacy-example",
-            "--tape",
-            "LIB01",
-            "--bay",
-            "0x0100",
-            "--dest",
-            "/tmp/restored",
-            "--xattr-namespace",
-            "system.",
-        ]);
-        let Command::Archive { command } = cli.command else {
-            panic!("expected tape archive command");
-        };
-        let ArchiveCommand::Restore(args) = *command else {
-            panic!("expected tape restore command");
-        };
-        assert_eq!(
-            archive_restore_options(&args).xattr_allowed_prefixes,
-            ["user.", "system."]
-        );
     }
 
     #[test]
@@ -19381,7 +19343,7 @@ mod tests {
         let stderr = String::from_utf8(err).unwrap();
         assert!(stdout.contains("security.selinux"), "{stdout}");
         assert!(stdout.contains("system.remanence_test"), "{stdout}");
-        assert_eq!(stderr.matches("skipped by namespace policy").count(), 1);
+        assert_eq!(stderr.matches("skipped during restore").count(), 1);
 
         let mut no_warning = Vec::new();
         print_xattr_policy_skip_warning(&BTreeMap::new(), &mut no_warning);
@@ -23104,7 +23066,7 @@ tape_catalog_dir = "{0}/cache/tapes"
             map_sha256: None,
             out: Some(out),
             rules: None,
-            full_fidelity_xattrs: false,
+
             scan_only: false,
             manifest_out: None,
             no_index: false,
@@ -24312,6 +24274,8 @@ tape_catalog_dir = "{0}/cache/tapes"
         fs::write(&zeta_path, zeta_payload).unwrap();
         fs::write(&alpha_path, alpha_payload).unwrap();
         fs::write(&beta_path, beta_payload).unwrap();
+        #[cfg(unix)]
+        xattr::set(&alpha_path, "user.mapped", b"mapped-value").expect("user xattrs required");
         let map_path = temp.path().join("source-map.tsv");
         let rows: Vec<(&str, &Path, &[u8], &str)> = vec![
             (
@@ -24369,7 +24333,11 @@ tape_catalog_dir = "{0}/cache/tapes"
         assert!(out_path.exists());
         let report: serde_json::Value = serde_json::from_str(&stdout).expect("build json");
         assert_eq!(report["map_sha256"], map_hash);
-        assert!(report.get("ingest").is_none());
+        assert_eq!(
+            report["ingest"]["xattr_policy"]["allowed_prefixes"],
+            json!(["user."])
+        );
+        assert!(report["ingest"]["tar_engine"].is_null());
         assert_eq!(
             report["manifest_out"].as_str(),
             Some(manifest_path.to_str().unwrap())
@@ -24413,6 +24381,12 @@ tape_catalog_dir = "{0}/cache/tapes"
         let read = remanence_format::read_rem_tar_object(&mut source, 4096, block_count).unwrap();
         assert_eq!(read.entry("z/zeta.bin").unwrap().data, zeta_payload);
         assert_eq!(read.entry("a.txt").unwrap().data, alpha_payload);
+        #[cfg(unix)]
+        assert_eq!(
+            read.entry("a.txt").unwrap().xattrs["user.mapped"],
+            b"mapped-value"
+        );
+        assert!(!stdout.contains("mapped-value"));
         assert_eq!(read.entry("nested/beta.txt").unwrap().data, beta_payload);
         assert!(files
             .iter()
@@ -25856,7 +25830,6 @@ blob Project/Render Files/
             std::slice::from_ref(&input_dir),
             None,
             false,
-            false,
             archive_ingest::ScanTuning::default(),
         )
         .expect("scan-only does not open regular-file payloads");
@@ -25947,44 +25920,6 @@ blob Project/Render Files/
         );
     }
 
-    #[test]
-    fn archive_build_full_fidelity_flag_sets_capture_posture_without_ruleset() {
-        let temp = tempfile::Builder::new()
-            .prefix("remanence-cli-full-fidelity-xattrs")
-            .tempdir()
-            .unwrap();
-        let input = temp.path().join("input.txt");
-        fs::write(&input, b"full fidelity posture").unwrap();
-        let out_path = temp.path().join("full.rem-object");
-
-        let (code, stdout, stderr) = invoke_without_discovery(&[
-            "rem",
-            "archive",
-            "build",
-            "--inputs",
-            input.to_str().unwrap(),
-            "--full-fidelity-xattrs",
-            "--out",
-            out_path.to_str().unwrap(),
-            "--chunk-size",
-            "4KiB",
-            "--object-id",
-            "object-full-xattrs",
-            "--caller-object-id",
-            "caller-full-xattrs",
-            "--manifest-file-id",
-            "manifest-full-xattrs",
-            "--timestamp",
-            "2026-01-01T00:00:00Z",
-        ]);
-
-        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
-        assert!(stderr.is_empty(), "{stderr}");
-        let report: Value = serde_json::from_str(&stdout).expect("build json");
-        assert_eq!(report["ingest"]["xattr_policy"]["mode"], "full-fidelity");
-        assert!(report["ingest"]["ruleset"].is_null());
-    }
-
     /// Plaintext and encrypted whole-object extracts must pass restore policy
     /// into wrapper extraction and include its skips in the normal report.
     #[cfg(unix)]
@@ -26018,8 +25953,8 @@ blob Project/Render Files/
             }
             let (code, _, stderr) = invoke_without_discovery(&build);
             assert_eq!(code, ExitCode::SUCCESS, "{stderr}");
-            for prefix in [None, Some("security."), Some("trusted.")] {
-                let dest = temp.path().join(prefix.unwrap_or("default"));
+            {
+                let dest = temp.path().join("restored");
                 let mut extract = vec![
                     "rem",
                     "archive",
@@ -26034,28 +25969,20 @@ blob Project/Render Files/
                 if encrypted {
                     extract.extend(["--private-key", private.to_str().unwrap()]);
                 }
-                if let Some(prefix) = prefix {
-                    extract.extend(["--xattr-namespace", prefix]);
-                }
                 let (code, stdout, stderr) = invoke_without_discovery(&extract);
-                if prefix.is_none() {
+                {
                     assert_eq!(code, ExitCode::SUCCESS, "{stderr}");
                     let report: Value = serde_json::from_str(&stdout).unwrap();
                     assert_eq!(
                         report["skipped_xattrs"]["tagged.txt"],
-                        json!(["security.remanence_test", "trusted.remanence_test"])
+                        json!([
+                            "security.remanence_test",
+                            "trusted.remanence_test",
+                            "user.keep"
+                        ])
                     );
-                    assert_eq!(stderr.matches("skipped by namespace policy").count(), 1);
-                    assert!(stderr.contains("2 extended attribute(s)"), "{stderr}");
-                } else if let Some(prefix) = prefix.filter(|_| code == ExitCode::SUCCESS) {
-                    let report: Value = serde_json::from_str(&stdout).unwrap();
-                    assert_eq!(
-                        report["applied_privileged_xattrs"]["tagged.txt"],
-                        json!([format!("{prefix}remanence_test")])
-                    );
-                } else {
-                    assert!(stderr.starts_with("error:"), "{stderr}");
-                    assert!(dest.join("source.remwrap.tar").is_file());
+                    assert_eq!(stderr.matches("skipped during restore").count(), 1);
+                    assert!(stderr.contains("3 extended attribute(s)"), "{stderr}");
                 }
                 assert!(!stdout.contains("private-value") && !stderr.contains("private-value"));
             }
@@ -26112,7 +26039,7 @@ blob Project/Render Files/
         ]);
 
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
-        assert_eq!(stderr.matches("skipped by namespace policy").count(), 1);
+        assert_eq!(stderr.matches("skipped during restore").count(), 1);
         assert!(stderr.contains("1 extended attribute(s)"), "{stderr}");
         assert!(!stdout.contains("sensitive-marker"));
         let report: Value = serde_json::from_str(&stdout).expect("extract json");
@@ -26216,7 +26143,7 @@ blob Project/Render Files/
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
         assert_eq!(
             stderr,
-            "warning: 1 extended attribute(s) dropped by capture namespace policy; see dropped_xattrs in the ingest report\n"
+            "warning: 1 extended attribute(s) dropped by capture policy; see dropped_xattrs in the ingest report\n"
         );
         let report: serde_json::Value = serde_json::from_str(&stdout).expect("build json");
         assert_eq!(report["ingest"]["scan"]["totals"]["dropped_xattrs"], 1);
@@ -26290,7 +26217,7 @@ blob Project/Render Files/
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
         assert_eq!(
             stderr,
-            "warning: 1 extended attribute(s) dropped by capture namespace policy; see dropped_xattrs in the ingest report\n"
+            "warning: 1 extended attribute(s) dropped by capture policy; see dropped_xattrs in the ingest report\n"
         );
         let report: serde_json::Value = serde_json::from_str(&stdout).expect("build json");
         assert_eq!(report["ingest"]["scan"]["totals"]["dropped_xattrs"], 1);
@@ -26304,7 +26231,7 @@ blob Project/Render Files/
     #[cfg(unix)]
     #[test]
     #[ignore = "requires a filesystem that accepts user xattr values larger than 4096 bytes"]
-    fn archive_build_rules_wraps_oversized_xattr() {
+    fn archive_build_preserves_large_xattr_natively() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-cli-rem-object-xattr-large")
             .tempdir()
@@ -26345,16 +26272,12 @@ blob Project/Render Files/
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
         assert!(stderr.is_empty(), "{stderr}");
         let report: serde_json::Value = serde_json::from_str(&stdout).expect("build json");
-        assert_eq!(report["ingest"]["scan"]["totals"]["wrapped_entries"], 1);
-        assert!(report["ingest"]["scan"]["clusters"]
-            .as_array()
+        assert_eq!(report["ingest"]["scan"]["totals"]["wrapped_entries"], 0);
+        assert!(report["ingest"]["tar_engine"].is_null());
+        let object = read_plaintext_archive_object_file(&out_path, 4096)
             .unwrap()
-            .iter()
-            .any(|cluster| cluster["reason"] == "xattr-large"));
-        let files = report["files"].as_array().expect("files array");
-        assert!(files
-            .iter()
-            .any(|file| file["path"] == "large-xattr.txt.remwrap.tar"));
+            .0;
+        assert_eq!(object.entries[0].xattrs["user.large"], large_xattr);
     }
 
     #[test]
@@ -26369,7 +26292,6 @@ blob Project/Render Files/
             &[temp.path().to_path_buf()],
             Some(&deny),
             false,
-            false,
             archive_ingest::ScanTuning::default()
         )
         .unwrap_err()
@@ -26380,7 +26302,6 @@ blob Project/Render Files/
         assert!(archive_ingest::scan_only_report(
             &[temp.path().to_path_buf()],
             Some(&allow),
-            false,
             false,
             archive_ingest::ScanTuning::default()
         )
