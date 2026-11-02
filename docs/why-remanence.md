@@ -360,6 +360,11 @@ These non-goals are listed so that you can rule Remanence out quickly.
   raises an alarm when a drive asks for cleaning too often. The `[cleaning]`
   section of the [configuration reference](reference-configuration.md) has the
   settings.
+- No system backup. Remanence keeps file contents and `user.*` extended
+  attributes, but not ownership, POSIX ACLs, security labels, file capabilities
+  or file flags, so it cannot put a host back the way it was.
+  [Why Remanence keeps only user extended attributes](why-user-xattrs-only.md)
+  explains the decision and how to keep that metadata when you need it.
 - No replication across hosts. A daemon manages the libraries named in its
   configuration on its own host. Coordination between hosts is the
   orchestrator's job.

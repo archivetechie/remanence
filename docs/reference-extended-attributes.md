@@ -40,7 +40,9 @@ Ownership and security mode bits are excluded because an archive is meant to
 outlive the system that produced it. A numeric owner or a security mode from a
 host that no longer exists describes that host's environment, not the file's
 content. The same reasoning governs which extended attributes are captured and
-restored.
+restored. [Why Remanence keeps only user extended
+attributes](why-user-xattrs-only.md) gives the reasons in full, with recipes
+for keeping the other metadata when a collection needs it.
 
 ## Where attributes are stored
 

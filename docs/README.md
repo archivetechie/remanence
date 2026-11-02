@@ -76,6 +76,9 @@ to understand why.
   other ways of putting data on tape.
 - [Why Remanence speaks SCSI directly](why-sg-passthrough.md): why the stack
   bypasses the kernel `st` driver and `mt`/`mtx`.
+- [Why Remanence keeps only user extended attributes](why-user-xattrs-only.md):
+  why security labels, ACLs, file capabilities and file flags are not
+  preserved, and how to keep them when a collection needs them.
 - [Encryption explained](encryption-explained.md): why REM-ENCRYPT seals objects
   in software instead of using drive encryption, and what an operator still
   manages.
