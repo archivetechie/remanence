@@ -8,11 +8,17 @@ per-release summaries.
 ## Unreleased
 
 - Startup reconstructs closeout and finalization obligations from native logs,
-  retries unavailable resources with capped backoff, and restricts maintenance
+  retries transient resource failures with capped backoff, and restricts media maintenance
   to configured libraries and drives. Eligible due-closeout tapes are preferred
   within a pool; capacity includes their sidecar and seal-due tapes receive no
   further Objects. Catalog, live status and `rem top` expose unprotected bytes,
   original debt age and overdue state, with an off-drive debt list.
+  Unreadable tape authority is a per-tape unknown, with optional debt fields and
+  an error; list/one-shot CLI output remains complete and exits nonzero. Interactive
+  top keeps running. Status reads use committed summary mirrors during checkpoints
+  and cache unchanged logs. Worker attempts are limited to one per library,
+  reserve memory after obtaining a drive, and let exact-tape clients wait.
+  Operator-required failures remain visible with a retry reason until a wake.
   `daemon.closeout_alarm_after_secs` defaults to 259200 and must be positive;
   overdue notification emits one WARN and audit per debt age per daemon run.
 

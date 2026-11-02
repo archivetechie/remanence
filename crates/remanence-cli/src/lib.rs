@@ -5668,15 +5668,8 @@ fn run_catalog_client_command(
                         .await
                         .map_err(drive_status_error)?
                         .into_inner();
-                    if json_output {
-                        print_json_envelope("rem.catalog.tape.list.v1", "list", json!({
-                            "tapes": response.tapes.iter().map(tape_json).collect::<Vec<_>>(),
-                            "active_tape_io_fence_count": response.active_tape_io_fence_count,
-                            "active_tape_io_fences": response.active_tape_io_fences.iter().map(proto_fence_json).collect::<Vec<_>>()
-                        }), out).map_err(DaemonClientError::from)
-                    } else {
-                        print_tape_list(response.tapes, false, out).map_err(DaemonClientError::from)
-                    }
+                    print_catalog_tape_response(response, json_output, out)
+                        .map_err(DaemonClientError::from)
                 }
                 CatalogClientCommand::Tape { tape_uuid } => {
                     let tape_uuid = resolve_tape_uuid_arg(&mut client, tape_uuid).await?;
@@ -6561,11 +6554,7 @@ fn run_top_command(
                 .await
                 .map_err(drive_status_error)?
                 .into_inner();
-            if json_output {
-                print_live_status_json(&response, out).map_err(DaemonClientError::from)
-            } else {
-                print_live_status_text(&response, out).map_err(DaemonClientError::from)
-            }
+            print_top_response(&response, json_output, out).map_err(DaemonClientError::from)
         })
     });
     finish_top_client_result(result, json_output, err)
@@ -6843,6 +6832,84 @@ fn print_operation_line(operation: &pb::OperationStatus, out: &mut dyn Write) {
     );
 }
 
+/// Shared response path for `rem tape list`, including partial-read exit status.
+fn print_catalog_tape_response(
+    response: pb::ListTapesResponse,
+    json_output: bool,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    let readable = ensure_debt_readable(&response.tapes);
+    if json_output {
+        print_json_envelope(
+            "rem.catalog.tape.list.v1",
+            "list",
+            json!({
+                "tapes": response.tapes.iter().map(tape_json).collect::<Vec<_>>(),
+                "active_tape_io_fence_count": response.active_tape_io_fence_count,
+                "active_tape_io_fences": response.active_tape_io_fences.iter().map(proto_fence_json).collect::<Vec<_>>()
+            }),
+            out,
+        )?;
+    } else {
+        print_tape_list(response.tapes, false, out)?;
+    }
+    readable
+}
+/// Shared one-shot top printer and partial-read status. Interactive top consumes
+/// the same response without terminating on individual authority errors.
+fn print_top_response(
+    response: &pb::GetLiveStatusResponse,
+    json_output: bool,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    if json_output {
+        print_live_status_json(response, out)?;
+    } else {
+        print_live_status_text(response, out)?;
+    }
+    ensure_live_debt_readable(response)
+}
+
+/// A partial response is printed in full before the command reports failure.
+fn ensure_debt_readable(tapes: &[pb::Tape]) -> Result<(), String> {
+    let count = tapes
+        .iter()
+        .filter(|t| t.closeout_authority_error.is_some())
+        .count();
+    if count == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "closeout authority unreadable for {count} tape(s); debt is unknown"
+        ))
+    }
+}
+fn ensure_live_debt_readable(live: &pb::GetLiveStatusResponse) -> Result<(), String> {
+    ensure_debt_readable(&live.closeout_debt)?;
+    if live
+        .libraries
+        .iter()
+        .flat_map(|l| &l.drives)
+        .any(|d| d.closeout_authority_error.is_some())
+    {
+        return Err("loaded tape closeout authority unreadable; debt is unknown".into());
+    }
+    Ok(())
+}
+fn debt_badge(error: Option<&str>, overdue: Option<bool>, retry: Option<&str>) -> String {
+    if let Some(error) = error {
+        return format!("DEBT? {error}");
+    }
+    [
+        if overdue == Some(true) { "OVERDUE" } else { "" },
+        retry.unwrap_or(""),
+    ]
+    .into_iter()
+    .filter(|s| !s.is_empty())
+    .collect::<Vec<_>>()
+    .join(" ")
+}
+
 fn print_tape(tape: pb::Tape, json_output: bool, out: &mut dyn Write) -> Result<(), String> {
     if json_output {
         return print_json_envelope("rem.catalog.tape.v1", "item", tape_json(&tape), out);
@@ -6892,6 +6959,19 @@ fn print_tape_line(tape: &pb::Tape, out: &mut dyn Write) {
         tape_state_name(tape.state),
         or_dash_display(tape.last_committed_tape_file),
         timestamp_text(tape.last_verified_at.as_ref()).unwrap_or_else(|| "-".into())
+    );
+    let _ = writeln!(
+        out,
+        "  unprotected_bytes={} unprotected_since={} {}",
+        tape.unprotected_bytes
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "unknown".into()),
+        timestamp_value(tape.unprotected_since.as_ref()),
+        debt_badge(
+            tape.closeout_authority_error.as_deref(),
+            tape.closeout_overdue,
+            tape.closeout_retry_reason.as_deref()
+        )
     );
 }
 
@@ -7412,10 +7492,12 @@ fn tape_json(tape: &pb::Tape) -> Value {
         "seal_due": tape.seal_due,
         "open_epoch_start": tape.open_epoch_start.map(|value| value.to_string()),
         "open_epoch_end": tape.open_epoch_end.map(|value| value.to_string()),
-        "unprotected_bytes": tape.unprotected_bytes.to_string(),
+        "unprotected_bytes": tape.unprotected_bytes.map(|n| n.to_string()),
         "unprotected_since": timestamp_value(tape.unprotected_since.as_ref()),
         "closeout_due": tape.closeout_due,
         "closeout_overdue": tape.closeout_overdue,
+        "closeout_authority_error": tape.closeout_authority_error,
+        "closeout_retry_reason": tape.closeout_retry_reason,
         "kind": tape.kind,
         "scheme_id": tape.scheme_id,
         "assignment_generation": tape.assignment_generation,
@@ -7544,10 +7626,12 @@ fn drive_live_json(drive: &pb::Drive) -> Value {
         "mount_age_seconds": drive.mount_age_seconds,
         "open_epoch_start": drive.open_epoch_start.map(|v| v.to_string()),
         "open_epoch_end": drive.open_epoch_end.map(|v| v.to_string()),
-        "unprotected_bytes": drive.unprotected_bytes.to_string(),
+        "unprotected_bytes": drive.unprotected_bytes.map(|n| n.to_string()),
         "unprotected_since": timestamp_value(drive.unprotected_since.as_ref()),
         "closeout_due": drive.closeout_due,
         "closeout_overdue": drive.closeout_overdue,
+        "closeout_authority_error": drive.closeout_authority_error,
+        "closeout_retry_reason": drive.closeout_retry_reason,
         "status": drive_status_name(drive.status),
         "drive_uuid": drive.drive_uuid.as_deref().map(bytes_to_uuid_text),
         "catalog_state": drive_catalog_state_name(drive.catalog_state),
@@ -7653,11 +7737,18 @@ fn print_live_status_text(
     for tape in &response.closeout_debt {
         let _ = writeln!(
             out,
-            "debt {} unprotected_bytes={} unprotected_since={} {}",
+            "debt {} {} unprotected_bytes={} unprotected_since={} {}",
             bytes_to_uuid_text(&tape.tape_uuid),
-            tape.unprotected_bytes,
+            or_dash(tape.voltag.as_deref()),
+            tape.unprotected_bytes
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "unknown".into()),
             timestamp_value(tape.unprotected_since.as_ref()),
-            if tape.closeout_overdue { "OVERDUE" } else { "" }
+            debt_badge(
+                tape.closeout_authority_error.as_deref(),
+                tape.closeout_overdue,
+                tape.closeout_retry_reason.as_deref()
+            )
         );
     }
     for library in &response.libraries {
@@ -7692,9 +7783,9 @@ fn print_live_status_text(
                 window_feed = or_dash_display(drive.tape_io_window_feed_bytes_per_second),
                 session_feed = or_dash_display(drive.tape_io_effective_feed_bytes_per_second),
                 mount_age = or_dash_display(drive.mount_age_seconds),
-                unprotected = drive.unprotected_bytes,
+                unprotected = drive.unprotected_bytes.map(|n| n.to_string()).unwrap_or_else(|| "unknown".into()),
                 since = timestamp_value(drive.unprotected_since.as_ref()),
-                overdue = if drive.closeout_overdue { "OVERDUE" } else { "" },
+                overdue = debt_badge(drive.closeout_authority_error.as_deref(), drive.closeout_overdue, drive.closeout_retry_reason.as_deref()),
             );
         }
     }
@@ -18630,13 +18721,13 @@ mod tests {
     fn b7_catalog_live_top_json_and_unseated_debt() {
         let tape = pb::Tape {
             tape_uuid: vec![1; 16],
-            unprotected_bytes: 786432,
+            unprotected_bytes: Some(786432),
             unprotected_since: Some(prost_types::Timestamp {
                 seconds: 0,
                 nanos: 0,
             }),
-            closeout_due: true,
-            closeout_overdue: true,
+            closeout_due: Some(true),
+            closeout_overdue: Some(true),
             ..Default::default()
         };
         let json = tape_json(&tape);
@@ -18647,8 +18738,8 @@ mod tests {
         let drive = drive_live_json(&pb::Drive {
             unprotected_bytes: tape.unprotected_bytes,
             unprotected_since: tape.unprotected_since,
-            closeout_due: true,
-            closeout_overdue: true,
+            closeout_due: Some(true),
+            closeout_overdue: Some(true),
             ..Default::default()
         });
         for key in [
@@ -18674,7 +18765,7 @@ mod tests {
         assert!(json.contains("closeout_debt"));
         assert!(json.contains("786432"));
         let empty = tape_json(&pb::Tape::default());
-        assert_eq!(empty["unprotected_bytes"], "0");
+        assert!(empty["unprotected_bytes"].is_null());
         assert!(empty["unprotected_since"].is_null());
     }
 
@@ -27683,3 +27774,6 @@ mod tape_log_cli_tests {
         assert!(!config.exists());
     }
 }
+
+#[cfg(test)]
+mod b7_surface_tests;

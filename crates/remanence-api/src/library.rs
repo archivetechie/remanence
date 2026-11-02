@@ -87,10 +87,12 @@ pub(crate) fn project_drive(
     pb::Drive {
         open_epoch_start: None,
         open_epoch_end: None,
-        unprotected_bytes: 0,
+        unprotected_bytes: None,
         unprotected_since: None,
-        closeout_due: false,
-        closeout_overdue: false,
+        closeout_due: None,
+        closeout_overdue: None,
+        closeout_authority_error: None,
+        closeout_retry_reason: None,
         // Known here, because the changer just told us: the bay, whether it is
         // fenced, and whatever a host-side INQUIRY managed to resolve.
         element_address: Some(u32::from(bay.element_address)),

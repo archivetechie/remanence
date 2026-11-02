@@ -282,6 +282,7 @@ fn holder_drive_label(drive: &DriveKey, serial: Option<&str>) -> String {
 #[derive(Clone)]
 pub(crate) struct DrivePool {
     closing: ClosingWork,
+    worker_closing: ClosingWork,
     ended_writes: Arc<Mutex<HashMap<Uuid, (crate::pb::WriteSession, bool)>>>,
     pub(crate) readiness_wake: Arc<ReadinessWake>,
     changers: Arc<HashMap<String, mpsc::Sender<ChangerCommand>>>,
@@ -324,6 +325,7 @@ impl DrivePool {
         self.session(id)
     }
     pub(crate) async fn wait_tape_closeout(&self, tape: TapeUuid) {
+        self.worker_closing.wait(|t, _| *t == tape).await;
         self.closing.wait(|t, _| *t == tape).await;
     }
     pub(crate) fn drive_is_closing(&self, drive: &DriveKey) -> bool {
@@ -399,6 +401,7 @@ impl DrivePool {
         Self {
             changers: Arc::new(changers),
             closing: lifecycle.closing,
+            worker_closing: ClosingWork::default(),
             ended_writes: lifecycle.ended_writes,
             drives: Arc::new(drives),
             reservations,
@@ -650,6 +653,73 @@ impl DrivePool {
                 .copied(),
         );
         in_use
+    }
+
+    /// Claim and publish the worker hold atomically with tape reservation.
+    pub(crate) fn reserve_worker_tape(
+        &self,
+        tape: TapeUuid,
+    ) -> Result<(ClosingGuard, TapeReservation), Status> {
+        let mut closing = None;
+        let reservation = self.reserve_tape_with_after_insert(tape, |_| {
+            closing = Some(
+                self.worker_closing
+                    .begin(tape, DriveKey::new("maintenance", 0))
+                    .0,
+            );
+        })?;
+        Ok((closing.expect("reservation registered worker"), reservation))
+    }
+    /// A closing owner may win between the initial wait and reservation. Join
+    /// that owner too; ordinary active-session conflicts still refuse promptly.
+    pub(crate) async fn reserve_tape_after_closeout(
+        &self,
+        tape: TapeUuid,
+    ) -> Result<TapeReservation, Status> {
+        loop {
+            self.wait_tape_closeout(tape).await;
+            if let Some(reservation) = self.try_reserve_tape_after_closeout(tape)? {
+                return Ok(reservation);
+            }
+        }
+    }
+
+    /// Inspect closing ownership under the reservation locks. A worker cannot
+    /// acquire the tape between this check and the admission decision.
+    fn try_reserve_tape_after_closeout(
+        &self,
+        tape: TapeUuid,
+    ) -> Result<Option<TapeReservation>, Status> {
+        let sessions = self.sessions.lock().unwrap_or_else(|err| err.into_inner());
+        let mut reservations = self
+            .tape_reservations
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if self
+            .worker_closing
+            .0
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|(t, _)| *t == tape)
+            || self
+                .closing
+                .0
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|(t, _)| *t == tape)
+        {
+            return Ok(None);
+        }
+        if sessions.values().any(|mounted| mounted.tape_uuid == tape) || !reservations.insert(tape)
+        {
+            return Err(Status::failed_precondition("tape is already mounted"));
+        }
+        Ok(Some(TapeReservation {
+            tape_uuid: tape,
+            reservations: self.tape_reservations.clone(),
+        }))
     }
 
     pub(crate) fn reserve_tape(&self, tape_uuid: TapeUuid) -> Result<TapeReservation, Status> {
@@ -1107,6 +1177,36 @@ pub(crate) mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    /// A worker can arrive after the initial wait; its hold stays waitable even
+    /// after dispatch has released the tape reservation but before cleanup ends.
+    #[tokio::test]
+    async fn b7_fix_tape_admission_rechecks_worker_and_distinguishes_active_clients() {
+        let pool = test_pool();
+        let tape = [0xb7; 16];
+        pool.wait_tape_closeout(tape).await;
+        let (closing, reserved) = pool.reserve_worker_tape(tape).unwrap();
+        assert!(pool
+            .try_reserve_tape_after_closeout(tape)
+            .unwrap()
+            .is_none());
+        drop(reserved);
+        assert!(pool
+            .try_reserve_tape_after_closeout(tape)
+            .unwrap()
+            .is_none());
+        drop(closing);
+        let client = pool.reserve_tape_after_closeout(tape).await.unwrap();
+        assert_eq!(
+            pool.reserve_tape_after_closeout(tape)
+                .await
+                .unwrap_err()
+                .message(),
+            "tape is already mounted"
+        );
+        drop(client);
+        assert!(pool.reserve_tape_after_closeout(tape).await.is_ok());
     }
 
     /// Busy resolution waits for all matching owners, without joining another library.

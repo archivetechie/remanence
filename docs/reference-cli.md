@@ -255,12 +255,27 @@ All of these speak gRPC to `rem-daemon` and take `--endpoint` and `--json`.
 `rem top` shows unprotected bytes, the UTC time since they became unprotected,
 and `OVERDUE` when their age reaches `daemon.closeout_alarm_after_secs`. Its
 wide drive table adds `unprot bytes` and `since` columns; narrow terminals keep
-these details in the separate debt list. Its
-closeout debt list includes unseated and unavailable tapes, including tapes outside
-the configured library and drive scope. Maintenance operates only within that scope.
-JSON uses `unprotected_bytes` (decimal string), `unprotected_since` (RFC3339 UTC
-or null), `closeout_due`, and `closeout_overdue`; `closeout_debt` contains the
-catalog-shaped tape entries. An unavailable native authority is a read error.
+these details in the separate debt list. The debt band shows barcodes and UUIDs,
+uses at most five rows, and adds `+N more` when needed. Its debt list includes
+unseated, unavailable and out-of-scope tapes. Media maintenance stays within the
+configured library/drive scope; deferred SQL projection can retry without media.
+
+An unreadable native log appears as `DEBT?` with its error. `rem tape list` and
+`rem top --once` print the complete response and exit nonzero if any authority
+is unreadable. Interactive top keeps running. JSON debt values are `null` when
+unknown, with `closeout_authority_error` explaining why. Known byte counts are
+decimal strings, `unprotected_since` is RFC3339 UTC or null, and `closeout_due`
+and `closeout_overdue` are booleans. Vacant drives have absent debt values.
+`closeout_debt` contains catalog-shaped entries, including unknown tapes.
+
+`OVERDUE` can coexist with `closeout_due=false` when an accepted finalization
+plan owns the range. That tape needs finalization to resume, not another
+`rem tape closeout`. The original unprotected age still determines the alarm.
+`closeout_retry_reason` shows the last worker refusal. Busy drives and memory
+shortages retry with capped backoff; write protection, fences, wrong media and
+identity mismatches wait for fence release, inventory change or operator
+closeout. Pinned writes, closeout and finalization wait for a worker holding
+their tape. Status reads during a checkpoint return the last committed summary.
 
 Note: `GetLiveStatus` also carries an advisory `drive_assignments`
 projection (per-bay busy/idle state, keyed `(library_serial, bay)`) for

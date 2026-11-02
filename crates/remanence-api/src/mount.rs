@@ -303,18 +303,37 @@ async fn open_write_session_reserved_for_caller(
         WriteSessionTarget::Pool { .. } => {
             let located_tapes =
                 located_tapes_in_operated_libraries(state, pool, library_constraint.as_deref())?;
-            let allowed_tape_uuids = located_tapes.keys().copied().collect::<HashSet<_>>();
+            let mut allowed_tape_uuids = located_tapes.keys().copied().collect::<HashSet<_>>();
+            let mut route_error = None;
             loop {
                 select_attempts = select_attempts.saturating_add(1);
-                let selected = crate::pool_write::select_tape_in_pool_for_write_session_scoped(
+                let selected = match crate::pool_write::select_tape_in_pool_for_write_session_scoped(
                     &index,
                     &pool_cfg,
                     0,
                     &pool.mounted_tape_uuids(),
                     state.checkpoint_journal_dir.as_path(),
                     &allowed_tape_uuids,
-                )
-                .map_err(crate::write_owner::status_from_select_tape_error)?;
+                ) {
+                    Ok(selected) => selected,
+                    // Reselection must not erase the actionable route/fence
+                    // diagnostic when no reachable alternative remains.
+                    Err(error) => {
+                        return Err(route_error.unwrap_or_else(|| {
+                            crate::write_owner::status_from_select_tape_error(error)
+                        }))
+                    }
+                };
+                if let Some(library) = located_tapes.get(&selected.tape_uuid) {
+                    if let Err(error) =
+                        resolve_actor_mount(state, library, &selected.tape_uuid, &HashSet::new())
+                    {
+                        tracing::debug!(tape_uuid = %Uuid::from_bytes(selected.tape_uuid), %error, "pool selection skipped unreachable tape");
+                        route_error = Some(error);
+                        allowed_tape_uuids.remove(&selected.tape_uuid);
+                        continue;
+                    }
+                }
                 match pool.reserve_tape(selected.tape_uuid) {
                     Ok(reservation) => {
                         break ReservedWriteDisposition::Writable {
@@ -343,7 +362,7 @@ async fn open_write_session_reserved_for_caller(
             // Own the exact tape before consulting the exceptional post-C
             // admission path. Recovery in this runtime uses the same owner,
             // so it cannot finalize the tape between admission and preflight.
-            let reservation = pool.reserve_tape(*tape_uuid)?;
+            let reservation = pool.reserve_tape_after_closeout(*tape_uuid).await?;
             let disposition = crate::pool_write::admit_pinned_tape_for_write_session(
                 &index,
                 *tape_uuid,
@@ -878,7 +897,7 @@ async fn manual_finalize_tape_critical(
 ) -> Result<crate::write_owner::ManualFinalizeTapeResult, Status> {
     let pool = state.drive_pool()?.clone();
     pool.wait_tape_closeout(admission.tape_uuid).await;
-    let tape_reservation = match pool.reserve_tape(admission.tape_uuid) {
+    let tape_reservation = match pool.reserve_tape_after_closeout(admission.tape_uuid).await {
         Ok(reservation) => reservation,
         Err(error)
             if error.code() == tonic::Code::FailedPrecondition
@@ -1248,12 +1267,12 @@ pub(crate) async fn service_closeout_obligation(
     incarnation: u64,
 ) -> Result<(), Status> {
     let pool = state.drive_pool()?.clone();
-    let tape_reservation = pool.reserve_tape(tape_uuid)?;
+    let (_closing, tape_reservation) = pool.reserve_worker_tape(tape_uuid)?;
     let mut index = state.index_write()?;
     if index
         .get_tape(&tape_uuid)
         .map_err(status_from_state_error)?
-        .is_some_and(|t| t.state == "retired")
+        .is_none_or(|t| t.state == "retired")
     {
         return Ok(());
     }
@@ -1267,6 +1286,7 @@ pub(crate) async fn service_closeout_obligation(
     }
     // Resolve only within configured library/drive ownership, before dispatch.
     let library = resolve_tape_library_serial(state, &pool, &tape_uuid)?;
+    let _library_attempt = state.closeout_work.reserve_library(&library)?;
     let route = resolve_actor_mount(state, &library, &tape_uuid, &HashSet::new())?;
     let mount = match &route {
         ActorMountPlan::Ready(mount) | ActorMountPlan::Evict { mount, .. } => mount,
@@ -1311,15 +1331,28 @@ pub(crate) async fn service_closeout_obligation(
             recover_automatic_terminal_tape(state, &pool, tape_reservation, tape_uuid).await
         }
     } else if closeout {
-        // closeout_tape takes the same reservation and rechecks under its lease.
-        drop(tape_reservation);
-        closeout_tape(
+        let progress =
+            crate::closeout_progress::CloseoutProgress::new(Uuid::new_v4(), tape_uuid, None)?;
+        let result = closeout_tape_reserved(
             state,
             tape_uuid,
             None,
-            crate::closeout_progress::CloseoutProgress::new(Uuid::new_v4(), tape_uuid, None)?,
+            progress.clone(),
+            Some(tape_reservation),
         )
-        .await
+        .await;
+        let (event, reason) = match &result {
+            Ok(()) => (remanence_state::AuditEvent::OperationFinished, None),
+            Err(error) => (remanence_state::AuditEvent::OperationFailed, Some(error)),
+        };
+        progress.audit(
+            &mut state.index_write()?,
+            &state.audit_dir,
+            &state.audit_append_lock,
+            event,
+            reason,
+        )?;
+        result
     } else {
         Ok(())
     }
@@ -2858,7 +2891,7 @@ pub(crate) fn resolve_tape_library_serial(
     }
 }
 
-fn located_tapes_in_operated_libraries(
+pub(crate) fn located_tapes_in_operated_libraries(
     state: &ApiState,
     pool: &crate::write_owner::DrivePool,
     library_constraint: Option<&str>,
@@ -2884,7 +2917,15 @@ fn located_tapes_in_operated_libraries(
         let barcodes = library
             .drive_bays
             .iter()
-            .filter(|bay| bay.loaded)
+            .filter(|bay| {
+                bay.loaded
+                    && pool
+                        .drive_tx(&crate::drive_pool::DriveKey::new(
+                            &library.serial,
+                            bay.element_address,
+                        ))
+                        .is_ok()
+            })
             .filter_map(|bay| bay.loaded_tape.as_deref())
             .chain(
                 library
@@ -2936,6 +2977,27 @@ async fn resolve_and_reserve_actor_mount(
     library_serial: &str,
     tape_uuid: &TapeUuid,
 ) -> Result<(ActorMount, crate::write_owner::DriveReservation), Status> {
+    let (mount, drive, ()) = resolve_and_reserve_actor_mount_with_resource(
+        state,
+        pool,
+        library_serial,
+        tape_uuid,
+        || Ok(()),
+    )
+    .await?;
+    Ok((mount, drive))
+}
+
+/// Resource admission happens after securing a drive and before eviction or any
+/// other media command. A closeout never holds memory while waiting for a drive.
+async fn resolve_and_reserve_actor_mount_with_resource<R>(
+    state: &ApiState,
+    pool: &crate::write_owner::DrivePool,
+    library_serial: &str,
+    tape_uuid: &TapeUuid,
+    resource: impl FnOnce() -> Result<R, Status>,
+) -> Result<(ActorMount, crate::write_owner::DriveReservation, R), Status> {
+    let mut resource = Some(resource);
     loop {
         let busy_bays = pool.busy_bays(library_serial);
         let resolved = resolve_actor_mount(state, library_serial, tape_uuid, &busy_bays);
@@ -2975,33 +3037,36 @@ async fn resolve_and_reserve_actor_mount(
         let drive_key = crate::drive_pool::DriveKey::new(library_serial.to_string(), bay);
         pool.wait_drive_closeout(&drive_key).await;
         match pool.reserve_drive(&drive_key) {
-            Ok(reservation) => match plan {
-                ActorMountPlan::Ready(mount) => {
-                    ensure_actor_mount_media_readiness_admitted(state, library_serial, &mount)?;
-                    return Ok((mount, reservation));
-                }
-                ActorMountPlan::Evict { mount, mut seated } => {
-                    ensure_actor_mount_media_readiness_admitted(state, library_serial, &mount)?;
-                    if let Some(parked) = pool.parked_at(&seated.drive_key()) {
-                        if parked.seated.library_serial == seated.library_serial
-                            && parked.seated.barcode == seated.barcode
-                            && parked.seated.home_slot == seated.home_slot
-                        {
-                            seated.tape_uuid = parked.seated.tape_uuid;
-                            seated.prior_session_id = parked.seated.prior_session_id;
-                        }
+            Ok(reservation) => {
+                let resource = resource.take().expect("resource admitted once")()?;
+                match plan {
+                    ActorMountPlan::Ready(mount) => {
+                        ensure_actor_mount_media_readiness_admitted(state, library_serial, &mount)?;
+                        return Ok((mount, reservation, resource));
                     }
-                    let reservation = dismount_reserved_cartridge(
-                        state,
-                        pool,
-                        &seated,
-                        DismountReason::Evicted,
-                        reservation,
-                    )
-                    .await?;
-                    return Ok((mount, reservation));
+                    ActorMountPlan::Evict { mount, mut seated } => {
+                        ensure_actor_mount_media_readiness_admitted(state, library_serial, &mount)?;
+                        if let Some(parked) = pool.parked_at(&seated.drive_key()) {
+                            if parked.seated.library_serial == seated.library_serial
+                                && parked.seated.barcode == seated.barcode
+                                && parked.seated.home_slot == seated.home_slot
+                            {
+                                seated.tape_uuid = parked.seated.tape_uuid;
+                                seated.prior_session_id = parked.seated.prior_session_id;
+                            }
+                        }
+                        let reservation = dismount_reserved_cartridge(
+                            state,
+                            pool,
+                            &seated,
+                            DismountReason::Evicted,
+                            reservation,
+                        )
+                        .await?;
+                        return Ok((mount, reservation, resource));
+                    }
                 }
-            },
+            }
             Err(err)
                 if err.code() == tonic::Code::FailedPrecondition
                     && err.message().split("; held by: ").next()
@@ -3047,6 +3112,37 @@ fn resolve_actor_mount(
         .ok_or_else(|| Status::not_found(format!("library {library_serial} not found")))?;
     // Only configured actor drives participate in maintenance or session placement.
     // A cartridge seated in an excluded drive is not movable by this owner.
+    if let Some(pool) = &state.drive_pool {
+        if let Some(bay) = library.drive_bays.iter().find(|bay| {
+            bay.loaded
+                && bay.loaded_tape.as_deref() == Some(voltag.as_str())
+                && pool
+                    .drive_tx(&crate::drive_pool::DriveKey::new(
+                        library_serial,
+                        bay.element_address,
+                    ))
+                    .is_err()
+        }) {
+            return Err(Status::failed_precondition(format!("cartridge {voltag} is seated in out-of-scope bay 0x{:04x} of library {library_serial}", bay.element_address)));
+        }
+    }
+    if let Some(pool) = &state.drive_pool {
+        if let Some(bay) = library.drive_bays.iter().find(|bay| {
+            bay.loaded
+                && bay.loaded_tape.as_deref() == Some(voltag.as_str())
+                && pool
+                    .drive_tx(&crate::drive_pool::DriveKey::new(
+                        library_serial,
+                        bay.element_address,
+                    ))
+                    .is_ok_and(|tx| tx.is_closed())
+        }) {
+            return Err(Status::unavailable(format!(
+                "drive actor is unavailable in bay 0x{:04x} of library {library_serial}",
+                bay.element_address
+            )));
+        }
+    }
     let mut scoped = library.clone();
     if let Some(pool) = &state.drive_pool {
         scoped.drive_bays.retain(|bay| {
@@ -3054,7 +3150,7 @@ fn resolve_actor_mount(
                 library_serial,
                 bay.element_address,
             ))
-            .is_ok()
+            .is_ok_and(|tx| !tx.is_closed())
         });
     }
     let library = &scoped;
@@ -3462,15 +3558,25 @@ pub(crate) async fn closeout_tape(
     expected_pool: Option<String>,
     progress: crate::closeout_progress::CloseoutProgress,
 ) -> Result<(), Status> {
-    if let Some(pool) = &state.drive_pool {
-        pool.wait_tape_closeout(tape_uuid).await;
-    }
-    let _tape = state
-        .drive_pool
-        .as_ref()
-        .map(|pool| pool.reserve_tape(tape_uuid))
-        .transpose()?;
-    let permit = {
+    state.closeout_work.wake.notify_one();
+    let reservation = if let Some(pool) = &state.drive_pool {
+        Some(pool.reserve_tape_after_closeout(tape_uuid).await?)
+    } else {
+        None
+    };
+    closeout_tape_reserved(state, tape_uuid, expected_pool, progress, reservation).await
+}
+
+/// Retain the worker's original reservation through dispatch; never create an
+/// unowned gap or wait for our own hold.
+async fn closeout_tape_reserved(
+    state: &ApiState,
+    tape_uuid: [u8; 16],
+    expected_pool: Option<String>,
+    progress: crate::closeout_progress::CloseoutProgress,
+    _tape: Option<crate::write_owner::TapeReservation>,
+) -> Result<(), Status> {
+    let (scheme, block_size, extent_count) = {
         let index = state.index()?;
         let tape = index
             .get_tape(&tape_uuid)
@@ -3515,18 +3621,23 @@ pub(crate) async fn closeout_tape(
             .scheme
             .as_ref()
             .ok_or_else(|| Status::internal("closeout lacks scheme"))?;
-        state.io_memory.reserve_closeout(
-            scheme,
-            summary.block_size,
-            summary.uncovered.len(),
-            tape_uuid,
-        )?
+        (scheme.clone(), summary.block_size, summary.uncovered.len())
     };
-    progress.reserved(permit.bytes());
     let pool = state.drive_pool()?.clone();
     let library_serial = resolve_tape_library_serial(state, &pool, &tape_uuid)?;
-    let (mount, _drive) =
-        resolve_and_reserve_actor_mount(state, &pool, &library_serial, &tape_uuid).await?;
+    let (mount, _drive, permit) = resolve_and_reserve_actor_mount_with_resource(
+        state,
+        &pool,
+        &library_serial,
+        &tape_uuid,
+        || {
+            state
+                .io_memory
+                .reserve_closeout(&scheme, block_size, extent_count, tape_uuid)
+        },
+    )
+    .await?;
+    progress.reserved(permit.bytes());
     pool.set_internal_holder(
         &mount.drive_key(),
         mount.drive_serial.as_deref(),
@@ -6190,8 +6301,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn startup_terminal_recovery_owns_the_tape_before_its_lease_so_same_key_finalize_rejoins()
-    {
+    async fn startup_terminal_recovery_owns_the_tape_and_same_key_finalize_waits() {
         use std::sync::atomic::AtomicBool;
         use std::sync::Arc;
 
@@ -6335,20 +6445,25 @@ mod tests {
             .await
             .expect("startup recovery takes the tape-log lease")
             .expect("lease hook reports exact-tape ownership");
-        let replay = manual_finalize_tape(&state, admission.clone()).await;
+        let mut replay = tokio::spawn({
+            let state = state.clone();
+            let admission = admission.clone();
+            async move { manual_finalize_tape(&state, admission).await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut replay)
+                .await
+                .is_err(),
+            "same-key finalization waits for the startup worker hold"
+        );
         resume_tx.send(()).expect("resume startup recovery");
         assert!(
             lease_owner_owns_tape,
-            "startup recovery holds the tape-log lease without owning the tape; same-key FinalizeTape saw {replay:?}"
+            "startup recovery must own the tape before taking its log lease"
         );
-        let replay = replay.expect("same-key FinalizeTape rejoins startup recovery");
-        let crate::write_owner::ManualFinalizeTapeResult::Accepted(replay) = replay else {
-            panic!("same-key FinalizeTape must not degrade to BUSY during startup recovery");
-        };
-        assert_eq!(replay.operation_id, accepted.operation_id);
 
         // Startup recovery remains the only owner: it dispatches exactly one
-        // tail for the original operation, and the rejoin dispatches none.
+        // tail for the original operation while the same-key caller waits.
         let reply = match tokio::time::timeout(Duration::from_secs(30), drive_rx.recv())
             .await
             .expect("startup recovery dispatches")
@@ -6370,7 +6485,17 @@ mod tests {
             changer_rx.try_recv().is_err(),
             "loaded-tape tail moved media"
         );
+        assert!(!replay.is_finished(), "worker still owns the tape");
         drop(reply);
+        let replay = tokio::time::timeout(Duration::from_secs(5), replay)
+            .await
+            .expect("finalization resumes after the worker releases its hold")
+            .expect("same-key caller joins")
+            .expect("same-key finalization is accepted");
+        let crate::write_owner::ManualFinalizeTapeResult::Accepted(replay) = replay else {
+            panic!("same-key FinalizeTape must not degrade to BUSY after waiting");
+        };
+        assert_eq!(replay.operation_id, accepted.operation_id);
     }
 
     #[tokio::test]

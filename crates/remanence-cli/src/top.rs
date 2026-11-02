@@ -196,7 +196,7 @@ fn render_top(frame: &mut Frame<'_>, state: &TopState) {
                 2 + state
                     .live
                     .as_ref()
-                    .map_or(0, |l| l.closeout_debt.len() as u16),
+                    .map_or(0, |l| l.closeout_debt.len().min(5) as u16),
             ),
             Constraint::Min(7),
             Constraint::Length(if state.help { 4 } else { 2 }),
@@ -208,19 +208,33 @@ fn render_top(frame: &mut Frame<'_>, state: &TopState) {
         .live
         .as_ref()
         .map(|live| {
-            live.closeout_debt
+            let count = live.closeout_debt.len();
+            let visible = if count > 5 { 4 } else { count };
+            let mut rows = live
+                .closeout_debt
                 .iter()
+                .take(visible)
                 .map(|t| {
                     format!(
-                        "{} {} bytes since {} {}",
+                        "{} {} {} bytes since {} {}",
+                        crate::or_dash(t.voltag.as_deref()),
                         bytes_to_uuid_text(&t.tape_uuid),
-                        t.unprotected_bytes,
+                        t.unprotected_bytes
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| "unknown".into()),
                         crate::timestamp_value(t.unprotected_since.as_ref()),
-                        if t.closeout_overdue { "OVERDUE" } else { "" }
+                        crate::debt_badge(
+                            t.closeout_authority_error.as_deref(),
+                            t.closeout_overdue,
+                            t.closeout_retry_reason.as_deref()
+                        )
                     )
                 })
-                .collect::<Vec<_>>()
-                .join("\n")
+                .collect::<Vec<_>>();
+            if count > visible {
+                rows.push(format!("+{} more", count - visible));
+            }
+            rows.join("\n")
         })
         .unwrap_or_default();
     frame.render_widget(
@@ -372,7 +386,12 @@ fn render_pinned_band(frame: &mut Frame<'_>, area: Rect, state: &TopState) {
                         Cell::from(mib_per_second(
                             drive.tape_io_effective_feed_bytes_per_second,
                         )),
-                        Cell::from(drive.unprotected_bytes.to_string()),
+                        Cell::from(
+                            drive
+                                .unprotected_bytes
+                                .map(|n| n.to_string())
+                                .unwrap_or_else(|| "unknown".into()),
+                        ),
                         Cell::from(
                             crate::timestamp_value(drive.unprotected_since.as_ref())
                                 .as_str()
@@ -382,11 +401,11 @@ fn render_pinned_band(frame: &mut Frame<'_>, area: Rect, state: &TopState) {
                         Cell::from(format!(
                             "{} {}",
                             badges,
-                            if drive.closeout_overdue {
-                                "OVERDUE"
-                            } else {
-                                ""
-                            }
+                            crate::debt_badge(
+                                drive.closeout_authority_error.as_deref(),
+                                drive.closeout_overdue,
+                                drive.closeout_retry_reason.as_deref()
+                            )
                         )),
                     ];
                     if area.width < 120 {
@@ -679,13 +698,44 @@ mod tests {
     }
 
     #[test]
+    fn b7_fix_tui_caps_debt_band_and_shows_barcode_and_error() {
+        let mut response = sample_response();
+        response.closeout_debt = (0..30)
+            .map(|i| pb::Tape {
+                tape_uuid: vec![i; 16],
+                voltag: Some(format!("DEBT{i:02}L9")),
+                closeout_authority_error: Some("unreadable log".into()),
+                ..Default::default()
+            })
+            .collect();
+        let state = TopState {
+            live: Some(response),
+            show_slots: true,
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(180, 30)).unwrap();
+        terminal.draw(|f| render_top(f, &state)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        for expected in ["DEBT00L9", "DEBT?", "unreadable log", "+26 more", "CLN001"] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        assert!(!text.contains("DEBT04L9"));
+    }
+
+    #[test]
     fn b7_tui_lists_unseated_overdue_debt() {
         let response = pb::GetLiveStatusResponse {
             closeout_debt: vec![pb::Tape {
                 tape_uuid: vec![1; 16],
-                unprotected_bytes: 786432,
-                closeout_due: true,
-                closeout_overdue: true,
+                unprotected_bytes: Some(786432),
+                closeout_due: Some(true),
+                closeout_overdue: Some(true),
                 unprotected_since: Some(prost_types::Timestamp {
                     seconds: 0,
                     nanos: 0,

@@ -380,11 +380,15 @@ message Drive {
   // Committed ordinals [W,T) awaiting parity on the seated cartridge.
   optional uint64 open_epoch_start = 31;
   optional uint64 open_epoch_end = 32;
-  // Native parity debt; authority read failures fail the entire response.
-  uint64 unprotected_bytes = 33;
+  // Native parity debt. Absent fields with closeout_authority_error mean unknown.
+  // Vacant drives have absent debt; a known protected tape has present zero/false.
+  optional uint64 unprotected_bytes = 33;
   optional google.protobuf.Timestamp unprotected_since = 34;
-  bool closeout_due = 35;
-  bool closeout_overdue = 36;
+  optional bool closeout_due = 35;
+  optional bool closeout_overdue = 36;
+  optional string closeout_authority_error = 37;
+  // Last worker refusal; operator-required failures wait for an explicit wake.
+  optional string closeout_retry_reason = 38;
 }
 
 // A row of the drive catalog. Field presence here MIRRORS the nullability of
@@ -858,11 +862,15 @@ message Tape {
   optional uint64 open_epoch_end = 21;
   // Automatic barrier seal trigger; not a removal deferral.
   optional string seal_due = 22;
-  // Native parity debt; authority read failures fail the entire response.
-  uint64 unprotected_bytes = 23;
+  // Native parity debt. Absent fields with closeout_authority_error mean unknown.
+  // Vacant drives have absent debt; a known protected tape has present zero/false.
+  optional uint64 unprotected_bytes = 23;
   optional google.protobuf.Timestamp unprotected_since = 24;
-  bool closeout_due = 25;
-  bool closeout_overdue = 26;
+  optional bool closeout_due = 25;
+  optional bool closeout_overdue = 26;
+  optional string closeout_authority_error = 27;
+  // Last worker refusal; operator-required failures wait for an explicit wake.
+  optional string closeout_retry_reason = 28;
 }
 
 message FinalizeTapeRequest {

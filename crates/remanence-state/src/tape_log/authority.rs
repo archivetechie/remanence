@@ -335,8 +335,95 @@ fn stream_reports(
     }
     Ok(())
 }
-/// Weak observers do not extend a writer's lease or grant append authority.
-type ObservedOwners = std::collections::HashMap<std::path::PathBuf, Weak<Mutex<Lease>>>;
+/// The mutex guard marks the independent mirror on unwind, including a panic
+/// outside publication. Readers never need to upgrade this owner to detect poison.
+#[derive(Debug)]
+struct ObservedLease {
+    inner: Mutex<Lease>,
+    mirror: Arc<SummaryMirror>,
+}
+struct ObservedGuard<'a> {
+    inner: MutexGuard<'a, Lease>,
+    mirror: &'a SummaryMirror,
+}
+impl std::ops::Deref for ObservedGuard<'_> {
+    type Target = Lease;
+    fn deref(&self) -> &Lease {
+        &self.inner
+    }
+}
+impl std::ops::DerefMut for ObservedGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Lease {
+        &mut self.inner
+    }
+}
+impl Drop for ObservedGuard<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            *self.mirror.write().unwrap_or_else(|p| p.into_inner()) =
+                Err("authority owner panicked".into());
+        }
+    }
+}
+impl ObservedLease {
+    fn new(lease: Lease) -> Self {
+        Self {
+            mirror: lease.observation(),
+            inner: Mutex::new(lease),
+        }
+    }
+    fn lock(&self) -> Result<ObservedGuard<'_>, ()> {
+        self.inner
+            .lock()
+            .map(|inner| ObservedGuard {
+                inner,
+                mirror: &self.mirror,
+            })
+            .map_err(|_| ())
+    }
+    fn try_lock(&self) -> Result<ObservedGuard<'_>, std::sync::TryLockError<()>> {
+        self.inner
+            .try_lock()
+            .map(|inner| ObservedGuard {
+                inner,
+                mirror: &self.mirror,
+            })
+            .map_err(|error| match error {
+                std::sync::TryLockError::WouldBlock => std::sync::TryLockError::WouldBlock,
+                std::sync::TryLockError::Poisoned(_) => {
+                    std::sync::TryLockError::Poisoned(std::sync::PoisonError::new(()))
+                }
+            })
+    }
+}
+
+/// Observers retain only a durable summary, never the owner's lease/flock.
+type SummaryMirror = std::sync::RwLock<Result<TapeSummary, String>>;
+#[derive(Default)]
+struct Observation {
+    owner: Weak<SummaryMirror>,
+    cached: Option<(LogChange, TapeSummary)>,
+    #[cfg(test)]
+    replays: usize,
+}
+/// Linux inode change notification: includes in-place writes and replacements,
+/// not just appends. No unchanged log is replayed by status polling.
+#[derive(Clone, PartialEq, Eq)]
+struct LogChange(u64, u64, u64, i64, i64, i64, i64);
+fn log_change(path: &Path) -> Result<LogChange, StateError> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).map_err(StoreError::from)?;
+    Ok(LogChange(
+        m.dev(),
+        m.ino(),
+        m.len(),
+        m.mtime(),
+        m.mtime_nsec(),
+        m.ctime(),
+        m.ctime_nsec(),
+    ))
+}
+type ObservedOwners = std::collections::HashMap<std::path::PathBuf, Observation>;
 static OBSERVED_OWNERS: std::sync::OnceLock<Mutex<ObservedOwners>> = std::sync::OnceLock::new();
 
 /// Factory for the per-tape authority backend.
@@ -385,7 +472,6 @@ impl TapeAuthority {
                 .is_some_and(|e| e == "remtape" || e == "ambiguous")
             {
                 let path = path.with_extension("remtape");
-                Self::entry_tape_uuid(&path)?;
                 entries.push(path);
             }
         }
@@ -442,44 +528,68 @@ impl TapeAuthority {
     pub fn acquire_exclusive_for_terminal_recovery(
         &self,
     ) -> Result<TapeAuthorityLease, StateError> {
-        self.wrap_lease(self.store.acquire(false)?)
+        self.wrap_lease(false)
     }
     /// Explicit physical-tail recovery only; ordinary publication remains
     /// refused until the retained cursor has been reconciled under this owner.
     pub fn acquire_for_tail_reconciliation(&self) -> Result<TapeAuthorityLease, StateError> {
-        self.wrap_lease(self.store.acquire_for_tail_reconciliation()?)
+        self.wrap_lease(true)
     }
     /// Observe only the last durable fold, including while a local actor owns
     /// its lease. This is a display/scheduling observation, never an admission
     /// capability. Other processes still require the ordinary shared snapshot.
     pub fn observe_summary(&self) -> Result<TapeSummary, StateError> {
-        let owner = OBSERVED_OWNERS
-            .get_or_init(Mutex::default)
-            .lock()
-            .map_err(|_| invalid("authority observer registry poisoned"))?
-            .get(self.store.path())
-            .and_then(Weak::upgrade);
-        if let Some(owner) = owner {
-            // Publications hold this mutex only across native host I/O, never
-            // drive commands. Wait for their durable outcome rather than turn
-            // ordinary fsync contention into a transient status-read failure.
-            let core = owner
-                .lock()
-                .map_err(|_| invalid("authority owner panicked"))?;
-            core.check()?;
-            Ok(core.summary().clone())
-        } else {
-            Ok(self.store.snapshot()?.summary().clone())
-        }
-    }
-    fn wrap_lease(&self, lease: Lease) -> Result<TapeAuthorityLease, StateError> {
-        let core = Arc::new(Mutex::new(lease));
         let mut owners = OBSERVED_OWNERS
             .get_or_init(Mutex::default)
             .lock()
             .map_err(|_| invalid("authority observer registry poisoned"))?;
-        owners.retain(|_, owner| owner.strong_count() > 0);
-        owners.insert(self.store.path().to_owned(), Arc::downgrade(&core));
+        if self.store.has_ambiguity()? {
+            return Err(StoreError::Fenced.into());
+        }
+        let entry = owners.entry(self.store.path().to_owned()).or_default();
+        if let Some(owner) = entry.owner.upgrade() {
+            return owner
+                .read()
+                .map_err(|_| invalid("authority owner panicked"))?
+                .clone()
+                .map_err(invalid);
+        }
+        let change = log_change(self.store.path())?;
+        if let Some((previous, summary)) = &entry.cached {
+            if previous == &change {
+                return Ok(summary.clone());
+            }
+        }
+        let summary = self.store.snapshot()?.summary().clone();
+        #[cfg(test)]
+        {
+            entry.replays += 1;
+        }
+        // Never cache a snapshot if an external writer changed the log during replay.
+        entry.cached =
+            (log_change(self.store.path())? == change).then(|| (change, summary.clone()));
+        Ok(summary)
+    }
+    fn wrap_lease(&self, recovery: bool) -> Result<TapeAuthorityLease, StateError> {
+        // Serialize registration with observations so no reader can fall into
+        // the gap between acquiring the flock and publishing the mirror.
+        let mut owners = OBSERVED_OWNERS
+            .get_or_init(Mutex::default)
+            .lock()
+            .map_err(|_| invalid("authority observer registry poisoned"))?;
+        let lease = if recovery {
+            self.store.acquire_for_tail_reconciliation()?
+        } else {
+            self.store.acquire(false)?
+        };
+        owners.insert(
+            self.store.path().to_owned(),
+            Observation {
+                owner: Arc::downgrade(&lease.observation()),
+                ..Default::default()
+            },
+        );
+        let core = Arc::new(ObservedLease::new(lease));
         Ok(TapeAuthorityLease {
             uuid: self.store.header.tape_uuid,
             core,
@@ -501,7 +611,7 @@ enum Scope {
 #[derive(Debug)]
 pub struct TapeAuthorityLease {
     uuid: [u8; 16],
-    core: Arc<Mutex<Lease>>,
+    core: Arc<ObservedLease>,
     structural: Option<StructuralCapability>,
     scope: Scope,
     pending: Option<(StagedGroup, Committed)>,
@@ -707,7 +817,7 @@ impl TapeAuthorityLease {
     pub fn accept_preparation(&mut self) -> Result<(), StateError> {
         accept(&mut *self.core()?)
     }
-    fn core(&self) -> Result<MutexGuard<'_, Lease>, StateError> {
+    fn core(&self) -> Result<ObservedGuard<'_>, StateError> {
         self.core
             .lock()
             .map_err(|_| invalid("authority owner panicked"))
@@ -2032,7 +2142,7 @@ fn publish_physical(
 }
 #[derive(Debug)]
 struct Structural {
-    core: Weak<Mutex<Lease>>,
+    core: Weak<ObservedLease>,
     read_cache: Weak<Mutex<Option<Snapshot>>>,
     uuid: [u8; 16],
 }

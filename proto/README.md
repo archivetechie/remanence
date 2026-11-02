@@ -139,21 +139,48 @@ there is no `SessionEndedDetails` status extension.
 
 ## Closeout obligation surfaces
 
-Regenerate consumer bindings for `Tape` tags 23–26 and `Drive` tags 33–36:
-`uint64 unprotected_bytes`, optional Timestamp `unprotected_since`,
-`bool closeout_due`, and `bool closeout_overdue`, respectively. Zero bytes and
-false flags are determined values; missing or unreadable authority fails the
-read. `unprotected_since` is absent exactly when unprotected bytes are zero.
-An accepted finalization plan may own the uncovered range, making ordinary
-`closeout_due` false while bytes and their age remain visible.
+Regenerate consumer bindings (including sutradhara `_proto`) for `Tape` tags
+23–28 and `Drive` tags 33–38. The four debt fields are presence-carrying:
+optional `uint64 unprotected_bytes`, optional Timestamp `unprotected_since`,
+optional `bool closeout_due`, and optional `bool closeout_overdue`.
+`closeout_authority_error` (27/37) and `closeout_retry_reason` (28/38) are
+optional strings. These fields are unreleased; no compatibility form is retained.
+
+Present zero bytes and false flags are determined values. An unreadable native
+log leaves all four debt fields absent and sets `closeout_authority_error`.
+`ListTapes` and `GetLiveStatus` retain the other tapes and all other status data;
+`GetTape` for the affected tape returns its error status. Vacant drives have
+absent debt fields and no authority error. For a readable tape,
+`unprotected_since` is absent exactly when unprotected bytes are zero.
+An accepted finalization plan may own the uncovered range: `closeout_due` is
+then false while bytes, age and `closeout_overdue` remain visible.
 
 `GetLiveStatusResponse.closeout_debt = 9` contains catalog `Tape` entries for
-all uncovered ranges and pending seal triggers, including unseated and unavailable
-tapes and tapes outside the daemon's configured scope. An empty list means no
-uncovered ranges or pending seal triggers. The
-worker operates only within configured library and drive ownership.
+all uncovered ranges, pending seal triggers and unknown authorities, including
+unseated and unavailable tapes and tapes outside the daemon's configured scope.
+An empty list means no known debt or unknown authority among catalog tapes.
+Media maintenance operates only within configured library and drive ownership;
+retrying deferred SQL projection requires no media access.
 
-CLI catalog/live/top JSON uses `unprotected_bytes` as a decimal string,
-`unprotected_since` as RFC3339 UTC or null, and the two boolean flags. Existing
-open-epoch and seal-trigger fields retain their meanings. There is no additional
-session receipt message or status extension; poll `GetWriteSession`.
+CLI catalog/live/top JSON uses decimal strings for present byte counts,
+RFC3339 UTC for present timestamps, booleans for present flags, and `null` for
+absent values. Both optional strings are strings or `null`. Lists print every
+entry before reporting unreadable authority as a nonzero exit status;
+interactive top keeps running and shows `DEBT?` and the per-tape error.
+`closeout_retry_reason` retains the worker's last refusal. Busy, no-drive and
+memory refusals use capped backoff; media protection, fences and identity
+refusals wait for fence release, inventory change or operator closeout.
+
+Status observations use the last durable fold during a staged checkpoint.
+Owners publish a separate summary mirror; observers retain no writer lease.
+Unowned summaries are cached by device/inode, length, mtime and ctime (including
+nanoseconds). Unchanged polls do no full replay; a changed log is revalidated.
+The cache stores one bounded summary per observed log, and only caches a replay
+if the log's change token remains stable through validation. Owner acquisition
+and registration are serialized with observation; ambiguity and poison still fail.
+There is at most one worker attempt per library, with memory reserved only after
+a drive is secured and before eviction or other media work. Pinned writes,
+CloseoutTape and FinalizeTape wait for an in-flight worker hold.
+
+Existing open-epoch and seal-trigger fields retain their meanings. There is no
+additional session receipt message or status extension; poll `GetWriteSession`.
