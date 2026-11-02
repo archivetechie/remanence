@@ -77,7 +77,7 @@ The October 2026 window on the MSL3040 produced these operational rules.
    must be installed) before it skips the bay, and `03-bringup.sh --stop`
    first unloads each allowlisted seated cartridge in the selected library through
    `rem drive unload --library <serial> --bay <bay>`. It records every unload and
-   records refusals, timeouts, and incomplete epoch closes as WARN with the bay.
+   records refusals and timeouts as WARN with the bay.
    Busy refusals retry every 10 seconds for the kit config's
    `default_idle_timeout_seconds + 60` (180 seconds with the generated config).
    Each inventory call is limited to 60 seconds; each unload call to the retry

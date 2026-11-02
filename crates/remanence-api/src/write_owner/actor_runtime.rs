@@ -603,6 +603,7 @@ pub(super) fn drive_loop(
                 let _ = reply.send(result);
             }
             DriveCommand::CloseoutTape {
+                permit,
                 progress,
                 tape_uuid,
                 expected_pool,
@@ -617,9 +618,12 @@ pub(super) fn drive_loop(
                     &mut index,
                     &cfg,
                     drive,
-                    tape_uuid,
-                    expected_pool.as_deref(),
-                    &progress,
+                    super::closeout::CloseoutWork {
+                        tape_uuid,
+                        expected_pool: expected_pool.as_deref(),
+                        progress: &progress,
+                        permit,
+                    },
                     |index, drive| {
                         super::readiness::session_open_short_probe_or_load(
                             index,

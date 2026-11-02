@@ -123,6 +123,7 @@ type FinishRequest = (
 );
 
 pub(super) struct WriteSessionState<'a> {
+    closing_error: Option<Status>,
     closing_work: Option<crate::drive_pool::ClosingGuard>,
     end_reason: remanence_state::tape_log::SessionEndReason,
     ended_durably: bool,
@@ -166,11 +167,13 @@ impl WriteSessionState<'_> {
     fn begin_closing_work(&mut self) {
         if self.closing_work.is_none() {
             if let Some(lifecycle) = &self.cfg.lifecycle {
-                self.closing_work = Some(lifecycle.closing.begin(
-                    self.tape_uuid,
-                    self.pool_cfg.id.clone(),
-                    self.cfg.endpoint(self.bay),
-                ));
+                match lifecycle
+                    .closing
+                    .begin(self.tape_uuid, self.cfg.endpoint(self.bay))
+                {
+                    Ok(guard) => self.closing_work = Some(guard),
+                    Err(error) => self.closing_error = Some(error),
+                }
             }
         }
     }
@@ -178,9 +181,27 @@ impl WriteSessionState<'_> {
     /// Retain durable receipts and accounting before any fallible context renewal.
     fn retain_checkpoint_outcome(&mut self, outcome: &super::checkpoint::BarrierOutcome) {
         extend_durable_checkpoint_records(&mut self.durable_checkpoint_records, outcome);
-        if let Err(error) = self.tail.committed(outcome.checkpoint_record.next_file) {
+        let clear = || self.tail.committed(outcome.checkpoint_record.next_file);
+        #[cfg(not(test))]
+        let cleared = clear();
+        #[cfg(test)]
+        let cleared = if self
+            .cfg
+            .io_memory
+            .epoch_test_action
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 12
+        {
+            Err(std::io::Error::other(
+                "injected committed-tail cleanup failure",
+            ))
+        } else {
+            clear()
+        };
+        if let Err(error) = cleared {
             tracing::error!(%error, "failed to clear committed tail evidence");
             self.append_gate.record_failure();
+            self.end_reason = remanence_state::tape_log::SessionEndReason::FailedAppend;
             self.begin_closing_work();
         }
         for record in &outcome.committed_objects {
@@ -203,10 +224,8 @@ impl WriteSessionState<'_> {
 
     /// Dispatch commands until a close transition releases the drive actor.
     ///
-    /// A successful close reply is returned to the caller so the outer owner
-    /// can drop this state, including its checkpoint lease, before
-    /// acknowledging the transition.
-    fn run(&mut self, rx: &mut mpsc::Receiver<DriveCommand>) -> Option<DeferredWriteCloseReply> {
+    /// Durable receipts precede post-reply closeout and native session ending.
+    fn run(&mut self, rx: &mut mpsc::Receiver<DriveCommand>) {
         while let Some(command) = rx.blocking_recv() {
             match command {
                 DriveCommand::FinishMountedInvocation { reply } => {
@@ -242,7 +261,7 @@ impl WriteSessionState<'_> {
                 command @ DriveCommand::AppendFinish { .. } => {
                     self.handle_append_finish(command);
                     if self.append_gate.poisoned || self.append_gate.sealed {
-                        if self.append_gate.sealed {
+                        if self.append_gate.sealed && !self.append_gate.poisoned {
                             self.end_reason =
                                 remanence_state::tape_log::SessionEndReason::CleanClose;
                         }
@@ -252,7 +271,7 @@ impl WriteSessionState<'_> {
                 command @ DriveCommand::Checkpoint { .. } => {
                     self.handle_checkpoint(command);
                     if self.append_gate.poisoned || self.append_gate.sealed {
-                        if self.append_gate.sealed {
+                        if self.append_gate.sealed && !self.append_gate.poisoned {
                             self.end_reason =
                                 remanence_state::tape_log::SessionEndReason::CleanClose;
                         }
@@ -366,41 +385,66 @@ impl WriteSessionState<'_> {
                 }
             }
         }
-        if self
-            .cfg
-            .lifecycle
-            .as_ref()
-            .is_some_and(|l| l.shutting_down.load(std::sync::atomic::Ordering::SeqCst))
+        if self.end_reason == remanence_state::tape_log::SessionEndReason::CleanClose
+            && self
+                .cfg
+                .lifecycle
+                .as_ref()
+                .is_some_and(|l| l.shutting_down.load(std::sync::atomic::Ordering::SeqCst))
         {
             self.end_reason = remanence_state::tape_log::SessionEndReason::GracefulShutdown;
         }
         self.begin_closing_work();
         if let Err(error) = self.finish_session() {
             if !self.ended_durably {
-                let _ = raise_tape_io_fence(self.index, self.cfg, remanence_state::TapeIoFenceInput {
-                    tape_uuid: self.tape_uuid, barcode: None, reason: "AuthorityAmbiguous".into(),
-                    evidence_json: Some(serde_json::json!({"session_id":self.session_id,"error":error.to_string()}).to_string()),
-                }, self.selected.standalone_endpoint.as_ref());
-            }
-            if let Some((reply, _)) = self.deferred_close_reply.take() {
-                let _ = reply.send(Err(error.clone()));
+                // Even a host failure before append leaves the ending unproved.
+                super::checkpoint::record_closeout_fence(
+                    self.index,
+                    self.cfg,
+                    self.tape_uuid,
+                    "AuthorityAmbiguous",
+                    serde_json::json!({"session_id":self.session_id,"error":error.to_string()})
+                        .to_string(),
+                );
             }
             tracing::error!(%error, session_id=%self.session_id, "write session ending failed");
         }
         self.drive.clear_append_admission();
-        None
     }
 
     fn finish_session(&mut self) -> Result<(), Status> {
         use remanence_state::tape_log::SessionEndReason;
+        // A deferred success contains already durable receipts. No host cleanup,
+        // lease query, or later publication may turn them into an error.
+        if let Some((reply, result)) = self.deferred_close_reply.take() {
+            let _ = reply.send(Ok(result));
+        }
+        if let Some(error) = self.closing_error.take() {
+            return Err(error);
+        }
+        #[cfg(test)]
+        if self
+            .cfg
+            .io_memory
+            .epoch_test_action
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 13
+        {
+            return Err(Status::internal("injected ending lease query failure"));
+        }
         self.checkpoint_lease
             .cancel_staged_report()
             .map_err(status_from_state_error)?;
-        if self.tail.drive_failed() && self.end_reason != SessionEndReason::GracefulShutdown {
+        if self.tail.drive_failed() {
             self.end_reason = SessionEndReason::DriveError;
         }
         let clean = !self.append_gate.poisoned
-            && self.pending_batch.is_none()
+            && self
+                .tail
+                .files()
+                .map_err(|e| Status::internal(e.to_string()))?
+                .next()
+                .is_none()
             && matches!(
                 self.end_reason,
                 SessionEndReason::CleanClose
@@ -412,9 +456,12 @@ impl WriteSessionState<'_> {
             .pending_finalization()
             .map_err(status_from_state_error)?;
         if clean {
-            if let Some((reply, result)) = self.deferred_close_reply.take() {
-                let _ = reply.send(Ok(result));
-            }
+            let closeout_due = self
+                .checkpoint_lease
+                .freeze()
+                .map_err(status_from_state_error)?
+                .tape_summary()
+                .closeout_due();
             let result = if finalization.is_some() {
                 Ok(None)
             } else {
@@ -429,7 +476,7 @@ impl WriteSessionState<'_> {
                 )
             };
             match result {
-                Ok(_) => {
+                Ok(_) if closeout_due && finalization.is_none() => {
                     let last = self
                         .checkpoint_lease
                         .latest_commit()
@@ -438,6 +485,7 @@ impl WriteSessionState<'_> {
                         .committed(last.as_ref().map_or(1, |c| c.next_file))
                         .map_err(|e| Status::internal(e.to_string()))?;
                 }
+                Ok(_) => {}
                 Err(error) => {
                     self.checkpoint_lease
                         .ensure_abandonment_allowed()
@@ -462,6 +510,18 @@ impl WriteSessionState<'_> {
                     .is_ok_and(|file| file.tape_file_number >= next_file)
                     || file.is_err()
             });
+        #[cfg(test)]
+        if self
+            .cfg
+            .io_memory
+            .epoch_test_action
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 12
+        {
+            return Err(Status::internal(
+                "injected end failure after tail cleanup failure",
+            ));
+        }
         self.checkpoint_lease
             .end_session(
                 *self.session_id.as_bytes(),
@@ -594,14 +654,16 @@ impl WriteSessionState<'_> {
                 .collect();
             let mut ended = lifecycle.ended_writes.lock().unwrap();
             if ended.len() >= 1024 {
-                if let Some(id) = ended.keys().next().copied() {
+                if let Some(id) = lifecycle.ended_write_order.lock().unwrap().pop_front() {
                     ended.remove(&id);
                 }
             }
             ended.insert(self.session_id, (session, finalization.is_some()));
-        }
-        if let Some((reply, result)) = self.deferred_close_reply.take() {
-            let _ = reply.send(Ok(result));
+            lifecycle
+                .ended_write_order
+                .lock()
+                .unwrap()
+                .push_back(self.session_id);
         }
         self.pending_batch = None;
         let mut parity = self.parity_session.take();
@@ -949,6 +1011,8 @@ impl WriteSessionState<'_> {
                                 Ok(context) => context,
                                 Err(err) => {
                                     self.append_gate.record_failure();
+                                    self.end_reason =
+                                        remanence_state::tape_log::SessionEndReason::FailedAppend;
                                     self.begin_closing_work();
                                     let _ = reply.send(Err(status_from_selected_write_error(
                                         &selected, err,
@@ -1024,7 +1088,8 @@ impl WriteSessionState<'_> {
                                         Ok(context) => context,
                                         Err(err) => {
                                             self.append_gate.record_failure();
-            self.begin_closing_work();
+                                            self.end_reason = remanence_state::tape_log::SessionEndReason::FailedAppend;
+                                            self.begin_closing_work();
                                             self.pending_batch = None;
                                             let _ = reply.send(Err(status_from_selected_write_error(&selected, err)));
                                             return;
@@ -1045,6 +1110,8 @@ impl WriteSessionState<'_> {
                                 let quarantine_identities = failure.requires_identity_quarantine();
                                 let status = failure.status;
                                 self.append_gate.record_failure();
+                                self.end_reason =
+                                    remanence_state::tape_log::SessionEndReason::FailedAppend;
                                 self.begin_closing_work();
                                 if quarantine_identities {
                                     self.pending_batch
@@ -1157,6 +1224,8 @@ impl WriteSessionState<'_> {
                         }
                         Err(error) => {
                             self.append_gate.record_failure();
+                            self.end_reason =
+                                remanence_state::tape_log::SessionEndReason::FailedAppend;
                             self.begin_closing_work();
                             let _ = reply.send(Err(error));
                         }
@@ -1177,6 +1246,7 @@ impl WriteSessionState<'_> {
                 };
                 if tape_started {
                     self.append_gate.record_failure();
+                    self.end_reason = remanence_state::tape_log::SessionEndReason::FailedAppend;
                     self.begin_closing_work();
                 }
                 let original_error = err.to_string();
@@ -1347,6 +1417,8 @@ impl WriteSessionState<'_> {
                             Ok(context) => context,
                             Err(err) => {
                                 self.append_gate.record_failure();
+                                self.end_reason =
+                                    remanence_state::tape_log::SessionEndReason::FailedAppend;
                                 self.begin_closing_work();
                                 self.pending_batch = None;
                                 let status = status_from_selected_write_error(&selected, err);
@@ -1421,6 +1493,7 @@ impl WriteSessionState<'_> {
                 let quarantine_identities = failure.requires_identity_quarantine();
                 let status = failure.status;
                 self.append_gate.record_failure();
+                self.end_reason = remanence_state::tape_log::SessionEndReason::FailedAppend;
                 self.begin_closing_work();
                 if quarantine_identities {
                     self.pending_batch
@@ -1445,7 +1518,6 @@ impl WriteSessionState<'_> {
 
     /// Close an idle session only when the timer still names its latest batch.
     fn handle_timer_idle_close(&mut self, command: DriveCommand) -> bool {
-        self.end_reason = remanence_state::tape_log::SessionEndReason::ClientStall;
         let DriveCommand::TimerIdleClose {
             session_id: requested,
             checkpoint_batch_id,
@@ -1488,12 +1560,12 @@ impl WriteSessionState<'_> {
             tracing::error!(session_id = %session_id, error = %err, "idle checkpoint close failed");
             return false;
         }
+        self.end_reason = remanence_state::tape_log::SessionEndReason::ClientStall;
         true
     }
 
     /// Flush any pending batch and perform a normal session close.
     fn handle_close(&mut self, command: DriveCommand) -> bool {
-        self.end_reason = remanence_state::tape_log::SessionEndReason::CleanClose;
         let DriveCommand::Close {
             session_id: requested,
             reply,
@@ -1534,31 +1606,13 @@ impl WriteSessionState<'_> {
             ) {
                 Ok(outcome) => {
                     self.retain_checkpoint_outcome(&outcome);
-                    if let Some(previous) = self.next_batched_append.as_ref() {
-                        let checkpoint_context =
-                            match crate::pool_write::batched_append_context_after_checkpoint(
-                                previous,
-                                &outcome.checkpoint_record,
-                            ) {
-                                Ok(context) => context,
-                                Err(err) => {
-                                    self.append_gate.record_failure();
-                                    self.begin_closing_work();
-                                    self.pending_batch = None;
-                                    let _ = reply.send(Err(status_from_selected_write_error(
-                                        &selected, err,
-                                    )));
-                                    return false;
-                                }
-                            };
-                        self.next_batched_append = Some(checkpoint_context);
-                    }
                     self.pending_batch = None;
                 }
                 Err(failure) => {
                     let quarantine_identities = failure.requires_identity_quarantine();
                     let status = failure.status;
                     self.append_gate.record_failure();
+                    self.end_reason = remanence_state::tape_log::SessionEndReason::FailedAppend;
                     self.begin_closing_work();
                     if quarantine_identities {
                         self.pending_batch
@@ -1592,6 +1646,9 @@ impl WriteSessionState<'_> {
         });
         match result {
             Ok(result) => {
+                if !self.append_gate.poisoned {
+                    self.end_reason = remanence_state::tape_log::SessionEndReason::CleanClose;
+                }
                 self.deferred_close_reply = Some((reply, result));
                 true
             }
@@ -1604,7 +1661,6 @@ impl WriteSessionState<'_> {
 
     /// Close the actor in the aborted state without committing new work.
     fn handle_abort(&mut self, command: DriveCommand) -> bool {
-        self.end_reason = remanence_state::tape_log::SessionEndReason::Abort;
         let DriveCommand::Abort {
             session_id: requested,
             reason,
@@ -1624,12 +1680,14 @@ impl WriteSessionState<'_> {
             let _ = reply.send(Err(Status::not_found("write session not found")));
             return false;
         }
-        if reason
+        let end_reason = if reason
             .as_deref()
             .is_some_and(|r| r.starts_with("AppendIngressDeadline:"))
         {
-            self.end_reason = remanence_state::tape_log::SessionEndReason::ClientStall;
-        }
+            remanence_state::tape_log::SessionEndReason::ClientStall
+        } else {
+            remanence_state::tape_log::SessionEndReason::Abort
+        };
         self.abort_reason = reason;
         self.pending_batch = None;
         let result = close_write_actor(CloseWriteActorInput {
@@ -1652,6 +1710,7 @@ impl WriteSessionState<'_> {
         });
         match result {
             Ok(result) => {
+                self.end_reason = end_reason;
                 self.deferred_close_reply = Some((reply, result));
                 true
             }
@@ -2112,12 +2171,7 @@ pub(super) fn handle_drive_open_write(
             selected.parity_config,
             remanence_parity::ParityConfig::Scheme(_)
         ) {
-        match validate_parity_actor_authority(
-            cfg,
-            &selected,
-            &mut checkpoint_lease,
-            &durable_checkpoint_records,
-        ) {
+        match validate_parity_actor_authority(&selected, &mut checkpoint_lease) {
             Ok(authority) => Some(authority),
             Err(status) => {
                 let _ = reply.send(Err(status));
@@ -2198,8 +2252,14 @@ pub(super) fn handle_drive_open_write(
         (parity_session, None)
     };
     let mut prepared_closeout = if snapshot_before_open.tape_summary().closeout_due() {
+        let Some(session) = parity_session.take() else {
+            let _ = reply.send(Err(Status::failed_precondition(
+                "catalog parity geometry disagrees with native closeout scheme",
+            )));
+            return None;
+        };
         match super::checkpoint::prepare_closeout(
-            parity_session.take().expect("parity closeout state"),
+            session,
             durable_checkpoint_records.last().expect("closeout commit"),
         ) {
             Ok(prepared) => Some(prepared),
@@ -2441,12 +2501,7 @@ pub(super) fn handle_drive_open_write(
                     .map_err(status_from_state_error)?;
             last_durable_checkpoint = durable_checkpoint_records.last().cloned();
             checkpoint_lease.finish_structural_scope();
-            let authority = validate_parity_actor_authority(
-                cfg,
-                &selected,
-                &mut checkpoint_lease,
-                &durable_checkpoint_records,
-            )?;
+            let authority = validate_parity_actor_authority(&selected, &mut checkpoint_lease)?;
             parity_session = Some(open_parity_actor_session(
                 index,
                 drive,
@@ -2547,6 +2602,7 @@ pub(super) fn handle_drive_open_write(
     drive.set_media_dispatch_observer(Some(Box::new(tail.clone())));
     let open_reply_lost = reply.send(Ok(open_reply)).is_err();
     let mut session_state = WriteSessionState {
+        closing_error: None,
         closing_work: None,
         end_reason: remanence_state::tape_log::SessionEndReason::ClientDisconnected,
         ended_durably: false,
@@ -2585,31 +2641,24 @@ pub(super) fn handle_drive_open_write(
         append_commit_diagnostics: crate::pool_write::AppendCommitDiagnostics::default(),
         deferred_close_reply: None,
     };
-    let deferred_close_reply = if open_reply_lost {
+    if open_reply_lost {
         session_state.begin_closing_work();
         if let Err(error) = session_state.finish_session() {
             if !session_state.ended_durably {
-                let _ = raise_tape_io_fence(
+                super::checkpoint::record_closeout_fence(
                     session_state.index,
                     cfg,
-                    remanence_state::TapeIoFenceInput {
-                        tape_uuid,
-                        barcode: None,
-                        reason: "AuthorityAmbiguous".into(),
-                        evidence_json: Some(
-                            serde_json::json!({"session_id":session_id,"error":error.to_string()})
-                                .to_string(),
-                        ),
-                    },
-                    session_state.selected.standalone_endpoint.as_ref(),
+                    tape_uuid,
+                    "AuthorityAmbiguous",
+                    serde_json::json!({"session_id": session_id, "error": error.to_string()})
+                        .to_string(),
                 );
             }
             tracing::error!(%error, "lost open reply ending failed");
         }
-        None
     } else {
-        session_state.run(rx)
-    };
+        session_state.run(rx);
+    }
     let finish_request = session_state.finish_request.take();
     let closing_work = session_state.closing_work.take();
     session_state.drive.set_media_dispatch_observer(None);
@@ -2618,9 +2667,6 @@ pub(super) fn handle_drive_open_write(
         tracing::error!(%error, "ended session ownership cleanup failed");
     }
     drop(closing_work);
-    if let Some((reply, result)) = deferred_close_reply {
-        let _ = reply.send(Ok(result));
-    }
     finish_request.map(|(reply, mut closed)| super::actor_runtime::MountedFinish {
         reply,
         result: closed

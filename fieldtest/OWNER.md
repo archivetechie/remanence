@@ -63,7 +63,7 @@ Either way the current leg stops. If something failed, run.sh captures read-only
 diagnostics. Its `03-bringup.sh --stop` teardown asks the live daemon to unload
 each allowlisted cartridge seated in the selected library to its recorded source
 slot, then stops the daemon and packs the evidence. Each unload has an evidence
-record; a refusal, timeout, or incomplete parity epoch close is a WARN naming
+record; a refusal or timeout is a WARN naming
 the bay. The unload phase is bounded and daemon stop follows even if it fails. Cartridges outside the allowlist
 are left alone. Graceful daemon shutdown itself leaves cartridges seated. A finished run prints a PASS/FAIL table, the evidence
 pack's path and its sha256.

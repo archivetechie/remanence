@@ -2535,9 +2535,8 @@ fn fresh_parity_bootstrap_short_completion_fences_without_journal_visibility() {
         let mut checkpoint_lease = checkpoint_journal
             .acquire_exclusive()
             .expect("acquire fresh checkpoint lease");
-        let authority =
-            validate_parity_actor_authority(&cfg, &selected, &mut checkpoint_lease, &[])
-                .expect("validate fresh parity authority");
+        let authority = validate_parity_actor_authority(&selected, &mut checkpoint_lease)
+            .expect("validate fresh parity authority");
         match open_parity_actor_session(
             &mut index,
             &mut drive,
@@ -9389,12 +9388,7 @@ fn resume_vectors_layer5_authorities(refusal: Option<&str>) {
         assert_eq!(pool_status.code(), tonic::Code::FailedPrecondition);
         assert!(pool_status.message().contains(expected_detail));
         drop(journal);
-        let result = super::checkpoint::validate_parity_actor_authority(
-            &cfg,
-            &selected,
-            &mut lease,
-            &checkpoints.iter().map(Into::into).collect::<Vec<_>>(),
-        );
+        let result = super::checkpoint::validate_parity_actor_authority(&selected, &mut lease);
         if kind == "empty" {
             assert!(
                 result.is_ok(),
@@ -9416,13 +9410,8 @@ fn resume_vectors_layer5_authorities(refusal: Option<&str>) {
         assert!(world.lock().unwrap().command_log.is_empty());
         return;
     }
-    let authority = super::checkpoint::validate_parity_actor_authority(
-        &cfg,
-        &selected,
-        &mut lease,
-        &checkpoints.iter().map(Into::into).collect::<Vec<_>>(),
-    )
-    .unwrap();
+    let authority =
+        super::checkpoint::validate_parity_actor_authority(&selected, &mut lease).unwrap();
     let mut index = CatalogIndex::open(&cfg.index_path).unwrap();
     let last = checkpoints.last().unwrap();
     // This fixture tests parity journal reconstruction after an explicit discard.
@@ -12205,13 +12194,12 @@ pub(crate) fn fail_append_context_now() -> bool {
     })
 }
 
-/// Exercise each post-barrier error path and both subsequent receipt delivery paths.
+/// Exercise post-barrier renewal failures and retrieve the ended session receipts.
 pub(crate) async fn check_context_failure_receipts(
     state: &StateHandle,
     world: Arc<Mutex<VirtualWorld>>,
     selected: SelectedTape,
     trigger: &str,
-    _deliver_on_close: bool,
 ) {
     let mut library = open_model_library(world);
     let mut cfg = test_write_owner_config(
@@ -12303,19 +12291,6 @@ pub(crate) async fn check_context_failure_receipts(
         b"second",
     )
     .await;
-    let close = || {
-        let tx = tx.clone();
-        async move {
-            let (reply, rx) = oneshot::channel();
-            tx.send(DriveCommand::Close {
-                session_id: id,
-                reply,
-            })
-            .await
-            .unwrap();
-            rx.await.unwrap()
-        }
-    };
     let error = match trigger {
         "threshold" => second.expect_err("threshold context renewal fails"),
         "explicit" => {
@@ -12323,10 +12298,6 @@ pub(crate) async fn check_context_failure_receipts(
             checkpoint(CheckpointTrigger::Explicit)
                 .await
                 .expect_err("explicit context renewal fails")
-        }
-        "close" => {
-            second.unwrap();
-            close().await.expect_err("close context renewal fails")
         }
         _ => panic!("unknown trigger"),
     };
@@ -12941,7 +12912,7 @@ pub(crate) async fn unload_adopted_cartridge(
     api.library_snapshot = Some(cfg.library().snapshot.clone());
     api.drive_pool = Some(pool);
     api.drive_idle_unload_seconds = 1;
-    crate::mount::test_remove_seated_epoch(&api, "idle", seated).await;
+    crate::mount::test_remove_seated_cartridge(&api, "idle", seated).await;
     assert!(world.lock().unwrap().drive_bays[&0x100].is_none());
     assert!(!TapeAuthority::exists(&cfg.checkpoint_journal_dir, tape_uuid).unwrap());
     assert!(
@@ -13416,7 +13387,7 @@ async fn idle_unload_stops_when_live_element_status_finds_empty_bay() {
         world.drive_source_slots.insert(0x100, None);
         world.command_log.clear();
     }
-    crate::mount::test_remove_seated_epoch(&api, "idle", seated).await;
+    crate::mount::test_remove_seated_cartridge(&api, "idle", seated).await;
     assert!(!cfg.library().snapshot.read().unwrap().report.libraries[0].drive_bays[0].loaded);
     let commands = world.lock().unwrap().command_log.len();
     tokio::time::sleep(StdDuration::from_millis(1200)).await;

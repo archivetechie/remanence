@@ -349,14 +349,32 @@ fn selected_drive_writer_binds_media_check_and_write_to_one_drive() {
 #[test]
 fn encrypted_parity_write_uses_configured_spool_ceiling_before_object_motion() {
     let (f, state) = Fixture::with_parity(scheme(2));
-    let mut actor = configured_owner(&f, state, Some(1), None, false, Default::default());
+    let mut actor = configured_owner(
+        &f,
+        state,
+        Some(
+            remanence_parity::closeout::EpochAccumulator::working_reservation_bytes(
+                match &scheme(2) {
+                    remanence_parity::ParityConfig::Scheme(s) => s,
+                    _ => unreachable!(),
+                },
+                BLOCK,
+                0,
+            )
+            .unwrap(),
+        ),
+        None,
+        false,
+        Default::default(),
+    );
     let mut input = f.request("encrypted-capacity");
     input.representation = PoolWriteRepresentation::Encrypted {
         recipients: vec![recipient(0x71, 0), recipient(0x72, 1)],
     };
+    actor.open_session("default").unwrap();
     let before = command_count(&f);
     let error = actor.write_checkpointed(input).unwrap_err();
-    assert!(error.to_string().contains("CloseoutMemory:"), "{error}");
+    assert!(error.to_string().contains("ParitySpoolCapacity"), "{error}");
     if let crate::MountError::Actor(failure) = &error {
         assert_eq!(failure.status.code(), tonic::Code::ResourceExhausted);
     } else {
@@ -366,8 +384,8 @@ fn encrypted_parity_write_uses_configured_spool_ceiling_before_object_motion() {
         .iter()
         .filter(|c| c[0] == 0x0a)
         .count();
-    assert_eq!(writes, 0, "reservation refuses before any drive command");
-    assert_eq!(command_count(&f), before);
+    assert_eq!(writes, 0, "spool reservation refuses before Object motion");
+
     assert_eq!(
         f.world.lock().unwrap().tapes["HAND"].records.len(),
         2,

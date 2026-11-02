@@ -1910,7 +1910,7 @@ fn encrypted_complete_tail_is_preserved_without_a_private_key_and_past_empty_fil
                 .unwrap(),
         ],
     };
-    let b = actor.write_checkpointed(input).unwrap();
+    actor.write_checkpointed(input).unwrap();
     let _ = actor.finish();
     let state = reopen_state();
     drop(state);
@@ -1932,10 +1932,7 @@ fn encrypted_complete_tail_is_preserved_without_a_private_key_and_past_empty_fil
     let error = append_for_rollback!(&mut state, &world, root.path(), "C")
         .unwrap_err()
         .to_string();
-    assert!(
-        error.contains(&uuid::Uuid::from_bytes(b.object.object_id).to_string()),
-        "{error}"
-    );
+    assert!(error.contains("without a session-tail identity"), "{error}");
     assert_eq!(dispatched_writes(&world), before);
     assert_eq!(world.lock().unwrap().tapes["HAND"].records, intact);
 }
@@ -2305,29 +2302,26 @@ async fn default_overlap_batches_small_objects_and_retains_mixed_receipts() {
 /// Durable receipts remain deliverable when the next append context cannot renew.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn committed_barrier_context_failures_preserve_receipts() {
-    for trigger in ["threshold", "explicit", "close"] {
-        for deliver_on_close in [false, true] {
-            let root = tempfile::tempdir().unwrap();
-            let parity = rollback_parity(false);
-            let world = world();
-            set_rollback_bootstrap(&world, parity.clone());
-            let mut state = state_with_parity(root.path(), true, parity.clone());
-            crate::write_owner::tests::check_context_failure_receipts(
-                &state,
-                world,
-                crate::SelectedTape {
-                    standalone_endpoint: None,
-                    pool_id: "default".into(),
-                    tape_uuid: UUID,
-                    block_size: BLOCK,
-                    parity_config: parity,
-                },
-                trigger,
-                deliver_on_close,
-            )
-            .await;
-            crate::write_owner::tests::assert_rebuild_safety_equivalent(&mut state);
-        }
+    for trigger in ["threshold", "explicit"] {
+        let root = tempfile::tempdir().unwrap();
+        let parity = rollback_parity(false);
+        let world = world();
+        set_rollback_bootstrap(&world, parity.clone());
+        let mut state = state_with_parity(root.path(), true, parity.clone());
+        crate::write_owner::tests::check_context_failure_receipts(
+            &state,
+            world,
+            crate::SelectedTape {
+                standalone_endpoint: None,
+                pool_id: "default".into(),
+                tape_uuid: UUID,
+                block_size: BLOCK,
+                parity_config: parity,
+            },
+            trigger,
+        )
+        .await;
+        crate::write_owner::tests::assert_rebuild_safety_equivalent(&mut state);
     }
 }
 

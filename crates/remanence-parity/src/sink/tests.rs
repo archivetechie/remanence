@@ -5829,11 +5829,6 @@ fn checkpoint_handoffs_and_crash_rebuild_preserve_epoch_parity() {
         let plan = sink
             .plan_terminal_index_close(identity.capture().unwrap())
             .unwrap();
-        assert_ne!(
-            plan.sidecar_directory_entries.last().unwrap().flags
-                & SIDECAR_DIRECTORY_FLAG_FINAL_PARTIAL_EPOCH,
-            0
-        );
         journal
             .prepare_terminal_with_manual_decision(&plan, mode == "manual")
             .unwrap();
@@ -5962,6 +5957,26 @@ fn checkpoint_handoffs_and_crash_rebuild_preserve_epoch_parity() {
             .unwrap();
         let committed = journal.load_committed().unwrap();
         let source = RecordingRawTapeSource::from_sink(&raw);
+        let map = committed
+            .entries
+            .iter()
+            .find(|e| e.kind == TapeFileKind::ParityMap)
+            .unwrap();
+        let start = map.physical_start_hint.unwrap() as usize;
+        let blocks = source.records[start..start + map.block_count as usize]
+            .iter()
+            .map(|record| match record {
+                RecordedTapeRecord::Block(bytes) => bytes.clone(),
+                _ => panic!("ParityMap contains filemark"),
+            })
+            .collect::<Vec<_>>();
+        let decoded = crate::parity_map::parse_parity_map_tape_file(&blocks, &[0x81; 16]).unwrap();
+        assert_ne!(
+            decoded.payload.directory.entries.last().unwrap().flags
+                & SIDECAR_DIRECTORY_FLAG_FINAL_PARTIAL_EPOCH,
+            0,
+            "{mode}: emitted directory after durable decision"
+        );
         let sidecars = committed
             .entries
             .iter()

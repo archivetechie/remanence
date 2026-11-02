@@ -1901,7 +1901,7 @@ mod tests {
             lifecycle.clone(),
         );
         state.drive_pool = Some(pool.clone());
-        let closing = lifecycle.closing.begin([0x41; 16], "pool".into(), key);
+        let closing = lifecycle.closing.begin([0x41; 16], key).unwrap();
         let caller = state.clone();
         let mut task = tokio::spawn(async move {
             caller
@@ -1926,6 +1926,13 @@ mod tests {
         assert!(drive_rx.try_recv().is_err());
         assert!(changer_rx.try_recv().is_err());
         pool.release_library("DEC418146K_LL02");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut task)
+                .await
+                .is_err()
+        );
+        assert!(drive_rx.try_recv().is_err());
+        assert!(changer_rx.try_recv().is_err());
         drop(closing);
         task.await.unwrap().unwrap();
         let crate::write_owner::DriveCommand::PrepareRemoval { reply } =

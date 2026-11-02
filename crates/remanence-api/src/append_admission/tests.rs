@@ -841,7 +841,10 @@ fn crash_prefix_can_be_identical_for_distinct_object_identities() {
                 .push(extra);
             f.drive.locate(2).unwrap();
             assert!(
-                super::session_suffix::named_file(&mut f.drive, &UUID, SIZE, &files[0]).is_err()
+                super::session_suffix::named_file(&mut f.drive, &UUID, SIZE, &files[0])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("SessionSuffixContradiction:")
             );
             f.world
                 .lock()
@@ -864,7 +867,12 @@ fn crash_prefix_can_be_identical_for_distinct_object_identities() {
             bytes[0] ^= 1;
         }
         f.drive.locate(2).unwrap();
-        assert!(super::session_suffix::named_file(&mut f.drive, &UUID, SIZE, &files[0]).is_err());
+        assert!(
+            super::session_suffix::named_file(&mut f.drive, &UUID, SIZE, &files[0])
+                .unwrap_err()
+                .to_string()
+                .contains("SessionSuffixContradiction:")
+        );
         first_blocks.push(first);
     }
     assert_eq!(
@@ -1335,26 +1343,11 @@ fn native_session_suffix_rows_and_unknown_command_frontiers() {
                     context(UUID, NATIVE_SIZE, 0, 2),
                 );
                 if row == "crash" && mark && survivors == 0 {
-                    let Err(AdmissionError::TailBeyondKnownState { found, .. }) = &result else {
-                        panic!("foreign empty file must require preview: {result:?}");
-                    };
-                    let mut confirmed = context(UUID, NATIVE_SIZE, 0, 2);
-                    confirmed.confirmed_discard = Some(found.clone());
-                    let refusal = admit_append_boundary(
-                        &mut f.drive,
-                        AppendAuthority::Session {
-                            snapshot: &snapshot,
-                            closeout: None,
-                        },
-                        confirmed,
-                    )
-                    .unwrap_err();
-                    assert!(
-                        refusal
-                            .to_string()
-                            .contains("without a session-tail identity"),
-                        "{refusal}"
-                    );
+                    assert!(result
+                        .as_ref()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("without a session-tail identity"));
                 }
                 let accepted = !mark
                     && match row {
@@ -1423,8 +1416,131 @@ fn own_closeout_prefix_consumes_every_block_and_proves_eod() {
                     !extra && (!mark || count == encoded.len()),
                     "count={count} mark={mark} extra={extra}"
                 );
+                if let Err(error) = result {
+                    assert!(
+                        error.to_string().contains("SessionSuffixContradiction:"),
+                        "{error}"
+                    );
+                }
                 assert_eq!(writes(&f.commands.lock().unwrap()), 0);
             }
         }
+    }
+}
+
+/// Item 32 re-proves a durable crash ending through the complete admission row.
+#[test]
+fn durable_torn_prefix_reproof_rejects_every_physical_contradiction_and_fences() {
+    use remanence_state::authority::TapeAuthorityView;
+    use remanence_state::tape_log::{SessionEndReason, TailFile, TailFilemark, TailIdentity};
+    use sha2::{Digest, Sha256};
+    const BLOCK: u32 = 262144;
+    let observed = vec![0x53; BLOCK as usize];
+    for mutation in ["exact", "mutated", "extra", "filemark", "early_eod"] {
+        let mut f = fixture_with_size(BLOCK);
+        let root = tempfile::tempdir().unwrap();
+        let mut index =
+            remanence_state::CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
+        index
+            .provision_tape(remanence_state::ProvisionTapeInput {
+                tape_uuid: UUID,
+                voltag: "TAIL".into(),
+                block_size: BLOCK,
+                parity: remanence_parity::ParityConfig::None,
+                force: false,
+            })
+            .unwrap();
+        std::fs::create_dir(root.path().join("tapes")).unwrap();
+        std::fs::create_dir(root.path().join("audit")).unwrap();
+        let authority =
+            remanence_state::TapeAuthority::open(root.path().join("tapes"), UUID, index.path())
+                .unwrap();
+        let mut lease = authority.acquire_exclusive().unwrap();
+        lease
+            .publish_initialized(
+                BLOCK,
+                None,
+                remanence_parity::CommitCursor {
+                    partition: 0,
+                    lba: 2,
+                },
+            )
+            .unwrap();
+        lease
+            .open_session([0x61; 16], "2026-11-02T00:00:00Z".into())
+            .unwrap();
+        lease
+            .end_session(
+                [0x61; 16],
+                "2026-11-02T00:00:01Z".into(),
+                SessionEndReason::CrashRecovered,
+                None,
+                [Ok(TailFile {
+                    tape_file_number: 1,
+                    identity: TailIdentity::TornPrefix(Sha256::digest(&observed).into()),
+                    known_blocks: 1,
+                    unknown_blocks: 0,
+                    filemark: TailFilemark::Absent,
+                })],
+            )
+            .unwrap();
+        let snapshot = lease.freeze().unwrap();
+        let mut block = observed.clone();
+        if mutation == "mutated" {
+            block[100] ^= 1;
+        }
+        {
+            let mut world = f.world.lock().unwrap();
+            let tape = world.tapes.get_mut("TAIL").unwrap();
+            if mutation != "early_eod" {
+                tape.records.push(Record::Block(block));
+            }
+            if mutation == "extra" {
+                tape.records.push(Record::Block(observed.clone()));
+            }
+            if mutation == "filemark" {
+                tape.records.push(Record::Filemark);
+            }
+        }
+        let result = admit_append_boundary(
+            &mut f.drive,
+            AppendAuthority::Session {
+                snapshot: &snapshot,
+                closeout: None,
+            },
+            context(UUID, BLOCK, 0, 2),
+        );
+        if mutation == "exact" {
+            assert_eq!(result.unwrap().boundary().2, 2);
+        } else {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, AdmissionError::SessionSuffixContradiction { .. }),
+                "{mutation}: {error}"
+            );
+            let cfg = crate::write_owner::TerminalWriteConfig {
+                io_memory: crate::io_memory::IoMemoryReservation::new(1024).unwrap(),
+                mounted_endpoint: None,
+                checkpoint_journal_dir: root.path().join("tapes"),
+                audit_dir: root.path().join("audit"),
+                audit_fsync: true,
+                audit_append_lock: Arc::new(Mutex::new(())),
+            };
+            let status = daemon_admission_error(
+                remanence_state::AuditActor::System,
+                &mut index,
+                &cfg,
+                UUID,
+                error,
+            );
+            assert!(
+                status.message().contains("SessionSuffixContradiction:"),
+                "{status}"
+            );
+            let fences = index.list_active_tape_io_fences().unwrap();
+            assert_eq!(fences.len(), 1);
+            assert_eq!(fences[0].reason, "SessionSuffixContradiction");
+        }
+        assert_eq!(writes(&f.commands.lock().unwrap()), 0);
     }
 }

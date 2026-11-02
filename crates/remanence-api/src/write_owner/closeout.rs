@@ -6,15 +6,27 @@ use remanence_state::authority::TapeAuthorityView;
 use remanence_state::CatalogIndex;
 use tonic::Status;
 
+/// Host-reserved maintenance work carried intact across the changer move.
+pub(super) struct CloseoutWork<'a> {
+    pub tape_uuid: [u8; 16],
+    pub expected_pool: Option<&'a str>,
+    pub progress: &'a crate::closeout_progress::CloseoutProgress,
+    pub permit: crate::io_memory::IoMemoryPermit,
+}
+
 pub(super) fn handle(
     index: &mut CatalogIndex,
     cfg: &WriteOwnerConfig,
     drive: &mut DriveHandle,
-    tape_uuid: [u8; 16],
-    expected_pool: Option<&str>,
-    progress: &crate::closeout_progress::CloseoutProgress,
+    work: CloseoutWork<'_>,
     ready: impl FnOnce(&mut CatalogIndex, &mut DriveHandle) -> Result<(), Status>,
 ) -> Result<(), Status> {
+    let CloseoutWork {
+        tape_uuid,
+        expected_pool,
+        progress,
+        permit,
+    } = work;
     let tape = index
         .get_tape(&tape_uuid)
         .map_err(crate::status_from_state_error)?
@@ -58,20 +70,7 @@ pub(super) fn handle(
         .latest_commit()
         .map_err(crate::status_from_state_error)?
         .ok_or_else(|| Status::internal("closeout lacks commit"))?;
-    let scheme = previous
-        .scheme
-        .as_ref()
-        .ok_or_else(|| Status::internal("closeout lacks scheme"))?;
-    let permit = super::checkpoint::reserve_closeout_memory(
-        cfg,
-        scheme,
-        block_size,
-        snapshot.tape_summary().uncovered.len(),
-        tape_uuid,
-    )?;
-    progress.reserved(permit.bytes());
-    let authority =
-        super::checkpoint::validate_parity_actor_authority(cfg, &selected, &mut lease, &[])?;
+    let authority = super::checkpoint::validate_parity_actor_authority(&selected, &mut lease)?;
     ready(index, drive)?;
     super::write_session::prepare_drive_for_write(
         drive,

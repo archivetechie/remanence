@@ -246,6 +246,11 @@ pub(crate) fn admit_append_boundary(
             },
             other => other,
         })?;
+        if recovered_tail.is_some() && suffix.unnameable {
+            return Err(AdmissionError::Unproved(
+                "crash suffix contains a delimited file without a session-tail identity; restore consistent tape state".into(),
+            ));
+        }
         let mut found = suffix.objects.clone();
         found.extend(suffix.foreign_components.clone());
         if ctx
@@ -260,11 +265,6 @@ pub(crate) fn admit_append_boundary(
                 found,
                 object_ids: suffix.objects.clone(),
             });
-        }
-        if recovered_tail.is_some() && suffix.unnameable {
-            return Err(AdmissionError::Unproved(
-                "crash suffix contains a delimited file without a session-tail identity; restore consistent tape state".into(),
-            ));
         }
         Ok(suffix)
     })();

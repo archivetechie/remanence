@@ -91,7 +91,6 @@ impl remanence_state::index::MediaReadinessObserver for ReadinessWake {
 #[derive(Clone, Default)]
 pub(crate) struct ClosingWork(Arc<Mutex<HashMap<TapeUuid, ClosingEntry>>>);
 struct ClosingEntry {
-    pool: String,
     drive: DriveKey,
     done: tokio::sync::watch::Receiver<()>,
 }
@@ -101,22 +100,31 @@ pub(crate) struct ClosingGuard {
     _done: tokio::sync::watch::Sender<()>,
 }
 impl ClosingWork {
-    pub(crate) fn begin(&self, tape: TapeUuid, pool: String, drive: DriveKey) -> ClosingGuard {
+    pub(crate) fn begin(&self, tape: TapeUuid, drive: DriveKey) -> Result<ClosingGuard, Status> {
         let (done, receiver) = tokio::sync::watch::channel(());
-        let old = self.0.lock().unwrap().insert(
+        let mut entries = self.0.lock().unwrap();
+        if entries.contains_key(&tape) {
+            return Err(Status::failed_precondition("two closeouts own one tape"));
+        }
+        entries.insert(
             tape,
             ClosingEntry {
-                pool,
                 drive,
                 done: receiver,
             },
         );
-        assert!(old.is_none(), "two closeouts own one tape");
-        ClosingGuard {
+        Ok(ClosingGuard {
             work: self.clone(),
             tape,
             _done: done,
-        }
+        })
+    }
+    pub(crate) fn drive_is_closing(&self, drive: &DriveKey) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .values()
+            .any(|entry| &entry.drive == drive)
     }
     async fn wait(&self, matches: impl Fn(&TapeUuid, &ClosingEntry) -> bool) {
         loop {
@@ -145,6 +153,7 @@ impl Drop for ClosingGuard {
 pub(crate) struct DrivePoolLifecycle {
     pub(crate) closing: ClosingWork,
     pub(crate) ended_writes: Arc<Mutex<HashMap<Uuid, (crate::pb::WriteSession, bool)>>>,
+    pub(crate) ended_write_order: Arc<Mutex<std::collections::VecDeque<Uuid>>>,
     pub(crate) readiness_wake: Arc<ReadinessWake>,
     holders: Arc<Mutex<HashMap<DriveKey, DriveHolder>>>,
     pub(crate) sessions: Arc<Mutex<HashMap<Uuid, MountedSession>>>,
@@ -192,6 +201,10 @@ impl DrivePoolLifecycle {
             active: self.dismounts.clone(),
             key: key.clone(),
         })
+    }
+
+    pub(crate) fn clear_holder(&self, drive: &DriveKey) {
+        self.holders.lock().unwrap().remove(drive);
     }
 
     /// Publish the actor's real session identity before readiness and tape setup.
@@ -275,6 +288,11 @@ pub(crate) struct DrivePool {
 }
 
 impl DrivePool {
+    #[cfg(test)]
+    pub(crate) fn test_begin_closing(&self, tape: TapeUuid, drive: DriveKey) -> ClosingGuard {
+        self.closing.begin(tape, drive).unwrap()
+    }
+
     pub(crate) fn ended_write(&self, id: Uuid) -> Option<crate::pb::WriteSession> {
         self.ended_writes
             .lock()
@@ -297,13 +315,26 @@ impl DrivePool {
     pub(crate) async fn wait_tape_closeout(&self, tape: TapeUuid) {
         self.closing.wait(|t, _| *t == tape).await;
     }
-    pub(crate) async fn wait_pool_closeout(&self, pool: &str) {
-        self.closing.wait(|_, e| e.pool == pool).await;
+    pub(crate) fn drive_is_closing(&self, drive: &DriveKey) -> bool {
+        self.closing.drive_is_closing(drive)
     }
-    pub(crate) async fn wait_library_closeouts(&self, library: &str) {
-        self.closing
-            .wait(|_, e| e.drive.library_serial() == Some(library))
-            .await;
+    /// A busy resolver retries after one relevant owner finishes. Other closing
+    /// drives can keep working once that release makes a mount possible.
+    pub(crate) async fn wait_busy_closeout(&self, library: &str, bay: Option<u16>) {
+        let pending = self
+            .closing
+            .0
+            .lock()
+            .unwrap()
+            .values()
+            .find(|entry| {
+                entry.drive.library_serial() == Some(library)
+                    && bay.is_none_or(|bay| entry.drive.bay() == Some(bay))
+            })
+            .map(|entry| entry.done.clone());
+        if let Some(mut done) = pending {
+            let _ = done.changed().await;
+        }
     }
     pub(crate) async fn wait_drive_closeout(&self, drive: &DriveKey) {
         self.closing.wait(|_, e| &e.drive == drive).await;
@@ -740,6 +771,9 @@ impl DrivePool {
         drive: &DriveKey,
         drive_uuid: Vec<u8>,
     ) -> Result<DriveHealthSnapshotRecord, Status> {
+        if self.drive_is_closing(drive) {
+            return Err(Status::unavailable("drive is completing session closeout"));
+        }
         let tx = self.drive_tx(drive)?;
         let (reply, rx) = oneshot::channel();
         tx.send(DriveCommand::PollHealth {
@@ -760,6 +794,9 @@ impl DrivePool {
         drive: &DriveKey,
         drive_uuid: Vec<u8>,
     ) -> Result<(), Status> {
+        if self.drive_is_closing(drive) {
+            return Ok(());
+        }
         let tx = self.drive_tx(drive)?;
         let (reply, rx) = oneshot::channel();
         tx.blocking_send(DriveCommand::Heartbeat { drive_uuid, reply })

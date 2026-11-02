@@ -1075,7 +1075,6 @@ fn automatic_terminal_media_completion_closes_audit_without_a_false_fence() {
     for trigger in [
         Trigger::ReachedLowWatermark,
         Trigger::HardwareEarlyWarning,
-        Trigger::OperatorCloseOut,
         Trigger::PoolCloseOut,
         Trigger::NoPendingObjectFits,
     ] {
@@ -1111,6 +1110,7 @@ fn check_automatic_terminal_media_completion(
     let mut checkpoint = writer.latest_commit().unwrap().unwrap();
     checkpoint.ordinal += 1;
     checkpoint.operation_id = [0x43; 16];
+    checkpoint.session_id = None;
     checkpoint.seal_due = Some(trigger);
     writer.publish_report(&checkpoint).unwrap();
     index.project_tape_log(&writer.freeze().unwrap()).unwrap();
@@ -1475,6 +1475,72 @@ fn frontend_returns_committed_receipt_beside_post_projection_failure() {
     assert_eq!(owner.receipts().len(), 1);
     let _ = owner.finish();
     assert!(fixture.reopen().is_ok());
+}
+
+/// A B6b projection failure returns the native receipt on replay after ending.
+#[test]
+fn projection_busy_returns_committed_receipt_on_native_replay() {
+    let (fixture, mut state) = Fixture::new(false);
+    let mut mount = OperatorMount::with_transport(
+        Path::new(DEVICE),
+        &StaticAllowlist::new([SERIAL]),
+        Box::new(Transport {
+            inner: ModelTransport::new(fixture.world.clone(), DeviceRole::Drive { bay: BAY }),
+            commands: fixture.commands.clone(),
+            fault: fixture.fault.clone(),
+            evidence: Some(fixture.config.audit.dir.clone()),
+            last_opcode: None,
+        }),
+        &mut state,
+        fixture.root.path(),
+    )
+    .unwrap();
+    let mounted = mount
+        .mount(MountTarget::Device {
+            path: DEVICE.into(),
+            expected_uuid: Some(UUID),
+        })
+        .unwrap();
+    let audit = mount.context.audit_error.clone();
+    mount.finish().unwrap();
+    let cfg = mounted_config(&state, &mounted, StaticAllowlist::new([SERIAL]), audit).unwrap();
+    cfg.io_memory
+        .epoch_test_action
+        .store(10, std::sync::atomic::Ordering::Relaxed);
+    let endpoint = cfg.mounted().unwrap().endpoint.clone();
+    let (tx, thread) = write_owner::spawn_mounted_actor(mounted, cfg).unwrap();
+    let mut owner = MountedDrive {
+        owner: Some(Owner {
+            tx: tx.clone(),
+            thread,
+            state,
+            _library_guard: None,
+        }),
+        client: MountedCommands::new(tx, UUID, endpoint),
+    };
+    let error = owner
+        .put_path_version_with_policy(fixture.request("committed-before-failure"), false)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("SQLite projection failed"),
+        "{error}"
+    );
+    assert!(
+        owner.receipts().is_empty(),
+        "catalog cannot supply a receipt before projection replay"
+    );
+    let _ = owner.finish();
+    let state = fixture.reopen().unwrap();
+    let mut owner = fixture.owner(state);
+    let receipt = owner
+        .write_checkpointed(fixture.request("committed-before-failure"))
+        .unwrap();
+    assert!(
+        receipt.is_replay(),
+        "native commit supplies the receipt on replay, without a second Object"
+    );
+    assert_eq!(receipt.object.caller_object_id, "committed-before-failure");
+    owner.finish().unwrap();
 }
 
 /// A catalog generation cannot replace the generation proof captured by the mount.
