@@ -2127,8 +2127,29 @@ fn clobber_catalogued_tape_and_refuse_another_label_owner() {
     );
     assert_ne!(code, ExitCode::SUCCESS);
     assert!(out.contains("belongs to tape"), "{out}");
-    assert!(out.contains("tape rebind --previous-uuid"), "{out}");
+    assert!(out.contains("choose a new label"), "{out}");
+    assert!(!out.contains("rebind"), "{out}");
     assert_eq!(f.writes(), before);
+
+    // A blank replacement cannot be rebound to an uncatalogued BOT identity.
+    // A new label is a usable recovery from the same label-ownership refusal.
+    f.world.lock().unwrap().put_tape_in_drive(
+        0x100,
+        "BLANK",
+        None,
+        remanence_chaos::model::VirtualTape::empty(256 * 1024 * 1024, 262144),
+    );
+    let (code, out, _) = f.run(
+        &["tape", "init", "--label", "FIRST", "--generation", "L9"],
+        true,
+    );
+    assert_ne!(code, ExitCode::SUCCESS);
+    assert!(
+        out.contains("choose a new label") && !out.contains("rebind"),
+        "{out}"
+    );
+    assert_eq!(f.writes(), before);
+    f.ok(&["tape", "init", "--label", "SECOND", "--generation", "L9"]);
 }
 
 /// Every init checks the partition page, including an explicitly confirmed clobber.

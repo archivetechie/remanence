@@ -112,7 +112,7 @@ integration must be off for this repository when format records are deposited.
 ## Development binary
 
 `rem-dev` is a workspace development target. Build it with
-`cargo build -p remanence-cli --bin rem-dev`. The release workflow selects
+`cargo build -p remanence-cli --features fixtures --bin rem-dev`. The release workflow selects
 `rem`, `rem-debug`, `rem-daemon` and `rem-recover` explicitly for its build
 and archive. The field-kit installer copies only `rem`, `rem-debug` and
 `rem-daemon`. Neither package includes `rem-dev`.

@@ -20,6 +20,7 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -521,18 +522,41 @@ pub(crate) fn unwrap_remwraps(
     root: &Path,
     overwrite: bool,
     plan: Option<UnwrapPlan>,
+    allowed_prefixes: &[String],
 ) -> Result<UnwrapReport, String> {
     let mut report = UnwrapReport {
         wrappers_unwrapped: 0,
         literal_entries_removed: 0,
         tar_engine: None,
+        skipped_xattrs: BTreeMap::new(),
+        applied_privileged_xattrs: BTreeMap::new(),
     };
     let Some(plan) = plan else {
         return Ok(report);
     };
     for (wrapper, idx) in &plan.wrappers {
         let wrapper = root.join(wrapper);
-        extract_wrapper_tar(&plan.tar_engine, root, &wrapper, overwrite)?;
+        let accounting = extract_wrapper_tar(
+            &plan.tar_engine,
+            root,
+            &wrapper,
+            overwrite,
+            allowed_prefixes,
+        )?;
+        for (target, source) in [
+            (&mut report.skipped_xattrs, accounting.skipped_xattrs),
+            (
+                &mut report.applied_privileged_xattrs,
+                accounting.applied_privileged_xattrs,
+            ),
+        ] {
+            for (path, names) in source {
+                let entry = target.entry(path).or_default();
+                entry.extend(names);
+                entry.sort();
+                entry.dedup();
+            }
+        }
         fs::remove_file(&wrapper)
             .map_err(|error| format!("remove wrapper {}: {error}", wrapper.display()))?;
         report.literal_entries_removed += 1;
@@ -554,6 +578,8 @@ pub(crate) struct UnwrapReport {
     pub(crate) literal_entries_removed: u64,
     /// `None` (JSON `null`) when there was no wrapper to unwrap.
     pub(crate) tar_engine: Option<TarEngineReport>,
+    pub(crate) skipped_xattrs: BTreeMap<String, Vec<String>>,
+    pub(crate) applied_privileged_xattrs: BTreeMap<String, Vec<String>>,
 }
 
 pub(crate) fn resolve_blob_member_from_index(
@@ -1954,6 +1980,21 @@ fn filter_wrapper_tar_xattrs(
     state: &mut PlannerState,
     report_prefix: &Path,
 ) -> Result<(), String> {
+    filter_wrapper_tar_xattrs_with(
+        wrapper,
+        |name| xattr_policy_decision(&String::from_utf8_lossy(name), policy),
+        state,
+        report_prefix,
+    )
+}
+
+/// Share pax rewriting between capture policy and restore namespace policy.
+fn filter_wrapper_tar_xattrs_with(
+    wrapper: &Path,
+    decide: impl Fn(&[u8]) -> XattrPolicyDecision,
+    state: &mut PlannerState,
+    report_prefix: &Path,
+) -> Result<(), String> {
     let parent = wrapper
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -1991,6 +2032,9 @@ fn filter_wrapper_tar_xattrs(
             }
 
             let size = parse_tar_size(&header)?;
+            if header[156] == b'g' {
+                return Err("global pax headers are unsupported in wrappers".to_string());
+            }
             if header[156] == b'x' {
                 let mut data = vec![
                     0u8;
@@ -2002,21 +2046,26 @@ fn filter_wrapper_tar_xattrs(
                     .read_exact(&mut data)
                     .map_err(|error| format!("read wrapper pax header: {error}"))?;
                 discard_tar_padding(&mut input, size)?;
-                let mut records = parse_pax_records(&data)?;
+                let records = parse_pax_records(&data)?;
                 if let Some(path) = records.get("path") {
                     pending_path = Some(path.clone());
                 }
-                records.retain(|key, _| {
-                    let Some(name) = pax_xattr_name(key) else {
-                        return true;
+                let mut kept = BTreeMap::new();
+                for (key, value) in records {
+                    let Some(name) = decoded_pax_xattr_name(&key)? else {
+                        kept.insert(key, value);
+                        continue;
                     };
-                    let decision = xattr_policy_decision(name, policy);
-                    pending_decisions.insert(name.to_string(), decision);
-                    matches!(
+                    let decision = decide(&name);
+                    pending_decisions.insert(escape_member_name(&name), decision);
+                    if matches!(
                         decision,
                         XattrPolicyDecision::KeepCore | XattrPolicyDecision::KeepNonCore
-                    )
-                });
+                    ) {
+                        kept.insert(key, value);
+                    }
+                }
+                let records = kept;
                 if !records.is_empty() {
                     let filtered_data = encode_pax_records(&records);
                     set_tar_header_size_and_checksum(&mut header, filtered_data.len() as u64)?;
@@ -2066,6 +2115,31 @@ fn filter_wrapper_tar_xattrs(
 fn pax_xattr_name(key: &str) -> Option<&str> {
     key.strip_prefix("LIBARCHIVE.xattr.")
         .or_else(|| key.strip_prefix("SCHILY.xattr."))
+}
+
+/// Libarchive percent-encodes attribute names; SCHILY names are literal bytes.
+fn decoded_pax_xattr_name(key: &str) -> Result<Option<Vec<u8>>, String> {
+    let Some(name) = pax_xattr_name(key) else {
+        return Ok(None);
+    };
+    if !key.starts_with("LIBARCHIVE.xattr.") {
+        return Ok(Some(name.as_bytes().to_vec()));
+    }
+    let mut decoded = Vec::new();
+    let mut bytes = name.as_bytes().iter().copied();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let high = bytes.next().and_then(|b| (b as char).to_digit(16));
+            let low = bytes.next().and_then(|b| (b as char).to_digit(16));
+            match (high, low) {
+                (Some(high), Some(low)) => decoded.push((high * 16 + low) as u8),
+                _ => return Err("invalid percent encoding in wrapper xattr name".to_string()),
+            }
+        } else {
+            decoded.push(byte);
+        }
+    }
+    Ok(Some(decoded))
 }
 
 fn wrapper_xattr_report_path(prefix: &Path, member: &[u8]) -> String {
@@ -2161,15 +2235,43 @@ fn extract_wrapper_tar(
     dest: &Path,
     wrapper: &Path,
     overwrite: bool,
-) -> Result<(), String> {
-    validate_wrap_tar_paths(wrapper, tar_engine)?;
+    allowed_prefixes: &[String],
+) -> Result<WrapperXattrAccounting, String> {
+    for prefix in allowed_prefixes {
+        remanence_stream::parse_xattr_namespace_prefix(prefix)?;
+    }
+    // Filter a private copy so a refusal leaves the preserved wrapper intact.
+    let filtered = tempfile::NamedTempFile::new()
+        .map_err(|error| format!("create restore wrapper: {error}"))?;
+    fs::copy(wrapper, filtered.path()).map_err(|error| format!("copy restore wrapper: {error}"))?;
+    let mut state = PlannerState::default();
+    filter_wrapper_tar_xattrs_with(
+        filtered.path(),
+        |name| {
+            if allowed_prefixes
+                .iter()
+                .any(|prefix| name.starts_with(prefix.as_bytes()))
+            {
+                if name.starts_with(b"user.") {
+                    XattrPolicyDecision::KeepCore
+                } else {
+                    XattrPolicyDecision::KeepNonCore
+                }
+            } else {
+                XattrPolicyDecision::DropPolicy
+            }
+        },
+        &mut state,
+        Path::new(""),
+    )?;
+    validate_wrap_tar_paths(filtered.path(), tar_engine)?;
     let mut command = Command::new(&tar_engine.program);
     command
         .arg("-x")
         .arg("-p")
         .arg("--xattrs")
         .arg("-f")
-        .arg(wrapper)
+        .arg(filtered.path())
         .arg("-C")
         .arg(dest);
     if !overwrite {
@@ -2186,7 +2288,106 @@ fn extract_wrapper_tar(
             String::from_utf8_lossy(&command_output.stderr)
         ));
     }
+    verify_wrapper_xattrs(dest, filtered.path())?;
+    let scan = state.scan_report(ScanTuning::default());
+    Ok(WrapperXattrAccounting {
+        skipped_xattrs: scan.dropped_xattrs,
+        applied_privileged_xattrs: scan.captured_non_core_xattrs,
+    })
+}
+
+#[derive(Default)]
+struct WrapperXattrAccounting {
+    skipped_xattrs: BTreeMap<String, Vec<String>>,
+    applied_privileged_xattrs: BTreeMap<String, Vec<String>>,
+}
+
+/// Check retained pax attributes after extraction: libarchive can suppress a
+/// filesystem's refusal to set an attribute, so exit status alone is insufficient.
+fn verify_wrapper_xattrs(dest: &Path, wrapper: &Path) -> Result<(), String> {
+    let mut input = File::open(wrapper).map_err(|error| format!("open wrapper: {error}"))?;
+    let mut pending = BTreeMap::new();
+    loop {
+        let mut header = [0u8; 512];
+        input
+            .read_exact(&mut header)
+            .map_err(|error| format!("read wrapper: {error}"))?;
+        if header.iter().all(|byte| *byte == 0) {
+            return Ok(());
+        }
+        let size = parse_tar_size(&header)?;
+        if header[156] == b'x' {
+            let mut data = vec![0; usize::try_from(size).map_err(|_| "pax header too large")?];
+            input
+                .read_exact(&mut data)
+                .map_err(|error| format!("read wrapper pax: {error}"))?;
+            pending.extend(parse_pax_records(&data)?);
+            discard_tar_padding(&mut input, size)?;
+            continue;
+        }
+        let path = pending
+            .get("path")
+            .cloned()
+            .unwrap_or_else(|| tar_header_path_bytes(&header));
+        for (key, value) in &pending {
+            let Some(name) = decoded_pax_xattr_name(key)? else {
+                continue;
+            };
+            let expected = if key.starts_with("LIBARCHIVE.xattr.") {
+                base64::engine::general_purpose::STANDARD
+                    .decode(value)
+                    .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(value))
+                    .map_err(|_| "invalid base64 in wrapper xattr value".to_string())?
+            } else {
+                value.clone()
+            };
+            verify_wrapper_xattr(dest, &path, &name, &expected)?;
+        }
+        pending.clear();
+        skip_tar_payload(&mut input, size)?;
+    }
+}
+
+/// Read without following the final symlink and never include attribute values
+/// in a diagnostic about an unapplied or incorrectly restored attribute.
+#[cfg(unix)]
+fn verify_wrapper_xattr(
+    dest: &Path,
+    path: &[u8],
+    name: &[u8],
+    expected: &[u8],
+) -> Result<(), String> {
+    let actual = xattr::get(dest.join(OsStr::from_bytes(path)), OsStr::from_bytes(name)).map_err(
+        |error| {
+            format!(
+                "verify wrapper xattr {} on {}: {error}",
+                escape_member_name(name),
+                escape_member_name(path)
+            )
+        },
+    )?;
+    if actual.as_deref() != Some(expected) {
+        return Err(format!(
+            "wrapper xattr {} was not applied correctly on {}",
+            escape_member_name(name),
+            escape_member_name(path)
+        ));
+    }
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_wrapper_xattr(
+    _dest: &Path,
+    path: &[u8],
+    name: &[u8],
+    _expected: &[u8],
+) -> Result<(), String> {
+    Err(format!(
+        "cannot verify wrapper xattr {} on {} on this platform",
+        escape_member_name(name),
+        escape_member_name(path)
+    ))
 }
 
 fn validate_wrap_tar_paths(wrapper: &Path, _tar_engine: &TarEngineReport) -> Result<(), String> {
@@ -2211,7 +2412,7 @@ fn validate_wrap_tar_paths(wrapper: &Path, _tar_engine: &TarEngineReport) -> Res
             let mut data = vec![0u8; usize::try_from(size).map_err(|_| "pax header too large")?];
             file.read_exact(&mut data)
                 .map_err(|error| format!("read pax data {}: {error}", wrapper.display()))?;
-            pending_pax = parse_pax_records(&data)?;
+            pending_pax.extend(parse_pax_records(&data)?);
             skip_tar_padding(&mut file, size)?;
             offset = next_tar_header_offset(data_offset, size)?;
             continue;
@@ -3125,6 +3326,51 @@ fn finalize_sha256_local(hasher: Sha256) -> [u8; 32] {
     out
 }
 
+/// Construct portable, privilege-independent pax fixtures for restore tests.
+#[cfg(test)]
+pub(crate) fn wrapper_xattr_fixture(libarchive: bool) -> Vec<u8> {
+    let records = [
+        "user.keep",
+        "security.remanence_test",
+        "trusted.remanence_test",
+    ]
+    .into_iter()
+    .map(|name| {
+        if libarchive {
+            (
+                format!("LIBARCHIVE.xattr.{}", name.replace('.', "%2E")),
+                base64::engine::general_purpose::STANDARD_NO_PAD
+                    .encode(b"private-value")
+                    .into_bytes(),
+            )
+        } else {
+            (format!("SCHILY.xattr.{name}"), b"private-value".to_vec())
+        }
+    })
+    .collect();
+    let mut tar = Vec::new();
+    for (kind, name, data) in [
+        (b'x', "PaxHeader/tagged.txt", encode_pax_records(&records)),
+        (b'0', "tagged.txt", b"payload".to_vec()),
+    ] {
+        let mut header = [0; 512];
+        header[..name.len()].copy_from_slice(name.as_bytes());
+        header[100..108].copy_from_slice(b"0000644\0");
+        header[108..116].copy_from_slice(b"0000000\0");
+        header[116..124].copy_from_slice(b"0000000\0");
+        header[136..148].copy_from_slice(b"00000000000\0");
+        header[156] = kind;
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        set_tar_header_size_and_checksum(&mut header, data.len() as u64).unwrap();
+        tar.extend_from_slice(&header);
+        tar.extend_from_slice(&data);
+        write_tar_padding(&mut tar, data.len() as u64).unwrap();
+    }
+    tar.extend_from_slice(&[0; 1024]);
+    tar
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3676,7 +3922,7 @@ blob Literal/Sub/
 
         let restore = temp.path().join("restore");
         fs::create_dir_all(&restore).unwrap();
-        extract_wrapper_tar(&tar_engine, &restore, &tar_path, true).unwrap();
+        extract_wrapper_tar(&tar_engine, &restore, &tar_path, true, &["user.".into()]).unwrap();
         let restored_source = restore.join("source");
         assert!(restored_source.join("empty").is_dir());
         assert_eq!(
@@ -3747,10 +3993,112 @@ blob Literal/Sub/
         assert!(!tar_bytes.windows(value.len()).any(|window| window == value));
         let restore = temp.path().join("restore");
         fs::create_dir_all(&restore).unwrap();
-        extract_wrapper_tar(&detect_tar_engine().unwrap(), &restore, &tar_path, false).unwrap();
+        extract_wrapper_tar(
+            &detect_tar_engine().unwrap(),
+            &restore,
+            &tar_path,
+            false,
+            &["user.".into()],
+        )
+        .unwrap();
         assert_eq!(
             xattr::get(restore.join("source/tagged.txt"), "user.wrapper_secret").unwrap(),
             None
         );
+    }
+
+    /// The same archive must enforce restore policy independently of capture.
+    #[cfg(unix)]
+    #[test]
+    fn wrapper_restore_filters_both_pax_encodings_and_surfaces_privileged_failures() {
+        let engine = detect_tar_engine().expect("bsdtar is required for wrapper restore tests");
+        for libarchive in [false, true] {
+            for opt_in in [None, Some("security."), Some("trusted.")] {
+                let temp = tempfile::tempdir().unwrap();
+                let wrapper = temp.path().join("source.remwrap.tar");
+                let original = wrapper_xattr_fixture(libarchive);
+                fs::write(&wrapper, &original).unwrap();
+                let dest = temp.path().join("restored");
+                fs::create_dir(&dest).unwrap();
+                let mut prefixes = vec!["user.".to_string()];
+                prefixes.extend(opt_in.map(str::to_string));
+                let result = extract_wrapper_tar(&engine, &dest, &wrapper, false, &prefixes);
+                assert_eq!(fs::read(&wrapper).unwrap(), original);
+                assert_eq!(fs::read(dest.join("tagged.txt")).unwrap(), b"payload");
+                assert_eq!(
+                    xattr::get(dest.join("tagged.txt"), "user.keep")
+                        .unwrap()
+                        .as_deref(),
+                    Some(b"private-value".as_slice())
+                );
+                for name in ["security.remanence_test", "trusted.remanence_test"] {
+                    if !prefixes.iter().any(|prefix| name.starts_with(prefix)) {
+                        assert_eq!(xattr::get(dest.join("tagged.txt"), name).unwrap(), None);
+                    }
+                }
+                match (opt_in, result) {
+                    (None, Ok(accounting)) => assert_eq!(
+                        accounting.skipped_xattrs["tagged.txt"],
+                        ["security.remanence_test", "trusted.remanence_test"]
+                    ),
+                    (None, Err(error)) => panic!("default wrapper restore failed: {error}"),
+                    (Some(prefix), Ok(accounting)) => {
+                        let name = format!("{prefix}remanence_test");
+                        assert_eq!(
+                            xattr::get(dest.join("tagged.txt"), &name)
+                                .unwrap()
+                                .as_deref(),
+                            Some(b"private-value".as_slice())
+                        );
+                        assert_eq!(accounting.applied_privileged_xattrs["tagged.txt"], [name]);
+                    }
+                    (Some(_), Err(error)) => {
+                        assert!(
+                            error.contains("xattr") || error.contains("extended attribute"),
+                            "{error}"
+                        );
+                        assert!(!error.contains("private-value"), "{error}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// An extractor that succeeds while omitting an allowed attribute must fail.
+    #[cfg(unix)]
+    #[test]
+    fn wrapper_restore_detects_silently_unapplied_attributes() {
+        let temp = tempfile::tempdir().unwrap();
+        let wrapper = temp.path().join("source.remwrap.tar");
+        fs::write(&wrapper, wrapper_xattr_fixture(false)).unwrap();
+        fs::write(temp.path().join("tagged.txt"), b"payload").unwrap();
+        let mut engine = detect_tar_engine().expect("bsdtar is required for wrapper restore tests");
+        engine.program = "/bin/true".to_string();
+        let error = extract_wrapper_tar(&engine, temp.path(), &wrapper, false, &["user.".into()])
+            .err()
+            .expect("missing allowed attribute must be surfaced");
+        assert!(
+            error.contains("user.keep") && error.contains("not applied correctly"),
+            "{error}"
+        );
+        assert!(!error.contains("private-value"));
+    }
+
+    /// Global pax inheritance must not provide an alternate unfiltered path.
+    #[test]
+    fn wrapper_restore_refuses_global_pax_headers() {
+        let temp = tempfile::tempdir().unwrap();
+        let wrapper = temp.path().join("source.remwrap.tar");
+        let mut bytes = wrapper_xattr_fixture(false);
+        bytes[156] = b'g';
+        fs::write(&wrapper, bytes).unwrap();
+        let error = filter_wrapper_tar_xattrs_with(
+            &wrapper,
+            |_| XattrPolicyDecision::KeepCore,
+            &mut PlannerState::default(),
+            Path::new(""),
+        )
+        .unwrap_err();
+        assert!(error.contains("global pax headers"));
     }
 }

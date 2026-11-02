@@ -234,7 +234,7 @@ pub struct StandaloneDriveConfig {
     pub serial: String,
 }
 
-/// Operator-defined pool for tape eligibility and Sutradhara placement.
+/// Operator-defined pool for tape eligibility and placement by an orchestrator.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TapePoolConfig {
@@ -273,7 +273,7 @@ pub struct TapePoolConfig {
         deserialize_with = "deserialize_byte_size"
     )]
     pub block_size_bytes: u64,
-    /// Sutradhara's declared minimum object/bundle floor in bytes.
+    /// An orchestrator's declared minimum object/bundle floor in bytes.
     #[serde(
         default,
         rename = "min_object_size",

@@ -1335,19 +1335,25 @@ enum Command {
 enum TapeLogCommand {
     /// Report the last valid closed boundary and any damage without mutation.
     Inspect {
+        /// Daemon configuration file locating the local tape log.
         #[arg(long)]
         config: PathBuf,
+        /// UUID of the tape log to inspect.
         #[arg(long)]
         tape_uuid: uuid::Uuid,
     },
     /// Archive a damaged suffix and retain an exact validated closed sequence.
     RepairTail {
+        /// Daemon configuration file locating the local tape log.
         #[arg(long)]
         config: PathBuf,
+        /// UUID of the tape log to repair.
         #[arg(long)]
         tape_uuid: uuid::Uuid,
+        /// Retain the validated closed sequence through this number.
         #[arg(long)]
         through_sequence: u64,
+        /// Acknowledge archiving and discarding the corrupt suffix.
         #[arg(long)]
         confirm_discard_corrupt_tail: bool,
         /// Rebuild this tape's projection atomically after repairing below its mark.
@@ -1490,10 +1496,15 @@ enum DaemonClientCommand {
 #[derive(Subcommand, Debug)]
 enum OperationClientCommand {
     /// Watch operation progress until it terminates.
-    Watch { operation_id: String },
+    Watch {
+        /// UUID of the operation to watch.
+        operation_id: String,
+    },
     /// Request cooperative cancellation.
     Cancel {
+        /// UUID of the operation to cancel.
         operation_id: String,
+        /// Request forced cancellation where the operation supports it.
         #[arg(long)]
         force: bool,
     },
@@ -2190,7 +2201,7 @@ fn with_bot_identity_drive<T>(
         .ok_or_else(|| format!("{} has no readable barcode", candidate.label()))?;
     let generation = remanence_api::MediaObservation::label_hint(voltag.as_str())
         .map(|observation| observation.generation)
-        .ok_or_else(|| format!("barcode {voltag:?} has no known LTO generation suffix"))?;
+        .ok_or_else(|| barcode_generation_error(Some(&voltag)))?;
     let mut handle = open_library_handle(library, policy)
         .map_err(|error| format!("opening library: {error}"))?;
     handle
@@ -2216,7 +2227,7 @@ fn with_bot_identity_drive<T>(
             })?;
         if !slot.full || slot.cartridge.as_deref() != Some(voltag.as_str()) {
             return Err(format!(
-                "live inventory no longer binds barcode {voltag:?} to storage element 0x{:04x}",
+                "live inventory no longer binds barcode {voltag} to storage element 0x{:04x}",
                 candidate.element_address
             ));
         }
@@ -2224,7 +2235,7 @@ fn with_bot_identity_drive<T>(
     } else {
         bay.source_slot.ok_or_else(|| {
             format!(
-                "loaded tape {voltag:?} in drive 0x{drive_element:04x} has no exact source/home slot"
+                "loaded tape {voltag} in drive 0x{drive_element:04x} has no exact source/home slot"
             )
         })?
     };
@@ -11136,10 +11147,7 @@ fn run_tape_bot_probe(
         Some(generation) => generation,
         None => {
             return print_command_error(
-                format!(
-                    "barcode {:?} has no known LTO generation suffix",
-                    candidate.voltag
-                ),
+                barcode_generation_error(candidate.voltag.as_deref()),
                 &fresh_report,
                 err,
             )
@@ -11210,11 +11218,7 @@ fn run_tape_adopt_bootstrap(
     let observation = match remanence_api::MediaObservation::label_hint(voltag) {
         Some(observation) => observation,
         None => {
-            return print_command_error(
-                format!("barcode {voltag:?} has no known LTO generation suffix"),
-                &fresh_report,
-                err,
-            )
+            return print_command_error(barcode_generation_error(Some(voltag)), &fresh_report, err)
         }
     };
     let generation = observation.generation;
@@ -11278,7 +11282,10 @@ fn run_tape_adopt_bootstrap(
             }
             None => {
                 return print_command_error(
-                    format!("BOT is not adoptable: {:?}", adoption.tail),
+                    format!(
+                        "BOT is not adoptable: {}",
+                        bootstrap_tail_reason(&adoption.tail)
+                    ),
                     &fresh_report,
                     err,
                 )
@@ -11493,6 +11500,34 @@ fn bootstrap_geometry_json(payload: &remanence_parity::BootstrapPayload) -> Valu
         "parity_blocks_per_stripe": payload.scheme.as_ref().map(|scheme| scheme.parity_blocks_per_stripe),
         "stripes_per_neighborhood": payload.scheme.as_ref().map(|scheme| scheme.stripes_per_neighborhood),
     })
+}
+
+/// Use the same plain barcode diagnostic in probe and adoption refusals.
+fn barcode_generation_error(barcode: Option<&str>) -> String {
+    match barcode {
+        Some(barcode) => format!("barcode {barcode} has no known LTO generation suffix"),
+        None => "cartridge has no barcode; its LTO generation cannot be inferred".to_string(),
+    }
+}
+
+/// Explain physical adoption refusals without exposing Rust enum formatting.
+fn bootstrap_tail_reason(tail: &remanence_api::BootstrapTailClassification) -> String {
+    use remanence_api::{BootstrapTailClassification as Tail, BotIdentityClassification as Bot};
+    match tail {
+        Tail::InvalidBot(bot) => match bot {
+            Bot::BlankCheckEod => "blank cartridge at BOT".to_string(),
+            Bot::ValidRemBootstrap { .. } => "Bootstrap tail could not be established".to_string(),
+            Bot::DamagedRemBootstrap { detail } => format!("damaged Bootstrap: {detail}"),
+            Bot::ForeignFormat { name } => format!("foreign format {name}"),
+            Bot::UnrecognizedData => "unrecognized BOT data".to_string(),
+            Bot::ReadError { detail } => format!("BOT read failed: {detail}"),
+        },
+        Tail::ExactBootstrapFilemarkEod => "Bootstrap followed by its filemark and EOD".to_string(),
+        Tail::DataAfterBootstrap => "data follows the Bootstrap".to_string(),
+        Tail::MissingFilemark => "Bootstrap filemark is missing".to_string(),
+        Tail::ExtraFilemark => "an extra filemark follows the Bootstrap".to_string(),
+        Tail::Ambiguous { detail } => format!("Bootstrap tail is ambiguous: {detail}"),
+    }
 }
 
 fn bootstrap_tail_name(tail: &remanence_api::BootstrapTailClassification) -> &'static str {
@@ -12513,7 +12548,7 @@ fn tape_init_readiness_error(
     let state = media_readiness_state_name(&poll.readiness, poll.timed_out);
     let exit_code = tape_init_readiness_exit_code(poll);
     format!(
-        "media not ready for tape init on {voltag} in drive 0x{drive_element:04x}{timeout} media_readiness_state={state} media_readiness_exit_code={exit_code}: {}; leave the tape in the drive and run `rem tape wait-ready` or fieldtest/scripts/09-media-ready.sh before retrying init",
+        "media not ready for tape init on {voltag} in drive 0x{drive_element:04x}{timeout} media_readiness_state={state} media_readiness_exit_code={exit_code}: {}; leave the tape in the drive and run `rem tape wait-ready` before retrying init",
         describe_media_readiness(&poll.readiness)
     )
 }
@@ -13902,13 +13937,7 @@ fn extract_plaintext_archive_object_file(args: &ArchiveExtractArgs) -> Result<Va
         stored_digest,
     };
     let mut value = archive_extract_report_json(&context, &report);
-    attach_unwrap_report(
-        &mut value,
-        &args.dest,
-        args.overwrite,
-        args.no_unwrap,
-        unwrap_plan,
-    )?;
+    attach_unwrap_report(&mut value, args, unwrap_plan)?;
     Ok(value)
 }
 
@@ -14035,28 +14064,42 @@ fn extract_encrypted_archive_object_file(args: &ArchiveExtractArgs) -> Result<Va
         stored_digest: inspected.stored_digest,
     };
     let mut value = archive_extract_report_json(&context, &report);
-    attach_unwrap_report(
-        &mut value,
-        &args.dest,
-        args.overwrite,
-        args.no_unwrap,
-        unwrap_plan,
-    )?;
+    attach_unwrap_report(&mut value, args, unwrap_plan)?;
     Ok(value)
 }
 
 fn attach_unwrap_report(
     value: &mut Value,
-    dest: &Path,
-    overwrite: bool,
-    no_unwrap: bool,
+    args: &ArchiveExtractArgs,
     unwrap_plan: Option<archive_ingest::UnwrapPlan>,
 ) -> Result<(), String> {
-    if no_unwrap {
+    if args.no_unwrap {
         value["unwrap"] = json!({ "enabled": false, "tar_engine": null });
         return Ok(());
     }
-    let report = archive_ingest::unwrap_remwraps(dest, overwrite, unwrap_plan)?;
+    let report = archive_ingest::unwrap_remwraps(
+        &args.dest,
+        args.overwrite,
+        unwrap_plan,
+        &archive_extract_restore_options(args).xattr_allowed_prefixes,
+    )?;
+    for (key, accounting) in [
+        ("skipped_xattrs", &report.skipped_xattrs),
+        (
+            "applied_privileged_xattrs",
+            &report.applied_privileged_xattrs,
+        ),
+    ] {
+        for (path, names) in accounting {
+            let entry = value[key][path].as_array().cloned().unwrap_or_default();
+            let mut merged = entry
+                .into_iter()
+                .filter_map(|name| name.as_str().map(str::to_owned))
+                .collect::<BTreeSet<_>>();
+            merged.extend(names.iter().cloned());
+            value[key][path] = json!(merged);
+        }
+    }
     value["unwrap"] = serde_json::to_value(report)
         .map_err(|error| format!("serialize unwrap report: {error}"))?;
     value["unwrap"]["enabled"] = json!(true);
@@ -17913,6 +17956,98 @@ mod tests {
             fs::read(public).unwrap(),
             key.public_key(0).unwrap().serialize().unwrap()
         );
+    }
+
+    /// Both local build and pool-write validation use the CLI's lowercase prefix.
+    #[test]
+    fn recipient_slot_order_refusals_use_lowercase_error_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_, primary, _, _) = write_test_recipient_files(temp.path(), "order", 0x41);
+        let input = temp.path().join("input.txt");
+        let output = temp.path().join("output.rem-object");
+        fs::write(&input, b"payload").unwrap();
+        let (code, _, local_error) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "build",
+            "--inputs",
+            input.to_str().unwrap(),
+            "--out",
+            output.to_str().unwrap(),
+            "--recipient",
+            primary.to_str().unwrap(),
+            "--recipient",
+            primary.to_str().unwrap(),
+        ]);
+        assert_eq!(code, ExitCode::FAILURE);
+        let report = DiscoveryReport {
+            libraries: vec![],
+            unattached_drives: vec![],
+            complete: true,
+            incomplete_evidence: vec![],
+            warnings: vec![],
+        };
+        let args = pool_ops::ArchiveWriteArgs {
+            library: "unused".into(),
+            file: input,
+            pool_id: "unused".into(),
+            archive_path: None,
+            caller_object_id: None,
+            recipients: vec![primary.clone(), primary],
+            json_output: false,
+            config: temp.path().join("must-not-open.toml"),
+        };
+        let mut err = Vec::new();
+        assert_eq!(
+            pool_ops::run_archive_write(&report, &args, &[], &[], &mut Vec::new(), &mut err),
+            ExitCode::FAILURE
+        );
+        let expected = "error: --recipient epochs must be distinct and in ascending slot order\n";
+        assert_eq!(local_error, expected);
+        assert_eq!(String::from_utf8(err).unwrap(), expected);
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn bot_identity_refusals_use_plain_barcodes_and_readable_reasons() {
+        use remanence_api::{
+            BootstrapTailClassification as Tail, BotIdentityClassification as Bot,
+        };
+        assert_eq!(
+            barcode_generation_error(Some("BARCODE")),
+            "barcode BARCODE has no known LTO generation suffix"
+        );
+        assert_eq!(
+            barcode_generation_error(None),
+            "cartridge has no barcode; its LTO generation cannot be inferred"
+        );
+        for (classification, expected) in [
+            (Bot::BlankCheckEod, "blank cartridge at BOT"),
+            (Bot::UnrecognizedData, "unrecognized BOT data"),
+            (
+                Bot::ForeignFormat {
+                    name: "LTFS".into(),
+                },
+                "foreign format LTFS",
+            ),
+            (
+                Bot::DamagedRemBootstrap {
+                    detail: "checksum mismatch".into(),
+                },
+                "damaged Bootstrap: checksum mismatch",
+            ),
+            (
+                Bot::ReadError {
+                    detail: "read denied".into(),
+                },
+                "BOT read failed: read denied",
+            ),
+        ] {
+            assert_eq!(
+                bootstrap_tail_reason(&Tail::InvalidBot(classification)),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -25848,6 +25983,83 @@ blob Project/Render Files/
         let report: Value = serde_json::from_str(&stdout).expect("build json");
         assert_eq!(report["ingest"]["xattr_policy"]["mode"], "full-fidelity");
         assert!(report["ingest"]["ruleset"].is_null());
+    }
+
+    /// Plaintext and encrypted whole-object extracts must pass restore policy
+    /// into wrapper extraction and include its skips in the normal report.
+    #[cfg(unix)]
+    #[test]
+    fn archive_extract_wrapper_namespace_policy_is_independent_of_encryption() {
+        for encrypted in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let wrapper = temp.path().join("source.remwrap.tar");
+            fs::write(&wrapper, archive_ingest::wrapper_xattr_fixture(true)).unwrap();
+            let object = temp.path().join("wrapper.rem-object");
+            let (_, primary, recovery, private) =
+                write_test_recipient_files(temp.path(), "wrapper", 0x31);
+            let mut build = vec![
+                "rem",
+                "archive",
+                "build",
+                "--inputs",
+                wrapper.to_str().unwrap(),
+                "--out",
+                object.to_str().unwrap(),
+                "--chunk-size",
+                "4KiB",
+            ];
+            if encrypted {
+                build.extend([
+                    "--recipient",
+                    primary.to_str().unwrap(),
+                    "--recipient",
+                    recovery.to_str().unwrap(),
+                ]);
+            }
+            let (code, _, stderr) = invoke_without_discovery(&build);
+            assert_eq!(code, ExitCode::SUCCESS, "{stderr}");
+            for prefix in [None, Some("security."), Some("trusted.")] {
+                let dest = temp.path().join(prefix.unwrap_or("default"));
+                let mut extract = vec![
+                    "rem",
+                    "archive",
+                    "extract",
+                    "--object",
+                    object.to_str().unwrap(),
+                    "--dest",
+                    dest.to_str().unwrap(),
+                    "--chunk-size",
+                    "4KiB",
+                ];
+                if encrypted {
+                    extract.extend(["--private-key", private.to_str().unwrap()]);
+                }
+                if let Some(prefix) = prefix {
+                    extract.extend(["--xattr-namespace", prefix]);
+                }
+                let (code, stdout, stderr) = invoke_without_discovery(&extract);
+                if prefix.is_none() {
+                    assert_eq!(code, ExitCode::SUCCESS, "{stderr}");
+                    let report: Value = serde_json::from_str(&stdout).unwrap();
+                    assert_eq!(
+                        report["skipped_xattrs"]["tagged.txt"],
+                        json!(["security.remanence_test", "trusted.remanence_test"])
+                    );
+                    assert_eq!(stderr.matches("skipped by namespace policy").count(), 1);
+                    assert!(stderr.contains("2 extended attribute(s)"), "{stderr}");
+                } else if let Some(prefix) = prefix.filter(|_| code == ExitCode::SUCCESS) {
+                    let report: Value = serde_json::from_str(&stdout).unwrap();
+                    assert_eq!(
+                        report["applied_privileged_xattrs"]["tagged.txt"],
+                        json!([format!("{prefix}remanence_test")])
+                    );
+                } else {
+                    assert!(stderr.starts_with("error:"), "{stderr}");
+                    assert!(dest.join("source.remwrap.tar").is_file());
+                }
+                assert!(!stdout.contains("private-value") && !stderr.contains("private-value"));
+            }
+        }
     }
 
     #[cfg(unix)]

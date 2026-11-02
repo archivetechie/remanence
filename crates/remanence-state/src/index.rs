@@ -7021,9 +7021,9 @@ fn validate_bootstrap_identity_adoption_conn(
     if let (Some(by_uuid), Some(by_voltag)) = (&by_uuid, &by_voltag) {
         if by_uuid.tape_uuid != by_voltag.tape_uuid {
             return Err(StateError::TapeProvisionConflict(format!(
-                "Bootstrap UUID {} and barcode {:?} resolve to different catalog identities",
-                hex_uuid(facts.tape_uuid),
-                facts.voltag
+                "Bootstrap UUID {} and barcode {} resolve to different catalog identities",
+                Uuid::from_bytes(facts.tape_uuid),
+                facts.voltag.unwrap_or("unlabelled")
             )));
         }
     }
@@ -7034,7 +7034,8 @@ fn validate_bootstrap_identity_adoption_conn(
     if existing.state == "retired" {
         return Err(StateError::TapeProvisionConflict(format!(
             "Bootstrap identity {} is retired; retired identities are permanent",
-            hex_uuid_from_slice(existing.tape_uuid.as_slice())
+            Uuid::from_slice(&existing.tape_uuid)
+                .map_err(|error| StateError::IndexCorrupt(format!("invalid tape UUID: {error}")))?
         )));
     }
     let evidence: (Option<String>, Option<String>, Option<String>) = conn.query_row(
@@ -7069,9 +7070,9 @@ fn validate_bootstrap_identity_adoption_conn(
         && existing.identity_only;
     if !exact_identity {
         return Err(StateError::TapeProvisionConflict(format!(
-            "Bootstrap identity {} barcode {:?} conflicts with existing {} catalog row",
-            hex_uuid(facts.tape_uuid),
-            facts.voltag,
+            "Bootstrap identity {} barcode {} conflicts with existing {} catalog row",
+            Uuid::from_bytes(facts.tape_uuid),
+            facts.voltag.unwrap_or("unlabelled"),
             existing.kind
         )));
     }

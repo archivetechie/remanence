@@ -148,7 +148,7 @@ impl CatalogIndex {
         &self,
         snapshot: &AuthoritySnapshot,
     ) -> Result<(), StateError> {
-        const REFUSAL: &str = "repair would discard a seal or accepted terminal finalization; a separate explicit forensic recovery path is required and is not part of step 2";
+        const REFUSAL: &str = "repair would discard a seal or accepted terminal finalization; a separate explicit forensic recovery path is required and is unavailable through repair-tail";
         let uuid = snapshot.raw.header().tape_uuid;
         let plan = snapshot.finalization().filter(|_| {
             snapshot

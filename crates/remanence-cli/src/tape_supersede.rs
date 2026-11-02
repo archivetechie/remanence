@@ -6,12 +6,16 @@ use std::process::ExitCode;
 
 #[derive(Args, Debug)]
 pub(crate) struct TapeSupersedeArgs {
+    /// UUID of the tape whose uncommitted tail will be discarded.
     #[arg(long, alias = "tape")]
     tape_uuid: String,
+    /// Repeat the tape UUID to acknowledge the recovery target.
     #[arg(long, alias = "acknowledge-tape")]
     ack_tape_uuid: String,
+    /// Supply the exact confirmation phrase returned by the recovery preview.
     #[arg(long)]
     confirm_supersede: Option<String>,
+    /// Daemon gRPC endpoint.
     #[arg(long, default_value = super::DEFAULT_DAEMON_ENDPOINT)]
     endpoint: String,
 }
