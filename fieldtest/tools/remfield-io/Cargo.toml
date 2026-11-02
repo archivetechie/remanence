@@ -9,6 +9,7 @@ license = "Apache-2.0"
 [workspace]
 
 [dependencies]
+remanence-state = { path = "../../../crates/remanence-state" }
 clap = { version = "4", features = ["derive"] }
 remanence-api = { path = "../../../crates/remanence-api" }
 serde = { version = "1", features = ["derive"] }

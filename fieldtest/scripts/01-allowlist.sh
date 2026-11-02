@@ -14,6 +14,10 @@ EOF
 }
 
 main() {
+  if [[ ${1:-} == --verify-session-epoch-a ]]; then
+    diff -u <(printf '%s\n' AOX032L9 AOX036L9 AOX038L9 AOX058L9) <(fieldtest_allowlist_barcodes | sort)
+    return
+  fi
   if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
     usage
     exit 0

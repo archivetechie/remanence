@@ -55,6 +55,10 @@ PY
 }
 
 main() {
+  if [[ ${1:-} == --session-epoch-a ]]; then
+    "$(fieldtest_script_dir)/session-epoch-preflight.sh" || return $?
+    shift
+  fi
   if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
     usage
     exit 0

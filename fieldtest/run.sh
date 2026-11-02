@@ -13,6 +13,7 @@ set -uo pipefail
 
 pkg="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 scripts="$pkg/scripts"
+[[ ! -e "$pkg/DRY-RUN-NOT-FOR-HARDWARE" ]] || { echo "refused: dry review package" >&2; exit 2; }
 
 die() {
   printf 'run.sh: refused: %s\n' "$*" >&2
@@ -71,6 +72,7 @@ fi
 printf '%s\n' "$$" >"$pidfile"
 
 stamp="$(fieldtest_timestamp_id)"
+export FIELD_SESSION_RUN_ID="${PLAN_NAME}-${stamp}"
 # The log and the table live in evidence/, so the pack carries them.
 log="$(fieldtest_evidence_dir)/run-${PLAN_NAME}-${stamp}.log"
 table="$(fieldtest_evidence_dir)/run-${PLAN_NAME}-${stamp}.tsv"

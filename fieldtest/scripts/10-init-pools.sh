@@ -669,6 +669,10 @@ init_already_recorded() {
 }
 
 main() {
+  if [[ ${1:-} == --session-epoch-a ]]; then
+    "$(fieldtest_script_dir)/session-epoch-init.sh"
+    return
+  fi
   if [[ "${1:-}" == --selftest ]]; then
     init_pools_selftest
     init_pools_escalation_selftest

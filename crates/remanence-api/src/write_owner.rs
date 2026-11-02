@@ -10,6 +10,8 @@ use tonic::Status;
 
 mod bot_recovery;
 mod cleaning;
+#[cfg(feature = "field-kit")]
+pub(crate) mod field_gate;
 mod readiness;
 #[cfg(test)]
 pub(crate) use tests::{

@@ -10,6 +10,7 @@ publish.workspace = true
 repository  .workspace = true
 
 [features]
+field-kit = ["remanence-library/field-kit"]
 # Deliberately destructive semantic fixtures; never enabled by production binaries.
 fixtures = []
 # Compile-time seam for cross-crate verification equivalence tests.

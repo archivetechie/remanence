@@ -26,6 +26,8 @@ struct Evidence {
     tape_uuid: [u8; 16],
     stopped: bool,
     spool_failed: bool,
+    #[cfg(feature = "field-kit")]
+    field_gate: Option<super::field_gate::Gate>,
 }
 
 fn invalid() -> TapeIoError {
@@ -48,6 +50,8 @@ impl SessionTail {
             tape_uuid,
             stopped: false,
             spool_failed: false,
+            #[cfg(feature = "field-kit")]
+            field_gate: None,
         }))))
     }
 
@@ -90,6 +94,10 @@ impl SessionTail {
         let mut e = self.0.lock().map_err(|_| "session tail lock poisoned")?;
         if e.stopped || e.spool_failed || id.is_empty() || id.len() > 64 {
             return Err("session tail object identity unavailable".into());
+        }
+        #[cfg(feature = "field-kit")]
+        {
+            e.field_gate = super::field_gate::Gate::load(e.tape_uuid, id)?;
         }
         e.next_object = Some(id.to_owned());
         Ok(())
@@ -230,6 +238,12 @@ impl MediaDispatchObserver for SessionTail {
             }
             file.filemark = TailFilemark::Unknown;
         }
+        #[cfg(feature = "field-kit")]
+        if cdb[0] == 0x0a {
+            if let Some(gate) = e.field_gate.as_mut() {
+                gate.dispatch(data.unwrap_or_default());
+            }
+        }
         Ok(())
     }
 
@@ -256,6 +270,12 @@ impl MediaDispatchObserver for SessionTail {
                 file.unknown_blocks -= known;
             }
             e.stopped = file.unknown_blocks != 0 || result.is_err();
+            #[cfg(feature = "field-kit")]
+            if let Some(mut gate) = e.field_gate.take() {
+                if let Ok(Some(outcome)) = result {
+                    e.stopped |= !gate.settled(outcome.bytes_transferred);
+                }
+            }
         } else if result.is_ok() {
             file.filemark = TailFilemark::Present;
             match e.next_file.checked_add(1) {

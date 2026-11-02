@@ -173,6 +173,21 @@ async fn b7_fix_top_once_json_reads_held_checkpoint_and_partial_lists_exit_nonze
             ExitCode::SUCCESS
         );
         assert!(!String::from_utf8(output).unwrap().contains("DEBT?"));
+        let tapes = state
+            .catalog_service()
+            .list_tapes(tonic::Request::new(pb::ListTapesRequest::default()))
+            .await
+            .unwrap()
+            .into_inner();
+        let result = print_catalog_tape_response(tapes, json, &mut Vec::new());
+        assert_eq!(
+            finish_daemon_client_result(
+                result.map_err(DaemonClientError::from),
+                json,
+                &mut Vec::new()
+            ),
+            ExitCode::SUCCESS
+        );
     }
 }
 

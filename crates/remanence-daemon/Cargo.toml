@@ -37,3 +37,6 @@ uuid = { workspace = true }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+
+[features]
+field-kit = ["remanence-api/field-kit"]

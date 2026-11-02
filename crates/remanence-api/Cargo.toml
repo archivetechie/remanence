@@ -49,6 +49,7 @@ tonic-prost-build.workspace = true
 
 [features]
 default = []
+field-kit = ["remanence-library/field-kit", "remanence-parity/field-kit"]
 # In-process inventory injection for cross-crate RPC/printer regressions.
 test-support = []
 

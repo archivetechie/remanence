@@ -15,6 +15,10 @@
 
 pub use remanence_scsi as scsi;
 
+#[cfg(feature = "field-kit")]
+#[doc(hidden)]
+pub mod field_trace;
+
 pub mod block_io;
 #[doc(hidden)]
 pub mod cursor;

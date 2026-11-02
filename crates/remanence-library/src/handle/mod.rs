@@ -1281,13 +1281,20 @@ impl LibraryHandle {
         );
 
         let library_serial = self.changer.library.serial.clone();
+        let transport = tape_io::media_gate::MediaFencedTransport::new(transport);
+        #[cfg(feature = "field-kit")]
+        let transport = {
+            let mut transport = transport;
+            transport.field_identity = serde_json::json!({"library_serial":library_serial,"bay":bay_address,"serial":installed_clone.serial,"firmware":installed_clone.revision});
+            transport
+        };
         Ok(DriveHandle {
             endpoint: MountEndpoint::Durable(DriveKey::Bay {
                 library_serial,
                 bay: bay_address,
             }),
             drive: installed_clone,
-            transport: tape_io::media_gate::MediaFencedTransport::new(transport),
+            transport,
             max_write_block_size_bytes: None,
             append_admission: None,
             position_known: true,
@@ -2038,6 +2045,10 @@ impl DriveHandle {
         );
         let mut transport = tape_io::media_gate::MediaFencedTransport::new(transport);
         transport.set_writable(matches!(endpoint, MountEndpoint::Durable(_)));
+        #[cfg(feature = "field-kit")]
+        {
+            transport.field_identity = serde_json::json!({"serial":serial,"firmware":inquiry.revision_str(),"endpoint":format!("{endpoint:?}")});
+        }
         Ok(Self {
             endpoint,
             drive: InstalledDrive {

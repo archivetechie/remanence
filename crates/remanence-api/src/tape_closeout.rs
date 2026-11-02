@@ -40,9 +40,6 @@ pub(crate) fn start(
         &actor_fingerprint,
         KIND.as_bytes(),
     );
-    if let Some(pool) = &state.drive_pool {
-        pool.check_finalizing(tape)?;
-    }
     let _start = state
         .operations
         .readiness_start
@@ -87,6 +84,14 @@ pub(crate) fn start(
     {
         return Ok(response);
     }
+    if existing.as_ref().and_then(|s| s.terminal_state.as_deref()) == Some("finished") {
+        let handle = state.operations.register(id, KIND);
+        handle.publish_state(pb::OperationState::Succeeded, &[("phase", "complete")]);
+        return Ok(response);
+    }
+    if let Some(pool) = &state.drive_pool {
+        pool.check_finalizing(tape)?;
+    }
     if existing.is_none() {
         append_operation_audit(
             &mut index,
@@ -120,10 +125,6 @@ pub(crate) fn start(
         )?;
     }
     let handle = state.operations.register(id, KIND);
-    if existing.as_ref().and_then(|s| s.terminal_state.as_deref()) == Some("finished") {
-        handle.publish_state(pb::OperationState::Succeeded, &[("phase", "complete")]);
-        return Ok(response);
-    }
     let progress = crate::closeout_progress::CloseoutProgress::new(id, tape, Some(handle.clone()))?
         .request(actor.clone(), key);
     progress.phase("queued");

@@ -49,6 +49,8 @@ pub struct EpochAccumulator {
     pub(crate) parity_accumulators: Vec<Vec<Vec<u8>>>,
     pub(crate) current_epoch_data_crc64s: Vec<u64>,
     check: CheckValueBuilder,
+    #[cfg(feature = "field-kit")]
+    checksum_time: std::time::Duration,
 }
 
 impl EpochAccumulator {
@@ -147,6 +149,8 @@ impl EpochAccumulator {
             parity_accumulators,
             current_epoch_data_crc64s: Vec::with_capacity(capacity),
             check: CheckValueBuilder::new(),
+            #[cfg(feature = "field-kit")]
+            checksum_time: std::time::Duration::ZERO,
         })
     }
 
@@ -196,6 +200,8 @@ impl EpochAccumulator {
             parity_accumulators,
             current_epoch_data_crc64s: block_crcs,
             check,
+            #[cfg(feature = "field-kit")]
+            checksum_time: std::time::Duration::ZERO,
         })
     }
 
@@ -222,9 +228,15 @@ impl EpochAccumulator {
             ))?;
         self.codec
             .accumulate((offset / s) as usize, block, accumulators)?;
+        #[cfg(feature = "field-kit")]
+        let checksum_started = std::time::Instant::now();
         let crc = data_shard_crc64(block);
         self.current_epoch_data_crc64s.push(crc);
         self.check.push(crc);
+        #[cfg(feature = "field-kit")]
+        {
+            self.checksum_time += checksum_started.elapsed();
+        }
         self.next_ordinal = next;
         Ok(())
     }
@@ -262,6 +274,8 @@ impl EpochAccumulator {
             self.parity_accumulators.clear();
             return Err(ParityError::Invariant("epoch parity shape mismatch"));
         }
+        #[cfg(feature = "field-kit")]
+        self.record_checksum();
         Ok(std::mem::take(&mut self.parity_accumulators)
             .into_iter()
             .flatten()
@@ -278,8 +292,19 @@ impl EpochAccumulator {
         self.check.value()
     }
 
+    #[cfg(feature = "field-kit")]
+    fn record_checksum(&mut self) {
+        let elapsed = std::mem::take(&mut self.checksum_time);
+        if elapsed.is_zero() {
+            return;
+        }
+        remanence_library::field_trace::stage("checksum", self.tape_uuid, self.epoch_id, elapsed);
+    }
+
     /// Consume the parity buffers into the sidecar's physical block order.
-    pub fn into_sidecar(self) -> Result<EncodedSidecarTapeFile, ParityError> {
+    pub fn into_sidecar(mut self) -> Result<EncodedSidecarTapeFile, ParityError> {
+        #[cfg(feature = "field-kit")]
+        self.record_checksum();
         let descriptor = SidecarDescriptor {
             tape_uuid: self.tape_uuid,
             epoch_id: self.epoch_id,
@@ -292,7 +317,10 @@ impl EpochAccumulator {
         };
         crate::sidecar::encode_sidecar_owned(
             &descriptor,
-            self.parity_accumulators.into_iter().flatten().collect(),
+            std::mem::take(&mut self.parity_accumulators)
+                .into_iter()
+                .flatten()
+                .collect(),
             self.current_epoch_data_crc64s,
         )
     }
@@ -453,6 +481,8 @@ pub(crate) fn rebuild_uncovered_once(
     for (start, end, lba) in spans {
         reader.read_extent(partition, lba, start, end, &mut accumulator)?;
     }
+    #[cfg(feature = "field-kit")]
+    accumulator.record_checksum();
     Ok(accumulator)
 }
 
@@ -583,6 +613,8 @@ mod tests {
                 .flatten()
                 .map(|b| b.as_ptr())
                 .collect();
+            #[cfg(feature = "field-kit")]
+            self.record_checksum();
             let descriptor = SidecarDescriptor {
                 tape_uuid: [7; 16],
                 epoch_id: 2,
