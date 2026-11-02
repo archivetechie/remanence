@@ -156,6 +156,8 @@ pub struct ResumeLiveEpochState {
 /// Result of rereading `[W,T)` from the committed prefix.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResumeOpenEpochRebuild {
+    /// Full-range read attempts (zero when the range is empty).
+    pub read_attempts: u32,
     /// Catalog-prefix append plan that drove this rebuild.
     pub plan: ResumeAppendPlan,
     /// Complete epochs rebuilt from committed object blocks and ready to emit
@@ -1326,6 +1328,7 @@ pub fn rebuild_open_epoch_from_bounded_summary_checked(
         }
         locate_resume_append_position(source, plan.append_position, block_size)?;
         return Ok(ResumeOpenEpochRebuild {
+            read_attempts: 0,
             plan,
             rebuilt_sidecars: Vec::new(),
             live_epoch: None,
@@ -1348,6 +1351,7 @@ pub fn rebuild_open_epoch_from_bounded_summary_checked(
             .collect(),
     };
     let mut reader = CommittedRawReader {
+        read_attempts: 1,
         source,
         tape_uuid,
         scheme,
@@ -1370,12 +1374,14 @@ pub fn rebuild_open_epoch_from_bounded_summary_checked(
         &range,
     )
     .map_err(crate::closeout::CloseoutError::into_parity)?;
+    let read_attempts = reader.read_attempts;
     let live_epoch = Some(live_epoch_from_accumulator(
         accumulator,
         original_check.is_some(),
     ));
     locate_resume_append_position(source, plan.append_position, block_size)?;
     Ok(ResumeOpenEpochRebuild {
+        read_attempts,
         plan,
         rebuilt_sidecars: Vec::new(),
         live_epoch,
@@ -1390,10 +1396,12 @@ struct CommittedRawReader<'a> {
     block_size: u32,
     next_lba: u64,
     buffer: Vec<u8>,
+    read_attempts: u32,
 }
 
 impl crate::closeout::CommittedReader for CommittedRawReader<'_> {
     fn reprove_identity(&mut self) -> Result<(), crate::closeout::CloseoutError> {
+        self.read_attempts += 1;
         self.locate(0, 0)?;
         let mut block = vec![0; self.block_size as usize];
         self.read_block(&mut block)?;
@@ -1560,6 +1568,7 @@ fn rebuild_open_epoch_from_plan(
         );
         locate_resume_append_position(source, plan.append_position, block_size)?;
         return Ok(ResumeOpenEpochRebuild {
+            read_attempts: 0,
             plan,
             rebuilt_sidecars: Vec::new(),
             live_epoch: None,
@@ -1572,7 +1581,7 @@ fn rebuild_open_epoch_from_plan(
         .next_epoch_id
         .checked_sub(rebuilt_epoch_count)
         .ok_or_else(|| resume_error("resume rebuild epoch id underflows"))?;
-    let (rebuilt_sidecars, live_epoch) = {
+    let (rebuilt_sidecars, live_epoch, read_attempts) = {
         let mut attempt = 0;
         loop {
             let mut accumulator = ResumeEpochBuilder::new(
@@ -1601,7 +1610,7 @@ fn rebuild_open_epoch_from_plan(
                 if let Some(live) = &mut live {
                     live.original_write_verified = true;
                 }
-                break (sidecars, live);
+                break (sidecars, live, attempt + 1);
             }
             drop(sidecars);
             drop(live);
@@ -1612,6 +1621,7 @@ fn rebuild_open_epoch_from_plan(
                 });
             }
             crate::closeout::CommittedReader::reprove_identity(&mut CommittedRawReader {
+                read_attempts: 1,
                 source,
                 tape_uuid,
                 scheme,
@@ -1629,6 +1639,7 @@ fn rebuild_open_epoch_from_plan(
     locate_resume_append_position(source, plan.append_position, block_size)?;
 
     Ok(ResumeOpenEpochRebuild {
+        read_attempts,
         plan,
         rebuilt_sidecars,
         live_epoch,

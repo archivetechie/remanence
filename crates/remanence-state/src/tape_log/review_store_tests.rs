@@ -118,14 +118,14 @@ fn repair_resumes_after_process_crash_between_fence_and_replacement() {
             Arc::new(FaultDirectory(faults)),
         );
         let store = store(std::path::Path::new(&path));
-        store.repair_tail(4, 4).unwrap();
+        store.repair_tail(5, 5).unwrap();
         panic!("crash hook was not reached");
     }
     let dir = tempfile::tempdir().unwrap();
     let store = store(dir.path());
     let mut lease = store.acquire(true).unwrap();
     append_object(&mut lease);
-    assert_eq!(lease.summary().last_closed_sequence, 4);
+    assert_eq!(lease.summary().last_closed_sequence, 5);
     let end = lease.summary().closed_end;
     drop(lease);
     std::fs::OpenOptions::new()
@@ -140,7 +140,7 @@ fn repair_resumes_after_process_crash_between_fence_and_replacement() {
     assert_eq!(status.code(), Some(87));
     assert!(store.path().with_extension("repair-required").exists());
     assert_eq!(std::fs::metadata(store.path()).unwrap().len(), end + 28);
-    store.repair_tail(4, 4).unwrap();
+    store.repair_tail(5, 5).unwrap();
     assert_eq!(std::fs::metadata(store.path()).unwrap().len(), end);
 }
 
@@ -236,7 +236,7 @@ fn staged_prefix_and_closer_are_written_one_frame_per_call() {
         writes.push((frame.end - frame.offset) as usize);
     }
     assert_eq!(*faults.writes.lock().unwrap(), writes);
-    assert_eq!(writes.len(), 5, "one header and four separate frame writes");
+    assert_eq!(writes.len(), 6, "one header and five separate frame writes");
 }
 
 #[test]
@@ -256,6 +256,7 @@ fn original_write_check_reaches_the_compatibility_report_unchanged() {
     let mut lease = store.acquire(true).unwrap();
     let mut group = lease.prepare().unwrap();
     lease.append(group.close(&init(true)).unwrap()).unwrap();
+    open_fixture_session(&mut lease);
     group = lease.prepare().unwrap();
     let row = object(1, 2, Some(0), 3);
     group
@@ -315,7 +316,7 @@ fn every_byte_crash_cut_of_a_multiframe_append_is_torn_or_complete() {
     append_object(&mut lease);
     drop(lease);
     let full = std::fs::read(store.path()).unwrap();
-    let mut decoder = Decoder::at(&full[boundary..], 5, boundary as u64);
+    let mut decoder = Decoder::at(&full[boundary..], 6, boundary as u64);
     let mut boundaries = vec![boundary];
     while let Some(frame) = decoder.next_frame().unwrap() {
         boundaries.push(frame.end as usize);
@@ -332,7 +333,7 @@ fn every_byte_crash_cut_of_a_multiframe_append_is_torn_or_complete() {
         assert_eq!(snapshot.summary().object_count, expected, "cut={cut}");
         // Check byte classification independently from group closure.
         let relative = cut - boundary;
-        let mut bytes = Decoder::at(&full[boundary..cut], 5, boundary as u64);
+        let mut bytes = Decoder::at(&full[boundary..cut], 6, boundary as u64);
         while bytes
             .next_frame()
             .unwrap_or_else(|e| panic!("cut={cut}: {e}"))

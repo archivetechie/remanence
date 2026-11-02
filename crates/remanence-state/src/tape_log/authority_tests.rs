@@ -312,7 +312,7 @@ fn leased_capture_reuses_validated_fold_and_external_capture_validates_again() {
     // Reusing trust does not mean that a compatibility replay emits zero frames.
     assert_eq!(
         writer.visit_commits(&mut |_| Ok(())).unwrap().frame_count,
-        4
+        5
     );
     drop(writer);
     let external = authority.freeze().unwrap();
@@ -472,7 +472,9 @@ fn staged_and_ambiguous_leases_explicitly_refuse_abandonment_and_stale_latest() 
             )
             .unwrap();
     }
-    writer.bind_session([9; 16]);
+    writer
+        .open_session([9; 16], "2026-11-02T00:00:00Z".into())
+        .unwrap();
     writer.stage_report(&report).unwrap();
     assert!(writer.ensure_abandonment_allowed().is_err());
     assert!(writer.latest_commit().is_err());
@@ -525,7 +527,9 @@ fn after_durable_report_clears_cached_snapshot_and_has_distinct_error_type() {
             )
             .unwrap();
     }
-    writer.bind_session([9; 16]);
+    writer
+        .open_session([9; 16], "2026-11-02T00:00:00Z".into())
+        .unwrap();
     writer.stage_report(&report).unwrap();
     writer
         .set_publication_observer(crate::tape_log::store::PublicationObserver(Arc::new(

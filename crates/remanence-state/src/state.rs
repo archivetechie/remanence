@@ -1363,6 +1363,16 @@ impl StateHandle {
     pub fn retire_tape(&mut self, input: RetireTapeInput) -> Result<RetireTapeOutcome, StateError> {
         let tape_uuid = input.tape_uuid;
         let reason = input.reason.clone();
+        let authority = crate::TapeAuthority::open(
+            self.paths.journal_dir.join("tapes"),
+            tape_uuid,
+            &self.paths.sqlite_path,
+        )?;
+        let lease = authority.acquire_exclusive()?;
+        let snapshot = lease.freeze()?;
+        if let Some(refusal) = snapshot.tape_summary().closeout_required("retirement") {
+            return Err(StateError::TapeProvisionConflict(refusal));
+        }
         let outcome = self.index.retire_tape(input)?;
         // An idempotent rerun changed nothing, so it appends nothing: the
         // `TapeRetired` event is the tamper-evident record of who declared
@@ -7025,7 +7035,7 @@ mod cutover_tests {
         let fault = rusqlite::Connection::open(&state.paths.sqlite_path).unwrap();
         fault.execute_batch("create trigger interrupt_projection before insert on tape_log_projection begin select raise(abort, 'interrupted rebuild'); end").unwrap();
         assert!(state.rebuild_projection_from_tape_logs().is_err());
-        assert_eq!(state.index.projected_through_sequence(id).unwrap(), 4);
+        assert_eq!(state.index.projected_through_sequence(id).unwrap(), 5);
         fault
             .execute_batch("drop trigger interrupt_projection")
             .unwrap();
@@ -7036,6 +7046,6 @@ mod cutover_tests {
             hash_files(path, &mut after);
         }
         assert_eq!(before, after);
-        assert_eq!(state.index.projected_through_sequence(id).unwrap(), 4);
+        assert_eq!(state.index.projected_through_sequence(id).unwrap(), 5);
     }
 }

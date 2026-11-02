@@ -521,9 +521,6 @@ pub(crate) fn record_library_event(
     event: AuditEvent,
     mut detail: BTreeMap<String, CborValue>,
 ) -> Result<(), Status> {
-    for (key, value) in handle.notes() {
-        detail.entry(key).or_insert(CborValue::Text(value));
-    }
     detail.insert(
         "library_serial".to_string(),
         CborValue::Text(library_serial.to_string()),

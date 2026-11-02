@@ -187,40 +187,6 @@ pub(super) fn changer_loop(
     }
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
-            ChangerCommand::PlanningMove {
-                src,
-                dst,
-                ownership,
-                reply,
-            } => {
-                let result =
-                    super::robotics::admit_fenced_elements(&index, changer.library(), &[src, dst])
-                        .and_then(|()| {
-                            changer.move_medium(src, dst, &cfg.policy).map_err(|err| {
-                                Status::failed_precondition(format!("move medium: {err}"))
-                            })
-                        });
-                {
-                    match observe_refreshed_library(&mut index, &cfg, changer.library()) {
-                        Ok(()) => clear_library_snapshot_persist_alarm(
-                            &mut index,
-                            &cfg,
-                            changer.library().serial.as_str(),
-                        ),
-                        Err(err) => record_library_observation_failure(
-                            &mut index,
-                            &cfg,
-                            changer.library(),
-                            err.message(),
-                        ),
-                    }
-                    publish_library_snapshot(&cfg.library().snapshot, changer.library().clone());
-                }
-                if result.is_ok() {
-                    ownership.moved();
-                }
-                let _ = reply.send(ownership.complete(result));
-            }
             ChangerCommand::Move {
                 src,
                 dst,
@@ -333,11 +299,6 @@ pub(super) fn drain_failed_changer_commands(
 ) {
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
-            ChangerCommand::PlanningMove {
-                reply, ownership, ..
-            } => {
-                let _ = reply.send(ownership.complete(Err(Status::internal(message.clone()))));
-            }
             ChangerCommand::Move { reply, .. } => {
                 let _ = reply.send(Err(Status::internal(message.clone())));
             }
@@ -375,24 +336,7 @@ pub(super) fn drive_loop(
         index.set_readiness_observer(lifecycle.readiness_wake.clone());
     }
     let mut snapshot_misses = 0u32;
-    let mut retained: Option<super::checkpoint::RetainedParityEpoch> = None;
     while let Some(cmd) = rx.blocking_recv() {
-        #[cfg(test)]
-        match cfg
-            .io_memory
-            .epoch_test_action
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            4 => {
-                retained = None;
-            }
-            5 => {
-                if let Some(e) = retained.as_mut() {
-                    e.identity_generation = e.identity_generation.wrapping_add(1);
-                }
-            }
-            _ => {}
-        }
         match cmd {
             DriveCommand::OpenMountedWrite {
                 host_only_recovery,
@@ -478,18 +422,10 @@ pub(super) fn drive_loop(
                         },
                         reply,
                     },
-                    &mut retained,
                 );
                 let audit = super::mounted_commands::settle_audit(&mut index, &cfg, drive, before);
                 if let Some(mut finish) = finish {
-                    let closed = super::mounted_commands::close_epoch(
-                        &mut index,
-                        &cfg,
-                        drive,
-                        bay,
-                        &mut retained,
-                    );
-                    finish.result = finish.result.and(audit).and(closed);
+                    finish.result = finish.result.and(audit);
                     rx.close();
                     drain_failed_drive_commands(rx, "mounted actor finished".into());
                     return Some(finish);
@@ -510,27 +446,17 @@ pub(super) fn drive_loop(
                     )));
                     continue;
                 }
-                let result = super::mounted_commands::close_epoch(
-                    &mut index,
-                    &cfg,
-                    drive,
-                    bay,
-                    &mut retained,
-                );
+                let result = Ok(());
                 rx.close();
                 drain_failed_drive_commands(rx, "mounted actor finished".into());
                 return Some(MountedFinish { reply, result });
             }
             DriveCommand::FinalizeMounted { request, reply } => {
                 let result = super::mounted_commands::finalize(&mut index, &cfg, drive, request);
-                if result.is_ok() {
-                    retained = None;
-                }
                 let _ = reply.send(result);
             }
             DriveCommand::SupersedeMounted { request, reply } => {
                 let result = super::mounted_commands::supersede(&mut index, &cfg, drive, request);
-                retained = None;
                 let _ = reply.send(result);
             }
             DriveCommand::WaitReady {
@@ -588,7 +514,6 @@ pub(super) fn drive_loop(
                         drive_serial,
                         reply,
                     },
-                    &mut retained,
                 );
             }
             DriveCommand::OpenRead {
@@ -677,6 +602,42 @@ pub(super) fn drive_loop(
                 );
                 let _ = reply.send(result);
             }
+            DriveCommand::CloseoutTape {
+                progress,
+                tape_uuid,
+                expected_pool,
+                needs_drive_load,
+                library_serial,
+                barcode,
+                source_slot,
+                drive_serial,
+                reply,
+            } => {
+                let result = super::closeout::handle(
+                    &mut index,
+                    &cfg,
+                    drive,
+                    tape_uuid,
+                    expected_pool.as_deref(),
+                    &progress,
+                    |index, drive| {
+                        super::readiness::session_open_short_probe_or_load(
+                            index,
+                            drive,
+                            super::SessionOpenReadinessContext {
+                                action: "closeout tape",
+                                bay,
+                                library_serial: &library_serial,
+                                barcode: barcode.as_deref(),
+                                source_slot,
+                                drive_serial: drive_serial.as_deref(),
+                                needs_drive_load,
+                            },
+                        )
+                    },
+                );
+                let _ = reply.send(result);
+            }
             DriveCommand::SupersedeTail {
                 request,
                 actor,
@@ -731,12 +692,18 @@ pub(super) fn drive_loop(
                         generation,
                         &Uuid::from_bytes(tape_uuid).to_string(),
                         actor,
-                        |required, found| {
+                        |required, found, sequence| {
                             preview = Some(pb::SupersedeTailResponse {
                                 found: found.to_vec(),
                                 required_confirmation: required.into(),
+                                tape_log_sequence: sequence,
                                 completed: false,
                             });
+                            if request.confirm_supersede.is_some()
+                                && request.observed_tape_log_sequence != Some(sequence)
+                            {
+                                return Err(match request.observed_tape_log_sequence { Some(expected) => format!("TailPreviewStale: tape-log sequence changed from {expected} to {sequence}; preview supersede-tail again."), None => "observed_tape_log_sequence is required when confirming supersede-tail".into() });
+                            }
                             match request.confirm_supersede.as_deref() {
                                 None => Err("confirmation required".into()),
                                 Some(value)
@@ -790,72 +757,13 @@ pub(super) fn drive_loop(
                         drive_uuid,
                         drive_serial,
                     },
-                    &mut retained,
-                );
-                if result.is_ok() {
-                    retained = None;
-                }
-                let _ = reply.send(result);
-            }
-            DriveCommand::PlanFinalization {
-                ownership,
-                request,
-                needs_drive_load,
-                barcode,
-                source_slot,
-                drive_serial,
-                reply,
-            } => {
-                let result = super::terminal_finalize::plan_mounted_epoch_finalization(
-                    &mut index,
-                    &cfg,
-                    drive,
-                    bay,
-                    &request,
-                    needs_drive_load,
-                    &mut retained,
-                    |index, drive| {
-                        super::readiness::session_open_short_probe_or_load(
-                            index,
-                            drive,
-                            super::SessionOpenReadinessContext {
-                                action: "plan terminal finalization",
-                                bay,
-                                library_serial: &cfg.library().serial,
-                                barcode: barcode.as_deref(),
-                                source_slot,
-                                drive_serial: drive_serial.as_deref(),
-                                needs_drive_load,
-                            },
-                        )
-                    },
-                );
-
-                let _ = reply.send(ownership.complete(result));
-            }
-            DriveCommand::PrepareRemoval { reply, progress } => {
-                let result = super::checkpoint::close_retained_reporting(
-                    &mut index,
-                    drive,
-                    &cfg,
-                    bay,
-                    &mut retained,
-                    progress.as_ref(),
                 );
                 let _ = reply.send(result);
+            }
+            DriveCommand::PrepareRemoval { reply } => {
+                let _ = reply.send(Ok(()));
             }
             DriveCommand::Unload { reply } => {
-                if let Err(error) = super::checkpoint::close_retained_before_removal(
-                    &mut index,
-                    drive,
-                    &cfg,
-                    bay,
-                    &mut retained,
-                    None,
-                ) {
-                    let _ = reply.send(Err(error));
-                    continue;
-                }
                 let result = unload_actor_drive(
                     drive,
                     std::path::Path::new(crate::mount_support::DEVICE_LOCK_ROOT),
@@ -899,9 +807,26 @@ pub(super) fn drive_loop(
                     });
                 let _ = reply.send(result);
             }
-            DriveCommand::AppendFinish { reply, source, .. } => {
+            DriveCommand::AppendFinish {
+                reply,
+                source,
+                session_id,
+                ..
+            } => {
                 source.remove_completed_path();
-                let _ = reply.send(Err(Status::failed_precondition("no active write session")));
+                let sealed = cfg.lifecycle.as_ref().is_some_and(|l| {
+                    l.ended_writes
+                        .lock()
+                        .unwrap()
+                        .get(&session_id)
+                        .is_some_and(|(_, sealed)| *sealed)
+                });
+                let error = if sealed {
+                    super::SessionSealed.into()
+                } else {
+                    Status::failed_precondition("no active write session")
+                };
+                let _ = reply.send(Err(error));
             }
             DriveCommand::Checkpoint { reply, .. } => {
                 if let Some(reply) = reply {
@@ -909,11 +834,37 @@ pub(super) fn drive_loop(
                 }
             }
             DriveCommand::TimerIdleClose { .. } => {}
-            DriveCommand::Get { reply, .. } => {
-                let _ = reply.send(Err(Status::not_found("no active write session")));
+            DriveCommand::Get { reply, session_id } => {
+                let ended = cfg.lifecycle.as_ref().and_then(|l| {
+                    l.ended_writes
+                        .lock()
+                        .unwrap()
+                        .get(&session_id)
+                        .map(|(session, _)| session.clone())
+                });
+                let _ =
+                    reply.send(ended.ok_or_else(|| Status::not_found("no active write session")));
             }
-            DriveCommand::Close { reply, .. } | DriveCommand::Abort { reply, .. } => {
-                let _ = reply.send(Err(Status::not_found("no active write session")));
+            DriveCommand::Close { reply, session_id }
+            | DriveCommand::Abort {
+                reply, session_id, ..
+            }
+            | DriveCommand::DisconnectWrite { reply, session_id } => {
+                let ended = cfg.lifecycle.as_ref().and_then(|l| {
+                    l.ended_writes
+                        .lock()
+                        .unwrap()
+                        .get(&session_id)
+                        .map(|(session, _)| session.clone())
+                });
+                let _ = reply.send(
+                    ended
+                        .map(|session| super::CloseWriteActorReply {
+                            session,
+                            diagnostics: Default::default(),
+                        })
+                        .ok_or_else(|| Status::not_found("no active write session")),
+                );
             }
             DriveCommand::ReadFile { chunk_tx, .. }
             | DriveCommand::ReadObjectRange { chunk_tx, .. } => {
@@ -967,18 +918,14 @@ pub(super) fn drain_failed_drive_commands(mut rx: mpsc::Receiver<DriveCommand>, 
             DriveCommand::VerifyTapeIndex { reply, .. } => {
                 let _ = reply.send(Err(Status::internal(message.clone())));
             }
+            DriveCommand::CloseoutTape { reply, .. } => {
+                let _ = reply.send(Err(Status::failed_precondition("drive is unavailable")));
+            }
             DriveCommand::SupersedeTail { reply, .. } => {
                 let _ = reply.send(Err(Status::unavailable("drive actor unavailable")));
             }
             DriveCommand::FinalizeTape { reply, .. } => {
                 let _ = reply.send(Err(Status::internal(message.clone())));
-            }
-            DriveCommand::PlanFinalization {
-                reply, ownership, ..
-            } => {
-                let _ = reply.send(ownership.complete(Err(Status::failed_precondition(
-                    "drive actor cannot plan finalization in its current state",
-                ))));
             }
             DriveCommand::PrepareRemoval { reply, .. } => {
                 let _ = reply.send(Err(Status::internal(message.clone())));
@@ -1002,7 +949,9 @@ pub(super) fn drain_failed_drive_commands(mut rx: mpsc::Receiver<DriveCommand>, 
                 }
             }
             DriveCommand::TimerIdleClose { .. } => {}
-            DriveCommand::Close { reply, .. } | DriveCommand::Abort { reply, .. } => {
+            DriveCommand::Close { reply, .. }
+            | DriveCommand::Abort { reply, .. }
+            | DriveCommand::DisconnectWrite { reply, .. } => {
                 let _ = reply.send(Err(Status::internal(message.clone())));
             }
             DriveCommand::Get { reply, .. } => {
@@ -1437,7 +1386,7 @@ pub(super) fn u64_to_i64(value: u64) -> Option<i64> {
     i64::try_from(value).ok()
 }
 
-/// Actor unload after its retained-write epoch has closed. Keep recovery's
+/// Actor unload after the exclusion handshake has settled. Keep recovery's
 /// device lock in the reply so a following changer MOVE remains protected.
 pub(crate) fn unload_actor_drive(
     drive: &mut remanence_library::DriveHandle,

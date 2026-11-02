@@ -7,6 +7,28 @@ per-release summaries.
 <!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/index.rs crates/remanence-library/src/discovery.rs @ 638210f7 -->
 ## Unreleased
 
+- Write sessions now own their parity epochs through ending. Checkpoints keep
+  an epoch only within the same session; clean close returns durable receipts,
+  then closes the short epoch while retaining the drive and tape lease.
+  Following access waits for that work. The native tape log records
+  `SessionOpened`, `ClosedOut`, and `SessionEnded` with dispatched tail evidence.
+  Abort, failed append, and ingress timeout add no abandonment filemark and a
+  durable live ending raises no automatic tape-I/O fence. Graceful shutdown
+  closes sessions and leaves cartridges seated.
+- Added `rem tape closeout <tape>` and the idempotent `Catalog.CloseoutTape` RPC.
+  Checked closeout runs from live parity or bounded read-back before a new
+  session. Manual finalization and retirement refuse outstanding closeout with
+  `CloseoutRequired`; a drive error leaves it due for a later access. Unload
+  performs no parity close and no longer emits epoch-close warnings or notes.
+- Supersede confirmation now requires the preview's tape-log sequence; stale
+  previews return `TailPreviewStale`. Crash-torn final files use the v2
+  `TornPrefix` identity (SHA-256 of their observed fixed-size blocks), re-proved
+  exactly before replacement. Live endings retain Object or sidecar identities.
+- A sealing session commits its finalization decision before replying and ends
+  before terminal media work. Further appends return `SessionSealed`.
+  `FINAL_PARTIAL_EPOCH` belongs only to a short sidecar following an accepted
+  finalization decision; ordinary session closeout does not set it.
+
 - Host commit authority now uses one per-tape log at
   `journal_dir/tapes/<lowercase-simple-uuid>.remtape`, for tapes with or without
   parity. The layout marker is `state_dir/authority-format` and the catalog

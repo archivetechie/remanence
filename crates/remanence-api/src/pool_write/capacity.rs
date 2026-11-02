@@ -1025,15 +1025,15 @@ pub(crate) fn reserve_parity_object_capacity(
     let spool_permit = io_memory
         .try_reserve_with_available(required_spool_bytes)
         .map_err(|available| {
-            let retained_epochs = io_memory.retained_diagnostics();
+            let active_parity_operations = io_memory.active_parity_diagnostics();
             tracing::warn!(
                 required_spool_bytes,
                 available,
-                %retained_epochs,
+                %active_parity_operations,
                 "parity spool reservation exceeds available memory"
             );
             PoolWriteError::ParitySpoolRefused {
-                retained_epochs,
+                active_parity_operations,
                 cause: Box::new(ParityError::CapacityReserveExceeded {
                     cause: CapacityReserveCause::ParitySpoolCapacity,
                     projected_object_blocks,

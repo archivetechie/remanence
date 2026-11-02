@@ -7,6 +7,9 @@ mod acceptance_finalization;
 #[path = "ingress_deadline_media_tests.rs"]
 mod ingress_deadline_media_tests;
 
+#[path = "host_record_tests.rs"]
+mod host_record_tests;
+
 use super::*;
 use remanence_chaos::file_model::{FileEvent, FileSnapshot, MemoryDirectory};
 use remanence_library::durable_file::test_support::register;
@@ -267,6 +270,82 @@ fn config(root: &Path, library: &remanence_library::LibraryHandle) -> WriteOwner
     cfg
 }
 
+/// A lost open reply still has a durable owner and must end it before releasing
+/// the drive; it cannot leave an anonymous epoch for the next session.
+#[test]
+fn lost_open_reply_ends_the_durable_session() {
+    let root = tempfile::tempdir().unwrap();
+    let world = setup(root.path());
+    let mut library = open_model_library(world);
+    let cfg = config(root.path(), &library);
+    let mut drive = library.open_drive(BAY, &cfg.policy).unwrap();
+    let (actor_tx, mut rx) = mpsc::channel(16);
+    let (reply, received) = oneshot::channel();
+    drop(received);
+    let request = super::super::actor_runtime::OpenWriteActorRequest {
+        actor: AuditActor::System,
+        pool_cfg: pool(),
+        selected: selected(),
+        target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
+        needs_drive_load: false,
+        library_serial: Some(LIBRARY.into()),
+        barcode: Some(BARCODE.into()),
+        source_slot: None,
+        drive_uuid: None,
+        drive_serial: Some(DRIVE.into()),
+        reply,
+    };
+    let mut index = CatalogIndex::open(&cfg.index_path).unwrap();
+    handle_drive_open_write(
+        BAY, &mut index, &cfg, actor_tx, &mut rx, &mut drive, &mut 0, request,
+    );
+    let authority = TapeAuthority::open(&cfg.checkpoint_journal_dir, TAPE, index.path()).unwrap();
+    let snapshot = authority.freeze().unwrap();
+    assert!(snapshot.tape_summary().open_session.is_none());
+    let end = snapshot.tape_summary().last_session_end.as_ref().unwrap();
+    assert_eq!(
+        end.reason,
+        remanence_state::tape_log::SessionEndReason::ClientDisconnected
+    );
+    assert_eq!(end.tail_file_count, 0);
+    assert!(!snapshot.tape_summary().closeout_due());
+    assert!(index.list_active_tape_io_fences().unwrap().is_empty());
+}
+
+/// The detached RPC task may receive an actor reply after its caller vanished.
+/// Its explicit disconnect command ends the already-open owner without a mark.
+#[tokio::test]
+async fn disconnected_open_task_ends_the_session_and_releases_authority() {
+    let root = tempfile::tempdir().unwrap();
+    let world = setup(root.path());
+    let (tx, opened, thread) = open_writer(root.path(), open_model_library(world.clone())).await;
+    let id = opened.unwrap();
+    let before = world.lock().unwrap().tapes[BARCODE].records.clone();
+    let (reply, ended) = oneshot::channel();
+    tx.send(DriveCommand::DisconnectWrite {
+        session_id: id,
+        reply,
+    })
+    .await
+    .unwrap();
+    ended.await.unwrap().unwrap();
+    thread.join().unwrap();
+    let index = CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
+    let authority =
+        TapeAuthority::open(root.path().join("journals/tapes"), TAPE, index.path()).unwrap();
+    let lease = authority.acquire_exclusive().unwrap();
+    let snapshot = lease.freeze().unwrap();
+    let end = snapshot.tape_summary().last_session_end.as_ref().unwrap();
+    assert_eq!(
+        end.reason,
+        remanence_state::tape_log::SessionEndReason::ClientDisconnected
+    );
+    assert_eq!(end.tail_file_count, 0);
+    assert!(snapshot.tape_summary().open_session.is_none());
+    assert_eq!(world.lock().unwrap().tapes[BARCODE].records, before);
+    assert!(index.list_active_tape_io_fences().unwrap().is_empty());
+}
+
 /// Run one session handler, joining its thread after close or refusal.
 async fn open_writer(
     root: &Path,
@@ -310,7 +389,7 @@ async fn open_writer_with_selection(
     let thread = std::thread::spawn(move || {
         let mut index = CatalogIndex::open(&cfg.index_path).unwrap();
         handle_drive_open_write(
-            BAY, &mut index, &cfg, actor_tx, &mut rx, &mut drive, &mut 0, request, &mut None,
+            BAY, &mut index, &cfg, actor_tx, &mut rx, &mut drive, &mut 0, request,
         );
     });
     let opened = received
@@ -554,8 +633,8 @@ fn acknowledge_tail(root: &Path, world: Arc<Mutex<VirtualWorld>>) -> Result<(), 
         generation,
         BARCODE,
         AuditActor::System,
-        |required, found| {
-            preview = Some((required.to_owned(), found.to_vec()));
+        |required, found, sequence| {
+            preview = Some((required.to_owned(), found.to_vec(), sequence));
             Err("confirmation required".into())
         },
     )
@@ -566,7 +645,7 @@ fn acknowledge_tail(root: &Path, world: Arc<Mutex<VirtualWorld>>) -> Result<(), 
         before,
         "preview does not change tape"
     );
-    let Some((confirmation, found)) = preview else {
+    let Some((confirmation, found, sequence)) = preview else {
         return Err(refusal);
     };
     crate::write_owner::supersede_mounted_tail(
@@ -577,7 +656,8 @@ fn acknowledge_tail(root: &Path, world: Arc<Mutex<VirtualWorld>>) -> Result<(), 
         generation,
         BARCODE,
         AuditActor::System,
-        |required, current| {
+        |required, current, current_sequence| {
+            assert_eq!(current_sequence, sequence);
             assert_eq!(required, confirmation);
             assert_eq!(current, found);
             Ok(())
@@ -605,16 +685,22 @@ fn record_refusal(
         "torn parity frame"
     } else if message.contains("tape identity: bootstrap I/O")
         || message.contains("bootstrap is not followed by a filemark")
+        || cut.receipts.is_empty() && message.contains("locate parity checkpoint EOD:")
     {
         "missing bootstrap"
     } else if message.contains("read audit segment header") {
         "short audit header"
     } else {
-        return Err(format!("unexpected recovery refusal: {status}"));
+        return Err(format!(
+            "unexpected recovery refusal at {} keep={keep}: {status}",
+            cut.boundary
+        ));
     };
     assert_eq!(
         status.code(),
-        if category == "short audit header" {
+        if message.contains("locate parity checkpoint EOD:") {
+            tonic::Code::Unavailable
+        } else if category == "short audit header" {
             tonic::Code::Internal
         } else if category == "torn parity frame" && !message.contains("open parity tape journal") {
             tonic::Code::Unavailable
@@ -781,10 +867,18 @@ async fn check_crash(
         match opened {
             Ok(id) => {
                 coverage.completed += 1;
-                let expected_start = authority.last().map_or(2, |record| record.eod_lba);
+                let protected_start = authority.last().map_or(2, |record| record.eod_lba);
+                // Admission closes any prior session's debt before opening the next epoch.
+                let expected_start = CatalogIndex::open(temp.path().join("state.sqlite"))
+                    .unwrap()
+                    .get_tape(&TAPE)
+                    .unwrap()
+                    .unwrap()
+                    .written_extent_lba
+                    .unwrap();
                 let before = world.lock().unwrap().tapes[BARCODE]
                     .records
-                    .get(..expected_start as usize)
+                    .get(..protected_start as usize)
                     .map(<[Record]>::to_vec);
                 let Some(before) = before else {
                     close_writer(&tx, id, thread).await;
@@ -1055,6 +1149,22 @@ async fn property(skip_barrier: bool, full: bool) -> Result<Coverage, String> {
         .any(|cut| cut.boundary.starts_with("BeforeSync")));
     assert!(cuts.iter().any(|cut| cut.receipts.len() == 3));
     let cases = crash_cases(&cuts, full);
+    // Check the immutable receipt/frontier property across every cut before
+    // recovery refusals can obscure a lost acknowledged block in another cut.
+    for case in &cases {
+        let cut = &cuts[case.cut];
+        let kept = &cut.records[..case.keep];
+        for receipt in &cut.receipts {
+            if kept.get(receipt.start..receipt.start + receipt.records.len())
+                != Some(receipt.records.as_slice())
+            {
+                return Err(format!(
+                    "{}: acknowledged object {} loses tape bytes at keep={}",
+                    cut.boundary, receipt.id, case.keep
+                ));
+            }
+        }
+    }
     eprintln!(
         "durability trace: {} cut points, {} cases, skip_barrier={skip_barrier}, full={full}",
         cuts.len(),

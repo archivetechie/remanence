@@ -229,6 +229,23 @@ promise. `rem-daemon` serves seven services:
 | `ReadPlanService` | `PlanBatchRead` — an advisory read-ordering RPC for a batch of targets on one tape; it moves no tape, and no client in this repository calls it; see [Read-order planning](#read-order-planning) |
 | `Audit` | registered on both the Unix socket and mTLS TCP listeners; its one RPC, `QueryAudit`, streams the append-only audit log back incrementally paged |
 
+Write sessions own parity epochs from open to end. The native log's
+`SessionOpened`, `SessionEnded`, and `ClosedOut` records select the next
+access's complete suffix proof. A crash-torn final file is identified by its
+observed-block SHA-256; live tails name Object or sidecar identities and bounded
+command outcomes. An accepted finalization plan takes priority over crash-tail
+recovery. Ordinary closeout never sets `FINAL_PARTIAL_EPOCH`.
+
+Clean close returns committed receipts before its short sidecar is written;
+the drive and tape lease remain held until closeout and ending are durable.
+Later access waits for that work. Other live endings name the dispatched tail
+before drive-owned checked closeout, except that a drive error leaves closeout
+due. No abandonment filemark is written and no accumulator survives its session.
+`Catalog.CloseoutTape`, exposed as `rem tape closeout`, performs the same
+idempotent operation explicitly and succeeds without media work when none is due.
+Manual finalization and retirement require due closeout to complete first.
+Removal is an exclusion handshake and performs no parity work.
+
 Checkpoint batching defaults to 32 GiB of pending logical bytes, 200 pending
 objects, or a 300 second batch age. The byte threshold counts logical object
 bytes, not physical tape bytes. The daemon starts the age timer when it opens
@@ -376,58 +393,44 @@ finalization.
    fails, the first sink error discards any batches still queued for that
    `AppendObject` call. A failed `AppendGate` makes every later append in that
    write session fail, until the caller opens a new session. A transfer error
-   whose outcome is unknown records a durable tape-I/O fence, which blocks
-   further writes, and daemon startup, until an operator releases it.
+   whose outcome is unknown is named in the session's tail. Failure to record
+   that end raises an ambiguity fence until authority can be reconciled.
 
-Daemon parity checkpoints preserve a short open epoch. Standalone writes close
-the epoch at every barrier. Each Object close emits any
-completed epochs before its checkpoint; the remaining committed range `[W,T)`
-contains fewer than `S × k` data blocks. The drive actor reserves the accumulator
-against the shared I/O memory ceiling and retains it while the cartridge stays
-seated. Reuse requires the tape UUID, parked-cartridge generation, drive identity
-generation, and the new session's end-of-data proof to match. Otherwise append
-rebuilds `[W,T)` from the committed tape prefix. Memory refusal closes the epoch
-at the barrier and appears in write diagnostics.
+Each write session owns its parity accumulator and its reservation from open to
+close. Checkpoints may leave a short epoch within that session; full epochs emit
+their sidecars as Objects finish. A clean close commits and returns the receipts,
+then writes the remaining short sidecar, takes a barrier, records `ClosedOut`,
+and records `SessionEnded(clean_close)`. Following access waits for this work to
+release the drive and tape. Standalone writes use the same actor policy.
 
-Idle unload, eviction, and operator removal attempt a sidecar-only checkpoint
-before moving the cartridge. Removal always proceeds. The close uses
-write-session admission: non-writable, foreign, unconfigured, and
-terminal-finalizing tapes skip it with a log entry. A close fences the tape when
-it contradicts committed state or an append has uncertain durability. A fence
-for damage to committed data carries `[W,T)` and the cause; a write-failure
-fence carries the batch evidence. Suffix evidence points at the append boundary.
-Admission contradictions record `admission_contradiction` with their phase and
-carry `[W,T)` only when `W < T`. Transient failures after projection log and audit
-`epoch_left_open` without a fence. Removal returns immediately when no checkpoint
-journal exists. Catalog kind, state, pool, parity scheme, terminal intent and
-fences can skip the close before journal access. Otherwise removal projects the
-journal before deciding whether an epoch is open. Any failure through projection,
-including a refused journal lease, audits `epoch_projection_failed` with the cause
-and no range; the epoch state stays unknown until replay succeeds. A durable
-journal commit with a failed SQLite projection stays closed;
-startup replay projects it. Shutdown attempts the close only with the head still
-at the last write EOD. Otherwise it dismounts and logs and audits
-`epoch_left_open` with `[W,T)`; the next append rebuilds that range.
+Abort, failed append, disconnect and incomplete-append deadline record a named
+tail without an abandonment filemark. A durable live ending needs no operator
+acknowledgement and raises no automatic tape-I/O fence. Closeout then runs as
+independent drive work, except after a drive error. A later write open or
+`rem tape closeout` rebuilds any due range through the checked kernel, reserves
+memory before drive commands, proves the entire suffix and EOD, and writes at the
+committed cursor. Memory refusal leaves closeout due. Contradictions use
+`CloseoutCheckMismatch`, `CloseoutReadContradiction` or
+`SessionSuffixContradiction`; ambiguous metadata publication uses
+`AuthorityAmbiguous`. A durable log record remains authority when SQLite
+projection fails.
 
-A cartridge outside a drive has no open epoch except after a crash, a close that
-leaves the epoch open, or a shutdown that finds the head away from EOD. A fenced
-tape keeps its epoch until append recovery clears the fence. Removal records a
-deferred automatic seal as the optional `seal_due` field in the checkpoint
-journal record, in the same fsync as the checkpoint. Its values are
-`hardware_early_warning` and `reached_low_watermark`. Older records omit the
-field and read as no new obligation. SQLite projects this field while the tape
-is ready; ordinary checkpoints preserve it, and terminal completion, sealing,
-retirement, or reprovisioning clears it. Startup and catalog rebuild use the
-same projection. Rebuild preserves a legacy catalog-only obligation until
-replayed authority resolves it and reports the preserved fallback. The next write
-session on that tape completes the seal before accepting Objects; explicit
-finalization also completes it. `rem catalog tapes --json` exposes the pending
-trigger. Finalization plans the terminal sidecar before freezing its layout,
-reuses its live or rebuilt accumulator, and closes through the terminal funnel
-with `FINAL_PARTIAL_EPOCH`. Planning owns the tape in a detached task. Changer
-and planning commands retain its reservations until their work ends; cleanup
-schedules idle dismount before releasing them. Planning waits through resumable
-readiness refusals within the worker's readiness budget. A dropped request
+Idle unload, eviction and operator removal perform only the exclusion handshake;
+they wait for ongoing closeout and do no parity work. Graceful shutdown checkpoints,
+closes and ends sessions as `graceful_shutdown`, leaving cartridges seated.
+Closeout failure or a drive error may leave a due range after the session ends.
+Retirement and manual finalization refuse such a range with `CloseoutRequired`,
+naming `rem tape closeout`.
+
+A barrier triggered by early warning or the low watermark records `seal_due` as
+`hardware_early_warning` or `reached_low_watermark`. The session accepts its
+immutable finalization plan before returning receipts, ends the session, and
+runs finalization as drive work. An accepted plan covering the range suppresses
+ordinary closeout. Its `TerminalPrefix` emits the short sidecar and ParityMap;
+`FINAL_PARTIAL_EPOCH` is set only if `FinalizationDecided` preceded that sidecar.
+Manual finalization at rest first requires ordinary closeout of any uncovered
+range, whose sidecar has the flag clear. Finalization planning owns the tape in
+a detached task, retaining reservations until its work ends. A dropped request
 before acceptance leaves no finalization intent; retrying its key plans again.
 
 ### Retries and idempotency
@@ -447,10 +450,15 @@ the committed copy set. After any loss of the session, the stream, or the
 daemon, the caller re-sends every object that was not reported CHECKPOINTED.
 The retry is the complete Object from byte zero, not a continuation.
 
-For an open, parity-off, rewritable tape, the durable per-tape log
-identifies the last committed EOD. After a restart the daemon locates there and
-overwrites any longer uncommitted tail, then writes the retried Object's single
-trailing filemark. A multi-member REM-OBJECT therefore stays one ordinary tar
+For an open, rewritable tape, the durable per-tape log identifies the committed
+cursor and the session that owns any uncommitted tail. Before another write,
+the daemon proves the complete expected suffix through EOD. A durable session
+ending names the dispatched tail and permits automatic recovery; a crash tail
+containing a complete Object requires `rem tape supersede-tail` acknowledgement.
+A crash-only torn header prefix is named by its byte digest and must be proved
+exactly on the next access. Any due parity closeout runs before a new session
+opens. The retried Object starts from byte zero and has one trailing filemark.
+A multi-member REM-OBJECT therefore stays one ordinary tar
 stream that standard tools can recover after a crash, and not two tape files
 that tar would have to join. Ordinary Object admission requires the drive to
 report `NotWorm`. WORM and unknown media are refused, because an interrupted
@@ -470,8 +478,11 @@ record whose SQLite projection failed is replayed rather than written again.
 
 ### Finalization
 
-When a tape is closed, no intermediate index is written. Finalization closes
-the open parity epoch and emits one final ParityMap if any sidecar metadata
+When a tape is finalized, no intermediate index is written. An automatic seal
+decision durably accepts the finalization plan before the session replies;
+finalization then closes any short epoch covered by that plan. Manual
+finalization at rest requires any due session closeout to finish first, using
+`rem tape closeout`. Finalization emits one final ParityMap if any sidecar metadata
 exists. It then fixes one immutable snapshot of the complete prefix that
 precedes replica A, and emits replica A, separation AB, replica B, separation
 BC, and replica C. A filemark and a persistence barrier follow each component,

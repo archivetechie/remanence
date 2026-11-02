@@ -187,9 +187,27 @@ impl Log {
         }
         self.members += member_count as u64;
     }
+    fn open(&mut self) {
+        let s = self.summary();
+        self.push(
+            Record::SessionOpened(SessionOpened {
+                session_id: [9; 16],
+                incarnation: s.incarnation,
+                base_media_sequence: s.last_media_commit.unwrap(),
+                cursor: SessionCursor {
+                    partition: s.cursor.partition,
+                    lba: s.cursor.lba,
+                    next_file: s.next_file,
+                },
+                opened_at_utc: "2026-11-02T00:00:00Z".into(),
+            }),
+            &[],
+        );
+    }
     fn first(parity: bool) -> Self {
         let mut log = Self::default();
         log.push(init(parity), &[]);
+        log.open();
         let row = object(1, 2, parity.then_some(0), 3);
         log.row(row.clone());
         log.catalog(&row, 3, 2, 31);
@@ -1342,6 +1360,7 @@ fn pending_groups_do_not_clone_old_extents_and_commit_splices_new_suffix() {
 fn many_objects_and_sidecar_cycles_keep_only_epoch_sized_extents() {
     let mut log = Log::default();
     log.push(init(true), &[]);
+    log.open();
     let mut file = 1;
     let mut lba = 2;
     let mut total = 0;
@@ -1441,6 +1460,7 @@ fn plan_requires_parity_map_exactly_when_directory_is_present() {
 
     let mut log = Log::default();
     log.push(init(true), &[]);
+    log.open();
     log.push(Record::Committed(commit(log.reference(), 1, 2, 0)), &[]);
     let mut map = plain_row(1, TapeFileKind::ParityMap, 1, 2);
     map.canonical_metadata_hash = Some([1; 32]);

@@ -766,6 +766,7 @@ service Catalog {
   // FINALIZING and detail carries that summary. The same idempotency key resumes
   // under the same operation id; retry and startup recovery publish RUNNING.
   rpc FinalizeTape     (FinalizeTapeRequest)      returns (TapeFinalization);
+  rpc CloseoutTape (CloseoutTapeRequest) returns (OperationRef);
   rpc SupersedeTail    (SupersedeTailRequest)     returns (SupersedeTailResponse);
   rpc GetTapeFinalization (GetTapeFinalizationRequest) returns (TapeFinalization);
 
@@ -2183,9 +2184,18 @@ message SupersedeTailRequest {
   bytes ack_tape_uuid = 2;
   optional string confirm_supersede = 3;
   repeated string expected_found = 4;
+  optional uint64 observed_tape_log_sequence = 5;
 }
 message SupersedeTailResponse {
   repeated string found = 1;
   string required_confirmation = 2;
   bool completed = 3;
+  uint64 tape_log_sequence = 4;
+}
+
+// Close the current uncovered parity range; an already protected tape is a no-op.
+message CloseoutTapeRequest {
+  bytes tape_uuid = 1;
+  optional string expected_pool_id = 2;
+  IdempotencyKey idempotency_key = 3;
 }

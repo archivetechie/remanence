@@ -54,7 +54,6 @@ pub(super) fn handle_drive_finalize_tape(
     drive: &mut DriveHandle,
     snapshot_misses: &mut u32,
     mounted: ManualFinalizeTapeMountRequest,
-    retained: &mut Option<super::checkpoint::RetainedParityEpoch>,
 ) -> Result<ManualFinalizeTapeActorReply, Status> {
     let ManualFinalizeTapeMountRequest {
         request,
@@ -65,30 +64,12 @@ pub(super) fn handle_drive_finalize_tape(
         drive_uuid,
         drive_serial,
     } = mounted;
-    let epoch = retained.take().filter(|e| {
-        !needs_drive_load
-            && e.selected.tape_uuid == request.tape_uuid
-            && e.identity_generation == drive.identity_generation()
-            && cfg.lifecycle.as_ref().is_some_and(|l| {
-                l.parked
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .by_drive
-                    .get(&crate::drive_pool::DriveKey::new(&library_serial, bay))
-                    .map_or(e.parked_generation == 0, |p| {
-                        p.generation == e.parked_generation
-                            && p.seated.tape_uuid == Some(request.tape_uuid)
-                    })
-            })
-    });
-    let carried = epoch.map(|e| (e.identity_generation, e.state, e.permit));
     finalize_mounted_tape(
         index,
         &cfg.terminal_config(),
         drive,
         &request,
         barcode.as_deref(),
-        carried,
         |index, drive| {
             session_open_short_probe_or_load(
                 index,
@@ -144,11 +125,6 @@ pub(crate) fn finalize_mounted_tape(
     drive: &mut DriveHandle,
     request: &ManualFinalizeTapeActorRequest,
     barcode: Option<&str>,
-    carried: Option<(
-        u64,
-        remanence_parity::ParitySinkSessionState,
-        crate::io_memory::IoMemoryPermit,
-    )>,
     prepare: impl FnOnce(&mut CatalogIndex, &mut DriveHandle) -> Result<(), Status>,
     finish: impl FnOnce(&mut CatalogIndex, &mut DriveHandle),
 ) -> Result<ManualFinalizeTapeActorReply, Status> {
@@ -233,10 +209,9 @@ pub(crate) fn finalize_mounted_tape(
     validate_manual_finalize_intent(request, accepted_intent)?;
     require_manual_finalize_preflight_binding(index, request)?;
     // Cold terminal recovery must reserve before readiness can issue drive commands.
-    let rebuild_permit = if carried.is_none()
-        && records
-            .last()
-            .is_some_and(|last| last.protected < last.total)
+    let rebuild_permit = if records
+        .last()
+        .is_some_and(|last| last.protected < last.total)
     {
         if let remanence_parity::ParityConfig::Scheme(scheme) = &request.parity_config {
             let journal = checkpoint_lease
@@ -284,12 +259,6 @@ pub(crate) fn finalize_mounted_tape(
         None
     };
     prepare(index, drive)?;
-    // Readiness can invalidate identity even when no load was requested.
-    let (carried, rebuild_permit) = carried
-        .filter(|(generation, _, _)| *generation == drive.identity_generation())
-        .map_or((None, rebuild_permit), |(_, state, permit)| {
-            (Some(state), Some(permit))
-        });
     let drive_config = drive
         .read_config()
         .map_err(|error| Status::unavailable(format!("read finalization drive config: {error}")))?;
@@ -348,7 +317,7 @@ pub(crate) fn finalize_mounted_tape(
             &selected,
             Some(request),
             rewritable,
-            carried,
+            None,
             rebuild_permit,
         ),
     };
@@ -601,6 +570,98 @@ pub(super) fn build_new_terminal_plan(
     Ok((intent, plan))
 }
 
+/// Decide a sealing session's immutable plan without issuing terminal media
+/// commands. Its live accumulator and reservation stay with the session until
+/// the reply and SessionEnded have been published.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn decide_live_finalization(
+    index: &mut CatalogIndex,
+    drive: &mut DriveHandle,
+    checkpoint: &mut remanence_state::TapeAuthorityLease,
+    previous: &remanence_state::authority::AuthorityCommit,
+    spec: &TerminalFinalizeSpec,
+    selected: &SelectedTape,
+    session: Option<&mut super::checkpoint::ParityActorSession>,
+    journal: Option<&mut dyn remanence_parity::authority::StructuralAuthority>,
+) -> Result<(), Status> {
+    let planned = if let Some(session) = session {
+        let mut journal = journal
+            .ok_or_else(|| Status::internal("sealing session has no structural authority"))?;
+        let state = session
+            .sink_state
+            .take()
+            .ok_or_else(|| Status::internal("sealing session has no accumulator"))?;
+        let mut raw = DriveHandleRawSink::new(drive);
+        let sink = remanence_parity::ParitySink::from_session_state(&mut raw, &mut journal, state)
+            .map_err(|e| status_from_parity_error(&e, e.to_string()))?;
+        let diagnostics = remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION"))
+            .capture()
+            .map_err(|e| status_from_parity_error(&e, e.to_string()))?;
+        let prefix = sink
+            .plan_terminal_index_close(diagnostics)
+            .map_err(|e| status_from_parity_error(&e, e.to_string()))?;
+        session.sink_state = Some(
+            sink.into_session_state()
+                .map_err(|e| status_from_parity_error(&e, e.to_string()))?,
+        );
+        let persisted = remanence_state::authority::AuthorityPrefixPlan::from(&prefix);
+        let mut source =
+            remanence_state::TerminalIndexSource::new_replay_backed_with_planned_terminal_prefix(
+                checkpoint, journal, &persisted,
+            )
+            .map_err(crate::status_from_state_error)?;
+        build_new_terminal_plan(
+            index,
+            selected,
+            spec,
+            previous,
+            &mut source,
+            TerminalPlanPosition {
+                first_tape_file_number: prefix.tail_start_tape_file_number,
+                first_start_lba: prefix.tail_start_lba,
+                terminal_prefix: Some(&prefix),
+            },
+        )?
+    } else {
+        let mut source =
+            remanence_state::TerminalIndexSource::new_replay_backed_no_parity(checkpoint)
+                .map_err(crate::status_from_state_error)?;
+        build_new_terminal_plan(
+            index,
+            selected,
+            spec,
+            previous,
+            &mut source,
+            TerminalPlanPosition {
+                first_tape_file_number: previous.next_file,
+                first_start_lba: previous.cursor.lba,
+                terminal_prefix: None,
+            },
+        )?
+    };
+    publish_terminal_intent(index, checkpoint, spec, &planned.0)
+}
+
+fn end_recovered_finalizing_session(
+    checkpoint: &mut remanence_state::TapeAuthorityLease,
+) -> Result<(), Status> {
+    let snapshot = checkpoint
+        .freeze()
+        .map_err(crate::status_from_state_error)?;
+    if let Some(open) = &snapshot.tape_summary().open_session {
+        checkpoint
+            .end_session(
+                open.session_id,
+                super::restore::now_rfc3339().map_err(|e| Status::internal(e.to_string()))?,
+                remanence_state::tape_log::SessionEndReason::CrashRecovered,
+                None,
+                std::iter::empty(),
+            )
+            .map_err(crate::status_from_state_error)?;
+    }
+    Ok(())
+}
+
 pub(super) fn publish_terminal_intent(
     index: &mut CatalogIndex,
     checkpoint: &mut remanence_state::TapeAuthorityLease,
@@ -748,6 +809,35 @@ pub(crate) fn preflight_manual_finalize_cancellable(
             .map_err(crate::status_from_state_error)?;
         (lease, None)
     };
+
+    let snapshot = checkpoint
+        .freeze()
+        .map_err(crate::status_from_state_error)?;
+    let summary = snapshot.tape_summary();
+    if summary.closeout_due() {
+        let unprovable = summary.provenance
+            != remanence_state::tape_log::CheckProvenance::OriginalWrite
+            || index
+                .tape_io_admission_conflicts(&request.tape_uuid, barcode)
+                .map_err(crate::status_from_state_error)?
+                .iter()
+                .any(|f| {
+                    matches!(
+                        f.reason.as_str(),
+                        "CloseoutCheckMismatch"
+                            | "CloseoutReadContradiction"
+                            | "SessionSuffixContradiction"
+                    )
+                });
+        if unprovable {
+            return Err(Status::failed_precondition(format!("CloseoutUnprotectedFinalizationUnavailable: tape {} remains at W={}, T={}; operator acceptance of unprotected finalization is not implemented in this migration step.", Uuid::from_bytes(request.tape_uuid), summary.protected, summary.total)));
+        }
+        return Err(Status::failed_precondition(
+            summary
+                .closeout_required("finalization")
+                .expect("due closeout"),
+        ));
+    }
 
     #[cfg(test)]
     PREFLIGHT_LEASE_HOOK.with(|hook| {
@@ -1444,6 +1534,7 @@ pub(super) fn finalize_terminal_no_parity(
             &plan,
             None,
         )?;
+        end_recovered_finalizing_session(checkpoint)?;
         drop(source);
         return complete_terminal_finalization_host_only(
             index,
@@ -1774,6 +1865,7 @@ pub(super) fn finalize_terminal_with_parity_journal(
             &plan,
             Some(&prefix),
         )?;
+        end_recovered_finalizing_session(checkpoint)?;
         drop(source);
         return complete_terminal_finalization_host_only(
             index,
@@ -1821,7 +1913,14 @@ pub(super) fn finalize_terminal_with_parity_journal(
             })?;
     }
 
-    let prefix_evidence = {
+    let named_tail = if prefix_already_journaled {
+        None
+    } else {
+        admit_ended_tail_for_terminal(checkpoint, drive, selected, prefix.start_lba)?
+    };
+    let prefix_evidence = if named_tail.is_some() {
+        TerminalPrefixReconcileEvidence::TornRewritable
+    } else {
         let mut raw = DriveHandleRawSource::new(drive);
         reconcile_terminal_prefix(
             &mut raw,
@@ -1845,7 +1944,9 @@ pub(super) fn finalize_terminal_with_parity_journal(
         // A complete, unpublished prefix is adopted without rewriting, but its
         // zero-count barrier is still a media write at `tail_start_lba`, where
         // reconciliation left the cursor. The admission ends with this block.
-        let _admission = if matches!(
+        let _admission = if named_tail.is_some() {
+            named_tail
+        } else if matches!(
             prefix_evidence,
             TerminalPrefixReconcileEvidence::Absent
                 | TerminalPrefixReconcileEvidence::TornRewritable
@@ -1864,6 +1965,9 @@ pub(super) fn finalize_terminal_with_parity_journal(
         } else {
             None
         };
+        if _admission.is_some() {
+            end_recovered_finalizing_session(checkpoint)?;
+        }
         let dispatches_before = drive.media_write_dispatch_count();
         let mut raw_write_attempted = false;
         let close_result = {
@@ -2146,7 +2250,19 @@ pub(super) fn finish_terminal_tail(
         reconciliation: None,
         durable_projection_pending: false,
     };
-    let mut admission = None;
+    let mut admission = if prefix_plan.is_none()
+        && parity_progress_from_state(authority.intent.progress).next_component_index() == Some(0)
+    {
+        admit_ended_tail_for_terminal(
+            authority.checkpoint,
+            drive,
+            selected,
+            plan.edition.descriptor.terminal_layout.components[0].planned_start_lba,
+        )?
+    } else {
+        None
+    };
+    let mut overwrite_named_tail = admission.is_some();
     loop {
         let progress = parity_progress_from_state(authority.intent.progress);
         let Some(component_index) = progress.next_component_index() else {
@@ -2158,7 +2274,9 @@ pub(super) fn finish_terminal_tail(
             .checked_add(component.record_count)
             .and_then(|lba| lba.checked_add(1))
             .ok_or_else(|| Status::failed_precondition("terminal cursor overflow"))?;
-        let evidence = {
+        let evidence = if std::mem::take(&mut overwrite_named_tail) {
+            remanence_parity::TerminalComponentReconcileEvidence::TornRewritable
+        } else {
             let mut raw = DriveHandleRawSource::new(drive);
             reconcile_terminal_tail_next(&mut raw, &plan, progress, rewritable)
         };
@@ -2182,6 +2300,7 @@ pub(super) fn finish_terminal_tail(
                 &plan,
                 prefix_plan.as_ref(),
             )?);
+            end_recovered_finalizing_session(authority.checkpoint)?;
         }
         if admission.is_some()
             && matches!(
@@ -2680,6 +2799,48 @@ const fn manual_finalize_progress_name(
     }
 }
 
+/// A durable named ending also authorizes replacement by a newly accepted
+/// terminal plan. Try its exact suffix before interpreting bytes as a partially
+/// written plan; an open crash owner never takes this alternative.
+fn admit_ended_tail_for_terminal(
+    checkpoint: &remanence_state::TapeAuthorityLease,
+    drive: &mut DriveHandle,
+    selected: &SelectedTape,
+    first_lba: u64,
+) -> Result<Option<crate::append_admission::AppendAdmission>, Status> {
+    let snapshot = checkpoint
+        .freeze()
+        .map_err(crate::status_from_state_error)?;
+    let summary = snapshot.tape_summary();
+    if summary.open_session.is_some()
+        || summary.cursor.lba != first_lba
+        || summary
+            .last_session_end
+            .as_ref()
+            .is_none_or(|end| end.tail_file_count == 0 || end.cursor.lba != first_lba)
+    {
+        return Ok(None);
+    }
+    let ctx = crate::append_admission::context(
+        selected.tape_uuid,
+        selected.block_size,
+        summary.cursor.partition,
+        summary.cursor.lba,
+    );
+    match crate::append_admission::admit_append_boundary(
+        drive,
+        crate::append_admission::AppendAuthority::Session {
+            snapshot: &snapshot,
+            closeout: None,
+        },
+        ctx,
+    ) {
+        Ok(admission) => Ok(Some(admission)),
+        Err(crate::append_admission::AdmissionError::SessionSuffixContradiction { .. }) => Ok(None),
+        Err(error) => Err(Status::failed_precondition(error.to_string())),
+    }
+}
+
 /// Preserve the terminal reconciler's position while checking the entire suffix
 /// for complete foreign objects before its first destructive operation.
 #[allow(clippy::too_many_arguments)]
@@ -2796,292 +2957,6 @@ pub(super) fn terminal_epoch_state(
     sink.into_session_state()
         .map(Some)
         .map_err(|e| status_from_parity_error(&e, e.to_string()))
-}
-
-/// Plan an open epoch's terminal sidecar without writing media or either journal.
-/// Loading and calibration use the finalization drive preparation policy.
-pub(crate) fn plan_unretained_epoch_finalization(
-    index: &mut CatalogIndex,
-    cfg: &super::terminal_types::TerminalWriteConfig,
-    drive: &mut DriveHandle,
-    request: &ManualFinalizeTapeActorRequest,
-    ready: impl FnOnce(&mut CatalogIndex, &mut DriveHandle) -> Result<(), Status>,
-) -> Result<
-    (
-        TerminalPrefixPlan,
-        Option<remanence_parity::ParitySinkSessionState>,
-        Option<crate::io_memory::IoMemoryPermit>,
-    ),
-    Status,
-> {
-    validate_manual_finalize_owned_request(index, request)?;
-    let tape = index
-        .get_tape(&request.tape_uuid)
-        .map_err(crate::status_from_state_error)?
-        .ok_or_else(|| Status::not_found("tape not found"))?;
-    session_open_reject_tape_io_fences(
-        index,
-        &request.tape_uuid,
-        tape.voltag.as_deref(),
-        "plan finalization",
-    )?;
-    let checkpoint = remanence_state::TapeAuthority::open(
-        &cfg.checkpoint_journal_dir,
-        request.tape_uuid,
-        index.path(),
-    )
-    .map_err(crate::status_from_state_error)?;
-    let lease = checkpoint
-        .acquire_exclusive()
-        .map_err(crate::status_from_state_error)?;
-    project_checkpoint_authority_bounded(index, &lease).map_err(crate::status_from_state_error)?;
-    let scheme = match &request.parity_config {
-        remanence_parity::ParityConfig::Scheme(scheme) => scheme.clone(),
-        _ => return Err(Status::internal("open epoch requires parity")),
-    };
-    let mut journal = lease
-        .open_structural(request.block_size, scheme.clone())
-        .map_err(|e| Status::failed_precondition(format!("open parity journal: {e}")))?;
-    remanence_state::TerminalIndexSource::new_replay_backed(&lease, &journal)
-        .map_err(crate::status_from_state_error)?;
-    let snapshot = journal
-        .freeze()
-        .map_err(|e| Status::failed_precondition(format!("freeze parity journal: {e}")))?;
-    let summary = remanence_parity::checked_bounded_resume_summary(&snapshot)
-        .map_err(|e| status_from_parity_error(&e, e.to_string()))?;
-    let mut rebuild_permit = Some(super::checkpoint::reserve_closeout_memory(
-        cfg,
-        &scheme,
-        request.block_size,
-        summary.open_epoch_object_extents.len(),
-        request.tape_uuid,
-    )?);
-    let previous = lease
-        .latest_commit()
-        .map_err(crate::status_from_state_error)?
-        .ok_or_else(|| Status::failed_precondition("terminal rebuild lacks a durable commit"))?;
-    ready(index, drive)?;
-    prepare_drive_for_write(
-        drive,
-        &request.tape_uuid,
-        request.block_size,
-        request.candidate_operation_id,
-        WriteMediaPolicy::TerminalAppend,
-    )?;
-    let selected = SelectedTape {
-        standalone_endpoint: cfg.mounted_endpoint.clone().or_else(|| {
-            drive
-                .endpoint()
-                .durable_key()
-                .filter(|key| matches!(key, remanence_library::DriveKey::Standalone { .. }))
-                .cloned()
-        }),
-        tape_uuid: request.tape_uuid,
-        block_size: request.block_size,
-        parity_config: request.parity_config.clone(),
-        pool_id: request
-            .expected_pool_id
-            .clone()
-            .unwrap_or_else(|| "(unpooled)".into()),
-    };
-    let state = terminal_epoch_state(
-        index,
-        cfg,
-        drive,
-        &mut journal,
-        &snapshot,
-        &selected,
-        None,
-        &previous,
-        &mut rebuild_permit,
-    )?;
-    let diagnostics = remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION"))
-        .capture()
-        .map_err(|e| status_from_parity_error(&e, e.to_string()))?;
-    if let Some(state) = state {
-        let mut raw = DriveHandleRawSink::new(drive);
-        let sink = remanence_parity::ParitySink::from_session_state(&mut raw, &mut journal, state)
-            .map_err(|e| status_from_parity_error(&e, e.to_string()))?;
-        let plan = sink
-            .plan_terminal_index_close(diagnostics)
-            .map_err(|e| status_from_parity_error(&e, e.to_string()))?;
-        let state = sink
-            .into_session_state()
-            .map_err(|e| status_from_parity_error(&e, e.to_string()))?;
-        Ok((plan, Some(state), rebuild_permit))
-    } else {
-        remanence_parity::plan_checkpointed_terminal_index_close(&snapshot, diagnostics)
-            .map(|plan| (plan, None, None))
-            .map_err(|e| status_from_parity_error(&e, e.to_string()))
-    }
-}
-
-/// Plan from a seated accumulator when its ownership and journal keys match.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn plan_mounted_epoch_finalization(
-    index: &mut CatalogIndex,
-    cfg: &WriteOwnerConfig,
-    drive: &mut DriveHandle,
-    bay: u16,
-    request: &ManualFinalizeTapeActorRequest,
-    needs_drive_load: bool,
-    retained: &mut Option<super::checkpoint::RetainedParityEpoch>,
-    ready: impl FnOnce(&mut CatalogIndex, &mut DriveHandle) -> Result<(), Status>,
-) -> Result<TerminalPrefixPlan, Status> {
-    validate_manual_finalize_owned_request(index, request)?;
-    let tape = index
-        .get_tape(&request.tape_uuid)
-        .map_err(crate::status_from_state_error)?
-        .ok_or_else(|| Status::not_found("tape not found"))?;
-    session_open_reject_tape_io_fences(
-        index,
-        &request.tape_uuid,
-        tape.voltag.as_deref(),
-        "finalize tape",
-    )?;
-    let checkpoint = remanence_state::TapeAuthority::open(
-        &cfg.checkpoint_journal_dir,
-        request.tape_uuid,
-        index.path(),
-    )
-    .map_err(crate::status_from_state_error)?;
-    let mut lease = checkpoint
-        .acquire_exclusive()
-        .map_err(crate::status_from_state_error)?;
-    let records = project_checkpoint_authority_bounded(index, &lease)
-        .map_err(crate::status_from_state_error)?;
-    let selected = SelectedTape {
-        standalone_endpoint: None,
-        tape_uuid: request.tape_uuid,
-        block_size: request.block_size,
-        parity_config: request.parity_config.clone(),
-        pool_id: request
-            .expected_pool_id
-            .clone()
-            .unwrap_or_else(|| "(unpooled)".into()),
-    };
-    let authority =
-        super::checkpoint::validate_parity_actor_authority(cfg, &selected, &mut lease, &records)?;
-    let previous = lease
-        .latest_commit()
-        .map_err(crate::status_from_state_error)?
-        .ok_or_else(|| Status::failed_precondition("terminal rebuild lacks a durable commit"))?;
-    let mut journal = lease
-        .structural_mut()
-        .ok_or_else(|| Status::internal("missing validated structural capability"))?;
-    let epoch = retained.take().filter(|e| {
-        e.selected.tape_uuid == selected.tape_uuid
-            && e.identity_generation == drive.identity_generation()
-            && e.state.matches_committed_summary(&authority.summary)
-            && cfg.lifecycle.as_ref().is_some_and(|l| {
-                l.parked
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .by_drive
-                    .get(&crate::drive_pool::DriveKey::new(
-                        &cfg.library().serial,
-                        bay,
-                    ))
-                    .map_or(e.parked_generation == 0, |p| {
-                        p.generation == e.parked_generation
-                    })
-            })
-    });
-    let (carried, owner) = if let Some(e) = epoch {
-        (Some(e.state), (e.permit, e.parked_generation))
-    } else {
-        let permit = super::checkpoint::reserve_closeout_memory(
-            cfg,
-            &authority.scheme,
-            selected.block_size,
-            authority.summary.open_epoch_object_extents.len(),
-            selected.tape_uuid,
-        )?;
-        let generation = cfg
-            .lifecycle
-            .as_ref()
-            .and_then(|l| {
-                l.parked
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .by_drive
-                    .get(&crate::drive_pool::DriveKey::new(
-                        &cfg.library().serial,
-                        bay,
-                    ))
-                    .map(|p| p.generation)
-            })
-            .unwrap_or(0);
-        (None, (permit, generation))
-    };
-    let prior_identity = drive.identity_generation();
-    let mut rebuild_permit = Some(owner.0);
-    ready(index, drive)?;
-    prepare_drive_for_write(
-        drive,
-        &request.tape_uuid,
-        request.block_size,
-        request.candidate_operation_id,
-        WriteMediaPolicy::TerminalAppend,
-    )?;
-    if needs_drive_load {
-        run_load_calibration_harvest(
-            index,
-            drive,
-            cfg,
-            &request.tape_uuid,
-            tape.voltag.as_deref(),
-        );
-    }
-    let carried = if prior_identity == drive.identity_generation() {
-        carried
-    } else {
-        drop(carried);
-        // A reset invalidated the old carrier. Release its possibly smaller
-        // live-write permit before reserving the rebuild's entire working set.
-        rebuild_permit = None;
-        None
-    };
-    let state = terminal_epoch_state(
-        index,
-        cfg,
-        drive,
-        journal,
-        &authority.snapshot,
-        &selected,
-        carried,
-        &previous,
-        &mut rebuild_permit,
-    )?;
-    let diagnostics = remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION"))
-        .capture()
-        .map_err(|e| status_from_parity_error(&e, e.to_string()))?;
-    if let Some(state) = state {
-        let mut raw = DriveHandleRawSink::new(drive);
-        let sink = remanence_parity::ParitySink::from_session_state(&mut raw, &mut journal, state)
-            .map_err(|e| status_from_parity_error(&e, e.to_string()))?;
-        let plan = sink
-            .plan_terminal_index_close(diagnostics)
-            .map_err(|e| status_from_parity_error(&e, e.to_string()))?;
-        let state = sink
-            .into_session_state()
-            .map_err(|e| status_from_parity_error(&e, e.to_string()))?;
-        let permit = rebuild_permit.take().expect("terminal epoch owns a permit");
-        let parked_generation = owner.1;
-        {
-            *retained = Some(super::checkpoint::RetainedParityEpoch {
-                state,
-                permit,
-                selected,
-                parked_generation,
-                identity_generation: drive.identity_generation(),
-            });
-        }
-        Ok(plan)
-    } else {
-        remanence_parity::plan_checkpointed_terminal_index_close(&authority.snapshot, diagnostics)
-            .map_err(|e| status_from_parity_error(&e, e.to_string()))
-    }
 }
 
 /// Fence a dirty terminal prefix before attempting fallible recovery persistence.

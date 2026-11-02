@@ -1030,7 +1030,7 @@ fn release_fences(rig: &Rig) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn failed_append_and_fence_leave_other_library_usable() {
+async fn failed_append_durable_end_leaves_both_libraries_usable() {
     let rig = Rig::new(2);
     let first = rig.open(0).await;
     *rig.controls[0].fail_write.lock().unwrap() = true;
@@ -1059,14 +1059,14 @@ async fn failed_append_and_fence_leave_other_library_usable() {
     );
     rig.abort(&first).await;
     rig.assert_released().await;
-    let before = rig.worlds[0].lock().unwrap().command_log.clone();
-    let refused = open(&rig.api, 0).await.unwrap_err();
-    assert_eq!(refused.code(), Code::FailedPrecondition);
+    assert!(CatalogIndex::open(&rig.config.index.sqlite_path)
+        .unwrap()
+        .list_active_tape_io_fences()
+        .unwrap()
+        .is_empty());
     let second = rig.open(1).await;
     append(&rig.api, &second, "unaffected").await.unwrap();
     rig.close(&second).await;
-    assert_eq!(rig.worlds[0].lock().unwrap().command_log, before);
-    release_fences(&rig);
     let next = rig.open(0).await;
     rig.close(&next).await;
     rig.finish().await;

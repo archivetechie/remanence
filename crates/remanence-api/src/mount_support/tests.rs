@@ -379,7 +379,7 @@ fn crash_after_session_open_allows_read_mount_but_refuses_writes() {
     );
 }
 #[test]
-fn uncertain_write_cut_is_durably_fenced_even_after_an_earlier_checkpoint() {
+fn uncertain_write_cut_records_a_live_end_and_preserves_prior_checkpoint() {
     let root = tempfile::tempdir().unwrap();
     let mut state = state(root.path());
     let world = world();
@@ -398,38 +398,23 @@ fn uncertain_write_cut_is_durably_fenced_even_after_an_earlier_checkpoint() {
     assert!(fault.lock().unwrap().is_none(), "the write cut was reached");
     let _ = actor.finish();
     let mut state = reopen_state();
-    assert!(!state
+    assert!(state
         .catalog_index()
         .list_active_tape_io_fences()
         .unwrap()
         .is_empty());
-    let audit_dir = state.paths().audit_dir.clone();
-    crate::tests::assert_fences_survive_empty_rebuild(state.catalog_index(), &audit_dir);
-    let records = remanence_state::FileAuditLog::replay(&state.paths().audit_dir).unwrap();
-    let mut rebuilt = CatalogIndex::open(root.path().join("rebuilt.sqlite")).unwrap();
-    rebuilt.replay_audit_records(&records).unwrap();
-    let fences = rebuilt.list_active_tape_io_fences().unwrap();
-    assert!(
-        fences.iter().any(|f| f.endpoint
-            == Some(remanence_library::DriveKey::Standalone {
-                drive_serial: SERIAL.into(),
-            })),
-        "audit replay must preserve the standalone fence identity"
-    );
     let mut reopened = backend(&mut state, &world, &lock, self::fault()).unwrap();
     let mounted = reopened.mount(target()).unwrap();
     let (mut actor, reopen_state) = own_mount!(reopened, mounted, state);
-    let error = actor
+    actor
         .write_checkpointed(request(root.path(), "third"))
-        .unwrap_err();
-    assert!(
-        matches!(error, MountError::Actor(ref failure) if failure.status.code() == tonic::Code::FailedPrecondition && failure.status.message().contains("fence")),
-        "{error}"
+        .unwrap();
+    actor.finish().unwrap();
+    let mut state = reopen_state();
+    assert_eq!(
+        state.catalog_index().list_native_objects().unwrap().len(),
+        2
     );
-    let finish_error = actor.finish().unwrap_err();
-    assert_eq!(finish_error.status.code(), tonic::Code::FailedPrecondition);
-    assert!(finish_error.status.message().contains("fence"));
-    drop(reopen_state());
 }
 /// A terminal component whose log record is durable but whose SQLite
 /// projection fails reports the replay retry, and the same request resumes.
@@ -916,18 +901,25 @@ fn automatic_terminal_close_reproves_after_checkpoint_publication() {
         .unwrap();
         let mounted = backend.mount(target()).unwrap();
         let (mut actor, reopen_state) = own_mount!(backend, mounted, state);
-        let error = actor
+        let receipt = actor
             .write_checkpointed(request(root.path(), "boundary"))
-            .unwrap_err();
-        assert!(*seen.lock().unwrap(), "boundary not exercised: {error}");
+            .unwrap();
+        assert!(!receipt.object.object_id.is_empty());
         let _ = actor.finish();
+        assert!(
+            *seen.lock().unwrap(),
+            "post-reply readiness boundary exercised"
+        );
         assert!(checkpoint
-            .acquire_exclusive()
+            .acquire_exclusive_for_terminal_recovery()
             .unwrap()
             .last_record_bounded()
             .unwrap()
             .is_some());
-        assert!(checkpoint.terminal_finalization_intent().unwrap().is_none());
+        assert!(
+            checkpoint.terminal_finalization_intent().unwrap().is_some(),
+            "decision precedes the object reply and media readiness"
+        );
         if !ua {
             assert_eq!(
                 world.lock().unwrap().tapes["SWAPPED"].written_bytes,
@@ -1358,6 +1350,7 @@ fn library_automatic_sealing_releases_owned_removal_guard() {
                 assert!(result.is_err());
             } else {
                 result.unwrap();
+                actor.close_session().unwrap();
                 assert_eq!(
                     actor
                         .catalog_index()
@@ -1572,6 +1565,21 @@ macro_rules! append_for_rollback {
         result
     }};
 }
+/// Restore an actual crash cut: the previous closed boundary plus a new unended owner.
+fn open_crash_fixture(state: &StateHandle) {
+    let authority = remanence_state::TapeAuthority::open(
+        state.paths().journal_dir.join("tapes"),
+        UUID,
+        &state.paths().sqlite_path,
+    )
+    .unwrap();
+    authority
+        .acquire_exclusive()
+        .unwrap()
+        .open_session([0xc7; 16], "2026-11-02T00:00:00Z".into())
+        .unwrap();
+}
+
 fn dispatched_writes(world: &SharedVirtualWorld) -> usize {
     world
         .lock()
@@ -1660,11 +1668,16 @@ async fn standalone_and_daemon_state_rollback_refuses_checkpoint_and_fresh_with_
                 };
 
                 assert!(
-                    error.contains("TailBeyondKnownState"),
+                    error.contains(if fresh {
+                        "TailBeyondKnownState"
+                    } else {
+                        "SessionSuffixContradiction"
+                    }),
                     "parity={parity_on} fresh={fresh}: {error}"
                 );
                 assert!(
-                    error.contains(&uuid::Uuid::from_bytes(b.object.object_id).to_string()),
+                    !fresh
+                        || error.contains(&uuid::Uuid::from_bytes(b.object.object_id).to_string()),
                     "{error}"
                 );
                 assert_eq!(dispatched_writes(&world), before);
@@ -1715,6 +1728,7 @@ fn complete_uncheckpointed_tail_requires_confirmation_and_records_discarded_ids(
             std::fs::remove_dir_all(&dir).unwrap();
             copy_closed_state(&backup, &dir);
             let mut state = configured_state(&dir, false);
+            open_crash_fixture(&state);
             let before = dispatched_writes(&world);
             assert!(append_for_rollback!(&mut state, &world, root.path(), "C")
                 .unwrap_err()
@@ -1863,6 +1877,7 @@ fn torn_object_after_rollback_is_superseded_with_both_parity_modes() {
         std::fs::remove_dir_all(&dir).unwrap();
         copy_closed_state(&backup, &dir);
         let mut state = configured_state(&dir, true);
+        open_crash_fixture(&state);
         append_for_rollback!(&mut state, &world, root.path(), "C").unwrap();
     }
 }
@@ -1912,6 +1927,7 @@ fn encrypted_complete_tail_is_preserved_without_a_private_key_and_past_empty_fil
     std::fs::remove_dir_all(&dir).unwrap();
     copy_closed_state(&backup, &dir);
     let mut state = configured_state(&dir, true);
+    open_crash_fixture(&state);
     let before = dispatched_writes(&world);
     let error = append_for_rollback!(&mut state, &world, root.path(), "C")
         .unwrap_err()
@@ -2295,7 +2311,7 @@ async fn committed_barrier_context_failures_preserve_receipts() {
             let parity = rollback_parity(false);
             let world = world();
             set_rollback_bootstrap(&world, parity.clone());
-            let state = state_with_parity(root.path(), true, parity.clone());
+            let mut state = state_with_parity(root.path(), true, parity.clone());
             crate::write_owner::tests::check_context_failure_receipts(
                 &state,
                 world,
@@ -2310,569 +2326,9 @@ async fn committed_barrier_context_failures_preserve_receipts() {
                 deliver_on_close,
             )
             .await;
+            crate::write_owner::tests::assert_rebuild_safety_equivalent(&mut state);
         }
     }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn seated_parity_sessions_close_before_unload_but_shutdown_leaves_seated() {
-    use crate::write_owner::tests::RetentionInvalidation::{
-        AutomaticSeal, Discarded, Disconnected, ExpectedEnd, Fenced, Finalize, FinalizeRebuilt,
-        IdentityGeneration, JournalFailure, NoHomeSlot, NoWriteShutdown, None as Unchanged,
-        OtherDrive, ParkedGeneration, PositionFailure, ProjectionBusy, SealDue, ShutdownSealDue,
-        ShutdownSealDueBusy, WriteFailure,
-    };
-    for (refuse_memory, shutdown, read_before_shutdown, invalidation, failed_close) in [
-        (false, false, false, Unchanged, false),
-        (false, false, false, NoHomeSlot, false),
-        (false, true, false, Unchanged, false),
-        (true, false, false, Unchanged, false),
-        (false, true, true, Unchanged, false),
-        (false, true, true, OtherDrive, false),
-        (false, false, false, ParkedGeneration, false),
-        (false, false, false, IdentityGeneration, false),
-        (false, false, false, ExpectedEnd, false),
-        (false, false, false, Unchanged, true),
-        (false, false, false, Discarded, false),
-        (false, false, false, Fenced, false),
-        (false, false, false, WriteFailure, false),
-        (false, false, false, PositionFailure, false),
-        (false, false, false, JournalFailure, false),
-        (false, true, false, NoWriteShutdown, false),
-        (false, false, false, Finalize, false),
-        (false, false, false, FinalizeRebuilt, false),
-        (false, false, false, SealDue, false),
-        (false, true, false, ShutdownSealDue, false),
-        (false, false, false, Disconnected, false),
-        (false, false, false, AutomaticSeal, false),
-        (false, false, false, ShutdownSealDueBusy, false),
-        (false, false, false, ProjectionBusy(false, "startup"), false),
-        (false, false, false, ProjectionBusy(true, "startup"), false),
-    ] {
-        // A failed close is also driven through removal preparation, which reports it.
-        let prepares: &[bool] = if failed_close {
-            &[false, true]
-        } else {
-            &[false]
-        };
-        for &prepare_removal in prepares {
-            let root = tempfile::tempdir().unwrap();
-            let parity = crate::ParityConfig::Scheme(remanence_parity::ParityScheme {
-                id: remanence_parity::SchemeId::new_static("seated"),
-                data_blocks_per_stripe: 128,
-                parity_blocks_per_stripe: 1,
-                stripes_per_neighborhood: 1,
-            });
-            let world = world();
-            set_rollback_bootstrap(&world, parity.clone());
-            let mut state = state_with_parity(root.path(), true, parity.clone());
-            crate::write_owner::tests::check_seated_parity_sessions(
-                &mut state,
-                world,
-                crate::SelectedTape {
-                    standalone_endpoint: None,
-                    pool_id: "default".into(),
-                    tape_uuid: UUID,
-                    block_size: BLOCK,
-                    parity_config: parity,
-                },
-                refuse_memory,
-                shutdown,
-                read_before_shutdown,
-                invalidation,
-                failed_close,
-                prepare_removal,
-            )
-            .await;
-        }
-    }
-}
-
-/// Removal keeps newly fenced cartridges seated and releases unfenced cartridges.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn epoch_removal_admission_failure_matrix() {
-    const CHILD: &str = "REMOVAL_MATRIX_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "mount_support::tests::epoch_removal_admission_failure_matrix",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
-    let logs = tempfile::tempdir().unwrap();
-    let log_path = logs.path().join("removal.log");
-    tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_max_level(tracing::Level::INFO)
-        .with_writer(std::fs::File::create(&log_path).unwrap())
-        .try_init()
-        .unwrap();
-
-    let requested_case = std::env::var("REMOVAL_MATRIX_CASE").ok();
-    let mut exercised = 0;
-    for case in [
-        "replay_failure",
-        "journal_corrupt",
-        "open_tail_catalog_read",
-        "suffix_medium",
-        "suffix_scan_medium",
-        "open_admission_blank",
-        "open_admission_medium",
-        "open_admission_unit_attention",
-        "open_admission_not_ready",
-        "open_admission_timeout",
-        "unit_attention",
-        "timeout",
-        "not_ready",
-        "transport",
-        "position_read",
-        "wrong_length",
-        "hardware_44",
-        "hardware_15",
-        "bot_filemark",
-        "bot_blank",
-        "bot_medium",
-        "bot_oversized",
-        "bot_transport",
-        "admission_filemark",
-        "admission_medium",
-        "admission_transport",
-        "admission_unit_attention",
-        "admission_not_ready",
-        "open_unit_attention",
-        "open_timeout",
-        "filemark",
-        "eod",
-        "blank_locate",
-        "absent_bootstrap",
-        "projection_busy",
-        "success",
-        "retired",
-        "sealed",
-        "finalizing",
-        "ingested",
-        "foreign",
-        "no_pool",
-        "pending",
-        "lease",
-        "finalize_lease",
-        "mode_sense",
-        "catalog_read",
-        "post_projection",
-        "summary_mismatch",
-        "tail",
-        "identity",
-        "read",
-        "medium",
-        "open_read",
-        "open_medium",
-        "missing_checkpoint",
-        "barcode_fence",
-        "late_barcode_fence",
-        "write_protected",
-    ] {
-        if requested_case
-            .as_deref()
-            .is_some_and(|requested| requested != case)
-        {
-            continue;
-        }
-        exercised += 1;
-        for path in ["idle", "eviction", "operator", "shutdown"] {
-            if matches!(
-                case,
-                "unit_attention"
-                    | "timeout"
-                    | "not_ready"
-                    | "transport"
-                    | "position_read"
-                    | "wrong_length"
-                    | "hardware_44"
-                    | "hardware_15"
-                    | "bot_filemark"
-                    | "bot_blank"
-                    | "bot_medium"
-                    | "bot_oversized"
-                    | "bot_transport"
-                    | "admission_filemark"
-                    | "admission_medium"
-                    | "admission_transport"
-                    | "admission_unit_attention"
-                    | "admission_not_ready"
-                    | "open_unit_attention"
-                    | "open_timeout"
-                    | "filemark"
-                    | "eod"
-                    | "blank_locate"
-                    | "absent_bootstrap"
-                    | "projection_busy"
-                    | "success"
-            ) && !matches!(path, "idle" | "operator")
-            {
-                continue;
-            }
-            if (case == "summary_mismatch" && path != "shutdown")
-                || (case == "finalize_lease" && path != "eviction")
-            {
-                continue;
-            }
-            let log_start = std::fs::metadata(&log_path).unwrap().len() as usize;
-            let root = tempfile::tempdir().unwrap();
-            let parity = crate::ParityConfig::Scheme(remanence_parity::ParityScheme {
-                id: remanence_parity::SchemeId::new_static("seated"),
-                data_blocks_per_stripe: 4,
-                parity_blocks_per_stripe: 2,
-                stripes_per_neighborhood: 32,
-            });
-            let world = world();
-            set_rollback_bootstrap(&world, parity.clone());
-            let mut state = state_with_parity(root.path(), true, parity.clone());
-            crate::write_owner::tests::check_seated_parity_sessions(
-                &mut state,
-                world,
-                crate::SelectedTape {
-                    standalone_endpoint: None,
-                    pool_id: "default".into(),
-                    tape_uuid: UUID,
-                    block_size: BLOCK,
-                    parity_config: parity,
-                },
-                false,
-                false,
-                false,
-                crate::write_owner::tests::RetentionInvalidation::Removal(case, path),
-                false,
-                false,
-            )
-            .await;
-            let log = std::fs::read_to_string(&log_path).unwrap();
-            let log = &log[log_start..];
-            let expected = if path == "shutdown" {
-                // Shutdown does not enter removal or its epoch-close diagnostics.
-                ""
-            } else if matches!(
-                case,
-                "replay_failure" | "journal_corrupt" | "lease" | "finalize_lease" | "catalog_read"
-            ) {
-                "epoch_projection_failed"
-            } else if matches!(case, "open_admission_blank" | "open_admission_medium") {
-                "fenced removal leaves the epoch open"
-            } else if matches!(
-                case,
-                "suffix_medium"
-                    | "suffix_scan_medium"
-                    | "open_admission_unit_attention"
-                    | "open_admission_not_ready"
-                    | "open_admission_timeout"
-            ) {
-                "epoch_left_open"
-            } else if case == "success" {
-                ""
-            } else if matches!(case, "post_projection" | "projection_busy") {
-                "durable epoch close follow-up fails"
-            } else if matches!(
-                case,
-                "mode_sense"
-                    | "summary_mismatch"
-                    | "unit_attention"
-                    | "timeout"
-                    | "not_ready"
-                    | "transport"
-                    | "position_read"
-                    | "wrong_length"
-                    | "hardware_44"
-                    | "hardware_15"
-                    | "bot_filemark"
-                    | "bot_blank"
-                    | "bot_medium"
-                    | "bot_oversized"
-                    | "bot_transport"
-                    | "admission_filemark"
-                    | "admission_medium"
-                    | "admission_transport"
-                    | "admission_unit_attention"
-                    | "admission_not_ready"
-                    | "open_unit_attention"
-                    | "open_timeout"
-                    | "filemark"
-                    | "eod"
-                    | "blank_locate"
-                    | "absent_bootstrap"
-            ) {
-                "epoch_left_open"
-            } else if matches!(
-                case,
-                "tail" | "identity" | "read" | "medium" | "late_barcode_fence"
-            ) {
-                "epoch close fails before removal"
-            } else if matches!(case, "barcode_fence" | "open_read" | "open_medium") {
-                "fenced removal leaves the epoch open"
-            } else {
-                "epoch close skipped"
-            };
-            assert!(
-                log.contains(expected),
-                "{case} through {path}: missing {expected}: {log}"
-            );
-        }
-    }
-    assert!(exercised > 0, "requested removal case does not exist");
-}
-
-/// Removal replays a durable session close without writing a second checkpoint.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn durable_session_close_survives_removal_after_projection_busy() {
-    let requested = std::env::var("SESSION_PROJECTION_PATH").ok();
-    let mut exercised = 0;
-    for path in ["idle", "eviction", "shutdown"] {
-        if requested
-            .as_deref()
-            .is_some_and(|requested| requested != path)
-        {
-            continue;
-        }
-        exercised += 1;
-        let root = tempfile::tempdir().unwrap();
-        let parity = crate::ParityConfig::Scheme(remanence_parity::ParityScheme {
-            id: remanence_parity::SchemeId::new_static("seated"),
-            data_blocks_per_stripe: 4,
-            parity_blocks_per_stripe: 2,
-            stripes_per_neighborhood: 32,
-        });
-        let world = world();
-        set_rollback_bootstrap(&world, parity.clone());
-        let mut state = state_with_parity(root.path(), true, parity.clone());
-        crate::write_owner::tests::check_seated_parity_sessions(
-            &mut state,
-            world,
-            crate::SelectedTape {
-                standalone_endpoint: None,
-                pool_id: "default".into(),
-                tape_uuid: UUID,
-                block_size: BLOCK,
-                parity_config: parity,
-            },
-            false,
-            false,
-            false,
-            crate::write_owner::tests::RetentionInvalidation::ProjectionBusy(false, path),
-            false,
-            false,
-        )
-        .await;
-    }
-    assert!(exercised > 0, "requested removal path does not exist");
-}
-
-/// Removal replays open checkpoints even when SQLite still describes closed or fresh media.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn open_checkpoint_survives_removal_after_projection_busy() {
-    check_open_checkpoint_removal(false, &["idle", "eviction", "shutdown"]).await;
-}
-
-/// A catalog row without a parity scheme skips removal projection.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn missing_parity_scheme_skips_removal_after_projection_busy() {
-    check_open_checkpoint_removal(true, &["idle", "eviction", "shutdown"]).await;
-}
-
-/// A pool-selection shared lease leaves a stale closed projection unknown at removal.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shared_checkpoint_lease_audits_unknown_epoch_after_projection_busy() {
-    check_open_checkpoint_removal(false, &["shared_lease"]).await;
-}
-
-/// Exercise removal with an unprojected open checkpoint.
-async fn check_open_checkpoint_removal(fresh: bool, paths: &[&'static str]) {
-    for &path in paths {
-        let root = tempfile::tempdir().unwrap();
-        let parity = crate::ParityConfig::Scheme(remanence_parity::ParityScheme {
-            id: remanence_parity::SchemeId::new_static("seated"),
-            data_blocks_per_stripe: 4,
-            parity_blocks_per_stripe: 2,
-            stripes_per_neighborhood: 32,
-        });
-        let world = world();
-        set_rollback_bootstrap(&world, parity.clone());
-        let mut state = state_with_parity(root.path(), true, parity.clone());
-        crate::write_owner::tests::check_seated_parity_sessions(
-            &mut state,
-            world,
-            crate::SelectedTape {
-                standalone_endpoint: None,
-                pool_id: "default".into(),
-                tape_uuid: UUID,
-                block_size: BLOCK,
-                parity_config: parity,
-            },
-            false,
-            false,
-            false,
-            crate::write_owner::tests::RetentionInvalidation::StaleProjection(fresh, path),
-            false,
-            false,
-        )
-        .await;
-    }
-}
-
-/// Shutdown during the parity reread cancels physical removal and keeps media seated.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shutdown_during_dismount_parity_rebuild_leaves_cartridge_seated() {
-    let root = tempfile::tempdir().unwrap();
-    let parity = crate::ParityConfig::Scheme(remanence_parity::ParityScheme {
-        id: remanence_parity::SchemeId::new_static("seated"),
-        data_blocks_per_stripe: 4,
-        parity_blocks_per_stripe: 2,
-        stripes_per_neighborhood: 32,
-    });
-    let world = world();
-    set_rollback_bootstrap(&world, parity.clone());
-    let mut state = state_with_parity(root.path(), true, parity.clone());
-    crate::write_owner::tests::check_seated_parity_sessions(
-        &mut state,
-        world,
-        crate::SelectedTape {
-            standalone_endpoint: None,
-            pool_id: "default".into(),
-            tape_uuid: UUID,
-            block_size: BLOCK,
-            parity_config: parity,
-        },
-        false,
-        false,
-        false,
-        crate::write_owner::tests::RetentionInvalidation::Removal("shutdown_rebuild", "idle"),
-        false,
-        false,
-    )
-    .await;
-}
-
-/// An epoch spans API sessions with multiple stripes and fills while the tape stays seated.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn api_epoch_fills_across_seated_sessions() {
-    let root = tempfile::tempdir().unwrap();
-    let parity = crate::ParityConfig::Scheme(remanence_parity::ParityScheme {
-        id: remanence_parity::SchemeId::new_static("seated"),
-        data_blocks_per_stripe: 4,
-        parity_blocks_per_stripe: 2,
-        stripes_per_neighborhood: 4,
-    });
-    let world = world();
-    set_rollback_bootstrap(&world, parity.clone());
-    let mut state = state_with_parity(root.path(), true, parity.clone());
-    crate::write_owner::tests::check_seated_parity_sessions(
-        &mut state,
-        world,
-        crate::SelectedTape {
-            standalone_endpoint: None,
-            pool_id: "default".into(),
-            tape_uuid: UUID,
-            block_size: BLOCK,
-            parity_config: parity,
-        },
-        false,
-        false,
-        false,
-        crate::write_owner::tests::RetentionInvalidation::ApiEpochFills,
-        false,
-        false,
-    )
-    .await;
-}
-
-/// One catalog contains live histories for a removed epoch, a pending seal,
-/// a completed finalization, and a write failure fence on distinct cartridges.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn multi_tape_write_history_rebuild_preserves_safety_projections() {
-    use crate::write_owner::tests::RetentionInvalidation::{
-        DeferredSealOnly, Finalize, None as Unchanged, WriteFailure,
-    };
-    let root = tempfile::tempdir().unwrap();
-    let mut state = configured_state(root.path(), true);
-    let parity = crate::ParityConfig::Scheme(remanence_parity::ParityScheme {
-        id: remanence_parity::SchemeId::new_static("seated"),
-        data_blocks_per_stripe: 128,
-        parity_blocks_per_stripe: 1,
-        stripes_per_neighborhood: 1,
-    });
-    for (i, history) in [Unchanged, DeferredSealOnly, Finalize, WriteFailure]
-        .into_iter()
-        .enumerate()
-    {
-        let uuid = [0x81 + i as u8; 16];
-        state
-            .catalog_index()
-            .provision_tape(remanence_state::ProvisionTapeInput {
-                tape_uuid: uuid,
-                voltag: format!("HISTORY{i}L9"),
-                block_size: BLOCK,
-                parity: parity.clone(),
-                force: false,
-            })
-            .unwrap();
-        state
-            .catalog_index()
-            .set_tape_generation(
-                uuid,
-                remanence_state::MediaObservation {
-                    generation: LtoGen::Lto9,
-                    source: GenerationSource::Operator,
-                },
-            )
-            .unwrap();
-        state
-            .catalog_index()
-            .project_tape_pool_membership(uuid, "default")
-            .unwrap();
-        let world = world();
-        let bootstrap = crate::build_tape_bootstrap(
-            uuid,
-            BLOCK,
-            parity.clone(),
-            "2026-10-23T00:00:00Z",
-            "test",
-        );
-        let mut bytes = vec![0; BLOCK as usize];
-        remanence_parity::bootstrap::write_bootstrap_block(&bootstrap, &mut bytes).unwrap();
-        world.lock().unwrap().tapes.get_mut("HAND").unwrap().records[0] = Record::Block(bytes);
-        {
-            let mut w = world.lock().unwrap();
-            let tape = w.tapes.remove("HAND").unwrap();
-            w.put_tape_in_drive(BAY, format!("HISTORY{i}L9"), None, tape);
-        }
-        crate::write_owner::tests::check_seated_parity_sessions(
-            &mut state,
-            world,
-            crate::SelectedTape {
-                standalone_endpoint: None,
-                pool_id: "default".into(),
-                tape_uuid: uuid,
-                block_size: BLOCK,
-                parity_config: parity.clone(),
-            },
-            false,
-            false,
-            false,
-            history,
-            false,
-            false,
-        )
-        .await;
-    }
-    crate::write_owner::tests::assert_rebuild_safety_equivalent(&mut state);
 }
 
 /// An uncertain bootstrap rewrite leaves replayable supersede failure evidence.
@@ -2911,41 +2367,4 @@ fn supersede_tail_failure_fence_survives_empty_catalog_rebuild() {
     assert_eq!(fences.len(), 1);
     assert_eq!(fences[0].reason, "supersede_tail_failed");
     crate::tests::assert_fences_survive_empty_rebuild(state.catalog_index(), &audit_dir);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn epoch_finalization_planner_refuses_sealed_and_before_replica_a_authority() {
-    use crate::write_owner::tests::RetentionInvalidation::{
-        PlannerRefusesBeforeReplicaA, PlannerRefusesSealed,
-    };
-    for invalidation in [PlannerRefusesBeforeReplicaA, PlannerRefusesSealed] {
-        let root = tempfile::tempdir().unwrap();
-        let parity = crate::ParityConfig::Scheme(remanence_parity::ParityScheme {
-            id: remanence_parity::SchemeId::new_static("seated"),
-            data_blocks_per_stripe: 128,
-            parity_blocks_per_stripe: 1,
-            stripes_per_neighborhood: 1,
-        });
-        let world = world();
-        set_rollback_bootstrap(&world, parity.clone());
-        let mut state = state_with_parity(root.path(), true, parity.clone());
-        crate::write_owner::tests::check_seated_parity_sessions(
-            &mut state,
-            world,
-            crate::SelectedTape {
-                standalone_endpoint: None,
-                pool_id: "default".into(),
-                tape_uuid: UUID,
-                block_size: BLOCK,
-                parity_config: parity,
-            },
-            false,
-            false,
-            false,
-            invalidation,
-            false,
-            false,
-        )
-        .await;
-    }
 }

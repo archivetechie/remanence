@@ -13,8 +13,7 @@ use std::sync::{Arc, Mutex};
 pub(crate) struct IoMemoryReservation {
     ceiling: u64,
     granted: AtomicU64,
-    retained_epochs: Mutex<BTreeMap<String, usize>>,
-    epoch_discards: AtomicU64,
+    active_parity_operations: Mutex<BTreeMap<String, usize>>,
     #[cfg(test)]
     pub(crate) epoch_test_action: AtomicU64,
 }
@@ -27,8 +26,7 @@ impl IoMemoryReservation {
         Ok(Arc::new(Self {
             ceiling,
             granted: AtomicU64::new(0),
-            retained_epochs: Mutex::new(BTreeMap::new()),
-            epoch_discards: AtomicU64::new(0),
+            active_parity_operations: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             epoch_test_action: AtomicU64::new(0),
         }))
@@ -44,19 +42,9 @@ impl IoMemoryReservation {
         self.granted.load(Ordering::Acquire)
     }
 
-    /// Count rejected take-over state independently of device command batching.
-    pub(crate) fn record_epoch_discard(&self) {
-        self.epoch_discards.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn epoch_discards(&self) -> u64 {
-        self.epoch_discards.load(Ordering::Relaxed)
-    }
-
-    /// Name retained epochs and drives in later allocation refusals.
-    pub(crate) fn retained_diagnostics(&self) -> String {
-        self.retained_epochs
+    /// Name active parity operations and drives in later allocation refusals.
+    pub(crate) fn active_parity_diagnostics(&self) -> String {
+        self.active_parity_operations
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .keys()
@@ -70,16 +58,16 @@ impl IoMemoryReservation {
         self: &Arc<Self>,
         bytes: u64,
         owner: String,
-    ) -> Option<IoMemoryPermit> {
-        let mut permit = self.try_reserve(bytes)?;
+    ) -> Result<IoMemoryPermit, u64> {
+        let mut permit = self.try_reserve_with_available(bytes)?;
         *self
-            .retained_epochs
+            .active_parity_operations
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .entry(owner.clone())
             .or_default() += 1;
         permit.epoch_owner = Some(owner);
-        Some(permit)
+        Ok(permit)
     }
 
     pub(crate) fn try_reserve(self: &Arc<Self>, bytes: u64) -> Option<IoMemoryPermit> {
@@ -152,7 +140,7 @@ impl Drop for IoMemoryPermit {
         if let Some(owner) = &self.epoch_owner {
             let mut owners = self
                 .manager
-                .retained_epochs
+                .active_parity_operations
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(count) = owners.get_mut(owner) {
@@ -171,9 +159,9 @@ impl Drop for IoMemoryPermit {
 mod tests {
     use super::*;
 
-    /// A refusal keeps every retained epoch owner visible until its permit drops.
+    /// A refusal keeps every active parity owner visible until its permit drops.
     #[test]
-    fn retained_epoch_refusal_names_tapes_and_drives() {
+    fn active_parity_refusal_names_tapes_and_drives() {
         let manager = IoMemoryReservation::new(10).unwrap();
         let first = manager
             .try_reserve_epoch(4, "tape 01 drive A".into())
@@ -183,13 +171,13 @@ mod tests {
             .unwrap();
         assert_eq!(manager.try_reserve_with_available(3).unwrap_err(), 2);
         assert_eq!(
-            manager.retained_diagnostics(),
+            manager.active_parity_diagnostics(),
             "tape 01 drive A, tape 02 drive B"
         );
         drop(first);
-        assert_eq!(manager.retained_diagnostics(), "tape 02 drive B");
+        assert_eq!(manager.active_parity_diagnostics(), "tape 02 drive B");
         drop(second);
-        assert!(manager.retained_diagnostics().is_empty());
+        assert!(manager.active_parity_diagnostics().is_empty());
     }
 
     #[test]

@@ -418,6 +418,9 @@ pub(super) fn handle_drive_open_read(
                     "read session already active",
                 )));
             }
+            DriveCommand::CloseoutTape { reply, .. } => {
+                let _ = reply.send(Err(Status::failed_precondition("session already active")));
+            }
             DriveCommand::SupersedeTail { reply, .. } => {
                 let _ = reply.send(Err(Status::failed_precondition(
                     "drive has an active session",
@@ -436,13 +439,6 @@ pub(super) fn handle_drive_open_read(
                 handle.publish_failed("read session already active", &[("phase", "admission")]);
                 drop(reservation);
                 handle.wake_readiness();
-            }
-            DriveCommand::PlanFinalization {
-                reply, ownership, ..
-            } => {
-                let _ = reply.send(ownership.complete(Err(Status::failed_precondition(
-                    "drive actor cannot plan finalization in its current state",
-                ))));
             }
             DriveCommand::PrepareRemoval { reply, .. } => {
                 let _ = reply.send(Err(Status::failed_precondition(
@@ -478,7 +474,9 @@ pub(super) fn handle_drive_open_read(
                 }
             }
             DriveCommand::TimerIdleClose { .. } => {}
-            DriveCommand::Close { reply, .. } | DriveCommand::Abort { reply, .. } => {
+            DriveCommand::Close { reply, .. }
+            | DriveCommand::Abort { reply, .. }
+            | DriveCommand::DisconnectWrite { reply, .. } => {
                 let _ = reply.send(Err(Status::failed_precondition(
                     "active session is a read session",
                 )));

@@ -285,6 +285,10 @@ impl Wire for TailIdentity {
                 1u8.put(w)?;
                 hash.put(w)
             }
+            Self::TornPrefix(hash) => {
+                2u8.put(w)?;
+                hash.put(w)
+            }
         }
     }
     fn get(r: &mut dyn Read) -> io::Result<Self> {
@@ -294,6 +298,7 @@ impl Wire for TailIdentity {
         match u8::get(r)? {
             0 => Ok(Self::Object(Wire::get(r)?)),
             1 => Ok(Self::Sidecar(Wire::get(r)?)),
+            2 => Ok(Self::TornPrefix(Wire::get(r)?)),
             _ => Err(invalid()),
         }
     }

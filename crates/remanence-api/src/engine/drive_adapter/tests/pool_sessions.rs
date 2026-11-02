@@ -356,18 +356,9 @@ fn encrypted_parity_write_uses_configured_spool_ceiling_before_object_motion() {
     };
     let before = command_count(&f);
     let error = actor.write_checkpointed(input).unwrap_err();
-    assert!(
-        error.to_string().to_lowercase().contains("spool"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("CloseoutMemory:"), "{error}");
     if let crate::MountError::Actor(failure) = &error {
-        assert!(
-            matches!(
-                failure.pool_write_error.as_deref(),
-                Some(PoolWriteError::ParitySpoolRefused { cause, .. }) if matches!(cause.as_ref(), remanence_parity::ParityError::CapacityReserveExceeded { cause: remanence_parity::CapacityReserveCause::ParitySpoolCapacity, remaining_spool_bytes: Some(1), .. })
-            ),
-            "{failure:?}"
-        );
+        assert_eq!(failure.status.code(), tonic::Code::ResourceExhausted);
     } else {
         panic!("typed capacity error: {error:?}");
     }
@@ -375,7 +366,8 @@ fn encrypted_parity_write_uses_configured_spool_ceiling_before_object_motion() {
         .iter()
         .filter(|c| c[0] == 0x0a)
         .count();
-    assert_eq!(writes, 1, "only the identity bootstrap is written");
+    assert_eq!(writes, 0, "reservation refuses before any drive command");
+    assert_eq!(command_count(&f), before);
     assert_eq!(
         f.world.lock().unwrap().tapes["HAND"].records.len(),
         2,
@@ -391,7 +383,7 @@ fn encrypted_parity_write_uses_configured_spool_ceiling_before_object_motion() {
 }
 
 #[test]
-fn checkpointed_parity_raw_write_failure_persists_fence_and_blocks_retry() {
+fn checkpointed_parity_raw_write_failure_names_tail_and_allows_retry() {
     let (f, state) = Fixture::with_parity(scheme(2));
     let mut actor = f.owner(state);
     actor.open_session("default").unwrap();
@@ -404,21 +396,13 @@ fn checkpointed_parity_raw_write_failure_persists_fence_and_blocks_retry() {
     let fences = index
         .tape_io_admission_conflicts(&UUID, Some("HAND"))
         .unwrap();
-    assert_eq!(
-        fences
-            .iter()
-            .filter(|f| f.reason == "transfer_error")
-            .count(),
-        1
+    assert!(
+        fences.is_empty(),
+        "durable live ends do not fence reads or retries"
     );
-    assert_eq!(fences.len(), 2);
-    assert!(fences.iter().any(|f| f.reason == "standalone_write_failed"));
-    crate::tests::assert_fences_survive_empty_rebuild(&index, &f.config.audit.dir);
-    let before = command_count(&f);
     let mut retry = f.owner(f.reopen().unwrap());
-    assert!(retry.write_checkpointed(f.request("raw-retry")).is_err());
-    let _ = retry.finish();
-    no_modifications(&f, before);
+    retry.write_checkpointed(f.request("raw-retry")).unwrap();
+    retry.finish().unwrap();
 }
 
 #[test]
@@ -579,15 +563,15 @@ fn terminal_failure_preserves_object_checkpoint_and_structured_intent() {
         false,
         Default::default(),
     );
-    let error = actor
+    let receipt = actor
         .write_checkpointed(f.request("terminal-failure"))
-        .unwrap_err();
+        .unwrap();
     assert!(
-        matches!(error, crate::MountError::Committed { .. }),
-        "{error}"
+        !receipt.object.object_id.is_empty(),
+        "object receipt precedes terminal work"
     );
-    assert_eq!(attempts.load(Ordering::SeqCst), 1);
     let _ = actor.finish();
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
     let index = f.index();
     crate::tests::assert_fences_survive_empty_rebuild(&index, &f.config.audit.dir);
     let journal = checkpoint(&f);
@@ -844,14 +828,14 @@ fn checkpointed_parity_tape_is_admitted_for_daemon_resume() {
 /// Fail the actual closing-frame sync after each physical barrier. No epoch
 /// action injection is involved; the normal actor publication/fence paths run.
 #[test]
-fn retained_close_prefix_and_component_publication_failures_poison_release_and_fence() {
+fn closeout_prefix_and_component_publication_failures_poison_release_and_fence() {
     use remanence_chaos::file_model::{FileEvent, MemoryDirectory};
     use remanence_library::durable_file::test_support::register;
     use remanence_state::tape_log::{codec::Decoder, store::Header, Record};
-    for target in ["retained_close", "prefix", "component"] {
+    for target in ["closeout", "prefix", "component"] {
         let (mut f, state) = Fixture::with_parity(scheme(128));
         drop(state);
-        if target != "retained_close" {
+        if target != "closeout" {
             f.config.tape_pools[0].capacity_cap_bytes = Some(3 * 1024 * 1024 * 1024);
             f.config.tape_pools[0].watermark_low = 0.000001;
             f.config.tape_pools[0].watermark_high = 0.25;
@@ -892,9 +876,7 @@ fn retained_close_prefix_and_component_publication_failures_poison_release_and_f
                     last = Some(frame.record);
                 }
                 let selected = match last {
-                    Some(Record::Committed(c)) => {
-                        target == "retained_close" && c.object_count == 1 && c.protected == c.total
-                    }
+                    Some(Record::ClosedOut(_)) => target == "closeout",
                     Some(Record::TerminalPrefix { .. }) => target == "prefix",
                     Some(Record::ComponentWritten { .. }) => target == "component",
                     _ => false,
@@ -905,16 +887,17 @@ fn retained_close_prefix_and_component_publication_failures_poison_release_and_f
                 }
             }
         })));
-        if target == "retained_close" {
+        if target == "closeout" {
             actor
                 .write_checkpointed(f.request("retained-object"))
                 .unwrap();
-            assert!(memory.granted() > 0, "retained accumulator is reserved");
+            assert!(memory.granted() > 0, "session accumulator is reserved");
             let _ = actor.finish();
         } else {
-            assert!(actor
+            actor
                 .write_checkpointed(f.request("terminal-object"))
-                .is_err());
+                .unwrap();
+            let _ = actor.close_session();
             let before_retry = command_count(&f);
             assert!(actor.append(f.request("poisoned-retry")).is_err());
             no_modifications(&f, before_retry);
@@ -923,7 +906,7 @@ fn retained_close_prefix_and_component_publication_failures_poison_release_and_f
         let failed = failed_at.load(Ordering::SeqCst);
         assert_ne!(failed, usize::MAX, "{target} reached its closing fsync");
         no_modifications(&f, failed);
-        assert_eq!(memory.granted(), 0, "{target} released retained memory");
+        assert_eq!(memory.granted(), 0, "{target} released session memory");
         assert!(
             f.index()
                 .tape_io_is_fenced(Some(&UUID), None, None)

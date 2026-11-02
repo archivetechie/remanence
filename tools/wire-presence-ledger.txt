@@ -228,3 +228,6 @@ GetLiveStatusResponse.active_tape_io_fence_count  the length of active_tape_io_f
 ListTapesResponse.active_tape_io_fence_count  the length of active_tape_io_fences in the same response; a failed fence query fails the RPC, so 0 means no active fence
 ReleaseTapeIoFenceRequest.quarantine_id   required; an empty id matches no fence (ids are generated non-empty), so the release answers NOT_FOUND
 ReleaseTapeIoFenceRequest.acknowledgment  required; the handler refuses an empty or blank acknowledgment with INVALID_ARGUMENT
+
+CloseoutTapeRequest.tape_uuid required; decode_uuid_bytes refuses empty or non-16-byte values before dispatch
+SupersedeTailResponse.tape_log_sequence every preview and confirmation names the observed native log sequence; zero is the real empty-log generation

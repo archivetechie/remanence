@@ -412,10 +412,13 @@ pub struct AppendSuffix {
     pub foreign_components: Vec<String>,
     /// At least one incomplete candidate was present.
     pub torn_fragment: bool,
+    /// A delimited file cannot be represented by any legal session-tail identity.
+    pub(crate) unnameable: bool,
 }
 
 /// Scan candidates directly from tape, stopping as soon as refusal is proved.
 /// Physical EOD without a closing filemark proves the final candidate is torn.
+#[cfg(test)]
 pub(crate) fn scan_append_suffix(
     drive: &mut DriveHandle,
     tape_uuid: &[u8; 16],
@@ -425,9 +428,36 @@ pub(crate) fn scan_append_suffix(
     prefix: Option<&remanence_parity::TerminalPrefixPlan>,
     inspect_all: bool,
 ) -> Result<AppendSuffix, crate::append_admission::AdmissionError> {
+    scan_append_suffix_observed(
+        drive,
+        tape_uuid,
+        size,
+        start_lba,
+        terminal,
+        prefix,
+        inspect_all,
+        None,
+    )
+}
+
+/// The crash walk additionally spools the observed tail without retaining files
+/// in memory. A torn last file is named by its exact bytes, never a guessed ID.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scan_append_suffix_observed(
+    drive: &mut DriveHandle,
+    tape_uuid: &[u8; 16],
+    size: u32,
+    start_lba: u64,
+    terminal: Option<&remanence_parity::TerminalTripleWritePlan>,
+    prefix: Option<&remanence_parity::TerminalPrefixPlan>,
+    inspect_all: bool,
+    tail: Option<&crate::write_owner::session_tail::SessionTail>,
+) -> Result<AppendSuffix, crate::append_admission::AdmissionError> {
     use crate::append_admission::AdmissionError;
     use remanence_library::TapeIoError;
     use remanence_parity::TapeFileKind;
+    use remanence_state::tape_log::{TailFilemark, TailIdentity};
+    use sha2::{Digest, Sha256};
     let mut result = AppendSuffix::default();
     let mut lba = start_lba;
     let mut block = vec![0; size as usize];
@@ -438,6 +468,7 @@ pub(crate) fn scan_append_suffix(
         let mut head = Vec::new();
         let mut aligned = true;
         let mut blocks = 0;
+        let mut digest = Sha256::new();
         let eod = loop {
             match drive.read_block(&mut block) {
                 Ok(n) => {
@@ -448,9 +479,11 @@ pub(crate) fn scan_append_suffix(
                         head.extend_from_slice(&block[..n]);
                     }
                     aligned &= n == size as usize;
+                    digest.update(&block[..n]);
                     blocks += 1;
                     lba = lba.checked_add(1).ok_or("suffix LBA overflow")?;
-                    if blocks == 1
+                    if tail.is_none()
+                        && blocks == 1
                         && remanence_parity::scan::classify_tape_file_head(
                             &head, tape_uuid, size, false,
                         ) != TapeFileKind::Object
@@ -493,6 +526,17 @@ pub(crate) fn scan_append_suffix(
         // Only physical EOD without a closing filemark proves truncation.
         // This applies to every candidate, even an incomplete or corrupt header.
         if eod && !head.is_empty() {
+            if let Some(tail) = tail {
+                if !aligned {
+                    return Err("crash suffix contains a non-fixed-size block".into());
+                }
+                tail.observe(
+                    TailIdentity::TornPrefix(digest.finalize().into()),
+                    blocks,
+                    TailFilemark::Absent,
+                )
+                .map_err(|e| AdmissionError::Unproved(e.to_string()))?;
+            }
             result.torn_fragment = true;
             return Ok(result);
         }
@@ -554,15 +598,29 @@ pub(crate) fn scan_append_suffix(
                         return Err(AdmissionError::Io(TapeIoError::OperationFailed(error)));
                     }
                     match classified {
-                        Ok(Some(id)) => result.objects.push(id),
+                        Ok(Some(id)) => {
+                            if let Some(tail) = tail {
+                                tail.observe(
+                                    TailIdentity::Object(id.clone()),
+                                    blocks,
+                                    TailFilemark::Present,
+                                )
+                                .map_err(|e| AdmissionError::Unproved(e.to_string()))?;
+                            }
+                            result.objects.push(id);
+                        }
                         Ok(None) => result.torn_fragment = true,
-                        Err(detail) => result
-                            .foreign_components
-                            .push(format!("unclassifiable at LBA {start}: {detail}")),
+                        Err(detail) => {
+                            result.unnameable = true;
+                            result
+                                .foreign_components
+                                .push(format!("unclassifiable at LBA {start}: {detail}"));
+                        }
                     }
                     drive.locate(lba).map_err(AdmissionError::Io)?;
                 }
                 TapeFileKind::TapeIndexReplica => {
+                    result.unnameable = true;
                     let parsed =
                         remanence_parity::parse_tape_index_replica_header(&head, tape_uuid);
                     let own = terminal.is_some_and(|plan| {
@@ -584,6 +642,7 @@ pub(crate) fn scan_append_suffix(
                     }
                 }
                 TapeFileKind::IndexSeparationExtent => {
+                    result.unnameable = true;
                     let parsed = remanence_parity::parse_index_separation_header(&head, tape_uuid);
                     let own = terminal.is_some_and(|plan| {
                         parsed.as_ref().is_ok_and(|h| {
@@ -604,6 +663,7 @@ pub(crate) fn scan_append_suffix(
                     }
                 }
                 TapeFileKind::ParityMap => {
+                    result.unnameable = true;
                     let hash = remanence_parity::parity_map::parse_parity_map_header_block(
                         &head, tape_uuid,
                     )
@@ -627,6 +687,14 @@ pub(crate) fn scan_append_suffix(
                         remanence_parity::sidecar::parse_sidecar_header_block(&head, tape_uuid)
                             .ok()
                             .map(|h| h.canonical_metadata_hash);
+                    result.unnameable |= hash.is_none();
+                    if let (Some(tail), Some(hash)) = (tail, hash) {
+                        if !aligned {
+                            return Err("crash sidecar contains a non-fixed-size block".into());
+                        }
+                        tail.observe(TailIdentity::Sidecar(hash), blocks, TailFilemark::Present)
+                            .map_err(|e| AdmissionError::Unproved(e.to_string()))?;
+                    }
                     let own = prefix.is_some_and(|p| {
                         p.committed_bundle.entries.iter().any(|e| {
                             e.kind == kind
@@ -640,11 +708,18 @@ pub(crate) fn scan_append_suffix(
                             .push(format!("terminal sidecar at LBA {start}"));
                     }
                 }
-                _ => result
-                    .foreign_components
-                    .push(format!("unclassifiable at LBA {start}")),
+                _ => {
+                    result.unnameable = true;
+                    result
+                        .foreign_components
+                        .push(format!("unclassifiable at LBA {start}"));
+                }
             }
         } else if !eod {
+            result.unnameable = true;
+            result
+                .foreign_components
+                .push(format!("empty filemark at LBA {start}"));
             result.torn_fragment = true;
         }
         if eod
@@ -745,4 +820,114 @@ impl BlockRead for TapeCandidate<'_> {
         self.read(out)
             .map_err(|e| remanence_library::TapeIoError::OperationFailed(e.to_string()))
     }
+}
+
+/// Read only the global PAX identity, skipping arbitrarily long other values in
+/// constant memory. A live partial header can end before its known ID appears.
+pub(crate) fn prove_named_plain_identity(
+    drive: &mut DriveHandle,
+    start: u64,
+    blocks: u64,
+    size: u32,
+    expected: &str,
+    partial: bool,
+) -> Result<(), crate::append_admission::AdmissionError> {
+    use crate::append_admission::AdmissionError;
+    let bad = || {
+        AdmissionError::Unproved("SessionSuffixContradiction: named object header differs".into())
+    };
+    let mut source = TapeCandidate::new(drive, start, blocks, size)?;
+    let mut header = [0; 512];
+    source.read_exact(&mut header).map_err(|_| bad())?;
+    let octal = |bytes: &[u8]| -> Option<u64> {
+        u64::from_str_radix(
+            std::str::from_utf8(bytes).ok()?.trim_matches(['\0', ' ']),
+            8,
+        )
+        .ok()
+    };
+    let checksum = octal(&header[148..156]).ok_or_else(bad)?;
+    let sum: u64 = header
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            if (148..156).contains(&i) {
+                32
+            } else {
+                u64::from(*b)
+            }
+        })
+        .sum();
+    if header[156] != b'g' || checksum != sum || &header[257..263] != b"ustar\0" {
+        return Err(bad());
+    }
+    let mut remaining = octal(&header[124..136]).ok_or_else(bad)?;
+    while remaining > 0 {
+        let mut digits = 0u64;
+        let mut length = 0u64;
+        loop {
+            let mut byte = [0];
+            if source.read_exact(&mut byte).is_err() {
+                return if partial && source.probe_error.is_none() {
+                    Ok(())
+                } else {
+                    Err(bad())
+                };
+            }
+            digits += 1;
+            if byte[0] == b' ' {
+                break;
+            }
+            if !byte[0].is_ascii_digit() || digits > 20 {
+                return Err(bad());
+            }
+            length = length
+                .checked_mul(10)
+                .and_then(|n| n.checked_add(u64::from(byte[0] - b'0')))
+                .ok_or_else(bad)?;
+        }
+        if length <= digits || length > remaining {
+            return Err(bad());
+        }
+        let mut body = (&mut source).take(length - digits);
+        let mut prefix = [0; 20];
+        let wanted = b"REMANENCE.object_id=";
+        let n = prefix.len().min((length - digits) as usize);
+        if body.read_exact(&mut prefix[..n]).is_err() {
+            return if partial && source.probe_error.is_none() {
+                Ok(())
+            } else {
+                Err(bad())
+            };
+        }
+        if prefix[..n].starts_with(wanted) {
+            let mut value = Vec::new();
+            if length - digits > 128 {
+                return Err(bad());
+            }
+            value.extend_from_slice(&prefix[wanted.len()..n]);
+            body.read_to_end(&mut value).map_err(|_| bad())?;
+            if body.limit() != 0 {
+                return if partial && source.probe_error.is_none() {
+                    Ok(())
+                } else {
+                    Err(bad())
+                };
+            }
+            if value != format!("{expected}\n").as_bytes() {
+                return Err(bad());
+            }
+            return Ok(());
+        }
+        std::io::copy(&mut body, &mut std::io::sink()).map_err(|_| bad())?;
+        if body.limit() != 0 {
+            return if partial && source.probe_error.is_none() {
+                Ok(())
+            } else {
+                Err(bad())
+            };
+        }
+        remaining -= length;
+    }
+    Err(bad())
 }

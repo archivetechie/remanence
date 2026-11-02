@@ -106,8 +106,8 @@ media, and the stripe geometry is physical.
 
 A durability barrier proves files on the medium; the subsequent durable
 commit record commits them. It need not end the open epoch. Every sidecar
-carries the full `S × m` parity region, even for a short epoch. Under the
-recommended policy of ending the remaining epoch at session close, small
+carries the full `S × m` parity region, even for a short epoch. With the
+session-owned policy of ending the remaining epoch at session close, small
 sessions pay more short-epoch overhead. Object size and session size have
 separate costs; [Sizing objects and write sessions](guide-object-sizing.md)
 explains them. Before an Object moves, admission includes the complete

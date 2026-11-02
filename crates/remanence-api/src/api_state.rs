@@ -1126,7 +1126,7 @@ impl ApiState {
     ) -> Result<crate::io_memory::IoMemoryPermit, Status> {
         self.io_memory.try_reserve(bytes).ok_or_else(|| {
             Status::resource_exhausted(format!(
-                "append spool growth of {bytes} bytes exceeds remaining daemon.io_memory_ceiling capacity; retained epochs [{}]", self.io_memory.retained_diagnostics()
+                "append spool growth of {bytes} bytes exceeds remaining daemon.io_memory_ceiling capacity; active parity operations [{}]", self.io_memory.active_parity_diagnostics()
             ))
         })
     }

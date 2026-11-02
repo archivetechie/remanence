@@ -29,6 +29,16 @@ impl tokio_stream::Stream for StalledBody {
 /// Both paths abandon only the incomplete object; committed receipts still read exact bytes.
 #[tokio::test]
 async fn ingress_deadline_preserves_committed_receipt_and_readable_object() {
+    check_ingress_ending(false).await;
+}
+
+/// Handler cancellation must wake overlap consumers and end serial owners too.
+#[tokio::test]
+async fn client_disconnect_preserves_committed_receipt_and_names_tail() {
+    check_ingress_ending(true).await;
+}
+
+async fn check_ingress_ending(disconnect: bool) {
     for overlap in [false, true] {
         for mid_object in [false, true] {
             let root = tempfile::tempdir().unwrap();
@@ -94,7 +104,7 @@ async fn ingress_deadline_preserves_committed_receipt_and_readable_object() {
                 pb::AppendDurability::Checkpointed as i32
             );
             let object_id = Uuid::from_slice(&receipt.object_id).unwrap().to_string();
-            let mut index = CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
+            let index = CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
             let saved = index.get_native_object(&object_id).unwrap().unwrap();
             let copies = index.find_native_object_copies(&object_id).unwrap();
             let before = world.lock().unwrap().tapes[BARCODE].records.clone();
@@ -179,19 +189,32 @@ async fn ingress_deadline_preserves_committed_receipt_and_readable_object() {
                 .await
                 .expect("overlap writer reaches tape before the client stalls");
             }
-            tokio::time::pause();
-            tokio::time::advance(StdDuration::from_secs(9)).await;
-            assert!(!append.is_finished());
-            tokio::time::advance(StdDuration::from_secs(1)).await;
-            // Give the synchronous writer real time to unwind; the client timer has fired.
-            tokio::time::resume();
-            let status = tokio::time::timeout(StdDuration::from_secs(5), append)
+            if disconnect {
+                append.abort();
+                assert!(append.await.unwrap_err().is_cancelled());
+                // Join without blocking the async cleanup task that sends DisconnectWrite.
+                tokio::time::timeout(StdDuration::from_secs(5), async {
+                    while !thread.is_finished() {
+                        tokio::task::yield_now().await;
+                    }
+                })
                 .await
-                .expect("overlap producer and writer exit")
-                .unwrap()
-                .unwrap_err();
-            assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
-            assert_eq!(status.message(), format!("AppendIngressDeadline: session {id} received no append data for 10 seconds; the incomplete object was abandoned."));
+                .expect("disconnected owner ends promptly");
+            } else {
+                tokio::time::pause();
+                tokio::time::advance(StdDuration::from_secs(9)).await;
+                assert!(!append.is_finished());
+                tokio::time::advance(StdDuration::from_secs(1)).await;
+                // Give the synchronous writer real time to unwind; the client timer has fired.
+                tokio::time::resume();
+                let status = tokio::time::timeout(StdDuration::from_secs(5), append)
+                    .await
+                    .expect("overlap producer and writer exit")
+                    .unwrap()
+                    .unwrap_err();
+                assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+                assert_eq!(status.message(), format!("AppendIngressDeadline: session {id} received no append data for 10 seconds; the incomplete object was abandoned."));
+            }
             assert_eq!(std::fs::read_dir(&spool).unwrap().count(), 0);
             let after = world.lock().unwrap().tapes[BARCODE].records.clone();
             assert_eq!(
@@ -202,17 +225,46 @@ async fn ingress_deadline_preserves_committed_receipt_and_readable_object() {
             if !overlap || !mid_object {
                 assert_eq!(after, before, "pre-tape abandonment leaves tape untouched");
             } else {
-                assert_eq!(
-                    after.last(),
-                    Some(&Record::Filemark),
-                    "existing abandonment delimiter"
+                assert!(
+                    matches!(after.last(), Some(Record::Block(_))),
+                    "deadline writes no abandonment filemark"
                 );
             }
             assert_eq!(index.get_native_object(&object_id).unwrap().unwrap(), saved);
             assert_eq!(index.find_native_object_copies(&object_id).unwrap(), copies);
             assert_eq!(index.list_native_objects().unwrap().len(), 1);
-            // Session close and its existing evidence remain the actor's responsibility.
-            close_writer(&tx, id, thread).await;
+            // A failed append definitively ends its owner; wait for its durable named end.
+            thread.join().expect("failed append owner exits");
+            let authority =
+                TapeAuthority::open(root.path().join("journals/tapes"), TAPE, index.path())
+                    .unwrap();
+            let snapshot = authority.freeze().unwrap();
+            let end = snapshot.tape_summary().last_session_end.as_ref().unwrap();
+            assert_eq!(
+                end.reason,
+                if disconnect {
+                    remanence_state::tape_log::SessionEndReason::ClientDisconnected
+                } else {
+                    remanence_state::tape_log::SessionEndReason::ClientStall
+                }
+            );
+            assert!(snapshot.tape_summary().open_session.is_none());
+            snapshot
+                .visit_session_tail(&mut |file| {
+                    assert_eq!(
+                        file.filemark,
+                        remanence_state::tape_log::TailFilemark::Absent
+                    );
+                    assert_eq!(file.unknown_blocks, 0);
+                    assert!(matches!(
+                        file.identity,
+                        remanence_state::tape_log::TailIdentity::Object(_)
+                    ));
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(end.tail_file_count > 0, overlap && mid_object);
+
             assert_eq!(checkpoint.committed_objects, vec![receipt]);
             let copy = &copies[0];
             let start = copy.global_start_block.unwrap() as usize;
@@ -233,19 +285,10 @@ async fn ingress_deadline_preserves_committed_receipt_and_readable_object() {
             )
             .unwrap();
             assert_eq!(restored.entry("saved").unwrap().data, payload);
-            // Live write failures already fence read-session admission. Verify
-            // that policy, then release only the fixture's fence after proving
-            // the committed bytes. B4 must not change the existing barrier.
-            let fences = index.list_active_tape_io_fences().unwrap();
-            assert_eq!(fences.is_empty(), !(overlap && mid_object));
-            for fence in fences {
-                index
-                    .release_tape_io_fence(
-                        &fence.quarantine_id,
-                        "test verified the previously committed archive",
-                    )
-                    .unwrap();
-            }
+            assert!(
+                index.list_active_tape_io_fences().unwrap().is_empty(),
+                "a durable live end keeps reads available"
+            );
             read_receipts(
                 root.path(),
                 world,

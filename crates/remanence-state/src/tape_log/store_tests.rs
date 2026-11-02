@@ -13,12 +13,31 @@ fn store(dir: &std::path::Path) -> Store {
     )
     .unwrap()
 }
+fn open_fixture_session(lease: &mut Lease) {
+    if lease.summary().open_session.is_none() {
+        let s = lease.summary();
+        let record = Record::SessionOpened(SessionOpened {
+            session_id: [9; 16],
+            incarnation: s.incarnation,
+            base_media_sequence: s.last_media_commit.unwrap(),
+            cursor: SessionCursor {
+                partition: s.cursor.partition,
+                lba: s.cursor.lba,
+                next_file: s.next_file,
+            },
+            opened_at_utc: "2026-11-02T00:00:00Z".into(),
+        });
+        let group = lease.prepare().unwrap();
+        lease.append(group.close(&record).unwrap()).unwrap();
+    }
+}
 fn append_object(lease: &mut Lease) {
     let summary = lease.summary().clone();
     if summary.is_fresh() {
         let group = lease.prepare().unwrap();
         lease.append(group.close(&init(false)).unwrap()).unwrap();
     }
+    open_fixture_session(lease);
     let mut group = lease.prepare().unwrap();
     let file = summary.next_file.max(1);
     let lba = if summary.is_fresh() {
@@ -215,6 +234,7 @@ fn three_thousand_short_epochs_and_streamed_plan_directory() {
         let mut group = lease.prepare().unwrap();
         if epoch == 0 {
             lease.append(group.close(&init(true)).unwrap()).unwrap();
+            open_fixture_session(&mut lease);
             group = lease.prepare().unwrap();
         }
         let file = 1 + 2 * epoch;
@@ -671,6 +691,7 @@ fn provisional_data_sync_then_closing_fsync_and_first_directory_sync() {
                 &["append", "fsync", "rename", "directory"]
             );
             drop(events);
+            open_fixture_session(&mut lease);
             faults.events.lock().unwrap().clear();
             append_object(&mut lease);
             assert_eq!(
@@ -885,6 +906,7 @@ fn original_write_check_is_retained_in_disk_snapshot() {
     let mut lease = store.acquire(true).unwrap();
     let mut group = lease.prepare().unwrap();
     lease.append(group.close(&init(true)).unwrap()).unwrap();
+    open_fixture_session(&mut lease);
     group = lease.prepare().unwrap();
     let row = object(1, 2, Some(0), 3);
     group
@@ -935,6 +957,7 @@ fn high_file_count_small_objects_stream_without_a_batch_vector() {
     let mut lease = store.acquire(true).unwrap();
     let mut group = lease.prepare().unwrap();
     lease.append(group.close(&init(false)).unwrap()).unwrap();
+    open_fixture_session(&mut lease);
     group = lease.prepare().unwrap();
     const OBJECTS: u64 = 25_000;
     for file in 1..=OBJECTS {

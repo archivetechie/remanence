@@ -77,9 +77,6 @@ elif args[:2] == ["drive", "unload"]:
         print("injected unload refusal")
         sys.exit(1)
     progress = {}
-    if mode in ("failed-close", "no-close") and bay == "256":
-        progress["epoch_close"] = "failed" if mode == "failed-close" else "not_attempted"
-        progress["epoch_close_error"] = "injected close problem"
     print(json.dumps({"schema": "rem.operation.status.v1", "kind": "item", "data": {"progress": progress}}))
 else:
     raise AssertionError(args)
@@ -116,8 +113,6 @@ os.execv("/usr/bin/timeout", ["timeout", *(["--foreground"] if foreground else [
              ("graceful", "08", "PASS", "failed"),
              ("graceful", "08", "PASS", "invalid"),
              ("graceful", "08", "PASS", "busy"),
-             ("graceful", "08", "PASS", "failed-close"),
-             ("graceful", "08", "PASS", "no-close"),
              ("graceful", "08", "PASS", "hang-top"),
              ("graceful", "08", "PASS", "hang-unload"),
              ("graceful", "08", "PASS", "hang-phase"),
@@ -170,7 +165,7 @@ os.execv("/usr/bin/timeout", ["timeout", *(["--foreground"] if foreground else [
             assert sequence[-1] == "TERM", sequence
             calls = [json.loads(line) for line in sequence[:-1]]
             unloads = [call for call in calls if call[:2] == ["drive", "unload"]]
-            if inventory_mode in ("valid", "busy", "failed-close", "no-close", "hang-unload", "slow-bays") or inventory_mode.startswith("default-"):
+            if inventory_mode in ("valid", "busy", "hang-unload", "slow-bays") or inventory_mode.startswith("default-"):
                 expected = ["256", "256", "256", "258", "260"] if inventory_mode == "busy" else ["256", "258", "260"]
                 if inventory_mode == "slow-bays":
                     expected = ["256", "260"]
@@ -180,8 +175,6 @@ os.execv("/usr/bin/timeout", ["timeout", *(["--foreground"] if foreground else [
                 if inventory_mode == "slow-bays":
                     expected_status = ["PASS", "PASS"]
                     assert (home / "timeouts").read_text().splitlines() == ["60", "2220", "1080", "1080"]
-                if inventory_mode in ("failed-close", "no-close"):
-                    expected_status[0] = "WARN"
                 if inventory_mode == "hang-unload":
                     expected_status = ["WARN"] * 3
                 assert [row["status"] for row in unload_records] == expected_status, unload_records

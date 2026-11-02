@@ -23,6 +23,45 @@ use crate::hex_encoding::bytes_to_hex;
 use crate::pb;
 use crate::pool_write::{StreamedWriteSource, WriteObjectInputKind};
 
+/// Cancelling a handler after Start must end its owner, including serial ingress
+/// that has not yet dispatched AppendFinish. Cleanup outlives the dropped future.
+struct IngressOwnerGuard {
+    state: ApiState,
+    session_id: Uuid,
+    armed: bool,
+}
+impl Drop for IngressOwnerGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                let state = self.state.clone();
+                let id = self.session_id;
+                runtime.spawn(async move {
+                    if let Err(error) = crate::mount::disconnect_write_session(&state, id).await {
+                        tracing::warn!(%error, session_id=%id, "disconnected append cleanup failed");
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// Dropping the overlap handler must also stop its detached producer and wake
+/// the synchronous consumer before a disconnect command can reach that actor.
+struct OverlapReceiveGuard {
+    task: tokio::task::AbortHandle,
+    control: Arc<AppendRingControl>,
+    armed: bool,
+}
+impl Drop for OverlapReceiveGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.control.fail("client disconnected during append");
+            self.task.abort();
+        }
+    }
+}
+
 /// Implementation of the Layer 5 write-session service.
 #[derive(Clone)]
 pub struct WriteSessionApi {
@@ -326,6 +365,12 @@ impl WriteSessionApi {
                 ));
             }
         };
+        let mut owner_guard = IngressOwnerGuard {
+            state: self.state.clone(),
+            session_id,
+            armed: true,
+        };
+        let result = async {
         let staging_reason = crate::append_request::append_staging_reason(
             self.state.append_staging_mode,
             logical_start.as_ref(),
@@ -502,6 +547,25 @@ impl WriteSessionApi {
             "remanence_write_diag",
         );
         Ok(Response::new(record))
+        }.await;
+        if let Err(error) = &result {
+            if error.message().starts_with("append stream failed:")
+                || error.message() == "append stream must end with Finish"
+            {
+                let _ = crate::mount::disconnect_write_session(&self.state, session_id).await;
+            } else if error.code() == tonic::Code::DeadlineExceeded {
+                // A stalled stream can expire before any AppendFinish reached the actor.
+                // End that session too; a mid-write failure may already have ended it.
+                let _ = crate::mount::abort_write_session(
+                    &self.state,
+                    session_id,
+                    Some(error.message().to_owned()),
+                )
+                .await;
+            }
+        }
+        owner_guard.armed = false;
+        result
     }
 
     async fn append_object_overlap<S>(
@@ -532,121 +596,134 @@ impl WriteSessionApi {
             receive_control,
             ingress,
         ));
-        if let Err(status) = control.wait_for_prefill().await {
-            let receive = receive_task.await.map_err(|err| {
-                Status::internal(format!("overlap receive task failed before prefill: {err}"))
-            })?;
-            return Err(receive.err().unwrap_or(status));
-        }
-        control.record_prefill_lead();
-        tracing::info!(
-            target: "remanence_write_diag",
-            phase = "overlap_prefill",
-            session_id = %session_id,
-            ring_occupancy_bytes = control.occupancy_bytes(),
-            ring_peak_occupancy_bytes = control.peak_occupancy_bytes(),
-            ring_capacity_bytes = control.capacity_bytes(),
-            ring_high_bytes = control.high_bytes(),
-            declared_size_bytes,
-            client_live = true,
-            "remanence_write_diag",
-        );
-
-        let mut source = StreamedWriteSource::new(
-            consumer,
-            declared_size_bytes,
-            start_digest,
-            Arc::clone(&control),
-        );
-        source.mtime = start.mtime.clone();
-        let append_started = Instant::now();
-        let append = crate::mount::append_streamed(
-            &self.state,
-            session_id,
-            source,
-            archive_path_from_start(&start),
-            start.caller_object_id,
-            start_digest,
-        )
-        .await;
-        let append = match append {
-            Ok(mut outcome)
-                if outcome
-                    .record
-                    .append_commit_info
-                    .as_ref()
-                    .is_some_and(|info| {
-                        info.durability == pb::AppendDurability::Written as i32
-                    }) =>
-            {
-                let object_id = outcome.record.object_id.clone();
-                let checkpoint = crate::mount::checkpoint_write_session(
-                    &self.state,
-                    session_id,
-                    crate::write_owner::CheckpointTrigger::Append,
-                )
-                .await;
-                match checkpoint {
-                    Ok(checkpoint) => committed_overlap_record(&self.state, object_id, checkpoint)
-                        .map(|record| {
-                            outcome.record = record;
-                            outcome
-                        }),
-                    Err(err) => {
-                        receive_task.abort();
-                        let _ = receive_task.await;
-                        return Err(err);
-                    }
-                }
-            }
-            other => other,
+        let mut receive_guard = OverlapReceiveGuard {
+            task: receive_task.abort_handle(),
+            control: control.clone(),
+            armed: true,
         };
-        match append {
-            Ok(outcome) if outcome.replay => {
-                receive_task.abort();
-                let _ = receive_task.await;
-                Ok(Response::new(outcome.record))
-            }
-            Ok(outcome) => {
+        let result = async {
+            if let Err(status) = control.wait_for_prefill().await {
                 let receive = receive_task.await.map_err(|err| {
-                    Status::internal(format!("overlap receive task failed: {err}"))
-                })??;
-                tracing::info!(
-                    target: "remanence_write_diag",
-                    phase = "overlap_complete",
-                    session_id = %session_id,
-                    payload_bytes = receive.bytes,
-                    chunks = receive.chunks,
-                    ring_peak_occupancy_bytes = control.peak_occupancy_bytes(),
-                    elapsed_ms = crate::diagnostics::duration_ms(append_started.elapsed()),
-                    throughput_mib_s = crate::diagnostics::mib_per_s(
-                        receive.bytes,
-                        append_started.elapsed()
-                    ),
-                    "remanence_write_diag",
-                );
-                Ok(Response::new(outcome.record))
+                    Status::internal(format!("overlap receive task failed before prefill: {err}"))
+                })?;
+                return Err(receive.err().unwrap_or(status));
             }
-            Err(actor_status) => {
-                if receive_task.is_finished() || control.failure_message().is_some() {
-                    // Ring failure wakes the actor before the receive task may
-                    // finish returning its status. Join it to retain the ingress
-                    // cause, including DeadlineExceeded, across that race.
-                    if let Ok(Err(receive_status)) = receive_task.await {
-                        // A closed ring is a consequence of the consumer failure.
-                        // Preserve the actor's cause; retain independently detected
-                        // stream validation errors (bad digest, length, or shape).
-                        if receive_status.code() != tonic::Code::Cancelled {
-                            return Err(receive_status);
+            control.record_prefill_lead();
+            tracing::info!(
+                target: "remanence_write_diag",
+                phase = "overlap_prefill",
+                session_id = %session_id,
+                ring_occupancy_bytes = control.occupancy_bytes(),
+                ring_peak_occupancy_bytes = control.peak_occupancy_bytes(),
+                ring_capacity_bytes = control.capacity_bytes(),
+                ring_high_bytes = control.high_bytes(),
+                declared_size_bytes,
+                client_live = true,
+                "remanence_write_diag",
+            );
+
+            let mut source = StreamedWriteSource::new(
+                consumer,
+                declared_size_bytes,
+                start_digest,
+                Arc::clone(&control),
+            );
+            source.mtime = start.mtime.clone();
+            let append_started = Instant::now();
+            let append = crate::mount::append_streamed(
+                &self.state,
+                session_id,
+                source,
+                archive_path_from_start(&start),
+                start.caller_object_id,
+                start_digest,
+            )
+            .await;
+            let append = match append {
+                Ok(mut outcome)
+                    if outcome
+                        .record
+                        .append_commit_info
+                        .as_ref()
+                        .is_some_and(|info| {
+                            info.durability == pb::AppendDurability::Written as i32
+                        }) =>
+                {
+                    let object_id = outcome.record.object_id.clone();
+                    let checkpoint = crate::mount::checkpoint_write_session(
+                        &self.state,
+                        session_id,
+                        crate::write_owner::CheckpointTrigger::Append,
+                    )
+                    .await;
+                    match checkpoint {
+                        Ok(checkpoint) => {
+                            committed_overlap_record(&self.state, object_id, checkpoint).map(
+                                |record| {
+                                    outcome.record = record;
+                                    outcome
+                                },
+                            )
+                        }
+                        Err(err) => {
+                            receive_task.abort();
+                            let _ = receive_task.await;
+                            return Err(err);
                         }
                     }
-                } else {
+                }
+                other => other,
+            };
+            match append {
+                Ok(outcome) if outcome.replay => {
                     receive_task.abort();
                     let _ = receive_task.await;
+                    Ok(Response::new(outcome.record))
                 }
-                Err(actor_status)
+                Ok(outcome) => {
+                    let receive = receive_task.await.map_err(|err| {
+                        Status::internal(format!("overlap receive task failed: {err}"))
+                    })??;
+                    tracing::info!(
+                        target: "remanence_write_diag",
+                        phase = "overlap_complete",
+                        session_id = %session_id,
+                        payload_bytes = receive.bytes,
+                        chunks = receive.chunks,
+                        ring_peak_occupancy_bytes = control.peak_occupancy_bytes(),
+                        elapsed_ms = crate::diagnostics::duration_ms(append_started.elapsed()),
+                        throughput_mib_s = crate::diagnostics::mib_per_s(
+                            receive.bytes,
+                            append_started.elapsed()
+                        ),
+                        "remanence_write_diag",
+                    );
+                    Ok(Response::new(outcome.record))
+                }
+                Err(actor_status) => {
+                    if receive_task.is_finished() || control.failure_message().is_some() {
+                        // Ring failure wakes the actor before the receive task may
+                        // finish returning its status. Join it to retain the ingress
+                        // cause, including DeadlineExceeded, across that race.
+                        if let Ok(Err(receive_status)) = receive_task.await {
+                            // A closed ring is a consequence of the consumer failure.
+                            // Preserve the actor's cause; retain independently detected
+                            // stream validation errors (bad digest, length, or shape).
+                            if receive_status.code() != tonic::Code::Cancelled {
+                                return Err(receive_status);
+                            }
+                        }
+                    } else {
+                        receive_task.abort();
+                        let _ = receive_task.await;
+                    }
+                    Err(actor_status)
+                }
             }
         }
+        .await;
+        receive_guard.armed = false;
+        result
     }
 
     pub(crate) fn library_serial_for_pool_target(

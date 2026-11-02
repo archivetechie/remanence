@@ -390,3 +390,65 @@ fn object_commits_require_session_identity_and_typed_triggers_roundtrip() {
         assert_eq!(log.summary().seal_due, Some(trigger));
     }
 }
+
+/// A stale actor cannot publish Objects after its session's durable end.
+#[test]
+fn stale_actor_commit_after_its_ended_session_is_refused() {
+    let mut log = session(false);
+    let end = ended(&log, 0);
+    log.push(Record::SessionEnded(end), &[]);
+    let row = object(1, 2, None, 3);
+    log.row(row.clone());
+    log.catalog(&row, 3, 0, 17);
+    log.push(Record::Committed(commit(log.reference(), 2, 6, 1)), &[]);
+    assert_eq!(
+        fault(fold::classify(&log.bytes).unwrap_err()),
+        Fault::Invalid("commit for wrong session")
+    );
+}
+
+/// TornPrefix is an exact crash observation, never a live writer identity.
+#[test]
+fn torn_prefix_wire_and_crash_only_final_geometry() {
+    for mutation in 0..6 {
+        let mut log = session(false);
+        let file = TailFile {
+            tape_file_number: 1,
+            identity: TailIdentity::TornPrefix([0x5a; 32]),
+            known_blocks: if mutation == 1 { 0 } else { 2 },
+            unknown_blocks: u64::from(mutation == 2),
+            filemark: if mutation == 3 {
+                TailFilemark::Present
+            } else {
+                TailFilemark::Absent
+            },
+        };
+        let record = Record::PayloadContinuation(Continuation {
+            group: log.group_start(),
+            chunk: Chunk::TailFile(file),
+        });
+        let mut bytes = Vec::new();
+        wire::encode(&record, &mut bytes).unwrap();
+        assert_eq!(
+            wire::decode(Tag::PayloadContinuation, &bytes).unwrap(),
+            record
+        );
+        log.push(record, &[]);
+        if mutation == 4 {
+            tail(&mut log, 2, 1, 0, TailFilemark::Present);
+        }
+        let mut end = ended(&session(false), if mutation == 4 { 2 } else { 1 });
+        end.tail = log.reference();
+        end.reason = if mutation == 5 {
+            SessionEndReason::FailedAppend
+        } else {
+            SessionEndReason::CrashRecovered
+        };
+        log.push(Record::SessionEnded(end), &[]);
+        assert_eq!(
+            fold::replay(log.bytes.as_slice()).is_ok(),
+            mutation == 0,
+            "mutation {mutation}"
+        );
+    }
+}

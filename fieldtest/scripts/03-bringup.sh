@@ -148,7 +148,7 @@ else:
     try:
         payload = json.loads(capture["stdout"])
         notes = payload["data"]["progress"]
-        print("epoch close " + notes["epoch_close"] if notes.get("epoch_close") in ("failed", "not_attempted") else "ok")
+        print("ok")
     except (ValueError, KeyError, TypeError, AttributeError):
         print("unrecognized unload result")
 PYRESULT

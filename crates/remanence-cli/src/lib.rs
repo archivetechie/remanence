@@ -106,6 +106,7 @@ pub use pool_ops::{
 mod media_readiness;
 mod put;
 mod recovery_report;
+mod tape_closeout;
 mod tape_finalize;
 #[cfg(test)]
 #[allow(dead_code)]
@@ -336,6 +337,7 @@ fn rem_debug_only_reason(cmd: &Command) -> Option<&'static str> {
         | Command::Top { .. }
         | Command::TapeAlertsAlias { .. }
         | Command::TapeSupersedeClient(_)
+        | Command::TapeCloseoutClient(_)
         | Command::TapeFinalizeClient(_)
         | Command::TapeInventoryClient(_)
         | Command::TapeVerifyIndexClient(_)
@@ -357,6 +359,7 @@ fn rem_only_reason(cmd: &Command) -> Option<&'static str> {
         | Command::Top { .. }
         | Command::TapeAlertsAlias { .. }
         | Command::TapeSupersedeClient(_)
+        | Command::TapeCloseoutClient(_)
         | Command::TapeFinalizeClient(_)
         | Command::TapeInventoryClient(_)
         | Command::TapeVerifyIndexClient(_)
@@ -775,6 +778,7 @@ impl From<RemCommand> for Command {
                 },
                 RemTapeCommand::SupersedeTail(args) => Self::TapeSupersedeClient(args),
                 RemTapeCommand::Finalize(args) => Self::TapeFinalizeClient(args),
+                RemTapeCommand::Closeout(args) => Self::TapeCloseoutClient(args),
                 RemTapeCommand::Inventory(args) => Self::TapeInventoryClient(args),
                 RemTapeCommand::VerifyIndex(args) => Self::TapeVerifyIndexClient(args),
                 other => Self::Tape {
@@ -837,6 +841,7 @@ fn state_changing_target(cmd: &Command) -> Option<&str> {
         | Command::Top { .. }
         | Command::TapeAlertsAlias { .. }
         | Command::TapeSupersedeClient(_)
+        | Command::TapeCloseoutClient(_)
         | Command::TapeFinalizeClient(_)
         | Command::TapeInventoryClient(_)
         | Command::TapeVerifyIndexClient(_)
@@ -1295,6 +1300,8 @@ enum Command {
     /// Finalize one exact tape through the daemon.
     #[command(name = "tape-finalize-client", hide = true)]
     TapeFinalizeClient(tape_finalize::TapeFinalizeArgs),
+    #[command(hide = true)]
+    TapeCloseoutClient(tape_closeout::TapeCloseoutArgs),
     TapeSupersedeClient(tape_supersede::TapeSupersedeArgs),
 
     /// Read one exact tape's terminal-index inventory through the daemon.
@@ -1798,6 +1805,8 @@ enum RemTapeCommand {
         after_help = "For a standalone drive: rem setup, or pass --device PATH --allow-device SERIAL."
     )]
     Finalize(tape_finalize::TapeFinalizeArgs),
+    /// Protect the committed partial epoch and wait for closeout completion.
+    Closeout(tape_closeout::TapeCloseoutArgs),
 
     /// Read the bounded terminal-index inventory for one exact tape.
     Inventory(tape_inventory::TapeInventoryArgs),
@@ -1820,6 +1829,7 @@ impl From<RemTapeCommand> for TapeCommand {
             RemTapeCommand::WaitReady(args) => Self::WaitReady(args),
             RemTapeCommand::Quarantine { command } => Self::Quarantine { command },
             RemTapeCommand::Retire(args) => Self::Retire(args),
+            RemTapeCommand::Closeout(_) => unreachable!("closeout uses the daemon client"),
             RemTapeCommand::Finalize(_) => {
                 unreachable!("rem tape finalize is dispatched as a daemon client")
             }
@@ -4538,6 +4548,7 @@ where
             return run_drive_client_command(endpoint, *json, &command, out, err);
         }
         Command::TapeSupersedeClient(args) => return tape_supersede::run(args, input, out, err),
+        Command::TapeCloseoutClient(args) => return tape_closeout::run(args, out, err),
         Command::TapeFinalizeClient(args) => return tape_finalize::run(args, out, err),
         Command::TapeInventoryClient(args) => return tape_inventory::run_inventory(args, out, err),
         Command::TapeVerifyIndexClient(args) => {
@@ -4771,6 +4782,7 @@ where
         },
         Command::TapeAlertsAlias { .. } => unreachable!("daemon alias dispatched pre-discovery"),
         Command::TapeSupersedeClient(_) => unreachable!("daemon recovery dispatched pre-discovery"),
+        Command::TapeCloseoutClient(_) => unreachable!("closeout is dispatched earlier"),
         Command::TapeFinalizeClient(_) => {
             unreachable!("daemon tape finalization dispatched pre-discovery")
         }
@@ -6079,39 +6091,8 @@ fn print_drive_unload(
         });
         return print_json_envelope("rem.operation.status.v1", "item", data, out);
     }
-    // `failed`: a close ran and failed. `not_attempted`: no close ran. Neither
-    // says an epoch existed, so the warning only says one may stay open.
-    let epoch_close = operation
-        .progress
-        .get("epoch_close")
-        .filter(|outcome| matches!(outcome.as_str(), "failed" | "not_attempted"))
-        .map(|outcome| {
-            let error = operation
-                .progress
-                .get("epoch_close_error")
-                .cloned()
-                .unwrap_or_default();
-            (outcome == "failed", error)
-        });
     print_operation(operation, false, out)?;
     let cartridge = location.barcode.as_deref().unwrap_or("cartridge");
-    if let Some((ran, error)) = epoch_close {
-        let what = if ran {
-            "closing the parity epoch failed"
-        } else {
-            "no parity epoch close ran"
-        };
-        let reason = if error.is_empty() {
-            String::new()
-        } else {
-            format!(" ({error})")
-        };
-        writeln!(
-            out,
-            "warning: {what} on {cartridge}{reason}; the cartridge was removed anyway, and any open epoch stays open"
-        )
-        .map_err(|error| error.to_string())?;
-    }
     match location.slot {
         Some(slot) => writeln!(
             out,

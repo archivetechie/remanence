@@ -176,6 +176,7 @@ pub(crate) fn supersede(
         return Err(refusal("acknowledgment does not identify the loaded tape"));
     }
     let mut request = crate::pb::SupersedeTailRequest {
+        observed_tape_log_sequence: None,
         tape_uuid: uuid.to_vec(),
         ack_tape_uuid: uuid.to_vec(),
         confirm_supersede: None,
@@ -186,6 +187,7 @@ pub(crate) fn supersede(
         .map_err(legacy_status)?;
     confirm(&preview.required_confirmation, &preview.found).map_err(refusal)?;
     request.confirm_supersede = Some(preview.required_confirmation);
+    request.observed_tape_log_sequence = Some(preview.tape_log_sequence);
     request.expected_found = preview.found;
     client
         .supersede_tail(request)

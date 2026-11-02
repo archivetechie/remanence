@@ -530,7 +530,6 @@ fn mounted_library_terminal_capacity_refusal_keeps_typed_cause() {
             &mut drive,
             &native,
             Some("HAND"),
-            None,
             |_, drive| {
                 drive
                     .test_unit_ready()

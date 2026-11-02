@@ -19,7 +19,9 @@ use remanence_stream::{
 };
 use uuid::Uuid;
 
-use super::capacity::{first_payload_body_lba, uuid_text};
+use super::capacity::first_payload_body_lba;
+#[cfg(test)]
+use super::capacity::uuid_text;
 use super::model::{
     AppendCommitDiagnostics, BatchedAppendPosition, BatchedNoParityAppendContext,
     PoolWriteDurability, PoolWriteError, PoolWriteObjectCopyRecord, PoolWriteObjectRecord,
@@ -35,7 +37,7 @@ use super::prepare::{
     PreparedPoolWrite, PreparedStoredObject, TransferDiagnosticOutcome,
 };
 use super::staging::{
-    run_faulted_counted_fenced_staged_transfer, CountingBlockSink, ObjectDigestBlockSink,
+    run_faulted_counted_staged_transfer, CountingBlockSink, ObjectDigestBlockSink,
 };
 use crate::bytes_to_hex;
 
@@ -52,8 +54,8 @@ use remanence_state::TapeJournalIndexInput;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
-    state: &mut CatalogIndex,
-    fence_cfg: &crate::write_owner::TerminalWriteConfig,
+    _state: &mut CatalogIndex,
+    _fence_cfg: &crate::write_owner::TerminalWriteConfig,
     sink: &mut CountingBlockSink<'_, S>,
     _pool_cfg: &TapePoolConfig,
     request: WriteObjectToPoolRequest,
@@ -70,7 +72,7 @@ pub(super) fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
     }
     let append = match &durability {
         #[cfg(test)]
-        PoolWriteDurability::PerObject => no_parity_append_context(state, &selected)?,
+        PoolWriteDurability::PerObject => no_parity_append_context(_state, &selected)?,
         PoolWriteDurability::Batched(context) => context.append,
     };
     let expected_initial_lba = append.expected_append_lba()?;
@@ -88,10 +90,7 @@ pub(super) fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
     }
     let transfer_started = Instant::now();
     let write_report: Result<StreamingObjectWriteReport, PoolWriteError> =
-        run_faulted_counted_fenced_staged_transfer(
-            state,
-            fence_cfg,
-            &selected,
+        run_faulted_counted_staged_transfer(
             sink,
             selected.block_size as usize,
             overlap_control.as_ref().map(Arc::clone),
@@ -268,7 +267,7 @@ pub(super) fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
         PoolWriteDurability::PerObject => {
             let commit_started = Instant::now();
             let commit_result = commit_pool_write(
-                state,
+                _state,
                 &selected,
                 &prepared,
                 &write_report,
@@ -328,6 +327,7 @@ pub(super) fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
     })
 }
 
+#[cfg(test)]
 pub(super) fn record_tape_io_fence_for_transfer_error(
     state: &mut CatalogIndex,
     fence_cfg: &crate::write_owner::TerminalWriteConfig,
@@ -358,6 +358,7 @@ pub(super) fn record_tape_io_fence_for_transfer_error(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn tape_io_fence_reason_for_transfer_error(error: &str) -> &'static str {
     if error.contains("reset UNIT ATTENTION") {
         "reset_unit_attention"
@@ -370,6 +371,7 @@ pub(super) fn tape_io_fence_reason_for_transfer_error(error: &str) -> &'static s
     }
 }
 
+#[cfg(test)]
 pub(super) fn json_escape(value: &str) -> String {
     value
         .replace('\\', "\\\\")

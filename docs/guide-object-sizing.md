@@ -96,7 +96,7 @@ available spool and memory budget with room for the configured write pipeline.
 
 A checkpoint pays for a synchronizing barrier and a durable commit record; it
 need not end the open epoch. A close commits the last Objects, then the
-recommended session policy ends any remaining short epoch and commits its
+session-owned policy ends any remaining short epoch and commits its
 sidecar. The client can receive durable receipts before parity closeout
 finishes. These are separate costs from each Object's filemark and index rows.
 

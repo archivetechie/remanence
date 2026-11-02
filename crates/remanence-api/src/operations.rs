@@ -5,7 +5,7 @@
 //! progress replay, watch streams, and cancellation tokens for operations that
 //! are currently owned by this daemon process.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -32,8 +32,6 @@ struct OpEntry {
     tx: broadcast::Sender<pb::OperationStatus>,
     cancel: Arc<AtomicBool>,
     verification: Option<pb::TapeIndexVerification>,
-    /// Outcomes a later phase must report, such as a failed epoch close before a removal.
-    notes: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Default)]
@@ -69,7 +67,6 @@ impl OperationRegistry {
             OpEntry {
                 created_at: timestamp_now(),
                 verification: None,
-                notes: BTreeMap::new(),
                 ring: VecDeque::new(),
                 tx: tx.clone(),
                 cancel: cancel.clone(),
@@ -199,24 +196,6 @@ impl OperationHandle {
         }
     }
 
-    /// Keep an outcome that the operation's terminal status (and, for library
-    /// operations, its audit) must carry.
-    pub(crate) fn record_note(&self, key: &str, value: &str) {
-        if let Ok(mut ops) = self.ops.lock() {
-            if let Some(entry) = ops.get_mut(&self.op_id) {
-                entry.notes.insert(key.to_string(), value.to_string());
-            }
-        }
-    }
-
-    pub(crate) fn notes(&self) -> BTreeMap<String, String> {
-        self.ops
-            .lock()
-            .ok()
-            .and_then(|ops| ops.get(&self.op_id).map(|entry| entry.notes.clone()))
-            .unwrap_or_default()
-    }
-
     pub(crate) fn op_id_uuid(&self) -> Uuid {
         self.op_id
     }
@@ -229,18 +208,9 @@ impl OperationHandle {
         self.cancel.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn publish(&self, mut status: pb::OperationStatus) {
+    pub(crate) fn publish(&self, status: pb::OperationStatus) {
         if let Ok(mut ops) = self.ops.lock() {
             if let Some(entry) = ops.get_mut(&self.op_id) {
-                // Every terminal status carries the recorded notes; a phase's own key wins.
-                if is_terminal(&status) {
-                    for (key, value) in &entry.notes {
-                        status
-                            .progress
-                            .entry(key.clone())
-                            .or_insert_with(|| value.clone());
-                    }
-                }
                 push_locked(entry, status);
             }
         }

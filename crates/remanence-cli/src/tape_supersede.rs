@@ -33,6 +33,7 @@ pub(crate) fn run(
         let channel = runtime.block_on(super::connect_daemon(&args.endpoint))?;
         let mut client = pb::catalog_client::CatalogClient::new(channel);
         let mut request = pb::SupersedeTailRequest {
+            observed_tape_log_sequence: None,
             tape_uuid: tape.as_bytes().to_vec(),
             ack_tape_uuid: ack.as_bytes().to_vec(),
             confirm_supersede: None,
@@ -69,6 +70,7 @@ pub(crate) fn run(
             return Err("supersede confirmation did not match".into());
         }
         request.confirm_supersede = Some(confirmation);
+        request.observed_tape_log_sequence = Some(preview.tape_log_sequence);
         request.expected_found = preview.found;
         let completed = runtime
             .block_on(client.supersede_tail(request))

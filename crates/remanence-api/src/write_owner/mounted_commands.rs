@@ -6,7 +6,6 @@ use super::{
     WriteOwnerConfig,
 };
 use remanence_library::DriveHandle;
-use remanence_state::authority::TapeAuthorityView;
 use remanence_state::{AuditEvent, CatalogIndex};
 use tonic::Status;
 use uuid::Uuid;
@@ -161,19 +160,6 @@ pub(super) fn with_evidence<T>(
     }
 }
 
-pub(super) fn close_epoch(
-    index: &mut CatalogIndex,
-    cfg: &WriteOwnerConfig,
-    drive: &mut DriveHandle,
-    bay: u16,
-    retained: &mut Option<super::checkpoint::RetainedParityEpoch>,
-) -> Result<(), Status> {
-    cfg.mounted_ready(index, drive)?;
-    // The shared close opens evidence only after journal authority proves an
-    // epoch needs media work. A no-op finish must not create an orphan candidate.
-    super::checkpoint::close_retained_before_removal(index, drive, cfg, bay, retained, None)
-}
-
 pub(super) fn finalize(
     index: &mut CatalogIndex,
     cfg: &WriteOwnerConfig,
@@ -230,35 +216,7 @@ pub(super) fn finalize(
     )?;
     with_evidence(index, cfg, drive, |index, drive| {
         let terminal = cfg.terminal_config();
-        let pending = remanence_state::TapeAuthority::open(
-            &terminal.checkpoint_journal_dir,
-            request.tape_uuid,
-            index.path(),
-        )
-        .and_then(|journal| journal.pending_finalization())
-        .map_err(crate::status_from_state_error)?;
-        let (prefix, carried) = if pending.is_none()
-            && tape.scheme_id.is_some()
-            && tape.highest_protected_ordinal < tape.total_committed_ordinals
-        {
-            let (plan, state, permit) =
-                super::terminal_finalize::plan_unretained_epoch_finalization(
-                    index,
-                    &terminal,
-                    drive,
-                    &request,
-                    |index, drive| cfg.mounted_ready(index, drive),
-                )?;
-            (
-                Some(plan),
-                state
-                    .zip(permit)
-                    .map(|(state, permit)| (drive.identity_generation(), state, permit)),
-            )
-        } else {
-            (None, None)
-        };
-
+        let prefix = None;
         if let Some(reply) = super::preflight_manual_finalize_with_prefix(
             index,
             super::ManualFinalizePreflightConfig {
@@ -281,7 +239,6 @@ pub(super) fn finalize(
             drive,
             &request,
             tape.voltag.as_deref(),
-            carried,
             |index, drive| {
                 cfg.mounted_ready(index, drive)?;
                 super::write_session::prepare_drive_for_write(
@@ -350,12 +307,18 @@ pub(super) fn supersede(
             generation,
             &Uuid::from_bytes(mounted.tape_uuid).to_string(),
             mounted.actor.clone(),
-            |required, found| {
+            |required, found, sequence| {
                 preview = Some(crate::pb::SupersedeTailResponse {
                     found: found.to_vec(),
                     required_confirmation: required.into(),
+                    tape_log_sequence: sequence,
                     completed: false,
                 });
+                if request.confirm_supersede.is_some()
+                    && request.observed_tape_log_sequence != Some(sequence)
+                {
+                    return Err(match request.observed_tape_log_sequence { Some(expected) => format!("TailPreviewStale: tape-log sequence changed from {expected} to {sequence}; preview supersede-tail again."), None => "observed_tape_log_sequence is required when confirming supersede-tail".into() });
+                }
                 match request.confirm_supersede.as_deref() {
                     None => Err("confirmation required".into()),
                     Some(value) if value == required && request.expected_found == found => Ok(()),

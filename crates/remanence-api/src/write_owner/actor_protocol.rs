@@ -68,12 +68,6 @@ impl From<StdDuration> for DriveUnloadOutcome {
 }
 
 pub(crate) enum ChangerCommand {
-    PlanningMove {
-        src: u16,
-        dst: u16,
-        ownership: std::sync::Arc<crate::mount::PlanningOwnership>,
-        reply: oneshot::Sender<crate::mount::PlanningResult<()>>,
-    },
     Move {
         src: u16,
         dst: u16,
@@ -98,6 +92,17 @@ pub(crate) enum ChangerCommand {
 }
 
 pub(crate) enum DriveCommand {
+    CloseoutTape {
+        progress: crate::closeout_progress::CloseoutProgress,
+        tape_uuid: [u8; 16],
+        expected_pool: Option<String>,
+        needs_drive_load: bool,
+        library_serial: String,
+        barcode: Option<String>,
+        source_slot: Option<u16>,
+        drive_serial: Option<String>,
+        reply: oneshot::Sender<Result<(), Status>>,
+    },
     OpenMountedWrite {
         host_only_recovery: bool,
         pool_cfg: TapePoolConfig,
@@ -191,19 +196,9 @@ pub(crate) enum DriveCommand {
         drive_serial: Option<String>,
         reply: oneshot::Sender<Result<ManualFinalizeTapeActorReply, Status>>,
     },
-    PlanFinalization {
-        ownership: std::sync::Arc<crate::mount::PlanningOwnership>,
-        request: ManualFinalizeTapeActorRequest,
-        needs_drive_load: bool,
-        barcode: Option<String>,
-        source_slot: Option<u16>,
-        drive_serial: Option<String>,
-        reply: oneshot::Sender<crate::mount::PlanningResult<remanence_parity::TerminalPrefixPlan>>,
-    },
     PrepareRemoval {
-        progress: Option<crate::operations::OperationHandle>,
-        /// `Err`: no close ran. `Ok` says what the close did.
-        reply: oneshot::Sender<Result<super::checkpoint::RemovalClose, Status>>,
+        /// Exclusion handshake only; removal never initiates parity work.
+        reply: oneshot::Sender<Result<(), Status>>,
     },
     Unload {
         reply: oneshot::Sender<Result<DriveUnloadOutcome, Status>>,
@@ -242,6 +237,11 @@ pub(crate) enum DriveCommand {
         checkpoint_batch_id: Uuid,
     },
     Close {
+        session_id: Uuid,
+        reply: oneshot::Sender<Result<CloseWriteActorReply, Status>>,
+    },
+    /// The detached open task observed that no caller can receive its session.
+    DisconnectWrite {
         session_id: Uuid,
         reply: oneshot::Sender<Result<CloseWriteActorReply, Status>>,
     },

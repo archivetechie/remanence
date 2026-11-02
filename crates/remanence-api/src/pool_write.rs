@@ -85,6 +85,4 @@ pub(crate) use no_parity::requested_copy_identity;
 
 pub(crate) use no_parity::pool_write_object_record_from_native;
 
-pub(crate) use append::reprove_checkpoint_boundary;
-
 pub(crate) use prepare::write_no_parity_bootstrap;

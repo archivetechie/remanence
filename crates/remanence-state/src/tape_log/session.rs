@@ -1,5 +1,6 @@
 //! Native v2 session metadata and bounded references to streamed abandoned files.
-//! These records are codec/fold primitives; production session emission lands later.
+//! Production writers publish these under the exclusive tape lease; the fold
+//! binds every Object commit and named ending to its session.
 use super::{CheckValue, CommitCursor, GroupRef};
 
 /// A proved physical append boundary, including the dense file number.
@@ -65,6 +66,9 @@ pub enum TailIdentity {
     Object(String),
     /// Canonical sidecar metadata SHA-256.
     Sidecar([u8; 32]),
+    /// Hash of the exact observed blocks of a crash-torn final file. This is
+    /// never a substitute for a live writer's known Object/sidecar identity.
+    TornPrefix([u8; 32]),
 }
 /// One streamed file after the committed cursor; never retained in TapeSummary.
 #[derive(Clone, Debug, PartialEq, Eq)]

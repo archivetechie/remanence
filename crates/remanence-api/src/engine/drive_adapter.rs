@@ -521,7 +521,26 @@ impl MountedCommands {
             reply,
         })?;
         match receive(rx) {
-            Ok(_) => Ok(()),
+            Ok(session) => {
+                if matches!(
+                    session.state(),
+                    pb::write_session::State::WriteSessionStateClosed
+                        | pb::write_session::State::WriteSessionStateAborted
+                ) {
+                    for receipt in &session.checkpointed_objects {
+                        if !self
+                            .receipts
+                            .iter()
+                            .any(|r| r.object_id == receipt.object_id)
+                        {
+                            self.receipts.push(receipt.clone());
+                        }
+                    }
+                    self.session = None;
+                    self.last_session = Some(session);
+                }
+                Ok(())
+            }
             Err(error) if error.status.code() == tonic::Code::NotFound => {
                 self.session = None;
                 if let Some(last) = self.last_session.as_mut() {
@@ -652,6 +671,12 @@ impl MountedCommands {
     /// Claim all committed receipts, including earlier automatic barriers.
     pub fn checkpoint(&mut self) -> Result<pb::WriteSession> {
         self.refresh_session()?;
+        if self.session.is_none() {
+            return self
+                .last_session
+                .clone()
+                .ok_or_else(|| Status::failed_precondition("no write session").into());
+        }
         let session_id = self
             .session
             .as_ref()
@@ -696,11 +721,20 @@ impl MountedCommands {
         let result = receive(rx)?;
         self.session = None;
         self.last_session = Some(result.session.clone());
+        let (reply, rx) = oneshot::channel();
+        self.send(DriveCommand::Get { session_id, reply })?;
+        let _ = receive(rx)?;
         Ok(result.session)
     }
     /// Abort the active session using the actor's existing recovery disposition.
     pub fn abort_session(&mut self, reason: Option<String>) -> Result<pb::WriteSession> {
         self.refresh_session()?;
+        if self.session.is_none() {
+            return self
+                .last_session
+                .clone()
+                .ok_or_else(|| Status::failed_precondition("no write session").into());
+        }
         let session_id = self
             .session
             .as_ref()
@@ -792,7 +826,7 @@ pub(crate) fn mounted_config(
         checkpoint_max_objects: c.daemon.checkpoint_max_objects,
         checkpoint_max_age_seconds: c.daemon.checkpoint_max_age_seconds,
         session_idle_seconds: c.daemon.default_idle_timeout_seconds,
-        lifecycle: None,
+        lifecycle: Some(crate::drive_pool::DrivePoolLifecycle::default()),
         changer_ready_wait: remanence_library::ChangerReadyWait::default(),
         calibration_store: state.calibration_control().clone(),
     })

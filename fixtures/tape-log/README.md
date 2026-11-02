@@ -33,132 +33,139 @@ the exported files here.
 
 Parity-off tape: Initialized and two Object barriers.
 
-- bytes: 1867, SHA-256 f68db2b01939a3eec8285e206a9154b958021784a0f67ecb00754cafc21a5971
+- bytes: 1964, SHA-256 57bae284836432958ebfd4cc0f5b16c3ad7ab69a00d5a086c7c7148fde911b52
 - header: tape UUID a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1, block size 262144, scheme none, 51 bytes
 - tail: complete
-- authoritative prefix: last closed sequence 7, closed end 1867
+- authoritative prefix: last closed sequence 8, closed end 1964
 - counters: objects 2, next file 3, W 0, T 6, check 0000000000000000 (Empty), next epoch 0, cursor 0:10, sealed false
 
 | sequence | tag | offset | end |
 |---:|---|---:|---:|
 | 1 | Initialized (1) | 51 | 150 |
-| 2 | PayloadContinuation (2) | 150 | 343 |
-| 3 | PayloadContinuation (2) | 343 | 824 |
-| 4 | Committed (3) | 824 | 1007 |
-| 5 | PayloadContinuation (2) | 1007 | 1200 |
-| 6 | PayloadContinuation (2) | 1200 | 1683 |
-| 7 | Committed (3) | 1683 | 1867 |
+| 2 | SessionOpened (18) | 150 | 247 |
+| 3 | PayloadContinuation (2) | 247 | 440 |
+| 4 | PayloadContinuation (2) | 440 | 921 |
+| 5 | Committed (3) | 921 | 1104 |
+| 6 | PayloadContinuation (2) | 1104 | 1297 |
+| 7 | PayloadContinuation (2) | 1297 | 1780 |
+| 8 | Committed (3) | 1780 | 1964 |
 
-## parity-object-retained-close.remtape
+## parity-object-session-close.remtape
 
-Parity tape: one Object barrier leaving its epoch open, then a retained close publishing the epoch's sidecar.
+Parity tape: one Object barrier leaving its epoch open, then ClosedOut and SessionEnded publishing the epoch's sidecar and clean end.
 
-- bytes: 1362, SHA-256 b2307f01fc98ef040c30cc53ec0e9ee7d92253d771ff7d19680bffd6f2db4bdf
+- bytes: 1614, SHA-256 3a160f6fbd99604025dd72360cb853cd3cb7ae5a19c738da9603ab1362b9ac5b
 - header: tape UUID a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2, block size 262144, scheme checkpoint-partial-epoch k=8 m=2 S=1, 84 bytes
 - tail: complete
-- authoritative prefix: last closed sequence 6, closed end 1362
-- counters: objects 1, next file 3, W 3, T 3, check 0000000000000000 (Empty), next epoch 1, cursor 0:8, sealed false
+- authoritative prefix: last closed sequence 8, closed end 1614
+- counters: objects 1, next file 3, W 3, T 3, check 0000000000000000 (Empty), next epoch 1, cursor 0:12, sealed false
 
 | sequence | tag | offset | end |
 |---:|---|---:|---:|
 | 1 | Initialized (1) | 84 | 216 |
-| 2 | PayloadContinuation (2) | 216 | 409 |
-| 3 | PayloadContinuation (2) | 409 | 890 |
-| 4 | Committed (3) | 890 | 1073 |
-| 5 | PayloadContinuation (2) | 1073 | 1179 |
-| 6 | Committed (3) | 1179 | 1362 |
+| 2 | SessionOpened (18) | 216 | 313 |
+| 3 | PayloadContinuation (2) | 313 | 506 |
+| 4 | PayloadContinuation (2) | 506 | 987 |
+| 5 | Committed (3) | 987 | 1171 |
+| 6 | PayloadContinuation (2) | 1171 | 1277 |
+| 7 | ClosedOut (17) | 1277 | 1462 |
+| 8 | SessionEnded (19) | 1462 | 1614 |
 
 ## sealed-terminal.remtape
 
 Sealed parity tape: an Object and sidecar barrier, an automatic FinalizationDecided plan, TerminalPrefix, five ComponentWritten records and Sealed.
 
-- bytes: 3426, SHA-256 fa1984fa072dcb5e4bb15cd5f7c98d90c680b847d54aa41854ede6504f004462
+- bytes: 3524, SHA-256 2932aeedea308d9fe344966bc0f67af37a556a70d703d8a68deab9f1552ec33b
 - header: tape UUID a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3, block size 262144, scheme checkpoint-partial-epoch k=8 m=2 S=1, 84 bytes
 - tail: complete
-- authoritative prefix: last closed sequence 21, closed end 3426
+- authoritative prefix: last closed sequence 22, closed end 3524
 - counters: objects 1, next file 9, W 3, T 3, check 0000000000000000 (Empty), next epoch 1, cursor 0:8220, sealed true
 
 | sequence | tag | offset | end |
 |---:|---|---:|---:|
 | 1 | Initialized (1) | 84 | 216 |
-| 2 | PayloadContinuation (2) | 216 | 409 |
-| 3 | PayloadContinuation (2) | 409 | 890 |
-| 4 | PayloadContinuation (2) | 890 | 996 |
-| 5 | Committed (3) | 996 | 1179 |
-| 6 | PayloadContinuation (2) | 1179 | 1285 |
-| 7 | PayloadContinuation (2) | 1285 | 1387 |
-| 8 | FinalizationDecided (7) | 1387 | 1666 |
-| 9 | PayloadContinuation (2) | 1666 | 1772 |
-| 10 | TerminalPrefix (4) | 1772 | 1941 |
-| 11 | PayloadContinuation (2) | 1941 | 2047 |
-| 12 | ComponentWritten (5) | 2047 | 2217 |
-| 13 | PayloadContinuation (2) | 2217 | 2325 |
-| 14 | ComponentWritten (5) | 2325 | 2497 |
-| 15 | PayloadContinuation (2) | 2497 | 2605 |
-| 16 | ComponentWritten (5) | 2605 | 2777 |
-| 17 | PayloadContinuation (2) | 2777 | 2887 |
-| 18 | ComponentWritten (5) | 2887 | 3059 |
-| 19 | PayloadContinuation (2) | 3059 | 3167 |
-| 20 | ComponentWritten (5) | 3167 | 3339 |
-| 21 | Sealed (6) | 3339 | 3426 |
+| 2 | SessionOpened (18) | 216 | 313 |
+| 3 | PayloadContinuation (2) | 313 | 506 |
+| 4 | PayloadContinuation (2) | 506 | 987 |
+| 5 | PayloadContinuation (2) | 987 | 1093 |
+| 6 | Committed (3) | 1093 | 1277 |
+| 7 | PayloadContinuation (2) | 1277 | 1383 |
+| 8 | PayloadContinuation (2) | 1383 | 1485 |
+| 9 | FinalizationDecided (7) | 1485 | 1764 |
+| 10 | PayloadContinuation (2) | 1764 | 1870 |
+| 11 | TerminalPrefix (4) | 1870 | 2039 |
+| 12 | PayloadContinuation (2) | 2039 | 2145 |
+| 13 | ComponentWritten (5) | 2145 | 2315 |
+| 14 | PayloadContinuation (2) | 2315 | 2423 |
+| 15 | ComponentWritten (5) | 2423 | 2595 |
+| 16 | PayloadContinuation (2) | 2595 | 2703 |
+| 17 | ComponentWritten (5) | 2703 | 2875 |
+| 18 | PayloadContinuation (2) | 2875 | 2985 |
+| 19 | ComponentWritten (5) | 2985 | 3157 |
+| 20 | PayloadContinuation (2) | 3157 | 3265 |
+| 21 | ComponentWritten (5) | 3265 | 3437 |
+| 22 | Sealed (6) | 3437 | 3524 |
 
 ## torn-tail.remtape
 
 The parity-off tape with a third group whose closing frame is cut short by EOF. The first two groups remain authoritative.
 
-- bytes: 2574, SHA-256 0d9669f6f7e708a64b97aecdff408ea082c518e245fd35f6c68815073de9486c
+- bytes: 2671, SHA-256 c03e74bd412f1df303a0b55d9f7ba27e221cfd34ab359f12c0e266b9000483e4
 - header: tape UUID a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1, block size 262144, scheme none, 51 bytes
-- tail: torn: short_body at byte 2543
-- authoritative prefix: last closed sequence 7, closed end 1867
+- tail: torn: short_body at byte 2640
+- authoritative prefix: last closed sequence 8, closed end 1964
 - counters: objects 2, next file 3, W 0, T 6, check 0000000000000000 (Empty), next epoch 0, cursor 0:10, sealed false
 
 | sequence | tag | offset | end |
 |---:|---|---:|---:|
 | 1 | Initialized (1) | 51 | 150 |
-| 2 | PayloadContinuation (2) | 150 | 343 |
-| 3 | PayloadContinuation (2) | 343 | 824 |
-| 4 | Committed (3) | 824 | 1007 |
-| 5 | PayloadContinuation (2) | 1007 | 1200 |
-| 6 | PayloadContinuation (2) | 1200 | 1683 |
-| 7 | Committed (3) | 1683 | 1867 |
-| 8 | PayloadContinuation (2) | 1867 | 2060 |
-| 9 | PayloadContinuation (2) | 2060 | 2543 |
+| 2 | SessionOpened (18) | 150 | 247 |
+| 3 | PayloadContinuation (2) | 247 | 440 |
+| 4 | PayloadContinuation (2) | 440 | 921 |
+| 5 | Committed (3) | 921 | 1104 |
+| 6 | PayloadContinuation (2) | 1104 | 1297 |
+| 7 | PayloadContinuation (2) | 1297 | 1780 |
+| 8 | Committed (3) | 1780 | 1964 |
+| 9 | PayloadContinuation (2) | 1964 | 2157 |
+| 10 | PayloadContinuation (2) | 2157 | 2640 |
 
 ## zero-filled-tail.remtape
 
 The two-Object parity-off log followed by 4096 zero bytes, as a filesystem may leave an unsynced append after power loss.
 
-- bytes: 5963, SHA-256 bc35cc32c73f7251ae5ffea6dd77c52e45615069e00460d9e4d43f6ab1b754ab
+- bytes: 6060, SHA-256 ea207261f2502f1e6bdba354a46b478cd1fa9a9f1abd01762ecc96c186c99496
 - header: tape UUID a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1, block size 262144, scheme none, 51 bytes
-- tail: torn: zero_filled at byte 1867
-- authoritative prefix: last closed sequence 7, closed end 1867
+- tail: torn: zero_filled at byte 1964
+- authoritative prefix: last closed sequence 8, closed end 1964
 - counters: objects 2, next file 3, W 0, T 6, check 0000000000000000 (Empty), next epoch 0, cursor 0:10, sealed false
 
 | sequence | tag | offset | end |
 |---:|---|---:|---:|
 | 1 | Initialized (1) | 51 | 150 |
-| 2 | PayloadContinuation (2) | 150 | 343 |
-| 3 | PayloadContinuation (2) | 343 | 824 |
-| 4 | Committed (3) | 824 | 1007 |
-| 5 | PayloadContinuation (2) | 1007 | 1200 |
-| 6 | PayloadContinuation (2) | 1200 | 1683 |
-| 7 | Committed (3) | 1683 | 1867 |
+| 2 | SessionOpened (18) | 150 | 247 |
+| 3 | PayloadContinuation (2) | 247 | 440 |
+| 4 | PayloadContinuation (2) | 440 | 921 |
+| 5 | Committed (3) | 921 | 1104 |
+| 6 | PayloadContinuation (2) | 1104 | 1297 |
+| 7 | PayloadContinuation (2) | 1297 | 1780 |
+| 8 | Committed (3) | 1780 | 1964 |
 
 ## recovery-required-tail.remtape
 
 The two-Object parity-off log with one bit flipped in the last closing frame's structural section. Only the first group is authoritative.
 
-- bytes: 1867, SHA-256 502248b03eb93e4e7bb3ad396ab7994199d9935ec10b88425d61d4c646fe1c7b
+- bytes: 1964, SHA-256 a8eb4e9b4ebd5a4d86fe9995768a5636904f5023a9b59977d35e76afebc2980c
 - header: tape UUID a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1, block size 262144, scheme none, 51 bytes
-- tail: recovery required at byte 1683, sequence 7: bad Structural CRC
-- authoritative prefix: last closed sequence 4, closed end 1007
+- tail: recovery required at byte 1780, sequence 8: bad Structural CRC
+- authoritative prefix: last closed sequence 5, closed end 1104
 - counters: objects 1, next file 2, W 0, T 3, check 0000000000000000 (Empty), next epoch 0, cursor 0:6, sealed false
 
 | sequence | tag | offset | end |
 |---:|---|---:|---:|
 | 1 | Initialized (1) | 51 | 150 |
-| 2 | PayloadContinuation (2) | 150 | 343 |
-| 3 | PayloadContinuation (2) | 343 | 824 |
-| 4 | Committed (3) | 824 | 1007 |
-| 5 | PayloadContinuation (2) | 1007 | 1200 |
-| 6 | PayloadContinuation (2) | 1200 | 1683 |
+| 2 | SessionOpened (18) | 150 | 247 |
+| 3 | PayloadContinuation (2) | 247 | 440 |
+| 4 | PayloadContinuation (2) | 440 | 921 |
+| 5 | Committed (3) | 921 | 1104 |
+| 6 | PayloadContinuation (2) | 1104 | 1297 |
+| 7 | PayloadContinuation (2) | 1297 | 1780 |

@@ -1,6 +1,9 @@
 //! Write-session state, append handling, close, and media preparation.
 
+use ciborium::Value as CborValue;
 use remanence_state::authority::TapeAuthorityView;
+use remanence_state::SourceLayer;
+use std::collections::BTreeMap;
 use std::time::{Duration as StdDuration, Instant};
 
 use remanence_library::{DriveHandle, DriveHandleSink, DriveHandleSource, TapeConfig};
@@ -20,8 +23,8 @@ use super::actor_runtime::{
 };
 use super::checkpoint::{
     arm_checkpoint_idle_close, arm_checkpoint_timer, extend_durable_checkpoint_records,
-    fence_failed_checkpoint_batch, fence_failed_parity_raw_write, open_parity_actor_session,
-    park_timer_closed_session, perform_checkpoint_barrier, project_checkpoint_authority_bounded,
+    fence_failed_parity_raw_write, open_parity_actor_session, park_timer_closed_session,
+    perform_checkpoint_barrier, project_checkpoint_authority_bounded,
     validate_parity_actor_authority, ParityActorSession, PendingCheckpointBatch, SessionAppendGate,
 };
 use super::read_session::session_open_reject_tape_io_fences;
@@ -29,10 +32,7 @@ use super::readiness::session_open_short_probe_or_load;
 use super::restore::{
     now_rfc3339, session_proto, status_from_selected_write_error, WriteSessionProtoInput,
 };
-use super::terminal_finalize::{
-    finalize_terminal_no_parity, finalize_terminal_with_parity,
-    finalize_terminal_with_parity_journal,
-};
+use super::terminal_finalize::{finalize_terminal_no_parity, finalize_terminal_with_parity};
 use super::terminal_types::TerminalFinalizeSpec;
 use super::{
     retain_committed_receipt, send_checkpoint_actor_reply, validate_provisional_replay_guards,
@@ -49,12 +49,10 @@ pub(super) struct CloseWriteActorInput<'a> {
     cfg: &'a WriteOwnerConfig,
     drive: &'a mut DriveHandle,
     drive_uuid: &'a Option<Vec<u8>>,
-    drive_serial: &'a Option<String>,
     snapshot_misses: &'a mut u32,
     session_id: Uuid,
     tape_uuid: TapeUuid,
     target_kind: pb::write_session::TargetKind,
-    library_serial: Option<&'a str>,
     bay: u16,
     objects_committed: u64,
     bytes_committed: u64,
@@ -63,14 +61,11 @@ pub(super) struct CloseWriteActorInput<'a> {
     state: pb::write_session::State,
     append_commit_diagnostics: crate::pool_write::AppendCommitDiagnostics,
     checkpointed_objects: &'a [pb::ObjectRecord],
-    /// Set only on the abort path, and only when the caller gave a reason.
-    abort_reason: Option<String>,
 }
 
 pub(super) fn close_write_actor(
     input: CloseWriteActorInput<'_>,
 ) -> Result<CloseWriteActorReply, Status> {
-    input.drive.clear_append_admission();
     let mut diagnostics = CloseWriteActorDiagnostics {
         filemark_write_drain: input.append_commit_diagnostics.filemark_write_drain,
         catalog_journal_fsync: input.append_commit_diagnostics.catalog_journal_fsync,
@@ -107,23 +102,6 @@ pub(super) fn close_write_actor(
         .iter()
         .flat_map(|object| object.copies.iter().cloned())
         .collect();
-    let audit_started = Instant::now();
-    record_session_event(
-        input.index,
-        input.cfg,
-        SessionAuditInput {
-            session_id: input.session_id,
-            session_kind: "write",
-            event: AuditEvent::SessionClosed,
-            tape_uuid: Some(input.tape_uuid),
-            library_serial: input.library_serial.map(str::to_owned),
-            drive_bay: Some(input.bay),
-            drive_uuid: input.drive_uuid.clone(),
-            drive_serial: input.drive_serial.clone(),
-            abort_reason: input.abort_reason,
-        },
-    )?;
-    diagnostics.session_audit_projection = audit_started.elapsed();
 
     Ok(CloseWriteActorReply {
         session,
@@ -145,6 +123,11 @@ type FinishRequest = (
 );
 
 pub(super) struct WriteSessionState<'a> {
+    closing_work: Option<crate::drive_pool::ClosingGuard>,
+    end_reason: remanence_state::tape_log::SessionEndReason,
+    ended_durably: bool,
+    abort_reason: Option<String>,
+    tail: super::session_tail::SessionTail,
     timers: super::timers::SessionTimers,
     finish_request: Option<FinishRequest>,
     bay: u16,
@@ -180,9 +163,26 @@ pub(super) struct WriteSessionState<'a> {
 }
 
 impl WriteSessionState<'_> {
+    fn begin_closing_work(&mut self) {
+        if self.closing_work.is_none() {
+            if let Some(lifecycle) = &self.cfg.lifecycle {
+                self.closing_work = Some(lifecycle.closing.begin(
+                    self.tape_uuid,
+                    self.pool_cfg.id.clone(),
+                    self.cfg.endpoint(self.bay),
+                ));
+            }
+        }
+    }
+
     /// Retain durable receipts and accounting before any fallible context renewal.
     fn retain_checkpoint_outcome(&mut self, outcome: &super::checkpoint::BarrierOutcome) {
         extend_durable_checkpoint_records(&mut self.durable_checkpoint_records, outcome);
+        if let Err(error) = self.tail.committed(outcome.checkpoint_record.next_file) {
+            tracing::error!(%error, "failed to clear committed tail evidence");
+            self.append_gate.record_failure();
+            self.begin_closing_work();
+        }
         for record in &outcome.committed_objects {
             retain_committed_receipt(&mut self.committed_receipts, record);
         }
@@ -197,51 +197,7 @@ impl WriteSessionState<'_> {
             });
         if outcome.sealed_after_write {
             self.append_gate.record_sealed();
-        }
-    }
-
-    /// Protect a resumed committed tail when a session ends without a memory grant.
-    fn close_unretained_committed_epoch(&mut self) -> Result<(), Status> {
-        if self.pending_batch.is_some() || self.append_gate.poisoned || self.append_gate.sealed {
-            return Ok(());
-        }
-        let Some(parity) = self.parity_session.as_mut() else {
-            return Ok(());
-        };
-        if (parity.retention.is_some() && !parity.close_at_barrier)
-            || !parity.sink_state.as_ref().is_some_and(|state| {
-                state
-                    .terminal_triple_capacity_runtime_state()
-                    .is_ok_and(|runtime| runtime.current_epoch_fill_blocks > 0)
-            })
-        {
-            return Ok(());
-        }
-        parity.close_at_barrier = true;
-        tracing::info!(target: "remanence_write_diag", phase = "parity_retention",
-            tape_uuid = %Uuid::from_bytes(self.tape_uuid), retained = false,
-            reserved_bytes = super::checkpoint::retained_epoch_bytes(&parity.scheme, self.selected.block_size),
-            close_reason = "io_memory_ceiling", "remanence_write_diag");
-        match super::checkpoint::close_committed_epoch(
-            self.index,
-            self.drive,
-            self.cfg,
-            &mut self.checkpoint_lease,
-            &mut self.checkpoint_ordinal,
-            &mut self.tape_committed_object_count,
-            parity,
-            &self.selected,
-            &self.pool_cfg,
-            true,
-        ) {
-            Ok(outcome) => {
-                self.retain_checkpoint_outcome(&outcome);
-                Ok(())
-            }
-            Err(failure) => {
-                self.append_gate.record_failure();
-                Err(failure.status)
-            }
+            self.begin_closing_work();
         }
     }
 
@@ -285,9 +241,23 @@ impl WriteSessionState<'_> {
                 }
                 command @ DriveCommand::AppendFinish { .. } => {
                     self.handle_append_finish(command);
+                    if self.append_gate.poisoned || self.append_gate.sealed {
+                        if self.append_gate.sealed {
+                            self.end_reason =
+                                remanence_state::tape_log::SessionEndReason::CleanClose;
+                        }
+                        break;
+                    }
                 }
                 command @ DriveCommand::Checkpoint { .. } => {
                     self.handle_checkpoint(command);
+                    if self.append_gate.poisoned || self.append_gate.sealed {
+                        if self.append_gate.sealed {
+                            self.end_reason =
+                                remanence_state::tape_log::SessionEndReason::CleanClose;
+                        }
+                        break;
+                    }
                 }
                 command @ DriveCommand::TimerIdleClose { .. } => {
                     if self.handle_timer_idle_close(command) {
@@ -295,7 +265,20 @@ impl WriteSessionState<'_> {
                     }
                 }
                 command @ DriveCommand::Close { .. } => {
-                    if self.handle_close(command) {
+                    if self.handle_close(command) || self.append_gate.poisoned {
+                        break;
+                    }
+                }
+                DriveCommand::DisconnectWrite { session_id, reply } => {
+                    let owns = session_id == self.session_id;
+                    self.handle_abort(DriveCommand::Abort {
+                        session_id,
+                        reason: None,
+                        reply,
+                    });
+                    if owns {
+                        self.end_reason =
+                            remanence_state::tape_log::SessionEndReason::ClientDisconnected;
                         break;
                     }
                 }
@@ -327,6 +310,9 @@ impl WriteSessionState<'_> {
                         "write session already active",
                     )));
                 }
+                DriveCommand::CloseoutTape { reply, .. } => {
+                    let _ = reply.send(Err(Status::failed_precondition("session already active")));
+                }
                 DriveCommand::SupersedeTail { reply, .. } => {
                     let _ = reply.send(Err(Status::failed_precondition(
                         "drive has an active session",
@@ -346,13 +332,6 @@ impl WriteSessionState<'_> {
                         .publish_failed("write session already active", &[("phase", "admission")]);
                     drop(reservation);
                     handle.wake_readiness();
-                }
-                DriveCommand::PlanFinalization {
-                    reply, ownership, ..
-                } => {
-                    let _ = reply.send(ownership.complete(Err(Status::failed_precondition(
-                        "drive actor cannot plan finalization in its current state",
-                    ))));
                 }
                 DriveCommand::PrepareRemoval { reply, .. } => {
                     let _ = reply.send(Err(Status::failed_precondition(
@@ -387,49 +366,333 @@ impl WriteSessionState<'_> {
                 }
             }
         }
-        if self.pending_batch.is_some() {
-            if let Err(error) = crate::append_admission::abandon_pending_append(
-                self.drive,
-                &mut self.checkpoint_lease,
-            ) {
-                let _ = fence_failed_parity_raw_write(
-                    self.index,
-                    self.cfg,
-                    &self.selected,
-                    "abandonment",
-                    None,
-                    self.pending_batch.as_ref(),
-                    &error,
-                    Status::unavailable(error.clone()),
-                );
+        if self
+            .cfg
+            .lifecycle
+            .as_ref()
+            .is_some_and(|l| l.shutting_down.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            self.end_reason = remanence_state::tape_log::SessionEndReason::GracefulShutdown;
+        }
+        self.begin_closing_work();
+        if let Err(error) = self.finish_session() {
+            if !self.ended_durably {
+                let _ = raise_tape_io_fence(self.index, self.cfg, remanence_state::TapeIoFenceInput {
+                    tape_uuid: self.tape_uuid, barcode: None, reason: "AuthorityAmbiguous".into(),
+                    evidence_json: Some(serde_json::json!({"session_id":self.session_id,"error":error.to_string()}).to_string()),
+                }, self.selected.standalone_endpoint.as_ref());
             }
-            self.pending_batch = None;
+            if let Some((reply, _)) = self.deferred_close_reply.take() {
+                let _ = reply.send(Err(error.clone()));
+            }
+            tracing::error!(%error, session_id=%self.session_id, "write session ending failed");
         }
         self.drive.clear_append_admission();
-        self.deferred_close_reply.take()
+        None
+    }
+
+    fn finish_session(&mut self) -> Result<(), Status> {
+        use remanence_state::tape_log::SessionEndReason;
+        self.checkpoint_lease
+            .cancel_staged_report()
+            .map_err(status_from_state_error)?;
+        if self.tail.drive_failed() && self.end_reason != SessionEndReason::GracefulShutdown {
+            self.end_reason = SessionEndReason::DriveError;
+        }
+        let clean = !self.append_gate.poisoned
+            && self.pending_batch.is_none()
+            && matches!(
+                self.end_reason,
+                SessionEndReason::CleanClose
+                    | SessionEndReason::ClientStall
+                    | SessionEndReason::GracefulShutdown
+            );
+        let finalization = self
+            .checkpoint_lease
+            .pending_finalization()
+            .map_err(status_from_state_error)?;
+        if clean {
+            if let Some((reply, result)) = self.deferred_close_reply.take() {
+                let _ = reply.send(Ok(result));
+            }
+            let result = if finalization.is_some() {
+                Ok(None)
+            } else {
+                super::checkpoint::closeout(
+                    self.index,
+                    self.drive,
+                    self.cfg,
+                    &self.selected,
+                    &mut self.checkpoint_lease,
+                    self.parity_session.take(),
+                    None,
+                )
+            };
+            match result {
+                Ok(_) => {
+                    let last = self
+                        .checkpoint_lease
+                        .latest_commit()
+                        .map_err(status_from_state_error)?;
+                    self.tail
+                        .committed(last.as_ref().map_or(1, |c| c.next_file))
+                        .map_err(|e| Status::internal(e.to_string()))?;
+                }
+                Err(error) => {
+                    self.checkpoint_lease
+                        .ensure_abandonment_allowed()
+                        .map_err(status_from_state_error)?;
+                    tracing::warn!(%error, "post-reply closeout failed");
+                    self.end_reason = SessionEndReason::CloseoutFailed;
+                }
+            }
+        }
+        self.drive.set_media_dispatch_observer(None);
+        let next_file = self
+            .checkpoint_lease
+            .latest_commit()
+            .map_err(status_from_state_error)?
+            .map_or(1, |c| c.next_file);
+        let files = self
+            .tail
+            .files()
+            .map_err(|e| Status::internal(e.to_string()))?
+            .filter(move |file| {
+                file.as_ref()
+                    .is_ok_and(|file| file.tape_file_number >= next_file)
+                    || file.is_err()
+            });
+        self.checkpoint_lease
+            .end_session(
+                *self.session_id.as_bytes(),
+                now_rfc3339().map_err(|e| Status::internal(e.to_string()))?,
+                self.end_reason,
+                None,
+                files,
+            )
+            .map_err(status_from_state_error)?;
+        self.ended_durably = true;
+        if let Some(mounted) = self.cfg.mounted() {
+            *mounted
+                .audit_session
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+        }
+        let sequence = self
+            .checkpoint_lease
+            .freeze()
+            .map_err(status_from_state_error)?
+            .log_reference()
+            .0;
+        let mut detail = BTreeMap::from([
+            ("session_kind".into(), CborValue::Text("write".into())),
+            (
+                "tape_uuid".into(),
+                CborValue::Bytes(self.tape_uuid.to_vec()),
+            ),
+            (
+                "tape_log_sequence".into(),
+                CborValue::Integer(sequence.into()),
+            ),
+            (
+                "end_reason".into(),
+                CborValue::Text(
+                    match self.end_reason {
+                        SessionEndReason::CleanClose => "clean_close",
+                        SessionEndReason::Abort => "abort",
+                        SessionEndReason::FailedAppend => "failed_append",
+                        SessionEndReason::ClientStall => "client_stall",
+                        SessionEndReason::DriveError => "drive_error",
+                        SessionEndReason::GracefulShutdown => "graceful_shutdown",
+                        SessionEndReason::ClientDisconnected => "client_disconnected",
+                        SessionEndReason::CrashRecovered => "crash_recovered",
+                        SessionEndReason::CloseoutFailed => "closeout_failed",
+                    }
+                    .into(),
+                ),
+            ),
+        ]);
+        if let Some(reason) = &self.abort_reason {
+            detail.insert("abort_reason".into(), CborValue::Text(reason.clone()));
+        }
+        if let Some(library) = &self.library_serial {
+            detail.insert("library_serial".into(), CborValue::Text(library.clone()));
+            detail.insert(
+                "drive_bay".into(),
+                CborValue::Integer(u64::from(self.bay).into()),
+            );
+        }
+        if let Some(id) = &self.drive_uuid {
+            detail.insert("drive_uuid".into(), CborValue::Bytes(id.clone()));
+        }
+        if let Some(serial) = &self.drive_serial {
+            detail.insert("drive_serial".into(), CborValue::Text(serial.clone()));
+        }
+        if let Some(mounted) = self.cfg.mounted() {
+            detail.remove("drive_uuid");
+            if let remanence_library::DriveKey::Bay {
+                library_serial,
+                bay,
+            } = &mounted.endpoint
+            {
+                detail.insert(
+                    "library_serial".into(),
+                    CborValue::Text(library_serial.clone()),
+                );
+                detail.insert(
+                    "drive_bay".into(),
+                    CborValue::Integer(u64::from(*bay).into()),
+                );
+            }
+            detail.insert(
+                "endpoint_key".into(),
+                CborValue::Text(mounted.endpoint.encode()),
+            );
+        }
+        let audit_result = crate::audit_projection::append_and_project_audit(
+            self.index,
+            &self.cfg.audit_dir,
+            true,
+            &self.cfg.audit_append_lock,
+            crate::audit_projection::ProjectedAuditInput {
+                actor: self
+                    .cfg
+                    .mounted()
+                    .map_or(AuditActor::System, |m| m.actor.clone()),
+                source_layer: SourceLayer::Layer5,
+                operation_id: None,
+                session_id: Some(self.session_id),
+                idempotency_key: None,
+                event: AuditEvent::SessionClosed,
+                subject_kind: "write",
+                subject_id: Some(self.session_id.to_string()),
+                detail,
+            },
+        );
+        if let Some(lifecycle) = &self.cfg.lifecycle {
+            let mut session = session_proto(WriteSessionProtoInput {
+                session_id: self.session_id,
+                tape_uuid: &self.tape_uuid,
+                target_kind: self.target_kind,
+                state: if clean {
+                    pb::write_session::State::WriteSessionStateClosed
+                } else {
+                    pb::write_session::State::WriteSessionStateAborted
+                },
+                objects_committed: self.objects_committed,
+                bytes_committed: self.bytes_committed,
+                opened_at_utc: &self.opened_at_utc,
+                last_checkpoint_at_utc: self.last_checkpoint_at_utc.as_deref(),
+                drive_element_address: self.cfg.wire_bay(self.bay),
+                pending_batch: None,
+            });
+            session.checkpointed_objects = self.committed_receipts.clone();
+            session.committed_copies = self
+                .committed_receipts
+                .iter()
+                .flat_map(|object| object.copies.iter().cloned())
+                .collect();
+            let mut ended = lifecycle.ended_writes.lock().unwrap();
+            if ended.len() >= 1024 {
+                if let Some(id) = ended.keys().next().copied() {
+                    ended.remove(&id);
+                }
+            }
+            ended.insert(self.session_id, (session, finalization.is_some()));
+        }
+        if let Some((reply, result)) = self.deferred_close_reply.take() {
+            let _ = reply.send(Ok(result));
+        }
+        self.pending_batch = None;
+        let mut parity = self.parity_session.take();
+        let permit = parity.as_mut().and_then(|session| session.permit.take());
+        if let Some(intent) = finalization {
+            let previous = self
+                .checkpoint_lease
+                .latest_commit()
+                .map_err(status_from_state_error)?
+                .ok_or_else(|| Status::internal("finalization lacks committed boundary"))?;
+            let spec =
+                TerminalFinalizeSpec::automatic(&self.selected, &self.pool_cfg, intent.trigger);
+            self.drive
+                .test_unit_ready()
+                .map_err(|e| Status::unavailable(format!("terminal readiness: {e}")))?;
+            prepare_drive_for_write(
+                self.drive,
+                &self.tape_uuid,
+                self.selected.block_size,
+                self.session_id,
+                WriteMediaPolicy::RewritableObject,
+            )?;
+            let config = self
+                .drive
+                .read_config()
+                .map_err(|e| Status::unavailable(e.to_string()))?;
+            let rewritable = matches!(config.worm, remanence_library::WormMediaState::NotWorm);
+            self.checkpoint_lease.finish_structural_scope();
+            let result = match self.selected.parity_config {
+                remanence_parity::ParityConfig::None => finalize_terminal_no_parity(
+                    self.index,
+                    self.cfg,
+                    self.drive,
+                    &mut self.checkpoint_lease,
+                    &previous,
+                    Some(intent),
+                    &spec,
+                    &self.selected,
+                    None,
+                    rewritable,
+                ),
+                remanence_parity::ParityConfig::Scheme(_) => finalize_terminal_with_parity(
+                    self.index,
+                    self.cfg,
+                    self.drive,
+                    &mut self.checkpoint_lease,
+                    &previous,
+                    Some(intent),
+                    &spec,
+                    &self.selected,
+                    None,
+                    rewritable,
+                    parity.and_then(|mut session| session.sink_state.take()),
+                    permit,
+                ),
+            }?;
+            if result.final_record.is_some() {
+                append_tape_sealed_evidence(self.index, self.cfg, self.tape_uuid)?;
+            }
+            return audit_result.map(|_| ());
+        }
+        drop(parity);
+        if !clean && self.end_reason != SessionEndReason::DriveError && !self.tail.drive_failed() {
+            self.checkpoint_lease.finish_structural_scope();
+            super::checkpoint::closeout(
+                self.index,
+                self.drive,
+                self.cfg,
+                &self.selected,
+                &mut self.checkpoint_lease,
+                None,
+                permit,
+            )?;
+        }
+        audit_result.map(|_| ())
     }
 
     /// Complete one accepted append and advance provisional checkpoint state.
     fn handle_append_finish(&mut self, mut command: DriveCommand) {
-        if self.cfg.mounted().is_none() {
-            return self.handle_append_finish_inner(command);
-        }
         let DriveCommand::AppendFinish { reply, .. } = &mut command else {
             unreachable!("append handler received another drive command");
         };
         let (inner_reply, mut rx) = oneshot::channel();
         let reply = std::mem::replace(reply, inner_reply);
-        let before = self.drive.media_write_dispatch_count();
         self.handle_append_finish_inner(command);
         let outcome = rx
             .try_recv()
             .unwrap_or_else(|_| Err(Status::internal("append omitted its reply")));
-        let outcome = match outcome {
-            Err(status) if self.drive.media_write_dispatch_count() != before => Err(
-                super::mounted_commands::fence_failed_write(self.index, self.cfg, status),
-            ),
-            result => result,
-        };
+        if self.append_gate.poisoned || self.append_gate.sealed {
+            self.begin_closing_work();
+        }
         let _ = reply.send(outcome);
     }
 
@@ -634,6 +897,7 @@ impl WriteSessionState<'_> {
                                     selected.clone(),
                                     &cfg.io_memory,
                                     &mut parity_raw_write_attempted,
+                                    Some(&self.tail),
                                 )
                             }
                             None => Err(PoolWriteError::InvalidInput(
@@ -653,6 +917,7 @@ impl WriteSessionState<'_> {
                             selected.clone(),
                             live_write_counter,
                             append,
+                            Some(&self.tail),
                         )
                     } else {
                         Err(PoolWriteError::InvalidInput(
@@ -684,6 +949,7 @@ impl WriteSessionState<'_> {
                                 Ok(context) => context,
                                 Err(err) => {
                                     self.append_gate.record_failure();
+                                    self.begin_closing_work();
                                     let _ = reply.send(Err(status_from_selected_write_error(
                                         &selected, err,
                                     )));
@@ -758,6 +1024,7 @@ impl WriteSessionState<'_> {
                                         Ok(context) => context,
                                         Err(err) => {
                                             self.append_gate.record_failure();
+            self.begin_closing_work();
                                             self.pending_batch = None;
                                             let _ = reply.send(Err(status_from_selected_write_error(&selected, err)));
                                             return;
@@ -776,31 +1043,9 @@ impl WriteSessionState<'_> {
                             }
                             Err(failure) => {
                                 let quarantine_identities = failure.requires_identity_quarantine();
-                                if failure.fence_handled && failure.durability_uncertain {
-                                    if let Err(error) =
-                                        crate::append_admission::abandon_pending_append(
-                                            self.drive,
-                                            &mut self.checkpoint_lease,
-                                        )
-                                    {
-                                        tracing::warn!(%error, "fenced batch abandonment marker failed");
-                                    }
-                                }
-                                let status =
-                                    if !failure.durability_uncertain || failure.fence_handled {
-                                        failure.status
-                                    } else {
-                                        fence_failed_checkpoint_batch(
-                                            self.drive,
-                                            &mut self.checkpoint_lease,
-                                            self.index,
-                                            cfg,
-                                            &selected,
-                                            batch,
-                                            failure.status,
-                                        )
-                                    };
+                                let status = failure.status;
                                 self.append_gate.record_failure();
+                                self.begin_closing_work();
                                 if quarantine_identities {
                                     self.pending_batch
                                         .as_mut()
@@ -880,98 +1125,39 @@ impl WriteSessionState<'_> {
                         let _ = reply.send(Err(status));
                         return;
                     }
-                    let drive_config = match self.drive.read_config() {
-                        Ok(config) => config,
-                        Err(error) => {
-                            self.append_gate.record_failure();
-                            let _ = reply.send(Err(Status::unavailable(format!(
-                                "read {terminal_reason} drive config: {error}"
-                            ))));
-                            return;
-                        }
-                    };
-                    if drive_config.write_protected {
-                        self.append_gate.record_failure();
-                        let _ = reply.send(Err(Status::failed_precondition(format!(
-                            "tape is write-protected and cannot complete {terminal_reason} finalization"
-                        ))));
-                        return;
-                    }
-                    let rewritable = matches!(
-                        drive_config.worm,
-                        remanence_library::WormMediaState::NotWorm
-                    );
                     let spec =
                         TerminalFinalizeSpec::automatic(&selected, &pool_cfg, terminal_trigger);
-                    let terminal_result = match &selected.parity_config {
-                        remanence_parity::ParityConfig::None => finalize_terminal_no_parity(
-                            self.index,
-                            cfg,
-                            self.drive,
-                            &mut self.checkpoint_lease,
-                            self.durable_checkpoint_records
-                                .last()
-                                .expect("automatic finalization requires checkpoint authority"),
-                            None,
-                            &spec,
-                            &selected,
-                            None,
-                            rewritable,
-                        ),
-                        remanence_parity::ParityConfig::Scheme(_) => self
-                            .checkpoint_lease
-                            .with_structural(|checkpoint, structural| match structural {
-                                Some(parity_journal) => finalize_terminal_with_parity_journal(
-                                    self.index,
-                                    cfg,
-                                    self.drive,
-                                    checkpoint,
-                                    self.durable_checkpoint_records.last().expect(
-                                        "automatic finalization requires checkpoint authority",
-                                    ),
-                                    None,
-                                    &spec,
-                                    &selected,
-                                    None,
-                                    parity_journal,
-                                    rewritable,
-                                    self.parity_session
-                                        .as_mut()
-                                        .and_then(|s| s.sink_state.take()),
-                                    None,
-                                ),
-                                None => Err(Status::internal(
-                                    "automatic parity rollover has no session-owned append journal",
-                                )),
-                            })
-                            .map_err(crate::status_from_state_error)
-                            .and_then(|result| result),
-                    };
-                    match terminal_result {
-                        Ok(result) => {
+                    let previous = self
+                        .durable_checkpoint_records
+                        .last()
+                        .expect("rollover checkpoint")
+                        .clone();
+                    let result = self
+                        .checkpoint_lease
+                        .with_structural(|checkpoint, rows| {
+                            super::terminal_finalize::decide_live_finalization(
+                                self.index,
+                                self.drive,
+                                checkpoint,
+                                &previous,
+                                &spec,
+                                &selected,
+                                self.parity_session.as_mut(),
+                                rows,
+                            )
+                        })
+                        .map_err(status_from_state_error)
+                        .and_then(|result| result);
+                    match result {
+                        Ok(()) => {
                             self.append_gate.record_sealed();
-                            if let Some(record) = result.final_record {
-                                self.checkpoint_ordinal = record.ordinal;
-                                self.durable_checkpoint_records.clear();
-                                self.durable_checkpoint_records.push(record);
-                                if let Err(error) =
-                                    append_tape_sealed_evidence(self.index, cfg, selected.tape_uuid)
-                                {
-                                    tracing::warn!(%error, %terminal_reason, "failed to append automatic terminal seal evidence");
-                                }
-                                let _ = reply.send(Err(Status::resource_exhausted(
-                                    format!(
-                                        "{terminal_reason} was reached before Object tape motion; selected tape was terminally finalized, reopen against the pool to roll placement: {original_error}"
-                                    ),
-                                )));
-                            } else {
-                                let _ = reply.send(Err(Status::unavailable(format!(
-                                    "{terminal_reason} permanently closed Object admission, but the terminal tail requires recovery: {original_error}"
-                                ))));
-                            }
+                            self.begin_closing_work();
+                            let _ = reply.send(Err(Status::resource_exhausted(format!(
+                                "{terminal_reason} was reached before Object tape motion; terminal finalization is decided, reopen against the pool to roll placement: {original_error}"))));
                         }
                         Err(error) => {
-                            self.append_gate.record_sealed();
+                            self.append_gate.record_failure();
+                            self.begin_closing_work();
                             let _ = reply.send(Err(error));
                         }
                     }
@@ -991,6 +1177,7 @@ impl WriteSessionState<'_> {
                 };
                 if tape_started {
                     self.append_gate.record_failure();
+                    self.begin_closing_work();
                 }
                 let original_error = err.to_string();
                 let mut status = status_from_selected_write_error(&selected, err);
@@ -1005,53 +1192,27 @@ impl WriteSessionState<'_> {
                             batch.objects.len(),
                         ));
                     }
-                    if parity_raw_write_attempted {
-                        if let Err(error) = crate::append_admission::abandon_pending_append(
-                            self.drive,
-                            &mut self.checkpoint_lease,
-                        ) {
-                            status = Status::unavailable(format!(
-                                "{}; abandonment marker failed: {error}",
-                                status.message()
-                            ));
-                        }
-                        let fenced = fence_failed_parity_raw_write(
-                            self.index,
-                            cfg,
-                            &selected,
-                            "append",
-                            Some(current_caller_object_id.as_str()),
-                            failed_batch.as_ref(),
-                            original_error.as_str(),
-                            status,
-                        );
-                        status = fenced.0;
-                    } else if let Some(batch) = failed_batch.as_ref() {
-                        status = fence_failed_checkpoint_batch(
-                            self.drive,
-                            &mut self.checkpoint_lease,
-                            self.index,
-                            cfg,
-                            &selected,
-                            batch,
-                            status,
-                        );
-                    } else if let Err(error) = crate::append_admission::abandon_pending_append(
-                        self.drive,
-                        &mut self.checkpoint_lease,
-                    ) {
-                        status = fence_failed_parity_raw_write(
-                            self.index,
-                            cfg,
-                            &selected,
-                            "abandonment",
-                            None,
-                            None,
-                            &error,
-                            status,
-                        )
-                        .0;
-                    }
+                    self.end_reason = if self.tail.drive_failed() {
+                        remanence_state::tape_log::SessionEndReason::DriveError
+                    } else if stream_control
+                        .as_ref()
+                        .and_then(|c| c.failure_message())
+                        .is_some_and(|m| m.contains("AppendIngressDeadline"))
+                    {
+                        remanence_state::tape_log::SessionEndReason::ClientStall
+                    } else if stream_control
+                        .as_ref()
+                        .and_then(|c| c.failure_message())
+                        .is_some_and(|m| {
+                            m.contains("client disconnected during append")
+                                || m.contains("append stream failed:")
+                                || m.contains("append stream must end with Finish")
+                        })
+                    {
+                        remanence_state::tape_log::SessionEndReason::ClientDisconnected
+                    } else {
+                        remanence_state::tape_log::SessionEndReason::FailedAppend
+                    };
                 }
                 tracing::info!(
                     target: "remanence_write_diag",
@@ -1186,6 +1347,7 @@ impl WriteSessionState<'_> {
                             Ok(context) => context,
                             Err(err) => {
                                 self.append_gate.record_failure();
+                                self.begin_closing_work();
                                 self.pending_batch = None;
                                 let status = status_from_selected_write_error(&selected, err);
                                 if let Some(reply) = reply {
@@ -1257,28 +1419,9 @@ impl WriteSessionState<'_> {
                     tracing::warn!(%error, "provisional tape-log rollback failed; abandonment remains fenced");
                 }
                 let quarantine_identities = failure.requires_identity_quarantine();
-                if failure.fence_handled && failure.durability_uncertain {
-                    if let Err(error) = crate::append_admission::abandon_pending_append(
-                        self.drive,
-                        &mut self.checkpoint_lease,
-                    ) {
-                        tracing::warn!(%error, "fenced batch abandonment marker failed");
-                    }
-                }
-                let status = if !failure.durability_uncertain || failure.fence_handled {
-                    failure.status
-                } else {
-                    fence_failed_checkpoint_batch(
-                        self.drive,
-                        &mut self.checkpoint_lease,
-                        self.index,
-                        cfg,
-                        &selected,
-                        batch,
-                        failure.status,
-                    )
-                };
+                let status = failure.status;
                 self.append_gate.record_failure();
+                self.begin_closing_work();
                 if quarantine_identities {
                     self.pending_batch
                         .as_mut()
@@ -1302,6 +1445,7 @@ impl WriteSessionState<'_> {
 
     /// Close an idle session only when the timer still names its latest batch.
     fn handle_timer_idle_close(&mut self, command: DriveCommand) -> bool {
+        self.end_reason = remanence_state::tape_log::SessionEndReason::ClientStall;
         let DriveCommand::TimerIdleClose {
             session_id: requested,
             checkpoint_batch_id,
@@ -1312,9 +1456,7 @@ impl WriteSessionState<'_> {
         let bay = self.bay;
         let cfg = self.cfg;
         let target_kind = self.target_kind;
-        let library_serial = self.library_serial.clone();
         let drive_uuid = self.drive_uuid.clone();
-        let drive_serial = self.drive_serial.clone();
         let session_id = self.session_id;
         let tape_uuid = self.tape_uuid;
         let opened_at_utc = self.opened_at_utc.clone();
@@ -1329,12 +1471,10 @@ impl WriteSessionState<'_> {
             cfg,
             drive: self.drive,
             drive_uuid: &drive_uuid,
-            drive_serial: &drive_serial,
             snapshot_misses: self.snapshot_misses,
             session_id,
             tape_uuid,
             target_kind,
-            library_serial: library_serial.as_deref(),
             bay,
             objects_committed: self.objects_committed,
             bytes_committed: self.bytes_committed,
@@ -1343,20 +1483,17 @@ impl WriteSessionState<'_> {
             state: pb::write_session::State::WriteSessionStateClosed,
             append_commit_diagnostics: self.append_commit_diagnostics,
             checkpointed_objects: &self.committed_receipts,
-            abort_reason: None,
         });
         if let Err(err) = result {
             tracing::error!(session_id = %session_id, error = %err, "idle checkpoint close failed");
             return false;
-        }
-        if let Err(err) = park_timer_closed_session(cfg, session_id) {
-            tracing::error!(session_id = %session_id, error = %err, "timer-closed session could not enter idle eviction");
         }
         true
     }
 
     /// Flush any pending batch and perform a normal session close.
     fn handle_close(&mut self, command: DriveCommand) -> bool {
+        self.end_reason = remanence_state::tape_log::SessionEndReason::CleanClose;
         let DriveCommand::Close {
             session_id: requested,
             reply,
@@ -1373,18 +1510,12 @@ impl WriteSessionState<'_> {
         let pool_cfg = self.pool_cfg.clone();
         let selected = self.selected.clone();
         let target_kind = self.target_kind;
-        let library_serial = self.library_serial.clone();
         let drive_uuid = self.drive_uuid.clone();
-        let drive_serial = self.drive_serial.clone();
         let session_id = self.session_id;
         let tape_uuid = self.tape_uuid;
         let opened_at_utc = self.opened_at_utc.clone();
         if requested != session_id {
             let _ = reply.send(Err(Status::not_found("write session not found")));
-            return false;
-        }
-        if let Err(error) = self.close_unretained_committed_epoch() {
-            let _ = reply.send(Err(error));
             return false;
         }
         if let Some(batch) = self.pending_batch.as_ref() {
@@ -1412,6 +1543,7 @@ impl WriteSessionState<'_> {
                                 Ok(context) => context,
                                 Err(err) => {
                                     self.append_gate.record_failure();
+                                    self.begin_closing_work();
                                     self.pending_batch = None;
                                     let _ = reply.send(Err(status_from_selected_write_error(
                                         &selected, err,
@@ -1425,28 +1557,9 @@ impl WriteSessionState<'_> {
                 }
                 Err(failure) => {
                     let quarantine_identities = failure.requires_identity_quarantine();
-                    if failure.fence_handled && failure.durability_uncertain {
-                        if let Err(error) = crate::append_admission::abandon_pending_append(
-                            self.drive,
-                            &mut self.checkpoint_lease,
-                        ) {
-                            tracing::warn!(%error, "fenced batch abandonment marker failed");
-                        }
-                    }
-                    let status = if !failure.durability_uncertain || failure.fence_handled {
-                        failure.status
-                    } else {
-                        fence_failed_checkpoint_batch(
-                            self.drive,
-                            &mut self.checkpoint_lease,
-                            self.index,
-                            cfg,
-                            &selected,
-                            batch,
-                            failure.status,
-                        )
-                    };
+                    let status = failure.status;
                     self.append_gate.record_failure();
+                    self.begin_closing_work();
                     if quarantine_identities {
                         self.pending_batch
                             .as_mut()
@@ -1464,12 +1577,10 @@ impl WriteSessionState<'_> {
             cfg,
             drive: self.drive,
             drive_uuid: &drive_uuid,
-            drive_serial: &drive_serial,
             snapshot_misses: self.snapshot_misses,
             session_id,
             tape_uuid,
             target_kind,
-            library_serial: library_serial.as_deref(),
             bay,
             objects_committed: self.objects_committed,
             bytes_committed: self.bytes_committed,
@@ -1478,7 +1589,6 @@ impl WriteSessionState<'_> {
             state: pb::write_session::State::WriteSessionStateClosed,
             append_commit_diagnostics: self.append_commit_diagnostics,
             checkpointed_objects: &self.committed_receipts,
-            abort_reason: None,
         });
         match result {
             Ok(result) => {
@@ -1494,6 +1604,7 @@ impl WriteSessionState<'_> {
 
     /// Close the actor in the aborted state without committing new work.
     fn handle_abort(&mut self, command: DriveCommand) -> bool {
+        self.end_reason = remanence_state::tape_log::SessionEndReason::Abort;
         let DriveCommand::Abort {
             session_id: requested,
             reason,
@@ -1505,9 +1616,7 @@ impl WriteSessionState<'_> {
         let bay = self.bay;
         let cfg = self.cfg;
         let target_kind = self.target_kind;
-        let library_serial = self.library_serial.clone();
         let drive_uuid = self.drive_uuid.clone();
-        let drive_serial = self.drive_serial.clone();
         let session_id = self.session_id;
         let tape_uuid = self.tape_uuid;
         let opened_at_utc = self.opened_at_utc.clone();
@@ -1515,44 +1624,23 @@ impl WriteSessionState<'_> {
             let _ = reply.send(Err(Status::not_found("write session not found")));
             return false;
         }
-        if let Err(error) = self.close_unretained_committed_epoch() {
-            let _ = reply.send(Err(error));
-            return false;
+        if reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with("AppendIngressDeadline:"))
+        {
+            self.end_reason = remanence_state::tape_log::SessionEndReason::ClientStall;
         }
-        if self.pending_batch.is_some() {
-            if let Err(error) = crate::append_admission::abandon_pending_append(
-                self.drive,
-                &mut self.checkpoint_lease,
-            ) {
-                let status = fence_failed_parity_raw_write(
-                    self.index,
-                    cfg,
-                    &self.selected,
-                    "abandonment",
-                    None,
-                    self.pending_batch.as_ref(),
-                    &error,
-                    Status::unavailable(error.clone()),
-                )
-                .0;
-                self.pending_batch = None;
-                self.drive.clear_append_admission();
-                let _ = reply.send(Err(status));
-                return true;
-            }
-            self.pending_batch = None;
-        }
+        self.abort_reason = reason;
+        self.pending_batch = None;
         let result = close_write_actor(CloseWriteActorInput {
             index: self.index,
             cfg,
             drive: self.drive,
             drive_uuid: &drive_uuid,
-            drive_serial: &drive_serial,
             snapshot_misses: self.snapshot_misses,
             session_id,
             tape_uuid,
             target_kind,
-            library_serial: library_serial.as_deref(),
             bay,
             objects_committed: self.objects_committed,
             bytes_committed: self.bytes_committed,
@@ -1561,7 +1649,6 @@ impl WriteSessionState<'_> {
             state: pb::write_session::State::WriteSessionStateAborted,
             append_commit_diagnostics: self.append_commit_diagnostics,
             checkpointed_objects: &self.committed_receipts,
-            abort_reason: reason,
         });
         match result {
             Ok(result) => {
@@ -1654,7 +1741,6 @@ pub(super) fn handle_drive_open_write(
     drive: &mut DriveHandle,
     snapshot_misses: &mut u32,
     request: OpenWriteActorRequest,
-    retained: &mut Option<super::checkpoint::RetainedParityEpoch>,
 ) -> Option<super::actor_runtime::MountedFinish> {
     let OpenWriteActorRequest {
         actor,
@@ -1676,12 +1762,9 @@ pub(super) fn handle_drive_open_write(
     };
     let actor_open_started = Instant::now();
     let session_id = Uuid::new_v4();
-    if let Some(lifecycle) = &cfg.lifecycle {
+    if let (Some(lifecycle), Some(library_serial)) = (&cfg.lifecycle, &library_serial) {
         lifecycle.set_holder(
-            &crate::drive_pool::DriveKey::new(
-                library_serial.as_deref().expect("library session"),
-                bay,
-            ),
+            &crate::drive_pool::DriveKey::new(library_serial, bay),
             drive_serial.as_deref(),
             "write session",
             session_id,
@@ -1809,57 +1892,27 @@ pub(super) fn handle_drive_open_write(
     // A cold open can know its memory obligation from host authority alone.
     // Each intersecting Object owns at least one ordinal, so this extent bound
     // is conservative without materializing any prefix or issuing drive commands.
-    let mut preflight_rebuild_permit = None;
-    if retained.is_none() {
-        if let (remanence_parity::ParityConfig::Scheme(scheme), Some(last)) =
-            (&selected.parity_config, durable_checkpoint_records.last())
-        {
-            let prefix_durable = (|| -> Result<bool, Status> {
-                let Some(prefix) = pending_terminal_intent
-                    .as_ref()
-                    .and_then(|intent| intent.terminal_prefix.as_ref())
-                else {
-                    return Ok(false);
-                };
-                let prefix = remanence_parity::TerminalPrefixPlan::try_from(prefix)
-                    .map_err(status_from_state_error)?;
-                let journal = checkpoint_lease
-                    .open_structural(selected.block_size, scheme.clone())
-                    .map_err(|e| Status::failed_precondition(e.to_string()))?;
-                journal
-                    .prefix_is_durable(
-                        &prefix
-                            .media_publication()
-                            .map_err(|e| Status::failed_precondition(e.to_string()))?,
-                    )
-                    .map_err(|e| Status::failed_precondition(e.to_string()))
-            })();
-            let prefix_durable = match prefix_durable {
-                Ok(durable) => durable,
+    let mut preflight_rebuild_permit =
+        if let remanence_parity::ParityConfig::Scheme(scheme) = &selected.parity_config {
+            let extents = durable_checkpoint_records
+                .last()
+                .map_or(0, |last| (last.total - last.protected).min(last.next_file));
+            match super::checkpoint::reserve_closeout_memory(
+                cfg,
+                scheme,
+                selected.block_size,
+                usize::try_from(extents).unwrap_or(usize::MAX),
+                tape_uuid,
+            ) {
+                Ok(permit) => Some(permit),
                 Err(status) => {
                     let _ = reply.send(Err(status));
                     return None;
                 }
-            };
-            if last.protected < last.total && !prefix_durable {
-                let extents = usize::try_from((last.total - last.protected).min(last.next_file))
-                    .unwrap_or(usize::MAX);
-                match super::checkpoint::reserve_closeout_memory(
-                    cfg,
-                    scheme,
-                    selected.block_size,
-                    extents,
-                    tape_uuid,
-                ) {
-                    Ok(permit) => preflight_rebuild_permit = Some(permit),
-                    Err(status) => {
-                        let _ = reply.send(Err(status));
-                        return None;
-                    }
-                }
             }
-        }
-    }
+        } else {
+            None
+        };
 
     if let Err(status) = if cfg.mounted().is_some() {
         cfg.mounted_ready(index, drive)
@@ -2054,6 +2107,119 @@ pub(super) fn handle_drive_open_write(
         "remanence_write_diag",
     );
 
+    let parity_authority = if pending_terminal_intent.is_none()
+        && matches!(
+            selected.parity_config,
+            remanence_parity::ParityConfig::Scheme(_)
+        ) {
+        match validate_parity_actor_authority(
+            cfg,
+            &selected,
+            &mut checkpoint_lease,
+            &durable_checkpoint_records,
+        ) {
+            Ok(authority) => Some(authority),
+            Err(status) => {
+                let _ = reply.send(Err(status));
+                return None;
+            }
+        }
+    } else {
+        None
+    };
+
+    let snapshot_before_open = match checkpoint_lease.freeze() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let _ = reply.send(Err(status_from_state_error(error)));
+            return None;
+        }
+    };
+    let closeout_progress =
+        match crate::closeout_progress::CloseoutProgress::new(Uuid::new_v4(), tape_uuid, None) {
+            Ok(progress) => progress,
+            Err(status) => {
+                let _ = reply.send(Err(status));
+                return None;
+            }
+        };
+    closeout_progress.bind(snapshot_before_open.tape_summary(), "rebuilt");
+    closeout_progress.phase("rebuilding");
+    let closeout_due = snapshot_before_open.tape_summary().closeout_due();
+    if closeout_due {
+        if let Some(permit) = &preflight_rebuild_permit {
+            closeout_progress.reserved(permit.bytes());
+        }
+        if let Err(status) = closeout_progress.audit(
+            index,
+            &cfg.audit_dir,
+            &cfg.audit_append_lock,
+            AuditEvent::OperationStarted,
+            None,
+        ) {
+            let _ = reply.send(Err(status));
+            return None;
+        }
+    }
+    // Existing-tape reconstruction is read-only, reserved before drive work,
+    // and precedes the suffix proof so a torn closeout can be compared exactly.
+    let (mut parity_session, fresh_parity_authority) = if durable_checkpoint_records.is_empty() {
+        (None, parity_authority)
+    } else {
+        let parity_session = if let Some(authority) = parity_authority {
+            match open_parity_actor_session(
+                index,
+                drive,
+                cfg,
+                &selected,
+                &durable_checkpoint_records,
+                authority,
+                &mut checkpoint_lease,
+                preflight_rebuild_permit.take(),
+            ) {
+                Ok(session) => Some(session),
+                Err(status) => {
+                    if closeout_due {
+                        let _ = closeout_progress.audit(
+                            index,
+                            &cfg.audit_dir,
+                            &cfg.audit_append_lock,
+                            AuditEvent::OperationFailed,
+                            Some(&status),
+                        );
+                    }
+                    let _ = reply.send(Err(status));
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+        (parity_session, None)
+    };
+    let mut prepared_closeout = if snapshot_before_open.tape_summary().closeout_due() {
+        match super::checkpoint::prepare_closeout(
+            parity_session.take().expect("parity closeout state"),
+            durable_checkpoint_records.last().expect("closeout commit"),
+        ) {
+            Ok(prepared) => Some(prepared),
+            Err(error) => {
+                if closeout_due {
+                    let _ = closeout_progress.audit(
+                        index,
+                        &cfg.audit_dir,
+                        &cfg.audit_append_lock,
+                        AuditEvent::OperationFailed,
+                        Some(&error),
+                    );
+                }
+                let _ = reply.send(Err(error));
+                return None;
+            }
+        }
+    } else {
+        None
+    };
     let last = durable_checkpoint_records.last();
     let ctx = crate::append_admission::context(
         tape_uuid,
@@ -2062,12 +2228,20 @@ pub(super) fn handle_drive_open_write(
         last.map_or(0, |r| r.cursor.lba),
     );
     let authority = last.map_or(crate::append_admission::AppendAuthority::Fresh, |_| {
-        crate::append_admission::AppendAuthority::Checkpoint { eod: ctx.boundary }
+        crate::append_admission::AppendAuthority::Session {
+            snapshot: &snapshot_before_open,
+            closeout: prepared_closeout.as_ref().map(|p| &p.encoded),
+        }
     });
-    let _admission = match crate::append_admission::admit_append_boundary(drive, authority, ctx) {
+    let mut admission = match crate::append_admission::admit_append_boundary(drive, authority, ctx)
+    {
         Ok(admission) => admission,
         Err(error) => {
-            if matches!(error, crate::append_admission::AdmissionError::Io(_)) {
+            if matches!(
+                error,
+                crate::append_admission::AdmissionError::Io(_)
+                    | crate::append_admission::AdmissionError::Unproved(_)
+            ) {
                 let range = index.get_tape(&tape_uuid).ok().flatten().map(|tape| {
                     (
                         tape.highest_protected_ordinal,
@@ -2093,31 +2267,19 @@ pub(super) fn handle_drive_open_write(
                 tape_uuid,
                 error,
             );
+            if closeout_due {
+                let _ = closeout_progress.audit(
+                    index,
+                    &cfg.audit_dir,
+                    &cfg.audit_append_lock,
+                    AuditEvent::OperationFailed,
+                    Some(&status),
+                );
+            }
             let _ = reply.send(Err(status));
             return None;
         }
     };
-    let parity_authority = if pending_terminal_intent.is_none()
-        && matches!(
-            selected.parity_config,
-            remanence_parity::ParityConfig::Scheme(_)
-        ) {
-        match validate_parity_actor_authority(
-            cfg,
-            &selected,
-            &mut checkpoint_lease,
-            &durable_checkpoint_records,
-        ) {
-            Ok(authority) => Some(authority),
-            Err(status) => {
-                let _ = reply.send(Err(status));
-                return None;
-            }
-        }
-    } else {
-        None
-    };
-
     let opened_at_utc = now_rfc3339().unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
     let objects_committed = 0u64;
     let bytes_committed = 0u64;
@@ -2143,86 +2305,25 @@ pub(super) fn handle_drive_open_write(
             return None;
         }
     }
-    let had_retained_epoch = retained.is_some();
-    let carried = retained.take().filter(|epoch| {
-        let parked_matches = cfg.mounted().is_some()
-            || cfg.lifecycle.as_ref().is_some_and(|lifecycle| {
-                let key = crate::drive_pool::DriveKey::new(
-                    library_serial.as_deref().expect("library session"),
-                    bay,
-                );
-                lifecycle
-                    .parked
-                    .lock()
-                    .unwrap_or_else(|err| err.into_inner())
-                    .by_drive
-                    .get(&key)
-                    .map_or(epoch.parked_generation == 0, |parked| {
-                        parked.generation == epoch.parked_generation
-                            && parked.seated.tape_uuid == Some(tape_uuid)
-                    })
-            });
-        !needs_drive_load
-            && parked_matches
-            && epoch.selected.tape_uuid == tape_uuid
-            && epoch.identity_generation == drive.identity_generation()
-            && parity_authority
-                .as_ref()
-                .is_some_and(|authority| epoch.state.matches_committed_summary(&authority.summary))
-            && last_durable_checkpoint
-                .as_ref()
-                .is_some_and(|last| last.cursor.lba == epoch.state.used_tape_blocks())
-    });
-    if had_retained_epoch && carried.is_none() {
-        cfg.io_memory.record_epoch_discard();
-    }
     let bootstrap_dispatch_before = drive.media_write_dispatch_count();
-    let mut parity_session = if let Some(authority) = parity_authority {
-        if let Some(epoch) = carried {
-            Some(ParityActorSession {
-                scheme: authority.scheme,
-                sink_state: Some(epoch.state),
-                retention: Some(epoch.permit),
-                close_at_barrier: false,
-            })
-        } else {
-            let open_range = (
-                authority.summary.highest_protected_ordinal,
-                authority.summary.total_committed_ordinals,
-            );
-            match open_parity_actor_session(
-                index,
-                drive,
-                cfg,
-                &selected,
-                &durable_checkpoint_records,
-                authority,
-                &mut checkpoint_lease,
-                preflight_rebuild_permit.take(),
-            ) {
-                Ok(session) => Some(session),
-                Err(status) => {
-                    if open_range.0 < open_range.1 {
-                        tracing::warn!(%status, bay, "epoch_left_open: session open cannot rebuild the committed epoch");
-                        super::checkpoint::audit_removal_epoch(
-                            index,
-                            cfg,
-                            bay,
-                            Some(tape_uuid),
-                            "epoch_left_open",
-                            status.to_string(),
-                            Some(open_range),
-                        );
-                    }
-                    let _ = reply.send(Err(status));
-                    return None;
-                }
+    if let Some(authority) = fresh_parity_authority {
+        parity_session = match open_parity_actor_session(
+            index,
+            drive,
+            cfg,
+            &selected,
+            &durable_checkpoint_records,
+            authority,
+            &mut checkpoint_lease,
+            preflight_rebuild_permit.take(),
+        ) {
+            Ok(session) => Some(session),
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return None;
             }
-        }
-    } else {
-        None
-    };
-    checkpoint_lease.bind_session(*session_id.as_bytes());
+        };
+    }
     if durable_checkpoint_records.is_empty() {
         let bootstrap = (|| -> Result<(), Status> {
             if parity_session.is_none() {
@@ -2305,6 +2406,81 @@ pub(super) fn handle_drive_open_write(
             return None;
         }
     }
+    let ready = (|| -> Result<(), Status> {
+        let snapshot = checkpoint_lease.freeze().map_err(status_from_state_error)?;
+        if let Some(open) = &snapshot.tape_summary().open_session {
+            checkpoint_lease
+                .end_session(
+                    open.session_id,
+                    now_rfc3339().map_err(|e| Status::internal(e.to_string()))?,
+                    remanence_state::tape_log::SessionEndReason::CrashRecovered,
+                    None,
+                    admission
+                        .recovered_tail
+                        .take()
+                        .ok_or_else(|| Status::internal("missing crash tail proof"))?
+                        .files()
+                        .map_err(|e| Status::internal(e.to_string()))?,
+                )
+                .map_err(status_from_state_error)?;
+        }
+        if snapshot.tape_summary().closeout_due() {
+            let permit = super::checkpoint::write_closeout(
+                index,
+                drive,
+                cfg,
+                &selected,
+                &mut checkpoint_lease,
+                prepared_closeout
+                    .take()
+                    .ok_or_else(|| Status::internal("missing checked closeout"))?,
+                &closeout_progress,
+            )?;
+            durable_checkpoint_records =
+                project_checkpoint_authority_bounded(index, &checkpoint_lease)
+                    .map_err(status_from_state_error)?;
+            last_durable_checkpoint = durable_checkpoint_records.last().cloned();
+            checkpoint_lease.finish_structural_scope();
+            let authority = validate_parity_actor_authority(
+                cfg,
+                &selected,
+                &mut checkpoint_lease,
+                &durable_checkpoint_records,
+            )?;
+            parity_session = Some(open_parity_actor_session(
+                index,
+                drive,
+                cfg,
+                &selected,
+                &durable_checkpoint_records,
+                authority,
+                &mut checkpoint_lease,
+                permit,
+            )?);
+        }
+        Ok(())
+    })();
+    if let Err(status) = ready {
+        super::checkpoint::fence_ambiguous_authority(
+            index,
+            cfg,
+            &checkpoint_lease,
+            tape_uuid,
+            "recover_session",
+            &status,
+        );
+        if closeout_due {
+            let _ = closeout_progress.audit(
+                index,
+                &cfg.audit_dir,
+                &cfg.audit_append_lock,
+                AuditEvent::OperationFailed,
+                Some(&status),
+            );
+        }
+        let _ = reply.send(Err(status));
+        return None;
+    }
     let next_batched_append = if parity_session.is_none() {
         match crate::pool_write::first_batched_append_context(
             index,
@@ -2341,39 +2517,41 @@ pub(super) fn handle_drive_open_write(
         drive_element_address: cfg.wire_bay(bay),
         pending_batch: None,
     });
-    if reply.send(Ok(open_reply)).is_err() {
-        if let Some(parity) = parity_session.as_mut() {
-            if let (Some(state), Some(permit)) = (parity.sink_state.take(), parity.retention.take())
-            {
-                let parked_generation = cfg
-                    .lifecycle
-                    .as_ref()
-                    .and_then(|lifecycle| {
-                        lifecycle
-                            .parked
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .by_drive
-                            .get(&crate::drive_pool::DriveKey::new(
-                                library_serial.as_deref().expect("library session"),
-                                bay,
-                            ))
-                            .map(|parked| parked.generation)
-                    })
-                    .unwrap_or(0);
-                *retained = Some(super::checkpoint::RetainedParityEpoch {
-                    identity_generation: drive.identity_generation(),
-                    parked_generation,
-                    state,
-                    permit,
-                    selected: selected.clone(),
-                });
-            }
+    let tail = match super::session_tail::SessionTail::new(
+        tape_uuid,
+        selected.block_size,
+        last_durable_checkpoint.as_ref().map_or(1, |c| c.next_file),
+    ) {
+        Ok(tail) => tail,
+        Err(error) => {
+            let _ = reply.send(Err(Status::internal(format!(
+                "create session tail spool: {error}"
+            ))));
+            return None;
         }
+    };
+    if let Err(error) = checkpoint_lease.open_session(*session_id.as_bytes(), opened_at_utc.clone())
+    {
+        let status = status_from_state_error(error);
+        super::checkpoint::fence_ambiguous_authority(
+            index,
+            cfg,
+            &checkpoint_lease,
+            tape_uuid,
+            "session_opened",
+            &status,
+        );
+        let _ = reply.send(Err(status));
         return None;
     }
-
+    drive.set_media_dispatch_observer(Some(Box::new(tail.clone())));
+    let open_reply_lost = reply.send(Ok(open_reply)).is_err();
     let mut session_state = WriteSessionState {
+        closing_work: None,
+        end_reason: remanence_state::tape_log::SessionEndReason::ClientDisconnected,
+        ended_durably: false,
+        abort_reason: None,
+        tail,
         timers: super::timers::SessionTimers::default(),
         finish_request: None,
         bay,
@@ -2407,91 +2585,39 @@ pub(super) fn handle_drive_open_write(
         append_commit_diagnostics: crate::pool_write::AppendCommitDiagnostics::default(),
         deferred_close_reply: None,
     };
-    let deferred_close_reply = session_state.run(rx);
-    if !session_state.append_gate.sealed
-        && session_state.pending_batch.is_none()
-        && session_state
-            .parity_session
-            .as_ref()
-            .and_then(|p| p.sink_state.as_ref())
-            .is_some_and(|state| {
-                state.is_checkpointed()
-                    && session_state
-                        .durable_checkpoint_records
-                        .last()
-                        .is_some_and(|last| last.cursor.lba == state.used_tape_blocks())
-            })
-    {
-        if let Some(mut parity) = session_state.parity_session.take() {
-            if cfg.mounted().is_some() {
-                if let (Some(state), Some(permit)) =
-                    (parity.sink_state.take(), parity.retention.take())
-                {
-                    *retained = Some(super::checkpoint::RetainedParityEpoch {
-                        state,
-                        permit,
-                        selected: session_state.selected.clone(),
-                        parked_generation: 0,
-                        identity_generation: session_state.drive.identity_generation(),
-                    });
-                }
-            } else if let (Some(state), Some(permit), Some(lifecycle)) = (
-                parity.sink_state.take(),
-                parity.retention.take(),
-                cfg.lifecycle.as_ref(),
-            ) {
-                let mounted = lifecycle
-                    .sessions
-                    .lock()
-                    .unwrap_or_else(|err| err.into_inner())
-                    .get(&session_id)
-                    .cloned();
-                let key = crate::drive_pool::DriveKey::new(
-                    session_state
-                        .library_serial
-                        .as_deref()
-                        .expect("library session"),
-                    bay,
+    let deferred_close_reply = if open_reply_lost {
+        session_state.begin_closing_work();
+        if let Err(error) = session_state.finish_session() {
+            if !session_state.ended_durably {
+                let _ = raise_tape_io_fence(
+                    session_state.index,
+                    cfg,
+                    remanence_state::TapeIoFenceInput {
+                        tape_uuid,
+                        barcode: None,
+                        reason: "AuthorityAmbiguous".into(),
+                        evidence_json: Some(
+                            serde_json::json!({"session_id":session_id,"error":error.to_string()})
+                                .to_string(),
+                        ),
+                    },
+                    session_state.selected.standalone_endpoint.as_ref(),
                 );
-                let mut parked = lifecycle
-                    .parked
-                    .lock()
-                    .unwrap_or_else(|err| err.into_inner());
-                if let Some(mounted) = mounted {
-                    if let Some(home_slot) = mounted.home_slot {
-                        parked.next_generation = parked.next_generation.wrapping_add(1).max(1);
-                        let generation = parked.next_generation;
-                        parked.by_drive.insert(
-                            key.clone(),
-                            super::ParkedCartridge {
-                                generation,
-                                seated: super::SeatedCartridge {
-                                    bay,
-                                    library_serial: mounted.library_serial,
-                                    barcode: mounted.barcode,
-                                    home_slot,
-                                    tape_uuid: Some(tape_uuid),
-                                    prior_session_id: Some(session_id),
-                                },
-                            },
-                        );
-                    }
-                }
-                *retained = Some(super::checkpoint::RetainedParityEpoch {
-                    state,
-                    permit,
-                    selected: session_state.selected.clone(),
-                    parked_generation: parked
-                        .by_drive
-                        .get(&key)
-                        .map_or(0, |parked| parked.generation),
-                    identity_generation: session_state.drive.identity_generation(),
-                });
             }
+            tracing::error!(%error, "lost open reply ending failed");
         }
-    }
+        None
+    } else {
+        session_state.run(rx)
+    };
     let finish_request = session_state.finish_request.take();
+    let closing_work = session_state.closing_work.take();
+    session_state.drive.set_media_dispatch_observer(None);
     drop(session_state);
+    if let Err(error) = park_timer_closed_session(cfg, session_id) {
+        tracing::error!(%error, "ended session ownership cleanup failed");
+    }
+    drop(closing_work);
     if let Some((reply, result)) = deferred_close_reply {
         let _ = reply.send(Ok(result));
     }

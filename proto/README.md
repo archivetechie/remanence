@@ -40,7 +40,7 @@ copy here.
 | Stable intent | Still evolving or explicitly unsupported |
 | --- | --- |
 | Explicit library identity; no implicit single-library default | Exact wire-stability declaration for the `remanence.api.v1` namespace |
-| REM-OBJECT identity, digests, and opaque body-format manifests | Caller-supplied idempotency keys: fields are reserved and non-empty values are rejected with `UNIMPLEMENTED` |
+| REM-OBJECT identity, digests, and opaque body-format manifests | Write-session caller idempotency keys remain reserved; `FinalizeTape` and `CloseoutTape` require supported keys |
 | Native object catalog plus additive native/foreign unit discovery | Persistent per-entry cache shape for foreign formats |
 | Pool-targeted and pinned-tape write admission | Runtime pool-assignment mutation; pool membership is configuration/catalog policy |
 | Server streaming with bounded producer channels | Write-session restart and the operations listed as unimplemented in `docs/status.md` |
@@ -122,3 +122,17 @@ only when one pool contains the caller id; several pools return
 `FAILED_PRECONDITION` naming those pools. No match returns `NOT_FOUND`.
 Repeated writes with the same pool, caller id and content replay the committed
 receipt; conflicting content is refused.
+
+## Session-owned epoch cutover
+
+Regenerate consumer bindings from this revision before deployment. `Catalog.CloseoutTape`
+accepts `CloseoutTapeRequest`: required UUID `tape_uuid = 1`, optional
+`expected_pool_id = 2`, and required message `IdempotencyKey idempotency_key = 3`.
+It returns `OperationRef`; follow `WatchOperation` to completion. A tape with no
+closeout due succeeds without media work. Repeating a key rejoins its operation.
+
+`SupersedeTailRequest.observed_tape_log_sequence = 5` is an optional uint64 on the
+wire and mandatory on confirmation. Preview returns the required value in
+`SupersedeTailResponse.tape_log_sequence = 4`. A stale value refuses with
+`TailPreviewStale`. `GetWriteSession` retains the ended session's durable receipts;
+there is no `SessionEndedDetails` status extension.

@@ -19,6 +19,45 @@ impl SgTransport for CorruptRebuildRead {
         cdb: &[u8],
         buf: &mut [u8],
     ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError> {
+        if cdb[0] == 0x08 && self.at_target {
+            if let Some(fault) = self.cursor_fault.and_then(|f| f.strip_prefix("read_")) {
+                use remanence_library::ScsiError;
+                let (key, asc, ascq) = match fault {
+                    "medium" => (3, 0x11, 0),
+                    "unit_attention" => (6, 0x28, 0),
+                    "not_ready" => (2, 4, 1),
+                    "hardware_44" => (4, 0x44, 0),
+                    "hardware_15" => (4, 0x15, 0),
+                    "eod" => (8, 0, 5),
+                    "filemark" | "wrong_length" => (0, 0, 0),
+                    "transport" => {
+                        return Err(ScsiError::Io(std::io::Error::other(
+                            "injected read transport",
+                        )))
+                    }
+                    "timeout" => {
+                        return Err(ScsiError::Io(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "injected read timeout",
+                        )))
+                    }
+                    _ => panic!("unknown read fault"),
+                };
+                let mut sense = readiness_fixed_sense(key, asc, ascq);
+                if fault == "filemark" {
+                    sense[2] |= 0x80;
+                }
+                if fault == "wrong_length" {
+                    sense[0] |= 0x80;
+                    sense[2] |= 0x20;
+                    sense[3..7].copy_from_slice(&(-1i32).to_be_bytes());
+                }
+                return Err(ScsiError::CheckCondition {
+                    sense,
+                    bytes_transferred: 0,
+                });
+            }
+        }
         if cdb[0] == 0x08
             && self.fault_armed
             && self.located == self.cursor - 1
@@ -126,6 +165,28 @@ fn check_closeout_route(terminal: bool, fence_failure: Option<FenceFailure>) {
 fn checked_rebuild_routes_refuse_bad_cursor_before_write() {
     for terminal in [false, true] {
         for fault in ["data", "short", "missing", "io", "lba", "partition"] {
+            check_closeout_route_case(terminal, None, Some(fault));
+        }
+    }
+}
+
+/// Both rebuilt entry points distinguish unreadable committed bytes from
+/// transient drive/transport errors, and neither dispatches a media write.
+#[test]
+fn checked_rebuild_read_fault_classification() {
+    for terminal in [false, true] {
+        for fault in [
+            "read_medium",
+            "read_unit_attention",
+            "read_not_ready",
+            "read_hardware_44",
+            "read_hardware_15",
+            "read_eod",
+            "read_filemark",
+            "read_wrong_length",
+            "read_transport",
+            "read_timeout",
+        ] {
             check_closeout_route_case(terminal, None, Some(fault));
         }
     }
@@ -285,10 +346,10 @@ fn check_closeout_route_case(
                 &mut permit,
             )
             .map(|state| ParityActorSession {
+                read_attempts: 1,
                 scheme: authority.scheme,
                 sink_state: state,
-                retention: permit.take(),
-                close_at_barrier: false,
+                permit: permit.take(),
             })
         } else {
             open_parity_actor_session_with_rows(
@@ -308,7 +369,9 @@ fn check_closeout_route_case(
                 result.is_err(),
                 "{cursor_fault:?}, terminal={terminal}: bad C admitted after read-back"
             );
-            assert!(drive.check_append_admission().is_err());
+            if !cursor_fault.is_some_and(|f| f.starts_with("read_")) {
+                assert!(drive.check_append_admission().is_err());
+            }
         } else if successful {
             let session = result.unwrap();
             let position = drive.position().unwrap();
@@ -339,7 +402,7 @@ fn check_closeout_route_case(
                     .message()
                     .contains("open epoch lacks durable check provenance"));
             } else if !refuse_memory {
-                assert!(status.message().contains("closeout check mismatch"));
+                assert!(status.message().contains("CloseoutCheckMismatch"));
             }
             if matches!(fence_failure, Some(FenceFailure::FenceWrite)) {
                 assert!(
@@ -400,6 +463,19 @@ fn check_closeout_route_case(
                 .as_ref()
                 .unwrap()
                 .contains("\"attempts\":2"));
+        } else if cursor_fault.is_some_and(|f| f.starts_with("read_")) {
+            let contradiction = matches!(
+                cursor_fault,
+                Some("read_medium" | "read_eod" | "read_filemark" | "read_wrong_length")
+            );
+            assert_eq!(
+                fences.len(),
+                usize::from(contradiction),
+                "{cursor_fault:?}, terminal={terminal}"
+            );
+            if contradiction {
+                assert_eq!(fences[0].reason, "CloseoutReadContradiction");
+            }
         } else if cursor_fault.is_none() {
             assert!(fences.is_empty());
         }

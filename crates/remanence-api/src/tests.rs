@@ -2497,7 +2497,7 @@ fn startup_replay_repairs_live_restart_cycle_partial_projection() {
         message.contains("tape=91919191919191919191919191919191"),
         "{message}"
     );
-    assert!(message.contains("sequence=7"), "{message}");
+    assert!(message.contains("sequence=8"), "{message}");
     assert!(
         message.contains("batch=62626262626262626262626262626262"),
         "{message}"
@@ -5260,7 +5260,7 @@ fn no_parity_stored_images_cross_read_between_serial_and_batched_paths() {
 }
 
 #[test]
-fn partial_batched_no_parity_write_is_uncommittable_and_fences_tape() {
+fn partial_batched_no_parity_write_is_uncommittable_without_automatic_fence() {
     let mut index = test_index();
     project_pool(&mut index, "scenario-a");
     project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
@@ -5299,22 +5299,17 @@ fn partial_batched_no_parity_write_is_uncommittable_and_fences_tape() {
         "bootstrap filemark is allowed; object-closing filemark must not be written"
     );
     assert_no_pool_write_catalog_reference(&index, "caller-partial-batch", POOL_WRITE_TAPE_UUID);
-    let fences = index
-        .tape_io_admission_conflicts(&POOL_WRITE_TAPE_UUID, Some("RMN004L9"))
-        .expect("active partial-batch fence");
-    assert_eq!(fences.len(), 1);
-    assert_eq!(fences[0].reason, "partial_batch");
     assert!(
-        fences[0]
-            .evidence_json
-            .as_deref()
-            .is_some_and(|evidence| evidence.contains("partial fixed batch uncommittable")),
-        "{fences:?}"
+        index
+            .tape_io_admission_conflicts(&POOL_WRITE_TAPE_UUID, Some("RMN004L9"))
+            .unwrap()
+            .is_empty(),
+        "the session owner records the dispatched tail; the writer does not fence"
     );
 }
 
 #[test]
-fn encrypted_no_parity_short_byte_batch_is_uncommittable_and_fences_tape() {
+fn encrypted_no_parity_short_byte_batch_is_uncommittable_without_automatic_fence() {
     let mut index = test_index();
     project_pool(&mut index, "scenario-a");
     project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
@@ -5360,22 +5355,17 @@ fn encrypted_no_parity_short_byte_batch_is_uncommittable_and_fences_tape() {
         "caller-short-byte-encrypted",
         POOL_WRITE_TAPE_UUID,
     );
-    let fences = index
-        .tape_io_admission_conflicts(&POOL_WRITE_TAPE_UUID, Some("RMN004L9"))
-        .expect("active short-byte fence");
-    assert_eq!(fences.len(), 1);
-    assert_eq!(fences[0].reason, "partial_batch");
     assert!(
-        fences[0]
-            .evidence_json
-            .as_deref()
-            .is_some_and(|evidence| evidence.contains("written_bytes=")),
-        "{fences:?}"
+        index
+            .tape_io_admission_conflicts(&POOL_WRITE_TAPE_UUID, Some("RMN004L9"))
+            .unwrap()
+            .is_empty(),
+        "the session owner records the dispatched tail; the writer does not fence"
     );
 }
 
 #[test]
-fn position_drift_during_batched_write_fences_with_position_evidence() {
+fn position_drift_during_batched_write_is_uncommittable_without_automatic_fence() {
     let mut index = test_index();
     project_pool(&mut index, "scenario-a");
     project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
@@ -5410,14 +5400,13 @@ fn position_drift_during_batched_write_fences_with_position_evidence() {
         "object-closing filemark must not be written after drift"
     );
     assert_no_pool_write_catalog_reference(&index, "caller-position-drift", POOL_WRITE_TAPE_UUID);
-    let fences = index
-        .tape_io_admission_conflicts(&POOL_WRITE_TAPE_UUID, Some("RMN004L9"))
-        .expect("active drift fence");
-    assert_eq!(fences.len(), 1);
-    assert_eq!(fences[0].reason, "position_drift");
-    let evidence = fences[0].evidence_json.as_deref().expect("drift evidence");
-    assert!(evidence.contains("expected_lba=11"), "{evidence}");
-    assert!(evidence.contains("device_lba=12"), "{evidence}");
+    assert!(
+        index
+            .tape_io_admission_conflicts(&POOL_WRITE_TAPE_UUID, Some("RMN004L9"))
+            .unwrap()
+            .is_empty(),
+        "the session owner records the dispatched tail; the writer does not fence"
+    );
 }
 
 #[test]
