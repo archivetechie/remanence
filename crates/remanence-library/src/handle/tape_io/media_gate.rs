@@ -315,6 +315,17 @@ pub(in crate::handle) enum MediaDispatchError {
     Scsi(ScsiError),
 }
 
+/// Session-owned evidence at the actual dispatch boundary. A refusal from
+/// `dispatching` prevents the command; `settled` reports the transport result,
+/// including errors whose completion is unknown. Observers must not issue I/O
+/// to the drive or infer media durability from command completion.
+pub trait MediaDispatchObserver: Send {
+    /// Record the requested operation immediately before transport dispatch.
+    fn dispatching(&mut self, cdb: &[u8], data: Option<&[u8]>) -> Result<(), TapeIoError>;
+    /// Record the settled response, preserving requested-but-unconfirmed work.
+    fn settled(&mut self, cdb: &[u8], result: &Result<Option<TransferOutcome>, ScsiError>);
+}
+
 /// The drive transport, wrapped so that write-direction dispatch is
 /// only reachable through the media gate. See the module docs for
 /// why the inner transport is private to this module.
@@ -338,6 +349,7 @@ pub(in crate::handle) struct MediaFencedTransport {
     write_identity_generation: u64,
     writable: bool,
     media_write_dispatch_count: u64,
+    observer: Option<Box<dyn MediaDispatchObserver>>,
 }
 
 impl MediaFencedTransport {
@@ -353,6 +365,7 @@ impl MediaFencedTransport {
             write_identity_generation: 0,
             writable: true,
             media_write_dispatch_count: 0,
+            observer: None,
         }
     }
 
@@ -413,6 +426,13 @@ impl MediaFencedTransport {
 
     pub(in crate::handle) fn media_write_dispatch_count(&self) -> u64 {
         self.media_write_dispatch_count
+    }
+
+    pub(in crate::handle) fn set_dispatch_observer(
+        &mut self,
+        observer: Option<Box<dyn MediaDispatchObserver>>,
+    ) {
+        self.observer = observer;
     }
 
     /// Whether the epoch has been advanced (and a media-modifying CDB
@@ -554,18 +574,25 @@ impl MediaFencedTransport {
             self.fenced_this_load = true;
         }
 
-        if class == WriteDirectionClass::MediaModifying {
-            self.media_write_dispatch_count =
-                self.media_write_dispatch_count.checked_add(1).ok_or(
-                    MediaDispatchError::NotDispatched(TapeIoError::InvalidRequest(
-                        ScsiError::InvalidInput("media dispatch counter exhausted"),
-                    )),
-                )?;
-        }
+        let next_dispatch_count = if class == WriteDirectionClass::MediaModifying {
+            self.media_write_dispatch_count.checked_add(1).ok_or(
+                MediaDispatchError::NotDispatched(TapeIoError::InvalidRequest(
+                    ScsiError::InvalidInput("media dispatch counter exhausted"),
+                )),
+            )?
+        } else {
+            self.media_write_dispatch_count
+        };
 
         self.verification
             .check_cancelled()
             .map_err(MediaDispatchError::Scsi)?;
+        if let Some(observer) = self.observer.as_mut() {
+            observer
+                .dispatching(cdb, data_out)
+                .map_err(MediaDispatchError::NotDispatched)?;
+        }
+        self.media_write_dispatch_count = next_dispatch_count;
         let result = match data_out {
             Some(buf) => {
                 let started = Instant::now();
@@ -589,6 +616,9 @@ impl MediaFencedTransport {
                 result.map(|()| None)
             }
         };
+        if let Some(observer) = self.observer.as_mut() {
+            observer.settled(cdb, &result);
+        }
         result.map_err(|error| {
             self.note_error(&error, false);
             MediaDispatchError::Scsi(error)

@@ -620,3 +620,351 @@ fn checkpoint_carriers_preserve_tape_file_numbers_beyond_u32() {
     assert_eq!(decoded.copy.tape_file_number, number);
     assert_eq!(decoded.object_recovery_row.tape_file_number, number);
 }
+
+/// Real owner/publication fixture with an open session and three uncovered
+/// committed blocks. Unlike the semantic legacy fixture it writes SessionOpened.
+fn session_owner_fixture() -> (
+    tempfile::TempDir,
+    TapeAuthority,
+    TapeAuthorityLease,
+    FilePublication,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let id = [0x91; 16];
+    let (seed, _, _) = crate::authority::contract_tests::structural_fixture(id);
+    let mut report: AuthorityCommit = (&seed).into();
+    let mut sidecar = report.barrier.take().unwrap();
+    report.object_files[0].files.truncate(1);
+    report.object_files[0].protected = 0;
+    report.payloads[0].projection.copy.protected_until_ordinal = Some(0);
+    report.protected = 0;
+    report.next_file = 2;
+    report.cursor.lba = 6;
+    report.check = Some((CheckValue(7), CheckProvenance::OriginalWrite));
+    report.session_id = Some([9; 16]);
+    let authority = TapeAuthority::open_fixture(dir.path(), id).unwrap();
+    let mut writer = authority.acquire_exclusive().unwrap();
+    writer
+        .publish_initialized(
+            report.block_size,
+            report.scheme.clone(),
+            CommitCursor {
+                partition: 0,
+                lba: 2,
+            },
+        )
+        .unwrap();
+    writer
+        .open_session([9; 16], "2026-11-02T00:00:00Z".into())
+        .unwrap();
+    writer.stage_report(&report).unwrap();
+    writer.complete_report(&report).unwrap();
+    let scheme = report.scheme.unwrap();
+    let parity =
+        u64::from(scheme.stripes_per_neighborhood) * u64::from(scheme.parity_blocks_per_stripe);
+    let h = remanence_parity::sidecar::checked_sidecar_index_capacity_layout(
+        u64::from(report.block_size),
+        parity,
+        report.total,
+    )
+    .unwrap()
+    .block_count;
+    sidecar.files[0].block_count = 2 * h + parity + 1;
+    sidecar.cursor = Some(CommitCursor {
+        partition: 0,
+        lba: 6 + sidecar.files[0].block_count + 1,
+    });
+    (dir, authority, writer, sidecar)
+}
+
+#[test]
+fn session_owner_closeout_advances_latest_cursor_and_survives_reopen() {
+    let (_dir, authority, mut writer, sidecar) = session_owner_fixture();
+    let before = writer.freeze().unwrap();
+    assert!(before.tape_summary().closeout_due());
+    writer
+        .publish_closed_out(
+            [3; 16],
+            Some([9; 16]),
+            &sidecar,
+            "2026-11-02T00:01:00Z".into(),
+        )
+        .unwrap();
+    let current = writer.latest_commit().unwrap().unwrap();
+    assert_eq!(current.cursor, sidecar.cursor.unwrap());
+    assert_eq!(current.next_file, 3);
+    assert_eq!((current.protected, current.total), (3, 3));
+    assert_eq!(current.check, None);
+    writer
+        .end_session(
+            [9; 16],
+            "2026-11-02T00:02:00Z".into(),
+            SessionEndReason::CleanClose,
+            None,
+            std::iter::empty(),
+        )
+        .unwrap();
+    assert_eq!(writer.bound_session_id(), None);
+    drop(writer);
+    let after = authority.freeze().unwrap();
+    assert!(!after.tape_summary().closeout_due());
+    assert!(after.tape_summary().open_session.is_none());
+    assert_eq!(
+        after
+            .tape_summary()
+            .last_session_end
+            .as_ref()
+            .unwrap()
+            .reason,
+        SessionEndReason::CleanClose
+    );
+    assert!(before.tape_summary().open_session.is_some());
+    assert_eq!(before.tape_summary().protected, 0);
+    let mut writer = authority.acquire_exclusive().unwrap();
+    writer
+        .open_session([10; 16], "2026-11-02T00:03:00Z".into())
+        .unwrap();
+    assert_eq!(writer.bound_session_id(), Some([10; 16]));
+    assert_eq!(
+        writer
+            .freeze()
+            .unwrap()
+            .tape_summary()
+            .open_session
+            .as_ref()
+            .unwrap()
+            .cursor
+            .lba,
+        sidecar.cursor.unwrap().lba
+    );
+}
+
+#[test]
+fn session_owner_streamed_end_preserves_tail_and_rejects_wrong_closeout_owner() {
+    let (_dir, authority, mut writer, sidecar) = session_owner_fixture();
+    let tail = TailFile {
+        tape_file_number: 2,
+        identity: TailIdentity::Object("abandoned".into()),
+        known_blocks: 2,
+        unknown_blocks: 4,
+        filemark: TailFilemark::Absent,
+    };
+    let sequence = writer.log_reference().unwrap().0;
+    let error = writer
+        .end_session(
+            [9; 16],
+            "2026-11-02T00:01:00Z".into(),
+            SessionEndReason::Abort,
+            None,
+            [Ok(tail.clone()), Err(invalid("tail producer failed"))],
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("tail producer failed"));
+    assert_eq!(writer.log_reference().unwrap().0, sequence);
+    writer
+        .end_session(
+            [9; 16],
+            "2026-11-02T00:01:00Z".into(),
+            SessionEndReason::Abort,
+            None,
+            [Ok(tail.clone())],
+        )
+        .unwrap();
+    let ended = writer.freeze().unwrap();
+    assert!(writer
+        .publish_closed_out(
+            [3; 16],
+            Some([10; 16]),
+            &sidecar,
+            "2026-11-02T00:02:00Z".into()
+        )
+        .is_err());
+    writer
+        .publish_closed_out(
+            [3; 16],
+            Some([9; 16]),
+            &sidecar,
+            "2026-11-02T00:02:00Z".into(),
+        )
+        .unwrap();
+    drop(writer);
+    let mut found = Vec::new();
+    ended
+        .visit_session_tail(&mut |row| {
+            found.push(row.clone());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(found, [tail]);
+    let mut count = 0;
+    authority
+        .freeze()
+        .unwrap()
+        .visit_session_tail(&mut |_| {
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn session_owner_every_new_record_lost_publication_response_poisoned() {
+    for tag in [17, 18, 19] {
+        for after in [false, true] {
+            let (_dir, authority, mut writer, sidecar) = session_owner_fixture();
+            if tag == 18 {
+                writer
+                    .publish_closed_out(
+                        [3; 16],
+                        Some([9; 16]),
+                        &sidecar,
+                        "2026-11-02T00:01:00Z".into(),
+                    )
+                    .unwrap();
+                writer
+                    .end_session(
+                        [9; 16],
+                        "2026-11-02T00:02:00Z".into(),
+                        SessionEndReason::CleanClose,
+                        None,
+                        std::iter::empty(),
+                    )
+                    .unwrap();
+            }
+            writer
+                .set_publication_observer(store::PublicationObserver(Arc::new(
+                    move |record, _, completed| {
+                        if record.tag() as u16 == tag && completed == after {
+                            Err(io::Error::other("publication response lost"))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )))
+                .unwrap();
+            let result = match tag {
+                17 => writer.publish_closed_out(
+                    [3; 16],
+                    Some([9; 16]),
+                    &sidecar,
+                    "2026-11-02T00:03:00Z".into(),
+                ),
+                18 => writer.open_session([10; 16], "2026-11-02T00:03:00Z".into()),
+                19 => writer.end_session(
+                    [9; 16],
+                    "2026-11-02T00:03:00Z".into(),
+                    SessionEndReason::DriveError,
+                    None,
+                    std::iter::empty(),
+                ),
+                _ => unreachable!(),
+            };
+            let error = result.unwrap_err();
+            assert_eq!(error.is_checkpoint_append_durable(), after, "tag {tag}");
+            assert_eq!(
+                error.is_checkpoint_append_authority_uncertain(),
+                !after,
+                "tag {tag}"
+            );
+            assert!(writer.ensure_abandonment_allowed().is_err());
+            assert!(writer.latest_commit().is_err());
+            assert!(writer.read_cache.lock().unwrap().is_none());
+            drop(writer);
+            if after {
+                let state = authority.freeze().unwrap();
+                match tag {
+                    17 => assert!(!state.tape_summary().closeout_due()),
+                    18 => assert_eq!(
+                        state
+                            .tape_summary()
+                            .open_session
+                            .as_ref()
+                            .unwrap()
+                            .session_id,
+                        [10; 16]
+                    ),
+                    19 => assert_eq!(
+                        state
+                            .tape_summary()
+                            .last_session_end
+                            .as_ref()
+                            .unwrap()
+                            .reason,
+                        SessionEndReason::DriveError
+                    ),
+                    _ => unreachable!(),
+                }
+            } else {
+                assert!(authority.acquire_exclusive().is_err());
+            }
+        }
+    }
+}
+
+#[test]
+fn session_owner_terminal_plan_keeps_closed_out_media_base() {
+    let (_dir, authority, mut writer, sidecar) = session_owner_fixture();
+    writer
+        .publish_closed_out(
+            [3; 16],
+            Some([9; 16]),
+            &sidecar,
+            "2026-11-02T00:01:00Z".into(),
+        )
+        .unwrap();
+    writer
+        .end_session(
+            [9; 16],
+            "2026-11-02T00:02:00Z".into(),
+            SessionEndReason::CleanClose,
+            None,
+            std::iter::empty(),
+        )
+        .unwrap();
+    let id = writer.tape_uuid();
+    let (mut seed, _, _) = crate::authority::contract_tests::structural_fixture(id);
+    seed.eod_lba = sidecar.cursor.unwrap().lba;
+    let mut prefix = crate::checkpoint::tests::terminal_prefix_plan_for_parity_record(&seed);
+    prefix.sidecar_directory_entries[0].sidecar_total_block_count = sidecar.files[0].block_count;
+    let scheme = seed.scheme.as_ref().unwrap();
+    let parity =
+        u64::from(scheme.stripes_per_neighborhood) * u64::from(scheme.parity_blocks_per_stripe);
+    prefix.sidecar_directory_entries[0].sidecar_header_block_count =
+        remanence_parity::sidecar::checked_sidecar_index_capacity_layout(
+            u64::from(seed.block_size),
+            parity,
+            3,
+        )
+        .unwrap()
+        .block_count;
+    prefix.sidecar_directory_entries[0].parity_shard_block_count = parity;
+    let mut plan = finalization_intent(id);
+    plan.layout = remanence_parity::TerminalTailLayout::new(
+        0,
+        seed.block_size,
+        prefix.tail_start_tape_file_number,
+        prefix.tail_start_lba,
+        4,
+        4096,
+    )
+    .unwrap()
+    .try_into()
+    .unwrap();
+    plan.terminal_prefix = Some(prefix);
+    let plan: AuthorityFinalization = (&plan).into();
+    writer.begin_finalization(&plan).unwrap();
+    writer.accept_preparation().unwrap();
+    let base = writer.latest_commit().unwrap().unwrap();
+    assert_eq!(base.cursor, sidecar.cursor.unwrap());
+    assert_eq!((base.protected, base.total, base.next_file), (3, 3, 3));
+    writer
+        .publish_terminal_prefix(&plan.terminal_prefix.as_ref().unwrap().publication)
+        .unwrap();
+    assert_eq!(writer.latest_commit().unwrap().unwrap().cursor, base.cursor);
+    drop(writer);
+    assert_eq!(
+        authority.latest_commit().unwrap().unwrap().cursor,
+        base.cursor
+    );
+}

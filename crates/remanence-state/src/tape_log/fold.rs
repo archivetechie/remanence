@@ -94,6 +94,9 @@ pub struct TapeSummary {
     pub last_ordinary_commit: Option<u64>,
     /// Constant-size last ordinary closer; never retains catalog payloads.
     pub last_ordinary_record: Option<Committed>,
+    /// Latest ordinary closeout after that checkpoint, retained as the media
+    /// base during terminal recovery. Cleared by the next Object checkpoint.
+    pub last_closeout_record: Option<ClosedOut>,
     /// Last barrier record sequence.
     pub last_media_commit: Option<u64>,
     /// API barrier ordinal, separate from sequence and journal_record_ordinal.
@@ -133,6 +136,7 @@ impl Default for TapeSummary {
             object_count: 0,
             last_ordinary_commit: None,
             last_ordinary_record: None,
+            last_closeout_record: None,
             last_media_commit: None,
             barrier_count: 0,
             ordinary_count: 0,
@@ -145,6 +149,16 @@ impl Default for TapeSummary {
     }
 }
 impl TapeSummary {
+    /// Ordinary closeout is due for an uncovered parity range unless a durable
+    /// accepted terminal plan owns that range. A provisional preparation does
+    /// not satisfy the obligation, and an active session is never preempted by
+    /// this predicate alone.
+    pub fn closeout_due(&self) -> bool {
+        self.scheme.is_some()
+            && self.protected < self.total
+            && self.finalization.as_ref().is_none_or(|plan| plan.prepared)
+    }
+
     // Clone constant metadata only. Pending extents contain new Objects, while
     // the authoritative deque remains untouched until successful group closure.
     fn pending_copy(&self) -> Self {
@@ -169,6 +183,7 @@ impl TapeSummary {
             object_count: self.object_count,
             last_ordinary_commit: self.last_ordinary_commit,
             last_ordinary_record: self.last_ordinary_record.clone(),
+            last_closeout_record: self.last_closeout_record.clone(),
             last_media_commit: self.last_media_commit,
             barrier_count: self.barrier_count,
             ordinary_count: self.ordinary_count,
@@ -727,6 +742,7 @@ impl Fold {
                 p.state.check = CheckValue::EMPTY;
                 p.state.provenance = CheckProvenance::Empty;
                 p.state.last_session_end = None;
+                p.state.last_closeout_record = Some(close.clone());
                 media_commit(&mut p.state, f.sequence)?;
                 self.publish_media(p.state);
             }
@@ -742,6 +758,7 @@ impl Fold {
                 check_commit(&mut p, &self.summary, commit)?;
                 p.state.last_ordinary_commit = Some(f.sequence);
                 p.state.last_ordinary_record = Some(commit.clone());
+                p.state.last_closeout_record = None;
                 p.state.ordinary_count = add(p.state.ordinary_count, 1)?;
                 media_commit(&mut p.state, f.sequence)?;
                 self.publish_media(p.state);
