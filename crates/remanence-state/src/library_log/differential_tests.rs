@@ -59,10 +59,9 @@ fn contradicted_fences_release_other_scopes_live_and_replay() {
                     at: Some(at(1, 9)),
                     operation: Some([9; 16]),
                 }),
-                Body::MediaGenerationSet(MediaGenerationSet {
+                Body::MediumSpecSet(MediumSpecSet {
                     tape: tape(2),
-                    generation: LtoGen::Lto2,
-                    source: GenerationSource::Measured,
+                    medium: medium_spec(),
                     change: GenerationChange {
                         expected: 1,
                         next: 2,

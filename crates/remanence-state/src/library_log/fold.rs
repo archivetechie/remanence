@@ -88,6 +88,15 @@ pub enum Scope {
 /// Typed history contradictions and live-append refusals.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum FoldError {
+    /// The codec reserves this vocabulary but no fold behavior is defined yet.
+    #[error("ReservedNotYetUsed")]
+    ReservedNotYetUsed,
+    /// A different medium requires a new incarnation.
+    #[error("MediumFamilyChanged")]
+    MediumFamilyChanged,
+    /// Raising capacity requires fresh measured provenance on this revision.
+    #[error("CapacityIncreaseRequiresMeasurement")]
+    CapacityIncreaseRequiresMeasurement,
     /// A rule assignment must be recomputed under the current configuration.
     #[error("StaleConfiguration")]
     StaleConfiguration,
@@ -238,6 +247,8 @@ pub struct TapeState {
     pub label_generation: u64,
     /// Media revision.
     pub media_revision: u64,
+    /// Current capabilities, retained to validate subsequent revisions.
+    pub medium: MediumSpec,
     /// Live shell label.
     pub label: Option<LabelText>,
     /// Current pool.
@@ -365,7 +376,7 @@ impl Body {
                 .chain(v.prior_holder.as_ref().map(|x| x.tape))
                 .collect(),
             Self::Retire(v) => vec![v.tape],
-            Self::MediaGenerationSet(v) => vec![v.tape],
+            Self::MediumSpecSet(v) => vec![v.tape],
             Self::WrapMapCached(v) => vec![v.tape],
             // Evidence never participates in fence liveness or queue scopes.
             Self::FenceRaised(v) => match &v.scope {
@@ -480,7 +491,7 @@ impl Body {
             Self::AssignPool(v) => Some(Scope::Tape(v.tape.uuid)),
             Self::Label(v) => Some(Scope::Tape(v.tape.uuid)),
             Self::Retire(v) => Some(Scope::Tape(v.tape.uuid)),
-            Self::MediaGenerationSet(v) => Some(Scope::Tape(v.tape.uuid)),
+            Self::MediumSpecSet(v) => Some(Scope::Tape(v.tape.uuid)),
             Self::ManualFinalizationAccepted(v) => Some(Scope::Tape(v.at.tape.uuid)),
             Self::WrapMapCached(_) | Self::MotionIntent(_) | Self::FenceRaised(_) => None,
             Self::DriveObserved(v) => Some(Scope::Drive(v.drive_uuid)),
@@ -763,6 +774,11 @@ impl LibraryFold {
     }
     fn validate_shape(&self, sequence: u64, r: &Record) -> Result<(), FoldError> {
         let b = &r.body;
+        if matches!(b, Body::FenceRaised(v) if v.cause == FenceCause::ContainerQuarantine
+            || matches!(v.scope, FenceScope::Model { .. }))
+        {
+            return Err(FoldError::ReservedNotYetUsed);
+        }
         // Codec bounds and canonical scalars are shared by live and replay validation.
         let mut sink = crate::log_frame::Limited {
             bytes: Vec::new(),
@@ -896,7 +912,7 @@ impl LibraryFold {
                 }
                 if v.label.is_some() != v.label_provenance.is_some()
                     || v.adoption.is_some() != (v.mode == ProvisionMode::Adopt)
-                    || v.block_size == 0
+                    || v.medium.record_size == 0
                     || v.pool.as_ref().is_some_and(Text::is_empty)
                 {
                     return Err(FoldError::InvalidSchema);
@@ -916,7 +932,7 @@ impl LibraryFold {
                     if v.label
                         .as_ref()
                         .is_some_and(|l| l.as_str().trim() != l.as_str())
-                        || !v.block_size.is_multiple_of(512)
+                        || !v.medium.record_size.is_multiple_of(512)
                         || a.operation != a.idempotency_key
                         || !a.identity_only
                         || a.bootstrap_drive_compression
@@ -998,7 +1014,21 @@ impl LibraryFold {
                     return Err(FoldError::GenerationMismatch);
                 }
             }
-            MediaGenerationSet(v) => generation(&v.change, self.tape(v.tape)?.media_revision)?,
+            MediumSpecSet(v) => {
+                let old = self.tape(v.tape)?;
+                generation(&v.change, old.media_revision)?;
+                if v.medium.record_size == 0 {
+                    return Err(FoldError::InvalidSchema);
+                }
+                if v.medium.family != old.medium.family {
+                    return Err(FoldError::MediumFamilyChanged);
+                }
+                if v.medium.usable_logical_bytes > old.medium.usable_logical_bytes
+                    && v.medium.source != GenerationSource::Measured
+                {
+                    return Err(FoldError::CapacityIncreaseRequiresMeasurement);
+                }
+            }
             AcceptUnprotectedFinalization(v) => {
                 if v.w >= v.t {
                     return Err(FoldError::InvalidSchema);
@@ -1445,6 +1475,7 @@ impl LibraryFold {
                         assignment_generation: 1,
                         label_generation: 1,
                         media_revision: 1,
+                        medium: v.medium.clone(),
                         label: v.label.clone(),
                         pool: v.pool.clone(),
                         calibration_generation: 0,
@@ -1482,8 +1513,10 @@ impl LibraryFold {
                 t.pool = None;
                 t.label = None;
             }
-            MediaGenerationSet(v) => {
-                self.tapes.get_mut(&v.tape.uuid).unwrap().media_revision = v.change.next
+            MediumSpecSet(v) => {
+                let t = self.tapes.get_mut(&v.tape.uuid).unwrap();
+                t.media_revision = v.change.next;
+                t.medium = v.medium.clone();
             }
             FenceRaised(v) => {
                 if let Some(at) = &v.at {
@@ -1510,6 +1543,9 @@ impl LibraryFold {
                 let scope = match &raised.scope {
                     FenceScope::Tape(tape) => Scope::Tape(tape.uuid),
                     FenceScope::Drive(endpoint) => Scope::Endpoint(endpoint.clone()),
+                    FenceScope::Model { .. } => {
+                        unreachable!("reserved scope refused before commit")
+                    }
                 };
                 self.insert_latest(
                     (Tag::FenceReleased, scope, None),
@@ -1983,9 +2019,7 @@ fn duplicate_key(a: &Body, b: &Body) -> bool {
     match (a, b) {
         (Body::AssignPool(a), Body::AssignPool(b)) => a.change.expected == b.change.expected,
         (Body::Label(a), Body::Label(b)) => a.change.expected == b.change.expected,
-        (Body::MediaGenerationSet(a), Body::MediaGenerationSet(b)) => {
-            a.change.expected == b.change.expected
-        }
+        (Body::MediumSpecSet(a), Body::MediumSpecSet(b)) => a.change.expected == b.change.expected,
         (Body::AlarmChanged(a), Body::AlarmChanged(b)) => a.change.expected == b.change.expected,
         (Body::DriveDecision(a), Body::DriveDecision(b)) => a.change.expected == b.change.expected,
         (Body::OperationRecorded(a), Body::OperationRecorded(b)) => a.previous == b.previous,

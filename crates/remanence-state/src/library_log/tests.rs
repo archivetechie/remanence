@@ -98,12 +98,15 @@ pub(super) fn provision(n: u8, label: Option<&str>) -> Body {
         mode: ProvisionMode::Initialize,
         label: label.map(Into::into),
         label_provenance: label.map(|_| LabelProvenance::Changer),
-        block_size: 1048576,
         parity_scheme: None,
-        media: Some(Media {
-            generation: LtoGen::Lto9,
+        medium: MediumSpec {
+            family: MediumFamily::Lto(LtoGen::Lto9),
+            usable_logical_bytes: 18_000_000_000_000,
+            record_size: 1048576,
+            rerecord: false,
+            lifecycle_ops: false,
             source: GenerationSource::Measured,
-        }),
+        },
         pool: None,
         endpoint: None,
         adoption: None,
@@ -1972,4 +1975,230 @@ fn semantic_vectors_pin_expected_errors() {
         .unwrap();
     assert_eq!(*expected, FoldError::WrongCounterpart);
     assert!(matches!(body, Body::FenceReleased(_)));
+}
+
+/// Common LTO capabilities for library history fixtures.
+pub(super) fn medium_spec() -> MediumSpec {
+    MediumSpec {
+        family: MediumFamily::Lto(LtoGen::Lto9),
+        usable_logical_bytes: 18_000_000_000_000,
+        record_size: 1048576,
+        rerecord: false,
+        lifecycle_ops: false,
+        source: GenerationSource::Measured,
+    }
+}
+
+/// Revise the whole spec under the existing media generation check.
+pub(super) fn medium_change(medium: MediumSpec, expected: u64) -> Body {
+    Body::MediumSpecSet(MediumSpecSet {
+        tape: tape(1),
+        medium,
+        change: GenerationChange {
+            expected,
+            next: expected + 1,
+        },
+    })
+}
+/// Each reserved vocabulary item has an otherwise ordinary fence shape.
+pub(super) fn reserved_fence(model: bool) -> Body {
+    Body::FenceRaised(FenceRaised {
+        kind: if model {
+            FenceKind::DriveFault
+        } else {
+            FenceKind::Write
+        },
+        scope: if model {
+            FenceScope::Model {
+                model: "HC560".into(),
+                firmware: "A1".into(),
+            }
+        } else {
+            FenceScope::Tape(tape(1))
+        },
+        cause: if model {
+            FenceCause::TransferError
+        } else {
+            FenceCause::ContainerQuarantine
+        },
+        evidence: None,
+        at: None,
+        operation: None,
+    })
+}
+/// Disk provisioning retains capabilities through live append and decoded replay.
+#[test]
+fn disk_reprovision_retains_medium_spec() {
+    let mut f = LibraryFold::default();
+    let mut b = provision(1, None);
+    let Body::Reprovision(v) = &mut b else {
+        unreachable!()
+    };
+    v.medium = MediumSpec {
+        family: MediumFamily::Disk,
+        rerecord: true,
+        lifecycle_ops: true,
+        ..medium_spec()
+    };
+    let expected = v.medium.clone();
+    feed(&mut f, b, &Present).unwrap();
+    assert_eq!(f.tapes[&tape(1).uuid].medium, expected);
+    assert_eq!(f.tapes[&tape(1).uuid].media_revision, 1);
+}
+/// Family and capacity rules apply to the latest committed spec, never just provisioning.
+#[test]
+fn medium_spec_revision_rules() {
+    let mut f = LibraryFold::default();
+    feed(&mut f, provision(1, None), &Present).unwrap();
+    for family in [MediumFamily::Disk, MediumFamily::Lto(LtoGen::Lto8)] {
+        assert_eq!(
+            feed(
+                &mut f,
+                medium_change(
+                    MediumSpec {
+                        family,
+                        ..medium_spec()
+                    },
+                    1
+                ),
+                &Present
+            )
+            .unwrap_err(),
+            FoldError::MediumFamilyChanged
+        );
+    }
+    for source in [GenerationSource::Operator, GenerationSource::Label] {
+        assert_eq!(
+            feed(
+                &mut f,
+                medium_change(
+                    MediumSpec {
+                        usable_logical_bytes: u64::MAX,
+                        source,
+                        ..medium_spec()
+                    },
+                    1
+                ),
+                &Present
+            )
+            .unwrap_err(),
+            FoldError::CapacityIncreaseRequiresMeasurement
+        );
+    }
+    // A decrease is valid even though the old provenance was measured.
+    let reduced = MediumSpec {
+        usable_logical_bytes: 100,
+        source: GenerationSource::Label,
+        ..medium_spec()
+    };
+    feed(&mut f, medium_change(reduced.clone(), 1), &Present).unwrap();
+    assert_eq!(f.tapes[&tape(1).uuid].medium, reduced);
+    assert_eq!(
+        feed(
+            &mut f,
+            medium_change(
+                MediumSpec {
+                    source: GenerationSource::Operator,
+                    ..medium_spec()
+                },
+                2
+            ),
+            &Present
+        )
+        .unwrap_err(),
+        FoldError::CapacityIncreaseRequiresMeasurement
+    );
+    // Equal capacity needs no measurement; a new measured revision may increase it.
+    feed(&mut f, medium_change(reduced, 2), &Present).unwrap();
+    let raised = MediumSpec {
+        usable_logical_bytes: u64::MAX,
+        ..medium_spec()
+    };
+    let update = medium_change(raised.clone(), 3);
+    feed(&mut f, update.clone(), &Present).unwrap();
+    assert_eq!(f.tapes[&tape(1).uuid].medium, raised);
+    assert_eq!(f.tapes[&tape(1).uuid].media_revision, 4);
+    assert!(matches!(
+        feed(&mut f, update, &Present),
+        Ok(fold::Validated::Duplicate(_))
+    ));
+    assert_eq!(
+        feed(&mut f, medium_change(medium_spec(), 1), &Present).unwrap_err(),
+        FoldError::GenerationMismatch
+    );
+    assert_eq!(
+        feed(
+            &mut f,
+            medium_change(
+                MediumSpec {
+                    record_size: 0,
+                    ..medium_spec()
+                },
+                4
+            ),
+            &Present
+        )
+        .unwrap_err(),
+        FoldError::InvalidSchema
+    );
+}
+/// Reserved codes round-trip through the codec and cannot open a fence, even on a blocked scope.
+#[test]
+fn reserved_fences_decode_then_refuse() {
+    for model in [false, true] {
+        for queued in [false, true] {
+            let mut f = LibraryFold::default();
+            feed(&mut f, provision(1, None), &Present).unwrap();
+            if queued {
+                let pending = record(
+                    Body::SupersedeTail(SupersedeTail {
+                        at: at(1, 9),
+                        operation: [7; 16],
+                        session_id: [3; 16],
+                        preview_digest: [0; 32],
+                        tail_file_count: 1,
+                    }),
+                    2,
+                );
+                f.receive(
+                    2,
+                    pending.clone(),
+                    receipt(&pending, 2),
+                    &View::default(),
+                    &History::default(),
+                )
+                .unwrap();
+                assert_eq!(f.pending.len(), 1);
+            }
+            let mut b = reserved_fence(model);
+            if queued {
+                let Body::FenceRaised(v) = &mut b else {
+                    unreachable!()
+                };
+                v.operation = Some([7; 16]);
+            }
+            let r = record(b, f.received_through + 1);
+            let mut bytes = Vec::new();
+            wire::encode(&r, &mut bytes).unwrap();
+            let decoded = wire::decode(r.body.tag() as u16, &bytes).unwrap();
+            assert_eq!(decoded, r);
+            let before = f.clone();
+            assert_eq!(
+                f.validate(&decoded, &Present, &History::default())
+                    .unwrap_err(),
+                FoldError::ReservedNotYetUsed
+            );
+            assert_eq!(
+                f.receive(
+                    f.received_through + 1,
+                    decoded.clone(),
+                    receipt(&decoded, f.received_through + 1),
+                    &Present,
+                    &History::default()
+                ),
+                Err(FoldError::ReservedNotYetUsed)
+            );
+            f.assert_same_state(&before);
+        }
+    }
 }

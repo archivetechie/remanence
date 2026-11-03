@@ -143,12 +143,29 @@ pub struct PriorHolder {
     /// CBOR key 1: `GenerationChange`.
     pub change: GenerationChange,
 }
-/// Media fields in ascending CBOR-key order.
+/// Medium identity; generation is meaningful only for LTO.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediumFamily {
+    /// Wire code 0, with an LTO generation payload.
+    Lto(LtoGen),
+    /// Wire code 1, with a null payload.
+    Disk,
+}
+/// Capabilities recorded at provisioning and revised under media_revision.
+/// Rerecord implies regenerative use; role is never stored separately.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Media {
-    /// CBOR key 0: `LtoGen`.
-    pub generation: LtoGen,
-    /// CBOR key 1: `GenerationSource`.
+pub struct MediumSpec {
+    /// CBOR key 0: medium identity.
+    pub family: MediumFamily,
+    /// CBOR key 1: usable capacity in logical bytes.
+    pub usable_logical_bytes: u64,
+    /// CBOR key 2: fixed block size, the sole geometry field.
+    pub record_size: u32,
+    /// CBOR key 3: identical-content re-record capability.
+    pub rerecord: bool,
+    /// CBOR key 4: lifecycle operations capability (never inferred from family).
+    pub lifecycle_ops: bool,
+    /// CBOR key 5: provenance of this spec; Measured attests a fresh measurement.
     pub source: GenerationSource,
 }
 /// Adoption fields in ascending CBOR-key order.
@@ -468,29 +485,25 @@ pub struct Reprovision {
     pub label: Option<LabelText>,
     /// CBOR key 4: `Option<LabelProvenance>`.
     pub label_provenance: Option<LabelProvenance>,
-    /// CBOR key 5: `u32`.
-    pub block_size: u32,
-    /// CBOR key 6: `Option<ParityScheme>`.
+    /// CBOR key 5: `Option<ParityScheme>`.
     pub parity_scheme: Option<ParityScheme>,
-    /// CBOR key 7: `Option<Media>`.
-    pub media: Option<Media>,
-    /// CBOR key 8: `Option<Text>`.
+    /// CBOR key 6: `MediumSpec`.
+    pub medium: MediumSpec,
+    /// CBOR key 7: `Option<Text>`.
     pub pool: Option<Text>,
-    /// CBOR key 9: `Option<DriveKey>`.
+    /// CBOR key 8: `Option<DriveKey>`.
     pub endpoint: Option<DriveKey>,
-    /// CBOR key 10: `Option<Adoption>`.
+    /// CBOR key 9: `Option<Adoption>`.
     pub adoption: Option<Adoption>,
 }
-/// MediaGenerationSet fields in ascending CBOR-key order.
+/// MediumSpecSet fields in ascending CBOR-key order.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MediaGenerationSet {
+pub struct MediumSpecSet {
     /// CBOR key 0: `TapeRef`.
     pub tape: TapeRef,
-    /// CBOR key 1: `LtoGen`.
-    pub generation: LtoGen,
-    /// CBOR key 2: `GenerationSource`.
-    pub source: GenerationSource,
-    /// CBOR key 3: `GenerationChange`.
+    /// CBOR key 1: replacement medium spec.
+    pub medium: MediumSpec,
+    /// CBOR key 2: `GenerationChange` against media_revision.
     pub change: GenerationChange,
 }
 /// SupersedeTail fields in ascending CBOR-key order.
@@ -912,6 +925,8 @@ pub enum FenceCause {
     CloseoutReadContradiction = 10,
     /// Wire code 11; producer vocabulary is recorded in SCHEMA.md.
     Cleaning = 11,
+    /// Wire code 12; decoded but reserved until disk quarantine is implemented.
+    ContainerQuarantine = 12,
 }
 /// Closed MotionResult wire vocabulary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1369,6 +1384,13 @@ pub enum FenceScope {
     Tape(TapeRef),
     /// Wire code 1.
     Drive(DriveKey),
+    /// Wire code 2; decoded but reserved until model qualification is implemented.
+    Model {
+        /// Hardware model.
+        model: Text,
+        /// Firmware revision.
+        firmware: Text,
+    },
 }
 /// Motion: each variant is encoded as `[code, payload]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1499,8 +1521,8 @@ pub enum Tag {
     Retire = 3,
     /// Reprovision.
     Reprovision = 4,
-    /// MediaGenerationSet.
-    MediaGenerationSet = 5,
+    /// MediumSpecSet.
+    MediumSpecSet = 5,
     /// SupersedeTail.
     SupersedeTail = 6,
     /// AcceptUnprotectedFinalization.
@@ -1557,8 +1579,8 @@ pub enum Body {
     Retire(Retire),
     /// Reprovision.
     Reprovision(Reprovision),
-    /// MediaGenerationSet.
-    MediaGenerationSet(MediaGenerationSet),
+    /// MediumSpecSet.
+    MediumSpecSet(MediumSpecSet),
     /// SupersedeTail.
     SupersedeTail(SupersedeTail),
     /// AcceptUnprotectedFinalization.
@@ -1612,7 +1634,7 @@ impl Body {
             Self::Label(..) => Tag::Label,
             Self::Retire(..) => Tag::Retire,
             Self::Reprovision(..) => Tag::Reprovision,
-            Self::MediaGenerationSet(..) => Tag::MediaGenerationSet,
+            Self::MediumSpecSet(..) => Tag::MediumSpecSet,
             Self::SupersedeTail(..) => Tag::SupersedeTail,
             Self::AcceptUnprotectedFinalization(..) => Tag::AcceptUnprotectedFinalization,
             Self::FenceRaised(..) => Tag::FenceRaised,

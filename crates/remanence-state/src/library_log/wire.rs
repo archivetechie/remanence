@@ -171,7 +171,7 @@ fields!(Bay; library_serial:Text,bay:u16);
 fields!(Standalone; drive_serial:Text);
 fields!(PriorHolder; tape:TapeRef,change:GenerationChange);
 fields!(ParityScheme;id:Text,data_blocks_per_stripe:u16,parity_blocks_per_stripe:u16,stripes_per_neighborhood:u32);
-fields!(Media; generation:LtoGen,source:GenerationSource);
+fields!(MediumSpec; family:MediumFamily,usable_logical_bytes:u64,record_size:u32,rerecord:bool,lifecycle_ops:bool,source:GenerationSource);
 fields!(Adoption; request_fingerprint:Hash,operation:Id,idempotency_key:Id,physical_tail:PhysicalTail,state:AdoptedState,library_revision:Option<Text>,home_slot:Option<u16>,drive_serial:Text,identity_only:bool,bootstrap_drive_compression:bool,configured_drive_compression:bool);
 fields!(Load; endpoint:DriveKey,attempt:u32);
 fields!(Unload; endpoint:DriveKey);
@@ -200,8 +200,8 @@ fields!(Recovered; source_digest:Hash);
 fields!(AssignPool; tape:TapeRef,pool:Option<Text>,change:GenerationChange,source:AssignmentSource,configuration:Option<DecisionRef>);
 fields!(Label; tape:TapeRef,label:Option<LabelText>,provenance:LabelProvenance,change:GenerationChange,prior_holder:Option<PriorHolder>,observed_bot_uuid:Option<Id>);
 fields!(Retire; tape:TapeRef,reason:RetireReason,observed_tape_sequence:Option<u64>,assignment_generation:u64,detail:Option<Text>);
-fields!(Reprovision; tape:TapeRef,predecessor:Option<TapeRef>,mode:ProvisionMode,label:Option<LabelText>,label_provenance:Option<LabelProvenance>,block_size:u32,parity_scheme:Option<ParityScheme>,media:Option<Media>,pool:Option<Text>,endpoint:Option<DriveKey>,adoption:Option<Adoption>);
-fields!(MediaGenerationSet; tape:TapeRef,generation:LtoGen,source:GenerationSource,change:GenerationChange);
+fields!(Reprovision; tape:TapeRef,predecessor:Option<TapeRef>,mode:ProvisionMode,label:Option<LabelText>,label_provenance:Option<LabelProvenance>,parity_scheme:Option<ParityScheme>,medium:MediumSpec,pool:Option<Text>,endpoint:Option<DriveKey>,adoption:Option<Adoption>);
+fields!(MediumSpecSet; tape:TapeRef,medium:MediumSpec,change:GenerationChange);
 fields!(SupersedeTail; at:TapeAt,operation:Id,session_id:Id,preview_digest:Hash,tail_file_count:u64);
 fields!(AcceptUnprotectedFinalization; at:TapeAt,operation:Id,w:u64,t:u64,reason:Text);
 fields!(FenceRaised; kind:FenceKind,scope:FenceScope,cause:FenceCause,evidence:Option<CompletionEvidence>,at:Option<TapeAt>,operation:Option<Id>);
@@ -231,7 +231,7 @@ enumeration!(ProvisionMode; 0=>Initialize,1=>Adopt);
 enumeration!(Dispatch; 0=>NotIssued,1=>Issued);
 enumeration!(Completion; 0=>Known,1=>Unknown);
 enumeration!(FenceKind; 0=>Write,1=>DriveFault);
-enumeration!(FenceCause; 0=>PartialBatch,1=>TransferError,2=>CloseoutCheckMismatch,3=>SupersedeTailFailed,4=>StandaloneWriteLostByRestart,5=>AppendAdmissionRefused,6=>ResetUnitAttention,7=>PositionDrift,8=>AuthorityAmbiguous,9=>SessionSuffixContradiction,10=>CloseoutReadContradiction,11=>Cleaning);
+enumeration!(FenceCause; 0=>PartialBatch,1=>TransferError,2=>CloseoutCheckMismatch,3=>SupersedeTailFailed,4=>StandaloneWriteLostByRestart,5=>AppendAdmissionRefused,6=>ResetUnitAttention,7=>PositionDrift,8=>AuthorityAmbiguous,9=>SessionSuffixContradiction,10=>CloseoutReadContradiction,11=>Cleaning,12=>ContainerQuarantine);
 enumeration!(MotionResult; 0=>Done,1=>Failed,2=>Unknown);
 enumeration!(ElementKind; 0=>Transport,1=>Storage,2=>ImportExport,3=>Drive);
 enumeration!(SelectionPolicy; 0=>CompleteOrFill,1=>FillOldest);
@@ -254,7 +254,80 @@ enumeration!(SessionKind; 1=>Read,2=>Operation);
 enumeration!(SessionEvent; 0=>Opened,1=>Closed,2=>Orphaned,3=>LostByRestart);
 enumeration!(DiagnosticEvent; 0=>RequestReceived,1=>OperationStarted,2=>OperationProgress,3=>OperationFinished,4=>OperationFailed,5=>CancelRequested,6=>CancelledBeforeDispatch,7=>CompletedAfterCancel,8=>CancellationRejected,9=>CompletionUnknown,10=>ClockRegressionObserved,11=>ClockForwardJumpObserved,12=>HardwareWarning,13=>RecoveryEvent,14=>ConfigLoaded,15=>ConfigRejected,16=>IndexRebuilt,17=>ReadOnlyModeEntered,18=>ReadOnlyModeLeft,19=>AuditWriteFailed);
 union!(DriveKey; 0=>Bay(Bay),1=>Standalone(Standalone));
-union!(FenceScope; 0=>Tape(TapeRef),1=>Drive(DriveKey));
+// Named payload keeps the Model wire map schema-directed.
+struct ModelScope {
+    model: Text,
+    firmware: Text,
+}
+fields!(ModelScope; model:Text,firmware:Text);
+impl Wire for MediumFamily {
+    fn put(&self, w: &mut dyn Write) -> io::Result<()> {
+        head(w, 4, 2)?;
+        match self {
+            Self::Lto(generation) => {
+                0u64.put(w)?;
+                generation.put(w)
+            }
+            Self::Disk => {
+                1u64.put(w)?;
+                Unit.put(w)
+            }
+        }
+    }
+    fn get(r: &mut dyn Read) -> io::Result<Self> {
+        if expect(r, 4)? != 2 {
+            return Err(invalid());
+        }
+        match u64::get(r)? {
+            0 => Ok(Self::Lto(LtoGen::get(r)?)),
+            1 => {
+                Unit::get(r)?;
+                Ok(Self::Disk)
+            }
+            _ => Err(invalid()),
+        }
+    }
+}
+impl Wire for FenceScope {
+    fn put(&self, w: &mut dyn Write) -> io::Result<()> {
+        head(w, 4, 2)?;
+        match self {
+            Self::Tape(t) => {
+                0u64.put(w)?;
+                t.put(w)
+            }
+            Self::Drive(d) => {
+                1u64.put(w)?;
+                d.put(w)
+            }
+            Self::Model { model, firmware } => {
+                2u64.put(w)?;
+                ModelScope {
+                    model: model.clone(),
+                    firmware: firmware.clone(),
+                }
+                .put(w)
+            }
+        }
+    }
+    fn get(r: &mut dyn Read) -> io::Result<Self> {
+        if expect(r, 4)? != 2 {
+            return Err(invalid());
+        }
+        match u64::get(r)? {
+            0 => Ok(Self::Tape(TapeRef::get(r)?)),
+            1 => Ok(Self::Drive(DriveKey::get(r)?)),
+            2 => {
+                let v = ModelScope::get(r)?;
+                Ok(Self::Model {
+                    model: v.model,
+                    firmware: v.firmware,
+                })
+            }
+            _ => Err(invalid()),
+        }
+    }
+}
 union!(Motion; 0=>Load(Load),1=>Unload(Unload),2=>Move(Move));
 union!(Confirmation; 0=>Inventory(u64),1=>Readiness(u64));
 union!(Stewardship; 0=>Retire(Reason),1=>Reinstate(Reason),2=>Annotate(Annotation));
@@ -277,7 +350,7 @@ pub(super) fn encode_body(body: &Body, w: &mut dyn Write) -> io::Result<()> {
         Body::Label(v) => v.put(w),
         Body::Retire(v) => v.put(w),
         Body::Reprovision(v) => v.put(w),
-        Body::MediaGenerationSet(v) => v.put(w),
+        Body::MediumSpecSet(v) => v.put(w),
         Body::SupersedeTail(v) => v.put(w),
         Body::AcceptUnprotectedFinalization(v) => v.put(w),
         Body::FenceRaised(v) => v.put(w),
@@ -316,7 +389,7 @@ pub(super) fn decode(tag: u16, bytes: &[u8]) -> io::Result<Record> {
         2 => Body::Label(Label::get(&mut r)?),
         3 => Body::Retire(Retire::get(&mut r)?),
         4 => Body::Reprovision(Reprovision::get(&mut r)?),
-        5 => Body::MediaGenerationSet(MediaGenerationSet::get(&mut r)?),
+        5 => Body::MediumSpecSet(MediumSpecSet::get(&mut r)?),
         6 => Body::SupersedeTail(SupersedeTail::get(&mut r)?),
         7 => Body::AcceptUnprotectedFinalization(AcceptUnprotectedFinalization::get(&mut r)?),
         8 => Body::FenceRaised(FenceRaised::get(&mut r)?),
@@ -359,7 +432,8 @@ pub(super) const SCHEMA_FIELDS: &[(&str, &[(&str, &str)])] = &[
     ("Bay", Bay::FIELDS),
     ("Standalone", Standalone::FIELDS),
     ("PriorHolder", PriorHolder::FIELDS),
-    ("Media", Media::FIELDS),
+    ("MediumSpec", MediumSpec::FIELDS),
+    ("ModelScope", ModelScope::FIELDS),
     ("Adoption", Adoption::FIELDS),
     ("Load", Load::FIELDS),
     ("Unload", Unload::FIELDS),
@@ -389,7 +463,7 @@ pub(super) const SCHEMA_FIELDS: &[(&str, &[(&str, &str)])] = &[
     ("Label", Label::FIELDS),
     ("Retire", Retire::FIELDS),
     ("Reprovision", Reprovision::FIELDS),
-    ("MediaGenerationSet", MediaGenerationSet::FIELDS),
+    ("MediumSpecSet", MediumSpecSet::FIELDS),
     ("SupersedeTail", SupersedeTail::FIELDS),
     (
         "AcceptUnprotectedFinalization",

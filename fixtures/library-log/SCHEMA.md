@@ -116,12 +116,23 @@ AuditActor is map {0: kind uint (0 System, 1 User, 2 Service), 1: name text4096|
 | 0 | tape | `TapeRef` | false |
 | 1 | change | `GenerationChange` | false |
 
-## Media
+## MediumSpec
 
 | Key | Field | CBOR type / bound | Optional |
 |---:|---|---|---|
-| 0 | generation | `LtoGen` | false |
-| 1 | source | `GenerationSource` | false |
+| 0 | family | `MediumFamily` | false |
+| 1 | usable_logical_bytes | `u64` | false |
+| 2 | record_size | `u32` | false |
+| 3 | rerecord | `bool` | false |
+| 4 | lifecycle_ops | `bool` | false |
+| 5 | source | `GenerationSource` | false |
+
+## ModelScope
+
+| Key | Field | CBOR type / bound | Optional |
+|---:|---|---|---|
+| 0 | model | `Text` | false |
+| 1 | firmware | `Text` | false |
 
 ## Adoption
 
@@ -368,21 +379,19 @@ AuditActor is map {0: kind uint (0 System, 1 User, 2 Service), 1: name text4096|
 | 2 | mode | `ProvisionMode` | false |
 | 3 | label | `Option<LabelText>` | true |
 | 4 | label_provenance | `Option<LabelProvenance>` | true |
-| 5 | block_size | `u32` | false |
-| 6 | parity_scheme | `Option<ParityScheme>` | true |
-| 7 | media | `Option<Media>` | true |
-| 8 | pool | `Option<Text>` | true |
-| 9 | endpoint | `Option<DriveKey>` | true |
-| 10 | adoption | `Option<Adoption>` | true |
+| 5 | parity_scheme | `Option<ParityScheme>` | true |
+| 6 | medium | `MediumSpec` | false |
+| 7 | pool | `Option<Text>` | true |
+| 8 | endpoint | `Option<DriveKey>` | true |
+| 9 | adoption | `Option<Adoption>` | true |
 
-## MediaGenerationSet
+## MediumSpecSet
 
 | Key | Field | CBOR type / bound | Optional |
 |---:|---|---|---|
 | 0 | tape | `TapeRef` | false |
-| 1 | generation | `LtoGen` | false |
-| 2 | source | `GenerationSource` | false |
-| 3 | change | `GenerationChange` | false |
+| 1 | medium | `MediumSpec` | false |
+| 2 | change | `GenerationChange` | false |
 
 ## SupersedeTail
 
@@ -714,6 +723,7 @@ AuditActor is map {0: kind uint (0 System, 1 User, 2 Service), 1: name text4096|
 | 9 | `SessionSuffixContradiction` |
 | 10 | `CloseoutReadContradiction` |
 | 11 | `Cleaning` |
+| 12 | `ContainerQuarantine` |
 
 ### MotionResult
 
@@ -995,13 +1005,6 @@ AuditActor is map {0: kind uint (0 System, 1 User, 2 Service), 1: name text4096|
 | 0 | `Bay(Bay)` |
 | 1 | `Standalone(Standalone)` |
 
-### FenceScope
-
-| Code | Variant / payload |
-|---:|---|
-| 0 | `Tape(TapeRef)` |
-| 1 | `Drive(DriveKey)` |
-
 ### Motion
 
 | Code | Variant / payload |
@@ -1082,6 +1085,23 @@ AuditActor is map {0: kind uint (0 System, 1 User, 2 Service), 1: name text4096|
 | 4 | `Bool(bool)` |
 | 5 | `Null(Unit)` |
 
+### MediumFamily
+
+| Code | Variant / payload |
+|---:|---|
+| 0 | Lto(LtoGen) |
+| 1 | Disk(null) |
+
+### FenceScope
+
+| Code | Variant / payload |
+|---:|---|
+| 0 | Tape(TapeRef) |
+| 1 | Drive(DriveKey) |
+| 2 | Model(ModelScope), reserved |
+
+MediumSpec stores capabilities, never role. rerecord implies regenerative; lifecycle_ops gates lifecycle operations independently of family. Source Measured on a revision attests a fresh measurement, not inherited provenance. Zero capacity is permitted (no usable space).
+
 ## Replay and pending
 
 Tags 6, 7, 13, 14, 15 and 26 depend on TapeAt; tag 15 requires native FinalizationPrepared. Present has both kind and digest. NotYet queues all touched scopes in source order, except FenceRaised always applies. resolve retries to a fixed point. Byte faults and library FoldError stop at the previous authoritative prefix. TapeContradiction isolates its tape and continues. applied_through never crosses pending.
@@ -1094,11 +1114,11 @@ LibraryHistory first uses retained state; otherwise the store binary-searches ex
 | 1 | AssignPool | Tape, Config | `change.expected` = the tape's `assignment_generation`. The tape is provisioned and not retired. `Rule` requires `configuration` to name the latest retained `ConfigurationAccepted`; an older reference is `StaleConfiguration`, including an identical retry. History classifies a mismatching reference: only an older ConfigurationAccepted is StaleConfiguration; another kind or absent reference is WrongCounterpart. `pool`, if present, is non-empty |
 | 2 | Label | Tape (both holders), Label (old and new) | `change` against the tape's `label_generation`. Labels are unique among live tapes. If the label is held by live tape X, `prior_holder` must name X with X's current `label_generation`. The one record moves the label, clears X's label and bumps X's generation. If the label is free, `prior_holder` is null. `observed_bot_uuid`, if present, equals `tape.uuid`. **Recovery 4** |
 | 3 | Retire | Tape, Label | `assignment_generation` equals the current one. The tape is live. Retire ends the incarnation for good and releases its label and pool. `observed_tape_sequence` is evidence, never a prerequisite. No later record except `Diagnostic` may name a retired `TapeRef` (`RetiredIdentity`) |
-| 4 | Reprovision | Tape (new and predecessor), Label | A new UUID, never seen before. `predecessor`, if present, is retired. The label, if any, is free. `label_provenance` is null exactly when `label` is. `adoption` is present exactly for `Adopt`. Sets assignment, label and media generations to 1 in one record; no separate `Label` or `AssignPool` for the initial state |
-| 5 | MediaGenerationSet | Tape | `change` against the tape's `media_revision`. The tape is live |
+| 4 | Reprovision | Tape (new and predecessor), Label | A new UUID, never seen before. `predecessor`, if present, is retired. The label, if any, is free. `label_provenance` is null exactly when `label` is. `adoption` is present exactly for `Adopt`. Mandatory MediumSpec owns the sole fixed block size (record_size > 0, multiple of 512 for adoption). Former key 5 block_size is removed; parity_scheme is key 5, medium key 6, pool key 7, endpoint key 8 and adoption key 9. Sets assignment, label and media generations to 1 in one record; no separate `Label` or `AssignPool` for the initial state |
+| 5 | MediumSpecSet | Tape | `change` against the live tape's `media_revision`. `medium.family` must equal the current family (including LTO generation), otherwise MediumFamilyChanged. Capacity may stay equal or decrease; an increase requires source Measured on this new revision (fresh measurement), otherwise CapacityIncreaseRequiresMeasurement. A retry is not a fresh revision. record_size must be nonzero |
 | 6 | SupersedeTail | Tape, Operation | **Pending dependency** on `at`. At most one per (`at.tape`, `session_id`). B4b's tape fold checks the `SessionEnded.crash_ack_audit_sequence` that names it (kind, tape, session, count); B2 provides `LibraryFold::supersede(sequence)` for that lookup |
 | 7 | AcceptUnprotectedFinalization | Tape, Operation | **Pending** on `at`. `w < t`. At most one per (incarnation, operation). Codec, fold and fixtures exist now. **No production constructor**; step 6 adds the emitter |
-| 8 | FenceRaised | Tape or Endpoint, Operation | `Write` requires tape scope; `DriveFault` requires drive scope (`FenceScopeMismatch`). The tape is live. A live or replay fence behind queued state takes effect immediately; its live-tape check covers only the scope tape, runs in queue order and failure becomes a scoped contradiction. A live fence on a tape unknown while its operation has queued records is accepted and becomes a scoped contradiction on resolution, as on replay; B4b writers check fence targets themselves. If the scope tape is already contradicted or becomes contradicted while queued, the check resolves immediately, releasing its queued entry and other scopes while the contradiction stands and the fence stays open. The fence id is this record's sequence. No deduplication: every raise is its own fence. **`at` is evidence, not a dependency:** the fence applies at once, and an unresolvable `at` is reported, never waited for |
+| 8 | FenceRaised | Tape or Endpoint, Operation | ContainerQuarantine (cause 12) and Model (scope 2) decode but are refused before queuing or committing with ReservedNotYetUsed. `Write` requires tape scope; `DriveFault` requires drive scope (`FenceScopeMismatch`). The tape is live. A live or replay fence behind queued state takes effect immediately; its live-tape check covers only the scope tape, runs in queue order and failure becomes a scoped contradiction. A live fence on a tape unknown while its operation has queued records is accepted and becomes a scoped contradiction on resolution, as on replay; B4b writers check fence targets themselves. If the scope tape is already contradicted or becomes contradicted while queued, the check resolves immediately, releasing its queued entry and other scopes while the contradiction stands and the fence stays open. The fence id is this record's sequence. No deduplication: every raise is its own fence. **`at` is evidence, not a dependency:** the fence applies at once, and an unresolvable `at` is reported, never waited for |
 | 9 | FenceReleased | raised fence scopes | `fence` remains a u64 FenceId: the raise sequence within the header-bound log UUID. Only this reference form uses sequence-only LibraryHistory lookup; DecisionRef always matches the record UUID. An earlier raise no longer open is `FenceAlreadyReleased`, even after later fences; another tag is `WrongCounterpart`; absent history is `ReleaseWithoutFence`. Zero/forward references remain `ForwardReference`. The latest identical release retry remains a no-op. `forced` changes nothing in the fold but the fence: it cannot resolve a motion, a pending record or an ambiguity |
 | 10 | MotionIntent | Tape, Endpoint, Library, Operation | `command` is unique among open intents. **The LOAD attempt count lives only here** (item 6): `attempt` is 1 plus the number of earlier `Load` intents with the same `parent_operation` and endpoint; with no parent it is 1. An intent with no outcome makes its library (a `Bay` endpoint's serial, a `Move`'s serial, or a standalone endpoint) **InventoryUnknown** |
 | 11 | MotionOutcome | intent scopes | `intent` names an open `MotionIntent` (`OutcomeWithoutOpenIntent`; `WrongCounterpart` if another tag). One outcome per intent. `Done` requires a confirmation: Inventory for Move and Unload, Readiness for Load. `Unknown` leaves the library InventoryUnknown |
