@@ -335,7 +335,7 @@ fn decoded(err: &ScsiError) -> Option<(u8, u8, u8)> {
         ScsiError::CheckCondition { sense, .. } => sense,
         _ => return None,
     };
-    let sense = remanence_scsi::decode_sense(sense)?;
+    let sense = remanence_scsi::decode_usable_sense(sense)?;
     // Deferred sense reports an earlier command, not this one's readiness.
     if !(sense.is_fixed_format() || sense.is_descriptor_format()) {
         return None;

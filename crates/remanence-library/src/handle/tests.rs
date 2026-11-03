@@ -4430,16 +4430,23 @@ fn drive_handle_write_block_batch_decodes_valid_fixed_residual() {
         });
     let mut handle = lib.open_with(&policy, factory).expect("library opens");
 
-    let outcome = {
+    let error = {
         let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
-        drive
+        let error = drive
             .write_block_batch(&[0x11u8; 16], 4)
-            .expect("partial fixed residual is decoded")
+            .expect_err("partial fixed residual is uncommittable evidence");
+        assert_eq!(drive.known_position(), None);
+        error
     };
 
-    assert_eq!(outcome.records_written, 3);
-    assert_eq!(outcome.bytes_written, 12);
-    assert_eq!(outcome.position_after.lba, 10);
+    assert!(matches!(error, TapeIoError::PartialBatchUncommittable {
+        requested_records: 4,
+        written_records: 3,
+        requested_bytes: 16,
+        written_bytes: 12,
+        end_of_medium: false,
+        sense: Some(ref raw),
+    } if raw == &fixed_residual_sense(1)));
     let rp_count = log.borrow().iter().filter(|cdb| cdb[0] == 0x34).count();
     assert_eq!(rp_count, 1, "partial residual does not add a follow-up RP");
     assert!(!handle.is_dirty());
@@ -6365,7 +6372,7 @@ use crate::error::{LoadError, UnloadError};
 /// two slots (0x0400 full / 0x0401 empty), and TWO IE ports
 /// (0x0300 empty, 0x0301 empty) — wider than the move_medium
 /// test rig because export/import need IE ports to target.
-fn composed_test_lib(serial: &str) -> Library {
+pub(super) fn composed_test_lib(serial: &str) -> Library {
     let mut lib = open_drive_test_lib(serial);
     lib.layout.ie_start = 0x0300;
     lib.layout.ie_count = 2;
@@ -6393,11 +6400,11 @@ fn composed_test_lib(serial: &str) -> Library {
 }
 
 /// Standard 4-response open-time script for the changer.
-fn open_script(serial: &str) -> Vec<Vec<u8>> {
+pub(super) fn open_script(serial: &str) -> Vec<Vec<u8>> {
     vec![changer_inquiry_response(), vpd80_response(serial)]
 }
 
-fn drive_script() -> Vec<Vec<u8>> {
+pub(super) fn drive_script() -> Vec<Vec<u8>> {
     vec![lto9_inquiry(), vpd80_response("DRV_A")]
 }
 
@@ -6793,7 +6800,9 @@ impl<T: SgTransport> SgTransport for FailExecuteNoneAfter<T> {
         self.count += 1;
         if self.count > self.succeed_n {
             Err(ScsiError::CheckCondition {
-                sense: vec![0x70, 0, 0x05, 0, 0, 0, 0, 0x0a],
+                sense: vec![
+                    0x70, 0, 0x05, 0, 0, 0, 0, 0x0a, 0, 0, 0, 0, 0x24, 0, 0, 0, 0, 0,
+                ],
                 bytes_transferred: 0,
             })
         } else {
@@ -7981,7 +7990,7 @@ fn standalone_policy_denies_unlisted_devices_and_ephemeral_audit_authority() {
 }
 
 /// Supply live RES responses for command fixtures, updating only on successful moves.
-fn with_inventory<F>(
+pub(super) fn with_inventory<F>(
     library: &Library,
     mut factory: F,
 ) -> impl FnMut(&Path) -> Result<Box<dyn SgTransport>, IoErrorKind>

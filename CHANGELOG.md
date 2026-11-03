@@ -7,6 +7,12 @@ per-release summaries.
 <!-- code-anchor: crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/drive_pool.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-api/src/append_admission.rs crates/remanence-state/src/index.rs crates/remanence-cli/src/lib.rs crates/remanence-stream/src/lib.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
 ## Unreleased
 
+- Failed fixed-block write batches return an uncommittable error with their
+  sense; failed fixed read batches no longer keep their cursor. CHECK CONDITION
+  without usable sense, or accompanied by a host or driver failure, is treated
+  as unknown completion, so the library refreshes before trusting its view.
+  A move refused with 3B/0E now reports an empty source.
+
 - Each write session owns its parity epoch. Checkpoints commit objects within
   that session; clean close returns durable receipts, then writes the remaining
   sidecar and records `ClosedOut` and `SessionEnded`. The drive and tape stay

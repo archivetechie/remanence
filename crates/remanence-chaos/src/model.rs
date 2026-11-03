@@ -3450,8 +3450,8 @@ mod l1b_tests {
             .expect_err("LIB-01 fails move");
 
         match err {
-            MoveError::DestinationFull { addr } => assert_eq!(addr, BAY),
-            other => panic!("expected DestinationFull, got {other:?}"),
+            MoveError::SourceEmpty { addr } => assert_eq!(addr, SLOT),
+            other => panic!("expected SourceEmpty, got {other:?}"),
         }
         assert!(!handle.is_dirty());
         assert_eq!(
@@ -4297,6 +4297,7 @@ mod l1b_tests {
     fn non_transient_move_failures_fail_at_once_with_the_wait_enabled() {
         for (catalogue_id, expected) in [
             ("LIB-01", (0x05, 0x3b, 0x0e)),
+            ("LIB-02", (0x05, 0x3b, 0x0d)),
             ("LIB-07", (0x04, 0x44, 0x00)),
         ] {
             let world = slotted_world(64 * 1024 * 1024);
@@ -4321,7 +4322,8 @@ mod l1b_tests {
                 .expect_err("non-transient sense fails");
 
             match (catalogue_id, err) {
-                ("LIB-01", MoveError::DestinationFull { addr }) => assert_eq!(addr, BAY),
+                ("LIB-01", MoveError::SourceEmpty { addr }) => assert_eq!(addr, SLOT),
+                ("LIB-02", MoveError::DestinationFull { addr }) => assert_eq!(addr, BAY),
                 ("LIB-07", MoveError::ScsiError(err)) => {
                     assert_eq!(scsi_error_tuple(&err), expected)
                 }

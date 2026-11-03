@@ -79,6 +79,24 @@ pub fn decode_sense(sense: &[u8]) -> Option<DecodedSense> {
     }
 }
 
+/// Decode sense only when the captured bytes contain the key, ASC and ASCQ:
+/// at least 14 bytes for fixed format (70h/71h), or 4 for descriptor format
+/// (72h/73h). Undefined response codes and shorter captures are unusable.
+///
+/// Captured length is authoritative, not the additional-sense-length byte:
+/// the host's 32-byte sense buffer may legitimately truncate a longer reply.
+pub fn decode_usable_sense(sense: &[u8]) -> Option<DecodedSense> {
+    let minimum = match sense.first()? & 0x7f {
+        0x70 | 0x71 => 14,
+        0x72 | 0x73 => 4,
+        _ => return None,
+    };
+    if sense.len() < minimum {
+        return None;
+    }
+    decode_sense(sense)
+}
+
 /// Walk the bounded descriptor list and collect boundary flags shared with
 /// fixed-format sense. Malformed trailing descriptors stop the walk while
 /// preserving fields decoded from earlier complete descriptors.
@@ -134,6 +152,57 @@ fn decode_descriptor_flags(sense: &[u8]) -> (bool, bool, bool, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Usability requires captured key, ASC and ASCQ, including deferred formats.
+    #[test]
+    fn b3a_usable_sense_rejects_missing_fields() {
+        assert_eq!(decode_usable_sense(&[]), None);
+        for code in [0, 0x7f] {
+            let mut sense = vec![0; 18];
+            sense[0] = code;
+            assert_eq!(decode_usable_sense(&sense), None);
+        }
+        for (code, lengths) in [
+            (0x70, &[3, 8, 13][..]),
+            (0x71, &[3, 8, 13][..]),
+            (0x72, &[2, 3][..]),
+            (0x73, &[2, 3][..]),
+        ] {
+            for &len in lengths {
+                let mut sense = vec![0; len];
+                sense[0] = code;
+                assert_eq!(decode_usable_sense(&sense), None, "{sense:02x?}");
+            }
+        }
+    }
+
+    /// Captured fields suffice even when additional-sense-length exceeds the host buffer.
+    #[test]
+    fn b3a_usable_sense_matches_lenient_fields_when_complete() {
+        for (code, lengths) in [
+            (0x70, &[14, 18, 32][..]),
+            (0x71, &[14, 18, 32][..]),
+            (0x72, &[4, 8][..]),
+            (0x73, &[4, 8][..]),
+        ] {
+            for &len in lengths {
+                let mut sense = vec![0; len];
+                sense[0] = code;
+                if code <= 0x71 {
+                    sense[2] = 3;
+                    sense[12] = 0x11;
+                    sense[13] = 5;
+                } else {
+                    sense[1..4].copy_from_slice(&[3, 0x11, 5]);
+                }
+                if len >= 8 {
+                    sense[7] = 255;
+                }
+                assert!(decode_sense(&sense).is_some());
+                assert_eq!(decode_usable_sense(&sense), decode_sense(&sense));
+            }
+        }
+    }
 
     fn descriptor_sense(response_code: u8, descriptors: &[u8]) -> Vec<u8> {
         let descriptor_length =

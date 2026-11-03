@@ -883,13 +883,13 @@ impl ChangerHandle {
                     // not-ready sense. No automatic retry uses the old inventory.
                     let refresh = self.check_elements(&[src, dst]);
                     if let ScsiError::CheckCondition { sense, .. } = &e {
-                        if let Some(sense) = remanence_scsi::decode_sense(sense) {
-                            // Known mislabel, kept deliberately: SPC names
-                            // 3B/0E MEDIUM SOURCE ELEMENT EMPTY (3B/0D is
-                            // destination full), but callers and tests rely on
-                            // this mapping.
-                            if sense.key == 0x05 && sense.asc == 0x3b && sense.ascq == 0x0e {
-                                return Err(MoveError::DestinationFull { addr: dst });
+                        if let Some(sense) = remanence_scsi::decode_usable_sense(sense) {
+                            if sense.key == 0x05 && sense.asc == 0x3b {
+                                match sense.ascq {
+                                    0x0d => return Err(MoveError::DestinationFull { addr: dst }),
+                                    0x0e => return Err(MoveError::SourceEmpty { addr: src }),
+                                    _ => {}
+                                }
                             }
                         }
                     }
@@ -2488,9 +2488,9 @@ fn scsi_outcome(err: &ScsiError, dirty: bool) -> AuditOutcome {
 /// - [`ScsiError::Io`] — the ioctl itself failed (very rare). The
 ///   request usually never reached the device, but we can't
 ///   prove it; safer default is dirty.
-/// - [`ScsiError::CheckCondition`] — the device received the CDB,
-///   chose not to execute it, and returned sense. Completion
-///   known: didn't happen. Not dirty.
+/// - [`ScsiError::CheckCondition`] — known only with usable sense. Missing
+///   key/ASC/ASCQ is not evidence that the command did not run; without those
+///   captured fields the completion is unknown and the snapshot is dirty.
 /// - [`ScsiError::UnexpectedStatus`] — the device returned a target
 ///   status such as BUSY/RESERVATION CONFLICT without a host/driver
 ///   failure. Completion known: command was not accepted. Not dirty.
@@ -2502,7 +2502,11 @@ fn completion_unknown(err: &ScsiError) -> bool {
         #[cfg(target_os = "linux")]
         ScsiError::Io(_) => true,
         #[cfg(target_os = "linux")]
-        ScsiError::CheckCondition { .. } | ScsiError::UnexpectedStatus { .. } => false,
+        ScsiError::CheckCondition { sense, .. } => {
+            remanence_scsi::decode_usable_sense(sense).is_none()
+        }
+        #[cfg(target_os = "linux")]
+        ScsiError::UnexpectedStatus { .. } => false,
         ScsiError::Cancelled
         | ScsiError::InvalidInput(_)
         | ScsiError::Truncated { .. }
@@ -2683,6 +2687,8 @@ fn revalidate_serial(transport: &mut dyn SgTransport) -> Result<Option<String>, 
 //  Tests — drive each gate independently
 // =====================================================================
 
+#[cfg(test)]
+mod changer_evidence_tests;
 #[cfg(test)]
 mod tests;
 

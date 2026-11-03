@@ -16,7 +16,7 @@ fn ramp_detector_reports_end_of_first_qualifying_five_second_window() {
 #[test]
 fn check_condition_is_not_completion_unknown() {
     let e = TapeIoError::CheckCondition(ScsiError::CheckCondition {
-        sense: Vec::new(),
+        sense: vec![0x70, 0, 5, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0x24, 0, 0, 0, 0, 0],
         bytes_transferred: 0,
     });
     assert!(!e.is_completion_unknown());

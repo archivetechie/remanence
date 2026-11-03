@@ -26,7 +26,7 @@ use std::collections::BTreeSet;
 use std::time::{Duration, Instant, SystemTime};
 
 use remanence_scsi::{
-    decode_sense,
+    decode_usable_sense,
     log_sense::{ErrorCounterPage, TapeAlerts},
     ScsiError,
 };
@@ -156,7 +156,7 @@ impl TapeIoError {
             .is_some_and(|(sense, bytes)| {
                 bytes == 0
                     && !sense_is_deferred(sense)
-                    && decode_sense(sense)
+                    && decode_usable_sense(sense)
                         .is_some_and(|s| s.key == 8 && s.asc == 0 && s.ascq == 5 && !s.filemark)
             })
     }
@@ -671,6 +671,9 @@ pub(crate) fn map_scsi(err: ScsiError) -> TapeIoError {
             ref sense,
             bytes_transferred,
         } => {
+            if decode_usable_sense(sense).is_none() {
+                return completion_unknown_check_condition(sense.clone(), bytes_transferred);
+            }
             if sense_is_deferred(sense) {
                 return completion_unknown_check_condition(sense.clone(), bytes_transferred);
             }
@@ -703,14 +706,42 @@ pub(crate) fn map_scsi(err: ScsiError) -> TapeIoError {
     }
 }
 
+/// Preserve a failed fixed WRITE's validated partial count as error evidence.
+/// A residual is not a successful credit; without a consistent count even the
+/// command's completion is unknown. Both batch paths use this mapping.
+fn failed_fixed_write_error(
+    sense: Vec<u8>,
+    bytes_transferred: u32,
+    records: u32,
+    block_size_bytes: u32,
+    completion_bytes: u32,
+) -> TapeIoError {
+    match fixed_records_transferred_from_sense(&sense, records) {
+        Some(records_written)
+            if validate_residual_claim(records_written, block_size_bytes, completion_bytes)
+                .is_ok() =>
+        {
+            TapeIoError::PartialBatchUncommittable {
+                requested_records: records,
+                written_records: records_written,
+                requested_bytes: u64::from(records) * u64::from(block_size_bytes),
+                written_bytes: u64::from(records_written) * u64::from(block_size_bytes),
+                end_of_medium: false,
+                sense: Some(sense),
+            }
+        }
+        _ => completion_unknown_check_condition(sense, bytes_transferred),
+    }
+}
+
 /// Extract sense key + ASC + ASCQ from fixed-format or descriptor-format
 /// SCSI sense.
 fn decode_sense_key_asc(sense: &[u8]) -> Option<(u8, u8, u8)> {
-    decode_sense(sense).map(|decoded| (decoded.key, decoded.asc, decoded.ascq))
+    decode_usable_sense(sense).map(|decoded| (decoded.key, decoded.asc, decoded.ascq))
 }
 
 fn sense_is_deferred(sense: &[u8]) -> bool {
-    decode_sense(sense)
+    decode_usable_sense(sense)
         .map(|decoded| matches!(decoded.response_code, 0x71 | 0x73))
         .unwrap_or(false)
 }
@@ -1810,41 +1841,16 @@ impl super::DriveHandle {
                     ));
                 }
 
-                let records_written = match fixed_records_transferred_from_sense(&sense, records) {
-                    Some(records_written) => records_written,
-                    None => {
-                        let mapped = completion_unknown_check_condition(sense, bytes_transferred);
-                        self.finish_tape_error(op, &mapped);
-                        return Err(mapped);
-                    }
-                };
-                if validate_residual_claim(records_written, block_size_bytes, completion_bytes)
-                    .is_err()
-                {
-                    let mapped = completion_unknown_check_condition(sense, bytes_transferred);
-                    self.finish_tape_error(op, &mapped);
-                    return Err(mapped);
-                }
-                let bytes_written = records_written.saturating_mul(block_size_bytes);
-                let position_after = match self.advance_expected_position(
-                    records_written,
-                    0,
-                    bytes_written as u64,
-                ) {
-                    Ok(position_after) => position_after.position(),
-                    Err(err) => {
-                        self.finish_tape_error(op, &err);
-                        return Err(err);
-                    }
-                };
-                self.finish_tape_success(op, started.elapsed());
-                Ok(WriteBatchOutcome::from_computed_position(
-                    records_written,
-                    bytes_written,
-                    false,
-                    false,
-                    position_after,
-                ))
+                let mapped = failed_fixed_write_error(
+                    sense,
+                    bytes_transferred,
+                    records,
+                    block_size_bytes,
+                    completion_bytes,
+                );
+                self.mark_position_unknown();
+                self.finish_tape_error(op, &mapped);
+                Err(mapped)
             }
             Err(e) => {
                 let mapped = map_scsi(e);
@@ -2086,28 +2092,13 @@ impl super::DriveHandle {
                     self.record_pipeline_accounting(completed_at);
                     Ok(outcome)
                 } else {
-                    let mapped = match fixed_records_transferred_from_sense(&sense, records) {
-                        Some(records_written)
-                            if validate_residual_claim(
-                                records_written,
-                                block_size_bytes,
-                                completion_bytes,
-                            )
-                            .is_ok() =>
-                        {
-                            TapeIoError::PartialBatchUncommittable {
-                                requested_records: records,
-                                written_records: records_written,
-                                requested_bytes: u64::from(records) * u64::from(block_size_bytes),
-                                written_bytes: u64::from(records_written)
-                                    * u64::from(block_size_bytes),
-                                end_of_medium: false,
-                                sense: Some(sense),
-                            }
-                        }
-                        None => completion_unknown_check_condition(sense, bytes_transferred),
-                        Some(_) => completion_unknown_check_condition(sense, bytes_transferred),
-                    };
+                    let mapped = failed_fixed_write_error(
+                        sense,
+                        bytes_transferred,
+                        records,
+                        block_size_bytes,
+                        completion_bytes,
+                    );
                     self.fire_tape_started(operation, cdb);
                     self.defer_pipeline_error_audit(operation, &mapped);
                     Err(mapped)
@@ -2471,6 +2462,13 @@ impl super::DriveHandle {
                     self.record_pipeline_accounting(completed_at);
                     return Ok(outcome);
                 }
+                if !sense_is_deferred(&sense)
+                    && decode_sense_key_asc(&sense).is_some_and(|(key, _, _)| key == 0x08)
+                {
+                    self.forget_position();
+                } else {
+                    self.mark_position_unknown();
+                }
                 let mapped = map_transfer_scsi(
                     ScsiError::CheckCondition {
                         sense,
@@ -2483,6 +2481,9 @@ impl super::DriveHandle {
                 Err(mapped)
             }
             Err(e) => {
+                if matches!(e, ScsiError::UnexpectedStatus { .. }) {
+                    self.mark_position_unknown();
+                }
                 let mapped = map_scsi(e);
                 self.finish_tape_error(op, &mapped);
                 Err(mapped)
@@ -3930,7 +3931,7 @@ fn fixed_records_transferred_from_sense(sense: &[u8], requested: u32) -> Option<
 }
 
 fn valid_fixed_residual_from_sense(sense: &[u8]) -> Option<u32> {
-    let decoded = decode_sense(sense)?;
+    let decoded = decode_usable_sense(sense)?;
     if decoded.response_code != 0x70 || !decoded.valid {
         return None;
     }
@@ -3996,7 +3997,7 @@ fn position_drift_error(expected: TapePosition, device: TapePosition) -> TapeIoE
 }
 
 pub(super) fn is_reset_unit_attention(sense: &[u8]) -> bool {
-    decode_sense(sense).is_some_and(|decoded| {
+    decode_usable_sense(sense).is_some_and(|decoded| {
         !decoded.is_deferred()
             && decoded.key == 0x06
             && decoded.asc == 0x29
@@ -4005,11 +4006,11 @@ pub(super) fn is_reset_unit_attention(sense: &[u8]) -> bool {
 }
 
 fn sense_is_current_recovered(sense: &[u8]) -> bool {
-    decode_sense(sense).is_some_and(|decoded| !decoded.is_deferred() && decoded.key == 0x01)
+    decode_usable_sense(sense).is_some_and(|decoded| !decoded.is_deferred() && decoded.key == 0x01)
 }
 
 fn sense_is_current_recovered_without_terminal_flags(sense: &[u8]) -> bool {
-    decode_sense(sense).is_some_and(|decoded| {
+    decode_usable_sense(sense).is_some_and(|decoded| {
         !decoded.is_deferred()
             && decoded.key == 0x01
             && !decoded.eom
@@ -4019,7 +4020,7 @@ fn sense_is_current_recovered_without_terminal_flags(sense: &[u8]) -> bool {
 }
 
 fn sense_has_current_ili(sense: &[u8]) -> bool {
-    decode_sense(sense).is_some_and(|decoded| !decoded.is_deferred() && decoded.ili)
+    decode_usable_sense(sense).is_some_and(|decoded| !decoded.is_deferred() && decoded.ili)
 }
 
 fn position_overflow_error() -> TapeIoError {
@@ -4241,7 +4242,7 @@ struct WriteEomSignal {
 /// EOM set and sense key in {0 NO_SENSE — approaching EOM (EW),
 /// 0x0D VOLUME_OVERFLOW — tape full}. The block has been committed.
 fn write_eom_signal(sense: &[u8]) -> Option<WriteEomSignal> {
-    let decoded = decode_sense(sense)?;
+    let decoded = decode_usable_sense(sense)?;
     if decoded.is_deferred() || !decoded.eom {
         return None;
     }
@@ -4262,7 +4263,7 @@ fn write_eom_signal(sense: &[u8]) -> Option<WriteEomSignal> {
 }
 
 fn read_filemark_signal(sense: &[u8]) -> bool {
-    let Some(decoded) = decode_sense(sense) else {
+    let Some(decoded) = decode_usable_sense(sense) else {
         return false;
     };
     !decoded.is_deferred() && decoded.filemark && !decoded.ili && matches!(decoded.key, 0x00 | 0x01)
@@ -4281,7 +4282,7 @@ fn read_filemark_signal(sense: &[u8]) -> bool {
 /// positive means the on-tape block was smaller than the host
 /// buffer, negative means it was larger.
 fn ili_signed_information(sense: &[u8]) -> Option<i64> {
-    let decoded = decode_sense(sense)?;
+    let decoded = decode_usable_sense(sense)?;
     if !decoded.is_fixed_format()
         || !decoded.valid
         || !decoded.ili
@@ -4308,7 +4309,7 @@ fn ili_signed_information(sense: &[u8]) -> Option<i64> {
 /// the request: backward SPACE returns a negative residual when it
 /// stops short.
 fn space_residual_if_early_stop(sense: &[u8]) -> Option<i64> {
-    let decoded = decode_sense(sense)?;
+    let decoded = decode_usable_sense(sense)?;
     if !decoded.is_fixed_format() || !decoded.valid {
         return None;
     }
@@ -4332,6 +4333,8 @@ fn units_traversed_from_space_residual(count: i64, residual: i64) -> i64 {
     }
 }
 
+#[cfg(test)]
+mod completion_evidence_tests;
 #[cfg(test)]
 mod media_gate_tests;
 #[cfg(test)]

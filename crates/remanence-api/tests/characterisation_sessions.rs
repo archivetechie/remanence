@@ -805,7 +805,7 @@ impl Transport {
         }
         if cdb[0] == 0xa5 && injection.move_full {
             injection.move_failures += 1;
-            return Err(check_condition(5, 0x3b, 0x0e));
+            return Err(check_condition(5, 0x3b, 0x0d));
         }
         Ok(())
     }

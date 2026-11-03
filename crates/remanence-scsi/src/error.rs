@@ -32,8 +32,10 @@ pub enum ScsiError {
     #[error("SG_IO ioctl failed: {0}")]
     Io(#[from] std::io::Error),
 
-    /// The target responded with CHECK CONDITION; the sense buffer is
-    /// included for the caller to decode if they need to.
+    /// The target responded with CHECK CONDITION without a host or driver
+    /// failure. The captured sense buffer may be empty or incomplete; callers
+    /// must establish its usability before deciding what completed.
+    /// A simultaneous host/driver failure is instead a `TransportError`.
     ///
     /// `bytes_transferred` is the kernel-reported count of bytes that
     /// actually moved across the SG_IO data phase before the target
@@ -66,9 +68,11 @@ pub enum ScsiError {
 
     /// The SG_IO ioctl returned 0 but a status field in the response header
     /// indicates the transport failed (host adapter error, driver error, or
-    /// the SG `info` "ok" bit was clear). The kernel hands back a response
-    /// like this for cable disconnects, bus resets, and timeouts that the
-    /// driver caught after we passed the ioctl boundary.
+    /// the SG `info` check bit was set on a non-CHECK-CONDITION completion).
+    /// The kernel hands back a response like this for cable disconnects,
+    /// bus resets, and timeouts that the
+    /// driver caught after we passed the ioctl boundary. It may carry status
+    /// 02h (CHECK CONDITION) and the sense captured alongside the failure.
     #[cfg(target_os = "linux")]
     #[error(
         "SG_IO transport error: status=0x{status:02x} host_status=0x{host_status:04x} \
@@ -81,8 +85,8 @@ pub enum ScsiError {
         host_status: u16,
         /// Linux SCSI driver status (SG_ERR_DRIVER_*).
         driver_status: u16,
-        /// SG `info` field; bit 0 (SG_INFO_OK_MASK) is clear when something
-        /// went wrong above the SCSI status byte.
+        /// SG `info` field; bit 0 (SG_INFO_OK_MASK) is set for a non-GOOD
+        /// completion, including an ordinary CHECK CONDITION.
         info: u32,
         /// Sense bytes, if the driver captured any.
         sense: Vec<u8>,
