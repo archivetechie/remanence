@@ -317,7 +317,7 @@ rem tape quarantine release <id> --after-settled-inventory \
 The `--ack` text is recorded. The fence exists so that nobody writes to a tape whose state was last seen
 mid-uncertainty.
 
-<!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs @ 638210f7 -->
+<!-- code-anchor: crates/remanence-api/src/startup_media_readiness.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/append_admission.rs crates/remanence-library/src/transport.rs crates/remanence-library/src/handle/tape_io/media_gate.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
 ## A drive stays not ready after a daemon crash
 
 A drive that answers `02/04/02` holds a cartridge it has not threaded. This
@@ -360,8 +360,8 @@ already issued command keeps its normal command timeout and is allowed to settle
 After settlement, the session records `SessionEnded` with the whole uncommitted
 tail, including an interrupted closeout sidecar, and leaves closeout due. The
 ending preserves a failed append, drive error or failed closeout; otherwise it
-records `graceful_shutdown`. No closeout starts at the next shutdown step. Already delivered
-receipts stay valid; a durable commit is never turned into a failed Close by a
+records `graceful_shutdown`. Shutdown does not start a separate closeout pass.
+Already delivered receipts stay valid; a durable commit is never turned into a failed Close by a
 later projection or cleanup error. One warning identifies each interrupted tape
 and session and the work left due.
 
@@ -370,10 +370,12 @@ session stays open in the log and the next access takes the crash-recovery row.
 A service-manager timeout that kills the daemon before settlement and the ending
 has the same effect. Complete uncommitted Objects then require the operator's
 `rem tape supersede-tail` acknowledgement; a recorded live ending needs none.
-A failed closeout or drive error can also leave an uncovered committed range. The next write
-open, or `rem tape closeout <tape>`, proves identity, the committed cursor and the
-whole named suffix, then rebuilds and closes that range. A recorded live ending
-needs no supersede acknowledgement. Memory refusal leaves closeout due; it does
+A failed closeout or drive error can also leave an uncovered committed range.
+The daemon services that [closeout debt](#closeout-debt) automatically. A later
+write open or `rem tape closeout <UUID>` can also request the work. Each path
+proves identity, the committed cursor and the whole named suffix before
+rebuilding and closing the range. A recorded live ending needs no supersede
+acknowledgement. Memory refusal leaves closeout due; it does
 not fall back to a different epoch policy. A durable log record remains authority
 when SQLite projection fails; startup replay restores the projection.
 
@@ -532,6 +534,75 @@ projection and session detach after transfer; it emits on success or error
 and does not itself assert a commit. Shared checkpoint barriers retain their
 separate diagnostics.
 
+The parity `transfer` event adds `write_commands_ms`, the sum of time inside
+raw fixed-block WRITE calls, and `between_writes_ms`, the sum of intervals
+from one WRITE return to the next WRITE entry. Those intervals include host
+work and any intervening filemark or position calls. `transfer_host_ms` is
+`elapsed_ms - write_commands_ms`; it also includes work before the first and
+after the last WRITE. These are host-side elapsed measurements, not drive
+firmware counters. `object_id`, `pool_id`, and `tape_uuid` correlate phases.
+The plain path reports the same elapsed fields; its
+existing gap and staging-wait distributions describe command cadence.
+
+One `drive_append_total` line identifies each completed actor append by
+`object_id` and `caller_object_id` and reports:
+
+| Field | Meaning |
+|---|---|
+| `staging_mode` | `overlap` for the receive ring, `serial` for a completed spool or local file. |
+| `staging_reason` | `configured_overlap`, `configured_serial`, or the first failed admission condition: `no_declared_size`, `empty_object`, `no_start_digest`, `no_replay_capability`, `no_caller_object_id`, `below_overlap_min`, or `canonical_start`. In-process local files use `completed_path`. Unsupported manifests are refused before append. |
+| `prefill_lead_bytes` | Actual ring occupancy when prefill completes, or zero for a completed spool. |
+| `feed_wait_ms` | Ring consumer receive/resume wait time for overlap; elapsed time between WRITE calls for serial. |
+| `feed_wait_measure` | `ring_consumer_wait` or `between_write_calls`, naming the proxy used. The latter spans the first WRITE entry through the last WRITE return, minus time inside WRITEs. It includes host work and intervening non-WRITE commands, so it is an upper bound on feed starvation. An error without transfer measurements uses `unavailable`. |
+| `open_path` | `full`, the current session-open path. |
+
+`replay=true` reports no new tape transfer and a zero append rate. Errors
+carry `status=error` and may lack an object UUID. `drive_append_total` measures
+the actor append before a threshold-triggered shared checkpoint; spool receive
+and session open/close remain outside this rate.
+
+The write and dual benchmarks match the receipt's object UUID to a
+`drive_append_total` event within that command's log window. Their CSV and
+evidence summary retain the client wall rate, daemon append rate, and staging
+mode. The dual aggregate row names the append leg's object and daemon rate;
+the client aggregate rate includes the concurrent restore. Missing diagnostics
+are `unavailable`; the kit never substitutes another object's latest event.
+
+<!-- code-anchor: crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/checkpoint.rs crates/remanence-api/src/append_admission.rs crates/remanence-api/src/tape_closeout.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-state/src/index.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
+## Closeout debt
+
+Committed data is on tape and has a durable record in the tape log. It is
+protected only when a parity sidecar covers it. An uncovered committed range
+is closeout debt: the data remains readable, but lacks that parity protection.
+Use `rem catalog tapes --json` or `rem top` to see its byte count, original age
+and retry reason. `OVERDUE` means it has reached the configured alarm age;
+`DEBT?` means the native log could not be read, so the debt is unknown.
+
+The daemon services eligible debt without a client request, including after a
+session ends and at startup. It reconstructs its work list from native logs,
+mounts tapes as needed, and attempts at most one maintenance operation per
+library at a time. Media work stays within the configured libraries and drives.
+Transient failures retry after 1, 5, 30 and then 60 seconds; the full work list is
+rescanned every 60 seconds and on a wake. Pool selection prefers eligible due
+tapes, so a write open can wait for a selected tape's closeout before admission.
+
+Write protection, fences, wrong media and identity mismatches park the work
+until the condition changes or an operator requests closeout. A parked tape
+keeps its debt and retry reason visible. Pool selection ranks it behind other
+fitting tapes; if none fit, it attempts the parked candidate so admission can
+return its actionable refusal. Readiness-fence clearance and barcode membership
+changes wake the affected work. Persistent medium or hardware failures have a
+limited retry budget, described under [Catalog and checkpoint lock
+refusals](#catalog-and-checkpoint-lock-refusals).
+
+After resolving the refusal, run `rem tape closeout <UUID>` to request and watch
+closeout for that exact tape. It succeeds without media work if nothing is due.
+An accepted finalization plan owns its uncovered range instead of ordinary
+closeout; resume that finalization with its original idempotency key. See the
+[CLI reference](reference-cli.md#rem-tape-closeout) for retry arguments and
+[manual finalization](reference-cli.md#rem-tape-finalize-library) for the
+`CloseoutRequired` refusal.
+
 A write session owns its parity accumulator until it ends. A checkpoint
 commits data without necessarily closing the epoch. Clean close returns durable
 receipts, then writes the short sidecar, synchronizes it, and records `ClosedOut`
@@ -573,52 +644,25 @@ An ambiguous native append still stops media work with `AuthorityAmbiguous`.
 Checked resumes retain original-write check provenance. A commit disagreeing
 with the frozen range is refused rather than used for reconstruction.
 
-Manual finalization and retirement refuse a due closeout with `CloseoutRequired`
-and name the closeout command. `CloseoutUnprotectedFinalizationUnavailable`
+Manual finalization refuses a due closeout with `CloseoutRequired` and names
+the closeout command. Retirement changes the offline catalog without checking
+or completing closeout debt. `CloseoutUnprotectedFinalizationUnavailable`
 refuses finalization when that range cannot be proved; operator acceptance of
 unprotected finalization is not implemented. Cartridge removal performs no parity
 work. Graceful shutdown closes sessions and leaves cartridges seated; its
 shared shutdown deadline covers maintenance as well as write sessions.
 
-The parity `transfer` event adds `write_commands_ms`, the sum of time inside
-raw fixed-block WRITE calls, and `between_writes_ms`, the sum of intervals
-from one WRITE return to the next WRITE entry. Those intervals include host
-work and any intervening filemark or position calls. `transfer_host_ms` is
-`elapsed_ms - write_commands_ms`; it also includes work before the first and
-after the last WRITE. These are host-side elapsed measurements, not drive
-firmware counters. `object_id`, `pool_id`, and `tape_uuid` correlate phases.
-The plain path reports the same elapsed fields; its
-existing gap and staging-wait distributions describe command cadence.
-
-One `drive_append_total` line identifies each completed actor append by
-`object_id` and `caller_object_id` and reports:
-
-| Field | Meaning |
-|---|---|
-| `staging_mode` | `overlap` for the receive ring, `serial` for a completed spool or local file. |
-| `staging_reason` | `configured_overlap`, `configured_serial`, or the first failed admission condition: `no_declared_size`, `empty_object`, `no_start_digest`, `no_replay_capability`, `no_caller_object_id`, `below_overlap_min`, or `canonical_start`. In-process local files use `completed_path`. Unsupported manifests are refused before append. |
-| `prefill_lead_bytes` | Actual ring occupancy when prefill completes, or zero for a completed spool. |
-| `feed_wait_ms` | Ring consumer receive/resume wait time for overlap; elapsed time between WRITE calls for serial. |
-| `feed_wait_measure` | `ring_consumer_wait` or `between_write_calls`, naming the proxy used. The latter spans the first WRITE entry through the last WRITE return, minus time inside WRITEs. It includes host work and intervening non-WRITE commands, so it is an upper bound on feed starvation. An error without transfer measurements uses `unavailable`. |
-| `open_path` | `full`, the current session-open path. |
-
-`replay=true` reports no new tape transfer and a zero append rate. Errors
-carry `status=error` and may lack an object UUID. `drive_append_total` measures
-the actor append before a threshold-triggered shared checkpoint; spool receive
-and session open/close remain outside this rate.
-
-The write and dual benchmarks match the receipt's object UUID to a
-`drive_append_total` event within that command's log window. Their CSV and
-evidence summary retain the client wall rate, daemon append rate, and staging
-mode. The dual aggregate row names the append leg's object and daemon rate;
-the client aggregate rate includes the concurrent restore. Missing diagnostics
-are `unavailable`; the kit never substitutes another object's latest event.
-
-<!-- code-anchor: crates/remanence-api/src/pool_write.rs crates/remanence-parity/src/error.rs crates/remanence-api/src/pool_write/selection.rs crates/remanence-api/src/write_admission.rs @ 1dd451b2 -->
+<!-- code-anchor: crates/remanence-api/src/pool_write.rs crates/remanence-parity/src/error.rs crates/remanence-api/src/pool_write/selection.rs crates/remanence-api/src/pool_write/model.rs crates/remanence-api/src/write_admission.rs crates/remanence-api/src/drive_pool.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
 ## Writes are refused
 
 Pool writes fail closed on a set of preconditions. The common refusals:
 
+- `tape <UUID> is sealed, seal-due or finalizing; maintenance must complete before Object admission`
+  refuses a pinned write. Complete pending maintenance; a sealed tape accepts no
+  more objects, so select another tape or open against the pool.
+- `Busy: tape is finalizing; watch operation <UUID>` is gRPC `ABORTED`.
+  The binary trailer `remanence-busy-operation-bin` carries that operation UUID.
+  Follow it with `rem op watch <UUID>` before choosing the next write target.
 - `active tape-I/O fence <id>: <reason>` — see fences above.
 - `tape is not ready for writing: state=...` — the tape's catalog state
   is not `ready` (retired, quarantined, or mid-initialization).
@@ -669,7 +713,7 @@ writable: <reason>` (the same writability preconditions above), `tape ...
 is fenced by quarantine ...` (see fences above). A tape with a known written
 prefix but no matching per-tape log is also refused before append positioning.
 
-<!-- code-anchor: crates/remanence-daemon/src/entry.rs @ 1dd451b2 -->
+<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/pool_write/selection.rs crates/remanence-api/src/drive_pool.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/terminal_inventory.rs crates/remanence-library/src/handle/tape_io/media_gate.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
 ## Reading the logs
 
 The daemon logs JSON to stderr, one flattened object per event, filtered
@@ -689,10 +733,25 @@ climbing across sessions, or an `occupancy_bytes` close to
 keep up with the drive (increase `tape_io.read_reservoir_bytes`, or
 speed up the reader) rather than a hardware fault.
 
-Strings worth grepping for, mapped to the sections above:
+Strings worth grepping for, mapped to the sections above. Some strings are
+RPC refusals or debt diagnostics rather than standalone log events:
 
-| String | Points at |
+| String | Remarks |
 |---|---|
+| `closeout work-list scan failed; retrying` | WARN: the worker cannot reconstruct its work list. Inspect the attached error and native-log access; it retries the scan. |
+| `closeout needs operator; waiting for wake` | WARN: work is parked. Resolve the reported refusal, then request closeout or allow the relevant readiness or inventory change to wake it. |
+| `CloseoutOverdue` | WARN: debt has reached the alarm age. The audit event is `closeout_overdue`; inspect the tape's retry reason. |
+| `parked: media fault (3/3 attempts)` | Debt diagnostic: repeated medium or hardware failures exhausted the attempt budget. Inspect the drive and media before waking the work. |
+| `shutdown close deadline interrupted session` | WARN: the shared shutdown deadline interrupted the session; the event identifies its tape, ending and remaining work. |
+| `shutdown close deadline expired; no new drive command` | Drive-command refusal at the shared cutoff. Issued commands still settle; see the shutdown bound above. |
+| `daemon shutdown; maintenance admission closed` | RPC refusal: the daemon is stopping. Submit fresh maintenance after restart. |
+| `drives are busy` | `RefreshInventory` refuses while sessions or other owners hold affected drives. Let them finish and retry. |
+| `terminal inventory interrupted by shutdown` | The inventory stops because shutdown began. Retry after restart. |
+| `pool selection waiting for tape closeout` | INFO: the selected tape is held by session closeout or a worker. The open waits, then checks that tape again; this is not a free-bay queue. |
+| `pool selection skipped tape` | INFO for the selection pass that decides admission; DEBUG for speculative passes. `pool_id`, `tape_uuid` and `reason` identify the excluded candidate, such as a live writer, finalization or parked debt. |
+| `pool selection skipped tape after closeout; selecting again` | INFO: the tape fails a check after waiting, or finalization wins the reservation race. Selection considers another tape; inspect `reason`. |
+| `pool selection skipped unreachable tape` | INFO: the selected tape has no usable route to a configured drive. Selection tries another candidate. |
+| `pool selection skipped tape after admission refusal; selecting again` | INFO: actor admission returned an operator-required refusal for a pool-selected tape before admitting an object. Selection tries another candidate; pinned writes return the refusal. |
 | `no tape libraries reachable` | permissions or no hardware |
 | `every SCSI probe returned EPERM` | missing CAP_SYS_RAWIO |
 | `was removed; the pipelined fixed-block path is now the only tape I/O path` | stale `tape_io.legacy_single_block`/`pipelined_submission` key in config |
@@ -738,17 +797,16 @@ A failed move also refreshes inventory. Sense `05/3B/0E` reports a full
 destination. An unload followed by a failed move does not prove that the
 cartridge remains in the drive; use the fresh element status for recovery.
 
-<!-- code-anchor: crates/remanence-library/src/handle/changer_ready.rs crates/remanence-api/src/live_status.rs @ 72bdca17 -->
+<!-- code-anchor: crates/remanence-library/src/handle/changer_ready.rs crates/remanence-api/src/live_status.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
 ## Waiting for the library (open magazine or door)
 
 A library shared with another system has its magazines and doors opened
 while Remanence works. A MOVE MEDIUM issued while a magazine is out fails
 with `02/3B/12` (medium magazine removed) and is not executed, so the
-cartridge stays where it was. Before this wait existed, such a failure ended
-the client operation even when the operator closed the magazine a minute
-later.
+cartridge stays where it was. The daemon waits for the operator to close the
+magazine before retrying the move.
 
-The daemon now waits instead. A wait starts when a move fails with
+A wait starts when a move fails with
 `02/3B/12`, `02/04/01` (becoming ready) or `02/04/18` (a door is open), or
 when the element status read just before the move already shows the source
 or destination with exception `3B/12`; in that case the wait starts before

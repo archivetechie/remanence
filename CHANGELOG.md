@@ -4,75 +4,67 @@ Notable changes to Remanence and its published formats. The format
 specifications carry their own revision histories; entries here are
 per-release summaries.
 
-<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-api/src/mount_support.rs crates/remanence-state/src/index.rs crates/remanence-library/src/discovery.rs @ 638210f7 -->
+<!-- code-anchor: crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/drive_pool.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-api/src/append_admission.rs crates/remanence-state/src/index.rs crates/remanence-cli/src/lib.rs crates/remanence-stream/src/lib.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
 ## Unreleased
 
-- Startup reconstructs closeout and finalization obligations from native logs,
-  retries transient resource failures with capped backoff, and restricts media maintenance
-  to configured libraries and drives. Eligible due-closeout tapes are preferred
-  within a pool; capacity includes their sidecar and seal-due tapes receive no
-  further Objects. Catalog, live status and `rem top` expose unprotected bytes,
-  original debt age and overdue state, with an off-drive debt list.
-  Unreadable tape authority is a per-tape unknown, with optional debt fields and
-  an error; list/one-shot CLI output remains complete and exits nonzero. Interactive
-  top keeps running. Status reads use committed summary mirrors during checkpoints
-  and cache unchanged logs. Worker attempts are limited to one per library,
-  reserve memory after obtaining a drive, and let exact-tape clients wait.
-  Operator-required failures remain visible with a retry reason until a wake.
-  `daemon.closeout_alarm_after_secs` defaults to 259200 and must be positive;
-  overdue notification emits one WARN and audit per debt age per daemon run.
-
-- Added `daemon.shutdown_close_deadline_secs` (default 300, nonzero). Graceful
-  shutdown ends write sessions in parallel against one deadline, stops new drive
-  commands at expiry, settles issued commands, and records the interrupted tail
-  when completion and native authority are known. Closeout stays due for the next
-  access. Service stop timeouts must exceed this budget plus one command's
-  worst-case time. Final Close retains and returns durable receipts even if
-  projection or later host work fails.
-
-- Write sessions now own their parity epochs through ending. Checkpoints keep
-  an epoch only within the same session; clean close returns durable receipts,
-  then closes the short epoch while retaining the drive and tape lease.
-  Following access waits for that work. The native tape log records
-  `SessionOpened`, `ClosedOut`, and `SessionEnded` with dispatched tail evidence.
-  Abort, failed append, and ingress timeout add no abandonment filemark and a
-  durable live ending raises no automatic tape-I/O fence. Graceful shutdown
-  closes sessions and leaves cartridges seated.
-- Added `rem tape closeout <tape>` and the idempotent `Catalog.CloseoutTape` RPC.
-  Checked closeout runs from live parity or bounded read-back before a new
-  session. Manual finalization and retirement refuse outstanding closeout with
-  `CloseoutRequired`; a drive error leaves it due for a later access. Unload
-  performs no parity close and no longer emits epoch-close warnings or notes.
-- Supersede confirmation now requires the preview's tape-log sequence; stale
+- Each write session owns its parity epoch. Checkpoints commit objects within
+  that session; clean close returns durable receipts, then writes the remaining
+  sidecar and records `ClosedOut` and `SessionEnded`. The drive and tape stay
+  held until that work ends. Following access waits, and no accumulator survives
+  the session. The tape log records `SessionOpened` and the ending's dispatched
+  tail, allowing proof of buffered-tail loss before reuse.
+- The daemon reconstructs closeout and finalization work from native logs at
+  startup and services due tapes without a client request. It limits media work
+  to configured libraries and drives, with one attempt per library. Pool writes
+  prefer eligible due tapes and rank parked tapes behind other fitting candidates.
+  The
+  [closeout-debt guide](docs/guide-troubleshooting.md#closeout-debt) explains
+  retries, wake conditions and the resulting robot motion.
+- `rem catalog tapes`, live status and `rem top` show unprotected bytes, their
+  original age, overdue state and worker refusals, including tapes outside
+  drives. Unknown authority produces an error and unknown debt values. The list
+  and one-shot status commands print complete responses before exiting 1 in that case;
+  interactive status keeps running. `daemon.closeout_alarm_after_secs` controls
+  the WARN `CloseoutOverdue` and audit `closeout_overdue` notification.
+- `rem tape closeout <UUID>` and `Catalog.CloseoutTape` request idempotent
+  closeout of one exact tape. Manual finalization refuses due closeout with
+  `CloseoutRequired`. Retirement changes the offline catalog without checking
+  closeout debt. Unload performs no parity work and leaves any debt due.
+- Graceful shutdown ends sessions in parallel against the shared
+  `daemon.shutdown_close_deadline_secs` deadline. No new drive command starts
+  after expiry; issued commands settle before an ending records the tail when
+  its outcome is known. Cartridges stay seated. Service stop timeouts must cover
+  the [shutdown bound](docs/guide-troubleshooting.md#a-drive-stays-not-ready-after-a-daemon-crash).
+  A durable receipt remains valid after projection or later host work fails.
+- A tape held by finalization reports `Busy: tape is finalizing; watch operation
+  <UUID>` with gRPC `ABORTED` and the `remanence-busy-operation-bin` trailer.
+  A BUSY `FinalizeTape` reply names the operation in `detail`. Pool selection
+  logs its closeout waits and skip reasons at INFO.
+- Supersede confirmation requires the preview's tape-log sequence; stale
   previews return `TailPreviewStale`. Crash-torn final files use the v2
-  `TornPrefix` identity (SHA-256 of their observed fixed-size blocks), re-proved
-  exactly before replacement. Live endings retain Object or sidecar identities.
+  `TornPrefix` identity, the SHA-256 of their observed fixed-size blocks,
+  re-proved before replacement. Live endings retain object or sidecar identities.
+  Abort, failed append and ingress timeout add no abandonment filemark; a durable
+  live ending raises no automatic tape-I/O fence.
 - A sealing session commits its finalization decision before replying and ends
   before terminal media work. Further appends return `SessionSealed`.
   `FINAL_PARTIAL_EPOCH` belongs only to a short sidecar following an accepted
   finalization decision; ordinary session closeout does not set it.
-- Remanence now captures and restores only `user.*` extended attributes; namespace
-  widening and full-fidelity options are removed, and wrappers apply no xattrs,
-  ACLs or file flags. Long-term preservation must not reapply one host’s security
-  posture on a different system.
-
-- Host commit authority now uses one per-tape log at
+- Remanence captures and restores only `user.*` extended attributes. Namespace
+  widening and full-fidelity options are not accepted, and wrappers apply no
+  xattrs, ACLs or file flags. Restoring these would reapply one host's security
+  policy on a different system.
+- Host commit authority uses one per-tape log at
   `journal_dir/tapes/<lowercase-simple-uuid>.remtape`, for tapes with or without
-  parity. The layout marker is `state_dir/authority-format` and the catalog
-  schema is 23. Old state is refused and has no importer; stop the daemon, run
-  `rem reset-catalog --config <PATH> --i-understand-this-erases-the-catalog`,
-  and reinitialize approved scratch tapes with new UUIDs. `rem-debug tape-log
-  inspect` reports log-tail damage; `rem-debug tape-log repair-tail` archives a
-  damaged suffix with explicit confirmation and requires physical reconciliation
-  through `rem tape supersede-tail` before append. Catalog rebuild through
-  `rem rebuild-catalog-from-journals` now rebuilds only the projection and
-  preserves log and audit bytes. Append output adds `tape_log_sequence` and
-  `tape_incarnation`; `journal_record_ordinal` remains present and null.
-- Removed the old host journal readers, writers and finalization companion
-  storage. The per-tape log is the only host commit authority. Old file names
-  remain recognized for refusal and declared-reset archival; the removed
-  implementation cannot read or import them. Tape formats and media bytes
-  are unchanged.
+  parity. The layout marker is `state_dir/authority-format`; the catalog schema
+  is 24. Ordinary opens refuse schemas 1 through 23, and no importer is available.
+  See the [declared reset procedure](docs/guide-troubleshooting.md#authority-layout-refusals-and-declared-reset).
+  `rem-debug tape-log inspect` reports log-tail damage; `rem-debug tape-log
+  repair-tail` archives a damaged suffix with explicit confirmation and requires
+  physical reconciliation through `rem tape supersede-tail` before append.
+  `rem rebuild-catalog-from-journals` rebuilds the projection and preserves log
+  and audit bytes. Append output carries `tape_log_sequence` and
+  `tape_incarnation`; `journal_record_ordinal` is present and null.
 
 - The field-test kit checks the changer not-ready wait on real hardware.
   `fieldtest/plan/magazine.env` runs `36-magazine-wait.sh`, which asks the
@@ -94,19 +86,9 @@ per-release summaries.
   every exit path, including a signal sent to the script, and preflight sweeps
   stale ones. `fieldtest/RUNBOOK.md` lists the knobs.
 - `rem drive unload --library <SERIAL> --bay <BAY> [--dest <SLOT>]` unloads a
-  drive bay through the daemon and waits for completion. The daemon closes any
-  retained parity epoch before the cartridge leaves the drive. Without `--dest`
-  the cartridge returns to its recorded source slot. The command reports the
-  slot that now holds it, and exits 1 with the daemon's message on a refusal.
-- A daemon unload or move whose epoch close fails, or does not run (a tape-I/O
-  fence, a medium that is not writable, a shutdown that cannot prove the head
-  position, a drive owner that stopped), still removes the cartridge, and now
-  says so: the operation progress and its finish audit
-  carry `epoch_close=failed` (a close ran and failed) or
-  `epoch_close=not_attempted` (no close ran), with the reason in
-  `epoch_close_error`, and `rem drive unload` prints a warning line. Neither
-  value says an epoch existed: the fence check runs before the close looks.
-  Before, the operation succeeded with only a daemon log line.
+  drive bay through the daemon and waits for completion. Without `--dest` the
+  cartridge returns to its recorded source slot. The command reports that slot
+  and exits 1 with the daemon's message on a refusal.
 - A daemon changer move that fails because the library is transiently not
   ready (`02/3B/12` medium magazine removed, `02/04/01` becoming ready,
   `02/04/18` door open), or whose endpoint already reports exception `3B/12`,
@@ -136,9 +118,7 @@ per-release summaries.
   `clobbered_identity = "unknown-to-catalog"` and `clobbered_uuid`. Standalone
   `rem tape init` has the same flag.
 
-- Removed the duplicate direct session writer and mount-session forwarding.
-  Standalone and pool-selected writes share the actor; ordinary checkpoints
-  retain partial parity epochs and owner finish closes them without unloading.
+- Standalone and pool-selected writes share the drive actor.
   Archive-write errors keep the typed cause first and include the actor's
   additional recovery, fence-persistence, and checkpoint retry advice.
 
@@ -179,19 +159,17 @@ per-release summaries.
     terminal completion during open, or remaining terminal recovery. Terminal
     work after a checkpoint uses `read terminal-finalization drive config:`
     and reports a tape that became write-protected before finalization.
-  - Actor session/admission, retained-epoch close, audit and receipt-projection
+  - Actor session/admission, session closeout, audit and receipt-projection
     failures keep their actor diagnostics and recovery evidence. These describe
     the actor's state and cannot be faithfully converted to a direct-writer
     error by stripping a prefix. Daemon diagnostics are unchanged.
 
-- Standalone `rem put`, `rem tape finalize` and `rem tape supersede-tail` now
+- Standalone `rem put`, `rem tape finalize` and `rem tape supersede-tail`
   run the daemon's write actor in process on the operator-mounted drive. Version
   skips, durable receipts and explicit recovery remain available. Init retains
-  its existing path. Temporary step-1 deviation: the adapter holds both the
-  owned device lock and `state.lock`; device-lock-only coordination lands in
-  architecture step 5. A failed ALLOW or RELEASE at the end of a standalone
-  write, finalize or supersede is now reported as a failure; previously it was
-  only logged.
+  its own path. The adapter holds both the device lock and `state.lock`.
+  A failed ALLOW or RELEASE at the end of a standalone write, finalize or
+  supersede is reported as a failure.
 
 - Test infrastructure: the chaos model separates buffered tape records from
   durable records, models power cuts and lost command responses, and supplies
@@ -262,23 +240,6 @@ per-release summaries.
   transfer and tail timing, time in WRITE commands and host time between them.
   The field kit records these figures alongside its own measurements and safely
   shares its CSV output between concurrent callers.
-- Write throughput: daemon checkpoints leave a short parity epoch open and
-  emit sidecars for full epochs. A seated cartridge retains its accumulator
-  between sessions when identity and committed coordinates match; otherwise
-  rebuilding reads each extent forward in batches. Finalization and cartridge
-  removal close the open epoch. Standalone checkpoints now retain it too; owner
-  finish closes the remaining epoch without unloading. Readers treat the open
-  range as unprotected, and `rem catalog tapes --json` and `rem top` show its
-  committed ordinals. Catalog schema 22 records
-  deferred sealing obligations for the next session or finalization.
-
-- Epoch-close fixes: removal projects the checkpoint journal before deciding
-  whether an epoch is open. Cartridges without a journal acquire none on
-  removal; sealed and finalized tapes skip replay. Unknown state and transient
-  failures are audited without fencing, and removal proceeds. Contradictions
-  in committed tape data or uncertain write durability fence the tape;
-  admission contradictions also fence a session open. A medium error beyond
-  the committed end is reported at that suffix location.
 - Checkpoint and finalization fixes: a deferred seal is recorded in the same
   journal fsync as its checkpoint and survives catalog rebuild. Terminal
   checkpoint replay also advances the protected ordinal. Finalization planning
@@ -413,11 +374,7 @@ per-release summaries.
   with its source (measured from the drive's density code, read from the label,
   or set by the operator) and each tape's pool-assignment history,
   independently of library identity, and it audits label rebinding. The
-  catalog schema is 20. A 0.2.0 catalog (schema 18) migrates in place the first
-  time the daemon or a state-changing command opens it; commands that only
-  read the catalog do not migrate it. A 0.2.0 binary refuses a schema-20
-  catalog. `rem rebuild-catalog-from-journals` also replays checkpoint
-  journals, which reproduces standalone objects exactly.
+  catalog is a rebuildable projection of native tape logs and the audit log.
 - Layer 5 contract: the `Catalog` service gains `SupersedeTail`.
   `HealthResponse` and `VersionResponse` carry `supported_endpoint_kinds`,
   `daemon_capabilities` and `observed_endpoints`. `FileRecord` and

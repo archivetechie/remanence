@@ -568,7 +568,7 @@ Used cartridges need more care: init refuses a tape that holds data unless you
 pass `--clobber-data` and confirm. The [CLI reference](reference-cli.md)
 describes those options.
 
-<!-- code-anchor: crates/remanence-cli/src/put.rs crates/remanence-cli/src/get.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-cli/src/put.rs crates/remanence-cli/src/get.rs crates/remanence-api/src/write_owner/checkpoint.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
 ## First write to tape (requires hardware, writes to media)
 
 Start the daemon again in its own shell, as before:
@@ -599,6 +599,10 @@ demo/src/notes.txt  object 3f2a9c1e-7b4d-4e8a-9c61-0d5e2f7a8b93  tape RMJ101L9 f
 demo/src/photos/img001.raw  object 8b17e4d2-5a6c-4f3b-a0e9-2c7d1b6f4e58  tape RMJ101L9 file 2  pool archive
 session 6c0e3b9a-1d2f-4a7e-8b5c-9f4d2e1a7c36 closed: 2 objects, 97.7 KiB committed
 ```
+
+This example writes one object per file. Before archiving many small files, read
+[Sizing objects and write sessions](guide-object-sizing.md): each object uses a
+tape file and index entries, and each session can leave a short parity sidecar.
 
 The daemon chose a tape from the pool, mounted it, and wrote each object as one
 tape file after the bootstrap (tape file 0). "Pending checkpoint" means the
@@ -632,52 +636,24 @@ time rather than an object UUID. The daemon read the copy from tape, and
 `rem get` checked its SHA-256 against the digest in the catalog before it
 reported success.
 
+<!-- code-anchor: crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/mount.rs crates/remanence-cli/src/tape_closeout.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
 ### When parity reaches the tape
 
-The paragraphs below describe when the parity for committed data is written to
-tape. You do not need them to finish this tutorial.
-
-Daemon and in-process write sessions keep a short epoch across ordinary
-checkpoint barriers. Standalone `rem put` and pool-selected `rem-debug archive
-write` use that same actor policy; finishing the command closes any remaining
-short epoch without unloading the cartridge.
-
-A checkpoint drains the drive, proves the end position, and commits the per-tape log
-and catalog. A CHECKPOINTED receipt keeps this meaning on a parity pool even
-when the newest committed data awaits parity. A short epoch stays open across
-ordinary checkpoints. Completed epochs emit their sidecars after the Object
-filemark; finalization closes its short epoch with `FINAL_PARTIAL_EPOCH`.
-Cartridge removal attempts to close an admitted open epoch without automatic
-finalization. It records a due seal as `seal_due` in the fsynced per-tape log and
-projects it into the catalog, visible in `rem catalog tapes
---json`; the next write session on that tape or explicit finalize completes it.
-
-While the cartridge stays seated, fewer than `S × k` committed data blocks can
-lack on-tape parity. At the default geometry this window is less than 16 GiB.
-The drive actor retains the accumulator between sessions under
-`daemon.io_memory_ceiling`. If it cannot reserve that memory, the barrier closes
-the short epoch instead. `rem catalog tapes --json` reports the pending range as
-`open_epoch_start` and `open_epoch_end`; `rem top` shows it on the loaded tape.
-Both fields clear when the sidecar commits.
-
-A new session proves tape identity and end of data before reusing retained state.
-A restart or mismatched state rebuilds the open epoch by reading its committed
-range before the next write. On shutdown, the daemon closes the epoch only if
-no read or other positioning follows the last write and the head remains at
-that end position. Otherwise it dismounts and logs and audits `epoch_left_open`
-with `[W,T)`; the next append rebuilds the epoch. Removal always proceeds.
-Non-writable, foreign, unconfigured, and terminal-finalizing tapes skip the close
-with a log entry. A close records a tape-I/O fence when the tape contradicts
-committed state or an append has uncertain durability. A contradiction fence
-carries the range and cause; a write-failure fence carries the batch evidence.
-Transient failures log and audit `epoch_left_open` without a fence. A durable
-journal commit stays closed when SQLite projection fails; startup replay
-projects it.
-A cartridge outside a drive has no open epoch except after a crash, a close that
-leaves the epoch open, or a shutdown that finds the head away from EOD. A fenced
-tape keeps its open epoch until append recovery clears the fence.
+The session that writes the data also writes its remaining parity sidecar at
+clean close, after returning the committed receipts and before releasing the
+drive. A failed closeout or an interrupted session can leave committed data
+unprotected. The daemon services that debt when it can; `rem top` and
+`rem catalog tapes --json` show it. To request closeout of one tape explicitly,
+use `rem tape closeout <UUID>`, with the tape UUID from the catalog. Unloading a
+cartridge performs no parity work, and graceful shutdown leaves cartridges
+seated. See [The write path](architecture-overview.md#the-write-path) for the
+session lifecycle and [Closeout debt](guide-troubleshooting.md#closeout-debt)
+for recovery and retries.
 
 ## Where to go next
+
+- [Sizing objects and write sessions](guide-object-sizing.md): choosing object
+  and session sizes before writing an archive.
 
 - [Using a standalone LTO drive](guide-standalone-drive.md): the complete
   one-drive workflow, without a changer or daemon.
