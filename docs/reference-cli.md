@@ -1279,6 +1279,7 @@ operation to a terminal state. `<TAPE>` is a tape UUID or an exact barcode;
 a barcode matching more than one data tape is refused. Use the UUID to disambiguate.
 `--expected-pool` checks the assigned pool before fresh work. Matching retries
 rejoin the original operation even if that pool assignment subsequently changed.
+A sealed tape is refused immediately with `FAILED_PRECONDITION` ("tape is sealed"), except matching retries of live or successful operations; there is nothing to close out.
 OperationControl authorization is required: the `operator`, `orchestrator`,
 `admin` or `system` role. These are client permissions, not job titles.
 

@@ -778,6 +778,7 @@ service Catalog {
   // FINALIZING and detail carries that summary. The same idempotency key resumes
   // under the same operation id; retry and startup recovery publish RUNNING.
   rpc FinalizeTape     (FinalizeTapeRequest)      returns (TapeFinalization);
+  // Sealed tapes fail immediately with FAILED_PRECONDITION ("tape is sealed"), except matching retries of live or successful operations.
   rpc CloseoutTape (CloseoutTapeRequest) returns (OperationRef);
   rpc SupersedeTail    (SupersedeTailRequest)     returns (SupersedeTailResponse);
   rpc GetTapeFinalization (GetTapeFinalizationRequest) returns (TapeFinalization);

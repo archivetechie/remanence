@@ -1433,7 +1433,11 @@ pub(crate) async fn service_closeout_obligation(
     let prepared = tokio::task::spawn_blocking(move || -> Result<_, Status> {
         let state = &preparing;
         let pool = state.drive_pool()?.clone();
-        let (_closing, tape_reservation) = pool.reserve_worker_tape(tape_uuid)?;
+        let (_closing, tape_reservation) =
+            pool.reserve_worker_tape(tape_uuid).inspect_err(|error| {
+                tracing::warn!(tape_uuid = %Uuid::from_bytes(tape_uuid), %error,
+                "closeout worker reservation refused; skipping attempt");
+            })?;
         let mut index = state.index_write()?;
         if index
             .get_tape(&tape_uuid)
@@ -1481,6 +1485,12 @@ pub(crate) async fn service_closeout_obligation(
         index
             .project_tape_log(&snapshot)
             .map_err(status_from_state_error)?;
+        // A scan can queue this tape while a request owns finalization. Once
+        // sealed, its retained manual intent must not restart the operation.
+        // The dispatcher refreshes native debt and removes the stale entry.
+        if summary.sealed {
+            return Ok(None);
+        }
         if let Some(intent) = intent.as_ref().filter(|i| i.manual.is_some()) {
             if !crate::write_owner::reconcile_manual_terminal_acceptance(
                 &index, &mut lease, intent,
