@@ -40,6 +40,9 @@ way, the kit user no longer needs a sudo rule for `setcap`. Delete that rule.
   guard refuses payloads that would leave the shared `/home` short. See
   "Disk guard" in RUNBOOK.md.
 - Raise `max_sectors_kb` for throughput plans. See "Host I/O setup" in RUNBOOK.md.
+- The kit needs Python 3.11 or later (it reads its configuration with `tomllib`):
+  `dnf install python3.11` on RHEL 9, or set `FIELD_PYTHON` for the kit user. Every plan
+  refuses before its first leg without it. Confirm it on the host before the window.
 
 The plan refuses to start unless `~/remfield/allowlist.txt` lists exactly the
 plan's barcodes, with no cleaning cartridge. It also refuses if the kit state has

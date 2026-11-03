@@ -190,13 +190,15 @@ main() {
       ;;
     --stop)
       fieldtest_init_layout
+      local py
+      py="$(fieldtest_python)" || exit 2
       local session pid started elapsed retry_window stop_timeout forced=0
       session="remfield"
       # The daemon may already have dispatched UNLOAD. Let its changer wait
       # expire and finish cleanup before the kit resorts to a forced kill.
       stop_timeout="${REMFIELD_STOP_TIMEOUT_SECONDS:-}"
       if [[ -z "$stop_timeout" ]]; then
-        stop_timeout="$("$(fieldtest_python)" - "$(fieldtest_config_path)" <<'PYSTOP'
+        stop_timeout="$("$py" - "$(fieldtest_config_path)" <<'PYSTOP'
 import sys, tomllib
 from pathlib import Path
 config = tomllib.loads(Path(sys.argv[1]).read_text())
@@ -216,7 +218,7 @@ PYSTOP
       # seated cartridges alone. Keep tmux alive for all operation diagnostics.
       pid="$(pgrep -f "rem-daemon --config $(fieldtest_config_path)" | head -1 || true)"
       if [[ -n "$pid" ]]; then
-        if retry_window="$("$(fieldtest_python)" - "$(fieldtest_config_path)" <<'PYCONFIG'
+        if retry_window="$("$py" - "$(fieldtest_config_path)" <<'PYCONFIG'
 import sys, tomllib
 from pathlib import Path
 config = tomllib.loads(Path(sys.argv[1]).read_text())
