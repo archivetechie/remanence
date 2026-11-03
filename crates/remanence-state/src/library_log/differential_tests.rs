@@ -292,7 +292,7 @@ pub(super) fn step(
     match validation {
         Ok(Validated::Apply) => {
             replay_result?;
-            live.apply_validated(n, record, receipt, view);
+            live.apply_validated(n, record, receipt, view)?;
         }
         Ok(Validated::Duplicate(original)) => {
             replay_result?;

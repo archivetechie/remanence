@@ -94,6 +94,12 @@ pub enum FoldError {
     /// A different medium requires a new incarnation.
     #[error("MediumFamilyChanged")]
     MediumFamilyChanged,
+    /// Geometry and capabilities cannot change within an incarnation.
+    #[error("ImmutableMediumField {{ field: {field} }}")]
+    ImmutableMediumField {
+        /// The fixed MediumSpec field that differed.
+        field: &'static str,
+    },
     /// Raising capacity requires fresh measured provenance on this revision.
     #[error("CapacityIncreaseRequiresMeasurement")]
     CapacityIncreaseRequiresMeasurement,
@@ -1017,11 +1023,32 @@ impl LibraryFold {
             MediumSpecSet(v) => {
                 let old = self.tape(v.tape)?;
                 generation(&v.change, old.media_revision)?;
-                if v.medium.record_size == 0 {
-                    return Err(FoldError::InvalidSchema);
+                for (field, changed) in [
+                    (
+                        "record_size",
+                        v.medium.record_size != old.medium.record_size,
+                    ),
+                    ("rerecord", v.medium.rerecord != old.medium.rerecord),
+                    (
+                        "lifecycle_ops",
+                        v.medium.lifecycle_ops != old.medium.lifecycle_ops,
+                    ),
+                ] {
+                    if changed {
+                        return Err(FoldError::ImmutableMediumField { field });
+                    }
                 }
-                if v.medium.family != old.medium.family {
-                    return Err(FoldError::MediumFamilyChanged);
+                match (old.medium.family, v.medium.family) {
+                    (MediumFamily::Lto(old_gen), MediumFamily::Lto(new_gen)) => {
+                        if old_gen != new_gen && old.medium.source == GenerationSource::Measured {
+                            return Err(FoldError::MediumFamilyChanged);
+                        }
+                    }
+                    (MediumFamily::Disk, MediumFamily::Disk) => {}
+                    (MediumFamily::Lto(_), MediumFamily::Disk)
+                    | (MediumFamily::Disk, MediumFamily::Lto(_)) => {
+                        return Err(FoldError::MediumFamilyChanged);
+                    }
                 }
                 if v.medium.usable_logical_bytes > old.medium.usable_logical_bytes
                     && v.medium.source != GenerationSource::Measured
@@ -1046,6 +1073,11 @@ impl LibraryFold {
             FenceReleased(v) => {
                 if v.evidence.is_empty() {
                     return Err(FoldError::InvalidSchema);
+                }
+                if let Some(held) = self.fences.get(&v.fence) {
+                    if let Body::FenceRaised(raised) = &held.record.body {
+                        release_scope(&raised.scope)?;
+                    }
                 }
                 if !self.fences.contains_key(&v.fence) {
                     let retained = self.at_sequence(v.fence);
@@ -1428,7 +1460,7 @@ impl LibraryFold {
         }
         let result = self.validate(&record, view, history)?;
         match &result {
-            Validated::Apply => self.apply_validated(sequence, record, receipt, view),
+            Validated::Apply => self.apply_validated(sequence, record, receipt, view)?,
             Validated::Duplicate(_) => self.duplicates += 1,
         }
         self.received_through = sequence;
@@ -1441,7 +1473,7 @@ impl LibraryFold {
         record: Record,
         receipt: Receipt,
         view: &dyn TapeView,
-    ) {
+    ) -> Result<(), FoldError> {
         // Fence scopes have no historical references. Recompute exactly the scope
         // validated before publication; no mutation can intervene under the writer lock.
         let deferred_scope = if matches!(record.body, Body::FenceRaised(_)) {
@@ -1451,15 +1483,21 @@ impl LibraryFold {
             None
         };
         if let Some(scope) = deferred_scope {
-            self.defer_fence(sequence, record, receipt, scope, view)
-                .expect("validated deferred fence capacity and shape");
+            self.defer_fence(sequence, record, receipt, scope, view)?;
         } else {
-            self.commit(sequence, record, receipt, view);
+            self.commit(sequence, record, receipt, view)?;
         }
         self.received_through = sequence;
         self.watermark();
+        Ok(())
     }
-    fn commit(&mut self, sequence: u64, record: Record, receipt: Receipt, view: &dyn TapeView) {
+    fn commit(
+        &mut self,
+        sequence: u64,
+        record: Record,
+        receipt: Receipt,
+        view: &dyn TapeView,
+    ) -> Result<(), FoldError> {
         let b = &record.body;
         use Body::*;
         match b {
@@ -1535,18 +1573,16 @@ impl LibraryFold {
                 );
             }
             FenceReleased(v) => {
-                let raised = self.fences.remove(&v.fence).unwrap();
-                self.unresolved_fence_evidence.remove(&v.fence);
+                let raised = self
+                    .fences
+                    .get(&v.fence)
+                    .ok_or(FoldError::ReleaseWithoutFence)?;
                 let Body::FenceRaised(raised) = &raised.record.body else {
-                    unreachable!()
+                    return Err(FoldError::WrongCounterpart);
                 };
-                let scope = match &raised.scope {
-                    FenceScope::Tape(tape) => Scope::Tape(tape.uuid),
-                    FenceScope::Drive(endpoint) => Scope::Endpoint(endpoint.clone()),
-                    FenceScope::Model { .. } => {
-                        unreachable!("reserved scope refused before commit")
-                    }
-                };
+                let scope = release_scope(&raised.scope)?;
+                self.fences.remove(&v.fence);
+                self.unresolved_fence_evidence.remove(&v.fence);
                 self.insert_latest(
                     (Tag::FenceReleased, scope, None),
                     Held {
@@ -1680,7 +1716,7 @@ impl LibraryFold {
                         receipt,
                     },
                 );
-                return;
+                return Ok(());
             }
             Body::AcceptUnprotectedFinalization(v) => {
                 self.unprotected.insert(
@@ -1691,14 +1727,14 @@ impl LibraryFold {
                         receipt,
                     },
                 );
-                return;
+                return Ok(());
             }
             _ => {}
         }
         if let Body::OperationRecorded(v) = b {
             if terminal(&v.event) {
                 self.close_operation(v.operation);
-                return;
+                return Ok(());
             }
         }
         if let Some(slot) = b.slot() {
@@ -1719,6 +1755,7 @@ impl LibraryFold {
                 );
             }
         }
+        Ok(())
     }
     fn scopes_for(
         &self,
@@ -1736,6 +1773,9 @@ impl LibraryFold {
         }
         if let Body::FenceReleased(v) = b {
             if let Some(h) = self.fences.get(&v.fence) {
+                if let Body::FenceRaised(raised) = &h.record.body {
+                    release_scope(&raised.scope)?;
+                }
                 s.extend(h.record.body.scopes());
             }
         }
@@ -1795,7 +1835,7 @@ impl LibraryFold {
             self.hold(sequence, record.clone(), receipt.clone(), scope)?;
             self.pending.last_mut().unwrap().deferred_fence = true;
         }
-        self.commit(sequence, record, receipt, view);
+        self.commit(sequence, record, receipt, view)?;
         Ok(())
     }
     /// Receive one frame during replay; only native contradictions are isolated.
@@ -1844,7 +1884,7 @@ impl LibraryFold {
             self.hold(sequence, record, receipt, scope)?;
         } else {
             match self.validate_at(sequence, &record, view, history) {
-                Ok(Validated::Apply) => self.commit(sequence, record, receipt, view),
+                Ok(Validated::Apply) => self.commit(sequence, record, receipt, view)?,
                 Ok(Validated::Duplicate(_)) => self.duplicates += 1,
                 Err(FoldError::Unresolved) => self.hold(sequence, record, receipt, scope)?,
                 Err(FoldError::TapeContradiction) => {
@@ -1952,10 +1992,16 @@ impl LibraryFold {
                 };
                 match self.validate_at(p.sequence, &record, view, history) {
                     Ok(Validated::Apply) => {
-                        self.pending_bytes -= p.bytes.len();
                         if !p.deferred_fence {
-                            self.commit(p.sequence, record, p.receipt, view);
+                            if let Err(e) = self.commit(p.sequence, record, p.receipt.clone(), view)
+                            {
+                                self.pending.push(p);
+                                self.pending.extend(it);
+                                self.watermark();
+                                return Err(e);
+                            }
                         }
+                        self.pending_bytes -= p.bytes.len();
                     }
                     Ok(Validated::Duplicate(_)) => {
                         self.pending_bytes -= p.bytes.len();
@@ -2100,10 +2146,64 @@ impl LibraryFold {
     }
 }
 
+/// Release indexing is deliberately exhaustive: disk work must define Model release semantics.
+fn release_scope(scope: &FenceScope) -> Result<Scope, FoldError> {
+    match scope {
+        FenceScope::Tape(tape) => Ok(Scope::Tape(tape.uuid)),
+        FenceScope::Drive(endpoint) => Ok(Scope::Endpoint(endpoint.clone())),
+        // disk: decide release scope before activating Model fences.
+        FenceScope::Model { .. } => Err(FoldError::ReservedNotYetUsed),
+    }
+}
+
 #[cfg(test)]
 mod retention_tests {
     use super::*;
-    use crate::library_log::tests::{endpoint, evidence, feed, Present};
+    use crate::library_log::tests::{
+        endpoint, evidence, feed, provision, record, release, reserved_fence, History, Present,
+    };
+
+    /// Even a future Model raise must not make release panic or silently discard its fence.
+    #[test]
+    fn model_fence_release_is_a_typed_refusal() {
+        let mut f = LibraryFold::default();
+        feed(&mut f, provision(1, None), &Present).unwrap();
+        let Body::FenceRaised(mut raised) = reserved_fence(false) else {
+            unreachable!()
+        };
+        raised.cause = FenceCause::TransferError;
+        feed(&mut f, Body::FenceRaised(raised), &Present).unwrap();
+        let held = f.fences.get_mut(&2).unwrap();
+        let Body::FenceRaised(raised) = &mut held.record.body else {
+            unreachable!()
+        };
+        raised.scope = FenceScope::Model {
+            model: "HC560".into(),
+            firmware: "A1".into(),
+        };
+        let before = f.clone();
+        let r = record(release(2), 3);
+        let receipt = Receipt {
+            sequence: 3,
+            record_uuid: r.envelope.record_uuid,
+            record_hash: [0; 32],
+            synced: true,
+        };
+        assert_eq!(
+            f.validate(&r, &Present, &History::default()).unwrap_err(),
+            FoldError::ReservedNotYetUsed
+        );
+        assert_eq!(
+            f.receive(3, r.clone(), receipt.clone(), &Present, &History::default())
+                .unwrap_err(),
+            FoldError::ReservedNotYetUsed
+        );
+        assert_eq!(
+            f.apply_validated(3, r, receipt, &Present).unwrap_err(),
+            FoldError::ReservedNotYetUsed
+        );
+        f.assert_same_state(&before);
+    }
 
     /// Readiness can terminate without a separate OperationRecorded chain.
     #[test]

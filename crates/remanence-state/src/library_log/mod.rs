@@ -151,7 +151,9 @@ pub enum MediumFamily {
     /// Wire code 1, with a null payload.
     Disk,
 }
-/// Capabilities recorded at provisioning and revised under media_revision.
+/// Medium spec recorded at provisioning and revised under media_revision.
+/// Geometry and capabilities are fixed per incarnation. Capacity and source are revisable;
+/// an LTO generation correction additionally requires the current source to be unmeasured.
 /// Rerecord implies regenerative use; role is never stored separately.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MediumSpec {

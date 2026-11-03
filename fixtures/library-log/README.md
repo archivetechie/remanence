@@ -712,6 +712,23 @@ Authoritative prefix end: 822 bytes; tail Complete.
 | 2 | Reprovision | 00000000000000000001-2026-11-03.remlib | 319 | 554 | `dec958f138a9d0238b6c0555c63f7fd6b7de0a5d93101ab5a5055850f99104d3` |
 | 3 | MotionIntent | 00000000000000000001-2026-11-03.remlib | 554 | 822 | `9c3d3219744af8f57f9af2dc4aa06fe939cdea9482ca2242d23bdbd1e74654db` |
 | 4 | MotionIntent | 00000000000000000001-2026-11-03.remlib | 822 | 1066 | `beb8f8f5c0509a72b87d44a2272720a2545a2f1da4deb154fe745a78c4595cca` |
+## rejected/medium-capability-flip
+
+Tail: `00000000000000000001-2026-11-03.remlib@554:Some(3):ImmutableMediumField { field: rerecord }`. Authoritative sequence 2; applied 2; pending 0; tapes 2; fences 0; duplicates 0.
+
+`00000000000000000001-2026-11-03.remlib`: 770 bytes, SHA-256 `834a607a3c20a9e6c672ca03746e9314870df3aaf656f3367cddea09a3f041e5`.
+
+Raw header (unvalidated): magic `52454d4c49420001`, version 1, log UUID `b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1`, first sequence 1, previous hash `0000000000000000000000000000000000000000000000000000000000000000`, date `2026-11-03`, stored CRC `678a79f09c0bd1e9`, computed CRC `678a79f09c0bd1e9`.
+
+Header: `Header { log_uuid: [177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177], first_sequence: 1, previous_segment_hash: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], date: [50, 48, 50, 54, 45, 49, 49, 45, 48, 51] }`.
+
+Authoritative prefix end: 554 bytes; tail Complete.
+
+| Sequence | Tag | Segment | Offset | End | Record hash |
+|---:|---|---|---:|---:|---|
+| 1 | Reprovision | 00000000000000000001-2026-11-03.remlib | 84 | 319 | `11f1bc3f654ddbffea9c861c08d00fda3b3b70f3146434f78b1e0a3914c5352b` |
+| 2 | Reprovision | 00000000000000000001-2026-11-03.remlib | 319 | 554 | `dec958f138a9d0238b6c0555c63f7fd6b7de0a5d93101ab5a5055850f99104d3` |
+| 3 | MediumSpecSet | 00000000000000000001-2026-11-03.remlib | 554 | 770 | `6a5292e43285be4edd989d8e2f27e66124692f2a81303244fdea54dc6aaa1e59` |
 ## rejected/medium-family-change
 
 Tail: `00000000000000000001-2026-11-03.remlib@554:Some(3):MediumFamilyChanged`. Authoritative sequence 2; applied 2; pending 0; tapes 2; fences 0; duplicates 0.
@@ -729,6 +746,23 @@ Authoritative prefix end: 554 bytes; tail Complete.
 | 1 | Reprovision | 00000000000000000001-2026-11-03.remlib | 84 | 319 | `11f1bc3f654ddbffea9c861c08d00fda3b3b70f3146434f78b1e0a3914c5352b` |
 | 2 | Reprovision | 00000000000000000001-2026-11-03.remlib | 319 | 554 | `dec958f138a9d0238b6c0555c63f7fd6b7de0a5d93101ab5a5055850f99104d3` |
 | 3 | MediumSpecSet | 00000000000000000001-2026-11-03.remlib | 554 | 770 | `46d276cbbc05b88b667560daf41f2b451dcb917494da58771f5aba2d1e239ba0` |
+## rejected/medium-record-size-change
+
+Tail: `00000000000000000001-2026-11-03.remlib@554:Some(3):ImmutableMediumField { field: record_size }`. Authoritative sequence 2; applied 2; pending 0; tapes 2; fences 0; duplicates 0.
+
+`00000000000000000001-2026-11-03.remlib`: 768 bytes, SHA-256 `5942afbc2c3ed63e77546c44ee883dfbaed37a27b04f0ecaa01f7f291118b4a1`.
+
+Raw header (unvalidated): magic `52454d4c49420001`, version 1, log UUID `b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1`, first sequence 1, previous hash `0000000000000000000000000000000000000000000000000000000000000000`, date `2026-11-03`, stored CRC `678a79f09c0bd1e9`, computed CRC `678a79f09c0bd1e9`.
+
+Header: `Header { log_uuid: [177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177], first_sequence: 1, previous_segment_hash: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], date: [50, 48, 50, 54, 45, 49, 49, 45, 48, 51] }`.
+
+Authoritative prefix end: 554 bytes; tail Complete.
+
+| Sequence | Tag | Segment | Offset | End | Record hash |
+|---:|---|---|---:|---:|---|
+| 1 | Reprovision | 00000000000000000001-2026-11-03.remlib | 84 | 319 | `11f1bc3f654ddbffea9c861c08d00fda3b3b70f3146434f78b1e0a3914c5352b` |
+| 2 | Reprovision | 00000000000000000001-2026-11-03.remlib | 319 | 554 | `dec958f138a9d0238b6c0555c63f7fd6b7de0a5d93101ab5a5055850f99104d3` |
+| 3 | MediumSpecSet | 00000000000000000001-2026-11-03.remlib | 554 | 768 | `f1f4fafc3b59d2c5c669286918aece5c6abd2f63e9738298b9051d38a7f1a091` |
 ## rejected/nonminimal-integer
 
 Tail: `00000000000000000001-2026-11-03.remlib@318:Some(2):NoncanonicalCbor`. Authoritative sequence 1; applied 1; pending 0; tapes 1; fences 0; duplicates 0.

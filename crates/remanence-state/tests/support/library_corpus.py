@@ -24,7 +24,8 @@ def cbor(data, pos=0):
         return -1 - value, pos
     if major in (2, 3):
         raw = data[pos:pos + value]
-        assert len(raw) == value
+        if len(raw) != value:
+            raise ValueError("truncated CBOR string")
         return raw if major == 2 else raw.decode(), pos + value
     if major == 4:
         result = []
@@ -37,7 +38,8 @@ def cbor(data, pos=0):
         for _ in range(value):
             key, pos = cbor(data, pos)
             item, pos = cbor(data, pos)
-            assert key not in result
+            if key in result:
+                raise ValueError("duplicate CBOR map key")
             result[key] = item
         return result, pos
     if major == 7 and value in (20, 21, 22):
@@ -46,27 +48,34 @@ def cbor(data, pos=0):
 
 
 def keys(value, count):
-    assert type(value) is dict and list(value) == list(range(count))
+    if not (type(value) is dict and list(value) == list(range(count))):
+        raise ValueError(f"expected map with ascending keys 0..{count - 1}")
 
 
 def uint(value, bits):
-    assert type(value) is int and 0 <= value < 1 << bits
+    if not (type(value) is int and 0 <= value < 1 << bits):
+        raise ValueError(f"expected unsigned {bits}-bit integer")
 
 
 def medium(value):
     keys(value, 6)
     family = value[0]
-    assert type(family) is list and len(family) == 2
+    if not (type(family) is list and len(family) == 2):
+        raise ValueError("expected two-element medium family union")
     uint(family[0], 8)
     if family[0] == 0:
         uint(family[1], 8)
-        assert family[1] <= 9
+        if family[1] > 9:
+            raise ValueError("invalid LTO generation")
     else:
-        assert family == [1, None]
+        if family != [1, None]:
+            raise ValueError('invalid medium family')
     uint(value[1], 64)
     uint(value[2], 32)
-    assert type(value[3]) is bool and type(value[4]) is bool
-    assert type(value[5]) is int and value[5] in (0, 1, 2)
+    if not (type(value[3]) is bool and type(value[4]) is bool):
+        raise ValueError("medium capabilities must be booleans")
+    if not (type(value[5]) is int and value[5] in (0, 1, 2)):
+        raise ValueError("invalid medium source")
     return family[0]
 
 
@@ -79,20 +88,26 @@ def main(root):
         case, sequence, tag, filename, start, end, digest = line.split("\t")
         data = (root / case / filename).read_bytes()[int(start):int(end)]
         version, code, length, payload, seq = struct.unpack_from("<HHIIQ", data)
-        assert version == 1 and seq == int(sequence)
-        assert payload == 32 or (case == "rejected/payload-length" and payload == 0)
+        if not (version == 1 and seq == int(sequence)):
+            raise ValueError("frame version or sequence mismatch")
+        if not (payload == 32 or (case == "rejected/payload-length" and payload == 0)):
+            raise ValueError("unexpected frame payload length")
         value, stop = cbor(data, 28)
-        assert stop == 28 + length and len(data) == 44 + length + payload
-        assert data[36 + length:36 + length + payload].hex() == digest
+        if not (stop == 28 + length and len(data) == 44 + length + payload):
+            raise ValueError("frame length mismatch")
+        if not (data[36 + length:36 + length + payload].hex() == digest):
+            raise ValueError("frame digest disagrees with manifest")
         keys(value, 2)
         body = value[1]
         if code == 4:
-            assert tag == "Reprovision"
+            if tag != "Reprovision":
+                raise ValueError("Reprovision tag mismatch")
             keys(body, 10)
             seen.add(("family", medium(body[6])))
             count += 1
         elif code == 5:
-            assert tag == "MediumSpecSet"
+            if tag != "MediumSpecSet":
+                raise ValueError("MediumSpecSet tag mismatch")
             keys(body, 3)
             medium(body[1])
             keys(body[2], 2)
@@ -101,20 +116,25 @@ def main(root):
         elif code == 8:
             keys(body, 6)
             scope = body[1]
-            assert type(scope) is list and len(scope) == 2
+            if not (type(scope) is list and len(scope) == 2):
+                raise ValueError("expected two-element fence scope union")
             uint(scope[0], 8)
-            assert scope[0] in (0, 1, 2)
+            if scope[0] not in (0, 1, 2):
+                raise ValueError("invalid fence scope")
             uint(body[2], 8)
-            assert body[2] <= 12
+            if body[2] > 12:
+                raise ValueError("invalid fence cause")
             if scope[0] == 2:
                 keys(scope[1], 2)
-                assert all(type(v) is str and len(v.encode()) <= 4096 for v in scope[1].values())
+                if not all(type(v) is str and len(v.encode()) <= 4096 for v in scope[1].values()):
+                    raise ValueError("invalid model scope text")
                 seen.add(("reserved", "model"))
             if body[2] == 12:
                 seen.add(("reserved", "quarantine"))
     required = {("family", 0), ("family", 1), ("tag", 5),
                 ("reserved", "model"), ("reserved", "quarantine")}
-    assert required <= seen, required - seen
+    if not required <= seen:
+        raise ValueError(f"missing corpus coverage: {required - seen}")
     print(f"independent decoder: {count} medium records; both families and reserved fence codes")
 
 

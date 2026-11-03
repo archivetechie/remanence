@@ -2139,7 +2139,9 @@ fn medium_spec_revision_rules() {
             &Present
         )
         .unwrap_err(),
-        FoldError::InvalidSchema
+        FoldError::ImmutableMediumField {
+            field: "record_size"
+        }
     );
 }
 /// Reserved codes round-trip through the codec and cannot open a fence, even on a blocked scope.
@@ -2197,6 +2199,96 @@ fn reserved_fences_decode_then_refuse() {
                     &History::default()
                 ),
                 Err(FoldError::ReservedNotYetUsed)
+            );
+            f.assert_same_state(&before);
+        }
+    }
+}
+
+/// All fixed fields refuse changes in either direction without advancing live or replay state.
+#[test]
+fn medium_fixed_fields_are_immutable() {
+    for capabilities in [false, true] {
+        let mut f = LibraryFold::default();
+        let mut initial = provision(1, None);
+        let Body::Reprovision(v) = &mut initial else {
+            unreachable!()
+        };
+        v.medium.rerecord = capabilities;
+        v.medium.lifecycle_ops = capabilities;
+        let medium = v.medium.clone();
+        feed(&mut f, initial, &Present).unwrap();
+        for field in ["record_size", "rerecord", "lifecycle_ops"] {
+            let mut changed = medium.clone();
+            match field {
+                "record_size" => changed.record_size = 513,
+                "rerecord" => changed.rerecord = !capabilities,
+                "lifecycle_ops" => changed.lifecycle_ops = !capabilities,
+                _ => unreachable!(),
+            }
+            let before = f.clone();
+            assert_eq!(
+                feed(&mut f, medium_change(changed, 1), &Present).unwrap_err(),
+                FoldError::ImmutableMediumField { field }
+            );
+            f.assert_same_state(&before);
+        }
+    }
+}
+
+/// Correction authority comes from the current spec's source, not the new one.
+#[test]
+fn lto_generation_correction_uses_current_source() {
+    for old_source in [
+        GenerationSource::Label,
+        GenerationSource::Operator,
+        GenerationSource::Measured,
+    ] {
+        for new_source in [
+            GenerationSource::Label,
+            GenerationSource::Operator,
+            GenerationSource::Measured,
+        ] {
+            let mut f = LibraryFold::default();
+            let mut initial = provision(1, None);
+            let Body::Reprovision(v) = &mut initial else {
+                unreachable!()
+            };
+            v.medium.source = old_source;
+            feed(&mut f, initial, &Present).unwrap();
+            let corrected = MediumSpec {
+                family: MediumFamily::Lto(LtoGen::Lto8),
+                source: new_source,
+                ..medium_spec()
+            };
+            let before = f.clone();
+            let result = feed(&mut f, medium_change(corrected.clone(), 1), &Present);
+            if old_source == GenerationSource::Measured {
+                assert_eq!(result.unwrap_err(), FoldError::MediumFamilyChanged);
+                f.assert_same_state(&before);
+            } else {
+                result.unwrap();
+                assert_eq!(f.tapes[&tape(1).uuid].medium, corrected);
+                assert_eq!(f.tapes[&tape(1).uuid].media_revision, 2);
+            }
+            // Family boundaries stay fixed regardless of either provenance.
+            let revision = f.tapes[&tape(1).uuid].media_revision;
+            let before = f.clone();
+            assert_eq!(
+                feed(
+                    &mut f,
+                    medium_change(
+                        MediumSpec {
+                            family: MediumFamily::Disk,
+                            source: new_source,
+                            ..medium_spec()
+                        },
+                        revision
+                    ),
+                    &Present
+                )
+                .unwrap_err(),
+                FoldError::MediumFamilyChanged
             );
             f.assert_same_state(&before);
         }

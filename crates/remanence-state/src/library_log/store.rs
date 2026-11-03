@@ -692,9 +692,15 @@ impl LibraryLog {
             synced,
         };
         // The same frozen view is expected throughout this synchronous append.
-        self.state
+        if let Err(error) = self
+            .state
             .fold
-            .apply_validated(sequence, record, receipt.clone(), view);
+            .apply_validated(sequence, record, receipt.clone(), view)
+        {
+            // Publication already happened: fail closed if a future scope lacks apply semantics.
+            publication::fence_ambiguity(&self.dir, &self.identity);
+            return Err(StoreError::Ambiguous(io::Error::other(error)));
+        }
         self.state.last_sequence = sequence;
         self.state.terminal_hash = hash;
         if let Some(s) = new_segment {
