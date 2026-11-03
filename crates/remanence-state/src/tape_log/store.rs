@@ -8,15 +8,15 @@ use super::{
     wire::Wire,
     *,
 };
+use crate::log_frame::publication::{self, Temporary};
 use nix::fcntl::{Flock, FlockArg};
-use remanence_library::durable_file::{self, File};
+use remanence_library::durable_file::File;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
     fs,
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, RwLock},
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 
@@ -387,11 +387,7 @@ impl Store {
         })
     }
     pub(super) fn has_ambiguity(&self) -> Result<bool, StoreError> {
-        Ok(process_fences()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .contains(&self.path)
-            || self.path.with_extension("ambiguous").try_exists()?)
+        Ok(publication::has_ambiguity(&self.path)?)
     }
     fn check_ambiguity(&self) -> Result<(), StoreError> {
         if self.has_ambiguity()? {
@@ -400,23 +396,17 @@ impl Store {
             Ok(())
         }
     }
-    // Remember first, even if ENOSPC/EIO prevents every persistence attempt.
     fn fence_ambiguity(&self) {
-        process_fences()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(self.path.clone());
-        // The marker's existence is the fence; contents are not required. Still
-        // attempt namespace sync when the marker's own fsync reports EIO.
-        let file_result = File::options()
-            .write(true)
-            .create(true)
-            .open(self.path.with_extension("ambiguous"))
-            .and_then(|file| file.sync_all());
-        let directory_result = File::open(&self.directory).and_then(|dir| dir.sync_all());
-        if let Err(error) = file_result.and(directory_result) {
-            tracing::error!(path = %self.path.display(), %error, "could not durably persist ambiguity fence; process fence remains");
-        }
+        publication::fence_ambiguity(&self.directory, &self.path);
+    }
+    fn temporary(&self, purpose: &str) -> io::Result<Temporary> {
+        Temporary::new(
+            &self.directory,
+            &uuid::Uuid::from_bytes(self.header.tape_uuid)
+                .simple()
+                .to_string(),
+            purpose,
+        )
     }
     /// Explicit recovery of uncertain host durability. Revalidate, copy the closed
     /// prefix to a new inode, fsync it and its replacement name, then retire the
@@ -456,10 +446,7 @@ impl Store {
             Ok(())
         })();
         if result.is_ok() {
-            process_fences()
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&self.path);
+            publication::clear_process_fence(&self.path);
         } else {
             self.fence_ambiguity();
         }
@@ -534,7 +521,7 @@ impl Store {
         if end >= original_len {
             return Err(StoreError::Refused("no suffix to repair"));
         }
-        let mut archive = Temporary::new(self, "repair-evidence")?;
+        let mut archive = self.temporary("repair-evidence")?;
         let mut digest = Sha256::new();
         let mut reader = source;
         let mut buffer = [0; 65536];
@@ -551,7 +538,7 @@ impl Store {
         archive.keep = true;
         let digest: [u8; 32] = digest.finalize().into();
         let fence_path = self.path.with_extension("repair-required");
-        let mut fence = Temporary::new(self, "repair-record")?;
+        let mut fence = self.temporary("repair-record")?;
         let evidence = RepairEvidence {
             archive: archive.path.clone(),
             digest,
@@ -569,9 +556,7 @@ impl Store {
         };
         serde_json::to_writer(&mut fence.file, &record)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        fence.file.sync_all()?;
-        durable_file::rename_noreplace(&fence.path, &fence_path)?;
-        File::open(&self.directory)?.sync_all()?;
+        publication::publish_new(&fence.file, &fence.path, &fence_path, &self.directory)?;
         replace_prefix(self, end)?;
         Ok(record.evidence)
     }
@@ -710,7 +695,7 @@ impl Lease {
             ));
         }
         let result = (|| -> Result<(), StoreError> {
-            let mut evidence = Temporary::new(&self.store, "repair-reconciled")?;
+            let mut evidence = self.store.temporary("repair-reconciled")?;
             serde_json::to_writer(
                 &mut evidence.file,
                 &serde_json::json!({
@@ -872,7 +857,7 @@ impl Lease {
             self.fenced = false;
         }
         let mut temporary = if fresh {
-            Some(Temporary::new(&self.store, "initial")?)
+            Some(self.store.temporary("initial")?)
         } else {
             None
         };
@@ -885,7 +870,15 @@ impl Lease {
         self.fenced = true;
         let copied = (|| -> io::Result<()> {
             group.temp.file.seek(SeekFrom::Start(0))?;
-            copy_frames(&mut group.temp.file, &mut output, group.end - group.offset)
+            crate::log_frame::copy_frames(
+                &mut group.temp.file,
+                &mut output,
+                group.end - group.offset,
+                |_len| {
+                    #[cfg(any(test, feature = "fixtures"))]
+                    super::measure::copied(_len);
+                },
+            )
         })();
         if let Err(error) = copied {
             return Err(self.ambiguous(error));
@@ -1091,20 +1084,22 @@ impl Staged<'_> {
         if self.trial.summary().last_closed_sequence != self.group.next {
             return Err(StoreError::Refused("closer did not close group"));
         }
-        let durable = (|| -> io::Result<()> {
-            self.output.write_all(&bytes)?;
-            if let Some(observer) = &self.lease.publication_observer {
-                (observer.0)(closer, self.group.next, false)?;
-            }
-            self.output.sync_all()?;
-            if let Some(temp) = &self.temporary {
-                durable_file::rename_noreplace(&temp.path, &self.lease.store.path)?;
-                File::open(&self.lease.store.directory)?.sync_all()?;
-            }
-            Ok(())
-        })();
+        let durable = publication::append_and_publish(
+            &mut self.output,
+            &bytes,
+            self.temporary.as_ref().map(|temp| temp.path.as_path()),
+            &self.lease.store.path,
+            &self.lease.store.directory,
+            || {
+                if let Some(observer) = &self.lease.publication_observer {
+                    (observer.0)(closer, self.group.next, false)?;
+                }
+                Ok(())
+            },
+        );
         if let Err(error) = durable {
-            return Err(self.lease.ambiguous(error));
+            self.lease.fenced = true;
+            return Err(StoreError::Ambiguous(error));
         }
         if let Some(observer) = &self.lease.publication_observer {
             (observer.0)(closer, self.group.next, true)
@@ -1146,32 +1141,6 @@ impl Staged<'_> {
         Ok(())
     }
 }
-/// Copy bounded, already preflighted frames with one whole-frame write each.
-/// A short kernel write may still tear; EOF-short prefixes/bodies handle that.
-fn copy_frames(input: &mut impl Read, output: &mut impl Write, mut left: u64) -> io::Result<()> {
-    let mut bytes = Vec::new();
-    while left > 0 {
-        let mut prefix = [0; PREFIX_LEN];
-        input.read_exact(&mut prefix)?;
-        let body = u64::from(u32::from_le_bytes(prefix[4..8].try_into().unwrap()))
-            + u64::from(u32::from_le_bytes(prefix[8..12].try_into().unwrap()));
-        let len = FRAME_OVERHEAD as u64 + body;
-        if body > MAX_FRAME_BODY as u64 || len > left {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid preflighted frame size",
-            ));
-        }
-        bytes.resize(len as usize, 0);
-        bytes[..PREFIX_LEN].copy_from_slice(&prefix);
-        input.read_exact(&mut bytes[PREFIX_LEN..])?;
-        output.write_all(&bytes)?;
-        #[cfg(any(test, feature = "fixtures"))]
-        super::measure::copied(len);
-        left -= len;
-    }
-    Ok(())
-}
 /// Disk-backed candidate builder. It retains only the current encoded frame.
 pub struct GroupWriter {
     temp: Temporary,
@@ -1184,7 +1153,7 @@ pub struct GroupWriter {
 impl GroupWriter {
     fn new(store: &Store, sequence: u64, offset: u64) -> Result<Self, StoreError> {
         Ok(Self {
-            temp: Temporary::new(store, "spool")?,
+            temp: store.temporary("spool")?,
             sequence,
             offset,
             next: sequence,
@@ -1240,47 +1209,19 @@ pub struct PreparedGroup {
     pub(super) writer: GroupWriter,
     pub(super) closer: Record,
 }
-struct Temporary {
-    path: PathBuf,
-    file: File,
-    keep: bool,
-}
-impl Temporary {
-    fn new(store: &Store, purpose: &str) -> io::Result<Self> {
-        let path = store.directory.join(format!(
-            ".{purpose}-{}-{}",
-            uuid::Uuid::from_bytes(store.header.tape_uuid).simple(),
-            uuid::Uuid::new_v4()
-        ));
-        let file = File::options()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
-        Ok(Self {
-            path,
-            file,
-            keep: false,
-        })
-    }
-}
-impl Drop for Temporary {
-    fn drop(&mut self) {
-        if !self.keep {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
 fn replace_prefix(store: &Store, end: u64) -> Result<(), StoreError> {
-    let mut temp = Temporary::new(store, "replacement")?;
-    let source = fs::File::open(&store.path)?;
-    if io::copy(&mut source.take(end), &mut temp.file)? != end {
-        return Err(StoreError::Refused("short repair source"));
-    }
-    temp.file.sync_all()?;
-    durable_file::rename(&temp.path, &store.path)?;
-    File::open(&store.directory)?.sync_all()?;
-    Ok(())
+    publication::replace_prefix(
+        &store.directory,
+        &store.path,
+        &uuid::Uuid::from_bytes(store.header.tape_uuid)
+            .simple()
+            .to_string(),
+        end,
+    )
+    .map_err(|error| match error {
+        publication::ReplaceError::ShortSource => StoreError::Refused("short repair source"),
+        publication::ReplaceError::Io(error) => StoreError::Io(error),
+    })
 }
 #[cfg(test)]
 thread_local! {
@@ -1328,11 +1269,6 @@ fn header_read_error(error: io::Error) -> StoreError {
         error.into()
     }
 }
-fn process_fences() -> &'static Mutex<BTreeSet<PathBuf>> {
-    static FENCES: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
-    FENCES.get_or_init(Mutex::default)
-}
-
 #[derive(serde::Serialize, serde::Deserialize)]
 struct RepairRecord {
     operator: String,

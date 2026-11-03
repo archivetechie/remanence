@@ -1,0 +1,38 @@
+# Error/refusal text decisions and conservative lexical reason comparisons.
+# Excluded: crates/remanence-cli/src/dev/ (vector tools compare finding text).
+# Typed SessionEndReason and operator request-reason equality are controls, not error-text policy.
+crates/remanence-api/src/append_admission.rs::admit_append_boundary::text-starts_with	1
+crates/remanence-api/src/closeout_obligation.rs::transient::text-contains	2
+crates/remanence-api/src/closeout_progress.rs::audit::text-starts_with	1
+crates/remanence-api/src/mount.rs::manual_finalize_tape_critical::text-equality	1
+crates/remanence-api/src/mount.rs::open_write_session_reserved_for_caller::text-equality	1
+crates/remanence-api/src/mount.rs::resolve_and_reserve_actor_mount_with_resource::text-contains	4
+crates/remanence-api/src/mount.rs::should_compensate_open_mount::text-contains	1
+crates/remanence-api/src/mount.rs::shutdown_mounted_session::text-equality	1
+crates/remanence-api/src/pool_write/no_parity.rs::tape_io_fence_reason_for_transfer_error::text-contains	3
+crates/remanence-api/src/readiness_wait.rs::spawn_auto_resume::text-equality	1
+crates/remanence-api/src/readiness_wait.rs::spawn_auto_resume::text-starts_with	1
+crates/remanence-api/src/startup_checkpoint.rs::restorable_projection_fences::text-equality	1
+crates/remanence-api/src/tape_closeout.rs::start::text-starts_with	1
+crates/remanence-api/src/write_owner/acceptance_finalization.rs::read_objects::text-equality	1
+crates/remanence-api/src/write_owner/checkpoint.rs::parity_raw_write_fence_reason::text-contains	6
+crates/remanence-api/src/write_owner/mounted_commands.rs::settle_audit::text-equality	1
+crates/remanence-api/src/write_owner/robotics.rs::finish_library_operation::text-contains	1
+crates/remanence-api/src/write_owner/terminal_finalize.rs::preflight_manual_finalize_cancellable::matches-reason	1
+crates/remanence-api/src/write_owner/terminal_finalize.rs::validate_manual_finalize_intent::text-equality	1
+crates/remanence-api/src/write_session_ingress.rs::append_object_stream::text-equality	1
+crates/remanence-api/src/write_session_ingress.rs::append_object_stream::text-starts_with	1
+crates/remanence-cli/src/archive_ingest.rs::materialize_inputs::text-equality	1
+crates/remanence-cli/src/lib.rs::finish_top_client_result::text-starts_with	1
+crates/remanence-cli/src/lib.rs::media_readiness_error_is_signal_abort::text-contains	2
+crates/remanence-cli/src/lib.rs::run_tape_wait_ready_hardware::text-starts_with	1
+crates/remanence-cli/src/media_readiness.rs::held_readiness_operation::text-split_once	1
+crates/remanence-cli/src/media_readiness.rs::media_readiness_operation_id::text-contains	1
+crates/remanence-cli/src/media_readiness.rs::retryable_precondition::text-contains	1
+crates/remanence-cli/src/pool_ops.rs::local_write_error::text-starts_with	1
+crates/remanence-cli/src/put.rs::append_one::text-contains	1
+crates/remanence-library/src/handle/tape_io/transfer.rs::verification_read_completion::text-starts_with	1
+crates/remanence-parity/src/terminal_inventory/one_pass.rs::verify_terminal_index_full_with_route::text-equality	1
+crates/remanence-state/src/authority/resume.rs::from::text-equality	1
+crates/remanence-state/src/fence.rs::release_restored_projection::text-equality	1
+crates/remanence-state/src/tape_log/fold.rs::apply::text-equality	2

@@ -1004,6 +1004,50 @@ fn c5_write_adapter_sessions_fence_audit_and_stale_fence_refusal() {
     assert_eq!(world.lock().unwrap().tapes["ORACLEL9"].records, before);
 }
 
+/// An unknown WRITE completion is not permission to dispatch a second write.
+/// This observes the standalone adapter and its persisted admission decision,
+/// independently of the blanket fence helpers removed in B3b.
+#[test]
+fn current_mounted_unknown_write_refuses_retry_without_changing_prefix() {
+    let root = tempfile::tempdir().unwrap();
+    let state = state(&root.path().join("state"));
+    let paths = state.paths().clone();
+    let config = state.config().clone();
+    let world = world(tape(UUID));
+    let transport = transport(&world);
+    let armed = transport.armed.clone();
+    let before = world.lock().unwrap().tapes["ORACLEL9"].records.clone();
+    let mut actor = MountedDrive::with_transport(
+        state,
+        Path::new(DEVICE),
+        &policy(),
+        Box::new(transport),
+        &root.path().join("locks"),
+        Some(UUID),
+    )
+    .unwrap();
+    *armed.lock().unwrap() = Some(Fault {
+        opcode: 0x0a,
+        key: 0,
+        asc: 0,
+        ascq: 0,
+        completion_unknown: true,
+    });
+    assert!(actor.write_checkpointed(request(root.path())).is_err());
+    assert!(armed.lock().unwrap().is_none(), "WRITE fault was reached");
+    let commands = world.lock().unwrap().command_log.len();
+    assert!(actor.write_checkpointed(request(root.path())).is_err());
+    assert_eq!(world.lock().unwrap().command_log.len(), commands);
+    let _ = actor.finish();
+    drop(actor);
+    let mut reopened = StateHandle::open_with_config(paths, config).unwrap();
+    assert!(reopened
+        .catalog_index()
+        .tape_io_is_fenced(Some(&UUID), Some("ORACLEL9"), None)
+        .unwrap());
+    assert_eq!(world.lock().unwrap().tapes["ORACLEL9"].records, before);
+}
+
 // Build valid objects with production format code. Only hostile member fixtures
 // need byte mutation: the public writer correctly rejects those paths at input.
 fn object_blocks(object_id: &str, member: &str, hostile: bool) -> Vec<Vec<u8>> {

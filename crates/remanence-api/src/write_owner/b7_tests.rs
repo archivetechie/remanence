@@ -116,6 +116,59 @@ fn state_for_crash(root: &Path) -> crate::ApiState {
     state(root)
 }
 
+/// B4b flips this to kept. A retirement stored only by the writable catalog
+/// suppresses live debt, but startup recreates that debt after SQLite loss.
+#[tokio::test]
+async fn current_empty_rebuild_retired_closeout_debt_exclusion_lost() {
+    let root = tempfile::tempdir().unwrap();
+    let world = due_tape(root.path()).await;
+    let before_commands = world.lock().unwrap().command_log.len();
+    {
+        let state = state(root.path());
+        scan(&state).unwrap();
+        assert!(state.closeout_work.contains((TAPE, 1)));
+        state
+            .index_write()
+            .unwrap()
+            .retire_tape(remanence_state::RetireTapeInput {
+                tape_uuid: TAPE,
+                reason: "retired medium".into(),
+            })
+            .unwrap();
+        scan(&state).unwrap();
+        assert!(!state.closeout_work.contains((TAPE, 1)));
+    }
+    std::fs::remove_file(root.path().join("state.sqlite")).unwrap();
+    for name in ["state.sqlite-wal", "state.sqlite-shm"] {
+        match std::fs::remove_file(root.path().join(name)) {
+            Ok(()) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => panic!("remove disposable SQLite sidecar: {e}"),
+        }
+    }
+    let state = state(root.path());
+    crate::startup_checkpoint::replay_checkpoint_journal_projections_with_audit(
+        &mut state.index_write().unwrap(),
+        &state.checkpoint_journal_dir,
+        &state.audit_dir,
+        &state.audit_append_lock,
+    )
+    .unwrap();
+    scan(&state).unwrap();
+    assert!(state.closeout_work.contains((TAPE, 1)));
+    assert_ne!(
+        state
+            .index()
+            .unwrap()
+            .get_tape(&TAPE)
+            .unwrap()
+            .unwrap()
+            .state,
+        "retired"
+    );
+    assert_eq!(world.lock().unwrap().command_log.len(), before_commands);
+}
+
 #[tokio::test]
 async fn b7_out_of_scope_debt_is_visible_and_never_worked() {
     let root = tempfile::tempdir().unwrap();

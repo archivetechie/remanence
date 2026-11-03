@@ -3770,6 +3770,57 @@ fn harness_reset_schema22_predecessor_then_admit_write_and_read() {
         == Some(&ciborium::value::Value::Text("declared_state_reset".into()))));
 }
 
+/// Declared reset archives authority and admits fresh initialization and I/O.
+/// No predecessor schema or row-preservation mechanism is needed for this
+/// contract, which remains when the schema-22 transition test is removed.
+#[test]
+fn current_declared_reset_archives_authority_then_admits_fresh_write_and_read() {
+    let f = VersionFixture::with_parity(false);
+    let config = remanence_state::load_config(f.config()).unwrap();
+    let before = authority_hashes(&config);
+    let writes = f.writes();
+    let (code, _, error) = offline_catalog_cli(&[
+        "rem",
+        "reset-catalog",
+        "--config",
+        f.config().to_str().unwrap(),
+        "--i-understand-this-erases-the-catalog",
+    ]);
+    assert_eq!(code, ExitCode::SUCCESS, "{error}");
+    assert_eq!(f.writes(), writes, "host reset issues no media writes");
+    // Every old authority file must be present byte-for-byte in the archive.
+    let mut archived = Vec::new();
+    fn collect(path: &std::path::Path, files: &mut Vec<Vec<u8>>) {
+        use sha2::{Digest, Sha256};
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect(&path, files);
+            } else {
+                files.push(Sha256::digest(std::fs::read(path).unwrap()).to_vec());
+            }
+        }
+    }
+    collect(
+        &config.daemon.state_dir.join("reset-archives"),
+        &mut archived,
+    );
+    for bytes in before.values() {
+        assert!(archived.contains(bytes), "reset retained authority bytes");
+    }
+    f.new_tape("B1RESET");
+    f.ok(&["tape", "init", "--label", "B1RESET", "--generation", "L9"]);
+    let source = f.root.path().join("b1-reset.txt");
+    std::fs::write(&source, b"fresh authority after reset").unwrap();
+    f.ok(&["put", source.to_str().unwrap()]);
+    let output = f.root.path().join("b1-reset-read");
+    f.ok(&["get", "b1-reset.txt", "--out", output.to_str().unwrap()]);
+    assert_eq!(
+        std::fs::read(output.join("b1-reset.txt")).unwrap(),
+        b"fresh authority after reset"
+    );
+}
+
 #[test]
 fn corrupt_seal_or_decision_cannot_be_repaired_or_superseded_to_writable() {
     use remanence_state::tape_log::{

@@ -17,6 +17,7 @@ pub mod error;
 pub mod fence;
 pub mod index;
 pub mod lock;
+pub mod log_frame;
 pub mod media;
 pub use media::{tape_generation, GenerationSource, LabelProvenance, LtoGen, MediaObservation};
 pub use remanence_library::DriveKey;

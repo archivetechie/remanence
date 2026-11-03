@@ -48,12 +48,7 @@ use remanence_parity::{SidecarEpochDirectoryEntry, TerminalTailLayout};
 
 /// Host frame version; independent of every on-tape format version.
 pub const VERSION: u16 = 2;
-/// Maximum sum of structural and payload bytes per frame.
-pub const MAX_FRAME_BODY: usize = 64 * 1024 * 1024;
-/// Fixed prefix bytes, including its CRC.
-pub const PREFIX_LEN: usize = 28;
-/// Two independent section CRC trailers.
-pub const FRAME_OVERHEAD: usize = PREFIX_LEN + 16;
+pub use crate::log_frame::{Section, FRAME_OVERHEAD, MAX_FRAME_BODY, PREFIX_LEN};
 
 macro_rules! tags {
     ($($name:ident = $value:literal, $doc:literal;)+) => {
@@ -324,17 +319,6 @@ pub enum Fault {
     /// Checked counter or coordinate overflow.
     #[error("counter overflow")]
     Overflow,
-}
-
-/// Independently checksummed regions.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Section {
-    /// Fixed prefix.
-    Prefix,
-    /// Structural CBOR.
-    Structural,
-    /// Catalog bytes.
-    Payload,
 }
 
 /// Fence reason type only: publication wiring belongs to B3b.
