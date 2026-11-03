@@ -859,36 +859,7 @@ pub(crate) fn spawn(state: ApiState) {
                     work: state.closeout_work.clone(),
                     key,
                 };
-                tokio::spawn(async move {
-                    let attempt = attempt;
-                    if let Err(error) =
-                        crate::mount::service_closeout_obligation(&state, key.0, key.1).await
-                    {
-                        state.closeout_work.failed(key, &error);
-                        tracing::debug!(tape_uuid = %Uuid::from_bytes(key.0), %error, "closeout obligation remains queued");
-                    } else {
-                        state.closeout_work.succeeded(key);
-                    }
-                    drop(attempt);
-                    if state
-                        .index()
-                        .and_then(|i| i.get_tape(&key.0).map_err(crate::status_from_state_error))
-                        .is_ok_and(|t| t.is_none_or(|t| t.state == "retired"))
-                    {
-                        state.closeout_work.forget(key.0);
-                    } else if let Ok(Ok(s)) = {
-                        let state = state.clone();
-                        tokio::task::spawn_blocking(move || summary(&state, key.0)).await
-                    } {
-                        state.closeout_work.observe(
-                            key,
-                            s.incarnation == key.1
-                                && (s.closeout_due()
-                                    || finalization_due(&s)
-                                    || s.finalization.as_ref().is_some_and(|p| p.prepared)),
-                        );
-                    }
-                });
+                tokio::spawn(service_claimed(state, key, attempt));
             }
             wake = tokio::select! {
                 _ = state.closeout_work.wake.notified() => true,
@@ -896,6 +867,50 @@ pub(crate) fn spawn(state: ApiState) {
             };
         }
     });
+}
+
+/// Service one claimed entry and refresh its debt after releasing attempt ownership.
+async fn service_claimed(state: ApiState, key: Key, attempt: Attempt) {
+    if let Err(error) = crate::mount::service_closeout_obligation(&state, key.0, key.1).await {
+        state.closeout_work.failed(key, &error);
+        tracing::debug!(tape_uuid = %Uuid::from_bytes(key.0), %error, "closeout obligation remains queued");
+    } else {
+        state.closeout_work.succeeded(key);
+    }
+    drop(attempt);
+    if state
+        .index()
+        .and_then(|i| i.get_tape(&key.0).map_err(crate::status_from_state_error))
+        .is_ok_and(|t| t.is_none_or(|t| t.state == "retired"))
+    {
+        state.closeout_work.forget(key.0);
+    } else if let Ok(Ok(s)) = {
+        let state = state.clone();
+        tokio::task::spawn_blocking(move || summary(&state, key.0)).await
+    } {
+        state.closeout_work.observe(
+            key,
+            s.incarnation == key.1
+                && (s.closeout_due()
+                    || finalization_due(&s)
+                    || s.finalization.as_ref().is_some_and(|p| p.prepared)),
+        );
+    }
+}
+
+/// Drive the production dispatcher without its polling clock or background scan.
+#[cfg(test)]
+pub(crate) async fn service_unheld_for_test(state: &ApiState) -> Vec<Key> {
+    let held = state.drive_pool().unwrap().mounted_tape_uuids();
+    let claimed = state.closeout_work.claim_unheld(Instant::now(), &held);
+    for key in &claimed {
+        let attempt = Attempt {
+            work: state.closeout_work.clone(),
+            key: *key,
+        };
+        service_claimed(state.clone(), *key, attempt).await;
+    }
+    claimed
 }
 
 #[cfg(test)]

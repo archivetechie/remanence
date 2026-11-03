@@ -422,3 +422,211 @@ async fn worker_owned_success_releases_finalizing_before_publication() {
 async fn worker_owned_failure_releases_finalizing_before_publication() {
     check_publication(true, false).await;
 }
+
+/// Poll the real read admission once so the test knows it reached the cleanup
+/// hold, without timing assumptions or a detached request task.
+async fn assert_read_waits_for_cleanup(
+    read: std::pin::Pin<&mut impl std::future::Future<Output = Result<pb::ReadSession, Status>>>,
+) {
+    let mut read = read;
+    let polled = std::future::poll_fn(|cx| std::task::Poll::Ready(read.as_mut().poll(cx))).await;
+    assert!(
+        polled.is_pending(),
+        "read must wait for cleanup, not return Busy: {polled:?}"
+    );
+}
+
+/// A model actor refusal proves read admission reached the drive. Physical read
+/// correctness is covered by the characterisation suite's in-memory tape actor.
+async fn finish_read_probe(
+    f: &mut Fixture,
+    read: impl std::future::Future<Output = Result<pb::ReadSession, Status>> + Send + 'static,
+) {
+    let read = tokio::spawn(read);
+    let command = tokio::time::timeout(Duration::from_secs(5), f.drive_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let crate::write_owner::DriveCommand::OpenRead { reply, .. } = command else {
+        panic!("expected admitted read command");
+    };
+    reply
+        .send(Err(Status::internal("model read reached actor")))
+        .unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(5), read)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.message(), "model read reached actor");
+    assert_ne!(error.code(), tonic::Code::Aborted);
+}
+
+/// Verify uses its real reservation path and must also reach the model actor.
+async fn assert_verify_admitted(f: &mut Fixture) {
+    let state = f.state.clone();
+    let tape = f.admission.tape_uuid;
+    let handle = state
+        .operations
+        .register(Uuid::new_v4(), "verify_tape_index");
+    let progress = crate::tape_verification::Progress::new(handle.clone(), tape);
+    let verify =
+        tokio::spawn(async move { verify_tape_index(&state, tape, handle, progress).await });
+    let command = tokio::time::timeout(Duration::from_secs(5), f.drive_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let crate::write_owner::DriveCommand::VerifyTapeIndex { reply, .. } = command else {
+        panic!("expected admitted verify command");
+    };
+    reply
+        .send(Ok(pb::TapeIndexVerification::default()))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), verify)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+/// Scan while the request owns finalization, seal and release it, then dispatch
+/// the stale entry through the production claim/service/debt-refresh path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sealed_request_finalization_is_not_readmitted_by_closeout_worker() {
+    let mut f = fixture(false);
+    let tape = f.admission.tape_uuid;
+    let id = f.admission.candidate_operation_id;
+    manual_finalize_tape(&f.state, f.admission.clone())
+        .await
+        .unwrap();
+    let command = tokio::time::timeout(Duration::from_secs(5), f.drive_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let crate::write_owner::DriveCommand::FinalizeTape {
+        mut request, reply, ..
+    } = command
+    else {
+        panic!("expected request-owned finalization");
+    };
+    crate::closeout_obligation::scan(&f.state).unwrap();
+    f.state.closeout_work.assert_unattempted_for_test(tape);
+    assert!(
+        crate::closeout_obligation::service_unheld_for_test(&f.state)
+            .await
+            .is_empty()
+    );
+    let authority = remanence_state::TapeAuthority::open(
+        f.state.checkpoint_journal_dir.as_ref(),
+        tape,
+        f.state.index_path.as_ref(),
+    )
+    .unwrap();
+    let key = (tape, authority.observe_summary().unwrap().incarnation);
+    let (published, release) = pause_publication(&f.state);
+    reply
+        .send(Ok(complete_model_tail(&f.state, &mut request)))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), published)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(authority.observe_summary().unwrap().sealed);
+    assert!(f.state.closeout_work.contains(key));
+    assert_operation_succeeded(&f).await;
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while f.pool.mounted_tape_uuids().contains(&tape) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(f.state.operations.running_publications_for_test(&id), 1);
+    let claimed = tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::closeout_obligation::service_unheld_for_test(&f.state),
+    )
+    .await
+    .unwrap();
+    assert_eq!(claimed, vec![key]);
+    assert_eq!(
+        f.state.operations.running_publications_for_test(&id),
+        1,
+        "a sealed tape must never publish Running again"
+    );
+    f.pool
+        .check_finalizing(tape)
+        .expect("sealed tape has no finalizing marker");
+    authority.check_finalizing().unwrap();
+    assert_operation_succeeded(&f).await;
+    assert!(
+        !f.state.closeout_work.contains(key),
+        "stale work-list entry was removed"
+    );
+    assert!(
+        f.drive_rx.try_recv().is_err(),
+        "no second actor finalization"
+    );
+    let read = open_read_session_critical(
+        f.state.clone(),
+        ReadSessionTarget::Tape { tape_uuid: tape },
+        None,
+    );
+    finish_read_probe(&mut f, read).await;
+    assert_verify_admitted(&mut f).await;
+    assert_operation_succeeded(&f).await;
+}
+
+/// Use the RPC implementation, including its durable-history/live-state overlay.
+async fn assert_operation_succeeded(f: &Fixture) {
+    let operation = <crate::DaemonService as pb::daemon_server::Daemon>::get_operation(
+        &f.state.daemon_service(),
+        tonic::Request::new(pb::GetOperationRequest {
+            operation_id: f.admission.candidate_operation_id.as_bytes().to_vec(),
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    assert_eq!(operation.state, pb::OperationState::Succeeded as i32);
+}
+
+/// Open a read exactly while terminal publication is paused and the request
+/// still owns cleanup; it must wait and then reach the actor without Busy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_during_terminal_publication_waits_without_busy() {
+    let mut f = fixture(false);
+    manual_finalize_tape(&f.state, f.admission.clone())
+        .await
+        .unwrap();
+    let command = tokio::time::timeout(Duration::from_secs(5), f.drive_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let crate::write_owner::DriveCommand::FinalizeTape {
+        mut request, reply, ..
+    } = command
+    else {
+        panic!("expected finalization");
+    };
+    let (published, release) = pause_publication(&f.state);
+    reply
+        .send(Ok(complete_model_tail(&f.state, &mut request)))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), published)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut read = Box::pin(open_read_session_critical(
+        f.state.clone(),
+        ReadSessionTarget::Tape {
+            tape_uuid: f.admission.tape_uuid,
+        },
+        None,
+    ));
+    assert_read_waits_for_cleanup(read.as_mut()).await;
+    assert_operation_succeeded(&f).await;
+    release.send(()).unwrap();
+    finish_read_probe(&mut f, read).await;
+}

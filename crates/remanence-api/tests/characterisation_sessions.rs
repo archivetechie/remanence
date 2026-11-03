@@ -1403,6 +1403,14 @@ async fn finalized_tape_remains_readable_after_restart_and_refuses_more_writes()
     check_finalized_access(true).await;
 }
 
+/// Keep a bounded repeat of the full finalization/read/write contract in CI.
+#[tokio::test]
+async fn finalized_tape_refuses_more_writes_stress_5() {
+    for _ in 0..5 {
+        check_finalized_access(true).await;
+    }
+}
+
 /// Repeat the client-visible finalization/read/write contract across 50 fresh
 /// daemon lifetimes. Run explicitly so the ordinary suite retains its duration.
 #[tokio::test]

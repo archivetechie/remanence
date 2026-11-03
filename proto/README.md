@@ -128,8 +128,10 @@ receipt; conflicting content is refused.
 Regenerate consumer bindings from this revision before deployment. `Catalog.CloseoutTape`
 accepts `CloseoutTapeRequest`: required UUID `tape_uuid = 1`, optional
 `expected_pool_id = 2`, and required message `IdempotencyKey idempotency_key = 3`.
-It returns `OperationRef`; follow `WatchOperation` to completion. A tape with no
-closeout due succeeds without media work. Repeating a key rejoins its operation.
+It returns `OperationRef`; follow `WatchOperation` to completion. An unsealed tape with no
+closeout due succeeds without media work; a fresh request on a sealed tape is
+refused immediately with `FAILED_PRECONDITION` ("tape is sealed"). Matching retries
+of live or successful operations rejoin them.
 
 `SupersedeTailRequest.observed_tape_log_sequence = 5` is an optional uint64 on the
 wire and mandatory on confirmation. Preview returns the required value in

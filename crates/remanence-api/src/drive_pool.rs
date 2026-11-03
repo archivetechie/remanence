@@ -820,11 +820,15 @@ impl DrivePool {
         let reservation = self.reserve_tape_with_after_insert(tape, |_| {
             closing = Some(
                 self.worker_closing
-                    .begin(tape, DriveKey::new("maintenance", 0))
-                    .0,
+                    .begin(tape, DriveKey::new("maintenance", 0)),
             );
         })?;
-        Ok((closing.expect("reservation registered worker"), reservation))
+        let (closing, error) = closing.expect("reservation registered worker");
+        if let Some(error) = error {
+            // Both new guards unwind here; the original closing owner remains.
+            return Err(error);
+        }
+        Ok((closing, reservation))
     }
     /// A closing owner may win between the initial wait and reservation. Join
     /// that owner too; ordinary active-session conflicts still refuse promptly.
@@ -1388,6 +1392,32 @@ pub(crate) mod tests {
         );
         drop(client);
         assert!(pool.reserve_tape_after_closeout(tape).await.is_ok());
+    }
+
+    /// A cleared marker retains its closing hold; duplicate admission must fail
+    /// without leaking a reservation or removing the original owner's hold.
+    #[test]
+    fn worker_reservation_returns_duplicate_closeout_error() {
+        let pool = test_pool();
+        let tape = [0xf7; 16];
+        let (closing, reserved) = pool.reserve_worker_tape(tape).unwrap();
+        closing.finalizing(Uuid::new_v4());
+        closing.clear_finalizing();
+        drop(reserved);
+        let error = match pool.reserve_worker_tape(tape) {
+            Ok(_) => panic!("duplicate worker reservation must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(error.message(), "two closeouts own one tape");
+        assert_eq!(pool.worker_closing.0.lock().unwrap().len(), 1);
+        assert!(!pool.mounted_tape_uuids().contains(&tape));
+        assert!(pool
+            .try_reserve_tape_after_closeout(tape)
+            .unwrap()
+            .is_none());
+        drop(closing);
+        assert!(pool.reserve_worker_tape(tape).is_ok());
     }
 
     /// Selection recovers the same poisoned ownership maps as reservation reads.

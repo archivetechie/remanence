@@ -40,6 +40,8 @@ pub(crate) struct OperationRegistry {
     ops: Arc<Mutex<HashMap<Uuid, OpEntry>>>,
     #[cfg(test)]
     after_terminal: TerminalPublicationHook,
+    #[cfg(test)]
+    running_publications: Arc<Mutex<HashMap<Uuid, usize>>>,
 }
 
 #[derive(Clone)]
@@ -52,6 +54,8 @@ pub(crate) struct OperationHandle {
     ops: Arc<Mutex<HashMap<Uuid, OpEntry>>>,
     #[cfg(test)]
     after_terminal: TerminalPublicationHook,
+    #[cfg(test)]
+    running_publications: Arc<Mutex<HashMap<Uuid, usize>>>,
 }
 
 /// Per-registry one-shot barrier after publication, without holding the registry lock.
@@ -62,6 +66,17 @@ impl OperationRegistry {
     #[cfg(test)]
     pub(crate) fn after_terminal_for_test(&self, hook: impl FnOnce() + Send + 'static) {
         *self.after_terminal.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    /// Count across re-registration, which replaces the operation's replay ring.
+    #[cfg(test)]
+    pub(crate) fn running_publications_for_test(&self, id: &Uuid) -> usize {
+        self.running_publications
+            .lock()
+            .unwrap()
+            .get(id)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub(crate) fn register(&self, op_id: Uuid, kind: &str) -> OperationHandle {
@@ -95,6 +110,8 @@ impl OperationRegistry {
             ops: self.ops.clone(),
             #[cfg(test)]
             after_terminal: self.after_terminal.clone(),
+            #[cfg(test)]
+            running_publications: self.running_publications.clone(),
         }
     }
 
@@ -238,6 +255,15 @@ impl OperationHandle {
     pub(crate) fn publish(&self, status: pb::OperationStatus) {
         #[cfg(test)]
         let terminal = is_terminal(&status);
+        #[cfg(test)]
+        if status.state == pb::OperationState::Running as i32 {
+            *self
+                .running_publications
+                .lock()
+                .unwrap()
+                .entry(self.op_id)
+                .or_default() += 1;
+        }
         if let Ok(mut ops) = self.ops.lock() {
             if let Some(entry) = ops.get_mut(&self.op_id) {
                 push_locked(entry, status);
