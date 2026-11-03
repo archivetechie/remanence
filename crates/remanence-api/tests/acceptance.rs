@@ -744,15 +744,32 @@ async fn opens_race_finalization_and_verification_without_writes() {
     rig.controls[0].entered().await;
     let before = rig.worlds[0].lock().unwrap().tapes[&barcode(0)].written_bytes;
     let (a, b) = tokio::join!(open(&rig.api, 0), open(&rig.api, 0));
+    let mut busy_operation = None;
     for result in [a, b] {
-        assert_eq!(result.unwrap_err().code(), Code::FailedPrecondition);
+        let busy = result.unwrap_err();
+        assert_eq!(busy.code(), Code::Aborted);
+        let operation = busy
+            .metadata()
+            .get_bin("remanence-busy-operation-bin")
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        uuid::Uuid::from_slice(&operation).expect("Busy identifies the finalization operation");
+        if let Some(previous) = &busy_operation {
+            assert_eq!(previous, &operation);
+        }
+        busy_operation = Some(operation);
     }
     assert_eq!(
         rig.worlds[0].lock().unwrap().tapes[&barcode(0)].written_bytes,
         before
     );
     rig.controls[0].release();
-    closing.await.unwrap().unwrap();
+    let finalized = closing.await.unwrap().unwrap();
+    assert_eq!(
+        busy_operation.unwrap().as_ref(),
+        finalized.operation_id.as_ref().unwrap()
+    );
     rig.assert_released().await;
 
     rig.controls[0].arm(0x08);

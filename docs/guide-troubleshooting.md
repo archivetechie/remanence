@@ -537,6 +537,9 @@ commits data without necessarily closing the epoch. Clean close returns durable
 receipts, then writes the short sidecar, synchronizes it, and records `ClosedOut`
 and `SessionEnded`. The drive and tape stay owned during this work; a following
 access waits. No accumulator or reservation carries into the next session.
+After `Close` or `rem put` returns, `written_extent_lba` and physical EOD can
+diverge until the ending records are published; wait for the session ending
+and reread the catalog before comparing the settled extent.
 
 `rem tape closeout <uuid-or-barcode>` waits for an idempotent `tape_closeout`
 operation. Its progress phases are `queued`, `proving`, `rebuilding`,

@@ -101,6 +101,13 @@ or an age limit (the `checkpoint_max_*` settings in the
 [configuration reference](reference-configuration.md#daemon-required)), when the client
 asks for one, and when the session closes.
 
+After `Close` or `rem put` returns its durable receipts, the catalog's written
+extent (`written_extent_lba`) and physical EOD can diverge while the session
+writes its ending records. The catalog initially records the Object checkpoint;
+parity closeout can advance physical EOD before `ClosedOut` and `SessionEnded`
+are published. A consumer needing the settled extent waits for the session
+ending, then reads the catalog again before comparing it with physical EOD.
+
 The order matters for crash recovery. If the host loses power after the blocks were written
 but before the barrier, the tape may hold the bytes, but no commit record names them, so they
 are not committed and the client writes them again. If the power fails after the barrier and
