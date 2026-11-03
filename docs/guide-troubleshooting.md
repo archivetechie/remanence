@@ -317,7 +317,7 @@ rem tape quarantine release <id> --after-settled-inventory \
 The `--ack` text is recorded. The fence exists so that nobody writes to a tape whose state was last seen
 mid-uncertainty.
 
-<!-- code-anchor: crates/remanence-api/src/startup_media_readiness.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/append_admission.rs crates/remanence-library/src/transport.rs crates/remanence-library/src/handle/tape_io/media_gate.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
+<!-- code-anchor: crates/remanence-api/src/startup_media_readiness.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/append_admission.rs crates/remanence-library/src/transport.rs crates/remanence-library/src/handle/tape_io/media_gate.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
 ## A drive stays not ready after a daemon crash
 
 A drive that answers `02/04/02` holds a cartridge it has not threaded. This
@@ -341,7 +341,7 @@ That MOVE retains the configured `changer_not_ready_wait_seconds` magazine/door
 wait even during shutdown. Other reservations retain their 600-second bound.
 The service manager's stop timeout (systemd `TimeoutStopSec`, for example) must
 cover `daemon.shutdown_close_deadline_secs` plus command settlement (TapeIo permits
-900 seconds), **plus up to 600 seconds per configured drive**, since ordinary
+900 seconds), plus up to 600 seconds per configured drive, since ordinary
 reservation waits run sequentially. Outstanding changer UNLOAD/MOVE work adds
 its configured readiness waits and command timeouts. These are additive bounds,
 not one global 600-second deadline. Every drive actor uses the shared cutoff from
@@ -568,7 +568,7 @@ mode. The dual aggregate row names the append leg's object and daemon rate;
 the client aggregate rate includes the concurrent restore. Missing diagnostics
 are `unavailable`; the kit never substitutes another object's latest event.
 
-<!-- code-anchor: crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/checkpoint.rs crates/remanence-api/src/append_admission.rs crates/remanence-api/src/tape_closeout.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-state/src/index.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
+<!-- code-anchor: crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/checkpoint.rs crates/remanence-api/src/append_admission.rs crates/remanence-api/src/tape_closeout.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-state/src/index.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
 ## Closeout debt
 
 Committed data is on tape and has a durable record in the tape log. It is
@@ -590,10 +590,15 @@ Write protection, fences, wrong media and identity mismatches park the work
 until the condition changes or an operator requests closeout. A parked tape
 keeps its debt and retry reason visible. Pool selection ranks it behind other
 fitting tapes; if none fit, it attempts the parked candidate so admission can
-return its actionable refusal. Readiness-fence clearance and barcode membership
-changes wake the affected work. Persistent medium or hardware failures have a
-limited retry budget, described under [Catalog and checkpoint lock
-refusals](#catalog-and-checkpoint-lock-refusals).
+return its actionable refusal. Parked work wakes when a readiness fence clears, a
+tape-I/O fence is released, the library's barcodes change, a load, unload or move
+completes successfully, or an operator runs `rem tape closeout`.
+
+Persistent typed medium or hardware failures in closeout maintenance receive
+three attempts with the existing backoff, then park the tape. Debt views and
+`rem top` show `parked: media fault (3/3 attempts)` with the diagnostic cause.
+Diagnostic text changes do not reset the budget; ordinary contention does not
+consume it. The wake conditions above reset the budget. Unrecognized failures remain transient.
 
 After resolving the refusal, run `rem tape closeout <UUID>` to request and watch
 closeout for that exact tape. It succeeds without media work if nothing is due.
@@ -713,7 +718,7 @@ writable: <reason>` (the same writability preconditions above), `tape ...
 is fenced by quarantine ...` (see fences above). A tape with a known written
 prefix but no matching per-tape log is also refused before append positioning.
 
-<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/pool_write/selection.rs crates/remanence-api/src/drive_pool.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/terminal_inventory.rs crates/remanence-library/src/handle/tape_io/media_gate.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
+<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/pool_write/selection.rs crates/remanence-api/src/drive_pool.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/terminal_inventory.rs crates/remanence-library/src/handle/tape_io/media_gate.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
 ## Reading the logs
 
 The daemon logs JSON to stderr, one flattened object per event, filtered
@@ -745,7 +750,7 @@ RPC refusals or debt diagnostics rather than standalone log events:
 | `shutdown close deadline interrupted session` | WARN: the shared shutdown deadline interrupted the session; the event identifies its tape, ending and remaining work. |
 | `shutdown close deadline expired; no new drive command` | Drive-command refusal at the shared cutoff. Issued commands still settle; see the shutdown bound above. |
 | `daemon shutdown; maintenance admission closed` | RPC refusal: the daemon is stopping. Submit fresh maintenance after restart. |
-| `drives are busy` | `RefreshInventory` refuses while sessions or other owners hold affected drives. Let them finish and retry. |
+| `drives are busy` | A library-wide request (inventory refresh, load, unload, move, reconcile) is refused while sessions or other owners hold the library's drives; let them finish and retry. |
 | `terminal inventory interrupted by shutdown` | The inventory stops because shutdown began. Retry after restart. |
 | `pool selection waiting for tape closeout` | INFO: the selected tape is held by session closeout or a worker. The open waits, then checks that tape again; this is not a free-bay queue. |
 | `pool selection skipped tape` | INFO for the selection pass that decides admission; DEBUG for speculative passes. `pool_id`, `tape_uuid` and `reason` identify the excluded candidate, such as a live writer, finalization or parked debt. |

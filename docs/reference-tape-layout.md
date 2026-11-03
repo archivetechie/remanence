@@ -305,7 +305,7 @@ rewrites a cartridge under an existing barcode, the catalog still binds that
 barcode to the old UUID (recycle skew; see
 [troubleshooting](guide-troubleshooting.md#known-open-issue)).
 
-<!-- code-anchor: crates/remanence-state/src/tape_log/store.rs crates/remanence-state/src/tape_log/projection.rs crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/calibration.rs @ dcf8d39a -->
+<!-- code-anchor: crates/remanence-state/src/index.rs crates/remanence-state/src/tape_log/store.rs crates/remanence-state/src/tape_log/projection.rs crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/calibration.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
 ## On disk: durable records and rebuildable state
 
 The host-side records that accompany the tapes. Paths are set by the operator;
@@ -354,7 +354,7 @@ Initialization is grouped with the first actual barrier. A known written
 prefix without matching log authority cannot be treated as a fresh tape.
 
 The old `.remjournal`, `.remcheckpoint` and `.finalizing` layout is refused.
-Ordinary catalog opens also refuse schemas 1 through 22. There is no importer;
+Ordinary catalog opens also refuse schemas 1 through 23. There is no importer;
 use the declared reset and reinitialize approved scratch tapes as described in
 [troubleshooting](guide-troubleshooting.md#authority-layout-refusals-and-declared-reset).
 The per-tape log is not recorded on tape and changes no REM-PARITY media byte.

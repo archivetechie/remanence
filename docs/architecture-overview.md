@@ -304,7 +304,7 @@ The figure shows the multi-drive daemon topology. The standalone `rem` path
 described above runs beside it and deliberately has no changer or service
 process.
 
-<!-- code-anchor: crates/remanence-api/src/mount.rs crates/remanence-api/src/pool_write.rs crates/remanence-api/src/write_owner.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/checkpoint.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/append_admission.rs crates/remanence-state/src/index.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
+<!-- code-anchor: crates/remanence-api/src/mount.rs crates/remanence-api/src/pool_write.rs crates/remanence-api/src/write_owner.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/checkpoint.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/append_admission.rs crates/remanence-state/src/index.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
 ## The write path
 
 This section follows one object from an orchestrator's daemon request to a
@@ -526,6 +526,11 @@ under the audit append lock, so a repeat after an interruption neither loses
 nor duplicates it. Both facts are fsynced whatever the configured audit fsync
 setting is.
 
+In plain terms, a receipt means the data is on tape and recorded; parity may
+still be due. The session holds the drive through its ending work, including
+parity closeout. Any parity left unwritten appears as closeout debt, which the
+daemon services when it can next use the tape.
+
 <!-- code-anchor: crates/remanence-api/src/read_core.rs crates/remanence-api/src/write_owner.rs crates/remanence-state/src/checkpoint.rs crates/remanence-state/src/tape_log/authority.rs @ dcf8d39a -->
 ## The read path
 
@@ -631,7 +636,7 @@ Four rules shape the rest of the design.
   safely. What to archive and when, including retention, scheduling, and
   workflow, belongs to the orchestrator that calls the API.
 
-<!-- code-anchor: crates/remanence-chaos/src/lib.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-chaos/src/lib.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
 ## Testing infrastructure
 
 `remanence-chaos` wraps any SCSI transport with fault injection driven by
@@ -686,8 +691,8 @@ Cut numbers count capture events from one; `keep` counts retained tape records,
 unsynced bytes. All unlisted unsynced tails are discarded. These examples use the
 default suite; they remain defects rather than accepted production guarantees.
 
-These trace examples predate the per-tape log cut-over. Their parity-journal
-names are retained trace labels, not descriptions of current host authority.
+The parity-journal names in these examples label trace events; current host
+authority resides in the per-tape logs.
 
 | Reference | Refusal without tape identity | Example cut and crash choice |
 | --- | --- | --- |
@@ -700,9 +705,3 @@ names are retained trace labels, not descriptions of current host authority.
 The fixed tape identity is `d0d0d0d0-d0d0-d0d0-d0d0-d0d0d0d0d0d0`, barcode
 `DUR001L9`. The audit filename follows the execution date. Each run prints its
 full cut descriptions so later changes to the trace are visible.
-
-<!-- code-anchor: crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/closeout_obligation.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
-In plain terms, a receipt tells the client that its data is committed. The daemon
-keeps the tape and drive until the session's ending work finishes. Any parity
-still due is visible as closeout debt, which the daemon services when the tape
-can be admitted.

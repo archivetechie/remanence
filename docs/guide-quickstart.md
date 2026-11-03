@@ -568,7 +568,7 @@ Used cartridges need more care: init refuses a tape that holds data unless you
 pass `--clobber-data` and confirm. The [CLI reference](reference-cli.md)
 describes those options.
 
-<!-- code-anchor: crates/remanence-cli/src/put.rs crates/remanence-cli/src/get.rs crates/remanence-api/src/write_owner/checkpoint.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
+<!-- code-anchor: crates/remanence-cli/src/put.rs crates/remanence-cli/src/get.rs crates/remanence-api/src/write_owner/checkpoint.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
 ## First write to tape (requires hardware, writes to media)
 
 Start the daemon again in its own shell, as before:
@@ -601,8 +601,10 @@ session 6c0e3b9a-1d2f-4a7e-8b5c-9f4d2e1a7c36 closed: 2 objects, 97.7 KiB committ
 ```
 
 This example writes one object per file. Before archiving many small files, read
-[Sizing objects and write sessions](guide-object-sizing.md): each object uses a
-tape file and index entries, and each session can leave a short parity sidecar.
+[Sizing objects and write sessions](guide-object-sizing.md): each object costs
+its own tape file and terminal-index rows, and a session on a parity pool
+usually ends with a short parity sidecar, so many small objects waste tape
+and drive time.
 
 The daemon chose a tape from the pool, mounted it, and wrote each object as one
 tape file after the bootstrap (tape file 0). "Pending checkpoint" means the
@@ -636,13 +638,14 @@ time rather than an object UUID. The daemon read the copy from tape, and
 `rem get` checked its SHA-256 against the digest in the catalog before it
 reported success.
 
-<!-- code-anchor: crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/mount.rs crates/remanence-cli/src/tape_closeout.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
+<!-- code-anchor: crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/mount.rs crates/remanence-cli/src/tape_closeout.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
 ### When parity reaches the tape
 
 The session that writes the data also writes its remaining parity sidecar at
 clean close, after returning the committed receipts and before releasing the
 drive. A failed closeout or an interrupted session can leave committed data
-unprotected. The daemon services that debt when it can; `rem top` and
+that no sidecar covers yet; this is called closeout debt. The daemon writes
+the missing sidecar itself, mounting the tape if needed; `rem top` and
 `rem catalog tapes --json` show it. To request closeout of one tape explicitly,
 use `rem tape closeout <UUID>`, with the tape UUID from the catalog. Unloading a
 cartridge performs no parity work, and graceful shutdown leaves cartridges
@@ -654,7 +657,6 @@ for recovery and retries.
 
 - [Sizing objects and write sessions](guide-object-sizing.md): choosing object
   and session sizes before writing an archive.
-
 - [Using a standalone LTO drive](guide-standalone-drive.md): the complete
   one-drive workflow, without a changer or daemon.
 - [CLI reference](reference-cli.md): every command and option.
