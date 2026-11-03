@@ -1076,18 +1076,6 @@ pub(crate) fn status_from_select_tape_error(
     let message = err.to_string();
     match err {
         SelectTapeError::UnknownPool { .. } => Status::invalid_argument(message),
-        // A pool containing only durably sealed candidates has a terminal
-        // admission refusal, even if a finalization owner is still cleaning up.
-        SelectTapeError::NoWritableTapes { reasons, .. }
-            if !reasons.is_empty()
-                && reasons.iter().all(|reason| {
-                    matches!(reason,
-                        crate::pool_write::WritabilityError::NotReady { state } if state == "sealed"
-                    )
-                }) =>
-        {
-            Status::failed_precondition(message)
-        }
         SelectTapeError::EmptyPool { .. }
         | SelectTapeError::NoWritableTapes { .. }
         | SelectTapeError::NoUnreservedWritableTapes { .. }
