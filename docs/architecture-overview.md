@@ -172,7 +172,7 @@ streaming, and ranged opens use a REMP `--private-key` file; the key's epoch id
 selects the matching slot in the key frame. `rem-recover` performs the same
 encrypted open without the daemon, catalog, or config.
 
-<!-- code-anchor: crates/remanence-state/src/state.rs crates/remanence-state/src/tape_log/projection.rs crates/remanence-state/src/index.rs @ dcf8d39a -->
+<!-- code-anchor: crates/remanence-state/src/state.rs crates/remanence-state/src/tape_log/projection.rs crates/remanence-state/src/index.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
 ## Layer 4: state
 
 `remanence-state` holds everything the daemon remembers: the validated
@@ -180,10 +180,10 @@ operator configuration, an exclusive state lock, the append-only audit log, and
 the SQLite catalog. The catalog is a projection of other records, not the
 source of truth: the projection-only rebuild replays the audit log and the
 per-tape logs to regenerate it. A catalog opened read-only is never migrated.
-The schema is version 23, tracked in SQLite's `user_version`. Ordinary opens
-refuse schemas 1 through 22. Its tables cover tapes, pools, tape files, objects,
-copies and files, catalog
-units, sessions, operations, idempotency keys, media-readiness records,
+SQLite's `user_version` tracks the schema. The
+[configuration reference](reference-configuration.md#what-ends-up-on-disk) gives
+the supported schema and the versions ordinary opens refuse. The tables cover
+tapes, pools, tape files, objects, copies and files, catalog units, sessions, operations, idempotency keys, media-readiness records,
 tape-I/O fences, wrap-map cache rows, and the drive-stewardship set (drives,
 events, health snapshots, clean runs, and alarms).
 
@@ -229,6 +229,7 @@ promise. `rem-daemon` serves seven services:
 | `ReadPlanService` | `PlanBatchRead` — an advisory read-ordering RPC for a batch of targets on one tape; it moves no tape, and no client in this repository calls it; see [Read-order planning](#read-order-planning) |
 | `Audit` | registered on both the Unix socket and mTLS TCP listeners; its one RPC, `QueryAudit`, streams the append-only audit log back incrementally paged |
 
+<!-- code-anchor: crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/tape_closeout.rs crates/remanence-api/src/mount.rs crates/remanence-state/src/tape_log/mod.rs crates/remanence-state/src/index.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
 Write sessions own parity epochs from open to end. The native log's
 `SessionOpened`, `SessionEnded`, and `ClosedOut` records select the next
 access's complete suffix proof. A crash-torn final file is identified by its
@@ -243,7 +244,8 @@ before drive-owned checked closeout, except that a drive error leaves closeout
 due. No abandonment filemark is written and no accumulator survives its session.
 `Catalog.CloseoutTape`, exposed as `rem tape closeout`, performs the same
 idempotent operation explicitly and succeeds without media work when none is due.
-Manual finalization and retirement require due closeout to complete first.
+Manual finalization requires due closeout to complete first. Retirement is an
+offline catalog change and does not check or complete closeout debt.
 Removal is an exclusion handshake and performs no parity work.
 
 Checkpoint batching defaults to 32 GiB of pending logical bytes, 200 pending
@@ -302,7 +304,7 @@ The figure shows the multi-drive daemon topology. The standalone `rem` path
 described above runs beside it and deliberately has no changer or service
 process.
 
-<!-- code-anchor: crates/remanence-api/src/mount.rs crates/remanence-api/src/pool_write.rs crates/remanence-api/src/write_owner.rs crates/remanence-state/src/index.rs @ 7f39930d -->
+<!-- code-anchor: crates/remanence-api/src/mount.rs crates/remanence-api/src/pool_write.rs crates/remanence-api/src/write_owner.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/checkpoint.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/append_admission.rs crates/remanence-state/src/index.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
 ## The write path
 
 This section follows one object from an orchestrator's daemon request to a
@@ -406,10 +408,19 @@ release the drive and tape. Standalone writes use the same actor policy.
 Abort, failed append, disconnect and incomplete-append deadline record a named
 tail without an abandonment filemark. A durable live ending needs no operator
 acknowledgement and raises no automatic tape-I/O fence. Closeout then runs as
-independent drive work, except after a drive error. A later write open or
-`rem tape closeout` rebuilds any due range through the checked kernel, reserves
-memory before drive commands, proves the entire suffix and EOD, and writes at the
-committed cursor. Memory refusal leaves closeout due. Contradictions use
+independent drive work, except after a drive error. The daemon also reconstructs
+its work list at startup and services due closeout without a client request.
+This can mount a cartridge and write a sidecar. It limits attempts to one per
+library and uses only configured libraries and drives. Eligible tapes with due
+closeout are preferred for pool writes. Tapes parked for operator action rank
+behind other fitting tapes; if only parked candidates remain, admission returns
+the actionable refusal. [Closeout debt](guide-troubleshooting.md#closeout-debt) describes the
+retry schedule and wake conditions.
+
+The worker, a later write open, or `rem tape closeout` rebuilds a due range through
+the checked kernel. It reserves memory before drive commands, proves the entire
+suffix and EOD, and writes at the committed cursor. Memory refusal leaves
+closeout due. Contradictions use
 `CloseoutCheckMismatch`, `CloseoutReadContradiction` or
 `SessionSuffixContradiction`; ambiguous metadata publication uses
 `AuthorityAmbiguous`. A durable log record remains authority when SQLite
@@ -419,7 +430,7 @@ Idle unload, eviction and operator removal perform only the exclusion handshake;
 they wait for ongoing closeout and do no parity work. Graceful shutdown checkpoints,
 closes and ends sessions as `graceful_shutdown`, leaving cartridges seated.
 Closeout failure or a drive error may leave a due range after the session ends.
-Retirement and manual finalization refuse such a range with `CloseoutRequired`,
+Manual finalization refuses such a range with `CloseoutRequired`,
 naming `rem tape closeout`.
 
 A barrier triggered by early warning or the low watermark records `seal_due` as
@@ -456,11 +467,10 @@ the daemon proves the complete expected suffix through EOD. A durable session
 ending names the dispatched tail, distinguishing accepted blocks and immediate
 filemarks from the prefix synchronized by a completed non-immediate filemark or
 barrier. Failed barriers do not promote accepted data. Recovery accepts proved
-EOD anywhere from that synchronized prefix through the possible accepted tail,
-records the exact EOD as a refinement of the same `SessionEnded` before reuse
-when the possible tail extends beyond the synchronized prefix, and fences EOD
-below either the synchronized prefix or committed cursor. An already exact
-ending needs no refinement record.
+EOD anywhere from that synchronized prefix through the possible accepted tail.
+When those bounds differ, it records the exact EOD as a refinement of the same
+`SessionEnded` before reuse. EOD below the synchronized prefix or committed
+cursor raises a fence. An already exact ending needs no refinement record.
 This permits automatic recovery after buffered-tail loss; a crash tail
 containing a complete Object requires `rem tape supersede-tail` acknowledgement.
 A crash-only torn header prefix is named by its byte digest and must be proved
@@ -690,3 +700,9 @@ names are retained trace labels, not descriptions of current host authority.
 The fixed tape identity is `d0d0d0d0-d0d0-d0d0-d0d0-d0d0d0d0d0d0`, barcode
 `DUR001L9`. The audit filename follows the execution date. Each run prints its
 full cut descriptions so later changes to the trace are visible.
+
+<!-- code-anchor: crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/closeout_obligation.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
+In plain terms, a receipt tells the client that its data is committed. The daemon
+keeps the tape and drive until the session's ending work finishes. Any parity
+still due is visible as closeout debt, which the daemon services when the tape
+can be admitted.

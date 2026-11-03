@@ -172,13 +172,15 @@ Authorization is a role matrix with no scope below the role. A client is
 readonly, operator, orchestrator, admin or system, and a role cannot be narrowed
 to particular pools, tapes or objects.
 
+<!-- code-anchor: crates/remanence-api/src/write_session_ingress.rs crates/remanence-api/src/tape_closeout.rs crates/remanence-api/src/daemon_catalog_services.rs proto/layer5.proto @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
 ### Some daemon operations are not implemented
 
 Library import and export through the mailslot, library-event streaming, and
 write-session restart all return `unimplemented`. So do write sessions that
 target a drive; sessions that target a pool or a pinned tape both work.
-Caller-supplied `idempotency_key` values are rejected. Write-session replay
-detection exists but does not use that field.
+Write-session RPCs reject caller-supplied `idempotency_key` values. Their replay
+detection does not use that field. `Catalog.CloseoutTape` and
+`Catalog.FinalizeTape` require an idempotency key for retries.
 
 ## Known limitations found in field testing
 
@@ -233,19 +235,17 @@ attempt reports `FAILED`, keeps the tape's finalizing intent, and resumes under
 the same operation ID when the caller retries with the same idempotency key.
 `rem tape finalize --wait` exits with the attempt's error summary.
 
+<!-- code-anchor: crates/remanence-api/src/startup_media_readiness.rs crates/remanence-api/src/mount.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
 ### A cartridge left unthreaded by a hard kill
 
-**A cartridge left unthreaded by a hard kill needed a LOAD by hand.** When the
-field stop script killed the daemon outright during an unload, the cartridge
-stayed in the drive unthreaded, the drive asked for an initializing command,
-and the daemon's media-readiness check polled it without sending a LOAD, so
-writes waited on a `media_initializing` fence until `sg_start --load` was
-sent by hand. On main the readiness wait now sends that LOAD once when the
-drive asks for it, and a stop signal lets the daemon finish the unload before
-it exits; both are in the next release, and the LOAD was reproduced on the
-same drive after a daemon killed during an unload. After any hard kill, still check
-`rem top` for a bay shown busy with no I/O and `rem tape quarantine list` for
-a `media_initializing` fence.
+A hard kill during an unload can leave the cartridge in the drive unthreaded.
+The drive then asks for an initializing command. When inventory shows the
+cartridge in the drive, the readiness wait sends one LOAD and records the
+attempt so a restart does not repeat it. A stop signal lets an unload already
+in progress finish its MOVE home before the daemon exits. After a hard kill,
+check `rem top` for a bay shown busy with no I/O and `rem tape quarantine list`
+for a `media_initializing` fence. See the
+[shutdown guidance](guide-troubleshooting.md#a-drive-stays-not-ready-after-a-daemon-crash).
 
 ### Full verification can be watched and cancelled, but not resumed
 

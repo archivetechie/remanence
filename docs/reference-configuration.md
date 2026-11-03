@@ -49,15 +49,15 @@ string with a suffix: `B`, `KiB`/`K`/`KB`, `MiB`/`M`/`MB`, `GiB`/`G`/`GB`,
 `TiB`/`T`/`TB`, `PiB`/`P`/`PB`. Every suffix is a power of 1024 — `KB` means
 1024 bytes here, not 1000.
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-daemon/src/entry.rs crates/remanence-daemon/src/tls.rs @ 1dd451b2 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-daemon/src/entry.rs crates/remanence-daemon/src/tls.rs crates/remanence-api/src/mount.rs crates/remanence-library/src/handle/tape_io/media_gate.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
 ## `[daemon]` (required)
 
-| Key | Type | Default | Meaning |
+| Key | Type | Default | Remarks |
 |---|---|---|---|
 | `state_dir` | absolute path | required | Root directory for mutable daemon state, including the default socket, default spool, and `state.lock`. Every daemon holds that lock for its lifetime; offline state-mutating commands acquire the same lock (see [What ends up on disk](#what-ends-up-on-disk)). |
 | `default_idle_timeout_seconds` | integer > 0 | required | Default idle timeout for write/read sessions. |
 | `append_ingress_idle_secs` | integer > 0 | `300` | Bounds client inactivity during append ingress, including before Start. Counts only time waiting with no bytes received from the client; empty chunks do not reset it, and daemon backpressure does not count. |
-| `shutdown_close_deadline_secs` | integer > 0 | `300` | Shared graceful shutdown deadline for every write session's final barrier, commit, and ending. At expiry no new drive command is issued; an issued command settles before the session records its honest tail and leaves closeout due. |
+| `shutdown_close_deadline_secs` | integer > 0 | `300` | Shared graceful shutdown deadline for every write session's final barrier, commit, and ending. At expiry no new drive command is issued; an issued command settles before the session records the tail it actually dispatched and leaves closeout due. |
 | `closeout_alarm_after_secs` | integer > 0 | `259200` | Warn and audit `CloseoutOverdue` once per debt age per daemon run. Age is measured from the original uncovered commit, including when the tape is unavailable; this notification does not fence the tape. |
 | `drive_idle_unload_seconds` | integer ≥ 0 | `300` | Rewind, unload, and return a seated cartridge to its home slot after this many idle seconds. `0` keeps it seated until eviction or explicit unload. Graceful shutdown leaves cartridges seated; startup registers them for the normal idle timeout. |
 | `changer_not_ready_wait_seconds` | integer 0–3600 | `600` | Longest wait, measured from the start of the wait, for a changer MOVE MEDIUM that failed because the library was transiently not ready (`02/3B/12` medium magazine removed, `02/04/01` becoming ready, `02/04/18` door open). The daemon polls the changer, re-reads the source and destination, and retries the move up to three times only when both are unchanged; one deadline covers every retry. Shutdown cuts ordinary move waits; a MOVE following an issued UNLOAD still waits up to this bound. `0` fails such a move at once, as before; a value above 3600 is refused at config load. See [Waiting for the library](guide-troubleshooting.md#waiting-for-the-library-open-magazine-or-door). |
@@ -79,17 +79,16 @@ string with a suffix: `B`, `KiB`/`K`/`KB`, `MiB`/`M`/`MB`, `GiB`/`G`/`GB`,
 Checkpoint-batched durability is the only write mode, so there is no
 `checkpoint_mode` key. A configuration that contains the key is rejected.
 
-The service manager's stop timeout must exceed `shutdown_close_deadline_secs`
-plus one drive command's worst-case time. If it kills the daemon sooner, the next
-open uses crash recovery; complete uncommitted Objects require
-`rem tape supersede-tail`. See the [shutdown guidance](guide-troubleshooting.md)
-for outstanding changer work. Graceful shutdown leaves cartridges
-seated: a dismount still rebuilding parity stops before issuing UNLOAD. Once
-UNLOAD has been issued, shutdown waits for its MOVE home without a reservation
-wait deadline, including a magazine/door wait bounded by
-`changer_not_ready_wait_seconds`. Other reservations retain a 600-second wait
-bound. A failed MOVE or a forced kill can still leave a cartridge unthreaded.
-Startup proves a seated cartridge's identity and append cursor at first use.
+The service manager's stop timeout must cover the
+[shutdown bound](guide-troubleshooting.md#a-drive-stays-not-ready-after-a-daemon-crash),
+which is larger than `shutdown_close_deadline_secs` alone. If the service manager
+kills the daemon before settlement, the next open uses crash recovery; complete
+uncommitted objects require `rem tape supersede-tail`. Graceful shutdown leaves
+cartridges seated. A dismount waiting for a closeout in progress stops before
+issuing UNLOAD. Once UNLOAD has been issued, shutdown waits for the MOVE home;
+the shutdown guidance includes that work in the bound. A failed MOVE or forced
+kill can still leave a cartridge unthreaded. Startup proves a seated cartridge's
+identity and append cursor at first use.
 
 ### Transport trust boundaries
 
@@ -581,9 +580,10 @@ Object admission is permanently disabled. A failure enters
 their proved positions, never a new Object or a second terminal suffix. SQLite
 and the per-tape catalog files remain rebuildable projections.
 
+<!-- code-anchor: crates/remanence-state/src/index.rs crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/state.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
 The marker contains `remanence-tape-log-v2\n`, the canonical configured journal
-root encoded as a JSON string, and a final `\n`. SQLite uses schema 24. Old
-state is refused and requires
+root encoded as a JSON string, and a final `\n`. SQLite uses schema 24. Ordinary opens refuse schemas 1 through 23. Such
+state requires
 `rem reset-catalog --config <PATH> --i-understand-this-erases-the-catalog`,
 followed by reinitialization of the approved scratch tapes. The reset archives
 the prior marker, audit and journals when those directories exist; it preserves

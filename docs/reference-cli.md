@@ -764,6 +764,7 @@ To follow a detached verification:
 rem op watch 9b1d2c3e-4f50-4a61-8b72-93a4b5c6d7e8
 ```
 
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-api/src/closeout_obligation.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
 ### rem catalog tapes, rem catalog tape
 
 List the catalogued tapes, or show one.
@@ -790,6 +791,23 @@ verdict is recorded. The list includes `active_tape_io_fence_count` and
 `active_tape_io_fences`, with drive-only fences even when no tape matches the filter. Each
 fence record identifies the quarantine, tape UUID, barcode, endpoint, reason and state; the
 daemon's release RPC is described in [the API reference](reference-api.md).
+
+Both JSON responses carry closeout debt from the native tape log:
+
+| Field | JSON type | Remarks |
+| --- | --- | --- |
+| `unprotected_bytes` | decimal string or `null` | Committed bytes not covered by a parity sidecar; `null` means no live debt value is available, including an unreadable log or a retired tape. |
+| `unprotected_since` | RFC3339 UTC string or `null` | Time of the original uncovered commit; `null` when no range is uncovered or its authority is unreadable. |
+| `closeout_due` | boolean or `null` | Whether ordinary closeout is needed. An accepted finalization plan can own an uncovered range instead. |
+| `closeout_overdue` | boolean or `null` | Whether the uncovered range has reached the configured alarm age. |
+| `closeout_authority_error` | string or `null` | Why debt is unknown; `null` when authority is readable. |
+| `closeout_retry_reason` | string or `null` | Last worker refusal, including whether the tape needs operator action. |
+
+The list prints every returned tape, then exits 1 with
+`closeout authority unreadable for N tape(s); debt is unknown` if any native log
+cannot be read. The single-tape command carries the error field but does not
+change its exit status for unreadable authority. See [Closeout debt](guide-troubleshooting.md#closeout-debt)
+for automatic servicing and operator recovery.
 
 To list the tapes in pool `archive`:
 
@@ -827,6 +845,7 @@ rem catalog entries [OPTIONS] <UNIT_ID>
 - `--origin <ORIGIN>` (on `units`) filters by origin: `all` (default), `native` (objects
   Remanence wrote) or `foreign` (archives scanned through an adapter).
 
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/top.rs crates/remanence-api/src/closeout_obligation.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
 ### rem top
 
 Show live daemon state.
@@ -853,7 +872,7 @@ uses at most five rows, and adds `+N more` when needed. Its debt list includes
 unseated, unavailable and out-of-scope tapes. Media maintenance stays within the
 configured library/drive scope; deferred SQL projection can retry without media.
 
-An unreadable native log appears as `DEBT?` with its error. `rem tape list` and
+An unreadable native log appears as `DEBT?` with its error. `rem catalog tapes` and
 `rem top --once` print the complete response and exit nonzero if any authority
 is unreadable. Interactive top keeps running. JSON debt values are `null` when
 unknown, with `closeout_authority_error` explaining why. Known byte counts are
@@ -1011,26 +1030,44 @@ To load `RMJ101L9` into bay `0x0100` of library `LIB001`:
 rem drive load --library LIB001 --bay 0x0100 --barcode RMJ101L9
 ```
 
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-api/src/library.rs crates/remanence-api/src/mount.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
 ### rem drive unload
 
 ```text
 rem drive unload --library <SERIAL> --bay <BAY> [--dest <SLOT>]
 ```
 
-Through the daemon, unload the cartridge in a drive bay to a storage slot and wait for completion. Without `--dest` the cartridge goes back to the source slot the changer recorded for it. `--library` takes a library serial or UUID. Before the cartridge leaves the drive the daemon closes any parity epoch the drive retains and reports `phase=epoch_close` in the operation progress while it does. If the close fails, or does not run (for example because the tape is fenced, the medium is not writable or the drive owner stopped), the daemon logs the reason and removes the cartridge anyway, leaving any open epoch open; the operation can still succeed, and then its progress and its finish audit carry `epoch_close=failed` (a close ran and failed) or `epoch_close=not_attempted` (no close ran) with the reason in `epoch_close_error`. Neither value says an epoch existed. The text output prints a `warning: closing the parity epoch failed on <BARCODE> (<REASON>)` or `warning: no parity epoch close ran on <BARCODE> (<REASON>)` line before the `unloaded` line. The daemon refuses with `failed_precondition` while a session or another operation holds a drive in the library; an empty bay or a full destination fails the operation. Either way the command prints the daemon's message and exits 1. On success it prints the operation and then `unloaded <BARCODE> from bay <BAY> to slot <SLOT>`; with `--json`, the `rem.operation.status.v1` item carries a `location` object with `library_serial`, `bay`, `barcode` and `slot`. A retry sends a new request. `rem-debug unload` is the break-glass form that bypasses the daemon.
+Through the daemon, unload the cartridge in a drive bay to a storage slot and
+wait for completion. Without `--dest` the cartridge returns to its recorded
+source slot. `--library` takes a library serial or UUID.
+
+Unload waits for ongoing closeout but performs no parity work itself. A due
+closeout stays due after removal. The daemon services eligible debt within its
+configured libraries; `rem tape closeout <UUID>` requests it explicitly. Check
+[closeout debt](guide-troubleshooting.md#closeout-debt) before taking a cartridge
+out of the library.
+
+The daemon refuses with `failed_precondition` while a session or another
+operation holds a drive in the library; an empty bay or full destination fails
+the operation. Either way the command prints the daemon's message and exits 1.
+On success it prints the operation, then
+`unloaded <BARCODE> from bay <BAY> to slot <SLOT>`. With `--json`, the
+`rem.operation.status.v1` item carries a `location` object with `library_serial`,
+`bay`, `barcode` and `slot`. A retry sends a new request. `rem-debug unload` is
+the break-glass form that bypasses the daemon.
 
 With `--json`, a failed, cancelled, or completion-unknown operation prints a
 `rem.error.v1` error on stderr with `code: "operation_failed"`,
 `details.operation_id`, and `details.state`, and exits 1. Connection failures
 remain `daemon_client_error`.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/tape_finalize.rs crates/remanence-cli/src/tape_inventory.rs crates/remanence-cli/src/tape_read_rate.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/tape_closeout.rs crates/remanence-cli/src/tape_finalize.rs crates/remanence-cli/src/tape_inventory.rs crates/remanence-cli/src/tape_read_rate.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
 ## Tape lifecycle
 
 Initialization, readiness and retirement run against local configuration and state, and
 initialization and readiness against real hardware. Initialization passes a chain of
 identity, ownership, readiness and data-presence checks before it writes anything. In
-library mode, finalization, inventory, verification and supersede-tail go through the
+library mode, closeout, finalization, inventory, verification and supersede-tail go through the
 daemon and its tape ownership and fencing checks; the CLI performs no local SCSI discovery
 for those verbs.
 
@@ -1189,6 +1226,7 @@ rem tape quarantine release mrq-9b1d2c3e-4f50-4a61-8b72-93a4b5c6d7e8 \
     --after-settled-inventory --ack "inventory settled; cartridge is in its home slot"
 ```
 
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-state/src/index.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
 ### rem tape retire
 
 Retire one tape identity permanently in the local catalog.
@@ -1205,7 +1243,8 @@ rem tape retire [OPTIONS] --reason <TEXT> <TARGET>
 - `--json` emits `rem.tape.retire.v1`.
 
 Every copy on the tape becomes `missing` in the catalog, and the barcode is released. The
-command touches no media. A retire that changes anything takes the state lock, so stop the
+command touches no media and does not check or complete closeout debt. A retire
+that changes anything takes the state lock, so stop the
 daemon first. [Tape identity and the retire operation](tape-identity-lifecycle-explainer.md)
 explains the effects and how they survive a catalog rebuild.
 
@@ -1227,19 +1266,20 @@ Without `--dry-run` the first line is
 standard error by a `warning:` line naming the objects that lost their last committed copy.
 An identity that is already retired prints `... is already retired; no change`.
 
+<!-- code-anchor: crates/remanence-cli/src/tape_closeout.rs crates/remanence-api/src/tape_closeout.rs crates/remanence-api/src/auth.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
 ### rem tape closeout
 
-```bash
-rem tape closeout <tape-uuid|barcode> [--expected-pool <pool-id>] \
-  [--idempotency-key <uuid>] [--endpoint <url>] [--json]
+```text
+rem tape closeout [OPTIONS] <TAPE>
 ```
 
 Close the current unprotected parity range on one exact tape, then watch the
-operation to a terminal state. The identifier is a tape UUID or an exact barcode;
+operation to a terminal state. `<TAPE>` is a tape UUID or an exact barcode;
 a barcode matching more than one data tape is refused. Use the UUID to disambiguate.
 `--expected-pool` checks the assigned pool before fresh work. Matching retries
 rejoin the original operation even if that pool assignment subsequently changed.
-OperationControl authorization is required (operator, orchestrator or admin).
+OperationControl authorization is required: the `operator`, `orchestrator`,
+`admin` or `system` role. These are client permissions, not job titles.
 
 Supply a non-nil `--idempotency-key` for a retry. If omitted, the command generates
 one and prints it to stderr **before connecting or sending the RPC**; retain it
@@ -1253,6 +1293,7 @@ Failures print to stderr and exit 1. JSON terminal failures include
 terminal operation state. Argument parsing failures exit 2. Each JSON message is
 one line, including the generated-key message preceding any error.
 
+<!-- code-anchor: crates/remanence-cli/src/tape_finalize.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-state/src/tape_log/fold.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
 ### rem tape finalize (library)
 
 Finalize one exact tape through the daemon.
@@ -1276,10 +1317,25 @@ resubmits. While the tape is `FINALIZING` it also checks the operation, and exit
 with its summary on `FAILED`, `CANCELLED` or `COMPLETION_UNKNOWN`. Reuse the same
 idempotency key to resume the durable request under the same operation id.
 
+Manual finalization refuses a due closeout. When the range retains its
+original-write check and has no closeout contradiction fence, the message is:
+
+```text
+CloseoutRequired: tape <UUID> has <N> unprotected bytes since <TIME>; run rem tape closeout <UUID> before finalization.
+```
+
+Run the named closeout command, then retry finalization with the same
+idempotency key. An unprovable range instead produces
+`CloseoutUnprotectedFinalizationUnavailable`; accepting unprotected
+finalization is not supported. See [Closeout debt](guide-troubleshooting.md#closeout-debt).
+
 The JSON schema is `rem.tape.finalization.v2`. Its `replica_progress` is historical barrier
 evidence, not a current media-health observation. A value the daemon does not have is
 `null`, never `0`: `operation_id` is `null` for a finalization that an automatic trigger
 started, and a BUSY response has `null` `operation_id`, `completed_replicas` and digests.
+For a BUSY response caused by an active finalization, `detail` names the operation:
+`tape is finalizing; watch operation <UUID>; no state or media motion occurred`.
+Use `rem op watch <UUID>` to follow it.
 `completed_replicas` `0` is a real value (before replica A).
 
 To finalize tape `5e8f8d3b-0c1a-4d2e-9f60-7a1b2c3d4e5f` in pool `archive` and wait:
