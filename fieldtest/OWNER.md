@@ -22,7 +22,7 @@ chown -R root:remfield /opt/remfield/remfield-run-<commit>
 chmod -R u=rwX,g=rX,o= /opt/remfield/remfield-run-<commit>
 cd /opt/remfield/remfield-run-<commit>
 sha256sum -c SHA256SUMS
-setcap cap_sys_rawio+ep bin/rem bin/rem-debug bin/rem-daemon
+for b in bin/rem bin/rem-debug bin/rem-daemon; do setcap cap_sys_rawio+ep "$b"; done   # RHEL 9 setcap takes one capability per file
 ln -sfn remfield-run-<commit> /opt/remfield/current
 ```
 
