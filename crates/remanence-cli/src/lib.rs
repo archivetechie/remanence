@@ -21792,6 +21792,61 @@ pool_id = "init-test"
         (tape, audit)
     }
 
+    /// Real `rem tape init` dispatch on fixture transports must publish enough
+    /// audit evidence to recover a logless tape's geometry, pool and label.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn current_empty_rebuild_cli_logless_provision_geometry_pool_kept() {
+        let run = run_tape_init_on_bot(
+            None,
+            false,
+            &["--clobber-data", "--confirm-clobber", "CLOBBER RMT001L9"],
+            "",
+        );
+        assert_eq!(run.code, ExitCode::SUCCESS, "{}", run.stderr);
+        assert_eq!(run.writes, 2);
+        let (tape, audit) = unknown_tape_catalog_and_audit(&run);
+        assert_eq!(audit.len(), 1);
+        let tape = tape.expect("real CLI provisioned tape");
+        assert_eq!(tape.block_size, Some(262144));
+        assert_eq!(tape.pool_id.as_deref(), Some("init-test"));
+        assert_eq!(tape.voltag.as_deref(), Some("RMT001L9"));
+        let config = run.temp.path().join("config.toml");
+        let state = remanence_state::StateHandle::open_from_config_file(&config).unwrap();
+        assert_eq!(
+            fs::read_dir(state.paths().journal_dir.join("tapes"))
+                .unwrap()
+                .count(),
+            0
+        );
+        let sqlite = state.paths().sqlite_path.clone();
+        drop(state);
+        fs::remove_file(&sqlite).unwrap();
+        for suffix in ["-wal", "-shm"] {
+            match fs::remove_file(PathBuf::from(format!("{}{suffix}", sqlite.display()))) {
+                Ok(()) => (),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                Err(e) => panic!("remove SQLite sidecar: {e}"),
+            }
+        }
+        let mut rebuilt = remanence_state::StateHandle::open_from_config_file(&config).unwrap();
+        rebuilt.startup_replay().unwrap();
+        let after = rebuilt
+            .catalog_index()
+            .get_tape(&tape.tape_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                after.tape_uuid,
+                after.block_size,
+                after.pool_id,
+                after.voltag
+            ),
+            (tape.tape_uuid, tape.block_size, tape.pool_id, tape.voltag)
+        );
+    }
+
     /// The named override erases an unknown Remanence identity only with the
     /// exact UUID and the typed confirmation, then audits what it destroyed.
     #[cfg(target_os = "linux")]

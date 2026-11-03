@@ -80,6 +80,8 @@ impl From<crate::log_frame::Fault> for Fault {
         }
     }
 }
+// The shared decoder reserves a zero first byte for zero-filled tails.
+const _: () = assert!(VERSION & 0xff != 0);
 struct TapeFamily;
 impl crate::log_frame::Family for TapeFamily {
     type Record = Record;

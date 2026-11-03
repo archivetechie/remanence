@@ -335,3 +335,54 @@ fn no_replace_and_immutable_prefix_replacement_preserve_old_readers() {
         "replacement alone never clears authority ambiguity"
     );
 }
+
+/// The Family contract makes a one-byte version distinguishable from padding.
+#[test]
+fn family_versions_have_nonzero_low_bytes_and_short_identity() {
+    assert_ne!(remanence_state::tape_log::VERSION & 0xff, 0);
+    assert!(Tiny::validate(256, 1).is_err());
+    assert!(!Tiny::valid_identity(256, 1));
+    let mut prefix = [0; frame::PREFIX_LEN];
+    prefix[..2].copy_from_slice(&256u16.to_le_bytes());
+    assert!(Tiny::validate_short_identity(&prefix, 1).is_err());
+    let bytes = encoded(1, 1);
+    assert_ne!(bytes[0], 0);
+    let mut decoder = Decoder::<_, Tiny>::new(&bytes[..1]);
+    assert!(decoder.next_frame().unwrap().is_none());
+    assert_eq!(
+        decoder.tail(),
+        Tail::Torn {
+            offset: 0,
+            kind: TornKind::ShortPrefix
+        }
+    );
+    let mut padding = Decoder::<_, Tiny>::new(&[0u8][..]);
+    assert!(padding.next_frame().unwrap().is_none());
+    assert_eq!(
+        padding.tail(),
+        Tail::Torn {
+            offset: 0,
+            kind: TornKind::ZeroFilled
+        }
+    );
+}
+
+/// A corrupt private spool must fail before a frame or progress is published.
+#[test]
+fn copy_frames_reports_prefix_crc_separately_from_size() {
+    let mut bytes = encoded(1, 1);
+    bytes[20] ^= 1;
+    let mut output = Vec::new();
+    let mut progress = 0;
+    let error = frame::copy_frames(
+        &mut bytes.as_slice(),
+        &mut output,
+        bytes.len() as u64,
+        |n| progress += n,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(error.to_string(), "invalid preflighted frame prefix CRC");
+    assert!(output.is_empty());
+    assert_eq!(progress, 0);
+}

@@ -1,13 +1,28 @@
-# SQLite mutation/open ratchet. remanence-chaos owns a separate fault-scenario database.
-# authority_layout is a read-only gating open; checkpoint is a cfg(test) competing writer inside production.
-crates/remanence-api/src/write_owner/checkpoint.rs::perform_checkpoint_barrier_with_rows::Connection::open	1
-crates/remanence-api/src/write_owner/checkpoint.rs::perform_checkpoint_barrier_with_rows::execute_batch	1
+# SQL mutation/open candidates; complete files, excluding cfg(test) items/blocks.
+# remanence-chaos uses its own fault-scenario database, not the catalog.
+# Mutating literals include TEMP/TEMPORARY, VIEW, REPLACE and CTE UPDATE forms.
 crates/remanence-chaos/src/lib.rs::for_read_medium_errors::Connection::open	1
 crates/remanence-chaos/src/lib.rs::from_state_path::Connection::open	1
 crates/remanence-chaos/src/lib.rs::log_event::execute	1
 crates/remanence-chaos/src/lib.rs::log_event::mutating-sql	1
 crates/remanence-chaos/src/lib.rs::record_corrupt_range::execute	1
 crates/remanence-chaos/src/lib.rs::record_corrupt_range::mutating-sql	1
+crates/remanence-chaos/src/model.rs::arm_element_status_fault::Connection::open	1
+crates/remanence-chaos/src/model.rs::arm_lib11_no_medium::Connection::open	1
+crates/remanence-chaos/src/model.rs::arm_library_fault::Connection::open	1
+crates/remanence-chaos/src/model.rs::arm_med01::Connection::open	1
+crates/remanence-chaos/src/model.rs::arm_med01_and_med05::Connection::open	1
+crates/remanence-chaos/src/model.rs::arm_med05::Connection::open	1
+crates/remanence-chaos/src/model.rs::arm_tape_alert::Connection::open	1
+crates/remanence-chaos/src/model.rs::changer_load_couples_barcode_to_per_tape_fault_targeting::Connection::open	1
+crates/remanence-chaos/src/model.rs::create_state::Connection::open	1
+crates/remanence-chaos/src/model.rs::create_state::execute	1
+crates/remanence-chaos/src/model.rs::create_state::execute_batch	1
+crates/remanence-chaos/src/model.rs::create_state::mutating-sql	2
+crates/remanence-chaos/src/model.rs::insert_fault::execute	1
+crates/remanence-chaos/src/model.rs::insert_fault::mutating-sql	1
+crates/remanence-cli/src/pool_ops.rs::run_archive_export_object::mutating-sql	1
+crates/remanence-cli/src/pool_ops.rs::run_archive_read::mutating-sql	1
 crates/remanence-state/src/authority_layout.rs::validate_layout::Connection::open	1
 crates/remanence-state/src/index.rs::<module>::mutating-sql	2
 crates/remanence-state/src/index.rs::accept_manual_terminal_finalization_with::transaction_with_behavior	1
@@ -210,11 +225,11 @@ crates/remanence-state/src/tape_log/projection.rs::project_snapshot::mutating-sq
 crates/remanence-state/src/tape_log/projection.rs::project_tape_log::transaction_with_behavior	1
 crates/remanence-state/src/tape_log/projection.rs::rebuild_repaired_tape_projection::execute	6
 crates/remanence-state/src/tape_log/projection.rs::rebuild_repaired_tape_projection::execute_batch	2
-crates/remanence-state/src/tape_log/projection.rs::rebuild_repaired_tape_projection::mutating-sql	7
+crates/remanence-state/src/tape_log/projection.rs::rebuild_repaired_tape_projection::mutating-sql	8
 crates/remanence-state/src/tape_log/projection.rs::rebuild_repaired_tape_projection::transaction_with_behavior	1
 crates/remanence-state/src/tape_log/projection.rs::rebuild_tape_log_projection::execute	1
 crates/remanence-state/src/tape_log/projection.rs::rebuild_tape_log_projection::mutating-sql	1
 crates/remanence-state/src/tape_log/projection.rs::rebuild_tape_log_projection::transaction_with_behavior	1
 crates/remanence-state/src/tape_log/projection.rs::validate_projected_history::execute	2
 crates/remanence-state/src/tape_log/projection.rs::validate_projected_history::execute_batch	2
-crates/remanence-state/src/tape_log/projection.rs::validate_projected_history::mutating-sql	3
+crates/remanence-state/src/tape_log/projection.rs::validate_projected_history::mutating-sql	4

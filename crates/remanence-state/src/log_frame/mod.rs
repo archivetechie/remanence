@@ -59,6 +59,12 @@ pub enum Fault {
 
 /// Family policy and schema. Validation is supplied by the caller, so distinct
 /// log versions/tags cannot be accepted merely because the framing is identical.
+///
+/// Every accepted version MUST have a nonzero low byte (`version & 0xff != 0`).
+/// The decoder uses a zero first byte to distinguish zero-filled tails from
+/// EOF-short identities, before a full version can be validated. Versions such
+/// as 256 violate this contract even when their complete prefix CRC is valid.
+/// Families must reject them in both identity validators.
 pub trait Family {
     /// Decoded structural value.
     type Record;
@@ -568,6 +574,11 @@ fn read_some(r: &mut impl Read, mut b: &mut [u8]) -> io::Result<usize> {
 
 /// Copy bounded, already preflighted frames with one whole-frame write each.
 /// A short kernel write may still tear; EOF-short prefixes/bodies handle that.
+///
+/// B1's one intentional behaviour change: recheck the private spool's prefix CRC
+/// before trusting its lengths. A corrupt preflighted spool is refused; the
+/// caller's already-fenced lease reports Ambiguous and keeps its sticky marker.
+/// Before the extraction, plausible lengths alone allowed the frame to be copied.
 pub fn copy_frames(
     input: &mut impl Read,
     output: &mut impl Write,
@@ -581,7 +592,7 @@ pub fn copy_frames(
         if crc64_xz(&prefix[..20]) != u64::from_le_bytes(prefix[20..].try_into().unwrap()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "invalid preflighted frame size",
+                "invalid preflighted frame prefix CRC",
             ));
         }
         let body = u64::from(u32::from_le_bytes(prefix[4..8].try_into().unwrap()))

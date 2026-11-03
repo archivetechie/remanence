@@ -113,6 +113,11 @@ tape_catalog_dir = "{0}/cache/tapes"
             .unwrap();
         self.state().replay_audit_projection().unwrap();
     }
+    // Minimal projector fixture, deliberately independent of the CLI crate to
+    // avoid a state -> CLI -> state dependency cycle. The real wire detail is
+    // covered by remanence-cli's
+    // current_empty_rebuild_cli_logless_provision_geometry_pool_kept, which runs
+    // `rem tape init` dispatch with fixture transports before deleting SQLite.
     fn audited_provision(&mut self, id: u8, label: &str) {
         self.provision(id, label);
         self.audit(
