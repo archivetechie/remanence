@@ -640,6 +640,11 @@ impl LibraryLog {
         let mut new_segment = None;
         let result = (|| -> io::Result<()> {
             if rotate {
+                // The new segment's hash chain covers every byte in its predecessor,
+                // including diagnostics whose own receipts did not promise durability.
+                if let Some(active) = self.state.segments.last() {
+                    File::open(self.dir.join(&active.name))?.sync_all()?;
+                }
                 let header = Header {
                     log_uuid: self.log_uuid,
                     first_sequence: sequence,

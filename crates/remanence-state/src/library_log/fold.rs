@@ -1,8 +1,10 @@
 //! Pure causal validation and resource-scoped replay. Presentation text never selects a rule.
+use super::index::Index;
 use super::*;
 use sha2::{Digest, Sha256};
 use std::{
     borrow::Cow,
+    cell::Cell,
     collections::{BTreeMap, BTreeSet},
 };
 /// A tape counterpart includes its decoded tape record kind, never diagnostic text.
@@ -63,7 +65,7 @@ pub const MAX_PENDING_RECORDS: usize = 4096;
 pub const MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
 
 /// Resource isolation keys; wall clocks are never keys.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Scope {
     /// Tape UUID.
     Tape(Id),
@@ -237,6 +239,8 @@ pub struct TapeState {
     pub pool: Option<Text>,
     /// Current calibration generation.
     pub calibration_generation: u64,
+    /// Opaque map digest only; projectors read descriptors from the record.
+    pub wrap_digest: Option<Hash>,
 }
 #[derive(Clone, Debug)]
 struct Held {
@@ -257,6 +261,7 @@ pub struct PendingRecord {
     pub scope: BTreeSet<Scope>,
     bytes: Box<[u8]>,
     receipt: Receipt,
+    deferred_fence: bool,
 }
 /// Result of validation, reused by append and replay.
 #[derive(Clone, Debug)]
@@ -266,7 +271,8 @@ pub enum Validated {
     /// Existing identical authority; no bytes should be appended.
     Duplicate(Receipt),
 }
-/// O(resources), plus pending up to the cap, plus one looked-up frame.
+/// O(resources), plus 80 bytes of key/value data per keyed operation (map overhead
+/// measured separately), pending up to the cap, and one looked-up frame.
 /// Pending bodies are canonical bytes, not a retained decoded record history.
 #[derive(Clone, Debug, Default)]
 pub struct LibraryFold {
@@ -285,15 +291,25 @@ pub struct LibraryFold {
     /// Missing fence evidence, which never delays the fence.
     pub unresolved_fence_evidence: BTreeSet<u64>,
     pending_bytes: usize,
-    latest: BTreeMap<(Tag, Scope, Option<Id>), Held>,
-    fences: BTreeMap<u64, Held>,
-    intents: BTreeMap<u64, Held>,
+    latest: Index<(Tag, Scope, Option<Id>), Held>,
+    fences: Index<u64, Held>,
+    intents: Index<u64, Held>,
     uncertain: BTreeSet<u64>,
-    loads: BTreeMap<(Id, DriveKey), u32>,
-    inventories: BTreeMap<Text, u64>,
-    drives: BTreeMap<Id, (u64, bool)>,
-    readiness: BTreeMap<DriveKey, u64>,
-    idempotency: BTreeMap<(Text, OperationKind, Id), (Id, Hash)>,
+    loads: Index<(Id, DriveKey), u32>,
+    inventories: Index<Text, u64>,
+    drives: Index<Id, (u64, bool)>,
+    readiness: Index<DriveKey, u64>,
+    idempotency: Index<Hash, (Id, Hash)>,
+    by_sequence: Index<u64, (Tag, Scope, Option<Id>)>,
+    operation_slots: Index<Id, BTreeSet<(Tag, Scope, Option<Id>)>>,
+    load_endpoints: Index<Id, BTreeSet<DriveKey>>,
+    released: Index<u64, (Tag, Scope, Option<Id>)>,
+    labels: Index<LabelText, Id>,
+    commands: Index<Id, u64>,
+    intent_scopes: Index<Scope, usize>,
+    cleaning_drives: Index<Id, Text>,
+    cleaning_tapes: Index<Id, Text>,
+    lookup_count: Cell<u64>,
 }
 impl Record {
     /// Reference that a later decision may bind.
@@ -462,7 +478,7 @@ impl Body {
             Self::Retire(v) => Some(Scope::Tape(v.tape.uuid)),
             Self::MediaGenerationSet(v) => Some(Scope::Tape(v.tape.uuid)),
             Self::ManualFinalizationAccepted(v) => Some(Scope::Tape(v.at.tape.uuid)),
-            Self::WrapMapCached(v) => Some(Scope::Tape(v.tape.uuid)),
+            Self::WrapMapCached(_) | Self::MotionIntent(_) | Self::FenceRaised(_) => None,
             Self::DriveObserved(v) => Some(Scope::Drive(v.drive_uuid)),
             Self::DriveDecision(v) => Some(Scope::Drive(v.drive_uuid)),
             Self::DriveHealthObserved(v) => Some(Scope::Drive(v.drive_uuid)),
@@ -517,6 +533,7 @@ fn terminal(e: &OperationEvent) -> bool {
 }
 impl LibraryFold {
     fn tape(&self, t: TapeRef) -> Result<&TapeState, FoldError> {
+        self.probe();
         let v = self.tapes.get(&t.uuid).ok_or(FoldError::UnknownTape)?;
         if v.tape != t {
             return Err(FoldError::IncarnationMismatch);
@@ -526,12 +543,112 @@ impl LibraryFold {
         }
         Ok(v)
     }
+    /// Keyed reads/updates in retained-state indexes, plus public tape-state probes.
+    /// Hash collision and allocator costs are excluded; indexes expose no iteration.
+    pub fn lookup_count(&self) -> u64 {
+        self.lookup_count.get()
+            + self.latest.probes()
+            + self.fences.probes()
+            + self.intents.probes()
+            + self.loads.probes()
+            + self.inventories.probes()
+            + self.drives.probes()
+            + self.readiness.probes()
+            + self.idempotency.probes()
+            + self.by_sequence.probes()
+            + self.operation_slots.probes()
+            + self.load_endpoints.probes()
+            + self.released.probes()
+            + self.labels.probes()
+            + self.commands.probes()
+            + self.intent_scopes.probes()
+            + self.cleaning_drives.probes()
+            + self.cleaning_tapes.probes()
+    }
+    /// Fixed key/value payload retained for lifetime idempotency.
+    pub fn idempotency_bytes(&self) -> usize {
+        self.idempotency.len() * 80
+    }
+    /// Retained decoded records, excluding bounded pending bytes.
+    pub fn retained_records(&self) -> usize {
+        self.latest.len() + self.fences.len() + self.intents.len()
+    }
+    fn probe(&self) {
+        self.lookup_count.set(self.lookup_count.get() + 1);
+    }
+    fn at_sequence(&self, sequence: u64) -> Option<&Held> {
+        if let Some(key) = self.by_sequence.get(&sequence) {
+            return self.latest.get(key);
+        }
+        self.fences
+            .get(&sequence)
+            .or_else(|| self.intents.get(&sequence))
+    }
     fn find(&self, r: DecisionRef) -> Option<&Held> {
-        self.latest
-            .values()
-            .chain(self.fences.values())
-            .chain(self.intents.values())
-            .find(|v| v.sequence == r.sequence && v.record.envelope.record_uuid == r.record_uuid)
+        self.at_sequence(r.sequence)
+            .filter(|h| h.record.envelope.record_uuid == r.record_uuid)
+    }
+    fn remove_latest(&mut self, key: &(Tag, Scope, Option<Id>)) {
+        if let Some(old) = self.latest.remove(key) {
+            self.by_sequence.remove(&old.sequence);
+            if let Body::FenceReleased(v) = &old.record.body {
+                self.released.remove(&v.fence);
+            }
+            if let Scope::Operation(scope_id) = &key.1 {
+                let op = old.record.body.operation().unwrap_or(*scope_id);
+                if let Some(keys) = self.operation_slots.get_mut(&op) {
+                    keys.remove(key);
+                    if keys.is_empty() {
+                        self.operation_slots.remove(&op);
+                    }
+                }
+            }
+        }
+    }
+    fn insert_latest(&mut self, key: (Tag, Scope, Option<Id>), held: Held) {
+        self.remove_latest(&key);
+        self.by_sequence.insert(held.sequence, key.clone());
+        if let Scope::Operation(scope_id) = &key.1 {
+            let op = held.record.body.operation().unwrap_or(*scope_id);
+            self.operation_slots
+                .entry(op)
+                .or_default()
+                .insert(key.clone());
+        }
+        if let Body::FenceReleased(v) = &held.record.body {
+            self.released.insert(v.fence, key.clone());
+        }
+        self.latest.insert(key, held);
+    }
+    fn close_operation(&mut self, operation: Id) {
+        if let Some(keys) = self.operation_slots.remove(&operation) {
+            for key in keys {
+                self.remove_latest(&key);
+            }
+        }
+        self.close_loads(operation);
+    }
+    fn close_loads(&mut self, operation: Id) {
+        if let Some(endpoints) = self.load_endpoints.remove(&operation) {
+            for endpoint in endpoints {
+                self.loads.remove(&(operation, endpoint));
+            }
+        }
+    }
+    fn remove_intent(&mut self, sequence: u64) {
+        if let Some(h) = self.intents.remove(&sequence) {
+            if let Body::MotionIntent(v) = &h.record.body {
+                self.commands.remove(&v.command);
+            }
+            for scope in h.record.body.scopes() {
+                let count = self.intent_scopes.get_mut(&scope).unwrap();
+                *count -= 1;
+                if *count == 0 {
+                    self.intent_scopes.remove(&scope);
+                }
+            }
+        }
+        self.uncertain.remove(&sequence);
     }
     fn historical<'a>(
         &'a self,
@@ -589,13 +706,13 @@ impl LibraryFold {
                 TapeLookup::NotYet => return Err(FoldError::Unresolved),
                 TapeLookup::Contradiction => return Err(FoldError::TapeContradiction),
                 TapeLookup::Present { kind, digest } => {
+                    if digest != at.record_digest {
+                        return Err(FoldError::TapeContradiction);
+                    }
                     if matches!(b, Body::ManualFinalizationAccepted(_))
                         && kind != crate::tape_log::Tag::FinalizationPrepared
                     {
                         return Err(FoldError::CounterpartKind);
-                    }
-                    if digest != at.record_digest {
-                        return Err(FoldError::TapeContradiction);
                     }
                 }
             }
@@ -616,10 +733,9 @@ impl LibraryFold {
         };
         if !matches!(r.body, Body::FenceRaised(_)) {
             let scopes = self.scopes_for(&r.body, history)?;
-            if self
-                .contradictions
-                .keys()
-                .any(|scope| scopes.contains(scope))
+            if scopes
+                .iter()
+                .any(|scope| self.contradictions.contains_key(scope))
             {
                 return Err(FoldError::TapeContradiction);
             }
@@ -650,6 +766,9 @@ impl LibraryFold {
             || matches!(b,Body::FenceReleased(v) if v.fence==0||v.fence>=sequence)
         {
             return Err(FoldError::ForwardReference);
+        }
+        if b.tapes().iter().any(|t| t.incarnation == 0) {
+            return Err(FoldError::InvalidSchema);
         }
         let at = b.at().or(match b {
             Body::FenceRaised(v) => v.at.as_ref(),
@@ -682,7 +801,16 @@ impl LibraryFold {
                     .last(Tag::ConfigurationAccepted, Scope::Config)
                     .ok_or(FoldError::WrongCounterpart)?;
                 if latest.record.reference(latest.sequence) != reference {
-                    return Err(FoldError::StaleConfiguration);
+                    return Err(
+                        if self
+                            .historical(reference, history)?
+                            .is_some_and(|r| r.body.tag() == Tag::ConfigurationAccepted)
+                        {
+                            FoldError::StaleConfiguration
+                        } else {
+                            FoldError::WrongCounterpart
+                        },
+                    );
                 }
             }
         }
@@ -700,9 +828,9 @@ impl LibraryFold {
         }
         if let Body::FenceReleased(v) = b {
             if let Some(old) = self
-                .latest
-                .values()
-                .find(|h| matches!(&h.record.body,Body::FenceReleased(r) if r.fence==v.fence))
+                .released
+                .get(&v.fence)
+                .and_then(|key| self.latest.get(key))
             {
                 return if old.record.body == *b {
                     Ok(Validated::Duplicate(old.receipt.clone()))
@@ -744,13 +872,10 @@ impl LibraryFold {
                 {
                     return Err(FoldError::InvalidSchema);
                 }
-                if v.label.as_ref().is_some_and(|l| {
-                    l.is_empty()
-                        || self
-                            .tapes
-                            .values()
-                            .any(|t| !t.retired && t.label.as_ref() == Some(l))
-                }) {
+                if v.label
+                    .as_ref()
+                    .is_some_and(|l| l.is_empty() || self.labels.contains_key(l))
+                {
                     return Err(FoldError::LabelHeld);
                 }
                 if let Some(s) = &v.parity_scheme {
@@ -825,9 +950,10 @@ impl LibraryFold {
                     return Err(FoldError::InvalidSchema);
                 }
                 let holder = v.label.as_ref().and_then(|l| {
-                    self.tapes
-                        .values()
-                        .find(|t| !t.retired && t.label.as_ref() == Some(l) && t.tape != v.tape)
+                    self.labels
+                        .get(l)
+                        .filter(|id| **id != v.tape.uuid)
+                        .and_then(|id| self.tapes.get(id))
                 });
                 match (holder, &v.prior_holder) {
                     (Some(t), Some(p)) if t.tape == p.tape => {
@@ -863,11 +989,7 @@ impl LibraryFold {
                     return Err(FoldError::InvalidSchema);
                 }
                 if !self.fences.contains_key(&v.fence) {
-                    let retained = self
-                        .latest
-                        .values()
-                        .chain(self.intents.values())
-                        .find(|h| h.sequence == v.fence);
+                    let retained = self.at_sequence(v.fence);
                     let historical;
                     let record = if let Some(h) = retained {
                         Some(&h.record)
@@ -883,11 +1005,7 @@ impl LibraryFold {
                 }
             }
             MotionIntent(v) => {
-                if self
-                    .intents
-                    .values()
-                    .any(|h| matches!(&h.record.body,Body::MotionIntent(i) if i.command==v.command))
-                {
+                if self.commands.contains_key(&v.command) {
                     return Err(FoldError::ConflictingDuplicate);
                 }
                 if let Motion::Load(l) = &v.motion {
@@ -1046,6 +1164,14 @@ impl LibraryFold {
                 }
             }
             ReadinessObserved(v) => {
+                if let Some(d) = v.previous {
+                    if self.historical(d, history)?.is_some_and(|h| {
+                        matches!(&h.body, Body::ReadinessObserved(old)
+                            if old.operation == v.operation && old.result != ReadinessResult::Pending)
+                    }) {
+                        return Err(FoldError::OperationState);
+                    }
+                }
                 let h = self.chain(
                     Tag::ReadinessObserved,
                     Scope::Operation(v.operation),
@@ -1108,11 +1234,14 @@ impl LibraryFold {
                     // Cartridge selection can occur after Begin. Check the new resource
                     // binding at every active step, excluding this run's own prior state.
                     if !matches!(v.action, CleaningAction::Finish(_))
-                        && self.latest.values().any(|h| matches!(&h.record.body,
-                            Body::CleaningRecorded(c) if c.run_id != v.run_id
-                                && !matches!(c.action, CleaningAction::Finish(_) | CleaningAction::Expire(_) | CleaningAction::Register(_))
-                                && (v.drive_uuid.is_some() && v.drive_uuid == c.drive_uuid
-                                    || v.cartridge.is_some() && v.cartridge == c.cartridge))) {
+                        && (v
+                            .drive_uuid
+                            .and_then(|id| self.cleaning_drives.get(&id))
+                            .is_some_and(|run| *run != v.run_id)
+                            || v.cartridge
+                                .and_then(|t| self.cleaning_tapes.get(&t.uuid))
+                                .is_some_and(|run| *run != v.run_id))
+                    {
                         return Err(FoldError::CleaningBusy);
                     }
                 }
@@ -1151,17 +1280,34 @@ impl LibraryFold {
                 }
             }
             OperationRecorded(v) => {
+                if let Some(previous) = v.previous {
+                    if self.historical(previous, history)?.is_some_and(|r| matches!(&r.body, Body::OperationRecorded(old) if old.operation == v.operation && terminal(&old.event))) {
+                        return Err(FoldError::OperationState);
+                    }
+                }
                 let old = self.chain(
                     Tag::OperationRecorded,
                     Scope::Operation(v.operation),
                     v.previous,
                 )?;
                 if old.is_some_and(|h|matches!(&h.record.body,Body::OperationRecorded(o) if terminal(&o.event)||o.kind!=v.kind)){return Err(FoldError::OperationState);}
-                match &v.event{
-                    OperationEvent::Accepted(a)=>{if old.is_some(){return Err(FoldError::OperationState);}
-if let Some(k)=a.idempotency_key{if self.idempotency.get(&(a.actor_fingerprint.clone(),v.kind,k)).is_some_and(|x|*x!=(v.operation,a.request_fingerprint)){return Err(FoldError::ConflictingDuplicate);}}},
-                    OperationEvent::Started(_)=>{if old.is_some_and(|h|!matches!(&h.record.body,Body::OperationRecorded(o) if matches!(o.event,OperationEvent::Accepted(_)))){return Err(FoldError::OperationState);}},
-                    _=>{if old.is_none(){return Err(FoldError::OperationState);}}
+                match &v.event {
+                    OperationEvent::Accepted(a) => {
+                        if old.is_some() { return Err(FoldError::OperationState); }
+                        if let Some(k) = a.idempotency_key {
+                            if self.idempotency.get(&idempotency_digest(&a.actor_fingerprint, v.kind, k))
+                                .is_some_and(|x| *x != (v.operation, a.request_fingerprint)) {
+                                return Err(FoldError::ConflictingDuplicate);
+                            }
+                        }
+                    }
+                    OperationEvent::Started(_) => {
+                        if old.is_some_and(|h| !matches!(&h.record.body,
+                            Body::OperationRecorded(o) if matches!(o.event, OperationEvent::Accepted(_)))) {
+                            return Err(FoldError::OperationState);
+                        }
+                    }
+                    _ => { if old.is_none() { return Err(FoldError::OperationState); } }
                 }
             }
             SessionObserved(v) => {
@@ -1244,6 +1390,9 @@ if let Some(k)=a.idempotency_key{if self.idempotency.get(&(a.actor_fingerprint.c
         use Body::*;
         match b {
             Reprovision(v) => {
+                if let Some(l) = &v.label {
+                    self.labels.insert(l.clone(), v.tape.uuid);
+                }
                 self.tapes.insert(
                     v.tape.uuid,
                     TapeState {
@@ -1255,6 +1404,7 @@ if let Some(k)=a.idempotency_key{if self.idempotency.get(&(a.actor_fingerprint.c
                         label: v.label.clone(),
                         pool: v.pool.clone(),
                         calibration_generation: 0,
+                        wrap_digest: None,
                     },
                 );
             }
@@ -1264,6 +1414,12 @@ if let Some(k)=a.idempotency_key{if self.idempotency.get(&(a.actor_fingerprint.c
                 t.pool = v.pool.clone();
             }
             Label(v) => {
+                if let Some(l) = &self.tapes[&v.tape.uuid].label {
+                    self.labels.remove(l);
+                }
+                if let Some(l) = &v.label {
+                    self.labels.insert(l.clone(), v.tape.uuid);
+                }
                 if let Some(p) = &v.prior_holder {
                     let t = self.tapes.get_mut(&p.tape.uuid).unwrap();
                     t.label = None;
@@ -1274,6 +1430,9 @@ if let Some(k)=a.idempotency_key{if self.idempotency.get(&(a.actor_fingerprint.c
                 t.label_generation = v.change.next;
             }
             Retire(v) => {
+                if let Some(l) = &self.tapes[&v.tape.uuid].label {
+                    self.labels.remove(l);
+                }
                 let t = self.tapes.get_mut(&v.tape.uuid).unwrap();
                 t.retired = true;
                 t.pool = None;
@@ -1308,7 +1467,7 @@ if let Some(k)=a.idempotency_key{if self.idempotency.get(&(a.actor_fingerprint.c
                     FenceScope::Tape(tape) => Scope::Tape(tape.uuid),
                     FenceScope::Drive(endpoint) => Scope::Endpoint(endpoint.clone()),
                 };
-                self.latest.insert(
+                self.insert_latest(
                     (Tag::FenceReleased, scope, None),
                     Held {
                         sequence,
@@ -1320,6 +1479,14 @@ if let Some(k)=a.idempotency_key{if self.idempotency.get(&(a.actor_fingerprint.c
             MotionIntent(v) => {
                 if let (Some(op), Motion::Load(l)) = (v.parent_operation, &v.motion) {
                     self.loads.insert((op, l.endpoint.clone()), l.attempt);
+                    self.load_endpoints
+                        .entry(op)
+                        .or_default()
+                        .insert(l.endpoint.clone());
+                }
+                self.commands.insert(v.command, sequence);
+                for scope in b.scopes() {
+                    *self.intent_scopes.entry(scope).or_default() += 1;
                 }
                 self.intents.insert(
                     sequence,
@@ -1334,20 +1501,23 @@ if let Some(k)=a.idempotency_key{if self.idempotency.get(&(a.actor_fingerprint.c
                 if v.result == MotionResult::Unknown {
                     self.uncertain.insert(v.intent.sequence);
                 } else {
-                    self.intents.remove(&v.intent.sequence);
+                    self.remove_intent(v.intent.sequence);
                 }
             }
             InventoryReconciled(v) => {
                 self.inventories
                     .insert(v.library_serial.clone(), v.observation_generation);
                 for d in &v.resolves.0 {
-                    self.intents.remove(&d.sequence);
+                    self.remove_intent(d.sequence);
                     self.uncertain.remove(&d.sequence);
                 }
             }
             ReadinessObserved(v) => {
                 self.readiness
                     .insert(v.endpoint.clone(), v.ready_generation);
+                if v.result != ReadinessResult::Pending {
+                    self.close_loads(v.operation);
+                }
             }
             DriveObserved(v) => {
                 self.drives.entry(v.drive_uuid).or_insert((1, false));
@@ -1365,7 +1535,7 @@ if let Some(k)=a.idempotency_key{if self.idempotency.get(&(a.actor_fingerprint.c
                 if let OperationEvent::Accepted(a) = &v.event {
                     if let Some(k) = a.idempotency_key {
                         self.idempotency.insert(
-                            (a.actor_fingerprint.clone(), v.kind, k),
+                            idempotency_digest(&a.actor_fingerprint, v.kind, k),
                             (v.operation, a.request_fingerprint),
                         );
                     }
@@ -1375,16 +1545,64 @@ if let Some(k)=a.idempotency_key{if self.idempotency.get(&(a.actor_fingerprint.c
                 self.tapes
                     .get_mut(&v.tape.uuid)
                     .unwrap()
-                    .calibration_generation = v.calibration_generation
+                    .calibration_generation = v.calibration_generation;
+                self.tapes.get_mut(&v.tape.uuid).unwrap().wrap_digest = match &v.action {
+                    WrapAction::Cache(c) => Some(c.digest),
+                    _ => None,
+                };
+            }
+            CleaningRecorded(v)
+                if !matches!(
+                    v.action,
+                    CleaningAction::Register(_) | CleaningAction::Expire(_)
+                ) =>
+            {
+                let key = (
+                    Tag::CleaningRecorded,
+                    Scope::CleaningRun(v.run_id.clone()),
+                    None,
+                );
+                if let Some(h) = self.latest.get(&key) {
+                    if let Body::CleaningRecorded(old) = &h.record.body {
+                        if let Some(id) = old.drive_uuid {
+                            self.cleaning_drives.remove(&id);
+                        }
+                        if let Some(t) = old.cartridge {
+                            self.cleaning_tapes.remove(&t.uuid);
+                        }
+                    }
+                }
+                if !matches!(
+                    v.action,
+                    CleaningAction::Finish(_)
+                        | CleaningAction::Register(_)
+                        | CleaningAction::Expire(_)
+                ) {
+                    if let Some(id) = v.drive_uuid {
+                        self.cleaning_drives.insert(id, v.run_id.clone());
+                    }
+                    if let Some(t) = v.cartridge {
+                        self.cleaning_tapes.insert(t.uuid, v.run_id.clone());
+                    }
+                }
             }
             _ => {}
         }
+        if let Body::OperationRecorded(v) = b {
+            if terminal(&v.event) {
+                self.close_operation(v.operation);
+                return;
+            }
+        }
         if let Some(slot) = b.slot() {
             let key = (b.tag(), slot, b.slot_tape());
-            if matches!(b,SessionObserved(v) if v.event!=SessionEvent::Opened) {
-                self.latest.remove(&key);
+            if matches!(b,SessionObserved(v) if v.event!=SessionEvent::Opened)
+                || matches!(b, ReadinessObserved(v) if v.result != ReadinessResult::Pending)
+                || matches!(b, CleaningRecorded(v) if matches!(v.action, CleaningAction::Finish(_)))
+            {
+                self.remove_latest(&key);
             } else {
-                self.latest.insert(
+                self.insert_latest(
                     key,
                     Held {
                         sequence,
@@ -1440,7 +1658,7 @@ if let Some(k)=a.idempotency_key{if self.idempotency.get(&(a.actor_fingerprint.c
         };
         let scope = self.scopes_for(&record.body, history)?;
         let blocked = self.pending.iter().any(|p| !p.scope.is_disjoint(&scope))
-            || self.contradictions.keys().any(|s| scope.contains(s));
+            || scope.iter().any(|s| self.contradictions.contains_key(s));
         // Unblocked records must first be self-consistent library history. For a queued
         // scope only shape and native counterpart checks are decidable until predecessors apply.
         let native = if blocked {
@@ -1462,7 +1680,21 @@ if let Some(k)=a.idempotency_key{if self.idempotency.get(&(a.actor_fingerprint.c
             Err(FoldError::Unresolved) | Ok(()) => {}
             Err(e) => return Err(e),
         }
-        if blocked && !matches!(record.body, Body::FenceRaised(_)) {
+        if blocked && matches!(record.body, Body::FenceRaised(_)) {
+            let Body::FenceRaised(v) = &record.body else {
+                unreachable!()
+            };
+            if !matches!(
+                (&v.kind, &v.scope),
+                (FenceKind::Write, FenceScope::Tape(_))
+                    | (FenceKind::DriveFault, FenceScope::Drive(_))
+            ) {
+                return Err(FoldError::FenceScopeMismatch);
+            }
+            self.hold(sequence, record.clone(), receipt.clone(), scope)?;
+            self.pending.last_mut().unwrap().deferred_fence = true;
+            self.commit(sequence, record, receipt, view);
+        } else if blocked {
             self.hold(sequence, record, receipt, scope)?;
         } else {
             match self.validate_at(sequence, &record, view, history) {
@@ -1529,6 +1761,7 @@ if let Some(k)=a.idempotency_key{if self.idempotency.get(&(a.actor_fingerprint.c
             scope,
             bytes,
             receipt,
+            deferred_fence: false,
         });
         Ok(())
     }
@@ -1551,7 +1784,7 @@ if let Some(k)=a.idempotency_key{if self.idempotency.get(&(a.actor_fingerprint.c
             let mut it = pending.into_iter();
             while let Some(p) = it.next() {
                 if self.pending.iter().any(|q| !q.scope.is_disjoint(&p.scope))
-                    || self.contradictions.keys().any(|s| p.scope.contains(s))
+                    || p.scope.iter().any(|s| self.contradictions.contains_key(s))
                 {
                     self.pending.push(p);
                     continue;
@@ -1568,7 +1801,9 @@ if let Some(k)=a.idempotency_key{if self.idempotency.get(&(a.actor_fingerprint.c
                 match self.validate_at(p.sequence, &record, view, history) {
                     Ok(Validated::Apply) => {
                         self.pending_bytes -= p.bytes.len();
-                        self.commit(p.sequence, record, p.receipt, view);
+                        if !p.deferred_fence {
+                            self.commit(p.sequence, record, p.receipt, view);
+                        }
                     }
                     Ok(Validated::Duplicate(_)) => {
                         self.pending_bytes -= p.bytes.len();
@@ -1581,6 +1816,16 @@ if let Some(k)=a.idempotency_key{if self.idempotency.get(&(a.actor_fingerprint.c
                             Scope::Tape(record.body.at().unwrap().tape.uuid),
                             FoldError::TapeContradiction,
                         );
+                    }
+                    Err(
+                        e @ (FoldError::UnknownTape
+                        | FoldError::IncarnationMismatch
+                        | FoldError::RetiredIdentity),
+                    ) if p.deferred_fence => {
+                        self.pending_bytes -= p.bytes.len();
+                        for t in record.body.tapes() {
+                            self.contradictions.insert(Scope::Tape(t.uuid), e.clone());
+                        }
                     }
                     Err(e) => {
                         self.pending.push(p);
@@ -1603,23 +1848,14 @@ if let Some(k)=a.idempotency_key{if self.idempotency.get(&(a.actor_fingerprint.c
     }
     /// Whether a changer or standalone endpoint has unresolved motion.
     pub fn inventory_unknown(&self, scope: &Scope) -> bool {
-        self.intents
-            .values()
-            .any(|h| h.record.body.scopes().contains(scope))
+        self.intent_scopes.contains_key(scope)
     }
     /// Native tape fold's typed crash acknowledgment lookup.
     pub fn supersede(&self, sequence: u64) -> Option<&SupersedeTail> {
-        self.latest.values().find_map(|h| {
-            if h.sequence == sequence {
-                if let Body::SupersedeTail(v) = &h.record.body {
-                    Some(v)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        })
+        match &self.at_sequence(sequence)?.record.body {
+            Body::SupersedeTail(v) => Some(v),
+            _ => None,
+        }
     }
 }
 fn duplicate_key(a: &Body, b: &Body) -> bool {
@@ -1654,5 +1890,81 @@ fn duplicate_key(a: &Body, b: &Body) -> bool {
         | (Body::ManualFinalizationAccepted(_), Body::ManualFinalizationAccepted(_))
         | (Body::Reprovision(_), Body::Reprovision(_)) => true,
         _ => false,
+    }
+}
+
+/// Length-prefix the text component to make the lifetime idempotency scope unambiguous.
+fn idempotency_digest(actor: &Text, kind: OperationKind, key: Id) -> Hash {
+    let mut hash = Sha256::new();
+    hash.update((actor.0.len() as u64).to_le_bytes());
+    hash.update(actor.0.as_bytes());
+    hash.update((kind as u16).to_le_bytes());
+    hash.update(key);
+    hash.finalize().into()
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    use crate::library_log::tests::{endpoint, evidence, feed, Present};
+
+    /// Readiness can terminate without a separate OperationRecorded chain.
+    #[test]
+    fn terminal_readiness_releases_load_attempt_indexes() {
+        let mut fold = LibraryFold::default();
+        let endpoint = endpoint("LIBA0001");
+        feed(
+            &mut fold,
+            Body::MotionIntent(MotionIntent {
+                command: [1; 16],
+                parent_operation: Some([8; 16]),
+                motion: Motion::Load(Load {
+                    endpoint: endpoint.clone(),
+                    attempt: 1,
+                }),
+                tape: None,
+                inventory_generation: None,
+                readiness_generation: None,
+            }),
+            &Present,
+        )
+        .unwrap();
+        assert_eq!(fold.loads.len(), 1);
+        let intent = fold.intents.get(&1).unwrap().record.reference(1);
+        feed(
+            &mut fold,
+            Body::MotionOutcome(MotionOutcome {
+                intent,
+                result: MotionResult::Done,
+                evidence: evidence(),
+                confirmation: Some(Confirmation::Readiness(1)),
+            }),
+            &Present,
+        )
+        .unwrap();
+        feed(
+            &mut fold,
+            Body::ReadinessObserved(ReadinessObserved {
+                operation: [8; 16],
+                endpoint,
+                tape: None,
+                barcode: None,
+                phase: ReadinessPhase::Ready,
+                state: ReadinessState::Ready,
+                previous: None,
+                started_unix_ns: 0,
+                limit_ms: 1,
+                evidence: None,
+                load_intent: None,
+                ready_generation: 1,
+                result: ReadinessResult::Ready,
+            }),
+            &Present,
+        )
+        .unwrap();
+        assert_eq!(fold.loads.len(), 0);
+        assert_eq!(fold.load_endpoints.len(), 0);
+        assert_eq!(fold.retained_records(), 0);
+        assert_eq!(fold.idempotency_bytes(), 0);
     }
 }

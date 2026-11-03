@@ -1,6 +1,14 @@
 //! Library authority v1: typed records, deterministic CBOR, causal fold and segmented storage.
 //! This module has no production caller until the B4b authority cutover.
 //!
+//! Fold retention is proportional to resources and open operations. Terminal
+//! operation chains and load-attempt indexes are removed. Lifetime idempotency
+//! retains SHA-256(length-prefixed actor UTF-8, little-endian u16 kind, key) ->
+//! (operation UUID, request fingerprint): 80 bytes of key/value data per keyed
+//! operation, plus measured hash-table overhead. Pending is independently capped.
+//! Wrap-map descriptors remain in source records for the projector; the fold keeps
+//! only the digest and calibration generation per tape.
+//!
 //! Tag 20 (`DriveHealthObserved`) compares a non-null `(session_id, trigger)` only
 //! with the drive's latest retained snapshot: an identical body is a no-op and a
 //! different body is `ConflictingDuplicate`. The fold does not enforce lifetime
@@ -10,6 +18,7 @@
 //! observations remain independent snapshots. Counters are cumulative per mount.
 pub mod codec;
 pub mod fold;
+mod index;
 #[cfg(test)]
 mod reference_fixtures;
 pub mod store;
@@ -1476,7 +1485,7 @@ pub struct Record {
     pub body: Body,
 }
 /// Allocated record kinds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u16)]
 pub enum Tag {
     /// AssignPool.

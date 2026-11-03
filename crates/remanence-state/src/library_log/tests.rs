@@ -300,7 +300,7 @@ fn pending_blocks_only_its_scope_in_order() {
         )
         .unwrap();
     }
-    assert_eq!(f.pending.len(), 2);
+    assert_eq!(f.pending.len(), 3); // includes the already-applied fence validation
     assert_eq!(f.open_fences(), 1);
     assert_eq!(f.tapes[&tape(1).uuid].assignment_generation, 1);
     assert_eq!(f.tapes[&tape(2).uuid].assignment_generation, 2);
@@ -748,7 +748,22 @@ fn library_log_ambiguous_fsync_never_rolls_back_claim() {
                 for (p, b) in before {
                     assert_eq!(std::fs::read(p).unwrap(), b);
                 }
-                let expected = l.state().last_sequence;
+                let expected = if existing {
+                    if stage == 1 && !after {
+                        1
+                    } else {
+                        2
+                    }
+                } else if stage == 4 || stage == 3 && after {
+                    1
+                } else {
+                    0
+                };
+                assert_eq!(
+                    l.state().last_sequence,
+                    expected,
+                    "existing={existing}, stage={stage}, after={after}"
+                );
                 drop(l);
                 let r = replay(d.path(), LOG, &Present).unwrap();
                 assert_eq!(r.last_sequence, expected);
@@ -1090,10 +1105,15 @@ fn readiness_chain_generation_and_terminal_rules() {
     v.ready_generation = 2;
     v.result = ReadinessResult::Ready;
     feed(&mut f, Body::ReadinessObserved(v.clone()), &Present).unwrap();
+    let history = History(BTreeMap::from([(
+        4,
+        record(Body::ReadinessObserved(v.clone()), 4),
+    )]));
     v.previous = Some(record(diagnostic(), 4).reference(4));
     v.ready_generation = 3;
     assert_eq!(
-        feed(&mut f, Body::ReadinessObserved(v), &Present).unwrap_err(),
+        f.validate(&record(Body::ReadinessObserved(v), 5), &Present, &history)
+            .unwrap_err(),
         FoldError::OperationState
     );
 }
@@ -1113,6 +1133,21 @@ fn operation_idempotency_is_not_envelope_identity() {
         }),
     };
     feed(&mut f, Body::OperationRecorded(v.clone()), &Present).unwrap();
+    feed(
+        &mut f,
+        Body::OperationRecorded(OperationRecorded {
+            operation: v.operation,
+            kind: v.kind,
+            previous: Some(decision(3)),
+            event: OperationEvent::Finished(Response {
+                response_fingerprint: None,
+            }),
+        }),
+        &Present,
+    )
+    .unwrap();
+    assert_eq!(f.retained_records(), 2);
+    assert_eq!(f.idempotency_bytes(), 80);
     v.operation = [93; 16];
     assert_eq!(
         feed(&mut f, Body::OperationRecorded(v), &Present).unwrap_err(),
@@ -1474,18 +1509,9 @@ fn historical_references_use_memory_and_store_views() {
         assert!(r.refusal.is_none(), "{name}: {:?}", r.refusal);
     }
 }
-/// Superseded rule assignments never ask history, including while computing scopes.
+/// Rule references distinguish superseded configurations from unrelated records.
 #[test]
-fn stale_configuration_never_reads_history() {
-    struct MustNotRead;
-    impl LibraryHistory for MustNotRead {
-        fn lookup_fence(&self, _: u64) -> Result<Option<Record>, FoldError> {
-            panic!("configuration read fence history")
-        }
-        fn lookup(&self, _: DecisionRef) -> Result<Option<Record>, FoldError> {
-            panic!("configuration read history")
-        }
-    }
+fn rule_configuration_classifies_historical_kind() {
     let mut f = initialized();
     feed(&mut f, configuration(1), &Present).unwrap();
     feed(&mut f, configuration(2), &Present).unwrap();
@@ -1494,10 +1520,17 @@ fn stale_configuration_never_reads_history() {
         v.source = AssignmentSource::Rule;
         v.configuration = Some(decision(3));
     }
+    let mut history = History::default();
+    history.0.insert(3, record(configuration(1), 3));
     assert_eq!(
-        f.validate(&record(b, 5), &Present, &MustNotRead)
+        f.validate(&record(b.clone(), 5), &Present, &history)
             .unwrap_err(),
         FoldError::StaleConfiguration
+    );
+    history.0.insert(3, record(diagnostic(), 3));
+    assert_eq!(
+        f.validate(&record(b, 5), &Present, &history).unwrap_err(),
+        FoldError::WrongCounterpart
     );
 }
 /// A history read failure fails closed instead of becoming a missing counterpart.
@@ -1672,7 +1705,12 @@ fn identical_rule_retry_under_superseded_configuration_is_stale() {
     feed(&mut f, assignment.clone(), &Present).unwrap();
     feed(&mut f, configuration(2), &Present).unwrap();
     assert_eq!(
-        feed(&mut f, assignment, &Present).unwrap_err(),
+        f.validate(
+            &record(assignment, 6),
+            &Present,
+            &History(BTreeMap::from([(3, record(configuration(1), 3))]))
+        )
+        .unwrap_err(),
         FoldError::StaleConfiguration
     );
 }
@@ -1809,4 +1847,107 @@ fn release_without_fence_uses_absent_history() {
         feed(&mut f, release(1), &Present).unwrap_err(),
         FoldError::ReleaseWithoutFence
     );
+}
+
+/// A power cut after rotation preserves the entire chain of each synced receipt.
+#[test]
+fn rotation_syncs_previous_diagnostics_before_publication() {
+    use remanence_library::durable_file::test_support::register;
+    for authority in [false, true] {
+        let d = tempfile::tempdir().unwrap();
+        let cache = durability::PageCache::default();
+        let reg = register(d.path().into(), Arc::new(cache.clone()));
+        let (mut l, clock) = open(d.path(), &Present);
+        let mut receipts = vec![put(&mut l, provision(1, None))];
+        for _ in 0..3 {
+            let r = put(&mut l, diagnostic());
+            assert!(!r.synced);
+            receipts.push(r);
+        }
+        clock.0.fetch_add(86_400_000_000_000, Ordering::SeqCst);
+        receipts.push(put(
+            &mut l,
+            if authority { pool(1, 1) } else { diagnostic() },
+        ));
+        assert!(receipts.last().unwrap().synced);
+        drop(l);
+        cache.crash();
+        drop(reg);
+        let r = replay(d.path(), LOG, &Present).unwrap();
+        assert!(r.refusal.is_none(), "{:?}", r.refusal);
+        for receipt in receipts.into_iter().filter(|r| r.synced) {
+            assert!(r.last_sequence >= receipt.sequence);
+        }
+        assert_eq!(r.last_sequence, 5);
+    }
+}
+
+/// Failure of the old-file barrier must fence before publishing the successor.
+#[test]
+fn rotation_old_segment_sync_failure_is_ambiguous() {
+    use remanence_library::durable_file::test_support::register;
+    for after in [false, true] {
+        let d = tempfile::tempdir().unwrap();
+        let (mut l, clock) = open(d.path(), &Present);
+        put(&mut l, provision(1, None));
+        put(&mut l, diagnostic());
+        clock.0.fetch_add(86_400_000_000_000, Ordering::SeqCst);
+        let reg = register(
+            d.path().into(),
+            Arc::new(durability::FaultDirectory(Arc::new(
+                durability::Injection {
+                    stage: std::sync::atomic::AtomicU8::new(2),
+                    after,
+                },
+            ))),
+        );
+        assert!(matches!(
+            l.append(
+                pool(1, 1),
+                AuditActor::System,
+                SourceLayer::Layer4,
+                &Present
+            ),
+            Err(StoreError::Ambiguous(_))
+        ));
+        assert!(d.path().join("library-log.ambiguous").exists());
+        assert_eq!(l.state().last_sequence, 2);
+        // Old-file sync occurs before even constructing the next temporary.
+        assert!(!std::fs::read_dir(d.path()).unwrap().any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".segment-")));
+        drop(reg);
+        l.clear_ambiguity(&Present).unwrap();
+        assert_eq!(l.state().last_sequence, 2);
+    }
+}
+
+/// There must be a single implementation of canonical struct-map key ordering.
+#[test]
+fn fields_macro_delegates_shared_map_codec() {
+    let source = include_str!("wire.rs");
+    let fields = source
+        .split("macro_rules! fields {")
+        .nth(1)
+        .unwrap()
+        .split("macro_rules! enumeration")
+        .next()
+        .unwrap();
+    assert!(fields.contains("crate::log_frame::cbor::fields!($ty; $($field),+)"));
+    assert!(!fields.contains("impl Wire for"));
+}
+
+/// Every simple rejected vector declares the rule it is intended to exercise.
+#[test]
+fn semantic_vectors_pin_expected_errors() {
+    let cases: Vec<(&str, FoldError, Body)> = super::reference_fixtures::semantic_cases();
+    assert_eq!(cases.len(), 10);
+    let (_, expected, body) = cases
+        .iter()
+        .find(|(name, _, _)| *name == "release-wrong-counterpart")
+        .unwrap();
+    assert_eq!(*expected, FoldError::WrongCounterpart);
+    assert!(matches!(body, Body::FenceReleased(_)));
 }

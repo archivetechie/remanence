@@ -1667,6 +1667,19 @@ fn scanner_helper_literal_is_known_residual() {
     .is_empty());
 }
 
+/// Beside S10: crate constants require name resolution, which this lexical scanner lacks.
+/// A non-origin receiver and const argument are deliberately pinned as a blind spot;
+/// imports, reexports, shadowing and associated constants prevent sound lexical substitution.
+#[test]
+fn scanner_const_argument_is_known_residual() {
+    assert!(scan(
+        "example.rs",
+        r#"const BUSY: &str = "busy"; fn f(s: &str) -> bool { s.contains(BUSY) }"#,
+        "text-decision"
+    )
+    .is_empty());
+}
+
 /// Explicit path children of skipped modules and test-named files are excluded.
 #[test]
 fn scanner_test_path_includes() {
@@ -1871,4 +1884,49 @@ fn destinations_in_producer_table_are_records() {
 #[test]
 fn verification_progress_has_no_production_constructor() {
     census("library-reserved");
+}
+
+/// Error classification and refusal guards must remain in B6's decision floor.
+#[test]
+fn b2_review_error_text_labels_are_decisions() {
+    let table = include_str!("census/text-candidates.tsv");
+    for (path, function, pattern) in [
+        (
+            "crates/remanence-state/src/authority/resume.rs",
+            "from",
+            "text-equality",
+        ),
+        (
+            "crates/remanence-api/src/readiness_wait.rs",
+            "start_readiness_wait_with_index",
+            "text-equality",
+        ),
+        (
+            "crates/remanence-api/src/write_owner/robotics.rs",
+            "finish_library_operation",
+            "text-contains",
+        ),
+        (
+            "crates/remanence-api/src/startup_checkpoint.rs",
+            "replay_checkpoint_journal_projections_with_audit",
+            "text-equality",
+        ),
+        (
+            "crates/remanence-parity/src/terminal_inventory/one_pass.rs",
+            "verify_terminal_index_full_with_route",
+            "text-equality",
+        ),
+        (
+            "crates/remanence-cli/src/standalone.rs",
+            "dispatch",
+            "text-equality",
+        ),
+    ] {
+        let row = table
+            .lines()
+            .map(|line| line.split('\t').collect::<Vec<_>>())
+            .find(|row| row.len() == 6 && row[..3] == [path, function, pattern])
+            .unwrap();
+        assert_eq!(row[4], "decision", "{path}::{function}::{pattern}");
+    }
 }

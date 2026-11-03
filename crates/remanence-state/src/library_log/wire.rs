@@ -96,16 +96,7 @@ impl Wire for Negative {
 }
 macro_rules! fields {
     ($ty:ident; $($field:ident:$ft:ty),+ $(,)?) => {
-        impl Wire for $ty {
-            fn put(&self,w:&mut dyn Write)->io::Result<()> {
-                let names=[$(stringify!($field)),+]; head(w,5,names.len() as u64)?;let mut key=0u64;
-                $(key.put(w)?; let value:&$ft=&self.$field; value.put(w)?;key+=1;)+let _=key;Ok(())
-            }
-            fn get(r:&mut dyn Read)->io::Result<Self>{
-                let names=[$(stringify!($field)),+];if expect(r,5)?!=names.len() as u64{return Err(invalid());}let mut key=0u64;
-                $(if u64::get(r)?!=key{return Err(invalid());}let $field=<$ft>::get(r)?;key+=1;)+let _=key;Ok(Self{$($field),+})
-            }
-        }
+        crate::log_frame::cbor::fields!($ty; $($field),+);
         impl $ty {
             #[cfg(test)]
             pub(super) const FIELDS: &'static [(&'static str,&'static str)] = &[$((stringify!($field),stringify!($ft))),+];
