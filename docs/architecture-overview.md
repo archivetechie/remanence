@@ -636,7 +636,7 @@ Four rules shape the rest of the design.
   safely. What to archive and when, including retention, scheduling, and
   workflow, belongs to the orchestrator that calls the API.
 
-<!-- code-anchor: crates/remanence-chaos/src/lib.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
+<!-- code-anchor: crates/remanence-chaos/src/lib.rs @ f643f8c2 -->
 ## Testing infrastructure
 
 `remanence-chaos` wraps any SCSI transport with fault injection driven by
@@ -691,8 +691,9 @@ Cut numbers count capture events from one; `keep` counts retained tape records,
 unsynced bytes. All unlisted unsynced tails are discarded. These examples use the
 default suite; they remain defects rather than accepted production guarantees.
 
-The parity-journal names in these examples label trace events; current host
-authority resides in the per-tape logs.
+The cut numbers and parity-journal names come from a recorded capture; a
+current run prints its own cut descriptions, and host authority resides in the
+per-tape logs.
 
 | Reference | Refusal without tape identity | Example cut and crash choice |
 | --- | --- | --- |

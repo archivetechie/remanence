@@ -326,7 +326,7 @@ catalog says that X is gone.
   `--dry-run` takes no state lock and opens the catalog read-only, so it can be used while
   the daemon runs.
 
-<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-state/src/state.rs crates/remanence-state/src/index.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
+<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-state/src/state.rs crates/remanence-state/src/index.rs @ 625f7044 -->
 ## 7. Rebind: moving an operator label to another identity
 
 On a standalone drive the outside name is the operator's label, and the operator may need

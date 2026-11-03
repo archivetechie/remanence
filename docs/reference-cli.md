@@ -220,7 +220,7 @@ The command subscribes to udev and prints coalesced bursts until it is interrupt
 issues no SCSI commands. It needs a build with the `linux-udev` feature; without it, the
 command exits 1 with `` error: `rem watch` requires the `linux-udev` build feature. ``
 
-<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-cli/src/standalone_writing.rs crates/remanence-api/src/engine/drive_adapter.rs crates/remanence-library/src/discovery.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
+<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-cli/src/standalone_writing.rs crates/remanence-api/src/engine/drive_adapter.rs crates/remanence-library/src/discovery.rs @ 625f7044 -->
 ## Standalone drives
 
 The standalone interface operates one manually loaded drive directly. It needs no
