@@ -150,7 +150,29 @@ pub(super) fn feed(
     let n = f.received_through + 1;
     let r = record(b, n);
     let receipt = receipt(&r, n);
-    f.apply(n, r, receipt, v, &History::default())
+    let mut replay = f.clone();
+    let mut live = f.clone();
+    let result = super::differential_tests::step(
+        &mut live,
+        &mut replay,
+        r.clone(),
+        receipt.clone(),
+        v,
+        &History::default(),
+    );
+    let applied = f.apply(n, r, receipt, v, &History::default());
+    match &applied {
+        Ok(_) => {
+            result.unwrap();
+            f.assert_same_state(&live);
+        }
+        Err(error) => {
+            if let Err(replay_error) = result {
+                assert_eq!(error, &replay_error);
+            }
+        }
+    }
+    applied
 }
 pub(super) fn open(path: &Path, view: &dyn TapeView) -> (LibraryLog, FixedClock) {
     let c = FixedClock(Arc::new(AtomicU64::new(NOW + 1_000_000_000)));

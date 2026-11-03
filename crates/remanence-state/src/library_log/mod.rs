@@ -5,7 +5,8 @@
 //! operation chains and load-attempt indexes are removed. Lifetime idempotency
 //! retains SHA-256(length-prefixed actor UTF-8, little-endian u16 kind, key) ->
 //! (operation UUID, request fingerprint): 80 bytes of key/value data per keyed
-//! operation, plus measured hash-table overhead. Pending is independently capped.
+//! operation, plus measured hash-table overhead. Rare crash supersedes and
+//! unprotected acceptances retain one lifetime entry each. Pending is independently capped.
 //! Wrap-map descriptors remain in source records for the projector; the fold keeps
 //! only the digest and calibration generation per tape.
 //!
@@ -17,6 +18,8 @@
 //! is reported as a projection conflict and never applied. Unkeyed (null-session)
 //! observations remain independent snapshots. Counters are cumulative per mount.
 pub mod codec;
+#[cfg(test)]
+mod differential_tests;
 pub mod fold;
 mod index;
 #[cfg(test)]

@@ -1,24 +1,29 @@
 //! Hash indexes with deterministic probe accounting for replay cost regressions.
 //! Counts keyed reads/updates, not hash collisions or allocator work. Iteration is
 //! intentionally unavailable so history-sized scans cannot hide behind the metric.
-use std::{borrow::Borrow, cell::Cell, collections::HashMap, hash::Hash};
+use std::{
+    borrow::Borrow,
+    collections::HashMap,
+    hash::Hash,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 #[derive(Clone, Debug)]
 pub(super) struct Index<K, V> {
     entries: HashMap<K, V>,
-    probes: Cell<u64>,
+    probes: ProbeCounter,
 }
 impl<K, V> Default for Index<K, V> {
     fn default() -> Self {
         Self {
             entries: HashMap::new(),
-            probes: Cell::new(0),
+            probes: ProbeCounter::default(),
         }
     }
 }
 impl<K: Eq + Hash, V> Index<K, V> {
     fn probe(&self) {
-        self.probes.set(self.probes.get() + 1);
+        self.probes.increment();
     }
     pub fn probes(&self) -> u64 {
         self.probes.get()
@@ -68,6 +73,30 @@ impl<K: Eq + Hash, V> Index<K, V> {
     pub fn entry(&mut self, key: K) -> std::collections::hash_map::Entry<'_, K, V> {
         self.probe();
         self.entries.entry(key)
+    }
+}
+
+/// Relaxed instrumentation only: counts never synchronize authority state.
+#[derive(Debug, Default)]
+pub(super) struct ProbeCounter(AtomicU64);
+impl Clone for ProbeCounter {
+    fn clone(&self) -> Self {
+        Self(AtomicU64::new(self.get()))
+    }
+}
+impl ProbeCounter {
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+    pub fn increment(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+impl<K: Eq + Hash, V: PartialEq> PartialEq for Index<K, V> {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
     }
 }
 

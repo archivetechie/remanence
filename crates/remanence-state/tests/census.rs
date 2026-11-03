@@ -1930,3 +1930,13 @@ fn b2_review_error_text_labels_are_decisions() {
         assert_eq!(row[4], "decision", "{path}::{function}::{pattern}");
     }
 }
+
+/// The pool-write classification includes its stored committed-state comparisons.
+#[test]
+fn pool_write_replay_reason_accounts_for_committed_state() {
+    let row = include_str!("census/text-candidates.tsv").lines()
+        .find(|line| line.starts_with("crates/remanence-api/src/pool_write/no_parity.rs\tmaybe_replay_pool_write\ttext-equality\t"))
+        .expect("pool-write census row");
+    assert!(row.contains("enum-as-text"));
+    assert!(row.contains("copy.status == \"committed\""));
+}
