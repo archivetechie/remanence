@@ -32,7 +32,7 @@ crates/remanence-api/src/catalogless_restore.rs::scan_append_suffix_observed::te
 crates/remanence-api/src/closeout_obligation.rs::failed::text-equality	1
 crates/remanence-api/src/closeout_obligation.rs::refresh_closeout_surfaces::text-equality	1
 crates/remanence-api/src/closeout_obligation.rs::scan::text-equality	1
-crates/remanence-api/src/closeout_obligation.rs::spawn::text-equality	1
+crates/remanence-api/src/closeout_obligation.rs::service_claimed::text-equality	1
 crates/remanence-api/src/closeout_obligation.rs::transient::text-contains	2
 crates/remanence-api/src/closeout_obligation.rs::transient::text-equality	1
 crates/remanence-api/src/closeout_obligation.rs::wake_ready::text-matches	1
