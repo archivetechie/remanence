@@ -1954,6 +1954,16 @@ mod tests {
     /// handshake. The handshake requests no parity work from the drive actor.
     #[tokio::test]
     async fn operator_removal_waits_for_post_reply_closeout() {
+        check_operator_removal_closeout(false).await;
+    }
+
+    /// Worker drive-side work receives the same robotics wait as session closeout.
+    #[tokio::test]
+    async fn b10_fix_operator_removal_waits_for_worker_actor() {
+        check_operator_removal_closeout(true).await;
+    }
+
+    async fn check_operator_removal_closeout(worker: bool) {
         let mut state = state_with_snapshot();
         let (changer_tx, mut changer_rx) = tokio::sync::mpsc::channel(1);
         let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel(1);
@@ -1966,7 +1976,11 @@ mod tests {
             lifecycle.clone(),
         );
         state.drive_pool = Some(pool.clone());
-        let closing = lifecycle.closing.begin([0x41; 16], key).0;
+        let closing = if worker {
+            lifecycle.actor_work.begin([0; 16], key).0
+        } else {
+            lifecycle.closing.begin([0x41; 16], key).0
+        };
         let caller = state.clone();
         let mut task = tokio::spawn(async move {
             caller

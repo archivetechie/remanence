@@ -13,6 +13,8 @@ mod b9_fix_tests;
 #[path = "b9_tests.rs"]
 mod b9_tests;
 
+#[path = "b10_fix_tests.rs"]
+mod b10_fix_tests;
 #[path = "b7_tests.rs"]
 mod b7_tests;
 

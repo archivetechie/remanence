@@ -152,6 +152,12 @@ impl ClosingWork {
     }
 }
 impl ClosingGuard {
+    /// A cloned watch receiver proves the test opener reached the real wait.
+    #[cfg(test)]
+    pub(crate) fn test_has_waiter(&self) -> bool {
+        self._done.receiver_count() > 1
+    }
+
     /// Switch the short discovery hold to a long, watchable finalization.
     pub(crate) fn finalizing(&self, operation: Uuid) {
         self.work
@@ -320,8 +326,13 @@ fn holder_drive_label(drive: &DriveKey, serial: Option<&str>) -> String {
     }
 }
 
+#[cfg(test)]
+type ReservationHook = Box<dyn FnOnce(&DrivePool) + Send>;
+
 #[derive(Clone)]
 pub(crate) struct DrivePool {
+    #[cfg(test)]
+    pub(crate) post_wait_reservation_hook: Arc<Mutex<Option<ReservationHook>>>,
     closing: ClosingWork,
     worker_closing: ClosingWork,
     actor_work: ClosingWork,
@@ -345,6 +356,12 @@ impl DrivePool {
     #[cfg(test)]
     pub(crate) fn test_begin_closing(&self, tape: TapeUuid, drive: DriveKey) -> ClosingGuard {
         self.closing.begin(tape, drive).0
+    }
+
+    /// Model a drive-side maintenance command separately from its tape claim.
+    #[cfg(test)]
+    pub(crate) fn test_begin_actor_work(&self, drive: DriveKey) -> ClosingGuard {
+        self.actor_work.begin([0; 16], drive).0
     }
 
     pub(crate) fn ended_write(&self, id: Uuid) -> Option<crate::pb::WriteSession> {
@@ -401,8 +418,17 @@ impl DrivePool {
             .unwrap()
             .iter()
             .any(|((t, _), e)| matches(t, e));
+        let pending = pending
+            || self
+                .actor_work
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|((t, _), e)| matches(t, e));
         if pending {
             self.closing.wait(matches).await;
+            self.actor_work.wait(matches).await;
         }
         pending
     }
@@ -459,6 +485,8 @@ impl DrivePool {
         lifecycle: DrivePoolLifecycle,
     ) -> Self {
         Self {
+            #[cfg(test)]
+            post_wait_reservation_hook: Arc::default(),
             changers: Arc::new(changers),
             closing: lifecycle.closing,
             actor_work: lifecycle.actor_work,
@@ -720,10 +748,17 @@ impl DrivePool {
     /// session's post-reply closing guard supersedes its lingering mount entry.
     pub(crate) fn tape_selection_holds(&self) -> crate::pool_write::TapeSelectionHolds {
         use crate::pool_write::{TapeSelectionHold, TapeSelectionHolds};
-        let sessions = self.sessions.lock().unwrap();
-        let reservations = self.tape_reservations.lock().unwrap();
-        let workers = self.worker_closing.0.lock().unwrap();
-        let closing = self.closing.0.lock().unwrap();
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let reservations = self
+            .tape_reservations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let workers = self
+            .worker_closing
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let closing = self.closing.0.lock().unwrap_or_else(|e| e.into_inner());
         let mut holds = TapeSelectionHolds::default();
         for tape in sessions
             .values()
@@ -746,6 +781,16 @@ impl DrivePool {
             );
         }
         holds
+    }
+
+    /// Register a request's finalization under its already-held reservation.
+    pub(crate) fn begin_finalizing(&self, tape: TapeUuid, operation: Uuid) -> ClosingGuard {
+        let guard = self
+            .worker_closing
+            .begin(tape, DriveKey::new("maintenance", 0))
+            .0;
+        guard.finalizing(operation);
+        guard
     }
 
     /// Claim and publish the worker hold atomically with tape reservation.
@@ -1331,6 +1376,25 @@ pub(crate) mod tests {
         );
         drop(client);
         assert!(pool.reserve_tape_after_closeout(tape).await.is_ok());
+    }
+
+    /// Selection recovers the same poisoned ownership maps as reservation reads.
+    #[test]
+    fn b10_fix_selection_snapshot_recovers_poisoned_mutexes() {
+        let pool = test_pool();
+        let tape = [0xb1; 16];
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _sessions = pool.sessions.lock().unwrap();
+            let mut reserved = pool.tape_reservations.lock().unwrap();
+            reserved.insert(tape);
+            let _workers = pool.worker_closing.0.lock().unwrap();
+            let _closing = pool.closing.0.lock().unwrap();
+            panic!("poison ownership locks");
+        }));
+        assert!(matches!(
+            pool.tape_selection_holds().0.get(&tape),
+            Some(crate::pool_write::TapeSelectionHold::LiveWriter)
+        ));
     }
 
     /// Busy resolution waits for all matching owners, without joining another library.

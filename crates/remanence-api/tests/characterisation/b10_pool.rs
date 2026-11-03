@@ -101,9 +101,20 @@ fn authority(fixture: &Harness, tape: [u8; 16]) -> remanence_state::TapeAuthorit
 /// Three immediate pool sessions append files 1, 2, 3 on the first cartridge.
 #[tokio::test]
 async fn b10_three_pool_sessions_keep_the_first_seated_tape() {
+    three_pool_sessions(remanence_state::PoolSelectionPolicyName::CompleteOrFill).await;
+}
+
+/// FillOldest retains the same tape across real post-reply session holds.
+#[tokio::test]
+async fn b10_three_pool_sessions_fill_oldest() {
+    three_pool_sessions(remanence_state::PoolSelectionPolicyName::FillOldest).await;
+}
+
+async fn three_pool_sessions(policy: remanence_state::PoolSelectionPolicyName) {
     use remanence_chaos::file_model::{FileEvent, MemoryDirectory};
     use remanence_library::durable_file::test_support::register;
-    let fixture = two_tapes(false);
+    let mut fixture = two_tapes(false);
+    fixture.config.tape_pools[0].selection_policy = policy;
     let files = MemoryDirectory::default();
     let _registration = register(
         fixture.config.journal.dir.join("tapes"),
@@ -330,6 +341,18 @@ async fn check_pool_closeout(fence: bool) {
         "{text}"
     );
     if fence {
+        assert_eq!(
+            text.matches("pool selection skipped tape after closeout; selecting again")
+                .count(),
+            1,
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("pool selection waiting for tape closeout")
+                .count(),
+            1,
+            "{text}"
+        );
         assert!(
             text.contains("pool selection skipped tape after closeout; selecting again")
                 && text.contains("b10 hold ended fenced"),
@@ -412,4 +435,97 @@ async fn b10_rolled_tape_first_checkpoint_projects_extent_through_catalog_rpc() 
         catalog_tape(&client, SECOND).await.written_extent_lba,
         Some(cursor)
     );
+}
+
+/// Initialized no-parity authority survives abort before the first Object.
+#[tokio::test]
+async fn b10_empty_aborted_pool_session_remains_eligible() {
+    let fixture = two_tapes(false);
+    let client = fixture.start().await;
+    let session = open_pool(&client).await;
+    assert_eq!(session.tape_uuid, Some(UUID.to_vec()));
+    client
+        .writer()
+        .abort_write_session(pb::AbortWriteSessionRequest {
+            session_id: session.session_id,
+            reason: Some("before first Object".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let next = open_pool(&client).await;
+    assert_eq!(next.tape_uuid, Some(UUID.to_vec()));
+    client.close(&next).await;
+    client.state.shutdown_drive_pool().await.unwrap();
+}
+
+/// Request-owned finalization exposes its operation through Catalog CloseoutTape.
+#[tokio::test]
+async fn b10_request_finalization_closeout_returns_typed_busy() {
+    let fixture = two_tapes(true);
+    let client = fixture.start().await;
+    let session = open_pool(&client).await;
+    client
+        .append(&session, "before-finalization", b"committed")
+        .await;
+    client.close(&session).await;
+    // Join the session's ending before gating the request-owned finalization.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let summary = authority(&fixture, UUID).observe_summary().unwrap();
+            if summary.open_session.is_none() && !summary.closeout_due() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let (entered, at_barrier) = tokio::sync::oneshot::channel();
+    let (release, gate) = std::sync::mpsc::channel();
+    fixture.injection.lock().unwrap().held_barrier = Some((entered, gate));
+    let mut catalog = pb::catalog_client::CatalogClient::new(client.channel.clone());
+    let accepted = catalog
+        .finalize_tape(pb::FinalizeTapeRequest {
+            tape_uuid: UUID.to_vec(),
+            expected_pool_id: Some("archive".into()),
+            reason: "busy regression".into(),
+            idempotency_key: Some(pb::IdempotencyKey {
+                value: uuid::Uuid::new_v4().as_bytes().to_vec(),
+            }),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    tokio::time::timeout(Duration::from_secs(10), at_barrier)
+        .await
+        .unwrap()
+        .unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        catalog.closeout_tape(pb::CloseoutTapeRequest {
+            tape_uuid: UUID.to_vec(),
+            expected_pool_id: Some("archive".into()),
+            idempotency_key: Some(pb::IdempotencyKey {
+                value: uuid::Uuid::new_v4().as_bytes().to_vec(),
+            }),
+        }),
+    )
+    .await;
+    release.send(()).unwrap();
+    let error = result
+        .expect("CloseoutTape refuses without waiting")
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Aborted);
+    assert_eq!(
+        error
+            .metadata()
+            .get_bin("remanence-busy-operation-bin")
+            .unwrap()
+            .to_bytes()
+            .unwrap()
+            .as_ref(),
+        accepted.operation_id.unwrap()
+    );
+    client.state.shutdown_drive_pool().await.unwrap();
 }

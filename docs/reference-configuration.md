@@ -275,6 +275,21 @@ pool, and Remanence picks the tape. Pool ids may use letters, digits, and
 | `block_size` | byte size | `262144` (256 KiB) | Fixed tape block size applied when a fresh tape is initialized into this pool. Must be exactly 256 KiB, 512 KiB, or 1 MiB. |
 | `min_object_size` | byte size | `0` | Minimum object/bundle size the orchestrator promises; checked against the watermark band. |
 
+### Within-pool tape choice
+
+The configured policy ranks eligible tapes, including tapes held for short
+session endings or worker closeout. A pool open waits when the selected tape is
+held, then checks admission again. Closeout-due tapes are preferred when they
+fit, including the pending sidecar charge; there is no recency override.
+Debt parked for operator intervention ranks after every other eligible tape.
+It remains eligible when no alternative fits, so admission reports the actual
+refusal. If that refusal has also marked the tape `recovery_required`, the
+original parked refusal is reported when no writable alternative remains.
+Live sessions and finalization remain excluded. These holds count as reserved
+before fullness and fence checks, so even a full or fenced held tape can produce
+`NoUnreservedWritableTapes`. A closing tape without durable authority also counts
+as reserved.
+
 Capacity admission subtracts the exact terminal reserve before admitting an
 Object. The terminal reserve is the space the tape must keep free for the
 terminal suffix (three index copies, A, B and C, with two separation extents

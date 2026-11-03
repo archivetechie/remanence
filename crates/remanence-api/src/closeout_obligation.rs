@@ -34,6 +34,7 @@ struct Retry {
     library: String,
     parked: bool,
     reason: Option<String>,
+    refusal: Option<Status>,
     woken: bool,
     readiness: Option<Uuid>,
 }
@@ -81,6 +82,44 @@ fn finalization_due(s: &TapeSummary) -> bool {
     !s.sealed && (s.seal_due.is_some() || s.finalization.as_ref().is_some_and(|p| !p.prepared))
 }
 impl WorkList {
+    /// Scheduling snapshot only; actual admission still proves native authority.
+    pub(crate) fn parked_tapes(&self) -> HashSet<[u8; 16]> {
+        self.entries
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|((tape, _), retry)| retry.parked.then_some(*tape))
+            .collect()
+    }
+    /// Preserve the original parked refusal even if it also changed the catalog
+    /// to recovery_required, causing selection to stop before actor admission.
+    pub(crate) fn parked_refusal(&self, tape: [u8; 16]) -> Option<Status> {
+        self.entries
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|((id, _), retry)| {
+                (*id == tape && retry.parked)
+                    .then(|| retry.refusal.clone())
+                    .flatten()
+            })
+    }
+    /// Exclude current owners at every dispatch tick, including between scans.
+    fn claim_unheld(&self, now: Instant, held: &HashSet<[u8; 16]>) -> Vec<Key> {
+        self.claim_filtered(now, false, held)
+    }
+    /// Assert live ownership caused no work-list attempts or retry diagnostics.
+    #[cfg(test)]
+    pub(crate) fn assert_unattempted_for_test(&self, tape: [u8; 16]) {
+        let entries = self.entries.lock().unwrap();
+        let retries: Vec<_> = entries.iter().filter(|((id, _), _)| *id == tape).collect();
+        assert!(!retries.is_empty());
+        for (_, retry) in retries {
+            assert_eq!(retry.attempt, 0);
+            assert!(!retry.running);
+            assert!(retry.reason.is_none(), "{:?}", retry.reason);
+        }
+    }
     #[cfg(test)]
     pub(crate) fn contains(&self, key: Key) -> bool {
         self.entries.lock().unwrap().contains_key(&key)
@@ -96,6 +135,7 @@ impl WorkList {
                 library: "unlocated".into(),
                 parked: false,
                 reason: None,
+                refusal: None,
                 woken: false,
                 readiness: None,
             });
@@ -103,7 +143,11 @@ impl WorkList {
             entries.remove(&key);
         }
     }
+    #[cfg(test)]
     fn claim(&self, now: Instant, wake: bool) -> Vec<Key> {
+        self.claim_filtered(now, wake, &HashSet::new())
+    }
+    fn claim_filtered(&self, now: Instant, wake: bool, held: &HashSet<[u8; 16]>) -> Vec<Key> {
         let mut entries = self.entries.lock().unwrap();
         if wake {
             for retry in entries.values_mut() {
@@ -121,7 +165,8 @@ impl WorkList {
         entries
             .iter_mut()
             .filter_map(|(key, r)| {
-                if !r.running
+                if !held.contains(&key.0)
+                    && !r.running
                     && (wake || (!r.parked && r.next <= now))
                     && busy.insert(r.library.clone())
                 {
@@ -144,6 +189,7 @@ impl WorkList {
         let transient = transient(error);
         if let Some(r) = self.entries.lock().unwrap().get_mut(&key) {
             let reason = error.message().to_string();
+            r.refusal = Some(error.clone());
             if !transient && self.warned.lock().unwrap().insert((key, error.code())) {
                 tracing::warn!(tape_uuid = %Uuid::from_bytes(key.0), %error, "closeout needs operator; waiting for wake");
             }
@@ -247,6 +293,7 @@ impl WorkList {
         if let Some(retry) = self.entries.lock().unwrap().get_mut(&key) {
             retry.media_failures = 0;
             retry.reason = None;
+            retry.refusal = None;
             retry.parked = false;
             retry.readiness = None;
         }
@@ -361,7 +408,7 @@ impl RetryCause {
         status
     }
 }
-fn transient(error: &Status) -> bool {
+pub(crate) fn transient(error: &Status) -> bool {
     if crate::readiness_wait::ReadinessFence::from_status(error).is_some()
         || crate::drive_pool::TapeBusy::from_status(error).is_some()
     {
@@ -800,7 +847,11 @@ pub(crate) fn spawn(state: ApiState) {
                 if state.readiness_shutdown.load(Ordering::Acquire) {
                     break;
                 }
-                state.closeout_work.claim(Instant::now(), false)
+                let held = state
+                    .drive_pool()
+                    .map(|pool| pool.mounted_tape_uuids())
+                    .unwrap_or_default();
+                state.closeout_work.claim_unheld(Instant::now(), &held)
             };
             for key in claimed {
                 let state = state.clone();

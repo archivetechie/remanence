@@ -4470,11 +4470,11 @@ fn checkpoint_selection_reports_every_accept_sealed_legacy_candidate() {
 }
 
 /// Run `f` and return every INFO+ event it logged, rendered as text.
-fn capture_info_logs<F: FnOnce() -> T, T>(f: F) -> (T, String) {
+fn capture_debug_logs<F: FnOnce() -> T, T>(f: F) -> (T, String) {
     let log_file = tempfile::tempfile().expect("log capture file");
     let mut reader = log_file.try_clone().expect("clone log capture file");
     let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_max_level(tracing::Level::DEBUG)
         .with_ansi(false)
         .with_writer(move || log_file.try_clone().expect("clone log writer"))
         .finish();
@@ -4486,7 +4486,7 @@ fn capture_info_logs<F: FnOnce() -> T, T>(f: F) -> (T, String) {
 }
 
 #[test]
-fn selection_logs_fenced_skips_when_another_tape_is_selected() {
+fn selection_logs_fenced_skips_at_debug_when_another_tape_is_selected() {
     let mut index = test_index();
     project_pool(&mut index, "camera.copy-a");
     project_no_parity_tape(&mut index, "camera.copy-a", POOL_WRITE_TAPE_UUID);
@@ -4502,22 +4502,33 @@ fn selection_logs_fenced_skips_when_another_tape_is_selected() {
     let cfg = pool_config("camera.copy-a");
 
     let (selected, logs) =
-        capture_info_logs(|| select_tape_in_pool(&index, &cfg, 123, &HashSet::new()));
+        capture_debug_logs(|| select_tape_in_pool(&index, &cfg, 123, &HashSet::new()));
     let selected = selected.expect("the unfenced tape is selected");
     assert_eq!(selected.tape_uuid, SECOND_POOL_WRITE_TAPE_UUID);
     assert!(
-        logs.contains("pool selection skipped tapes under an active tape-I/O fence"),
+        logs.contains("DEBUG") && logs.contains("pool selection skipped tape"),
         "{logs}"
     );
     assert!(
         logs.contains(&format!(
-            "RMN004L9 ({}) fenced by {}: position_mismatch",
-            Uuid::from_bytes(POOL_WRITE_TAPE_UUID),
+            "fenced by {}: position_mismatch",
             fence.quarantine_id
         )),
         "{logs}"
     );
-    assert!(logs.contains("skipped_count=1"), "{logs}");
+    assert!(
+        logs.contains(&Uuid::from_bytes(POOL_WRITE_TAPE_UUID).to_string()),
+        "{logs}"
+    );
+    assert_eq!(
+        logs.matches("pool selection skipped tape").count(),
+        1,
+        "{logs}"
+    );
+    assert!(
+        !logs.contains("INFO"),
+        "speculative selector passes stay DEBUG: {logs}"
+    );
 
     // Nothing is logged when no candidate was fenced.
     index
@@ -4525,12 +4536,12 @@ fn selection_logs_fenced_skips_when_another_tape_is_selected() {
         .expect("release fence")
         .expect("released fence");
     let (selected, logs) =
-        capture_info_logs(|| select_tape_in_pool(&index, &cfg, 123, &HashSet::new()));
+        capture_debug_logs(|| select_tape_in_pool(&index, &cfg, 123, &HashSet::new()));
     assert_eq!(
         selected.expect("selection after release").tape_uuid,
         POOL_WRITE_TAPE_UUID
     );
-    assert!(!logs.contains("active tape-I/O fence"), "{logs}");
+    assert!(!logs.contains("pool selection skipped tape"), "{logs}");
 }
 
 #[test]
@@ -4682,6 +4693,7 @@ fn write_session_selection_respects_the_physical_library_scope() {
         &crate::pool_write::TapeSelectionHolds::default(),
         checkpoint_dir.path(),
         &allowed,
+        &mut crate::pool_write::SelectionSkips::default(),
     )
     .expect("select tape from physical library scope");
 

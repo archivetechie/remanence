@@ -336,6 +336,15 @@ impl Client {
             loop {
                 match reader.open_read_session(request.clone()).await {
                     Ok(session) => break session.into_inner(),
+                    Err(error) if error.code() == tonic::Code::Aborted => {
+                        let operation = error
+                            .metadata()
+                            .get_bin("remanence-busy-operation-bin")
+                            .expect("finalization Busy carries its operation")
+                            .to_bytes()
+                            .unwrap();
+                        uuid::Uuid::from_slice(&operation).expect("Busy operation is a UUID");
+                    }
                     Err(error) => {
                         assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}")
                     }
