@@ -4,7 +4,7 @@ Notable changes to Remanence and its published formats. The format
 specifications carry their own revision histories; entries here are
 per-release summaries.
 
-<!-- code-anchor: crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/drive_pool.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-api/src/append_admission.rs crates/remanence-state/src/index.rs crates/remanence-cli/src/lib.rs crates/remanence-stream/src/lib.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
+<!-- code-anchor: crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/drive_pool.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-api/src/append_admission.rs crates/remanence-state/src/index.rs crates/remanence-cli/src/lib.rs crates/remanence-stream/src/lib.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
 ## Unreleased
 
 - Each write session owns its parity epoch. Checkpoints commit objects within
@@ -17,8 +17,8 @@ per-release summaries.
   startup and services due tapes without a client request. It limits media work
   to configured libraries and drives, with one attempt per library. Pool writes
   prefer eligible due tapes and rank parked tapes behind other fitting candidates.
-  The
-  [closeout-debt guide](docs/guide-troubleshooting.md#closeout-debt) explains
+  Capacity accounts for the sidecar, and seal-due tapes receive no further objects.
+  The [closeout-debt guide](docs/guide-troubleshooting.md#closeout-debt) explains
   retries, wake conditions and the resulting robot motion.
 - `rem catalog tapes`, live status and `rem top` show unprotected bytes, their
   original age, overdue state and worker refusals, including tapes outside
@@ -58,6 +58,8 @@ per-release summaries.
   `journal_dir/tapes/<lowercase-simple-uuid>.remtape`, for tapes with or without
   parity. The layout marker is `state_dir/authority-format`; the catalog schema
   is 24. Ordinary opens refuse schemas 1 through 23, and no importer is available.
+  Old file names remain recognized for refusal and declared-reset archival;
+  tape formats and media bytes are unchanged.
   See the [declared reset procedure](docs/guide-troubleshooting.md#authority-layout-refusals-and-declared-reset).
   `rem-debug tape-log inspect` reports log-tail damage; `rem-debug tape-log
   repair-tail` archives a damaged suffix with explicit confirmation and requires
@@ -92,24 +94,24 @@ per-release summaries.
 - A daemon changer move that fails because the library is transiently not
   ready (`02/3B/12` medium magazine removed, `02/04/01` becoming ready,
   `02/04/18` door open), or whose endpoint already reports exception `3B/12`,
-  now waits for the library instead of failing the client operation. The
+  waits for the library instead of failing the client operation. The
   daemon polls with TEST UNIT READY, re-reads the source and destination once
   the changer and both elements are ready, and retries up to three times only
   when both are unchanged and the source barcode was known; a changed
-  inventory refuses as before with a `Refused` audit event. The bound is the
-  new `[daemon] changer_not_ready_wait_seconds` (default 600, at most 3600,
-  `0` keeps the old behaviour). Daemon shutdown, a cancelled robotics or
+  inventory refuses with a `Refused` audit event. The bound is the
+  `[daemon] changer_not_ready_wait_seconds` (default 600, at most 3600,
+  `0` refuses immediately). Daemon shutdown, a cancelled robotics or
   reconcile operation, and a write-open client that goes away during the load
   move end the wait. A wait that began before any MOVE and ends by its
   deadline or a stop sends no MOVE and reports `MoveError::NotReady`. The wait
   is logged, shown by `rem top`, and carried in the new live-status field
   `LibraryState.changer_wait`.
 
-- `rem tape init` can now erase a Remanence tape whose BOT UUID has no catalog
-  row, which previously could only be adopted. Pass `--clobber-data
+- `rem tape init` can erase a Remanence tape whose BOT UUID has no catalog
+  row. Pass `--clobber-data
   --clobber-unknown-tape <UUID>` with the clobber confirmation; the UUID must
   equal the BOT UUID exactly. Adoption stays the default, and the
-  `needs-explicit-rebuild` refusal now gives both adoption and the override as
+  `needs-explicit-rebuild` refusal gives both adoption and the override as
   runnable commands with the UUID filled in. A mismatch refuses and names both
   UUIDs. Committed copies in the catalog that still reference the BOT UUID also
   refuse. BOT is re-read just before the write and must still carry the named
@@ -122,7 +124,7 @@ per-release summaries.
   Archive-write errors keep the typed cause first and include the actor's
   additional recovery, fence-persistence, and checkpoint retry advice.
 
-- Pool-selected `rem-debug archive write` now uses the same in-process write
+- Pool-selected `rem-debug archive write` uses the same in-process write
   actor on its actual library bay. Committed replay still avoids loading tape;
   locator output and the gated WOR checkpoint crash seam are preserved. The
   caller also takes the host device lock to coordinate with standalone use of
@@ -136,7 +138,7 @@ per-release summaries.
   New adapter-only errors use their local diagnostic: device-lock acquisition,
   bay/retained-library identity, mount readiness, endpoint
   audit/admission, actor startup/stoppage, and owner cleanup failures have no
-  direct-writer equivalent. In particular a failed ALLOW is now reported as
+  direct-writer equivalent. In particular a failed ALLOW is reported as
   a write failure after the committed locator rather than only being logged.
   Archive-write diagnostic differences where the actor has no retained typed
   cause are:
@@ -418,11 +420,11 @@ per-release summaries.
   startup reconciliation, load waits and `rem tape wait-ready --wait` all do
   this. The operation records the attempt before the LOAD and sends no second
   one until the drive reports ready. A cartridge left unthreaded by a daemon
-  killed between unload and move no longer holds a write session behind its
-  fence until the readiness timeout. Library code that matches
+  killed between unload and move can become ready after this LOAD. Library code
+  that matches
   `MediaReadinessWaitEvent` must accept the `InitializingLoad` and
   `InitializingLoadFailed` variants.
-- A graceful daemon stop no longer separates a cartridge's SSC UNLOAD from
+- A graceful daemon stop keeps a cartridge's SSC UNLOAD together with
   its move home. The pair runs on a task that owns the bay reservation, so a
   cancelled eviction request still finishes the move. Idle and eviction
   dismounts do not start once shutdown has begun, and SIGHUP starts the same
@@ -444,7 +446,7 @@ per-release summaries.
   skips barcodes its init script has already initialized, re-threads a drive
   left not ready before draining, and waits a minute for a graceful daemon
   stop. Bring-up stops the daemon before it kills the daemon's tmux session, so
-  the shutdown messages are no longer lost. It refuses to start the daemon when
+  the shutdown messages are captured. It refuses to start the daemon when
   the locked-memory limit it would inherit is below 1 GiB and not unlimited
   (`FIELD_ALLOW_LOW_MEMLOCK=1` overrides), and when the configuration uses
   serial append staging (`FIELD_ALLOW_SERIAL_STAGING=1` overrides for a

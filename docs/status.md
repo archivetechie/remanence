@@ -172,15 +172,16 @@ Authorization is a role matrix with no scope below the role. A client is
 readonly, operator, orchestrator, admin or system, and a role cannot be narrowed
 to particular pools, tapes or objects.
 
-<!-- code-anchor: crates/remanence-api/src/write_session_ingress.rs crates/remanence-api/src/tape_closeout.rs crates/remanence-api/src/daemon_catalog_services.rs proto/layer5.proto @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
+<!-- code-anchor: crates/remanence-api/src/catalog_conversion.rs crates/remanence-api/src/read_session_service.rs crates/remanence-api/src/library.rs crates/remanence-api/src/write_session_ingress.rs crates/remanence-api/src/tape_closeout.rs crates/remanence-api/src/daemon_catalog_services.rs proto/layer5.proto @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
 ### Some daemon operations are not implemented
 
 Library import and export through the mailslot, library-event streaming, and
 write-session restart all return `unimplemented`. So do write sessions that
 target a drive; sessions that target a pool or a pinned tape both work.
-Write-session RPCs reject caller-supplied `idempotency_key` values. Their replay
-detection does not use that field. `Catalog.CloseoutTape` and
-`Catalog.FinalizeTape` require an idempotency key for retries.
+`Catalog.CloseoutTape` and `Catalog.FinalizeTape` require an idempotency key
+and replay a retried request. Every other RPC refuses a non-empty
+`idempotency_key` with `UNIMPLEMENTED`; write-session replay detection does
+not use that field.
 
 ## Known limitations found in field testing
 
@@ -235,10 +236,12 @@ attempt reports `FAILED`, keeps the tape's finalizing intent, and resumes under
 the same operation ID when the caller retries with the same idempotency key.
 `rem tape finalize --wait` exits with the attempt's error summary.
 
-<!-- code-anchor: crates/remanence-api/src/startup_media_readiness.rs crates/remanence-api/src/mount.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
+<!-- code-anchor: crates/remanence-api/src/startup_media_readiness.rs crates/remanence-api/src/mount.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
 ### A cartridge left unthreaded by a hard kill
 
 A hard kill during an unload can leave the cartridge in the drive unthreaded.
+The field evidence includes a readiness LOAD reproduced on the same drive
+after the daemon is killed during an unload.
 The drive then asks for an initializing command. When inventory shows the
 cartridge in the drive, the readiness wait sends one LOAD and records the
 attempt so a restart does not repeat it. A stop signal lets an unload already

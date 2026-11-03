@@ -220,7 +220,7 @@ The command subscribes to udev and prints coalesced bursts until it is interrupt
 issues no SCSI commands. It needs a build with the `linux-udev` feature; without it, the
 command exits 1 with `` error: `rem watch` requires the `linux-udev` build feature. ``
 
-<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-cli/src/standalone_writing.rs crates/remanence-api/src/engine/drive_adapter.rs crates/remanence-library/src/discovery.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-cli/src/standalone_writing.rs crates/remanence-api/src/engine/drive_adapter.rs crates/remanence-library/src/discovery.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
 ## Standalone drives
 
 The standalone interface operates one manually loaded drive directly. It needs no
@@ -393,7 +393,7 @@ refused: adopt it with `rem tape adopt` (the default), or erase it with
 `--clobber-data --clobber-unknown-tape <UUID>` naming that exact UUID, plus the clobber
 confirmation. The refusal prints the UUID to copy. A different UUID, or the flag on any
 other tape, refuses without writing. A label that already belongs to another tape is refused
-with `label <LABEL> belongs to tape <UUID>; use tape rebind --previous-uuid <UUID> or choose a new label`.
+with `label <LABEL> belongs to tape <UUID>; choose a new label`.
 
 The parser accepts `--generation` values `L1` to `L9`, `LZ` and `M8`. The drive's measured
 density wins and is recorded. Without `--generation`, a label that ends in a generation code
@@ -764,7 +764,7 @@ To follow a detached verification:
 rem op watch 9b1d2c3e-4f50-4a61-8b72-93a4b5c6d7e8
 ```
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-api/src/closeout_obligation.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-api/src/closeout_obligation.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
 ### rem catalog tapes, rem catalog tape
 
 List the catalogued tapes, or show one.
@@ -805,8 +805,9 @@ Both JSON responses carry closeout debt from the native tape log:
 
 The list prints every returned tape, then exits 1 with
 `closeout authority unreadable for N tape(s); debt is unknown` if any native log
-cannot be read. The single-tape command carries the error field but does not
-change its exit status for unreadable authority. See [Closeout debt](guide-troubleshooting.md#closeout-debt)
+cannot be read. `rem catalog tape` fails with the daemon's error and exits 1
+when that tape's native log cannot be read; it does not print a partial record.
+See [Closeout debt](guide-troubleshooting.md#closeout-debt)
 for automatic servicing and operator recovery.
 
 To list the tapes in pool `archive`:
@@ -1266,7 +1267,7 @@ Without `--dry-run` the first line is
 standard error by a `warning:` line naming the objects that lost their last committed copy.
 An identity that is already retired prints `... is already retired; no change`.
 
-<!-- code-anchor: crates/remanence-cli/src/tape_closeout.rs crates/remanence-api/src/tape_closeout.rs crates/remanence-api/src/auth.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
+<!-- code-anchor: crates/remanence-cli/src/tape_closeout.rs crates/remanence-api/src/tape_closeout.rs crates/remanence-api/src/auth.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
 ### rem tape closeout
 
 ```text
@@ -1280,6 +1281,11 @@ a barcode matching more than one data tape is refused. Use the UUID to disambigu
 rejoin the original operation even if that pool assignment subsequently changed.
 OperationControl authorization is required: the `operator`, `orchestrator`,
 `admin` or `system` role. These are client permissions, not job titles.
+
+- `--expected-pool <EXPECTED_POOL>` checks the pool before fresh work.
+- `--idempotency-key <IDEMPOTENCY_KEY>` supplies a non-nil UUID to retry the same request.
+- `--endpoint <ENDPOINT>` selects the daemon endpoint (default `unix:/var/lib/rem/rem.sock`).
+- `--json` prints the terminal operation and diagnostics as JSON.
 
 Supply a non-nil `--idempotency-key` for a retry. If omitted, the command generates
 one and prints it to stderr **before connecting or sending the RPC**; retain it

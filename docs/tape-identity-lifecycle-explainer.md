@@ -326,7 +326,7 @@ catalog says that X is gone.
   `--dry-run` takes no state lock and opens the catalog read-only, so it can be used while
   the daemon runs.
 
-<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-state/src/state.rs crates/remanence-state/src/index.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-state/src/state.rs crates/remanence-state/src/index.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
 ## 7. Rebind: moving an operator label to another identity
 
 On a standalone drive the outside name is the operator's label, and the operator may need
@@ -337,11 +337,15 @@ already knows. Retire is the wrong tool here, because X is not dead; its objects
 on it.
 
 `rem tape init --label FIRST` on such a cartridge is refused before it writes anything, and
-the refusal names the way out:
+the refusal asks for an unused label:
 
 ```text
-error: label FIRST belongs to tape 5e8f8d3b-0c1a-4d2e-9f60-7a1b2c3d4e5f; use tape rebind --previous-uuid 5e8f8d3b-0c1a-4d2e-9f60-7a1b2c3d4e5f or choose a new label
+error: label FIRST belongs to tape 5e8f8d3b-0c1a-4d2e-9f60-7a1b2c3d4e5f; choose a new label
 ```
+
+For a blank cartridge, initialize it under an unused label first. A blank
+cartridge has no bootstrap identity for rebind to read. Once the loaded
+cartridge has a catalogued identity, rebind can move `FIRST` to it.
 
 `rem tape rebind` is a standalone-drive command. It reads the tape UUID from the bootstrap of
 the cartridge in the drive, so the cartridge that should carry the label must be loaded.
