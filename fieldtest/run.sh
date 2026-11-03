@@ -51,6 +51,8 @@ export REMFIELD_ENV="${REMFIELD_ENV:-field}"
 # shellcheck disable=SC1091 # Dynamic kit root; lib.sh is checked separately.
 # shellcheck source=scripts/lib.sh
 source "$scripts/lib.sh"
+# Every plan needs the kit's Python before its first leg; refuse here, before any device access.
+fieldtest_python >/dev/null || { echo "run.sh: refused before any device access" >&2; exit 2; }
 set +e
 fieldtest_init_layout
 
@@ -145,7 +147,9 @@ if [[ -n "$interrupted" ]]; then
 elif [[ -n "$failed" ]]; then
   reason="$failed failed"
 fi
-if [[ -n "$failed" || -n "$interrupted" ]]; then
+# A failed preflight has started nothing, and the owner's exclusion may not be attested yet:
+# capture no device diagnostics for it.
+if [[ ( -n "$failed" && "$failed" != "00-preflight.sh" ) || -n "$interrupted" ]]; then
   echo "run.sh: === diagnostics ($reason)"
   # Teardown ignores TERM, so use SIGKILL to enforce this last diagnostic
   # deadline and always reach the daemon stop that returns cartridges home.

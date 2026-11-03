@@ -32,17 +32,22 @@ fieldtest_script_dir() {
 # configuration with tomllib, which needs Python 3.11 or later; RHEL 9's default
 # python3 is 3.9. FIELD_PYTHON names one explicitly; otherwise the first of
 # python3.13, python3.12, python3.11 and python3 that can import tomllib is used.
+# A FIELD_PYTHON that cannot import tomllib is refused by name, never skipped.
 fieldtest_python() {
-  if [[ -n "${FIELDTEST_PYTHON_CHOSEN:-}" ]]; then
-    printf '%s\n' "$FIELDTEST_PYTHON_CHOSEN"
-    return 0
-  fi
   local candidate path
-  for candidate in ${FIELD_PYTHON:-} python3.13 python3.12 python3.11 python3; do
+  if [[ -n "${FIELD_PYTHON:-}" ]]; then
+    path="$(command -v -- "$FIELD_PYTHON" 2>/dev/null)" || {
+      echo "refused: FIELD_PYTHON=$FIELD_PYTHON is not an executable" >&2; return 2; }
+    if "$path" -c 'import tomllib' >/dev/null 2>&1; then
+      printf '%s\n' "$path"
+      return 0
+    fi
+    echo "refused: FIELD_PYTHON=$FIELD_PYTHON cannot import tomllib (needs Python 3.11 or later)" >&2
+    return 2
+  fi
+  for candidate in python3.13 python3.12 python3.11 python3; do
     path="$(command -v -- "$candidate" 2>/dev/null)" || continue
     if "$path" -c 'import tomllib' >/dev/null 2>&1; then
-      FIELDTEST_PYTHON_CHOSEN="$path"
-      export FIELDTEST_PYTHON_CHOSEN
       printf '%s\n' "$path"
       return 0
     fi
