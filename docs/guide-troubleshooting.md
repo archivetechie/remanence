@@ -798,8 +798,8 @@ an inventory refusal. Check the refreshed inventory and other initiators before
 requesting another move. A full home slot requires an explicit empty destination;
 the daemon does not select a replacement automatically.
 
-A failed move also refreshes inventory. Sense `05/3B/0E` reports a full
-destination. An unload followed by a failed move does not prove that the
+A failed move also refreshes inventory. Sense `05/3B/0D` reports a full destination
+and `05/3B/0E` an empty source. An unload followed by a failed move does not prove that the
 cartridge remains in the drive; use the fresh element status for recovery.
 
 <!-- code-anchor: crates/remanence-library/src/handle/changer_ready.rs crates/remanence-api/src/live_status.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->

@@ -3514,34 +3514,43 @@ mod compat_tests {
         assert_eq!(log.iter().filter(|cdb| cdb[0] == 0x08).count(), 1);
     }
 
-    /// ILI without complete INFORMATION remains the single reader's error.
+    /// Truncated ILI is completion-unknown on both paths, with raw evidence retained.
     #[test]
     fn truncated_ili_batch_fault_matches_single_read_error() {
         for len in 3..7 {
             let mut sense = vec![0; len];
             sense[0] = 0xf0;
             sense[2] = 0x20;
-            assert_stable_batch_fault_matches_single(sense, 0, None);
+            assert_stable_batch_fault_matches_single(sense, 0, None, true);
         }
     }
 
     /// Even recovered completions accepted by restore are re-read singly.
     #[test]
     fn recovered_batch_completion_matches_single_read_error() {
-        for sense in [
+        for mut sense in [
             vec![0x70, 0, 0x01],
             vec![0xf0, 0, 0x01, 0, 0, 0, 0],
             vec![0x72, 0x01, 0, 0],
         ] {
-            assert_stable_batch_fault_matches_single(sense, 4, None);
+            // This tests recovered completion policy, not missing ASC/ASCQ.
+            if sense[0] & 0x7f == 0x70 {
+                sense.resize(18, 0);
+                sense[7] = 10;
+            }
+            assert_stable_batch_fault_matches_single(sense, 4, None, false);
         }
     }
 
     /// Recovered completions rejected by restore also use the single error policy.
     #[test]
     fn rejected_recovered_batch_completion_matches_single_check_condition() {
-        assert_stable_batch_fault_matches_single(vec![0x72, 1, 0, 0], 0, None);
-        assert_stable_batch_fault_matches_single(vec![0xf0, 0, 1, 0, 0, 0, 1], 4, Some(3));
+        assert_stable_batch_fault_matches_single(vec![0x72, 1, 0, 0], 0, None, false);
+        // Keep the one-record residue, with complete key/ASC/ASCQ evidence.
+        let mut sense = vec![0xf0, 0, 1, 0, 0, 0, 1];
+        sense.resize(18, 0);
+        sense[7] = 10;
+        assert_stable_batch_fault_matches_single(sense, 4, Some(3), false);
     }
 
     #[test]
@@ -3727,6 +3736,7 @@ mod compat_tests {
         sense: Vec<u8>,
         bytes_transferred: u32,
         corrected_bytes: Option<u32>,
+        completion_unknown: bool,
     ) {
         let fault = || remanence_library::ScsiError::CheckCondition {
             sense: sense.clone(),
@@ -3765,7 +3775,7 @@ mod compat_tests {
                 }
                 raw.read_record(&mut [0; 4]).unwrap_err()
             };
-            match (&error, corrected_bytes) {
+            match (&error, corrected_bytes, completion_unknown) {
                 (
                     ParityError::TapeIo(TapeIoError::CheckConditionWithResidue {
                         source:
@@ -3776,6 +3786,7 @@ mod compat_tests {
                         bytes_transferred: corrected,
                     }),
                     Some(expected),
+                    false,
                 ) => {
                     assert_eq!(actual, &sense);
                     assert_eq!(*kernel, bytes_transferred);
@@ -3789,6 +3800,20 @@ mod compat_tests {
                         },
                     )),
                     None,
+                    false,
+                ) => {
+                    assert_eq!(actual, &sense);
+                    assert_eq!(*kernel, bytes_transferred);
+                }
+                (
+                    ParityError::TapeIo(TapeIoError::Transport(
+                        remanence_library::ScsiError::CheckCondition {
+                            sense: actual,
+                            bytes_transferred: kernel,
+                        },
+                    )),
+                    None,
+                    true,
                 ) => {
                     assert_eq!(actual, &sense);
                     assert_eq!(*kernel, bytes_transferred);

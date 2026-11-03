@@ -40,7 +40,7 @@ pub mod sg_io;
 pub use error::ScsiError;
 pub use inquiry::{DeviceType, Inquiry};
 pub use read_element_status::{Element, ElementStatusData, ElementType};
-pub use sense::{decode_sense, DecodedSense};
+pub use sense::{decode_sense, decode_usable_sense, DecodedSense};
 pub use vpd::{
     Association, CodeSet, DesignatorType, DeviceDesignator, DeviceIdentification, UnitSerial,
     VpdHeader,

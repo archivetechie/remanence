@@ -25,7 +25,7 @@
 //! failures, `CheckCondition` for target-reported CHECK CONDITION
 //! (with sense bytes and bytes_transferred derived from `resid`), and
 //! `TransportError` for host/driver/transport-level faults that the
-//! ioctl reports without a CHECK CONDITION.
+//! ioctl reports, including alongside CHECK CONDITION.
 
 use core::ffi::{c_int, c_uint, c_ushort};
 use std::fs::File;
@@ -128,31 +128,82 @@ fn captured_sense(sense: &[u8; SENSE_BUF_LEN as usize], len: u8) -> Vec<u8> {
 }
 
 fn classify_non_check_condition_failure(
-    hdr: &sg_io_hdr_t,
-    sense: &[u8; SENSE_BUF_LEN as usize],
+    status: u8,
+    host_status: u16,
+    driver_status: u16,
+    info: u32,
+    sense: Vec<u8>,
 ) -> Option<ScsiError> {
-    let info = hdr.info;
-    let transport_ok =
-        (info & SG_INFO_OK_MASK) == 0 && hdr.host_status == 0 && hdr.driver_status == 0;
-    if hdr.status != 0 && transport_ok {
-        return Some(ScsiError::UnexpectedStatus { status: hdr.status });
+    let transport_ok = (info & SG_INFO_OK_MASK) == 0 && host_status == 0 && driver_status == 0;
+    if status != 0 && transport_ok {
+        return Some(ScsiError::UnexpectedStatus { status });
     }
 
-    let transport_bad = (info & SG_INFO_OK_MASK) != 0
-        || hdr.host_status != 0
-        || hdr.driver_status != 0
-        || hdr.status != 0;
+    let transport_bad =
+        (info & SG_INFO_OK_MASK) != 0 || host_status != 0 || driver_status != 0 || status != 0;
     if transport_bad {
         return Some(ScsiError::TransportError {
-            status: hdr.status,
-            host_status: hdr.host_status,
-            driver_status: hdr.driver_status,
+            status,
+            host_status,
+            driver_status,
             info,
-            sense: captured_sense(sense, hdr.sb_len_wr),
+            sense,
         });
     }
 
     None
+}
+
+/// Classify the captured completion fields without issuing I/O. CHECK CONDITION
+/// preserves the clamped residual count; other failures retain their original fields.
+fn classify_completion(
+    status: u8,
+    host_status: u16,
+    driver_status: u16,
+    info: u32,
+    resid: i32,
+    dxfer_len: u32,
+    sense: Vec<u8>,
+) -> Result<usize, ScsiError> {
+    if (status & 0xFE) == STATUS_CHECK_CONDITION {
+        // Linux sets DRIVER_SENSE and SG_INFO_CHECK on ordinary autosense.
+        // Only the driver low nibble describes a failure; high suggest bits
+        // do not invalidate an otherwise ordinary CHECK CONDITION.
+        let driver = driver_status & 0x0f;
+        if host_status != 0 || !matches!(driver, 0x00 | 0x08) {
+            return Err(ScsiError::TransportError {
+                status,
+                host_status,
+                driver_status,
+                info,
+                sense,
+            });
+        }
+        let bytes_transferred = if resid < 0 || i64::from(resid) > i64::from(dxfer_len) {
+            0
+        } else {
+            dxfer_len - resid as u32
+        };
+        return Err(ScsiError::CheckCondition {
+            sense,
+            bytes_transferred,
+        });
+    }
+    if let Some(error) =
+        classify_non_check_condition_failure(status, host_status, driver_status, info, sense)
+    {
+        return Err(error);
+    }
+    if resid < 0 || i64::from(resid) > i64::from(dxfer_len) {
+        return Err(ScsiError::TransportError {
+            status,
+            host_status,
+            driver_status,
+            info,
+            sense: Vec::new(),
+        });
+    }
+    Ok(dxfer_len as usize - resid as usize)
 }
 
 // SG_IO is defined in sg.h as a literal 0x2285 (no _IOC encoding of size).
@@ -236,51 +287,15 @@ pub fn execute_in(
         ioctl::sg_io(dev.as_raw_fd(), &mut hdr).map_err(|e| ScsiError::Io(e.into()))?;
     }
 
-    // CHECK CONDITION — the common, expected "soft" error. Status is the
-    // raw SCSI status byte; high bits are reserved/vendor and the spec
-    // defines status values masked at 0xFE.
-    //
-    // Compute bytes_transferred FIRST: CHECK CONDITION can be raised
-    // after a partial data transfer (ILI on short read, EOM on write
-    // — see IBM LTO SCSI Reference §4.12.1 / Table 17), and Layer 3a
-    // needs the partial count. If resid is out of range we clamp to 0
-    // rather than synthesise a fake count.
-    if (hdr.status & 0xFE) == STATUS_CHECK_CONDITION {
-        let bytes_transferred = if hdr.resid < 0 || (hdr.resid as i64) > (dxfer_len as i64) {
-            0
-        } else {
-            dxfer_len - (hdr.resid as u32)
-        };
-        let sense = captured_sense(&sense, hdr.sb_len_wr);
-        return Err(ScsiError::CheckCondition {
-            sense,
-            bytes_transferred,
-        });
-    }
-
-    // Transport-layer failure: ioctl said 0 but the kernel marked the
-    // request as not OK, or the host/driver complained, or the SCSI status
-    // byte was something other than GOOD (0) / CHECK_CONDITION.
-    let info = hdr.info as u32;
-    if let Some(error) = classify_non_check_condition_failure(&hdr, &sense) {
-        return Err(error);
-    }
-
-    // Compute bytes transferred. resid can in principle be negative
-    // (target sent more than we asked for) or larger than dxfer_len
-    // (driver bug). Both cases indicate the kernel/driver/HBA are
-    // misbehaving — surface it as a transport error rather than silently
-    // returning a wrong count.
-    if hdr.resid < 0 || (hdr.resid as i64) > (dxfer_len as i64) {
-        return Err(ScsiError::TransportError {
-            status: hdr.status,
-            host_status: hdr.host_status as u16,
-            driver_status: hdr.driver_status as u16,
-            info,
-            sense: Vec::new(),
-        });
-    }
-    Ok((dxfer_len as usize) - (hdr.resid as usize))
+    classify_completion(
+        hdr.status,
+        hdr.host_status,
+        hdr.driver_status,
+        hdr.info,
+        hdr.resid,
+        hdr.dxfer_len,
+        captured_sense(&sense, hdr.sb_len_wr),
+    )
 }
 
 /// Send a CDB with no data phase (`SG_DXFER_NONE`). For state-changing
@@ -334,21 +349,16 @@ pub fn execute_none(dev: &File, cdb: &[u8], timeout_ms: u32) -> Result<(), ScsiE
         ioctl::sg_io(dev.as_raw_fd(), &mut hdr).map_err(|e| ScsiError::Io(e.into()))?;
     }
 
-    if (hdr.status & 0xFE) == STATUS_CHECK_CONDITION {
-        let sense = captured_sense(&sense, hdr.sb_len_wr);
-        // execute_none has no data phase, so bytes_transferred is
-        // structurally 0 — the field exists for API uniformity
-        // with execute_in.
-        return Err(ScsiError::CheckCondition {
-            sense,
-            bytes_transferred: 0,
-        });
-    }
-
-    if let Some(error) = classify_non_check_condition_failure(&hdr, &sense) {
-        return Err(error);
-    }
-    Ok(())
+    classify_completion(
+        hdr.status,
+        hdr.host_status,
+        hdr.driver_status,
+        hdr.info,
+        0,
+        0,
+        captured_sense(&sense, hdr.sb_len_wr),
+    )
+    .map(|_| ())
 }
 
 /// Send a CDB to `dev` and write `data_out` to the device. Returns
@@ -421,34 +431,15 @@ pub fn execute_out(
         ioctl::sg_io(dev.as_raw_fd(), &mut hdr).map_err(|e| ScsiError::Io(e.into()))?;
     }
 
-    if (hdr.status & 0xFE) == STATUS_CHECK_CONDITION {
-        let bytes_transferred = if hdr.resid < 0 || (hdr.resid as i64) > (dxfer_len as i64) {
-            0
-        } else {
-            dxfer_len - (hdr.resid as u32)
-        };
-        let sense = captured_sense(&sense, hdr.sb_len_wr);
-        return Err(ScsiError::CheckCondition {
-            sense,
-            bytes_transferred,
-        });
-    }
-
-    let info = hdr.info as u32;
-    if let Some(error) = classify_non_check_condition_failure(&hdr, &sense) {
-        return Err(error);
-    }
-
-    if hdr.resid < 0 || (hdr.resid as i64) > (dxfer_len as i64) {
-        return Err(ScsiError::TransportError {
-            status: hdr.status,
-            host_status: hdr.host_status as u16,
-            driver_status: hdr.driver_status as u16,
-            info,
-            sense: Vec::new(),
-        });
-    }
-    Ok((dxfer_len as usize) - (hdr.resid as usize))
+    classify_completion(
+        hdr.status,
+        hdr.host_status,
+        hdr.driver_status,
+        hdr.info,
+        hdr.resid,
+        hdr.dxfer_len,
+        captured_sense(&sense, hdr.sb_len_wr),
+    )
 }
 
 /// Request a Linux sg reserved buffer size and return the actual size
@@ -510,6 +501,50 @@ mod tests {
     use super::*;
     use std::fs::OpenOptions;
 
+    /// Ordinary Linux autosense metadata and suggest bits preserve sense and the residual.
+    #[test]
+    fn b3a_check_condition_benign_driver_fields() {
+        for driver in [0, 8, 0x18] {
+            for (resid, expected) in [(512, 1536), (0, 2048), (-1, 0), (2049, 0)] {
+                let sense = vec![0x70; 18];
+                let error =
+                    classify_completion(2, 0, driver, 1, resid, 2048, sense.clone()).unwrap_err();
+                assert!(
+                    matches!(error, ScsiError::CheckCondition { sense: s, bytes_transferred } if s == sense && bytes_transferred == expected)
+                );
+            }
+        }
+    }
+
+    /// A host timeout alongside CHECK CONDITION cannot be hidden by autosense.
+    #[test]
+    fn b3a_check_condition_host_failure_keeps_fields_and_sense() {
+        let sense = vec![0x70; 18];
+        let error = classify_completion(2, 3, 8, 1, 0, 2048, sense.clone()).unwrap_err();
+        assert!(
+            matches!(error, ScsiError::TransportError { status: 2, host_status: 3, driver_status: 8, info: 1, sense: s } if s == sense)
+        );
+    }
+
+    /// A driver timeout alongside CHECK CONDITION remains a transport failure.
+    #[test]
+    fn b3a_check_condition_driver_failure_keeps_fields_and_sense() {
+        let sense = vec![0x70; 18];
+        let error = classify_completion(2, 0, 6, 1, 0, 2048, sense.clone()).unwrap_err();
+        assert!(
+            matches!(error, ScsiError::TransportError { status: 2, host_status: 0, driver_status: 6, info: 1, sense: s } if s == sense)
+        );
+    }
+
+    /// Missing autosense without a transport fault reaches the library as CHECK CONDITION.
+    #[test]
+    fn b3a_check_condition_empty_capture() {
+        let error = classify_completion(2, 0, 8, 1, 0, 0, Vec::new()).unwrap_err();
+        assert!(
+            matches!(error, ScsiError::CheckCondition { sense, bytes_transferred: 0 } if sense.is_empty())
+        );
+    }
+
     fn completion_hdr(status: u8, host_status: u16, driver_status: u16, info: u32) -> sg_io_hdr_t {
         sg_io_hdr_t {
             interface_id: 'S' as c_int,
@@ -542,8 +577,14 @@ mod tests {
         let sense = [0u8; SENSE_BUF_LEN as usize];
         let hdr = completion_hdr(0x08, 0, 0, 0);
 
-        let error =
-            classify_non_check_condition_failure(&hdr, &sense).expect("BUSY status should fail");
+        let error = classify_non_check_condition_failure(
+            hdr.status,
+            hdr.host_status,
+            hdr.driver_status,
+            hdr.info,
+            captured_sense(&sense, hdr.sb_len_wr),
+        )
+        .expect("BUSY status should fail");
 
         assert!(matches!(
             error,
@@ -556,8 +597,14 @@ mod tests {
         let sense = [0u8; SENSE_BUF_LEN as usize];
         let hdr = completion_hdr(0x08, 0x0001, 0, 0);
 
-        let error =
-            classify_non_check_condition_failure(&hdr, &sense).expect("host failure should fail");
+        let error = classify_non_check_condition_failure(
+            hdr.status,
+            hdr.host_status,
+            hdr.driver_status,
+            hdr.info,
+            captured_sense(&sense, hdr.sb_len_wr),
+        )
+        .expect("host failure should fail");
 
         assert!(matches!(
             error,

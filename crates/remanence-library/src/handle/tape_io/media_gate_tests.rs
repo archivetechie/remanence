@@ -803,6 +803,22 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
                 why: "standalone boundary-test forwarder uses only in-memory ModelTransport and FixtureTransport; no real device",
             },
         ),
+        (
+            "remanence-library/src/handle/tape_io/completion_evidence_tests.rs",
+            DispatchPolicy::Exact {
+                execute_out: 1,
+                execute_none: 1,
+                why: "completion-evidence tests forward only to FixtureTransport; no device I/O",
+            },
+        ),
+        (
+            "remanence-library/src/handle/changer_evidence_tests.rs",
+            DispatchPolicy::Exact {
+                execute_out: 1,
+                execute_none: 1,
+                why: "changer-evidence tests forward only to FixtureTransport and fixture inventory; no device I/O",
+            },
+        ),
         // Frozen P1 model-only fault-injection forwarders.
         ("remanence-api/tests/oracle_standalone_mount.rs", DispatchPolicy::Exact { execute_out: 1, execute_none: 2, why: "P1 model fault-injection forwarder" }),
         ("remanence-cli/tests/standalone_dispatch.rs", DispatchPolicy::Exact { execute_out: 2, execute_none: 2, why: "integration model and source-mutation transport forwarders; no production dispatch" }),
