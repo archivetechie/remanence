@@ -1,0 +1,3 @@
+crates/remanence-state/src/lib.rs::<module>::library_log	1
+crates/remanence-state/src/library_log/mod.rs::fixture_progress::constructor::VerificationProgress	1
+crates/remanence-state/src/library_log/mod.rs::fixture_unprotected::constructor::AcceptUnprotectedFinalization	1

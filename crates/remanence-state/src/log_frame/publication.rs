@@ -93,6 +93,22 @@ pub fn publish_new(
     File::open(directory)?.sync_all()
 }
 
+/// Append a prevalidated diagnostic frame without establishing durability.
+/// A failed write is ambiguous and fences the logical target exactly as a synced
+/// append does. A subsequent authority append's sync covers these earlier bytes.
+pub fn append_without_sync(
+    output: &mut File,
+    bytes: &[u8],
+    target: &Path,
+    directory: &Path,
+) -> io::Result<()> {
+    let result = output.write_all(bytes);
+    if result.is_err() {
+        fence_ambiguity(directory, target);
+    }
+    result
+}
+
 /// Append a prevalidated frame and establish durability. For first publication,
 /// the already-written header/provisional prefix is in `temporary`. The optional
 /// callback preserves a family's before-sync observer at the actual boundary.
@@ -105,8 +121,8 @@ pub fn append_and_publish(
     directory: &Path,
     before_sync: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
+    append_without_sync(output, bytes, target, directory)?;
     let result = (|| {
-        output.write_all(bytes)?;
         before_sync()?;
         if let Some(temporary) = temporary {
             publish_new(output, temporary, target, directory)

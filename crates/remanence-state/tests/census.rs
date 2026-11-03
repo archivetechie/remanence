@@ -1,8 +1,8 @@
 //! Migration ratchets for SQL mutation, audit production and text-based policy.
 //! Tokenization joins wrapped chains and ignores comments. Keys use the enclosing
 //! function, never a line number; counts also catch an added site in that function.
-//! All files are scanned to EOF. Only cfg(test) items/blocks are removed, using
-//! balanced tokens (comments and string contents never act as delimiters).
+//! All files are scanned to EOF. Test-only cfg items and their module files are
+//! removed using balanced tokens; any(test, ...) and not(test) remain visible.
 //! This is a conservative lexical ratchet, not Rust type resolution: append
 //! candidates and event readers are retained and labelled in the producer table.
 
@@ -10,10 +10,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Token {
     text: String,
     literal: bool,
+    string: bool,
 }
 
 fn tokens(source: &str) -> Vec<Token> {
@@ -69,6 +70,7 @@ fn tokens(source: &str) -> Vec<Token> {
                         out.push(Token {
                             text: source[quote + 1..i].into(),
                             literal: true,
+                            string: true,
                         });
                         i += 1 + hashes;
                         break;
@@ -96,6 +98,7 @@ fn tokens(source: &str) -> Vec<Token> {
             out.push(Token {
                 text: source[quote + 1..i].into(),
                 literal: true,
+                string: true,
             });
             i += 1;
         } else if b[i] == b'\'' && (b.get(i + 2) == Some(&b'\'') || b.get(i + 1) == Some(&b'\\')) {
@@ -113,6 +116,7 @@ fn tokens(source: &str) -> Vec<Token> {
             out.push(Token {
                 text: source[start..i].into(),
                 literal: true,
+                string: false,
             });
         } else {
             i += 1;
@@ -128,6 +132,7 @@ fn tokens(source: &str) -> Vec<Token> {
             out.push(Token {
                 text: source[start..i].into(),
                 literal: false,
+                string: false,
             });
         }
     }
@@ -169,6 +174,9 @@ fn receiver_start(t: &[Token], mut end: usize) -> usize {
                 }
             }
         }
+        if end > 0 && sequence(&t[end - 1..], &["!"]) {
+            end -= 1;
+        }
         if end > 0
             && !t[end - 1].literal
             && (t[end - 1].text.as_bytes()[0].is_ascii_alphabetic()
@@ -200,9 +208,6 @@ fn excluded(path: &Path) -> bool {
 fn files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
-        if excluded(&path) {
-            continue;
-        }
         if path.is_dir() {
             files(&path, out);
         } else if path.extension().is_some_and(|x| x == "rs") {
@@ -235,14 +240,174 @@ fn group_end(t: &[Token], start: usize) -> usize {
     panic!("unclosed token group");
 }
 
+// Only a bare test conjunct guarantees absence from production. any/not do not.
+fn test_cfg(t: &[Token], i: usize) -> Option<(usize, bool)> {
+    let inner = sequence(&t[i..], &["#", "!", "["]);
+    let bracket = i + if inner { 2 } else { 1 };
+    if !sequence(&t[i..], &["#"]) || !sequence(t.get(bracket..)?, &["[", "cfg", "("]) {
+        return None;
+    }
+    let end = group_end(t, bracket);
+    let start = bracket + 3;
+    if sequence(&t[start..], &["test", ")"]) {
+        return Some((end, inner));
+    }
+    if sequence(&t[start..], &["all", "("]) {
+        let mut j = start + 2;
+        while j < end - 2 {
+            if sequence(&t[j..], &["test"])
+                && (sequence(&t[j + 1..], &[","]) || sequence(&t[j + 1..], &[")"]))
+            {
+                return Some((end, inner));
+            }
+            if !t[j].literal && matches!(t[j].text.as_str(), "(" | "[" | "{") {
+                j = group_end(t, j);
+            } else {
+                j += 1;
+            }
+        }
+    }
+    None
+}
+
+// Resolve explicit module paths in test-only regions, including test-named files.
+// Inline modules change the relative path base according to Rust's module layout.
+fn test_includes(source: &str, base: &Path, module_dir: &Path, whole: bool) -> BTreeSet<PathBuf> {
+    // Compare lexical paths without depending on the included file existing.
+    fn normalized(path: PathBuf) -> PathBuf {
+        let mut out = PathBuf::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::CurDir => (),
+                std::path::Component::ParentDir
+                    if out.file_name().is_some_and(|name| name != "..") =>
+                {
+                    out.pop();
+                }
+                component => out.push(component),
+            }
+        }
+        out
+    }
+    fn walk(t: &[Token], base: &Path, module_dir: &Path, whole: bool, out: &mut BTreeSet<PathBuf>) {
+        let mut i = 0;
+        let mut test = whole;
+        let mut path = None;
+        while i < t.len() {
+            if let Some((end, inner)) = test_cfg(t, i) {
+                if inner {
+                    walk(&t[end..], base, module_dir, true, out);
+                    return;
+                }
+                test = true;
+                i = end;
+                continue;
+            }
+            if sequence(&t[i..], &["#", "[", "path", "="])
+                && t.get(i + 4).is_some_and(|x| x.literal)
+            {
+                path = Some(t[i + 4].text.clone());
+                i = group_end(t, i + 1);
+                continue;
+            }
+            if sequence(&t[i..], &["mod"]) && i + 2 < t.len() {
+                let name = &t[i + 1].text;
+                if sequence(&t[i + 2..], &[";"]) {
+                    if test {
+                        if let Some(ref path) = path {
+                            out.insert(base.join(path));
+                        } else {
+                            out.insert(module_dir.join(format!("{name}.rs")));
+                            out.insert(module_dir.join(name).join("mod.rs"));
+                        }
+                    }
+                    i += 3;
+                } else if sequence(&t[i + 2..], &["{"]) {
+                    let end = group_end(t, i + 2);
+                    let nested = path
+                        .as_ref()
+                        .map_or_else(|| module_dir.join(name), |p| base.join(p));
+                    walk(&t[i + 3..end - 1], &nested, &nested, test, out);
+                    i = end;
+                } else {
+                    i += 1;
+                }
+                test = whole;
+                path = None;
+                continue;
+            }
+            if !t[i].literal && matches!(t[i].text.as_str(), "(" | "[" | "{") {
+                let block = sequence(&t[i..], &["{"]);
+                let end = group_end(t, i);
+                walk(&t[i + 1..end - 1], base, module_dir, test, out);
+                i = end;
+                if block {
+                    test = whole;
+                    path = None;
+                }
+            } else {
+                if sequence(&t[i..], &[";"]) {
+                    test = whole;
+                    path = None;
+                }
+                i += 1;
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    walk(&tokens(source), base, module_dir, whole, &mut out);
+    out.into_iter().map(normalized).collect()
+}
+
+fn test_files(sources: &[(PathBuf, String)]) -> BTreeSet<PathBuf> {
+    let mut skipped: BTreeSet<_> = sources
+        .iter()
+        .filter(|(p, _)| excluded(p))
+        .map(|(p, _)| p.clone())
+        .collect();
+    loop {
+        let before = skipped.len();
+        for (path, source) in sources {
+            let parent = path.parent().unwrap();
+            let base = if matches!(
+                path.file_name().and_then(|x| x.to_str()),
+                Some("lib.rs" | "main.rs" | "mod.rs")
+            ) {
+                parent.to_path_buf()
+            } else {
+                parent.join(path.file_stem().unwrap())
+            };
+            skipped.extend(test_includes(source, parent, &base, skipped.contains(path)));
+        }
+        if skipped.len() == before {
+            return skipped;
+        }
+    }
+}
+
 fn production_tokens(source: &str) -> Vec<Token> {
     let mut t = tokens(source);
     let mut type_bodies = Vec::new();
     let mut i = 0;
     while i < t.len() {
-        if sequence(&t[i..], &["#", "[", "cfg", "(", "test", ")", "]"]) {
+        if let Some((end, inner)) = test_cfg(&t, i) {
             let start = i;
-            i += 7;
+            if inner {
+                // Inner attributes govern their enclosing module, not following siblings.
+                let mut end = i;
+                while end < t.len() && !sequence(&t[end..], &["}"]) {
+                    if !t[end].literal && matches!(t[end].text.as_str(), "(" | "[" | "{") {
+                        end = group_end(&t, end);
+                    } else {
+                        end += 1;
+                    }
+                }
+                t.drain(start..end);
+                continue;
+            }
+            i = end;
+            let mut is_fn = false;
+            let mut is_let = false;
             let mut angles = 0usize;
             let mut initializer = false;
             let declaration = type_bodies.last() == Some(&true)
@@ -261,8 +426,13 @@ fn production_tokens(source: &str) -> Vec<Token> {
             while i < t.len() {
                 if !t[i].literal {
                     match t[i].text.as_str() {
+                        "fn" => is_fn = true,
+                        "let" => is_let = true,
                         "{" => {
                             i = group_end(&t, i);
+                            if is_let {
+                                continue;
+                            }
                             break;
                         }
                         "=" if angles == 0 => initializer = true,
@@ -277,7 +447,7 @@ fn production_tokens(source: &str) -> Vec<Token> {
                             i += 1;
                             break;
                         }
-                        "," if angles == 0 => {
+                        "," if angles == 0 && !is_fn && !is_let => {
                             i += 1;
                             break;
                         }
@@ -313,10 +483,49 @@ fn production_tokens(source: &str) -> Vec<Token> {
     t
 }
 
+// Canonical audit names survive use aliases, including aliases of aliases.
+fn audit_names(t: &[Token]) -> BTreeMap<String, String> {
+    let mut names: BTreeMap<_, _> = ["AuditEvent", "AuditEventRecord", "AuditRecord"]
+        .into_iter()
+        .map(|n| (n.to_owned(), n.to_owned()))
+        .collect();
+    loop {
+        let before = names.len();
+        for w in t.windows(3) {
+            if sequence(&w[1..], &["as"]) {
+                if let Some(canonical) = names.get(&w[0].text).cloned() {
+                    names.insert(w[2].text.clone(), canonical);
+                }
+            }
+        }
+        if names.len() == before {
+            return names;
+        }
+    }
+}
+
+fn record_impls(t: &[Token]) -> Vec<(usize, usize)> {
+    let names = audit_names(t);
+    (0..t.len())
+        .filter_map(|i| {
+            if !sequence(&t[i..], &["impl"]) {
+                return None;
+            }
+            let end = (i + 1..t.len()).find(|&j| sequence(&t[j..], &["{"]))?;
+            t[i + 1..end]
+                .iter()
+                .any(|x| names.get(&x.text).is_some_and(|n| n == "AuditEventRecord"))
+                .then(|| (end, group_end(t, end)))
+        })
+        .collect()
+}
+
 // Discover record-returning functions from signatures rather than a builder
 // name list. The workspace union is used for cross-module calls (and aliases).
 fn record_builders(t: &[Token]) -> BTreeSet<String> {
     let mut builders = BTreeSet::new();
+    let names = audit_names(t);
+    let impls = record_impls(t);
     for i in 0..t.len() {
         if !sequence(&t[i..], &["fn"]) {
             continue;
@@ -341,9 +550,11 @@ fn record_builders(t: &[Token]) -> BTreeSet<String> {
             .find(|&j| sequence(&t[j..], &["{"]) || sequence(&t[j..], &[";"]))
             .unwrap_or(t.len());
         if sequence(&t[result..], &["-", ">"])
-            && t[result..end]
-                .iter()
-                .any(|x| !x.literal && x.text == "AuditEventRecord")
+            && t[result..end].iter().any(|x| {
+                !x.literal
+                    && (names.get(&x.text).is_some_and(|n| n == "AuditEventRecord")
+                        || (x.text == "Self" && impls.iter().any(|&(a, b)| a < i && i < b)))
+            })
         {
             builders.insert(t[i + 1].text.clone());
         }
@@ -351,11 +562,47 @@ fn record_builders(t: &[Token]) -> BTreeSet<String> {
     builders
 }
 
+// The candidate census follows syntax, never error-like receiver names.
+fn string_value(t: &[Token]) -> bool {
+    let mut i = 0;
+    while i < t.len() && sequence(&t[i..], &["&"]) {
+        i += 1;
+    }
+    t.get(i).is_some_and(|x| x.string) || sequence(&t[i..], &["format", "!"])
+}
+
+fn text_aliases(t: &[Token]) -> BTreeSet<String> {
+    let mut aliases = legacy_text_aliases(t);
+    for i in 0..t.len() {
+        if !sequence(&t[i..], &["let"]) {
+            continue;
+        }
+        let end = (i + 1..t.len())
+            .find(|&j| sequence(&t[j..], &[";"]))
+            .unwrap_or(t.len());
+        if let Some(eq) = (i + 1..end).find(|&j| sequence(&t[j..], &["="])) {
+            if string_value(&t[eq + 1..end]) {
+                let name = i + if sequence(&t[i + 1..], &["mut"]) {
+                    2
+                } else {
+                    1
+                };
+                if t.get(name).is_some_and(|x| {
+                    !x.literal && x.text.chars().all(|c| c.is_alphanumeric() || c == '_')
+                }) {
+                    aliases.insert(t[name].text.clone());
+                }
+            }
+        }
+    }
+    aliases
+}
+
 fn text_origin(t: &Token, aliases: &BTreeSet<String>) -> bool {
     !t.literal
         && (matches!(
             t.text.as_str(),
-            "message" | "to_string" | "detail" | "error" | "reason" | "summary"
+            "message" | "to_string" | "detail" | "error" | "reason" | "summary" | "format"
         ) || t.text.ends_with("_error")
             || t.text.ends_with("_reason")
             || t.text.ends_with("_detail")
@@ -366,7 +613,7 @@ fn text_origin(t: &Token, aliases: &BTreeSet<String>) -> bool {
 
 // Conservative local dataflow: propagate error/message origins through let
 // bindings, including lowercasing, borrowing, formatting and alias chains.
-fn text_aliases(t: &[Token]) -> BTreeSet<String> {
+fn legacy_text_aliases(t: &[Token]) -> BTreeSet<String> {
     let mut aliases = BTreeSet::new();
     loop {
         let before = aliases.len();
@@ -417,6 +664,52 @@ fn text_aliases(t: &[Token]) -> BTreeSet<String> {
     }
 }
 
+// Inspect patterns only; arm bodies and guards have their own method/equality sites.
+fn literal_pattern(t: &[Token]) -> bool {
+    let end = (0..t.len())
+        .find(|&i| sequence(&t[i..], &["if"]))
+        .unwrap_or(t.len());
+    let mut i = 0;
+    while i < end {
+        if sequence(&t[i..], &["#", "["]) {
+            i = group_end(t, i + 1);
+        } else if t[i].string {
+            return true;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+fn string_match(t: &[Token]) -> usize {
+    let mut i = 0;
+    let mut start = 0;
+    let mut body = false;
+    let mut found = 0;
+    while i < t.len() {
+        if sequence(&t[i..], &["=", ">"]) {
+            found += usize::from(literal_pattern(&t[start..i]));
+            body = true;
+            i += 2;
+        } else if !t[i].literal && matches!(t[i].text.as_str(), "(" | "[" | "{") {
+            let block = sequence(&t[i..], &["{"]);
+            i = group_end(t, i);
+            if body && block {
+                start = i;
+                body = false;
+            }
+        } else {
+            if sequence(&t[i..], &[","]) {
+                start = i + 1;
+                body = false;
+            }
+            i += 1;
+        }
+    }
+    found
+}
+
 fn function_end(t: &[Token], start: usize) -> usize {
     let mut i = start;
     while i < t.len() {
@@ -447,6 +740,8 @@ fn scan_with_builders(
     builders: &BTreeSet<String>,
 ) -> BTreeMap<String, usize> {
     let t = production_tokens(source);
+    let names = audit_names(&t);
+    let impls = record_impls(&t);
     let mut builders = builders
         .union(&record_builders(&t))
         .cloned()
@@ -507,6 +802,20 @@ fn scan_with_builders(
             .or(pending.as_deref())
             .unwrap_or("<module>");
         let mut add = |pattern: &str| {
+            if kind == "text-decision" && std::env::var_os("CENSUS_SNIPPETS").is_some() {
+                println!(
+                    "SNIP\t{path}::{name}::{pattern}\t{}",
+                    t[i.saturating_sub(12)..(i + 15).min(t.len())]
+                        .iter()
+                        .map(|x| if x.literal {
+                            format!("{:?}", x.text)
+                        } else {
+                            x.text.clone()
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+            }
             *found
                 .entry(format!("{path}::{name}::{pattern}"))
                 .or_insert(0) += 1;
@@ -584,11 +893,17 @@ fn scan_with_builders(
                     add("audit-hub");
                 }
                 if pending.is_none()
-                    && (sequence(rest, &["AuditEventRecord", "{"])
-                        || sequence(rest, &["AuditRecord", "{"]))
+                    && !token.literal
+                    && sequence(&t[i + 1..], &["{"])
+                    && (names
+                        .get(&token.text)
+                        .is_some_and(|n| matches!(n.as_str(), "AuditEventRecord" | "AuditRecord"))
+                        || (token.text == "Self" && impls.iter().any(|&(a, b)| a < i && i < b)))
                     && t.get(i.wrapping_sub(1)).is_none_or(|t| t.text != "struct")
                 {
-                    add(&token.text);
+                    add(names
+                        .get(&token.text)
+                        .map_or("AuditEventRecord", String::as_str));
                 }
                 // This also catches qualified traits and generic impl headers.
                 if sequence(rest, &["AuditSink", "for"]) {
@@ -604,14 +919,18 @@ fn scan_with_builders(
                     // table labels non-audit calls; receiver spelling is irrelevant.
                     add("audit-append");
                 }
-                if sequence(rest, &[".", "audit", "(", ")"]) {
+                if sequence(rest, &[".", "audit", "(", ")"])
+                    || sequence(rest, &[":", ":", "audit", "("])
+                {
                     add("audit-access");
                 }
                 if path == "crates/remanence-state/src/state.rs" && sequence(rest, &["fn", "audit"])
                 {
                     add("public-audit-sink");
                 }
-                if sequence(rest, &["AuditEvent", ":", ":"])
+                if !token.literal
+                    && names.get(&token.text).is_some_and(|n| n == "AuditEvent")
+                    && sequence(&t[i + 1..], &[":", ":"])
                     && t.get(i + 3)
                         .is_some_and(|x| x.text.starts_with(char::is_uppercase))
                 {
@@ -639,6 +958,26 @@ fn scan_with_builders(
                     add(&token.text);
                 }
             }
+            "library-reserved" => {
+                if !path.starts_with("crates/remanence-state/src/library_log/")
+                    && !token.literal
+                    && matches!(token.text.as_str(), "library_log" | "LibraryLog")
+                {
+                    add(&token.text);
+                }
+                if pending.is_none()
+                    && !token.literal
+                    && matches!(
+                        token.text.as_str(),
+                        "VerificationProgress" | "AcceptUnprotectedFinalization"
+                    )
+                    && sequence(&t[i + 1..], &["{"])
+                    && t.get(i.wrapping_sub(1))
+                        .is_none_or(|x| !matches!(x.text.as_str(), "struct" | "impl"))
+                {
+                    add(&format!("constructor::{}", token.text));
+                }
+            }
             "text-decision" => {
                 if path.starts_with("crates/remanence-cli/src/dev/") {
                     continue;
@@ -653,12 +992,22 @@ fn scan_with_builders(
                             | "strip_prefix"
                             | "strip_suffix"
                             | "find"
+                            | "rfind"
+                            | "rsplit_once"
+                            | "matches"
+                            | "eq"
+                            | "eq_ignore_ascii_case"
+                            | "trim_start_matches"
+                            | "trim_end_matches"
+                            | "trim_matches"
                     )
                     && i > 0
                     && sequence(&t[i - 1..], &["."])
                 {
                     let begin = receiver_start(&t, i - 1);
-                    if t[begin..i].iter().any(|x| text_origin(x, aliases)) {
+                    if (sequence(&t[i + 1..], &["("]) && string_value(&t[i + 2..]))
+                        || t[begin..i].iter().any(|x| text_origin(x, aliases))
+                    {
                         add(&format!("text-{}", token.text));
                     }
                 }
@@ -683,18 +1032,21 @@ fn scan_with_builders(
                         end += 1;
                     }
                     let operands = &t[begin..end];
-                    let string_evidence = operands.iter().any(|x| {
-                        x.literal
-                            || matches!(
-                                x.text.as_str(),
-                                "message" | "to_string" | "as_str" | "format"
-                            )
-                    }) || ((i - begin == 1
-                        && aliases.contains(&t[begin].text))
-                        || (end == i + 3 && aliases.contains(&t[i + 2].text)))
-                        || (operands.iter().any(|x| x.text == "reason")
-                            && sequence(rest, &["!", "="]));
-                    if string_evidence && operands.iter().any(|x| text_origin(x, aliases)) {
+                    let legacy = operands.iter().any(|x| text_origin(x, aliases))
+                        && (operands.iter().any(|x| {
+                            x.literal
+                                || matches!(
+                                    x.text.as_str(),
+                                    "message" | "to_string" | "as_str" | "format"
+                                )
+                        }) || (operands.iter().any(|x| x.text == "reason")
+                            && sequence(rest, &["!", "="])));
+                    if legacy
+                        || string_value(&t[begin..i])
+                        || string_value(&t[i + 2..end])
+                        || (i - begin == 1 && aliases.contains(&t[begin].text))
+                        || (end == i + 3 && aliases.contains(&t[i + 2].text))
+                    {
                         add("text-equality");
                     }
                 }
@@ -708,9 +1060,7 @@ fn scan_with_builders(
                         }
                     }
                     let close = group_end(&t, i + 2);
-                    if t[i + 3..end].iter().any(|x| text_origin(x, aliases))
-                        && t[end..close].iter().any(|x| x.literal)
-                    {
+                    if literal_pattern(&t[end..close]) {
                         add("text-matches");
                     }
                 }
@@ -718,14 +1068,10 @@ fn scan_with_builders(
                     let end = (i + 1..t.len())
                         .find(|&j| sequence(&t[j..], &["{"]))
                         .unwrap_or(t.len());
-                    if end < t.len() && t[i + 1..end].iter().any(|x| text_origin(x, aliases)) {
+                    if end < t.len() {
                         // Only string-pattern arms, not literals inside arm bodies.
                         let close = group_end(&t, end);
-                        if (end + 1..close).any(|j| {
-                            t[j].literal
-                                && (sequence(&t[j + 1..], &["=", ">"])
-                                    || sequence(&t[j + 1..], &["|"]))
-                        }) {
+                        for _ in 0..string_match(&t[end + 1..close - 1]) {
                             add("text-match");
                         }
                     }
@@ -740,7 +1086,9 @@ fn scan_with_builders(
 fn census(kind: &str) {
     let workspace = std::env::var_os("CENSUS_WORKSPACE")
         .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."));
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+        .canonicalize()
+        .unwrap();
     let mut paths = Vec::new();
     for entry in fs::read_dir(workspace.join("crates")).unwrap() {
         let src = entry.unwrap().path().join("src");
@@ -750,7 +1098,12 @@ fn census(kind: &str) {
     }
     let sources: Vec<_> = paths
         .iter()
-        .map(|file| (file, fs::read_to_string(file).unwrap()))
+        .map(|file| (file.clone(), fs::read_to_string(file).unwrap()))
+        .collect();
+    let skipped = test_files(&sources);
+    let sources: Vec<_> = sources
+        .into_iter()
+        .filter(|(p, _)| !skipped.contains(p))
         .collect();
     let builders = sources
         .iter()
@@ -760,12 +1113,14 @@ fn census(kind: &str) {
     for (file, source) in sources {
         let path = file.strip_prefix(&workspace).unwrap().to_str().unwrap();
         actual.extend(scan_with_builders(path, &source, kind, &builders));
-        if path.starts_with("crates/remanence-state/src/log_frame/") {
+        if path.starts_with("crates/remanence-state/src/log_frame/")
+            || path.starts_with("crates/remanence-state/src/library_log/")
+        {
             let tokens = tokens(&source);
             assert!(
                 !tokens.iter().any(|t| !t.literal
                     && matches!(t.text.as_str(), "set_len" | "ftruncate" | "truncate")),
-                "shared log frame must not truncate: {path}"
+                "log authority must not truncate: {path}"
             );
         }
     }
@@ -892,6 +1247,14 @@ fn assert_scan_resumes_after_test_items(kind: &str) {
         #[cfg(test)] mod tests {{ mod nested {{ {body} }} const S: &str = "}}"; }}
         #[cfg(test)] fn helper() {{ {body} }}
         #[cfg(test)] impl Fake {{ {body} }}
+        #[cfg(all(test, unix))] mod first {{ {body} }}
+        #[cfg(all(target_os = "linux", test))] mod last {{ {body} }}
+        #[cfg(test)] fn generic<T>() where T: Copy, {{ {body} }}
+        fn attributed_statement() {{
+            #[cfg(test)] let value = if condition {{ {body} }} else if other {{ {body} }} else {{ {body} }};
+        }}
+        #[cfg(test)] #[path = "included.rs"] mod included;
+        mod inner {{ #![cfg(test)] {body} }}
         #[cfg(not(test))] mod runtime {{ {body} }}
         {body}
     "#
@@ -1047,4 +1410,465 @@ fn audit_producer_table_matches_ratchet_and_sink_callers() {
     }
     assert_eq!(actual, expected);
     assert_eq!(public_sink.unwrap(), callers.join("; "));
+}
+/// Pins literal comparison discovery for closure contains.
+#[test]
+fn b2_text_closure_contains() {
+    let found = scan(
+        "example.rs",
+        r#"fn f() { a.is_some_and(|m| m.contains("busy")); }"#,
+        "text-decision",
+    );
+    assert_eq!(found.values().sum::<usize>(), 1, "{found:?}");
+}
+/// Pins literal comparison discovery for closure prefix.
+#[test]
+fn b2_text_closure_prefix() {
+    let found = scan(
+        "example.rs",
+        r#"fn f() { a.any(|m| m.starts_with("EPERM")); }"#,
+        "text-decision",
+    );
+    assert_eq!(found.values().sum::<usize>(), 1, "{found:?}");
+}
+/// Pins literal comparison discovery for text parameter.
+#[test]
+fn b2_text_text_parameter() {
+    let found = scan(
+        "example.rs",
+        r#"fn f(text: &str) -> bool { text.contains("is busy") }"#,
+        "text-decision",
+    );
+    assert_eq!(found.values().sum::<usize>(), 1, "{found:?}");
+}
+/// Pins literal comparison discovery for msg parameter.
+#[test]
+fn b2_text_msg_parameter() {
+    let found = scan(
+        "example.rs",
+        r#"fn f(msg: &str) -> bool { msg.contains("is busy") }"#,
+        "text-decision",
+    );
+    assert_eq!(found.values().sum::<usize>(), 1, "{found:?}");
+}
+/// Pins literal comparison discovery for s parameter.
+#[test]
+fn b2_text_s_parameter() {
+    let found = scan(
+        "example.rs",
+        r#"fn f(s: &str) -> bool { s.contains("is busy") }"#,
+        "text-decision",
+    );
+    assert_eq!(found.values().sum::<usize>(), 1, "{found:?}");
+}
+/// Pins literal comparison discovery for format binding.
+#[test]
+fn b2_text_format_binding() {
+    let found = scan(
+        "example.rs",
+        r#"fn f() { let s = format!("{e}"); if s == want {} }"#,
+        "text-decision",
+    );
+    assert_eq!(found.values().sum::<usize>(), 1, "{found:?}");
+}
+/// Pins literal comparison discovery for format method.
+#[test]
+fn b2_text_format_method() {
+    let found = scan(
+        "example.rs",
+        r#"fn f() { let s = format!("{e:#}"); if s.ends_with("not ready") {} }"#,
+        "text-decision",
+    );
+    assert_eq!(found.values().sum::<usize>(), 1, "{found:?}");
+}
+/// Pins literal comparison discovery for case insensitive.
+#[test]
+fn b2_text_case_insensitive() {
+    let found = scan(
+        "example.rs",
+        r#"fn f() { status.message().eq_ignore_ascii_case("drive bay busy"); }"#,
+        "text-decision",
+    );
+    assert_eq!(found.values().sum::<usize>(), 1, "{found:?}");
+}
+/// Pins literal comparison discovery for err guard.
+#[test]
+fn b2_text_err_guard() {
+    let found = scan(
+        "example.rs",
+        r#"fn f() { match run() { Err(e) if e.contains("busy") => retry(), _ => () } }"#,
+        "text-decision",
+    );
+    assert_eq!(found.values().sum::<usize>(), 1, "{found:?}");
+}
+/// Pins literal comparison discovery for field.
+#[test]
+fn b2_text_field() {
+    let found = scan(
+        "example.rs",
+        r#"fn f() { out.stderr_text.contains("Operation not permitted"); }"#,
+        "text-decision",
+    );
+    assert_eq!(found.values().sum::<usize>(), 1, "{found:?}");
+}
+/// Pins literal comparison discovery for field match.
+#[test]
+fn b2_text_field_match() {
+    let found = scan(
+        "example.rs",
+        r#"fn f() { match resp.status_text.as_str() { "busy" => retry(), _ => () } }"#,
+        "text-decision",
+    );
+    assert_eq!(found.values().sum::<usize>(), 1, "{found:?}");
+}
+/// Pins exclusion of all test first and resumption at the sibling.
+#[test]
+fn b2_test_all_test_first() {
+    let source = concat!(
+        r#"#[cfg(all(test, unix))] mod t { fn hidden() { c.execute("x"); } }"#,
+        r#" fn live() { c.execute("x"); }"#
+    );
+    assert_eq!(
+        scan("example.rs", source, "sql-mutation"),
+        BTreeMap::from([("example.rs::live::execute".into(), 1)])
+    );
+}
+/// Pins exclusion of all test last and resumption at the sibling.
+#[test]
+fn b2_test_all_test_last() {
+    let source = concat!(
+        r#"#[cfg(all(target_os = "linux", test))] mod t { fn hidden() { c.execute("x"); } }"#,
+        r#" fn live() { c.execute("x"); }"#
+    );
+    assert_eq!(
+        scan("example.rs", source, "sql-mutation"),
+        BTreeMap::from([("example.rs::live::execute".into(), 1)])
+    );
+}
+/// Pins exclusion of where clause and resumption at the sibling.
+#[test]
+fn b2_test_where_clause() {
+    let source = concat!(
+        r#"#[cfg(test)] fn hidden<T>() where T: Copy, { c.execute("x"); }"#,
+        r#" fn live() { c.execute("x"); }"#
+    );
+    assert_eq!(
+        scan("example.rs", source, "sql-mutation"),
+        BTreeMap::from([("example.rs::live::execute".into(), 1)])
+    );
+}
+/// Pins exclusion of let else chain and resumption at the sibling.
+#[test]
+fn b2_test_let_else_chain() {
+    let source = concat!(
+        r#"fn enclosing() { #[cfg(test)] let x = if c { c.execute("x") } else if d { c.execute("x") } else { c.execute("x") }; }"#,
+        r#" fn live() { c.execute("x"); }"#
+    );
+    assert_eq!(
+        scan("example.rs", source, "sql-mutation"),
+        BTreeMap::from([("example.rs::live::execute".into(), 1)])
+    );
+}
+/// Inner test attributes govern their module; any/not still compile in production.
+#[test]
+fn b2_test_predicates() {
+    assert!(scan(
+        "example.rs",
+        "#![cfg(test)] fn hidden() { c.execute(\"x\"); }",
+        "sql-mutation"
+    )
+    .is_empty());
+    for predicate in ["any(test, unix)", "not(test)"] {
+        assert_eq!(
+            scan(
+                "example.rs",
+                &format!("#[cfg({predicate})] fn live() {{ c.execute(\"x\"); }}"),
+                "sql-mutation"
+            )
+            .len(),
+            1
+        );
+    }
+}
+/// Pins audit coverage of enum alias.
+#[test]
+fn b2_audit_enum_alias() {
+    let found = scan(
+        "example.rs",
+        "use a::AuditEvent as LibraryAuditEvent; fn emit() { LibraryAuditEvent::Warning {} }",
+        "audit-producer",
+    );
+    assert_eq!(
+        found.get("example.rs::emit::AuditEvent::Warning"),
+        Some(&1),
+        "{found:?}"
+    );
+}
+/// Pins audit coverage of record alias.
+#[test]
+fn b2_audit_record_alias() {
+    let found = scan(
+        "example.rs",
+        "use a::AuditEventRecord as Renamed; fn emit() { Renamed {} }",
+        "audit-producer",
+    );
+    assert_eq!(
+        found.get("example.rs::emit::AuditEventRecord"),
+        Some(&1),
+        "{found:?}"
+    );
+}
+/// Pins audit coverage of ufcs.
+#[test]
+fn b2_audit_ufcs() {
+    let found = scan(
+        "example.rs",
+        "fn emit() { StateHandle::audit(&mut h); }",
+        "audit-producer",
+    );
+    assert_eq!(
+        found.get("example.rs::emit::audit-access"),
+        Some(&1),
+        "{found:?}"
+    );
+}
+/// Pins audit coverage of self literal.
+#[test]
+fn b2_audit_self_literal() {
+    let found = scan(
+        "example.rs",
+        "impl AuditEventRecord { fn factory() -> Self { Self {} } }",
+        "audit-producer",
+    );
+    assert_eq!(
+        found.get("example.rs::factory::AuditEventRecord"),
+        Some(&1),
+        "{found:?}"
+    );
+}
+/// Pins audit coverage of self factory.
+#[test]
+fn b2_audit_self_factory() {
+    let found = scan("example.rs", "use a::AuditEventRecord as Renamed; impl Renamed { fn factory() -> Self { todo!() } } fn emit() { Renamed::factory(); }", "audit-producer");
+    assert_eq!(
+        found.get("example.rs::emit::record-builder::factory"),
+        Some(&1),
+        "{found:?}"
+    );
+}
+/// An S10 helper argument remains outside the documented comparison shapes.
+#[test]
+fn scanner_helper_literal_is_known_residual() {
+    assert!(scan(
+        "example.rs",
+        r#"fn f() { has(&e.to_string(), "busy"); }"#,
+        "text-decision"
+    )
+    .is_empty());
+}
+
+/// Explicit path children of skipped modules and test-named files are excluded.
+#[test]
+fn scanner_test_path_includes() {
+    let base = Path::new("/scratch/crates/example/src");
+    let sources = vec![
+        (base.join("lib.rs"), r#"#[cfg(test)] mod tests { #[path = "included.rs"] mod nested; } fn live() { c.execute("x"); }"#.into()),
+        (base.join("tests/included.rs"), r#"fn hidden() { c.execute("x"); }"#.into()),
+        (base.join("durability_tests.rs"), r#"#[path = "acceptance.rs"] mod acceptance;"#.into()),
+        (base.join("acceptance.rs"), r#"fn hidden() { c.execute("x"); }"#.into()),
+        (base.join("ordinary.rs"), r#"#[cfg(test)] #[path = "custom.rs"] mod t; fn live() {}"#.into()),
+        (base.join("custom.rs"), r#"fn hidden() { c.execute("x"); }"#.into()),
+        (base.join("paths.rs"), r#"#[cfg(test)] mod fixtures { #[path = "../relative.rs"] mod relative; } fn live() {}"#.into()),
+        (base.join("paths/relative.rs"), r#"fn hidden() { c.execute("x"); }"#.into()),
+    ];
+    let included_in_function = test_includes(
+        r#"#[cfg(test)] fn test() { #[path = "nested.rs"] mod hidden; }"#,
+        base,
+        base,
+        false,
+    );
+    assert!(included_in_function.contains(&base.join("nested.rs")));
+    let skipped = test_files(&sources);
+    assert!(skipped.contains(&base.join("tests/included.rs")));
+    assert!(skipped.contains(&base.join("acceptance.rs")));
+    assert!(skipped.contains(&base.join("custom.rs")));
+    assert!(skipped.contains(&base.join("paths/relative.rs")));
+    let found: BTreeMap<_, _> = sources
+        .iter()
+        .filter(|(p, _)| !skipped.contains(p))
+        .flat_map(|(_, s)| scan("example.rs", s, "sql-mutation"))
+        .collect();
+    assert_eq!(
+        found,
+        BTreeMap::from([("example.rs::live::execute".into(), 1)])
+    );
+}
+
+/// The full candidate allowlist and its dispositions must agree in both directions.
+#[test]
+fn text_candidate_table_matches_ratchet() {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/census");
+    let baseline = fs::read_to_string(directory.join("text-decision.tsv")).unwrap();
+    let expected: BTreeMap<_, _> = baseline
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+        .map(|l| {
+            let (k, n) = l.split_once('\t').unwrap();
+            (k.to_owned(), n.to_owned())
+        })
+        .collect();
+    let table = fs::read_to_string(directory.join("text-candidates.tsv")).unwrap();
+    let mut actual = BTreeMap::new();
+    let mut counts = BTreeMap::<&str, (usize, usize)>::new();
+    for line in table.lines().skip(1) {
+        let f: Vec<_> = line.split('\t').collect();
+        assert_eq!(f.len(), 6, "{line}");
+        assert!(
+            matches!(
+                f[4],
+                "decision" | "enum-as-text" | "cli-argument" | "path" | "magic-or-unit" | "other"
+            ),
+            "{line}"
+        );
+        assert!(!f[5].trim().is_empty(), "unclassified: {line}");
+        assert!(actual
+            .insert(format!("{}::{}::{}", f[0], f[1], f[2]), f[3].to_owned())
+            .is_none());
+        let entry = counts.entry(f[4]).or_default();
+        entry.0 += 1;
+        entry.1 += f[3].parse::<usize>().unwrap();
+    }
+    println!("text labels (keys, occurrences): {counts:?}");
+    assert_eq!(actual, expected);
+    for (function, count) in [
+        ("handle_append_finish_inner", 4),
+        ("handle_abort", 1),
+        ("print_setcap_hint_if_error_text_matches", 2),
+    ] {
+        let rows: Vec<_> = table
+            .lines()
+            .skip(1)
+            .map(|l| l.split('\t').collect::<Vec<_>>())
+            .filter(|f| f[1] == function)
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][3].parse::<usize>().unwrap(), count);
+        assert_eq!(rows[0][4], "decision");
+        assert!(rows[0][5].contains("new"));
+    }
+}
+
+/// Direct format operands, nested literal patterns and arm counts are shape based.
+#[test]
+fn scanner_literal_operand_and_arm_shapes() {
+    let source = r#"fn f() {
+        if format!("{e}") == want {}
+        if want != format!("{e}") {}
+        match s { Some("a") => (), Some("b") => (), _ => () }
+        match e { #[cfg(target_os = "linux")] Err(e) => log!("busy"), _ => () }
+        value.eq("x"); value.rfind("x"); value.rsplit_once("x");
+        value.matches("x"); value.trim_start_matches("x");
+        value.trim_end_matches("x"); value.trim_matches("x");
+    }"#;
+    let found = scan("example.rs", source, "text-decision");
+    assert_eq!(found["example.rs::f::text-equality"], 2);
+    assert_eq!(found["example.rs::f::text-match"], 2);
+    assert_eq!(found.values().sum::<usize>(), 11);
+}
+
+/// No production component may use the disconnected library authority.
+#[test]
+fn library_reserved_census() {
+    census("library-reserved");
+}
+
+/// Reserved constructors remain visible even inside the future log module.
+#[test]
+fn scanner_library_reserved_shapes() {
+    for word in ["library_log", "LibraryLog"] {
+        let found = scan(
+            "outside.rs",
+            &format!("fn f() {{ use state::{word}; }}"),
+            "library-reserved",
+        );
+        assert_eq!(found[&format!("outside.rs::f::{word}")], 1);
+        assert!(scan(
+            "crates/remanence-state/src/library_log/store.rs",
+            &format!("fn f() {{ {word}; }}"),
+            "library-reserved"
+        )
+        .is_empty());
+    }
+    for name in ["VerificationProgress", "AcceptUnprotectedFinalization"] {
+        let path = "crates/remanence-state/src/library_log/wire.rs";
+        let found = scan(
+            path,
+            &format!("fn decode() {{ {name} {{}} }}"),
+            "library-reserved",
+        );
+        assert_eq!(found[&format!("{path}::decode::constructor::{name}")], 1);
+        assert!(scan(
+            path,
+            &format!("pub struct {name} {{ a: u64 }}"),
+            "library-reserved"
+        )
+        .is_empty());
+        // Fixture feature code is production-scanned and must be explicitly allowed.
+        let found = scan(
+            path,
+            &format!(
+                "#[cfg(any(test, feature = \"fixtures\"))] fn fixture_value() {{ {name} {{}} }}"
+            ),
+            "library-reserved",
+        );
+        assert_eq!(
+            found[&format!("{path}::fixture_value::constructor::{name}")],
+            1
+        );
+    }
+}
+
+/// Inherent reader implementations are not reserved record constructors.
+#[test]
+fn reserved_reader_impl_is_not_a_constructor() {
+    assert!(scan(
+        "crates/remanence-state/src/library_log/mod.rs",
+        "impl VerificationProgress { pub fn parts_done(&self)->u32 { self.parts_done } }",
+        "library-reserved"
+    )
+    .is_empty());
+}
+/// Every typed destination in the producer census has an allocated library record.
+#[test]
+fn destinations_in_producer_table_are_records() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = fs::read_to_string(root.join("src/library_log/mod.rs")).unwrap();
+    let start = source.find("pub enum Tag {").unwrap();
+    let body = source[start..].split_once('}').unwrap().0;
+    let tags: BTreeSet<_> = tokens(body)
+        .into_iter()
+        .filter(|t| !t.literal)
+        .map(|t| t.text)
+        .collect();
+    let table = fs::read_to_string(root.join("tests/census/library-producers.tsv")).unwrap();
+    for row in table.lines().skip(1) {
+        let destination = row.split('\t').nth(4).unwrap();
+        for word in
+            destination.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | ';'))
+        {
+            if word.len() > 1
+                && word.chars().all(|c| c.is_ascii_alphabetic())
+                && word.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                && !matches!(word, "DriveFault" | "LibraryAuthority")
+            {
+                assert!(tags.contains(word), "unallocated destination {word}: {row}");
+            }
+        }
+    }
+}
+
+/// Both reserved bodies are counted by the production scanner and restricted to reader/fixture sites.
+#[test]
+fn verification_progress_has_no_production_constructor() {
+    census("library-reserved");
 }

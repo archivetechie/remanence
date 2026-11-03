@@ -67,6 +67,22 @@ fn error(offset: u64, sequence: Option<u64>, fault: Fault) -> CodecError {
 /// Validated frame with the tape family's decoded structural record.
 pub type Frame<'a> = crate::log_frame::Frame<'a, Record>;
 
+/// Digest one fully decoded frame, binding a cross-log reference to its bytes.
+/// Call only on full frames: structural row scans deliberately omit payloads.
+#[allow(dead_code)] // Consumed by the library TapeView adapter in the later cutover.
+pub(crate) fn record_digest(frame: &Frame<'_>) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    assert!(
+        frame.payload_validated,
+        "record digest requires a full frame"
+    );
+    let mut digest = Sha256::new();
+    digest.update(frame.prefix);
+    digest.update(frame.structural);
+    digest.update(frame.payload);
+    digest.finalize().into()
+}
+
 impl From<crate::log_frame::Fault> for Fault {
     fn from(fault: crate::log_frame::Fault) -> Self {
         use crate::log_frame::Fault as Raw;
@@ -234,4 +250,36 @@ pub fn classify_frames(bytes: &[u8]) -> Result<Tail, CodecError> {
     let mut decoder = Decoder::new(bytes);
     while decoder.next_frame()?.is_some() {}
     Ok(decoder.tail())
+}
+
+#[cfg(test)]
+mod b2_digest_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use std::io::Cursor;
+
+    /// Cross-log digests use the production tape decoder and independent raw slices.
+    #[test]
+    fn tape_record_digest_matches_fixture_frames() {
+        let bytes =
+            include_bytes!("../../../../fixtures/tape-log/session-tail-synchronized.remtape");
+        let mut reader = Cursor::new(bytes.as_slice());
+        super::super::store::Header::decode(&mut reader, [0xa1; 16]).unwrap();
+        let start = reader.position();
+        let mut decoder = Decoder::at(reader, 1, start);
+        let mut count = 0;
+        while let Some(frame) = decoder.next_frame().unwrap() {
+            let raw = &bytes[frame.offset as usize..frame.end as usize];
+            let structural = u32::from_le_bytes(raw[4..8].try_into().unwrap()) as usize;
+            let payload = u32::from_le_bytes(raw[8..12].try_into().unwrap()) as usize;
+            let mut expected = Sha256::new();
+            expected.update(&raw[..20]);
+            expected.update(&raw[28..28 + structural]);
+            expected.update(&raw[36 + structural..36 + structural + payload]);
+            let expected: [u8; 32] = expected.finalize().into();
+            assert_eq!(record_digest(&frame), expected);
+            count += 1;
+        }
+        assert_eq!(count, 8);
+    }
 }

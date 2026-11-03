@@ -11,145 +11,8 @@ use remanence_parity::{
 };
 use std::io::{self, Read, Write};
 
-pub(super) fn invalid() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        "noncanonical tape-log CBOR or invalid schema",
-    )
-}
-pub(super) trait Wire: Sized {
-    fn put(&self, w: &mut dyn Write) -> io::Result<()>;
-    fn get(r: &mut dyn Read) -> io::Result<Self>;
-}
-pub(super) fn head(w: &mut dyn Write, major: u8, n: u64) -> io::Result<()> {
-    let base = major << 5;
-    match n {
-        0..=23 => w.write_all(&[base | n as u8]),
-        24..=255 => w.write_all(&[base | 24, n as u8]),
-        256..=65535 => {
-            w.write_all(&[base | 25])?;
-            w.write_all(&(n as u16).to_be_bytes())
-        }
-        65536..=4294967295 => {
-            w.write_all(&[base | 26])?;
-            w.write_all(&(n as u32).to_be_bytes())
-        }
-        _ => {
-            w.write_all(&[base | 27])?;
-            w.write_all(&n.to_be_bytes())
-        }
-    }
-}
-pub(super) fn read_head(r: &mut dyn Read) -> io::Result<(u8, u64)> {
-    let mut b = [0];
-    r.read_exact(&mut b)?;
-    let a = b[0] & 31;
-    let n = match a {
-        0..=23 => a as u64,
-        24..=27 => {
-            let len = 1usize << (a - 24);
-            let mut bytes = [0; 8];
-            r.read_exact(&mut bytes[8 - len..])?;
-            let n = u64::from_be_bytes(bytes);
-            let min = [24, 256, 65536, 4294967296][(a - 24) as usize];
-            if n < min {
-                return Err(invalid());
-            }
-            n
-        }
-        _ => return Err(invalid()),
-    };
-    Ok((b[0] >> 5, n))
-}
-fn expect(r: &mut dyn Read, major: u8) -> io::Result<u64> {
-    let (m, n) = read_head(r)?;
-    if m != major {
-        return Err(invalid());
-    }
-    Ok(n)
-}
-macro_rules! uint {
-    ($($ty:ty),+) => {$ (impl Wire for $ty {
-        fn put(&self,w:&mut dyn Write)->io::Result<()> { head(w,0,*self as u64) }
-        fn get(r:&mut dyn Read)->io::Result<Self> { expect(r,0)?.try_into().map_err(|_|invalid()) }
-    })+};
-}
-uint!(u8, u16, u32, u64);
-impl Wire for bool {
-    fn put(&self, w: &mut dyn Write) -> io::Result<()> {
-        w.write_all(&[if *self { 0xf5 } else { 0xf4 }])
-    }
-    fn get(r: &mut dyn Read) -> io::Result<Self> {
-        match read_head(r)? {
-            (7, 20) => Ok(false),
-            (7, 21) => Ok(true),
-            _ => Err(invalid()),
-        }
-    }
-}
-impl<T: Wire> Wire for Option<T> {
-    fn put(&self, w: &mut dyn Write) -> io::Result<()> {
-        match self {
-            Some(v) => v.put(w),
-            None => w.write_all(&[0xf6]),
-        }
-    }
-    fn get(r: &mut dyn Read) -> io::Result<Self> {
-        let mut b = [0];
-        r.read_exact(&mut b)?;
-        if b[0] == 0xf6 {
-            Ok(None)
-        } else {
-            T::get(&mut b.as_slice().chain(r)).map(Some)
-        }
-    }
-}
-impl<const N: usize> Wire for [u8; N] {
-    fn put(&self, w: &mut dyn Write) -> io::Result<()> {
-        head(w, 2, N as u64)?;
-        w.write_all(self)
-    }
-    fn get(r: &mut dyn Read) -> io::Result<Self> {
-        if expect(r, 2)? != N as u64 {
-            return Err(invalid());
-        }
-        let mut b = [0; N];
-        r.read_exact(&mut b)?;
-        Ok(b)
-    }
-}
-impl Wire for Vec<u8> {
-    fn put(&self, w: &mut dyn Write) -> io::Result<()> {
-        head(w, 2, self.len() as u64)?;
-        w.write_all(self)
-    }
-    fn get(r: &mut dyn Read) -> io::Result<Self> {
-        bytes(r, 2)
-    }
-}
-fn bytes(r: &mut dyn Read, major: u8) -> io::Result<Vec<u8>> {
-    let len = expect(r, major)?;
-    // A catalog spans frames, but each scalar field is bounded independently.
-    // Refuse before allocating or consuming bytes from subsequent fields.
-    if len > MAX_FRAME_BODY as u64 {
-        return Err(invalid());
-    }
-    let mut out = Vec::new();
-    let read = r.take(len).read_to_end(&mut out)?;
-    if read as u64 != len {
-        return Err(io::ErrorKind::UnexpectedEof.into());
-    }
-    Ok(out)
-}
-impl Wire for String {
-    fn put(&self, w: &mut dyn Write) -> io::Result<()> {
-        head(w, 3, self.len() as u64)?;
-        w.write_all(self.as_bytes())
-    }
-    fn get(r: &mut dyn Read) -> io::Result<Self> {
-        String::from_utf8(bytes(r, 3)?).map_err(|_| invalid())
-    }
-}
+pub(crate) use crate::log_frame::cbor::*;
+
 // Catalog's existing API uses lowercase hexadecimal recipient IDs; the wire
 // representation is still an array of binary UUID byte strings.
 impl Wire for Vec<String> {
@@ -231,12 +94,6 @@ impl Wire for SchemeId {
         Ok(Self::new_owned(String::get(r)?))
     }
 }
-macro_rules! enumeration {
-    ($ty:ty; $($n:literal=>$variant:ident),+ $(,)?) => { impl Wire for $ty {
-        fn put(&self,w:&mut dyn Write)->io::Result<()> { let n:u64=match self {$(Self::$variant=>$n),+}; n.put(w) }
-        fn get(r:&mut dyn Read)->io::Result<Self> { match u64::get(r)? {$($n=>Ok(Self::$variant),)+_=>Err(invalid())} }
-    }};
-}
 enumeration!(CheckProvenance; 0=>Empty,1=>OriginalWrite);
 enumeration!(TapeFileKind; 0=>Object,1=>ParitySidecar,2=>Bootstrap,3=>ParityMap,4=>TapeIndexReplica,5=>IndexSeparationExtent);
 enumeration!(TerminalTailComponentKind; 4=>TapeIndexReplica,5=>IndexSeparationExtent);
@@ -244,21 +101,6 @@ enumeration!(TerminalFinalizationTrigger; 0=>ReachedLowWatermark,1=>HardwareEarl
 
 // Mandatory maps, keys in declaration order. A duplicate, unknown or reordered
 // key is an error, even if a generic CBOR deserializer would accept it.
-macro_rules! fields {
-    ($ty:ty; $($field:ident),+ $(,)?) => { impl Wire for $ty {
-        fn put(&self,w:&mut dyn Write)->io::Result<()> {
-            let keys=[$(stringify!($field)),+]; head(w,5,keys.len() as u64)?;
-            let mut key=0u64;
-            $(key.put(w)?; self.$field.put(w)?; key+=1;)+ let _=key; Ok(())
-        }
-        fn get(r:&mut dyn Read)->io::Result<Self> {
-            let keys=[$(stringify!($field)),+]; if expect(r,5)? != keys.len() as u64 {return Err(invalid());}
-            let mut key=0u64;
-            $(if u64::get(r)? != key { return Err(invalid()); } let $field=Wire::get(r)?; key+=1;)+ let _=key;
-            Ok(Self {$($field),+})
-        }
-    }};
-}
 fields!(CommitCursor; partition,lba);
 fields!(ParityScheme; id,data_blocks_per_stripe,parity_blocks_per_stripe,stripes_per_neighborhood);
 fields!(TapeFileEntry; tape_file_number,kind,block_count,physical_start_hint,object_id,first_parity_data_ordinal,epoch_id,protected_ordinal_start,protected_ordinal_end_exclusive,canonical_metadata_hash,object_recovery_row);

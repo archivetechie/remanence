@@ -386,3 +386,81 @@ fn copy_frames_reports_prefix_crc_separately_from_size() {
     assert!(output.is_empty());
     assert_eq!(progress, 0);
 }
+
+/// Unsynced diagnostics skip file sync, but an uncertain write still fences.
+#[test]
+fn unsynced_append_fences_before_and_after_landed_write() {
+    for after in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("diagnostic.log");
+        fs::write(&target, b"prefix").unwrap();
+        let injection = Arc::new(Injection {
+            stage: AtomicU8::new(1),
+            after,
+        });
+        let _registration = durable_file::test_support::register(
+            root.path().into(),
+            Arc::new(FaultDirectory(injection.clone())),
+        );
+        let mut output = durable_file::File::options()
+            .append(true)
+            .open(&target)
+            .unwrap();
+        assert!(
+            publication::append_without_sync(&mut output, b"claim", &target, root.path()).is_err()
+        );
+        assert_eq!(injection.stage.load(Ordering::SeqCst), 0);
+        assert!(publication::has_ambiguity(&target).unwrap());
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            if after {
+                b"prefixclaim".as_slice()
+            } else {
+                b"prefix".as_slice()
+            }
+        );
+    }
+}
+
+/// A diagnostic success leaves the sync fault armed for a later authority sync.
+#[test]
+fn unsynced_append_defers_sync_until_authority() {
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("diagnostic.log");
+    fs::write(&target, b"prefix").unwrap();
+    let injection = Arc::new(Injection {
+        stage: AtomicU8::new(2),
+        after: false,
+    });
+    let _registration = durable_file::test_support::register(
+        root.path().into(),
+        Arc::new(FaultDirectory(injection.clone())),
+    );
+    let mut output = durable_file::File::options()
+        .append(true)
+        .open(&target)
+        .unwrap();
+    publication::append_without_sync(&mut output, b"diagnostic", &target, root.path()).unwrap();
+    assert_eq!(
+        injection.stage.load(Ordering::SeqCst),
+        2,
+        "diagnostic did not sync"
+    );
+    assert!(!publication::has_ambiguity(&target).unwrap());
+    assert!(publication::append_and_publish(
+        &mut output,
+        b"authority",
+        None,
+        &target,
+        root.path(),
+        || Ok(())
+    )
+    .is_err());
+    assert_eq!(
+        injection.stage.load(Ordering::SeqCst),
+        0,
+        "authority reached sync"
+    );
+    assert!(publication::has_ambiguity(&target).unwrap());
+    assert_eq!(fs::read(&target).unwrap(), b"prefixdiagnosticauthority");
+}

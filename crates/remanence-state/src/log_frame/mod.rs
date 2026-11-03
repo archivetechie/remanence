@@ -3,6 +3,7 @@
 //! EOF-short bodies with internal zeros followed by data remain torn suffixes;
 //! complete contradictory bodies are refused. Group closure belongs to callers.
 
+pub(crate) mod cbor;
 pub mod publication;
 
 use remanence_crc::crc64_xz;
@@ -27,7 +28,7 @@ pub enum Section {
 }
 
 /// Byte-level fault, converted by a family to its existing diagnostic type.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Fault {
     /// CRC mismatch.
     #[error("bad {0:?} CRC")]

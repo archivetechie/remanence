@@ -1,7 +1,7 @@
 # Audit event selections, record constructions/factories, sink access and append candidates.
+# Every append is retained regardless of receiver name; non-audit candidates are labelled in the table.
 # Exact keys/counts and reader/non-audit labels: crates/remanence-state/tests/census/library-producers.tsv
 # Related deliverables: crates/remanence-state/tests/census/{mechanism-tests,w2-trace}.tsv
-# Every append is retained regardless of receiver name; non-audit candidates are labelled in the table.
 crates/remanence-api/src/api_state.rs::record_alarm_acked::AuditEvent::AlarmAcked	1
 crates/remanence-api/src/api_state.rs::record_alarm_acked::append_operation_audit	1
 crates/remanence-api/src/api_state.rs::record_cancel_requested::AuditEvent::CancelRequested	1
@@ -173,11 +173,6 @@ crates/remanence-api/src/write_owner/write_session.rs::handle_drive_open_write::
 crates/remanence-api/src/write_owner/write_session.rs::handle_drive_open_write::AuditEvent::OperationStarted	1
 crates/remanence-api/src/write_owner/write_session.rs::handle_drive_open_write::AuditEvent::SessionOpened	1
 crates/remanence-chaos/src/lib.rs::open_event_log::audit-append	1
-crates/remanence-chaos/src/model.rs::capture_finished_sense::AuditEvent::Finished	1
-crates/remanence-chaos/src/model.rs::capture_move_audit::AuditEvent::Finished	4
-crates/remanence-chaos/src/model.rs::capture_move_audit::AuditEvent::Refused	2
-crates/remanence-chaos/src/model.rs::capture_move_audit::AuditEvent::Started	2
-crates/remanence-chaos/src/model.rs::capture_move_audit::AuditEvent::Warning	2
 crates/remanence-cli/src/lib.rs::append_tape_provisioned_audit_event::AuditEvent::TapeProvisioned	1
 crates/remanence-cli/src/lib.rs::append_tape_provisioned_audit_event::AuditEventRecord	1
 crates/remanence-cli/src/lib.rs::append_tape_provisioned_audit_event::audit-access	1
@@ -226,9 +221,13 @@ crates/remanence-state/src/adapters.rs::append_parity_recovery_event::record-bui
 crates/remanence-state/src/adapters.rs::append_record::audit-append	1
 crates/remanence-state/src/adapters.rs::append_sidecar_metadata_health_event::audit-append	1
 crates/remanence-state/src/adapters.rs::append_sidecar_metadata_health_event::record-builder::sidecar_metadata_health_audit_record	1
+crates/remanence-state/src/adapters.rs::library_audit_event_record::AuditEvent::Finished	1
 crates/remanence-state/src/adapters.rs::library_audit_event_record::AuditEvent::HardwareWarning	1
 crates/remanence-state/src/adapters.rs::library_audit_event_record::AuditEvent::OperationFailed	1
 crates/remanence-state/src/adapters.rs::library_audit_event_record::AuditEvent::OperationStarted	1
+crates/remanence-state/src/adapters.rs::library_audit_event_record::AuditEvent::Refused	1
+crates/remanence-state/src/adapters.rs::library_audit_event_record::AuditEvent::Started	1
+crates/remanence-state/src/adapters.rs::library_audit_event_record::AuditEvent::Warning	1
 crates/remanence-state/src/adapters.rs::library_audit_event_record::record-builder::library_record	4
 crates/remanence-state/src/adapters.rs::library_hook::record-builder::library_audit_event_record	1
 crates/remanence-state/src/adapters.rs::library_outcome_audit_event::AuditEvent::CompletionUnknown	1
@@ -367,6 +366,9 @@ crates/remanence-state/src/index.rs::terminal_state_for_event::AuditEvent::Compl
 crates/remanence-state/src/index.rs::terminal_state_for_event::AuditEvent::CompletionUnknown	1
 crates/remanence-state/src/index.rs::terminal_state_for_event::AuditEvent::OperationFailed	1
 crates/remanence-state/src/index.rs::terminal_state_for_event::AuditEvent::OperationFinished	1
+crates/remanence-state/src/library_log/store.rs::append::audit-append	1
+crates/remanence-state/src/library_log/store.rs::fixture_append::audit-append	1
+crates/remanence-state/src/library_log/store.rs::lock::audit-append	1
 crates/remanence-state/src/state.rs::adopt_bootstrap_identity::AuditEvent::TapeIdentityAdopted	3
 crates/remanence-state/src/state.rs::adopt_bootstrap_identity::AuditEventRecord	1
 crates/remanence-state/src/state.rs::adopt_bootstrap_identity::audit-append	1
