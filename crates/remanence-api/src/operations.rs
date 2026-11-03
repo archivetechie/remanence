@@ -38,6 +38,8 @@ struct OpEntry {
 pub(crate) struct OperationRegistry {
     pub(crate) readiness_start: Arc<Mutex<()>>,
     ops: Arc<Mutex<HashMap<Uuid, OpEntry>>>,
+    #[cfg(test)]
+    after_terminal: TerminalPublicationHook,
 }
 
 #[derive(Clone)]
@@ -48,9 +50,20 @@ pub(crate) struct OperationHandle {
     operation_kind: String,
     cancel: Arc<AtomicBool>,
     ops: Arc<Mutex<HashMap<Uuid, OpEntry>>>,
+    #[cfg(test)]
+    after_terminal: TerminalPublicationHook,
 }
 
+/// Per-registry one-shot barrier after publication, without holding the registry lock.
+#[cfg(test)]
+type TerminalPublicationHook = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
 impl OperationRegistry {
+    #[cfg(test)]
+    pub(crate) fn after_terminal_for_test(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.after_terminal.lock().unwrap() = Some(Box::new(hook));
+    }
+
     pub(crate) fn register(&self, op_id: Uuid, kind: &str) -> OperationHandle {
         let (tx, _rx) = broadcast::channel(BROADCAST_CAP);
         let cancel = Arc::new(AtomicBool::new(false));
@@ -80,6 +93,8 @@ impl OperationRegistry {
             operation_kind,
             cancel,
             ops: self.ops.clone(),
+            #[cfg(test)]
+            after_terminal: self.after_terminal.clone(),
         }
     }
 
@@ -221,9 +236,18 @@ impl OperationHandle {
     }
 
     pub(crate) fn publish(&self, status: pb::OperationStatus) {
+        #[cfg(test)]
+        let terminal = is_terminal(&status);
         if let Ok(mut ops) = self.ops.lock() {
             if let Some(entry) = ops.get_mut(&self.op_id) {
                 push_locked(entry, status);
+            }
+        }
+        #[cfg(test)]
+        if terminal {
+            let hook = self.after_terminal.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
             }
         }
     }

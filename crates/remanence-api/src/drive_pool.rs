@@ -158,6 +158,18 @@ impl ClosingGuard {
         self._done.receiver_count() > 1
     }
 
+    /// End the watchable finalization before publishing its terminal operation.
+    /// Keep the closing hold until physical ownership and cleanup are released.
+    pub(crate) fn clear_finalizing(&self) {
+        self.work
+            .0
+            .lock()
+            .unwrap()
+            .get_mut(&self.key)
+            .unwrap()
+            .finalization = None;
+    }
+
     /// Switch the short discovery hold to a long, watchable finalization.
     pub(crate) fn finalizing(&self, operation: Uuid) {
         self.work

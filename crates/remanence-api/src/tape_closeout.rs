@@ -97,6 +97,7 @@ pub(crate) fn start(
             "CloseoutTape expected_pool_id does not match the tape's assigned pool",
         ));
     }
+    crate::mount::refuse_sealed_tape(&index, tape)?;
     if let Some(pool) = &state.drive_pool {
         pool.check_finalizing(tape)?;
     }
