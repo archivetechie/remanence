@@ -28,6 +28,29 @@ fieldtest_script_dir() {
   cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd
 }
 
+# The interpreter for the kit's Python steps. Several steps parse the kit's TOML
+# configuration with tomllib, which needs Python 3.11 or later; RHEL 9's default
+# python3 is 3.9. FIELD_PYTHON names one explicitly; otherwise the first of
+# python3.13, python3.12, python3.11 and python3 that can import tomllib is used.
+fieldtest_python() {
+  if [[ -n "${FIELDTEST_PYTHON_CHOSEN:-}" ]]; then
+    printf '%s\n' "$FIELDTEST_PYTHON_CHOSEN"
+    return 0
+  fi
+  local candidate path
+  for candidate in ${FIELD_PYTHON:-} python3.13 python3.12 python3.11 python3; do
+    path="$(command -v -- "$candidate" 2>/dev/null)" || continue
+    if "$path" -c 'import tomllib' >/dev/null 2>&1; then
+      FIELDTEST_PYTHON_CHOSEN="$path"
+      export FIELDTEST_PYTHON_CHOSEN
+      printf '%s\n' "$path"
+      return 0
+    fi
+  done
+  echo 'refused: the field kit needs Python 3.11 or later (tomllib); install python3.11 (RHEL 9: dnf install python3.11) or set FIELD_PYTHON' >&2
+  return 2
+}
+
 fieldtest_repo_root() {
   # scripts/ -> fieldtest/ -> repo root (two levels up)
   cd -- "$(fieldtest_script_dir)/../.." && pwd

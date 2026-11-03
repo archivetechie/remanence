@@ -196,7 +196,7 @@ main() {
       # expire and finish cleanup before the kit resorts to a forced kill.
       stop_timeout="${REMFIELD_STOP_TIMEOUT_SECONDS:-}"
       if [[ -z "$stop_timeout" ]]; then
-        stop_timeout="$(python3 - "$(fieldtest_config_path)" <<'PYSTOP'
+        stop_timeout="$("$(fieldtest_python)" - "$(fieldtest_config_path)" <<'PYSTOP'
 import sys, tomllib
 from pathlib import Path
 config = tomllib.loads(Path(sys.argv[1]).read_text())
@@ -216,7 +216,7 @@ PYSTOP
       # seated cartridges alone. Keep tmux alive for all operation diagnostics.
       pid="$(pgrep -f "rem-daemon --config $(fieldtest_config_path)" | head -1 || true)"
       if [[ -n "$pid" ]]; then
-        if retry_window="$(python3 - "$(fieldtest_config_path)" <<'PYCONFIG'
+        if retry_window="$("$(fieldtest_python)" - "$(fieldtest_config_path)" <<'PYCONFIG'
 import sys, tomllib
 from pathlib import Path
 config = tomllib.loads(Path(sys.argv[1]).read_text())
