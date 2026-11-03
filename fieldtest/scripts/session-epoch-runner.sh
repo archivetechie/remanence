@@ -3,6 +3,7 @@
 set -euo pipefail
 scripts="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$scripts/lib.sh"
+py="$(fieldtest_python)" || exit 2
 step=${1:?} mode=${2:?} barcode=${3:?} evidence=${4:?}
 rem=$(fieldtest_rem_bin)
 io=$(fieldtest_io_bin)
@@ -23,13 +24,13 @@ begin)
   "$rem" top --endpoint "$endpoint" --once --json > "$evidence/top-before.json"
   "$rem" drive list --endpoint "$endpoint" --json > "$evidence/drives.json"
   "$rem" library "$(fieldtest_selected_library_serial)" --json --slots > "$evidence/library.json"
-  python3 "$scripts/session-epoch-evidence.py" identity "$evidence" "$barcode" "$(fieldtest_config_path)"
+  "$py" "$scripts/session-epoch-evidence.py" identity "$evidence" "$barcode" "$(fieldtest_config_path)"
   # Fresh daemon VmHWM baseline for every leg; no live write exists yet.
   "$scripts/03-bringup.sh" --stop
   export REM_FIELD_GATE_DIR="$gate" REM_FIELD_TRACE="$evidence/commands.jsonl" REM_FIELD_PROGRESS="$evidence/progress.jsonl"
   "$scripts/03-bringup.sh"
-  python3 "$scripts/session-epoch-evidence.py" pid "$evidence" "$(fieldtest_rem_daemon_bin)" "$(fieldtest_config_path)"
-  python3 "$scripts/session-epoch-evidence.py" sample "$evidence" >> "$evidence/memory.jsonl" &
+  "$py" "$scripts/session-epoch-evidence.py" pid "$evidence" "$(fieldtest_rem_daemon_bin)" "$(fieldtest_config_path)"
+  "$py" "$scripts/session-epoch-evidence.py" sample "$evidence" >> "$evidence/memory.jsonl" &
   echo "$!" > "$evidence/sampler.pid"
   pkg=$(cd "$scripts/.." && pwd -P)
   cp "$pkg/KIT-COMMIT" "$evidence/KIT-COMMIT"
@@ -44,19 +45,19 @@ prepare)
   echo "$!" > "$evidence/helper.pid"
   ;;
 dispatch)
-  python3 "$scripts/session-epoch-evidence.py" wait "$evidence" "${FIELD_SESSION_CONTROL:-}"
+  "$py" "$scripts/session-epoch-evidence.py" wait "$evidence" "${FIELD_SESSION_CONTROL:-}"
   ;;
 fault)
   if [[ $mode == kill-mid-write && -z ${FIELD_SESSION_CONTROL:-} ]]; then
-    python3 "$scripts/session-epoch-evidence.py" kill "$evidence" "$(fieldtest_rem_daemon_bin)" "$(fieldtest_config_path)"
-    python3 "$scripts/session-epoch-evidence.py" stop-helper "$evidence" "$io"
+    "$py" "$scripts/session-epoch-evidence.py" kill "$evidence" "$(fieldtest_rem_daemon_bin)" "$(fieldtest_config_path)"
+    "$py" "$scripts/session-epoch-evidence.py" stop-helper "$evidence" "$io"
     export REM_FIELD_GATE_DIR="$gate" REM_FIELD_TRACE="$evidence/commands.jsonl" REM_FIELD_PROGRESS="$evidence/progress.jsonl"
     "$scripts/03-bringup.sh"
-    python3 "$scripts/session-epoch-evidence.py" pid "$evidence" "$(fieldtest_rem_daemon_bin)" "$(fieldtest_config_path)"
-    python3 "$scripts/session-epoch-evidence.py" sample "$evidence" >> "$evidence/memory.jsonl" &
+    "$py" "$scripts/session-epoch-evidence.py" pid "$evidence" "$(fieldtest_rem_daemon_bin)" "$(fieldtest_config_path)"
+    "$py" "$scripts/session-epoch-evidence.py" sample "$evidence" >> "$evidence/memory.jsonl" &
     echo "$!" > "$evidence/restarted-sampler.pid"
   else
-    python3 "$scripts/session-epoch-evidence.py" settled "$evidence"
+    "$py" "$scripts/session-epoch-evidence.py" settled "$evidence"
   fi
   ;;
 closeout)
@@ -64,24 +65,24 @@ closeout)
   "$io" "${args[@]}" --phase finish > "$evidence/finish.jsonl" 2> "$evidence/finish.stderr"
   ;;
 verify)
-  python3 "$scripts/session-epoch-evidence.py" sample-once "$evidence" >> "$evidence/memory.jsonl"
+  "$py" "$scripts/session-epoch-evidence.py" sample-once "$evidence" >> "$evidence/memory.jsonl"
   touch "$evidence/commands.jsonl.stop" "$evidence/progress.jsonl.stop"
-  python3 "$scripts/session-epoch-evidence.py" stop-samplers "$evidence"
+  "$py" "$scripts/session-epoch-evidence.py" stop-samplers "$evidence"
   "$rem" top --endpoint "$endpoint" --once --json > "$evidence/top-after.json"
-  python3 "$scripts/session-epoch-evidence.py" verify "$evidence" "$mode" "${FIELD_SESSION_CONTROL:-}"
+  "$py" "$scripts/session-epoch-evidence.py" verify "$evidence" "$mode" "${FIELD_SESSION_CONTROL:-}"
   ;;
 collect)
-  python3 "$scripts/session-epoch-evidence.py" manifest "$evidence" "$mode" "$barcode"
+  "$py" "$scripts/session-epoch-evidence.py" manifest "$evidence" "$mode" "$barcode"
   ;;
 cleanup)
   # Cancel ingress before releasing the actor into the failed ring.
   cleanup_rc=0
-  if python3 "$scripts/session-epoch-evidence.py" stop-helper "$evidence" "$io"; then
+  if "$py" "$scripts/session-epoch-evidence.py" stop-helper "$evidence" "$io"; then
     [[ ! -d $gate ]] || touch "$gate/release"
   else
     cleanup_rc=1
   fi
-  python3 "$scripts/session-epoch-evidence.py" stop-samplers "$evidence" || cleanup_rc=1
+  "$py" "$scripts/session-epoch-evidence.py" stop-samplers "$evidence" || cleanup_rc=1
   if [[ -f $evidence/session.json && ! -f $evidence/after.json ]]; then
     helper_args
     timeout --signal=TERM --kill-after=5s 30s "$io" "${args[@]}" --phase cancel > "$evidence/cleanup.jsonl" 2>&1 || true

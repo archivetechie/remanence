@@ -6,6 +6,7 @@ source "$scripts/lib.sh"
 [[ ${FIELD_SESSION_EPOCH_ARM:-} == session-epoch-a ]] || { echo 'field leg A is not owner armed' >&2; exit 2; }
 [[ ${REM_FIELD_ALLOW_FAIL:-} == 1 ]] || { echo 'failed-append requires REM_FIELD_ALLOW_FAIL=1' >&2; exit 2; }
 fieldtest_init_layout
+py="$(fieldtest_python)" || exit 2
 out="$(fieldtest_evidence_dir)/session-epoch-preflight"
 mkdir -p "$out"
 python3 - "${FIELD_MIRIA_ATTESTATION:?set written attestation path}" "$out" <<'PY'
@@ -22,7 +23,7 @@ for bin in "$(fieldtest_rem_bin)" "$(fieldtest_rem_debug_bin)" "$(fieldtest_rem_
   getcap "$bin" | tee -a "$out/capabilities.txt" | grep -q 'cap_sys_rawio=ep'
 done
 # No old unscoped catalog can reach the startup worker.
-python3 - "$(fieldtest_config_path)" <<'PY'
+"$py" - "$(fieldtest_config_path)" <<'PY'
 import pathlib, sqlite3, sys, tomllib
 path = pathlib.Path(sys.argv[1])
 if path.exists():
