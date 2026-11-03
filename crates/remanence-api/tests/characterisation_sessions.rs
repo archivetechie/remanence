@@ -1403,6 +1403,17 @@ async fn finalized_tape_remains_readable_after_restart_and_refuses_more_writes()
     check_finalized_access(true).await;
 }
 
+/// Repeat the client-visible finalization/read/write contract across 50 fresh
+/// daemon lifetimes. Run explicitly so the ordinary suite retains its duration.
+#[tokio::test]
+#[ignore = "50-iteration finalization stress; run explicitly with --ignored --nocapture"]
+async fn finalized_tape_refuses_more_writes_stress_50() {
+    for iteration in 1..=50 {
+        check_finalized_access(true).await;
+        eprintln!("finalized access iteration {iteration}/50 passed");
+    }
+}
+
 #[tokio::test]
 async fn completed_finalization_releases_tape_for_reading_without_restart() {
     check_finalized_access(false).await;

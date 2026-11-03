@@ -470,6 +470,12 @@ pub(super) fn select_tape_in_pool_with_policy_and_eligibility(
         }
         let hold = holds.0.get(&tape_uuid).copied();
         let waiting = hold.is_some_and(TapeSelectionHold::waitable);
+        // A durable seal outranks even a stale finalizing hold. Other active
+        // owners retain their watchable Busy response while work is running.
+        if tape.state == "sealed" {
+            reasons.push(WritabilityError::NotReady { state: tape.state });
+            continue;
+        }
         if let Some(hold) = hold.filter(|h| {
             matches!(
                 h,

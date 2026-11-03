@@ -361,6 +361,7 @@ async fn open_write_session_reserved_for_caller(
                                             .map_err(crate::status_from_state_error)?
                                             .is_some_and(|t| {
                                                 t.pool_id.as_deref() == Some(pool_cfg.id.as_str())
+                                                    && t.state != "sealed"
                                             })
                                     {
                                         if let Err(busy) = pool.check_finalizing(*tape) {
@@ -463,6 +464,7 @@ async fn open_write_session_reserved_for_caller(
                 required_pool_id,
             } => {
                 select_attempts = 1;
+                refuse_sealed_tape(&index, *tape_uuid)?;
                 // A pinned request joins the same bounded closeout hold as a
                 // selected pool tape, but cannot reselect if admission changes.
                 pool.wait_tape_closeout(*tape_uuid).await;
@@ -1102,7 +1104,6 @@ async fn manual_finalize_tape_critical(
     };
     let worker_state = state.clone();
     tokio::spawn(async move {
-        let _finalizing = finalizing;
         let tape_uuid = actor_request.tape_uuid;
         let operation_id = actor_request.candidate_operation_id;
         if let Err(error) = run_started_manual_finalize_worker(
@@ -1112,6 +1113,7 @@ async fn manual_finalize_tape_critical(
             actor_request,
             Duration::from_secs(crate::readiness_wait::DEFAULT_OPERATION_READY_WAIT_SECONDS),
             handle,
+            &finalizing,
         )
         .await
         {
@@ -1176,6 +1178,10 @@ async fn run_manual_finalize_worker_with_budget(
     ready_wait: Duration,
 ) -> Result<(), Status> {
     let handle = start_finalize_attempt(&state, &actor_request)?;
+    let finalizing = pool.begin_finalizing(
+        actor_request.tape_uuid,
+        actor_request.candidate_operation_id,
+    );
     run_started_manual_finalize_worker(
         state,
         pool,
@@ -1183,6 +1189,7 @@ async fn run_manual_finalize_worker_with_budget(
         actor_request,
         ready_wait,
         handle,
+        &finalizing,
     )
     .await
 }
@@ -1231,6 +1238,7 @@ async fn run_started_manual_finalize_worker(
     actor_request: crate::write_owner::ManualFinalizeTapeActorRequest,
     ready_wait: Duration,
     handle: crate::operations::OperationHandle,
+    finalizing: &crate::drive_pool::ClosingGuard,
 ) -> Result<(), Status> {
     let id = actor_request.candidate_operation_id;
     let mut deadline = None;
@@ -1255,6 +1263,7 @@ async fn run_started_manual_finalize_worker(
     .await;
     match result {
         Ok(()) => {
+            finalizing.clear_finalizing();
             handle.publish_state(pb::OperationState::Succeeded, &[]);
             Ok(())
         }
@@ -1266,6 +1275,7 @@ async fn run_started_manual_finalize_worker(
                 remanence_state::AuditEvent::OperationFailed,
                 Some(&summary),
             );
+            finalizing.clear_finalizing();
             handle.publish_failed(&summary, &[]);
             if let Err(audit_error) = recorded {
                 return Err(Status::internal(format!(
@@ -1546,11 +1556,13 @@ pub(crate) async fn service_closeout_obligation(
                 tape_reservation,
                 intent,
                 terminal_handle.as_ref().unwrap().clone(),
+                &_closing,
             )
             .await
         } else {
             recover_automatic_terminal_tape(state, &pool, tape_reservation, tape_uuid).await
         };
+        _closing.clear_finalizing();
         // Manual recovery publishes its terminal state itself. Early recovery
         // refusals and automatic recovery still need this outer publication.
         if let Some(handle) = terminal_handle.filter(|_| {
@@ -1662,6 +1674,7 @@ async fn recover_manual_terminal_tape(
     tape_reservation: crate::write_owner::TapeReservation,
     intent: &remanence_state::authority::AuthorityFinalization,
     handle: crate::operations::OperationHandle,
+    finalizing: &crate::drive_pool::ClosingGuard,
 ) -> Result<(), Status> {
     let request = manual_finalize_request_from_intent(state, intent)?;
     record_finalize_attempt(
@@ -1677,6 +1690,7 @@ async fn recover_manual_terminal_tape(
         request,
         Duration::from_secs(crate::readiness_wait::DEFAULT_OPERATION_READY_WAIT_SECONDS),
         handle,
+        finalizing,
     )
     .await
 }
@@ -3829,6 +3843,19 @@ pub(crate) async fn supersede_tail(
     })
     .await
     .map_err(|e| Status::internal(e.to_string()))?
+}
+
+/// A completed durable seal takes precedence over transient ownership. This
+/// read-only check leaves incomplete host-only projection repair to admission.
+pub(crate) fn refuse_sealed_tape(index: &CatalogIndex, tape: TapeUuid) -> Result<(), Status> {
+    if index
+        .get_tape(&tape)
+        .map_err(crate::status_from_state_error)?
+        .is_some_and(|row| row.state == "sealed")
+    {
+        return Err(Status::failed_precondition("tape is sealed"));
+    }
+    Ok(())
 }
 
 /// Maintenance owns the exact tape and drive through the closeout barrier and
@@ -8038,4 +8065,5 @@ mod tests {
             cartridge: None,
         }
     }
+    mod finalization_publication_tests;
 }
