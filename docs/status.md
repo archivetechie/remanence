@@ -179,9 +179,9 @@ Library import and export through the mailslot, library-event streaming, and
 write-session restart all return `unimplemented`. So do write sessions that
 target a drive; sessions that target a pool or a pinned tape both work.
 `Catalog.CloseoutTape` and `Catalog.FinalizeTape` require an idempotency key
-and replay a retried request. Every other RPC refuses a non-empty
-`idempotency_key` with `UNIMPLEMENTED`; write-session replay detection does
-not use that field.
+and replay a retried request. `LibraryService.CleanDrive` accepts the field
+and ignores it. Every other RPC refuses a non-empty `idempotency_key` with
+`UNIMPLEMENTED`; write-session replay detection does not use that field.
 
 ## Known limitations found in field testing
 

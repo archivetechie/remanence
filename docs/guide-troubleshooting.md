@@ -904,10 +904,3 @@ journal leases before publishing the refusal, so an immediate retry or replay
 does not race that cleanup. Lock refusals log at WARN
 with the operation and write-session context. Check the session and tape ids
 and allow the holder to close before retrying. Do not delete a held lock file.
-
-Persistent typed medium or hardware failures in closeout maintenance receive
-three attempts with the existing backoff, then park the tape. Debt views and
-`rem top` show `parked: media fault (3/3 attempts)` with the diagnostic cause.
-Diagnostic text changes do not reset the budget; ordinary contention does not
-consume it. Readiness-fence clearance, barcode membership changes and operator
-actions wake the tape and reset the budget. Unrecognized failures remain transient.
