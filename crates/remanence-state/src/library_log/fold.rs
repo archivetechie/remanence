@@ -367,16 +367,11 @@ impl Body {
             Self::Retire(v) => vec![v.tape],
             Self::MediaGenerationSet(v) => vec![v.tape],
             Self::WrapMapCached(v) => vec![v.tape],
-            Self::FenceRaised(v) => {
-                let mut t = match &v.scope {
-                    FenceScope::Tape(t) => vec![*t],
-                    _ => vec![],
-                };
-                if let Some(at) = &v.at {
-                    t.push(at.tape);
-                }
-                t
-            }
+            // Evidence never participates in fence liveness or queue scopes.
+            Self::FenceRaised(v) => match &v.scope {
+                FenceScope::Tape(t) => vec![*t],
+                _ => vec![],
+            },
             Self::MotionIntent(v) => v.tape.into_iter().collect(),
             Self::ReadinessObserved(v) => v.tape.into_iter().collect(),
             Self::DriveHealthObserved(v) => v.tape.into_iter().collect(),
@@ -794,7 +789,7 @@ impl LibraryFold {
             Body::FenceRaised(v) => v.at.as_ref(),
             _ => None,
         });
-        if at.is_some_and(|at| at.sequence == 0) {
+        if at.is_some_and(|at| at.sequence == 0 || at.tape.incarnation == 0) {
             return Err(FoldError::InvalidSchema);
         }
         Ok(())
@@ -1724,6 +1719,12 @@ impl LibraryFold {
         self.pending.iter().any(|p| !p.scope.is_disjoint(scopes))
             || scopes.iter().any(|s| self.contradictions.contains_key(s))
     }
+    /// A fence's scoped tape already has a verdict; no liveness check can clear it.
+    fn contradicted_fence_scope(&self, scopes: &BTreeSet<Scope>) -> bool {
+        scopes
+            .iter()
+            .any(|s| matches!(s, Scope::Tape(_)) && self.contradictions.contains_key(s))
+    }
     fn validate_deferred_fence(
         &self,
         record: &Record,
@@ -1738,7 +1739,11 @@ impl LibraryFold {
         ) {
             return Err(FoldError::FenceScopeMismatch);
         }
-        self.check_pending_capacity(record, scope)
+        if self.contradicted_fence_scope(scope) {
+            Ok(())
+        } else {
+            self.check_pending_capacity(record, scope)
+        }
     }
     /// Restrict immediately, retaining the same queued liveness check for append and replay.
     fn defer_fence(
@@ -1750,8 +1755,10 @@ impl LibraryFold {
         view: &dyn TapeView,
     ) -> Result<(), FoldError> {
         self.validate_deferred_fence(&record, &scope)?;
-        self.hold(sequence, record.clone(), receipt.clone(), scope)?;
-        self.pending.last_mut().unwrap().deferred_fence = true;
+        if !self.contradicted_fence_scope(&scope) {
+            self.hold(sequence, record.clone(), receipt.clone(), scope)?;
+            self.pending.last_mut().unwrap().deferred_fence = true;
+        }
         self.commit(sequence, record, receipt, view);
         Ok(())
     }
@@ -1886,6 +1893,12 @@ impl LibraryFold {
             let pending = std::mem::take(&mut self.pending);
             let mut it = pending.into_iter();
             while let Some(p) = it.next() {
+                // The fence is already open. Release its check even when an earlier
+                // record still waits on this tape; preserve the contradiction itself.
+                if p.deferred_fence && self.contradicted_fence_scope(&p.scope) {
+                    self.pending_bytes -= p.bytes.len();
+                    continue;
+                }
                 if self.pending.iter().any(|q| !q.scope.is_disjoint(&p.scope))
                     || p.scope.iter().any(|s| self.contradictions.contains_key(s))
                 {

@@ -345,6 +345,25 @@ Authoritative prefix end: 302 bytes; tail Complete.
 | Sequence | Tag | Segment | Offset | End | Record hash |
 |---:|---|---|---:|---:|---|
 | 1 | Reprovision | 00000000000000000001-2026-11-03.remlib | 84 | 302 | `8789dd205b2f85410f302bb69093820ff04fadfc7d080fad6223adb6736f3ebb` |
+## rejected/closed-operation-replay
+
+Tail: `00000000000000000001-2026-11-03.remlib@1045:Some(5):ClosedOperationReplay { operation: [31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31] }`. Authoritative sequence 4; applied 4; pending 0; tapes 2; fences 0; duplicates 0.
+
+`00000000000000000001-2026-11-03.remlib`: 1296 bytes, SHA-256 `ba0c66fd52f983e00d1874d5853a12d436cf8b38f81d67e647c195d5fe3a8536`.
+
+Raw header (unvalidated): magic `52454d4c49420001`, version 1, log UUID `b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1`, first sequence 1, previous hash `0000000000000000000000000000000000000000000000000000000000000000`, date `2026-11-03`, stored CRC `678a79f09c0bd1e9`, computed CRC `678a79f09c0bd1e9`.
+
+Header: `Header { log_uuid: [177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177], first_sequence: 1, previous_segment_hash: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], date: [50, 48, 50, 54, 45, 49, 49, 45, 48, 51] }`.
+
+Authoritative prefix end: 1045 bytes; tail Complete.
+
+| Sequence | Tag | Segment | Offset | End | Record hash |
+|---:|---|---|---:|---:|---|
+| 1 | Reprovision | 00000000000000000001-2026-11-03.remlib | 84 | 303 | `7c1d67f6ccfa34acde7d6af3c53ace2397b30caffd87d8905dcc5f22a5ac651f` |
+| 2 | Reprovision | 00000000000000000001-2026-11-03.remlib | 303 | 522 | `22e3d688bfe8b7cc3bd69a9c5a0f6ec326a9d09bb233bf57d79f5cb2d3f99d5d` |
+| 3 | OperationRecorded | 00000000000000000001-2026-11-03.remlib | 522 | 813 | `32844ad801c9afcf196291f5d58bdebaf0cf92c1e0bf5b2ebbdfbe0e0ca440cc` |
+| 4 | OperationRecorded | 00000000000000000001-2026-11-03.remlib | 813 | 1045 | `0f823337b1747586226f82292548bf3f3d980c36815baabd088a7b5cf91fcc92` |
+| 5 | OperationRecorded | 00000000000000000001-2026-11-03.remlib | 1045 | 1296 | `20866bcaf24c6a5a7d9f2f6950fdc87f8bf8e678d3f52446c8af770412fce67d` |
 ## rejected/conflicting-duplicate
 
 Tail: `00000000000000000001-2026-11-03.remlib@730:Some(4):ConflictingDuplicate`. Authoritative sequence 3; applied 3; pending 0; tapes 2; fences 0; duplicates 0.
@@ -5662,6 +5681,25 @@ Authoritative prefix end: 267 bytes; tail Complete.
 | Sequence | Tag | Segment | Offset | End | Record hash |
 |---:|---|---|---:|---:|---|
 | 4 | Diagnostic | 00000000000000000004-2026-11-05.remlib | 84 | 267 | `e968c0a759fc156ffe731feae20bc3bea84e6a89f993e74a1578316e2b51b7e2` |
+## supersede-after-terminal
+
+Tail: `Some(Complete)`. Authoritative sequence 5; applied 5; pending 0; tapes 1; fences 0; duplicates 1.
+
+`00000000000000000001-2026-11-03.remlib`: 1372 bytes, SHA-256 `21776df81d390e562bd56e7867076177b8c7939e962b998b029df2dfe4e6d1bd`.
+
+Raw header (unvalidated): magic `52454d4c49420001`, version 1, log UUID `b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1`, first sequence 1, previous hash `0000000000000000000000000000000000000000000000000000000000000000`, date `2026-11-03`, stored CRC `678a79f09c0bd1e9`, computed CRC `678a79f09c0bd1e9`.
+
+Header: `Header { log_uuid: [177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177], first_sequence: 1, previous_segment_hash: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], date: [50, 48, 50, 54, 45, 49, 49, 45, 48, 51] }`.
+
+Authoritative prefix end: 1372 bytes; tail Complete.
+
+| Sequence | Tag | Segment | Offset | End | Record hash |
+|---:|---|---|---:|---:|---|
+| 1 | Reprovision | 00000000000000000001-2026-11-03.remlib | 84 | 302 | `8789dd205b2f85410f302bb69093820ff04fadfc7d080fad6223adb6736f3ebb` |
+| 2 | OperationRecorded | 00000000000000000001-2026-11-03.remlib | 302 | 512 | `c13cab0e4b8a18e2392e5b4187a95356f0a47bfce59583cf194df95e9f92b4e7` |
+| 3 | SupersedeTail | 00000000000000000001-2026-11-03.remlib | 512 | 846 | `09b559d523188de73d1e7b4fcdefdbbbdeb3c6cfba1e6dbf8a55e989f0044466` |
+| 4 | OperationRecorded | 00000000000000000001-2026-11-03.remlib | 846 | 1078 | `36b77f317c5b55833995fde90450a82b59507850dc7c69c7137279e3fd9c4448` |
+| 5 | SupersedeTail | 00000000000000000001-2026-11-03.remlib | 1078 | 1372 | `0deb8a3b8faea9bc74f257e164cfa6589cb0f23efeee8f9e0260ffefd39fcbde` |
 ## torn-tail
 
 Tail: `Some(Torn { offset: 302, kind: ShortBody })`. Authoritative sequence 1; applied 1; pending 0; tapes 1; fences 0; duplicates 0.
