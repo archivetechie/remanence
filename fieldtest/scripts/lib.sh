@@ -1448,9 +1448,16 @@ for idx, lib in enumerate(libs, start=1):
         f"{lib.get('revision','').strip()}  changer={lib.get('changer_sg', '?')} "
         f"drives={lib.get('drive_count')} slots={lib.get('slot_count')} loaded={lib.get('loaded_slot_count')}"
     )
+# stdin is this heredoc, so the answer comes from the terminal itself.
 try:
-    choice = input("Choose library number: ").strip()
-except EOFError as exc:
+    with open("/dev/tty") as tty:
+        sys.stdout.write("Choose library number: ")
+        sys.stdout.flush()
+        line = tty.readline()
+    if not line:
+        raise EOFError
+    choice = line.strip()
+except (EOFError, OSError) as exc:
     raise SystemExit(
         "no library selection provided; set FIELDTEST_LIBRARY_SERIAL or "
         "write ~/remfield/state/selected-library"
