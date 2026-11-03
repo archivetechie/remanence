@@ -206,6 +206,7 @@ async fn assert_sealed_refusals(f: &Fixture) {
             pool_id: f.admission.expected_pool_id.clone().unwrap(),
         },
     ] {
+        let pool_target = matches!(target, WriteSessionTarget::Pool { .. });
         let error = tokio::time::timeout(
             Duration::from_secs(2),
             open_write_session_reserved(
@@ -219,7 +220,15 @@ async fn assert_sealed_refusals(f: &Fixture) {
         .await
         .expect("sealed open refuses while publisher is paused")
         .unwrap_err();
-        assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+        // A pinned open names the sealed tape; a pool whose only tape is sealed keeps its
+        // long-standing "no writable tapes" code. Neither may answer Busy.
+        let expected = if pool_target {
+            tonic::Code::ResourceExhausted
+        } else {
+            tonic::Code::FailedPrecondition
+        };
+        assert_eq!(error.code(), expected, "{error}");
+        assert_ne!(error.code(), tonic::Code::Aborted, "{error}");
         assert!(error.message().contains("sealed"), "{error}");
     }
     let error = crate::tape_closeout::start(
