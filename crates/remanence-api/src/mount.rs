@@ -3299,6 +3299,13 @@ async fn resolve_and_reserve_actor_mount_with_resource<R>(
     let mut resource = Some(resource);
     loop {
         let busy_bays = pool.busy_bays(library_serial);
+        #[cfg(test)]
+        {
+            let hook = pool.mount_busy_snapshot_hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook(pool);
+            }
+        }
         let resolved = resolve_actor_mount(state, library_serial, tape_uuid, &busy_bays);
         if resolved.as_ref().is_err_and(|error| {
             error.code() == tonic::Code::FailedPrecondition
@@ -3310,7 +3317,12 @@ async fn resolve_and_reserve_actor_mount_with_resource<R>(
                     .copied()
                     .find(|bay| error.message() == format!("drive bay 0x{bay:04x} is busy"))
             });
-            if pool.wait_busy_closeout(library_serial, specific).await {
+            // Cleanup can release both the reservation and its closing guard
+            // after our busy snapshot, leaving no owner for the wait to join.
+            // Replan on that release instead of returning the stale refusal.
+            if pool.wait_busy_closeout(library_serial, specific).await
+                || !busy_bays.is_subset(&pool.busy_bays(library_serial))
+            {
                 continue;
             }
         }
@@ -3371,7 +3383,11 @@ async fn resolve_and_reserve_actor_mount_with_resource<R>(
                     && err.message().split("; held by: ").next()
                         == Some(format!("{} is busy", drive_key.label()).as_str()) =>
             {
-                if pool.wait_busy_closeout(library_serial, Some(bay)).await {
+                // The owner can also finish between a failed reservation and
+                // the closeout wait; only a still-held bay justifies refusal.
+                if pool.wait_busy_closeout(library_serial, Some(bay)).await
+                    || !pool.busy_bays(library_serial).contains(&bay)
+                {
                     continue;
                 }
                 return Err(err);
@@ -4502,6 +4518,65 @@ mod tests {
             pool,
             drive_rxs,
             changer_rx,
+        }
+    }
+
+    /// A completed closeout must not strand the busy snapshot used by eviction.
+    #[tokio::test]
+    async fn mount_evicts_when_closeout_releases_after_busy_snapshot() {
+        for actor_work in [false, true] {
+            let mut harness = three_bay_two_pool_harness(
+                vec![drive_bay(0x0101, true, Some("FTA001L9"))],
+                vec![empty_slot(0x0401), slot(0x0402, "FTB001L9")],
+            );
+            let key = crate::drive_pool::DriveKey::new("LIB001", 0x0101);
+            let reservation = harness.pool.reserve_drive(&key).unwrap();
+            let closing = if actor_work {
+                harness.pool.test_begin_actor_work(key)
+            } else {
+                harness.pool.test_begin_closing(POOL_TAPE_A, key)
+            };
+            *harness.pool.mount_busy_snapshot_hook.lock().unwrap() = Some(Box::new(move |pool| {
+                assert_eq!(pool.busy_bays("LIB001"), HashSet::from([0x0101]));
+                // Match actor cleanup: release the reservation before its watchable hold.
+                drop(reservation);
+                drop(closing);
+                assert!(pool.busy_bays("LIB001").is_empty());
+            }));
+            let mut drive_rx = harness.drive_rxs.remove(&0x0101).unwrap();
+            let mut changer_rx = harness.changer_rx;
+            let commands = tokio::spawn(async move {
+                let crate::write_owner::DriveCommand::Unload { reply } =
+                    drive_rx.recv().await.unwrap()
+                else {
+                    panic!("eviction unloads the spare");
+                };
+                reply.send(Ok(Duration::ZERO.into())).unwrap();
+                let crate::write_owner::ChangerCommand::Move {
+                    src, dst, reply, ..
+                } = changer_rx.recv().await.unwrap()
+                else {
+                    panic!("eviction moves the spare home");
+                };
+                assert_eq!((src, dst), (0x0101, 0x0401));
+                reply.send(Ok(())).unwrap();
+            });
+            let (mount, _reservation) = tokio::time::timeout(
+                Duration::from_secs(2),
+                resolve_and_reserve_actor_mount(
+                    &harness.state,
+                    &harness.pool,
+                    "LIB001",
+                    &POOL_TAPE_B,
+                ),
+            )
+            .await
+            .unwrap()
+            .expect("released closeout allows eviction and admission");
+            assert_eq!(mount.bay, 0x0101);
+            assert_eq!(mount.source_slot, Some(0x0402));
+            assert!(mount.needs_drive_load);
+            commands.await.unwrap();
         }
     }
 
