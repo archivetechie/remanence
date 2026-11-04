@@ -1778,15 +1778,21 @@ impl LibraryFold {
         if let Body::FenceReleased(v) = b {
             if let Some(h) = self.fences.get(&v.fence) {
                 if let Body::FenceRaised(raised) = &h.record.body {
-                    release_scope(&raised.scope)?;
+                    s.insert(release_scope(&raised.scope)?);
                 }
-                s.extend(h.record.body.scopes());
             }
         }
         Ok(s)
     }
-    /// Direct resource scopes plus current labels; fences have no DecisionRef scopes.
+    /// A fence orders only its scope-tape liveness check; drive fences never defer.
+    /// Other records retain their resource scopes and current labels.
     fn fence_scopes(&self, b: &Body) -> BTreeSet<Scope> {
+        if let Body::FenceRaised(v) = b {
+            return match &v.scope {
+                FenceScope::Tape(t) => BTreeSet::from([Scope::Tape(t.uuid)]),
+                FenceScope::Drive(_) | FenceScope::Model { .. } => BTreeSet::new(),
+            };
+        }
         let mut scopes = b.scopes();
         for tape in b.tapes() {
             if let Some(label) = self.tapes.get(&tape.uuid).and_then(|t| t.label.as_ref()) {

@@ -2512,3 +2512,294 @@ fn queued_measured_two_step_generation_change_is_refused_on_drain() {
     );
     f.assert_same_state(&before);
 }
+
+/// Persist the reviewer's operation spanning a contradicted tape and a healthy target.
+pub(super) fn freeze_history(drive: bool) -> Vec<Body> {
+    let supersede = |sequence, session| {
+        Body::SupersedeTail(SupersedeTail {
+            at: at(1, sequence),
+            operation: [9; 16],
+            session_id: [session; 16],
+            preview_digest: [0; 32],
+            tail_file_count: 1,
+        })
+    };
+    vec![
+        provision(1, Some("A")),
+        provision(2, Some("B")),
+        Body::OperationRecorded(OperationRecorded {
+            operation: [9; 16],
+            kind: OperationKind::MoveMedium,
+            previous: None,
+            event: OperationEvent::Started(Unit),
+        }),
+        supersede(9, 3),
+        supersede(10, 4),
+        Body::FenceRaised(FenceRaised {
+            kind: if drive {
+                FenceKind::DriveFault
+            } else {
+                FenceKind::Write
+            },
+            scope: if drive {
+                FenceScope::Drive(endpoint("LIBA0001"))
+            } else {
+                FenceScope::Tape(tape(2))
+            },
+            cause: FenceCause::TransferError,
+            evidence: None,
+            at: None,
+            operation: Some([9; 16]),
+        }),
+        Body::MediumSpecSet(MediumSpecSet {
+            tape: tape(2),
+            medium: medium_spec(),
+            change: GenerationChange {
+                expected: 1,
+                next: 2,
+            },
+        }),
+    ]
+}
+
+/// Check actual store replay, reopened live append, and the byte differential oracle.
+fn freeze_fence_paths(drive: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut log, _) = open(dir.path(), &Present);
+    let bodies = freeze_history(drive);
+    for b in &bodies[..5] {
+        put(&mut log, b.clone());
+    }
+    drop(log);
+    let view =
+        super::reference_fixtures::corpus_view(Path::new("fence-behind-contradicted-operation"));
+    let (mut log, _) = open(dir.path(), view.as_ref());
+    for b in &bodies[5..] {
+        log.append(
+            b.clone(),
+            AuditActor::User("operator".into()),
+            SourceLayer::Layer4,
+            view.as_ref(),
+        )
+        .unwrap();
+    }
+    let mut live = LibraryFold::default();
+    let mut decoded = LibraryFold::default();
+    let mut history = History::default();
+    for (i, b) in bodies.into_iter().enumerate() {
+        let n = i as u64 + 1;
+        let r = record(b, n);
+        super::differential_tests::step(
+            &mut live,
+            &mut decoded,
+            r.clone(),
+            receipt(&r, n),
+            view.as_ref(),
+            &history,
+        )
+        .unwrap();
+        history.0.insert(n, r);
+    }
+    drop(log);
+    let r = replay(dir.path(), LOG, view.as_ref()).unwrap();
+    assert!(r.refusal.is_none());
+    assert_eq!(
+        r.fold
+            .pending
+            .iter()
+            .map(|p| p.sequence)
+            .collect::<Vec<_>>(),
+        [5]
+    );
+    assert_eq!(r.fold.open_fences(), 1);
+    assert_eq!(r.fold.tapes[&tape(2).uuid].media_revision, 2);
+    for b in [pool(2, 1), release(6)] {
+        assert!(matches!(
+            r.fold.validate(&record(b, 8), view.as_ref(), &history),
+            Ok(fold::Validated::Apply)
+        ));
+    }
+    let (mut log, _) = open(dir.path(), view.as_ref());
+    log.append(
+        release(6),
+        AuditActor::System,
+        SourceLayer::Layer4,
+        view.as_ref(),
+    )
+    .unwrap();
+    assert_eq!(log.state().fold.open_fences(), 0);
+    assert_eq!(
+        live.pending.iter().map(|p| p.sequence).collect::<Vec<_>>(),
+        [5]
+    );
+    assert_eq!(live.tapes[&tape(2).uuid].media_revision, 2);
+    assert_eq!(live.open_fences(), 1);
+    let release_record = record(release(6), 8);
+    super::differential_tests::step(
+        &mut live,
+        &mut decoded,
+        release_record.clone(),
+        receipt(&release_record, 8),
+        view.as_ref(),
+        &history,
+    )
+    .unwrap();
+    assert_eq!(live.open_fences(), 0);
+    assert_eq!(
+        live.pending.iter().map(|p| p.sequence).collect::<Vec<_>>(),
+        [5]
+    );
+}
+
+/// A Write fence never transfers an operation's contradicted-tape blockage to T2.
+#[test]
+fn freeze_write_fence_on_healthy_tape_is_not_held_by_operation() {
+    freeze_fence_paths(false);
+}
+
+/// Drive fences have no tape-ordered liveness check and cannot defer on an operation.
+#[test]
+fn freeze_drive_fence_never_defers() {
+    freeze_fence_paths(true);
+}
+
+/// A fence still waits behind a pending predecessor and reprovision of its own tape.
+#[test]
+fn freeze_fence_still_waits_on_its_tape() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/library-log/queued-successor-fence");
+    let mut r = replay(&root, LOG, &View::default()).unwrap();
+    assert!(r.refusal.is_none());
+    assert_eq!(
+        r.fold
+            .pending
+            .iter()
+            .map(|p| p.sequence)
+            .collect::<Vec<_>>(),
+        [2, 3, 4, 5]
+    );
+    assert_eq!(
+        r.fold.pending.last().unwrap().scope,
+        std::collections::BTreeSet::from([fold::Scope::Tape(tape(2).uuid)])
+    );
+    r.fold.resolve(&Present, &History::default()).unwrap();
+    assert!(r.fold.pending.is_empty());
+    assert!(r.fold.contradictions.is_empty());
+    assert_eq!(r.fold.open_fences(), 1);
+    assert!(r.fold.tapes.contains_key(&tape(2).uuid));
+}
+
+/// Operator assignment is independent of Config, while a Rule reference orders on it.
+#[test]
+fn assign_pool_operator_is_tape_scoped() {
+    let bodies = [
+        provision(1, None),
+        provision(2, None),
+        configuration(1),
+        freeze_history(false)[3].clone(),
+        {
+            let mut b = pool(1, 1);
+            if let Body::AssignPool(v) = &mut b {
+                v.source = AssignmentSource::Rule;
+                v.configuration = Some(decision(3));
+            }
+            b
+        },
+        pool(2, 1),
+        {
+            let mut b = pool(2, 2);
+            if let Body::AssignPool(v) = &mut b {
+                v.source = AssignmentSource::Rule;
+                v.configuration = Some(decision(3));
+            }
+            b
+        },
+    ];
+    let mut f = LibraryFold::default();
+    let mut history = History::default();
+    for (i, b) in bodies.into_iter().enumerate() {
+        let n = i as u64 + 1;
+        let r = record(b, n);
+        f.receive(n, r.clone(), receipt(&r, n), &View::default(), &history)
+            .unwrap();
+        history.0.insert(n, r);
+    }
+    assert_eq!(
+        f.pending.iter().map(|p| p.sequence).collect::<Vec<_>>(),
+        [4, 5, 7]
+    );
+    assert_eq!(f.tapes[&tape(2).uuid].assignment_generation, 2);
+    assert!(f.pending[1].scope.contains(&fold::Scope::Config));
+    assert!(f.pending[2].scope.contains(&fold::Scope::Config));
+}
+
+/// Read a named rejection with its published view and require the exact typed error.
+fn freeze_refusal(case: &str, expected: RefusalKind, sequence: u64) {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/library-log");
+    let view = super::reference_fixtures::corpus_view(Path::new(case));
+    let r = replay(&root.join(case), LOG, view.as_ref()).unwrap();
+    let refusal = r.refusal.unwrap();
+    assert_eq!(refusal.fault, expected);
+    assert_eq!(refusal.sequence, Some(sequence));
+    assert!(r.fold.pending.is_empty());
+}
+
+/// Measurement acquired by a revision survives an Operator revision and forbids LTO changes.
+#[test]
+fn freeze_measured_revision_prevents_generation_change() {
+    freeze_refusal(
+        "rejected/medium-measured-by-revision-generation-change",
+        RefusalKind::Fold(FoldError::MediumFamilyChanged),
+        4,
+    );
+}
+
+/// A header-only final segment is refused at the next sequence, rather than accepted empty.
+#[test]
+fn freeze_empty_segment_is_refused() {
+    freeze_refusal(
+        "rejected/empty-segment",
+        RefusalKind::Bytes(codec::Fault::EmptySegment),
+        4,
+    );
+}
+
+/// Extension selection retains a nineteen-digit segment name for typed refusal.
+#[test]
+fn freeze_unparseable_segment_name_is_refused() {
+    freeze_refusal(
+        "rejected/segment-name-unparseable",
+        RefusalKind::Bytes(codec::Fault::SegmentName),
+        4,
+    );
+}
+
+/// A matching native digest with the wrong kind stops replay without holding the record.
+#[test]
+fn freeze_matching_digest_wrong_kind_is_refused() {
+    freeze_refusal(
+        "rejected/counterpart-kind",
+        RefusalKind::Fold(FoldError::CounterpartKind),
+        2,
+    );
+}
+
+/// The frame cap is a prefix refusal even when no declared body bytes are present.
+#[test]
+fn freeze_oversized_frame_is_refused_before_body_read() {
+    freeze_refusal(
+        "rejected/frame-too-large",
+        RefusalKind::Bytes(codec::Fault::Frame(crate::log_frame::Fault::FrameTooLarge)),
+        2,
+    );
+}
+
+/// A command with an open intent cannot be reused before an outcome.
+#[test]
+fn freeze_open_motion_command_is_conflicting_duplicate() {
+    freeze_refusal(
+        "rejected/motion-command-open",
+        RefusalKind::Fold(FoldError::ConflictingDuplicate),
+        3,
+    );
+}
