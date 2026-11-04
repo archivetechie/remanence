@@ -27,7 +27,7 @@ getrandom        = { workspace = true }
 rand_core        = { workspace = true }
 libcrux-ml-kem   = { version = "=0.0.10", default-features = false, features = ["mlkem768"] }
 # SHAKE moved out of sha3 0.12; use the same vetted backend as ML-KEM.
-libcrux-sha3      = "=0.0.10"
+libcrux-sha3      = "=0.0.11"
 sha2             = { workspace = true }
 sha3             = { version = "=0.12.0", features = ["zeroize"] }
 thiserror        = { workspace = true }
