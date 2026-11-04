@@ -181,13 +181,13 @@ tape_catalog_dir = "{0}/cache"
         ))
         .unwrap();
         config.daemon.checkpoint_max_age_seconds = 1800;
-        let mut state = StateHandle::open_with_config(
+        let state = StateHandle::open_with_config(
             remanence_state::StatePaths::from_config(root.path().join("config.toml"), &config),
             config.clone(),
         )
         .unwrap();
         state
-            .catalog_index()
+            .write_handle()
             .provision_tape(remanence_state::ProvisionTapeInput {
                 tape_uuid: UUID,
                 voltag: "HAND".into(),
@@ -197,7 +197,7 @@ tape_catalog_dir = "{0}/cache"
             })
             .unwrap();
         state
-            .catalog_index()
+            .write_handle()
             .set_tape_generation(
                 UUID,
                 remanence_state::MediaObservation {
@@ -207,7 +207,7 @@ tape_catalog_dir = "{0}/cache"
             )
             .unwrap();
         state
-            .catalog_index()
+            .write_handle()
             .project_tape_pool_membership(UUID, "default")
             .unwrap();
         let payload = crate::build_tape_bootstrap(
@@ -276,7 +276,9 @@ tape_catalog_dir = "{0}/cache"
         }
     }
     fn index(&self) -> CatalogIndex {
-        CatalogIndex::open(&self.config.index.sqlite_path).unwrap()
+        remanence_state::projector::open(&self.config.index.sqlite_path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap()
     }
 }
 #[test]
@@ -514,9 +516,9 @@ fn audit_failure_refuses_modifying_dispatch_even_when_config_fsync_is_false() {
 
 #[test]
 fn ready_only_gate_and_wrong_pool_refuse_before_write_motion() {
-    let (fixture, mut state) = Fixture::new(false);
+    let (fixture, state) = Fixture::new(false);
     state
-        .catalog_index()
+        .write_handle()
         .set_append_recovery_required(UUID, true)
         .unwrap();
     let mut owner = fixture.owner(state);
@@ -719,10 +721,7 @@ fn abrupt_process_restart_recovers_only_the_recorded_endpoint_with_fsync_disable
             panic!("unrelated endpoint recovered a mounted session")
         })
         .unwrap();
-    assert_eq!(
-        state.catalog_index().non_terminal_sessions().unwrap().len(),
-        1
-    );
+    assert_eq!(state.catalog().non_terminal_sessions().unwrap().len(), 1);
     let mount = OperatorMount::with_transport(
         Path::new(DEVICE),
         &StaticAllowlist::new([SERIAL]),
@@ -738,7 +737,7 @@ fn abrupt_process_restart_recovers_only_the_recorded_endpoint_with_fsync_disable
     )
     .unwrap();
     mount.finish().unwrap();
-    let fences = state.catalog_index().list_active_tape_io_fences().unwrap();
+    let fences = state.catalog().list_active_tape_io_fences().unwrap();
     assert_eq!(fences.len(), 1);
     assert_eq!(
         fences[0].endpoint,
@@ -747,11 +746,7 @@ fn abrupt_process_restart_recovers_only_the_recorded_endpoint_with_fsync_disable
         })
     );
     assert_eq!(fences[0].reason, "standalone_write_lost_by_restart");
-    assert!(state
-        .catalog_index()
-        .non_terminal_sessions()
-        .unwrap()
-        .is_empty());
+    assert!(state.catalog().non_terminal_sessions().unwrap().is_empty());
     drop(state);
     std::fs::remove_dir_all(&config.daemon.state_dir).unwrap();
 }
@@ -1563,7 +1558,7 @@ fn supersede_requires_mounted_generation_before_any_modifying_command() {
     let audit = mount.context.audit_error.clone();
     mount.finish().unwrap();
     assert!(state
-        .catalog_index()
+        .catalog()
         .get_tape(&UUID)
         .unwrap()
         .unwrap()

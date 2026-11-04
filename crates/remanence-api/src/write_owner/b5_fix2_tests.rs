@@ -95,7 +95,9 @@ async fn cleaning_shutdown(before_unload: bool) {
     let snapshot = world.lock().unwrap().library_snapshot();
     let library = open_model_library(world.clone());
     let index_path = temp.path().join("state.sqlite");
-    let mut index = CatalogIndex::open(&index_path).unwrap();
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let drive_uuid = index
         .observe_drive(DriveObservationInput {
             serial: "DRV-CLEAN-STOP".into(),
@@ -131,7 +133,7 @@ async fn cleaning_shutdown(before_unload: bool) {
         Arc::new(HashMap::new()),
         lifecycle.clone(),
     );
-    let mut api = crate::ApiState::new(CatalogIndex::open(&index_path).unwrap());
+    let mut api = crate::ApiState::new(remanence_state::projector::open(&index_path).unwrap());
     api.drive_pool = Some(pool.clone());
     let cleaning_world = world.clone();
     let cleaning_unloads = unloads.clone();
@@ -234,7 +236,7 @@ async fn cancelled_read_open_parks_audits_close_and_idle_returns_home() {
         Arc::new(HashMap::from([(key.clone(), AtomicBool::new(false))])),
         lifecycle,
     );
-    let mut api = crate::ApiState::new(CatalogIndex::open(&index_path).unwrap());
+    let mut api = crate::ApiState::new(remanence_state::projector::open(&index_path).unwrap());
     api.drive_pool = Some(pool.clone());
     api.library_snapshot = Some(snapshot);
     api.audit_dir = Arc::new(temp.path().join("audit"));

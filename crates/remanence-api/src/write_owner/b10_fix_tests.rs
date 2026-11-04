@@ -7,7 +7,9 @@ const THIRD: [u8; 16] = [0x13; 16];
 
 /// Seat another cartridge with the same geometry; no physical device is opened.
 fn add_tape(root: &Path, world: &Arc<Mutex<VirtualWorld>>, id: [u8; 16], label: &str, bay: u16) {
-    let mut index = CatalogIndex::open(root.join("state.sqlite")).unwrap();
+    let mut index = remanence_state::projector::open(root.join("state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     index
         .provision_tape(ProvisionTapeInput {
             tape_uuid: id,

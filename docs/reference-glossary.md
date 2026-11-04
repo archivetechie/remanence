@@ -11,7 +11,7 @@ formats and objects, the catalog and the daemon, safety and operations, and labe
 endpoints. Then come the tape and SCSI background, and last the implementation terms that
 matter to integrators and contributors.
 
-<!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-aead/src/header.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/key_frame.rs crates/remanence-aead/src/xwing.rs crates/remanence-parity/src/lib.rs crates/remanence-parity/src/authority/identity.rs crates/remanence-state/src/index.rs crates/remanence-library/src/handle/tape_io/model.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-aead/src/header.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/key_frame.rs crates/remanence-aead/src/xwing.rs crates/remanence-parity/src/lib.rs crates/remanence-parity/src/authority/identity.rs crates/remanence-state/src/projector/index.rs crates/remanence-library/src/handle/tape_io/model.rs @ 625f7044 -->
 ## Formats and objects
 
 Remanence uses three formats. REM-OBJECT packages files into one stored unit, REM-ENCRYPT
@@ -301,7 +301,7 @@ An auxiliary, read-only parser linked into a separate Remanence distribution. Co
 owns the normalized reader and registry contract but ships with an empty registry and no
 concrete adapters. See [foreign-format adapters](reference-foreign-format-adapters.md).
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-state/src/index.rs crates/remanence-state/src/tape_log/projection.rs crates/remanence-state/src/tape_log/store.rs crates/remanence-state/src/authority_layout.rs crates/remanence-api/src/write_owner/checkpoint.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/tape_log/store.rs crates/remanence-state/src/authority_layout.rs crates/remanence-api/src/write_owner/checkpoint.rs @ 625f7044 -->
 ## Catalog and daemon
 
 ### tape log
@@ -534,7 +534,7 @@ Proof that the tape's physical suffix permits a write
 at the tape-log-authorized position. Complete data beyond known state produces
 `TailBeyondKnownState`; state rows and fence release do not authorize erasure.
 
-<!-- code-anchor: crates/remanence-api/src/engine/drive_adapter.rs crates/remanence-library/src/discovery.rs crates/remanence-cli/src/standalone.rs crates/remanence-state/src/index.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-api/src/engine/drive_adapter.rs crates/remanence-library/src/discovery.rs crates/remanence-cli/src/standalone.rs crates/remanence-state/src/projector/index.rs @ 625f7044 -->
 ## Labels and endpoints
 
 ### label (voltag)

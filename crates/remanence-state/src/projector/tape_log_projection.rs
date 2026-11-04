@@ -31,7 +31,7 @@ create table if not exists tape_log_object_commits (
  primary key(tape_uuid, tape_file_number)
 );";
 
-impl CatalogIndex {
+impl CatalogCore {
     /// Catalog accelerator only; the log remains authority and must be validated.
     pub fn projected_through_sequence(&self, uuid: [u8; 16]) -> Result<u64, StateError> {
         Ok(projection_mark(&self.conn, uuid)?.map_or(0, |(sequence, _)| sequence))
@@ -73,7 +73,7 @@ impl CatalogIndex {
             .map_err(|e| sqlite_error("commit tape-log projection", e))
     }
 }
-impl CatalogIndex {
+impl CatalogCore {
     /// Projection-only rebuild: this entry point has no filesystem reset access.
     pub fn rebuild_tape_log_projection(
         &mut self,
@@ -661,14 +661,15 @@ fn project_terminal_log_progress(
 /// and projection functions as a full rebuild. Only this tape's acceleration
 /// mark is discarded, allowing tests to model a lost or partial SQLite cache.
 #[cfg(any(test, feature = "fixtures"))]
-impl CatalogIndex {
+impl CatalogCore {
     /// Publish a semantic fixture to a native log, then reconstruct its catalog.
     pub fn project_checkpoint_record(
         &mut self,
         record: &crate::CommitFixture,
+        path: &Path,
     ) -> Result<(), StateError> {
         use crate::authority::{TapeAuthority, TapeAuthorityView, TapeAuthorityWriter};
-        let directory = self.path().with_extension("fixture-logs");
+        let directory = path.with_extension("fixture-logs");
         std::fs::create_dir_all(&directory).map_err(StoreError::Io)?;
         let authority = TapeAuthority::open_fixture(directory, record.tape_uuid)?;
         let mut writer = if authority.pending_finalization()?.is_some() {
@@ -759,19 +760,24 @@ mod tests {
         let older = lease.freeze().unwrap();
         lease.publish_report(&(&second_record(id)).into()).unwrap();
         let newer = lease.freeze().unwrap();
-        let mut index = CatalogIndex::open(root.path().join("index.sqlite")).unwrap();
-        index.conn.execute_batch("create trigger fail_mark before insert on tape_log_projection begin select raise(abort, 'projection failure'); end;").unwrap();
+        let mut index = crate::projector::open(root.path().join("index.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
+        Connection::open(index.path()).unwrap().execute_batch("create trigger fail_mark before insert on tape_log_projection begin select raise(abort, 'projection failure'); end;").unwrap();
         assert!(index.project_tape_log(&newer).is_err());
         assert_eq!(index.projected_through_sequence(id).unwrap(), 0);
         assert_eq!(
-            index
-                .conn
+            Connection::open(index.path())
+                .unwrap()
                 .query_row("select count(*) from object_copies", [], |r| r
                     .get::<_, u64>(0))
                 .unwrap(),
             0
         );
-        index.conn.execute_batch("drop trigger fail_mark").unwrap();
+        Connection::open(index.path())
+            .unwrap()
+            .execute_batch("drop trigger fail_mark")
+            .unwrap();
         index.project_tape_log(&newer).unwrap();
         assert!(index.project_tape_log(&older).is_err());
         index.project_tape_log(&newer).unwrap();
@@ -780,8 +786,8 @@ mod tests {
             newer.raw.summary().last_closed_sequence
         );
         assert_eq!(
-            index
-                .conn
+            Connection::open(index.path())
+                .unwrap()
                 .query_row("select count(*) from object_copies", [], |r| r
                     .get::<_, u64>(0))
                 .unwrap(),
@@ -804,11 +810,18 @@ mod tests {
         let id = [0x66; 16];
         let authority = TapeAuthority::open_fixture(root.path(), id).unwrap();
         let mut writer = authority.acquire_exclusive().unwrap();
-        let mut index = CatalogIndex::open(root.path().join("index.sqlite")).unwrap();
-        index.conn.trace_v2(
-            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
-            Some(|_| SQL_COUNT.set(SQL_COUNT.get() + 1)),
-        );
+        let mut index = crate::projector::open(root.path().join("index.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
+        index
+            .with_core(|core| {
+                core.conn.trace_v2(
+                    rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+                    Some(|_| SQL_COUNT.set(SQL_COUNT.get() + 1)),
+                );
+                Ok(())
+            })
+            .unwrap();
         let mut baseline = None;
         for n in 1..=80u64 {
             let mut r = record(id);
@@ -833,7 +846,12 @@ mod tests {
             let count = crate::tape_log::measure::counts().catalog_payloads;
             assert_eq!(count, 1, "barrier {n} decoded history");
             let statements = SQL_COUNT.get();
+            assert!(
+                statements > 0,
+                "barrier {n} must trace the catalog connection"
+            );
             if n == 2 {
+                eprintln!("SQL statements per incremental barrier: {statements}");
                 baseline = Some(statements);
             }
             if n > 2 {
@@ -856,11 +874,15 @@ mod tests {
         let mut writer = authority.acquire_exclusive().unwrap();
         writer.publish_report(&(&record(id)).into()).unwrap();
         let snapshot = writer.freeze().unwrap();
-        let mut index = CatalogIndex::open(root.path().join("index.sqlite")).unwrap();
+        let mut index = crate::projector::open(root.path().join("index.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         index.project_tape_log(&snapshot).unwrap();
-        let (_, offset) = projection_mark(&index.conn, id).unwrap().unwrap();
-        index
-            .conn
+        let (_, offset) = projection_mark(&Connection::open(index.path()).unwrap(), id)
+            .unwrap()
+            .unwrap();
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "update tape_log_projection set projected_through_offset = ?1",
                 params![SqliteU64::new(offset + 1)],
@@ -880,19 +902,21 @@ mod tests {
         let mut writer = authority.acquire_exclusive().unwrap();
         writer.publish_report(&(&record(id)).into()).unwrap();
         let snapshot = writer.freeze().unwrap();
-        let mut index = CatalogIndex::open(root.path().join("index.sqlite")).unwrap();
+        let mut index = crate::projector::open(root.path().join("index.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         index.project_tape_log(&snapshot).unwrap();
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute("delete from tape_log_projection", [])
             .unwrap();
         index.project_tape_log(&snapshot).unwrap();
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute("delete from tape_log_projection", [])
             .unwrap();
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "update tape_log_object_commits set tape_log_sequence = ?1",
                 params![SqliteU64::new(99)],
@@ -922,9 +946,9 @@ mod tests {
             });
             let mut writer = authority.acquire_exclusive().unwrap(); writer.publish_report(&(&r).into()).unwrap();
             let snapshot = writer.freeze().unwrap();
-            let mut index = CatalogIndex::open(root.path().join("index.sqlite")).unwrap();
+            let mut index = crate::projector::open(root.path().join("index.sqlite")).map(|catalog| catalog.write_handle()).unwrap();
             index.project_tape_log(&snapshot).unwrap();
-            index.conn.execute_batch(update).unwrap();
+            Connection::open(index.path()).unwrap().execute_batch(update).unwrap();
             assert!(index.rebuild_tape_log_projection(&[], &[snapshot]).unwrap_err().to_string().contains("conflicts with SQLite"), "{update}");
         }
     }
@@ -940,19 +964,21 @@ mod tests {
             (&crate::checkpoint::tests::finalization_intent(id)).into();
         writer.begin_finalization(&intent).unwrap();
         writer.accept_preparation().unwrap();
-        let mut index = CatalogIndex::open(root.path().join("index.sqlite")).unwrap();
+        let mut index = crate::projector::open(root.path().join("index.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         index.project_tape_log(&writer.freeze().unwrap()).unwrap();
-        index.conn.execute_batch("update tapes set finalization_progress=null, finalization_trigger=null, finalization_operation_id=null, finalization_edition_digest=null, finalization_layout_digest=null, finalization_outcome=null, completed_replicas=null, state='ready'").unwrap();
+        Connection::open(index.path()).unwrap().execute_batch("update tapes set finalization_progress=null, finalization_trigger=null, finalization_operation_id=null, finalization_edition_digest=null, finalization_layout_digest=null, finalization_outcome=null, completed_replicas=null, state='ready'").unwrap();
         assert!(index
             .validate_repair_prefix(&before)
             .unwrap_err()
             .to_string()
             .contains("separate explicit forensic recovery path"));
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute("delete from idempotency_keys", [])
             .unwrap();
-        index.conn.execute("insert into operations(operation_id,operation_kind,state,subject,started_at_utc,updated_at_utc) values ('accepted-operation','finalize_tape','running',?1,'now','now')", params![Uuid::from_bytes(id).to_string()]).unwrap();
+        Connection::open(index.path()).unwrap().execute("insert into operations(operation_id,operation_kind,state,subject,started_at_utc,updated_at_utc) values ('accepted-operation','finalize_tape','running',?1,'now','now')", params![Uuid::from_bytes(id).to_string()]).unwrap();
         assert!(index
             .validate_repair_prefix(&before)
             .unwrap_err()
@@ -967,16 +993,18 @@ mod tests {
         let mut writer = authority.acquire_exclusive().unwrap();
         writer.publish_report(&(&record(id)).into()).unwrap();
         let before = writer.freeze().unwrap();
-        let mut index = CatalogIndex::open(root.path().join("index.sqlite")).unwrap();
+        let mut index = crate::projector::open(root.path().join("index.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         index.project_tape_log(&before).unwrap();
         index.validate_repair_prefix(&before).unwrap();
         let this = format!("tape:{}", Uuid::from_bytes(id));
         let other = format!("tape:{}", Uuid::from_bytes([0x60; 16]));
         let operation = |index: &CatalogIndex, op: &str, state: &str, subject: &str| {
-            index.conn.execute("insert into operations(operation_id,operation_kind,state,subject,started_at_utc,updated_at_utc) values (?1,'finalize_tape',?2,?3,'now','now')", params![op, state, subject]).unwrap();
+            Connection::open(index.path()).unwrap().execute("insert into operations(operation_id,operation_kind,state,subject,started_at_utc,updated_at_utc) values (?1,'finalize_tape',?2,?3,'now','now')", params![op, state, subject]).unwrap();
         };
         let key = |index: &CatalogIndex, op: &str, terminal: Option<&str>| {
-            index.conn.execute("insert into idempotency_keys(actor_fingerprint,operation_kind,idempotency_key,request_fingerprint,operation_id,terminal_state,response_fingerprint,updated_at_utc) values ('actor','finalize_tape',?1,X'00',?1,?2,null,'now')", params![op, terminal]).unwrap();
+            Connection::open(index.path()).unwrap().execute("insert into idempotency_keys(actor_fingerprint,operation_kind,idempotency_key,request_fingerprint,operation_id,terminal_state,response_fingerprint,updated_at_utc) values ('actor','finalize_tape',?1,X'00',?1,?2,null,'now')", params![op, terminal]).unwrap();
         };
         let refused = |index: &CatalogIndex| {
             index
@@ -999,8 +1027,8 @@ mod tests {
         for state in ["failed", "running", "finished", "completion_unknown"] {
             operation(&index, "pending", state, &this);
             assert!(refused(&index), "{state}");
-            index
-                .conn
+            Connection::open(index.path())
+                .unwrap()
                 .execute("delete from operations where operation_id = 'pending'", [])
                 .unwrap();
         }
@@ -1018,11 +1046,13 @@ mod tests {
         let older = lease.freeze().unwrap();
         lease.publish_report(&(&second_record(id)).into()).unwrap();
         drop(lease);
-        let mut index = CatalogIndex::open(root.path().join("index.sqlite")).unwrap();
+        let mut index = crate::projector::open(root.path().join("index.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         index.project_tape_log(&older).unwrap();
         let extent = |index: &CatalogIndex| {
-            index
-                .conn
+            Connection::open(index.path())
+                .unwrap()
                 .query_row(
                     "select written_extent_lba from tapes where tape_uuid = ?1",
                     params![id.as_slice()],
@@ -1035,8 +1065,8 @@ mod tests {
         assert_eq!(extent(&index), retained);
         // The second group reached tape before its log tail was damaged.
         let physical = second_record(id).eod_lba.max(retained + 1);
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "update tapes set written_extent_lba = ?2 where tape_uuid = ?1",
                 params![id.as_slice(), SqliteU64::new(physical)],
@@ -1070,7 +1100,9 @@ mod tests {
         let older = lease.freeze().unwrap();
         lease.publish_report(&(&second_record(id)).into()).unwrap();
         let newer = lease.freeze().unwrap();
-        let mut index = CatalogIndex::open(root.path().join("index.sqlite")).unwrap();
+        let mut index = crate::projector::open(root.path().join("index.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         index.project_tape_log(&newer).unwrap();
         let other_id = [0x69; 16];
         let other = TapeAuthority::open_fixture(root.path(), other_id).unwrap();
@@ -1110,8 +1142,8 @@ mod tests {
             older.raw.summary().last_closed_sequence
         );
         assert_eq!(
-            index
-                .conn
+            Connection::open(index.path())
+                .unwrap()
                 .query_row("select count(*) from object_copies", [], |r| r
                     .get::<_, u64>(0))
                 .unwrap(),

@@ -136,7 +136,11 @@ fn bot_recovery_authority_does_not_create_a_missing_journal() {
         dir.path(),
         &{
             let p = dir.path().join("bot-index.sqlite");
-            drop(crate::CatalogIndex::open(&p).unwrap());
+            drop(
+                crate::projector::open(&p)
+                    .map(|catalog| catalog.write_handle())
+                    .unwrap(),
+            );
             p
         },
         tape_uuid,
@@ -168,7 +172,11 @@ fn bot_recovery_authority_streams_exact_checkpoint_rows_and_scope() {
         dir.path(),
         &{
             let p = dir.path().join("bot-index.sqlite");
-            drop(crate::CatalogIndex::open(&p).unwrap());
+            drop(
+                crate::projector::open(&p)
+                    .map(|catalog| catalog.write_handle())
+                    .unwrap(),
+            );
             p
         },
         tape_uuid,
@@ -229,7 +237,11 @@ fn bot_recovery_authority_reads_the_ordinary_prefix_of_a_sealed_journal() {
         dir.path(),
         &{
             let p = dir.path().join("bot-index.sqlite");
-            drop(crate::CatalogIndex::open(&p).unwrap());
+            drop(
+                crate::projector::open(&p)
+                    .map(|catalog| catalog.write_handle())
+                    .unwrap(),
+            );
             p
         },
         tape_uuid,

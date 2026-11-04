@@ -39,7 +39,7 @@ impl OperatorMount<'_> {
             let (uuid, plan) = prepare(&mut drive, self.state).map_err(refusal)?;
             self.flush_audit()?;
             standalone_fence_policy(
-                self.state.catalog_index(),
+                self.state.catalog(),
                 Some(uuid),
                 drive.endpoint().durable_key(),
                 true,

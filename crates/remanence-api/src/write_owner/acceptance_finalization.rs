@@ -287,7 +287,7 @@ fn start(
         warnings: vec![],
     };
     ApiState::with_drive_pool_opener(
-        CatalogIndex::open(root.join("state.sqlite")).unwrap(),
+        remanence_state::projector::open(root.join("state.sqlite")).unwrap(),
         &cfg,
         report,
         remanence_library::StaticAllowlist::new([LIBRARY]),

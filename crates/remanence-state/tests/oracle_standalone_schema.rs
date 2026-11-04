@@ -2,7 +2,7 @@
 //! SQL is used only for fixture construction, observation, and a crash-cut trigger;
 //! all assignments and reconciliation under test use CatalogIndex entry points.
 
-use remanence_state::{CatalogIndex, TapePoolProjectionInput, TapePoolRuleConfig};
+use remanence_state::{TapePoolProjectionInput, TapePoolRuleConfig};
 use rusqlite::{params, Connection};
 
 const AT: &str = "2026-10-15T00:00:00Z";
@@ -56,7 +56,9 @@ fn c2_schema_v010_requires_reset_without_backfilling_provenance() {
         drop(db);
         let before = std::fs::read(&path).unwrap();
         for _ in 0..2 {
-            let error = CatalogIndex::open(&path).unwrap_err();
+            let error = remanence_state::projector::open(&path)
+                .map(|catalog| catalog.write_handle())
+                .unwrap_err();
             assert!(error
                 .to_string()
                 .contains(remanence_state::authority_layout::RESET_REQUIRED));
@@ -93,7 +95,9 @@ fn ledger(db: &Connection, id: u8) -> Vec<(i64, Option<String>, String, i64)> {
 fn c2_ledger_operator_precedence_rule_clear_and_atomic_projection() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("index.sqlite");
-    let mut index = CatalogIndex::open(&path).unwrap();
+    let mut index = remanence_state::projector::open(&path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let db = Connection::open(&path).unwrap();
     // Existing provisioning is used so this test reaches the new ledger even
     // before provenance columns have been introduced.

@@ -3073,7 +3073,9 @@ mod tests {
     }
 
     fn fenced_catalog(barcode: Option<&str>) -> (CatalogIndex, TapeIoFenceRecord) {
-        let mut catalog = CatalogIndex::open(":memory:").expect("open in-memory catalog");
+        let mut catalog = remanence_state::projector::open(":memory:")
+            .map(|catalog| catalog.write_handle())
+            .expect("open in-memory catalog");
         let fence = catalog
             .record_tape_io_fence(remanence_state::TapeIoFenceInput {
                 tape_uuid: BOT_UUID,

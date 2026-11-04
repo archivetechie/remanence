@@ -257,13 +257,13 @@ tape_catalog_dir = "{0}/cache"
             ),
         )
         .unwrap();
-        let mut state = crate::StateHandle::open_from_config_file(&config_path).unwrap();
+        let state = crate::StateHandle::open_from_config_file(&config_path).unwrap();
         let audit = state.paths().audit_dir.clone();
         let endpoint = DriveKey::Standalone {
             drive_serial: "CRASH-DRIVE".into(),
         };
         assert!(raise_with_fault(
-            state.catalog_index(),
+            &mut state.write_handle(),
             &audit,
             TapeIoFenceInput {
                 tape_uuid: [2; 16],
@@ -277,7 +277,7 @@ tape_catalog_dir = "{0}/cache"
         )
         .is_err());
         assert!(state
-            .catalog_index()
+            .catalog()
             .list_active_tape_io_fences()
             .unwrap()
             .is_empty());
@@ -286,16 +286,16 @@ tape_catalog_dir = "{0}/cache"
         assert_eq!(records[0].event, AuditEvent::TapeIoFenceRaised);
         drop(state);
         for _ in 0..2 {
-            let mut state = crate::StateHandle::open_from_config_file(&config_path).unwrap();
-            let fences = state.catalog_index().list_active_tape_io_fences().unwrap();
+            let state = crate::StateHandle::open_from_config_file(&config_path).unwrap();
+            let fences = state.catalog().list_active_tape_io_fences().unwrap();
             assert_eq!(fences.len(), 1);
             assert_eq!(fences[0].endpoint, Some(endpoint.clone()));
             assert_eq!(fences[0].tape_uuid, [2; 16]);
             assert_eq!(fences[0].barcode.as_deref(), Some("CRASH001"));
             assert_eq!(fences[0].created_at_utc, records[0].timestamp_utc);
-            reconcile(state.catalog_index(), &audit).unwrap();
+            reconcile(&mut state.write_handle(), &audit).unwrap();
             assert_eq!(
-                state.catalog_index().list_active_tape_io_fences().unwrap(),
+                state.catalog().list_active_tape_io_fences().unwrap(),
                 fences
             );
             assert_eq!(FileAuditLog::replay(&audit).unwrap(), records);
@@ -306,7 +306,9 @@ tape_catalog_dir = "{0}/cache"
     #[test]
     fn raise_audit_failure_leaves_no_row() {
         let dir = tempfile::tempdir().unwrap();
-        let mut index = CatalogIndex::open(dir.path().join("index.sqlite")).unwrap();
+        let mut index = crate::projector::open(dir.path().join("index.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         let audit = dir.path().join("blocked");
         std::fs::write(&audit, b"not a directory").unwrap();
         assert!(raise(
@@ -330,7 +332,9 @@ tape_catalog_dir = "{0}/cache"
     fn reconcile_raise_and_release_preserves_release_and_rebuilds_empty_catalog() {
         let dir = tempfile::tempdir().unwrap();
         let audit = dir.path().join("audit");
-        let mut index = CatalogIndex::open(dir.path().join("index.sqlite")).unwrap();
+        let mut index = crate::projector::open(dir.path().join("index.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         let raised = raise(
             &mut index,
             &audit,
@@ -353,7 +357,9 @@ tape_catalog_dir = "{0}/cache"
         )
         .unwrap()
         .unwrap();
-        let mut empty = CatalogIndex::open(dir.path().join("empty.sqlite")).unwrap();
+        let mut empty = crate::projector::open(dir.path().join("empty.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         for catalog in [&mut index, &mut empty] {
             for _ in 0..2 {
                 reconcile(catalog, &audit).unwrap();
@@ -377,7 +383,9 @@ tape_catalog_dir = "{0}/cache"
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("index.sqlite");
             let audit = dir.path().join("audit");
-            let mut index = CatalogIndex::open(&path).unwrap();
+            let mut index = crate::projector::open(&path)
+                .map(|catalog| catalog.write_handle())
+                .unwrap();
             let endpoint = crate::DriveKey::new("LIB", 1);
             let fence = index
                 .record_tape_io_fence_at_endpoint(
@@ -405,7 +413,9 @@ tape_catalog_dir = "{0}/cache"
             assert_eq!(records.len(), 1);
             assert_eq!(records[0].event, AuditEvent::TapeIoFenceReleased);
             drop(index);
-            let mut index = CatalogIndex::open(&path).unwrap();
+            let mut index = crate::projector::open(&path)
+                .map(|catalog| catalog.write_handle())
+                .unwrap();
             if restart {
                 reconcile(&mut index, &audit).unwrap();
             }
@@ -430,7 +440,9 @@ tape_catalog_dir = "{0}/cache"
     #[test]
     fn release_audit_failure_keeps_fence_active() {
         let dir = tempfile::tempdir().unwrap();
-        let mut index = CatalogIndex::open(dir.path().join("index.sqlite")).unwrap();
+        let mut index = crate::projector::open(dir.path().join("index.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         let fence = index
             .record_tape_io_fence(crate::TapeIoFenceInput {
                 tape_uuid: [1; 16],
@@ -457,7 +469,9 @@ tape_catalog_dir = "{0}/cache"
     fn restored_projection_release_refuses_every_other_reason() {
         let dir = tempfile::tempdir().unwrap();
         let audit = dir.path().join("audit");
-        let mut index = CatalogIndex::open(dir.path().join("index.sqlite")).unwrap();
+        let mut index = crate::projector::open(dir.path().join("index.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         let raise_reason = |index: &mut CatalogIndex, reason: &str| {
             raise(
                 index,

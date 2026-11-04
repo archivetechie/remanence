@@ -4,8 +4,11 @@ Notable changes to Remanence and its published formats. The format
 specifications carry their own revision histories; entries here are
 per-release summaries.
 
-<!-- code-anchor: crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/drive_pool.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-api/src/append_admission.rs crates/remanence-state/src/index.rs crates/remanence-cli/src/lib.rs crates/remanence-stream/src/lib.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
+<!-- code-anchor: crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/mount.rs crates/remanence-api/src/drive_pool.rs crates/remanence-api/src/daemon_catalog_services.rs crates/remanence-api/src/append_admission.rs crates/remanence-state/src/projector/index.rs crates/remanence-cli/src/lib.rs crates/remanence-stream/src/lib.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
 ## Unreleased
+
+- The catalog now uses one writable connection per state directory in each
+  process, with its storage and behavior otherwise unchanged.
 
 - Device failures are judged in one place from the drive's own completion,
   never from message text. A mounted or standalone write with an uncertain

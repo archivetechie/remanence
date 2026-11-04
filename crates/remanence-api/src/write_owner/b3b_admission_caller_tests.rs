@@ -40,7 +40,9 @@ async fn caller_matrix(caller: &str) {
         };
         let mut library = open_model_library(world.clone());
         let cfg = config(root.path(), &library);
-        let mut index = CatalogIndex::open(&cfg.index_path).unwrap();
+        let mut index = remanence_state::projector::open(&cfg.index_path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         let mut drive = library.open_drive(BAY, &cfg.policy).unwrap();
         let mut selection = selected();
         // The terminal caller needs a valid plan, but its admission refuses

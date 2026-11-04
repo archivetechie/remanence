@@ -292,7 +292,7 @@ remains backpressured by the receiver; independently valid conflicting
 candidates may require one bounded replay before the reader can fail closed or
 emit a selected authority.
 
-<!-- code-anchor: crates/remanence-parity/src/bootstrap.rs crates/remanence-state/src/index.rs @ c80a553a -->
+<!-- code-anchor: crates/remanence-parity/src/bootstrap.rs crates/remanence-state/src/projector/index.rs @ c80a553a -->
 ## Tape identity
 
 A tape's durable identity is the 16-byte UUID in its bootstrap at BOT,
@@ -305,7 +305,7 @@ rewrites a cartridge under an existing barcode, the catalog still binds that
 barcode to the old UUID (recycle skew; see
 [troubleshooting](guide-troubleshooting.md#known-open-issue)).
 
-<!-- code-anchor: crates/remanence-state/src/tape_log/store.rs crates/remanence-state/src/tape_log/projection.rs crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/calibration.rs @ dcf8d39a -->
+<!-- code-anchor: crates/remanence-state/src/tape_log/store.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/calibration.rs @ dcf8d39a -->
 ## On disk: durable records and rebuildable state
 
 The host-side records that accompany the tapes. Paths are set by the operator;
@@ -353,7 +353,7 @@ Initialization, adoption and reset-preserved ready identities create no log.
 Initialization is grouped with the first actual barrier. A known written
 prefix without matching log authority cannot be treated as a fresh tape.
 
-<!-- code-anchor: crates/remanence-state/src/index.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
+<!-- code-anchor: crates/remanence-state/src/projector/index.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
 The old `.remjournal`, `.remcheckpoint` and `.finalizing` layout is refused.
 Ordinary catalog opens also refuse schemas 1 through 23. There is no importer;
 use the declared reset and reinitialize approved scratch tapes as described in

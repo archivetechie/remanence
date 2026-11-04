@@ -59,8 +59,8 @@ tape_catalog_dir = "{0}/cache/tapes"
     fn state(&mut self) -> &mut StateHandle {
         self.handle.as_mut().unwrap()
     }
-    fn index(&mut self) -> &mut CatalogIndex {
-        self.state().catalog_index()
+    fn index(&mut self) -> CatalogIndex {
+        self.state().write_handle()
     }
     fn empty_rebuild(&mut self) {
         let path = self.state().paths().sqlite_path.clone();

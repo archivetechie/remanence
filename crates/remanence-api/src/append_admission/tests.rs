@@ -1319,8 +1319,9 @@ fn native_session_suffix_rows_and_unknown_command_frontiers() {
             for mark in [false, true] {
                 let mut f = fixture_with_size(NATIVE_SIZE);
                 let root = tempfile::tempdir().unwrap();
-                let index =
-                    remanence_state::CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
+                let index = remanence_state::projector::open(root.path().join("state.sqlite"))
+                    .map(|catalog| catalog.write_handle())
+                    .unwrap();
                 std::fs::create_dir(root.path().join("tapes")).unwrap();
                 let authority = remanence_state::TapeAuthority::open(
                     root.path().join("tapes"),
@@ -1483,8 +1484,9 @@ fn durable_torn_prefix_reproof_rejects_every_physical_contradiction_and_fences()
     for mutation in ["exact", "mutated", "extra", "filemark", "early_eod"] {
         let mut f = fixture_with_size(BLOCK);
         let root = tempfile::tempdir().unwrap();
-        let mut index =
-            remanence_state::CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
+        let mut index = remanence_state::projector::open(root.path().join("state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         index
             .provision_tape(remanence_state::ProvisionTapeInput {
                 tape_uuid: UUID,
@@ -1645,7 +1647,9 @@ fn b3b_admission_carrier_and_renderer_census() {
     assert_eq!(outcome.evidence.current_sense().unwrap().key, 4);
     assert_ne!(f.drive.last_command_outcome().unwrap(), &outcome);
     let root = tempfile::tempdir().unwrap();
-    let mut index = remanence_state::CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
+    let mut index = remanence_state::projector::open(root.path().join("state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let cfg = crate::write_owner::TerminalWriteConfig {
         io_memory: crate::io_memory::IoMemoryReservation::new(1024).unwrap(),
         mounted_endpoint: None,
@@ -1680,7 +1684,9 @@ fn b3b_scoped_suffix_contradiction_classifies_once() {
     let mutation = "mutated";
     let mut f = fixture_with_size(BLOCK);
     let root = tempfile::tempdir().unwrap();
-    let mut index = remanence_state::CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
+    let mut index = remanence_state::projector::open(root.path().join("state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     index
         .provision_tape(remanence_state::ProvisionTapeInput {
             tape_uuid: UUID,
@@ -1841,7 +1847,9 @@ fn b3b_fix1_admission_suffix_position_drift_is_transient() {
         remanence_library::outcome::RetryCause::Transient
     );
     let root = tempfile::tempdir().unwrap();
-    let mut index = remanence_state::CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
+    let mut index = remanence_state::projector::open(root.path().join("state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     index
         .provision_tape(remanence_state::ProvisionTapeInput {
             tape_uuid: UUID,
@@ -1888,7 +1896,9 @@ fn golden_suffix_contradiction() -> AdmissionError {
     let mutation = "mutated";
     let mut f = fixture_with_size(BLOCK);
     let root = tempfile::tempdir().unwrap();
-    let mut index = remanence_state::CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
+    let mut index = remanence_state::projector::open(root.path().join("state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     index
         .provision_tape(remanence_state::ProvisionTapeInput {
             tape_uuid: UUID,
@@ -2037,8 +2047,9 @@ pub(crate) fn golden_production_admission_rows() {
         };
         assert_eq!(actual_kind, name);
         let root = tempfile::tempdir().unwrap();
-        let mut index =
-            remanence_state::CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
+        let mut index = remanence_state::projector::open(root.path().join("state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         index
             .provision_tape(remanence_state::ProvisionTapeInput {
                 tape_uuid: UUID,

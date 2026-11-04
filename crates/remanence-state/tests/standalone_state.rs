@@ -47,7 +47,9 @@ fn predecessor_geometry_and_bay_zero_rows_require_reset_without_mutation() {
     drop(db);
     let before = std::fs::read(&path).unwrap();
     for _ in 0..2 {
-        let error = CatalogIndex::open(&path).unwrap_err();
+        let error = remanence_state::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap_err();
         assert!(error
             .to_string()
             .contains(remanence_state::authority_layout::RESET_REQUIRED));
@@ -59,7 +61,9 @@ fn predecessor_geometry_and_bay_zero_rows_require_reset_without_mutation() {
 fn clearing_bay_coordinates_clears_old_key_but_preserves_explicit_standalone_key() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("index.sqlite");
-    let _index = CatalogIndex::open(&path).unwrap();
+    let _index = remanence_state::projector::open(&path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let db = Connection::open(&path).unwrap();
     db.execute_batch("insert into drives(drive_uuid, serial, identity_source, managed, first_seen_utc, last_seen_utc, last_library_serial, last_element_address)
         values (X'01010101010101010101010101010101','drive','vpd','rem','now','now','LIB',0);").unwrap();
@@ -88,7 +92,9 @@ fn clearing_bay_coordinates_clears_old_key_but_preserves_explicit_standalone_key
 fn rebuild_preserves_recorded_generation_without_a_label_or_assignment() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("index.sqlite");
-    let mut index = CatalogIndex::open(&path).unwrap();
+    let mut index = remanence_state::projector::open(&path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     provision(&mut index, 1, "OLD001L7");
     index
         .set_tape_generation(
@@ -122,7 +128,9 @@ fn invalid_legacy_geometry_rolls_back_the_entire_migration() {
     ))
     .unwrap();
     db.execute("insert into tapes(tape_uuid, state, updated_at_utc, total_committed_ordinals) values (?1, 'ready','now',-1)",[[2u8;16].as_slice()]).unwrap();
-    assert!(CatalogIndex::open(&path).is_err());
+    assert!(remanence_state::projector::open(&path)
+        .map(|catalog| catalog.write_handle())
+        .is_err());
     assert_eq!(
         db.query_row("pragma user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
@@ -147,7 +155,9 @@ fn invalid_legacy_geometry_rolls_back_the_entire_migration() {
 
 #[test]
 fn standalone_readiness_and_fence_round_trip_without_library_coordinates() {
-    let mut index = CatalogIndex::open(":memory:").unwrap();
+    let mut index = remanence_state::projector::open(":memory:")
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let endpoint = DriveKey::Standalone {
         drive_serial: "LIB:0\"/drive".into(),
     };
@@ -205,7 +215,9 @@ fn standalone_readiness_and_fence_round_trip_without_library_coordinates() {
 fn explicit_unassignment_and_same_pool_takeover_survive_rules() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("index.sqlite");
-    let mut index = CatalogIndex::open(&path).unwrap();
+    let mut index = remanence_state::projector::open(&path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     provision(&mut index, 1, "AUTO01L7");
     let rules = [TapePoolRuleConfig {
         pool_id: "archive".into(),
@@ -285,7 +297,9 @@ fn explicit_unassignment_and_same_pool_takeover_survive_rules() {
 
 #[test]
 fn observed_generation_is_independent_of_label_and_operator_reuse_needs_rebind() {
-    let mut index = CatalogIndex::open(":memory:").unwrap();
+    let mut index = remanence_state::projector::open(":memory:")
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let observation = MediaObservation {
         generation: LtoGen::Lto7,
         source: GenerationSource::Measured,
@@ -391,7 +405,9 @@ fn rebind_record(sequence: u64, previous: u8) -> remanence_state::AuditRecord {
 fn assignment_replay_preserves_order_null_intent_and_projection_generation() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("index.sqlite");
-    let mut index = CatalogIndex::open(&path).unwrap();
+    let mut index = remanence_state::projector::open(&path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     provision(&mut index, 1, "AUTO01L7");
     let mut pools = vec![pool()];
     pools.push(TapePoolProjectionInput {
@@ -457,7 +473,9 @@ fn assignment_replay_preserves_order_null_intent_and_projection_generation() {
 #[test]
 fn historical_library_init_assignment_remains_rule_derived() {
     use ciborium::value::Value;
-    let mut index = CatalogIndex::open(":memory:").unwrap();
+    let mut index = remanence_state::projector::open(":memory:")
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     provision(&mut index, 1, "AUTO01L7");
     index.upsert_tape_pool_projection(pool()).unwrap();
     let events = [
@@ -488,7 +506,9 @@ fn historical_library_init_assignment_remains_rule_derived() {
 #[test]
 fn provision_rebind_replay_and_rebuild_keep_final_label_binding() {
     use ciborium::value::Value;
-    let mut index = CatalogIndex::open(":memory:").unwrap();
+    let mut index = remanence_state::projector::open(":memory:")
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let records = [
         audit(
             1,
@@ -518,7 +538,9 @@ fn provision_rebind_replay_and_rebuild_keep_final_label_binding() {
         assert_eq!(new.voltag_source, Some(LabelProvenance::Operator));
     }
     // The same authority also reconstructs the binding in a brand-new index.
-    let mut fresh = CatalogIndex::open(":memory:").unwrap();
+    let mut fresh = remanence_state::projector::open(":memory:")
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     fresh
         .rebuild_from_authoritative_sources(&records, &[])
         .unwrap();
@@ -535,7 +557,9 @@ fn provision_rebind_replay_and_rebuild_keep_final_label_binding() {
 
 #[test]
 fn readiness_uses_recorded_generation_and_only_hints_before_row_creation() {
-    let mut index = CatalogIndex::open(":memory:").unwrap();
+    let mut index = remanence_state::projector::open(":memory:")
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     assert_eq!(
         index.readiness_media_observation(Some("CAP001L9")).unwrap(),
         MediaObservation::label_hint("CAP001L9")
@@ -581,7 +605,9 @@ fn readiness(index: &mut CatalogIndex, endpoint: DriveKey, label: &str, scope: O
 }
 #[test]
 fn endpoint_admission_preserves_cartridge_robotics_and_unknown_scope_guards() {
-    let mut index = CatalogIndex::open(":memory:").unwrap();
+    let mut index = remanence_state::projector::open(":memory:")
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     readiness(
         &mut index,
         DriveKey::new("LIB", 1),
@@ -658,7 +684,9 @@ fn predecessor_terminal_assignment_requires_reset_without_mutation() {
     drop(db);
     let before = std::fs::read(&path).unwrap();
     for _ in 0..2 {
-        let error = CatalogIndex::open(&path).unwrap_err();
+        let error = remanence_state::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap_err();
         assert!(error
             .to_string()
             .contains(remanence_state::authority_layout::RESET_REQUIRED));
@@ -670,7 +698,9 @@ fn predecessor_terminal_assignment_requires_reset_without_mutation() {
 fn failed_assignment_replay_rolls_back_event_cursor_and_projection() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("index.sqlite");
-    let mut index = CatalogIndex::open(&path).unwrap();
+    let mut index = remanence_state::projector::open(&path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     provision(&mut index, 1, "CAP001L7");
     index.upsert_tape_pool_projection(pool()).unwrap();
     let db = Connection::open(&path).unwrap();
@@ -712,7 +742,9 @@ fn rule_clear_or_change_survives_repeated_replay_and_rebuild() {
         for rebuild_first in [false, true] {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join("legacy.sqlite");
-            let mut index = CatalogIndex::open(&path).unwrap();
+            let mut index = remanence_state::projector::open(&path)
+                .map(|catalog| catalog.write_handle())
+                .unwrap();
             provision(&mut index, 1, "AUTO01L7");
             let events = [
                 audit(
@@ -762,7 +794,9 @@ fn rule_clear_or_change_survives_repeated_replay_and_rebuild() {
                 .unwrap();
             assert_eq!(expected_count, if target.is_some() { 3 } else { 2 });
             drop(index);
-            let mut index = CatalogIndex::open(&path).unwrap();
+            let mut index = remanence_state::projector::open(&path)
+                .map(|catalog| catalog.write_handle())
+                .unwrap();
             for _ in 0..2 {
                 if rebuild_first {
                     index
@@ -811,7 +845,9 @@ fn rule_clear_or_change_survives_repeated_replay_and_rebuild() {
 #[test]
 fn rebind_then_provision_released_uuid_updates_label_and_provenance_atomically() {
     for change_geometry in [false, true] {
-        let mut index = CatalogIndex::open(":memory:").unwrap();
+        let mut index = remanence_state::projector::open(":memory:")
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         provision(&mut index, 1, "PEN001L9");
         provision(&mut index, 2, "PEN002L9");
         index.project_audit_record(&rebind_record(1, 1)).unwrap();
@@ -852,7 +888,9 @@ fn rebind_then_provision_released_uuid_updates_label_and_provenance_atomically()
 #[test]
 fn assignment_replay_reconstructs_recorded_generations_across_unaudited_changes() {
     use ciborium::value::Value;
-    let mut index = CatalogIndex::open(":memory:").unwrap();
+    let mut index = remanence_state::projector::open(":memory:")
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     provision(&mut index, 1, "AUTO01L7");
     index.upsert_tape_pool_projection(pool()).unwrap();
     let mut assigned = assignment(20, Some("archive"));

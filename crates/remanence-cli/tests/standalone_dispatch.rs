@@ -142,8 +142,7 @@ impl RemovalTransport {
         }
         let config = remanence_state::load_config(&self.config).unwrap();
         let paths = remanence_state::StatePaths::from_config(&self.config, &config);
-        let index =
-            remanence_state::CatalogIndex::open_read_only(&config.index.sqlite_path).unwrap();
+        let index = remanence_state::CatalogReader::open(&config.index.sqlite_path).unwrap();
         let sessions = index.non_terminal_sessions().unwrap();
         let session = sessions
             .iter()
@@ -308,8 +307,9 @@ fn home_roundtrip_and_metadata_use_real_dispatch() {
         events[1].detail.get("assignment_source"),
         Some(&ciborium::Value::Text("operator".into()))
     );
-    let mut rebuilt =
-        remanence_state::CatalogIndex::open(root.path().join("rebuilt.sqlite")).unwrap();
+    let mut rebuilt = remanence_state::projector::open(root.path().join("rebuilt.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     rebuilt.replay_audit_records(&audit).unwrap();
     let recovered = rebuilt.get_tape_by_voltag("HOMEL9").unwrap().unwrap();
     assert_eq!(recovered.pool_id.as_deref(), Some("default"));
@@ -334,12 +334,16 @@ fn home_roundtrip_and_metadata_use_real_dispatch() {
     run(&["pool", "new", "second"]);
     let assert_recovered = |pool: Option<&str>, generation: &str| {
         let config = remanence_state::load_config(&config_path).unwrap();
-        let live = remanence_state::CatalogIndex::open(&config.index.sqlite_path).unwrap();
+        let live = remanence_state::projector::open(&config.index.sqlite_path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         let expected = live.get_tape_by_voltag("HOMEL9").unwrap().unwrap();
         assert_eq!(expected.pool_id.as_deref(), pool);
         assert_eq!(expected.cartridge_generation.as_deref(), Some(generation));
         let audit = remanence_state::FileAuditLog::replay(&paths.audit_dir).unwrap();
-        let mut rebuilt = remanence_state::CatalogIndex::open(":memory:").unwrap();
+        let mut rebuilt = remanence_state::projector::open(":memory:")
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         for full_rebuild in [false, false, true] {
             if full_rebuild {
                 rebuilt
@@ -384,7 +388,9 @@ fn home_roundtrip_and_metadata_use_real_dispatch() {
     );
     let config_path = root.path().join("state/rem/config.toml");
     let config = remanence_state::load_config(&config_path).unwrap();
-    let mut index = remanence_state::CatalogIndex::open(&config.index.sqlite_path).unwrap();
+    let mut index = remanence_state::projector::open(&config.index.sqlite_path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let tape = index.get_tape_by_voltag("HOMEL9").unwrap().unwrap();
     index
         .record_tape_io_fence(remanence_state::TapeIoFenceInput {
@@ -396,7 +402,9 @@ fn home_roundtrip_and_metadata_use_real_dispatch() {
         .unwrap();
     drop(index);
     run(&["tape", "release"]);
-    let index = remanence_state::CatalogIndex::open(&config.index.sqlite_path).unwrap();
+    let index = remanence_state::projector::open(&config.index.sqlite_path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     assert_eq!(
         index.list_active_tape_io_fences().unwrap().len(),
         1,
@@ -685,7 +693,9 @@ fn init_geometry_and_failed_bootstrap_are_guarded() {
         let (code, output) = run(&init);
         let config =
             remanence_state::load_config(root.path().join("state/rem/config.toml")).unwrap();
-        let index = remanence_state::CatalogIndex::open(&config.index.sqlite_path).unwrap();
+        let index = remanence_state::projector::open(&config.index.sqlite_path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         if fail {
             assert_ne!(code, ExitCode::SUCCESS, "{output}");
             assert_eq!(index.list_active_tape_io_fences().unwrap().len(), 1);
@@ -837,7 +847,12 @@ impl VersionFixture {
         std::fs::create_dir_all(&spool).unwrap();
         let world = f.world.clone();
         let state = remanence_api::ApiState::with_drive_pool_opener(
-            f.index(),
+            {
+                let index = f.index();
+                let catalog = remanence_state::projector::open(index.path()).unwrap();
+                drop(index);
+                catalog
+            },
             &config,
             remanence_library::DiscoveryReport {
                 libraries: vec![library.clone()],
@@ -880,7 +895,9 @@ impl VersionFixture {
     }
     fn index(&self) -> remanence_state::CatalogIndex {
         let config = remanence_state::load_config(self.config()).unwrap();
-        remanence_state::CatalogIndex::open(config.index.sqlite_path).unwrap()
+        remanence_state::projector::open(config.index.sqlite_path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap()
     }
     fn writes(&self) -> usize {
         self.world
@@ -1008,7 +1025,9 @@ impl remanence_library::SgTransport for VersionMutationTransport {
         if cdb[0] == 0x0a {
             if let Some(path) = &self.fail_after_path {
                 let config = remanence_state::load_config(&self.inner.config).unwrap();
-                let index = remanence_state::CatalogIndex::open(config.index.sqlite_path).unwrap();
+                let index = remanence_state::projector::open(config.index.sqlite_path)
+                    .map(|catalog| catalog.write_handle())
+                    .unwrap();
                 if !index
                     .list_committed_versions_by_path("default", path)
                     .unwrap()
@@ -1023,7 +1042,9 @@ impl remanence_library::SgTransport for VersionMutationTransport {
     fn execute_none(&mut self, cdb: &[u8]) -> Result<(), remanence_library::ScsiError> {
         if cdb[0] == 0x00 && self.mutation.lock().unwrap().is_some() {
             let config = remanence_state::load_config(&self.inner.config).unwrap();
-            let index = remanence_state::CatalogIndex::open(config.index.sqlite_path).unwrap();
+            let index = remanence_state::projector::open(config.index.sqlite_path)
+                .map(|catalog| catalog.write_handle())
+                .unwrap();
             if index
                 .non_terminal_sessions()
                 .unwrap()
@@ -2906,7 +2927,9 @@ fn catalog_inventory_writer_child() {
         return;
     };
     let config = remanence_state::load_config(config).unwrap();
-    let mut writer = remanence_state::CatalogIndex::open(&config.index.sqlite_path).unwrap();
+    let mut writer = remanence_state::projector::open(&config.index.sqlite_path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     writer
         .upsert_tape_pool_projection(remanence_state::TapePoolProjectionInput {
             pool_id: "live-wal".into(),
@@ -2949,7 +2972,7 @@ fn catalog_list_does_not_mutate_state() {
     // nor alter its read marks. The second pool exists only in the WAL.
     let _writer = inventory_writer(&f);
     let before = snapshot(&f.root.path().join("state"));
-    let inventory = remanence_state::CatalogIndex::open_inventory(
+    let inventory = remanence_state::CatalogReader::open_inventory(
         &remanence_state::load_config(f.config())
             .unwrap()
             .index
@@ -3123,7 +3146,7 @@ fn catalog_inventory_never_copies_to_tmpdir() {
     if let Some(config) = std::env::var_os(CHILD) {
         let config = remanence_state::load_config(config).unwrap();
         let index =
-            remanence_state::CatalogIndex::open_inventory(&config.index.sqlite_path).unwrap();
+            remanence_state::CatalogReader::open_inventory(&config.index.sqlite_path).unwrap();
         assert!(index.get_tape_pool("live-wal").unwrap().is_some());
     } else {
         let f = VersionFixture::with_parity(false);
@@ -3743,8 +3766,8 @@ fn harness_reset_schema22_predecessor_then_admit_write_and_read() {
     ]);
     assert_eq!(code, ExitCode::SUCCESS, "{err}");
     assert!(config.daemon.state_dir.join("authority-format").exists());
-    let mut state = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap();
-    assert_eq!(state.catalog_index().schema_version().unwrap(), 24);
+    let state = remanence_state::StateHandle::open_from_config_file(f.config()).unwrap();
+    assert_eq!(state.catalog().schema_version().unwrap(), 24);
     drop(state);
     assert!(!config.journal.dir.join("checkpoints").exists());
     f.new_tape("AFTERRESET");

@@ -217,7 +217,9 @@ fn setup(root: &Path) -> Arc<Mutex<VirtualWorld>> {
 }
 
 fn setup_with_barcode(root: &Path, barcode: &str) -> Arc<Mutex<VirtualWorld>> {
-    let mut index = CatalogIndex::open(root.join("state.sqlite")).unwrap();
+    let mut index = remanence_state::projector::open(root.join("state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     index
         .upsert_tape_pool_projection(TapePoolProjectionInput {
             pool_id: POOL.into(),
@@ -316,7 +318,9 @@ fn lost_open_reply_ends_the_durable_session() {
         drive_serial: Some(DRIVE.into()),
         reply,
     };
-    let mut index = CatalogIndex::open(&cfg.index_path).unwrap();
+    let mut index = remanence_state::projector::open(&cfg.index_path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     handle_drive_open_write(
         BAY, &mut index, &cfg, actor_tx, &mut rx, &mut drive, &mut 0, None, request,
     );
@@ -351,7 +355,9 @@ async fn disconnected_open_task_ends_the_session_and_releases_authority() {
     .unwrap();
     ended.await.unwrap().unwrap();
     thread.join().unwrap();
-    let index = CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
+    let index = remanence_state::projector::open(root.path().join("state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let authority =
         TapeAuthority::open(root.path().join("journals/tapes"), TAPE, index.path()).unwrap();
     let lease = authority.acquire_exclusive().unwrap();
@@ -417,7 +423,8 @@ async fn open_writer_configured(
         target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
         needs_drive_load: false,
         library_serial: Some(LIBRARY.into()),
-        barcode: CatalogIndex::open(&cfg.index_path)
+        barcode: remanence_state::projector::open(&cfg.index_path)
+            .map(|catalog| catalog.write_handle())
             .unwrap()
             .get_tape(&TAPE)
             .unwrap()
@@ -429,7 +436,9 @@ async fn open_writer_configured(
         reply,
     };
     let thread = std::thread::spawn(move || {
-        let mut index = CatalogIndex::open(&cfg.index_path).unwrap();
+        let mut index = remanence_state::projector::open(&cfg.index_path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         handle_drive_open_write(
             BAY, &mut index, &cfg, actor_tx, &mut rx, &mut drive, &mut 0, None, request,
         );
@@ -544,7 +553,9 @@ async fn trace_session(root: &Path, skip_barrier: bool) -> Vec<Cut> {
             object.append_commit_info.as_ref().unwrap().durability,
             pb::AppendDurability::Checkpointed as i32
         );
-        let index = CatalogIndex::open(root.join("state.sqlite")).unwrap();
+        let index = remanence_state::projector::open(root.join("state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         let object_id = Uuid::from_slice(&object.object_id).unwrap().to_string();
         let copy = &index.find_native_object_copies(&object_id).unwrap()[0];
         let start = copy.global_start_block.unwrap() as usize;
@@ -599,7 +610,9 @@ async fn read_receipts(
         reply,
     };
     let thread = std::thread::spawn(move || {
-        let mut index = CatalogIndex::open(&cfg.index_path).unwrap();
+        let mut index = remanence_state::projector::open(&cfg.index_path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         handle_drive_open_read(
             BAY, &mut index, &cfg, &mut rx, &mut drive, &mut 0, None, request,
         );
@@ -612,7 +625,9 @@ async fn read_receipts(
             return Err(format!("read open refuses acknowledged object: {status}"));
         }
     };
-    let index = CatalogIndex::open(root.join("state.sqlite")).unwrap();
+    let index = remanence_state::projector::open(root.join("state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let mut outcome = Ok(());
     for receipt in receipts {
         let member = &index.list_native_object_files(&receipt.id).unwrap()[0];
@@ -657,7 +672,9 @@ fn acknowledge_tail(root: &Path, world: Arc<Mutex<VirtualWorld>>) -> Result<(), 
     let mut library = open_model_library(world.clone());
     let cfg = config(root, &library);
     let mut drive = library.open_drive(BAY, &cfg.policy).unwrap();
-    let mut index = CatalogIndex::open(root.join("state.sqlite")).unwrap();
+    let mut index = remanence_state::projector::open(root.join("state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     prepare_drive_for_write(
         &mut drive,
         &TAPE,
@@ -838,7 +855,9 @@ async fn check_crash(
         }
     }
     let world = Arc::new(Mutex::new(world));
-    let mut index = CatalogIndex::open(temp.path().join("state.sqlite")).unwrap();
+    let mut index = remanence_state::projector::open(temp.path().join("state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let replay = crate::startup_checkpoint::replay_checkpoint_journal_projections(
         &mut index,
         &temp.path().join("journals/tapes"),
@@ -913,13 +932,15 @@ async fn check_crash(
                 coverage.completed += 1;
                 let protected_start = authority.last().map_or(2, |record| record.eod_lba);
                 // Admission closes any prior session's debt before opening the next epoch.
-                let expected_start = CatalogIndex::open(temp.path().join("state.sqlite"))
-                    .unwrap()
-                    .get_tape(&TAPE)
-                    .unwrap()
-                    .unwrap()
-                    .written_extent_lba
-                    .unwrap();
+                let expected_start =
+                    remanence_state::projector::open(temp.path().join("state.sqlite"))
+                        .map(|catalog| catalog.write_handle())
+                        .unwrap()
+                        .get_tape(&TAPE)
+                        .unwrap()
+                        .unwrap()
+                        .written_extent_lba
+                        .unwrap();
                 let before = world.lock().unwrap().tapes[BARCODE]
                     .records
                     .get(..protected_start as usize)
@@ -953,7 +974,9 @@ async fn check_crash(
                 let next_id = Uuid::from_slice(&response.committed_objects[0].object_id)
                     .unwrap()
                     .to_string();
-                let index = CatalogIndex::open(temp.path().join("state.sqlite")).unwrap();
+                let index = remanence_state::projector::open(temp.path().join("state.sqlite"))
+                    .map(|catalog| catalog.write_handle())
+                    .unwrap();
                 let next = index.find_native_object_copies(&next_id).unwrap();
                 assert_eq!(
                     next[0].global_start_block,
@@ -987,7 +1010,9 @@ async fn check_crash(
             }
         }
     }
-    let mut index = CatalogIndex::open(temp.path().join("state.sqlite")).unwrap();
+    let mut index = remanence_state::projector::open(temp.path().join("state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     for fence in index.list_active_tape_io_fences().unwrap() {
         assert_eq!(fence.tape_uuid, TAPE);
         assert_eq!(fence.reason, "supersede_tail_failed");

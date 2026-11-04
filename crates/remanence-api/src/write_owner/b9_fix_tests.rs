@@ -154,17 +154,21 @@ async fn b9_fix_cold_preparation_leaves_other_rpc_and_shutdown_admissible() {
     );
     state.drive_pool = Some(pool.clone());
     let other = [0xe1; 16];
-    state
-        .index_write()
-        .unwrap()
-        .provision_tape(ProvisionTapeInput {
-            tape_uuid: other,
-            voltag: "OTHER".into(),
-            block_size: BLOCK,
-            parity: ParityConfig::None,
-            force: false,
-        })
-        .unwrap();
+    {
+        let mut index = state.catalog.write_handle();
+        if let Some(pool) = &state.drive_pool {
+            index.set_readiness_observer(pool.readiness_wake.clone());
+        }
+        index
+    }
+    .provision_tape(ProvisionTapeInput {
+        tape_uuid: other,
+        voltag: "OTHER".into(),
+        block_size: BLOCK,
+        parity: ParityConfig::None,
+        force: false,
+    })
+    .unwrap();
     // A distinct log path has no warm observer cache from fixture construction.
     let cold = root.path().join("cold");
     std::fs::create_dir(&cold).unwrap();

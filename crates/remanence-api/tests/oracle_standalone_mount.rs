@@ -115,8 +115,8 @@ tape_catalog_dir = "{0}/cache"
     ))
     .unwrap();
     let paths = StatePaths::from_config(root.join("config.toml"), &config);
-    let mut state = StateHandle::open_with_config(paths, config).unwrap();
-    provision(state.catalog_index());
+    let state = StateHandle::open_with_config(paths, config).unwrap();
+    provision(&mut state.write_handle());
     // ModelTransport's INQUIRY is LTO-9. Record an operator observation so
     // mount/write tests do not depend on label inference or model density 0.
     rusqlite::Connection::open(&state.paths().sqlite_path)
@@ -128,7 +128,7 @@ tape_catalog_dir = "{0}/cache"
         )
         .unwrap();
     state
-        .catalog_index()
+        .write_handle()
         .project_tape_pool_membership(UUID, "default")
         .unwrap();
     state
@@ -185,7 +185,9 @@ impl FaultTransport {
                 // session for this tape and C2's decoded standalone DriveKey.
                 // RestartSession.drive_key exposes the migrated endpoint without
                 // prescribing its SQLite encoding in this oracle.
-                let index = CatalogIndex::open(db_path).unwrap();
+                let index = remanence_state::projector::open(db_path)
+                    .map(|catalog| catalog.write_handle())
+                    .unwrap();
                 assert!(
                     index
                         .non_terminal_sessions()
@@ -884,7 +886,9 @@ fn c5_calibration_fence_failure_after_mount_prevents_media_dispatch() {
 
 #[test]
 fn c2_null_generation_refuses_writability_even_with_lto_label() {
-    let mut index = CatalogIndex::open(":memory:").unwrap();
+    let mut index = remanence_state::projector::open(":memory:")
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     provision(&mut index);
     let mut tape = index.get_tape(&UUID).unwrap().unwrap();
     tape.cartridge_generation = None;
@@ -926,7 +930,7 @@ fn c5_write_adapter_sessions_fence_audit_and_stale_fence_refusal() {
     .unwrap();
     actor.write_checkpointed(request(temp.path())).unwrap();
     actor.finish().unwrap();
-    let mut state = StateHandle::open_with_config(paths_before, config_before).unwrap();
+    let state = StateHandle::open_with_config(paths_before, config_before).unwrap();
     assert!(*observed.lock().unwrap() > 0, "observer saw media dispatch");
     assert!(world.lock().unwrap().tapes["ORACLEL9"].written_bytes > u64::from(BLOCK));
     assert!(
@@ -954,7 +958,7 @@ fn c5_write_adapter_sessions_fence_audit_and_stale_fence_refusal() {
         "a drive audit subject must name the VPD serial: {records:?}"
     );
     state
-        .catalog_index()
+        .write_handle()
         .record_tape_io_fence(TapeIoFenceInput {
             tape_uuid: UUID,
             barcode: Some("ORACLEL9".into()),
@@ -1005,10 +1009,10 @@ fn c5_write_adapter_sessions_fence_audit_and_stale_fence_refusal() {
                     error
                 }
             };
-            let mut reopened = StateHandle::open_with_config(paths, config).unwrap();
+            let reopened = StateHandle::open_with_config(paths, config).unwrap();
             assert!(
                 !reopened
-                    .catalog_index()
+                    .catalog()
                     .list_active_tape_io_fences()
                     .unwrap()
                     .is_empty(),
@@ -1057,9 +1061,9 @@ fn current_mounted_unknown_write_refuses_retry_without_changing_prefix() {
     assert_eq!(world.lock().unwrap().command_log.len(), commands);
     let _ = actor.finish();
     drop(actor);
-    let mut reopened = StateHandle::open_with_config(paths, config).unwrap();
+    let reopened = StateHandle::open_with_config(paths, config).unwrap();
     assert!(reopened
-        .catalog_index()
+        .catalog()
         .tape_io_is_fenced(Some(&UUID), Some("ORACLEL9"), None)
         .unwrap());
     assert_eq!(world.lock().unwrap().tapes["ORACLEL9"].records, before);
@@ -1371,11 +1375,8 @@ fn b3b_mounted_bootstrap_unknown_write_raises_one_fence() {
     assert_eq!(world.lock().unwrap().command_log.len(), commands);
     let _ = actor.finish();
     drop(actor);
-    let mut reopened = StateHandle::open_with_config(paths, config).unwrap();
-    let fences = reopened
-        .catalog_index()
-        .list_active_tape_io_fences()
-        .unwrap();
+    let reopened = StateHandle::open_with_config(paths, config).unwrap();
+    let fences = reopened.catalog().list_active_tape_io_fences().unwrap();
     assert_eq!(fences.len(), 1, "{fences:?}");
     assert_eq!(fences[0].reason, "transfer_error");
     assert_eq!(world.lock().unwrap().tapes["ORACLEL9"].records, before);
@@ -1420,11 +1421,8 @@ fn b3b_mounted_named_tail_preserves_no_fence() {
     assert_eq!(world.lock().unwrap().command_log.len(), commands);
     let _ = actor.finish();
     drop(actor);
-    let mut reopened = StateHandle::open_with_config(paths, config).unwrap();
-    let fences = reopened
-        .catalog_index()
-        .list_active_tape_io_fences()
-        .unwrap();
+    let reopened = StateHandle::open_with_config(paths, config).unwrap();
+    let fences = reopened.catalog().list_active_tape_io_fences().unwrap();
     assert!(fences.is_empty(), "durable live ending: {fences:?}");
     assert_eq!(world.lock().unwrap().tapes["ORACLEL9"].records, before);
 }
@@ -1454,8 +1452,8 @@ fn b3b_mounted_bootstrap_failure_one_fence() {
     assert!(error.to_string().contains("partial"), "{error}");
     let _ = actor.finish();
     drop(actor);
-    let mut state = StateHandle::open_with_config(paths, config).unwrap();
-    let fences = state.catalog_index().list_active_tape_io_fences().unwrap();
+    let state = StateHandle::open_with_config(paths, config).unwrap();
+    let fences = state.catalog().list_active_tape_io_fences().unwrap();
     assert_eq!(fences.len(), 1, "{fences:?}");
     assert_eq!(fences[0].reason, "partial_batch");
     let records = FileAuditLog::replay(&state.paths().audit_dir).unwrap();
@@ -1509,9 +1507,9 @@ fn b3b_mounted_named_tail_rejection_reproves_on_reopen() {
     assert_eq!(world.lock().unwrap().tapes["ORACLEL9"].records, prefix);
     let _ = actor.finish();
     drop(actor);
-    let mut state = StateHandle::open_with_config(paths, config).unwrap();
+    let state = StateHandle::open_with_config(paths, config).unwrap();
     assert!(state
-        .catalog_index()
+        .catalog()
         .list_active_tape_io_fences()
         .unwrap()
         .is_empty());
@@ -1589,11 +1587,8 @@ fn b3b_fix1_mounted_later_reset_has_no_fence() {
     assert_eq!(world.lock().unwrap().command_log.len(), commands);
     let _ = actor.finish();
     drop(actor);
-    let mut reopened = StateHandle::open_with_config(paths, config).unwrap();
-    let fences = reopened
-        .catalog_index()
-        .list_active_tape_io_fences()
-        .unwrap();
+    let reopened = StateHandle::open_with_config(paths, config).unwrap();
+    let fences = reopened.catalog().list_active_tape_io_fences().unwrap();
     assert!(fences.is_empty(), "durable live ending: {fences:?}");
     assert_eq!(world.lock().unwrap().tapes["ORACLEL9"].records, before);
 }

@@ -580,7 +580,7 @@ Object admission is permanently disabled. A failure enters
 their proved positions, never a new Object or a second terminal suffix. SQLite
 and the per-tape catalog files remain rebuildable projections.
 
-<!-- code-anchor: crates/remanence-state/src/index.rs crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/state.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
+<!-- code-anchor: crates/remanence-state/src/projector/index.rs crates/remanence-state/src/authority_layout.rs crates/remanence-state/src/state.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
 The marker contains `remanence-tape-log-v2\n`, the canonical configured journal
 root encoded as a JSON string, and a final `\n`. SQLite uses schema 24. Ordinary opens refuse schemas 1 through 23. Such
 state requires

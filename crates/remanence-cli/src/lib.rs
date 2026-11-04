@@ -8228,7 +8228,7 @@ fn run_tape_retire(args: &TapeRetireArgs, out: &mut dyn Write, err: &mut dyn Wri
     let report = if args.dry_run {
         // Dry-run never takes the state lock or opens the audit log: it
         // reads the catalog and computes the would-be outcome.
-        let catalog = match remanence_state::CatalogIndex::open_read_only(&paths.sqlite_path) {
+        let catalog = match remanence_state::CatalogReader::open(&paths.sqlite_path) {
             Ok(catalog) => catalog,
             Err(error) => {
                 let _ = writeln!(err, "error: {error}");
@@ -8436,10 +8436,7 @@ fn run_tape_quarantine(
                     return ExitCode::from(1);
                 }
             };
-            let records = match state
-                .catalog_index()
-                .list_active_media_readiness_operations(None)
-            {
+            let records = match state.catalog().list_active_media_readiness_operations(None) {
                 Ok(records) => records,
                 Err(error) => {
                     let _ = writeln!(err, "error: {error}");
@@ -8477,7 +8474,7 @@ fn run_tape_quarantine(
                     return ExitCode::from(1);
                 }
             };
-            let released = match state.catalog_index().record_media_readiness_transition(
+            let released = match state.write_handle().record_media_readiness_transition(
                 media_readiness_release_transition(operation_id, ack.trim()),
             ) {
                 Ok(record) => record,
@@ -8556,9 +8553,9 @@ fn load_state_config(
 fn open_catalog_read_only_for_config(
     config_path: &Path,
     err: &mut dyn Write,
-) -> Result<remanence_state::CatalogIndex, ExitCode> {
+) -> Result<remanence_state::CatalogReader, ExitCode> {
     let (paths, _) = load_state_config(config_path, err)?;
-    remanence_state::CatalogIndex::open_read_only(&paths.sqlite_path).map_err(|error| {
+    remanence_state::CatalogReader::open(&paths.sqlite_path).map_err(|error| {
         let _ = writeln!(err, "error: {error}");
         ExitCode::from(1)
     })
@@ -8899,14 +8896,14 @@ fn apply_tape_retire(
     target: &str,
     reason: &str,
 ) -> Result<TapeRetireReport, String> {
-    let record = resolve_tape_retire_target(state.catalog_index(), target)?;
+    let record = resolve_tape_retire_target(state.catalog(), target)?;
     let tape_uuid: [u8; 16] = record
         .tape_uuid
         .as_slice()
         .try_into()
         .map_err(|_| format!("catalog tape row has {} UUID bytes", record.tape_uuid.len()))?;
     let degraded_before = state
-        .catalog_index()
+        .catalog()
         .list_objects_with_no_committed_copies()
         .map_err(|error| format!("query degraded objects before retire: {error}"))?;
     let outcome = state
@@ -8916,7 +8913,7 @@ fn apply_tape_retire(
         })
         .map_err(|error| format!("retire tape: {error}"))?;
     let degraded_after = state
-        .catalog_index()
+        .catalog()
         .list_objects_with_no_committed_copies()
         .map_err(|error| format!("query degraded objects after retire: {error}"))?;
     let mut degraded_objects = degraded_after
@@ -9071,7 +9068,7 @@ impl TapeInitStateOps for remanence_state::StateHandle {
         bot: &remanence_api::BotClassification,
         pool_id: &str,
     ) -> Result<remanence_api::TapeInitCatalogProjection, String> {
-        remanence_api::project_tape_init_catalog_inputs(self.catalog_index(), voltag, bot, pool_id)
+        remanence_api::project_tape_init_catalog_inputs(self.catalog(), voltag, bot, pool_id)
             .map_err(|error| format!("project catalog init inputs: {error}"))
     }
 
@@ -9109,7 +9106,7 @@ impl TapeInitStateOps for remanence_state::StateHandle {
         &mut self,
         input: remanence_state::MediaReadinessOperationInput,
     ) -> Result<(), String> {
-        self.catalog_index()
+        self.write_handle()
             .record_media_readiness_operation(input)
             .map(|_| ())
             .map_err(|error| format!("record media readiness operation: {error}"))
@@ -9119,7 +9116,7 @@ impl TapeInitStateOps for remanence_state::StateHandle {
         &mut self,
         input: remanence_state::MediaReadinessTransitionInput,
     ) -> Result<(), String> {
-        self.catalog_index()
+        self.write_handle()
             .record_media_readiness_transition(input)
             .map(|_| ())
             .map_err(|error| format!("record media readiness transition: {error}"))
@@ -9132,7 +9129,7 @@ impl TapeInitStateOps for remanence_state::StateHandle {
         barcode: Option<&str>,
         library_robotics: bool,
     ) -> Result<Vec<remanence_state::MediaReadinessOperationRecord>, String> {
-        self.catalog_index()
+        self.catalog()
             .media_readiness_admission_conflicts(
                 library_serial,
                 drive_element,
@@ -9147,7 +9144,7 @@ impl TapeInitStateOps for remanence_state::StateHandle {
         barcode: Option<&str>,
         bot_uuid: Option<&remanence_api::TapeUuid>,
     ) -> Result<(), String> {
-        remanence_api::refuse_tape_init_while_fenced(self.catalog_index(), barcode, bot_uuid)
+        remanence_api::refuse_tape_init_while_fenced(self.catalog(), barcode, bot_uuid)
     }
 }
 
@@ -9194,7 +9191,7 @@ fn provision_initialized_tape_with_media(
         .map_err(|e| format!("provision catalog tape row: {e}"))?;
     if context.explicit_pool.is_none() {
         state
-            .catalog_index()
+            .write_handle()
             .reconcile_tape_pool_projection_from_rules(
                 &pool_projection_inputs(config),
                 &config.tape_pool_rules,
@@ -9202,7 +9199,7 @@ fn provision_initialized_tape_with_media(
             .map_err(|e| format!("project tape pool membership: {e}"))?;
     }
     let pool_id = state
-        .catalog_index()
+        .catalog()
         .get_tape_pool_membership(&tape_uuid)
         .map_err(|e| e.to_string())?;
     append_tape_provisioned_audit_event(
@@ -9243,7 +9240,7 @@ fn append_tape_provisioned_audit_event(
         ),
     };
     let assignment_generation = state
-        .catalog_index()
+        .catalog()
         .get_tape_assignment_snapshot(&tape_uuid)
         .map_err(|error| format!("read provisioning assignment generation: {error}"))?
         .ok_or_else(|| "provisioned tape has no assignment snapshot".to_string())?
@@ -9396,11 +9393,11 @@ impl TapeInitStateOps for remanence_state::CatalogIndex {
 }
 
 struct DryRunTapeInitState {
-    catalog: remanence_state::CatalogIndex,
+    catalog: remanence_state::CatalogReader,
 }
 
 impl DryRunTapeInitState {
-    fn new(catalog: remanence_state::CatalogIndex) -> Self {
+    fn new(catalog: remanence_state::CatalogReader) -> Self {
         Self { catalog }
     }
 }
@@ -9718,7 +9715,7 @@ fn run_tape_wait_ready(
     };
     let policy = configured_library_policy(&config);
     let paths = remanence_state::StatePaths::from_config(&args.config, &config);
-    let mut state = match remanence_state::StateHandle::open_with_config(paths, config.clone()) {
+    let state = match remanence_state::StateHandle::open_with_config(paths, config.clone()) {
         Ok(state) => state,
         Err(error) => {
             let _ = writeln!(err, "error: {error}");
@@ -9726,14 +9723,21 @@ fn run_tape_wait_ready(
             return ExitCode::from(1);
         }
     };
-    let result = match run_tape_wait_ready_hardware(library, &policy, args, state.catalog_index()) {
-        Ok(result) => result,
-        Err(failure) => {
-            print_tape_wait_ready_failure(library.serial.as_str(), &failure, args.json, out, err);
-            print_warnings(report, err);
-            return ExitCode::from(failure.exit_code);
-        }
-    };
+    let result =
+        match run_tape_wait_ready_hardware(library, &policy, args, &mut state.write_handle()) {
+            Ok(result) => result,
+            Err(failure) => {
+                print_tape_wait_ready_failure(
+                    library.serial.as_str(),
+                    &failure,
+                    args.json,
+                    out,
+                    err,
+                );
+                print_warnings(report, err);
+                return ExitCode::from(failure.exit_code);
+            }
+        };
     print_tape_wait_ready_result(library.serial.as_str(), &result, args.json, out, err);
     print_warnings(report, err);
     tape_wait_ready_exit_code(&result)
@@ -11470,7 +11474,7 @@ fn run_tape_adopt_bootstrap(
         Ok(drive_element) => drive_element,
         Err(error) => return print_command_error(error, &fresh_report, err),
     };
-    let conflicts = match state.catalog_index().media_readiness_admission_conflicts(
+    let conflicts = match state.catalog().media_readiness_admission_conflicts(
         library.serial.as_str(),
         Some(drive_element),
         Some(voltag),
@@ -11869,9 +11873,11 @@ fn run_tape_init(
             return ExitCode::from(1);
         }
     };
-    if let Err(error) =
-        remanence_api::reconcile_media_readiness_on_startup(state.catalog_index(), report, &policy)
-    {
+    if let Err(error) = remanence_api::reconcile_media_readiness_on_startup(
+        &mut state.write_handle(),
+        report,
+        &policy,
+    ) {
         let _ = writeln!(err, "error: startup media-readiness reconcile: {error}");
         print_warnings(report, err);
         return ExitCode::from(1);
@@ -11891,16 +11897,16 @@ fn run_tape_init(
 /// Any catalog that exists but cannot be opened is still an error.
 fn open_tape_init_dry_run_catalog(
     sqlite_path: &Path,
-) -> Result<(remanence_state::CatalogIndex, DryRunCatalog), String> {
+) -> Result<(remanence_state::CatalogReader, DryRunCatalog), String> {
     let exists = sqlite_path
         .try_exists()
         .map_err(|error| format!("stat catalog {}: {error}", sqlite_path.display()))?;
     if exists {
-        remanence_state::CatalogIndex::open_read_only(sqlite_path)
+        remanence_state::CatalogReader::open(sqlite_path)
             .map(|catalog| (catalog, DryRunCatalog::Present))
             .map_err(|e| e.to_string())
     } else {
-        remanence_state::CatalogIndex::open(":memory:")
+        remanence_state::CatalogReader::empty()
             .map(|catalog| (catalog, DryRunCatalog::Absent))
             .map_err(|error| format!("open empty in-memory catalog for dry run: {error}"))
     }
@@ -17398,6 +17404,9 @@ fn format_warning(w: &DiscoveryWarning) -> String {
 // =====================================================================
 
 #[cfg(test)]
+mod b4a_tests;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn removed_xattr_flags_have_no_clap_alias_and_explain_policy() {
@@ -17724,8 +17733,9 @@ mod tests {
         daemon_runtime().unwrap().block_on(async {
             let dir = tempfile::tempdir().unwrap();
             let _lock = remanence_state::StateLockGuard::acquire(dir.path()).unwrap();
-            let mut index =
-                remanence_state::CatalogIndex::open(dir.path().join("state.sqlite")).unwrap();
+            let mut index = remanence_state::projector::open(dir.path().join("state.sqlite"))
+                .map(|catalog| catalog.write_handle())
+                .unwrap();
             let fence = index
                 .record_tape_io_fence(remanence_state::TapeIoFenceInput {
                     tape_uuid: [0x31; 16],
@@ -17734,7 +17744,12 @@ mod tests {
                     evidence_json: None,
                 })
                 .unwrap();
-            let state = remanence_api::ApiState::new(index);
+            let state = remanence_api::ApiState::new({
+                let index = index;
+                let catalog = remanence_state::projector::open(index.path()).unwrap();
+                drop(index);
+                catalog
+            });
             let (client, server) = tokio::io::duplex(65536);
             let task = tokio::spawn(
                 tonic::transport::Server::builder()
@@ -20553,8 +20568,9 @@ mod tests {
         use remanence_chaos::model::{ModelTransport, VirtualTape, VirtualWorld};
         use std::sync::{Arc, Mutex};
         let temp = tempfile::tempdir().expect("tempdir");
-        let mut index =
-            remanence_state::CatalogIndex::open(temp.path().join("state.sqlite")).expect("catalog");
+        let mut index = remanence_state::projector::open(temp.path().join("state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("catalog");
         let operation_id = Uuid::new_v4();
         index
             .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
@@ -20646,8 +20662,9 @@ mod tests {
             .prefix("remanence-cli-wait-ready-admission")
             .tempdir()
             .expect("temp dir");
-        let mut index =
-            remanence_state::CatalogIndex::open(temp.path().join("state.sqlite")).expect("open");
+        let mut index = remanence_state::projector::open(temp.path().join("state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let operation_id = Uuid::from_u128(0x9001);
         record_test_media_readiness_operation(
             &mut index,
@@ -20806,7 +20823,8 @@ mod tests {
             .prefix("remanence-cli-readiness-signal")
             .tempdir()
             .expect("temp dir");
-        let mut index = remanence_state::CatalogIndex::open(temp.path().join("state.sqlite"))
+        let mut index = remanence_state::projector::open(temp.path().join("state.sqlite"))
+            .map(|catalog| catalog.write_handle())
             .expect("open catalog");
         let operation_id = Uuid::from_u128(0x456);
         index
@@ -20864,7 +20882,8 @@ mod tests {
             .prefix("remanence-cli-readiness-signal-failure")
             .tempdir()
             .expect("temp dir");
-        let mut index = remanence_state::CatalogIndex::open(temp.path().join("state.sqlite"))
+        let mut index = remanence_state::projector::open(temp.path().join("state.sqlite"))
+            .map(|catalog| catalog.write_handle())
             .expect("open catalog");
         let operation_id = Uuid::from_u128(0x457);
         index
@@ -21494,10 +21513,9 @@ pool_id = "init-test"
                 log.iter().filter(|cdb| cdb[0] == 0x10).count(),
                 usize::from(complete)
             );
-            let catalog = remanence_state::CatalogIndex::open_read_only(
-                temp.path().join("index/rem-state.sqlite"),
-            )
-            .expect("open real CLI catalog");
+            let catalog =
+                remanence_state::CatalogReader::open(temp.path().join("index/rem-state.sqlite"))
+                    .expect("open real CLI catalog");
             let tapes = catalog
                 .list_tapes(None, remanence_state::TapeKindFilter::All)
                 .expect("list initialized tapes");
@@ -21703,7 +21721,7 @@ pool_id = "init-test"
                         "{stderr}"
                     );
                 }
-                let catalog = remanence_state::CatalogIndex::open_read_only(
+                let catalog = remanence_state::CatalogReader::open(
                     temp.path().join("index/rem-state.sqlite"),
                 )
                 .unwrap();
@@ -21985,10 +22003,9 @@ pool_id = "init-test"
         Option<remanence_state::TapeRecord>,
         Vec<remanence_state::AuditRecord>,
     ) {
-        let catalog = remanence_state::CatalogIndex::open_read_only(
-            run.temp.path().join("index/rem-state.sqlite"),
-        )
-        .unwrap();
+        let catalog =
+            remanence_state::CatalogReader::open(run.temp.path().join("index/rem-state.sqlite"))
+                .unwrap();
         let tape = catalog.get_tape_by_voltag("RMT001L9").unwrap();
         let audit = remanence_state::FileAuditLog::replay(run.temp.path().join("audit"))
             .unwrap()
@@ -22038,7 +22055,7 @@ pool_id = "init-test"
         let mut rebuilt = remanence_state::StateHandle::open_from_config_file(&config).unwrap();
         rebuilt.startup_replay().unwrap();
         let after = rebuilt
-            .catalog_index()
+            .catalog()
             .get_tape(&tape.tape_uuid)
             .unwrap()
             .unwrap();
@@ -22323,7 +22340,8 @@ pool_id = "init-test"
             remanence_state::StateHandle::open_from_config_file(config_path)
                 .expect("create catalog"),
         );
-        remanence_state::CatalogIndex::open(root.join("index/rem-state.sqlite"))
+        remanence_state::projector::open(root.join("index/rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
             .expect("open catalog")
             .record_tape_io_fence(remanence_state::TapeIoFenceInput {
                 tape_uuid,
@@ -22470,7 +22488,8 @@ pool_id = "init-test"
                     Some("RMT001L9"),
                     "partial_batch",
                 );
-                remanence_state::CatalogIndex::open(root.join("index/rem-state.sqlite"))
+                remanence_state::projector::open(root.join("index/rem-state.sqlite"))
+                    .map(|catalog| catalog.write_handle())
                     .expect("open catalog")
                     .release_tape_io_fence(&fence.quarantine_id, "inventory settled")
                     .expect("release fence")
@@ -22842,8 +22861,9 @@ pool_id = "init-test"
             .prefix("remanence-cli-wait-ready-no-medium")
             .tempdir()
             .expect("temp dir");
-        let mut index =
-            remanence_state::CatalogIndex::open(temp.path().join("state.sqlite")).expect("open");
+        let mut index = remanence_state::projector::open(temp.path().join("state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let operation_id = Uuid::from_u128(0x9002);
         record_test_media_readiness_operation(
             &mut index,
@@ -22907,8 +22927,9 @@ pool_id = "init-test"
             .prefix("remanence-cli-wait-ready-ua-epoch")
             .tempdir()
             .expect("temp dir");
-        let mut index =
-            remanence_state::CatalogIndex::open(temp.path().join("state.sqlite")).expect("open");
+        let mut index = remanence_state::projector::open(temp.path().join("state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let operation_id = Uuid::from_u128(0x9003);
         record_test_media_readiness_operation(
             &mut index,
@@ -22984,8 +23005,15 @@ pool_id = "init-test"
             .prefix("remanence-cli-daemon-health")
             .tempdir()
             .unwrap();
-        let index = remanence_state::CatalogIndex::open(temp.path().join("state.sqlite")).unwrap();
-        let state = remanence_api::ApiState::new(index);
+        let index = remanence_state::projector::open(temp.path().join("state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
+        let state = remanence_api::ApiState::new({
+            let index = index;
+            let catalog = remanence_state::projector::open(index.path()).unwrap();
+            drop(index);
+            catalog
+        });
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -23337,11 +23365,11 @@ tape_catalog_dir = "{0}/cache/tapes"
         )
         .expect("write config");
         {
-            let mut state = remanence_state::StateHandle::open_from_config_file(&config_path)
+            let state = remanence_state::StateHandle::open_from_config_file(&config_path)
                 .expect("open state");
             for (tape_uuid, voltag) in [([0xA1; 16], "RMN009L9"), ([0xA2; 16], "RMN010L9")] {
                 state
-                    .catalog_index()
+                    .write_handle()
                     .provision_tape(remanence_state::ProvisionTapeInput {
                         tape_uuid,
                         voltag: voltag.to_string(),
@@ -23352,7 +23380,7 @@ tape_catalog_dir = "{0}/cache/tapes"
                     .expect("provision tape");
             }
             state
-                .catalog_index()
+                .write_handle()
                 .seal_tape([0xA2; 16])
                 .expect("seal second tape");
         }
@@ -23434,10 +23462,10 @@ tape_catalog_dir = "{0}/cache/tapes"
         )
         .expect("write config");
         {
-            let mut state = remanence_state::StateHandle::open_from_config_file(&config_path)
+            let state = remanence_state::StateHandle::open_from_config_file(&config_path)
                 .expect("open state");
             state
-                .catalog_index()
+                .write_handle()
                 .provision_tape(remanence_state::ProvisionTapeInput {
                     tape_uuid: [0xB1; 16],
                     voltag: "RMN009L9".to_string(),
@@ -23447,7 +23475,7 @@ tape_catalog_dir = "{0}/cache/tapes"
                 })
                 .expect("provision data");
             state
-                .catalog_index()
+                .write_handle()
                 .provision_tape(remanence_state::ProvisionTapeInput {
                     tape_uuid: [0xB2; 16],
                     voltag: "CLN001L9".to_string(),
@@ -23457,7 +23485,7 @@ tape_catalog_dir = "{0}/cache/tapes"
                 })
                 .expect("provision cleaning");
             state
-                .catalog_index()
+                .write_handle()
                 .set_tape_kind(&[0xB2; 16], "cleaning")
                 .expect("set cleaning kind");
         }
@@ -23944,7 +23972,8 @@ tape_catalog_dir = "{0}/cache/tapes"
         let config = write_retire_test_config(root.path());
         drop(remanence_state::StateHandle::open_from_config_file(&config).unwrap());
         let sqlite = root.path().join("index/rem-state.sqlite");
-        let fence = remanence_state::CatalogIndex::open(&sqlite)
+        let fence = remanence_state::projector::open(&sqlite)
+            .map(|catalog| catalog.write_handle())
             .unwrap()
             .record_tape_io_fence(remanence_state::TapeIoFenceInput {
                 tape_uuid: [0x31; 16],
@@ -23964,7 +23993,9 @@ tape_catalog_dir = "{0}/cache/tapes"
 
         // The daemon: lifetime state lock, open catalog, served socket.
         let _lock = remanence_state::StateLockGuard::acquire(root.path()).unwrap();
-        let _catalog = remanence_state::CatalogIndex::open(&sqlite).unwrap();
+        let _catalog = remanence_state::projector::open(&sqlite)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         let listener =
             std::os::unix::net::UnixListener::bind(root.path().join("rem.sock")).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -23973,7 +24004,7 @@ tape_catalog_dir = "{0}/cache/tapes"
         let server = std::thread::spawn(move || {
             daemon_runtime().unwrap().block_on(async move {
                 let state = remanence_api::ApiState::new(
-                    remanence_state::CatalogIndex::open(&server_sqlite).unwrap(),
+                    remanence_state::projector::open(&server_sqlite).unwrap(),
                 );
                 let incoming = tokio_stream::wrappers::UnixListenerStream::new(
                     tokio::net::UnixListener::from_std(listener).unwrap(),
@@ -24152,10 +24183,10 @@ tape_catalog_dir = "{0}/cache/tapes"
     }
 
     fn provision_retire_test_tape(config_path: &Path, tape_uuid: [u8; 16], voltag: &str) {
-        let mut handle =
+        let handle =
             remanence_state::StateHandle::open_from_config_file(config_path).expect("open state");
         handle
-            .catalog_index()
+            .write_handle()
             .provision_tape(remanence_state::ProvisionTapeInput {
                 tape_uuid,
                 voltag: voltag.to_string(),
@@ -24169,7 +24200,7 @@ tape_catalog_dir = "{0}/cache/tapes"
     fn retire_test_tape_state(config_path: &Path, tape_uuid: [u8; 16]) -> (String, Option<String>) {
         let config = remanence_state::load_config(config_path).expect("load config");
         let paths = remanence_state::StatePaths::from_config(config_path, &config);
-        let catalog = remanence_state::CatalogIndex::open_read_only(&paths.sqlite_path)
+        let catalog = remanence_state::CatalogReader::open(&paths.sqlite_path)
             .expect("open catalog read-only");
         let record = catalog
             .get_tape(&tape_uuid)
@@ -24511,8 +24542,9 @@ tape_catalog_dir = "{0}/cache/tapes"
         let db_path = temp.path().join("state.sqlite");
         let active_operation_id = Uuid::from_u128(0x7001);
         {
-            let mut index =
-                remanence_state::CatalogIndex::open(&db_path).expect("open writable catalog");
+            let mut index = remanence_state::projector::open(&db_path)
+                .map(|catalog| catalog.write_handle())
+                .expect("open writable catalog");
             record_test_media_readiness_operation(
                 &mut index,
                 active_operation_id,
@@ -24523,8 +24555,8 @@ tape_catalog_dir = "{0}/cache/tapes"
                 Some("drive+tape"),
             );
         }
-        let catalog = remanence_state::CatalogIndex::open_read_only(&db_path)
-            .expect("open read-only catalog");
+        let catalog =
+            remanence_state::CatalogReader::open(&db_path).expect("open read-only catalog");
         let mut state = DryRunTapeInitState::new(catalog);
 
         let conflicts = state
@@ -24561,8 +24593,8 @@ tape_catalog_dir = "{0}/cache/tapes"
         .expect("dry-run readiness transition record is a no-op");
         drop(state);
 
-        let catalog = remanence_state::CatalogIndex::open_read_only(&db_path)
-            .expect("reopen read-only catalog");
+        let catalog =
+            remanence_state::CatalogReader::open(&db_path).expect("reopen read-only catalog");
         assert!(
             catalog
                 .media_readiness_operation(dry_run_operation_id)

@@ -222,7 +222,9 @@ fn check_closeout_route_case(
             &library,
             library_snapshot_cell(library.library().clone()),
         );
-        let mut index = CatalogIndex::open(&cfg.index_path).unwrap();
+        let mut index = remanence_state::projector::open(&cfg.index_path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         let selected = SelectedTape {
             standalone_endpoint: None,
             pool_id: "closeout".into(),
@@ -448,7 +450,9 @@ fn check_closeout_route_case(
                 .unwrap();
         }
         drop(index);
-        let reopened = CatalogIndex::open(&cfg.index_path).unwrap();
+        let reopened = remanence_state::projector::open(&cfg.index_path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         let fences = reopened
             .tape_io_admission_conflicts(&selected.tape_uuid, Some("RESUME001"))
             .unwrap();

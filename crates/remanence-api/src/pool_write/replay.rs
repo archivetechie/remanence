@@ -24,7 +24,7 @@ pub(crate) fn replay_committed_pool_write_reconciled(
     request: &WriteObjectToPoolRequest,
 ) -> Result<Option<PoolWriteResult>, PoolWriteError> {
     let pool_cfg = configured_direct_pool(state, &request.pool_id)?;
-    maybe_replay_pool_write(state.catalog_index(), &pool_cfg, request)
+    maybe_replay_pool_write(state.catalog(), &pool_cfg, request)
 }
 
 pub(super) fn configured_direct_pool(

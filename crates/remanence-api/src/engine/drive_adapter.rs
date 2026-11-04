@@ -341,7 +341,7 @@ impl MountedDrive {
             .as_mut()
             .ok_or_else(|| crate::mount_support::refusal("mounted drive finished"))?;
         crate::mount_support::standalone_fence_policy(
-            owner.state.catalog_index(),
+            owner.state.catalog(),
             Some(self.client.tape_uuid),
             Some(&self.client.endpoint),
             true,
@@ -354,7 +354,7 @@ impl MountedDrive {
             .as_mut()
             .expect("unfinished mounted owner")
             .state
-            .catalog_index()
+            .catalog()
     }
     pub fn reconcile_checkpoints(&mut self) -> Result<()> {
         self.client
@@ -575,7 +575,7 @@ impl MountedCommands {
         let journals = state.paths().journal_dir.join("tapes");
         let (selected, host_only_recovery) =
             match crate::pool_write::admit_pinned_tape_for_write_session(
-                state.catalog_index(),
+                state.catalog(),
                 self.tape_uuid,
                 pool_id,
                 &pool_cfg,
@@ -813,6 +813,7 @@ pub(crate) fn mounted_config(
     })?;
     let c = state.config();
     Ok(write_owner::WriteOwnerConfig {
+        catalog: state.projection_client(),
         index_path: state.paths().sqlite_path.clone(),
         report: remanence_library::DiscoveryReport {
             unattached_drives: vec![],
@@ -871,13 +872,13 @@ pub(crate) fn put_version(
         .reconcile_checkpoints(state)
         .map_err(crate::MountError::Actor)?;
     crate::mount_support::standalone_fence_policy(
-        state.catalog_index(),
+        state.catalog(),
         Some(client.tape_uuid),
         Some(&client.endpoint),
         true,
     )?;
     match crate::standalone_write::prepare_version(
-        state.catalog_index(),
+        state.catalog(),
         request,
         allow_plaintext_copy,
         before_prepare,
@@ -897,7 +898,7 @@ pub(crate) fn write_checkpointed(
     use crate::mount_support::{refusal, MountError};
     client.refresh_session().map_err(MountError::Actor)?;
     let loaded = state
-        .catalog_index()
+        .catalog()
         .get_tape(&client.tape_uuid)
         .map_err(refusal)?
         .ok_or_else(|| refusal("mounted tape is not catalogued"))?;

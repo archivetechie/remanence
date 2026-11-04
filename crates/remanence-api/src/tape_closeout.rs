@@ -45,7 +45,13 @@ pub(crate) fn start(
         .readiness_start
         .lock()
         .map_err(|_| Status::internal("operation admission lock poisoned"))?;
-    let mut index = state.index_write()?;
+    let mut index = {
+        let mut index = state.catalog.write_handle();
+        if let Some(pool) = &state.drive_pool {
+            index.set_readiness_observer(pool.readiness_wake.clone());
+        }
+        index
+    };
     let existing = index
         .idempotency_scope_record(&actor_fingerprint, KIND, key)
         .map_err(crate::status_from_state_error)?;
@@ -141,7 +147,13 @@ pub(crate) fn start(
     tokio::spawn(async move {
         let record = |event, detail| -> Result<(), Status> {
             append_operation_audit(
-                &mut state.index_write()?,
+                &mut {
+                    let mut index = state.catalog.write_handle();
+                    if let Some(pool) = &state.drive_pool {
+                        index.set_readiness_observer(pool.readiness_wake.clone());
+                    }
+                    index
+                },
                 state.audit_dir.as_ref(),
                 true,
                 &state.audit_append_lock,

@@ -377,7 +377,9 @@ fn media_readiness_admission_helper_blocks_active_fence() {
         .prefix("rem-api-readiness-admission")
         .tempdir()
         .expect("temp dir");
-    let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+    let mut index = remanence_state::projector::open(temp.path().join("rem-state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open");
     let operation_id = Uuid::from_u128(0xabc);
     index
         .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
@@ -696,7 +698,9 @@ where
 
 fn test_index() -> CatalogIndex {
     let dir = std::env::temp_dir().join(format!("remanence-api-{}", Uuid::new_v4()));
-    CatalogIndex::open(dir.join("state.sqlite")).expect("open test index")
+    remanence_state::projector::open(dir.join("state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open test index")
 }
 
 fn temp_dir(prefix: &str) -> std::path::PathBuf {
@@ -727,7 +731,12 @@ fn recipient_pair(first_epoch: u8) -> (RecipientPrivateKey, Vec<RecipientPublicK
 }
 
 fn state_with_spool(spool_dir: PathBuf, budget_bytes: u64) -> ApiState {
-    let mut state = ApiState::new(test_index());
+    let mut state = ApiState::new({
+        let index = test_index();
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    });
     state.spool_dir = Some(Arc::new(spool_dir));
     state.spool_budget_bytes = Some(budget_bytes);
     state.io_memory =
@@ -1391,7 +1400,8 @@ fn manual_finalize_changed_fields_conflict_after_catalog_restart() {
         actor_fingerprint,
         b"ship copy offsite",
     );
-    CatalogIndex::open(&index_path)
+    remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
         .expect("open catalog")
         .register_idempotency_request(
             actor_fingerprint,
@@ -1424,7 +1434,8 @@ fn manual_finalize_changed_fields_conflict_after_catalog_restart() {
         ),
     ];
     for changed_fingerprint in changed_fingerprints {
-        let conflict = CatalogIndex::open(&index_path)
+        let conflict = remanence_state::projector::open(&index_path)
+            .map(|catalog| catalog.write_handle())
             .expect("restart catalog")
             .register_idempotency_request(
                 actor_fingerprint,
@@ -1592,7 +1603,13 @@ fn authorization_matrix_covers_drive_stewardship_mutations() {
 
 #[tokio::test]
 async fn write_session_rejects_readonly_role_before_validation() {
-    let service = ApiState::new(test_index()).write_session_service();
+    let service = ApiState::new({
+        let index = test_index();
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    })
+    .write_session_service();
     let mut request = Request::new(pb::OpenWriteSessionRequest {
         target: None,
         body_format: None,
@@ -1634,7 +1651,13 @@ fn unimplemented_idempotency_rejects_only_non_empty_keys() {
 
 #[tokio::test]
 async fn write_session_rejects_idempotency_key_before_validation() {
-    let service = ApiState::new(test_index()).write_session_service();
+    let service = ApiState::new({
+        let index = test_index();
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    })
+    .write_session_service();
     let err = pb::write_session_service_server::WriteSessionService::open_write_session(
         &service,
         Request::new(pb::OpenWriteSessionRequest {
@@ -1656,7 +1679,13 @@ async fn write_session_rejects_idempotency_key_before_validation() {
 /// these were the same request on the wire.
 #[tokio::test]
 async fn write_session_separates_absent_body_format_from_a_blank_one() {
-    let service = ApiState::new(test_index()).write_session_service();
+    let service = ApiState::new({
+        let index = test_index();
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    })
+    .write_session_service();
     let open = |body_format| {
         pb::write_session_service_server::WriteSessionService::open_write_session(
             &service,
@@ -1694,7 +1723,12 @@ async fn write_session_separates_absent_body_format_from_a_blank_one() {
 
 #[test]
 fn cancel_audit_records_request_actor() {
-    let state = ApiState::new(test_index());
+    let state = ApiState::new({
+        let index = test_index();
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    });
     let operation_id = Uuid::new_v4();
     let actor = AuditActor::Service("operator-a".to_string());
 
@@ -1710,7 +1744,12 @@ fn cancel_audit_records_request_actor() {
 
 #[test]
 fn library_request_audit_records_request_actor() {
-    let state = ApiState::new(test_index());
+    let state = ApiState::new({
+        let index = test_index();
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    });
     let operation_id = Uuid::new_v4();
     let actor = AuditActor::Service("operator-a".to_string());
 
@@ -1890,7 +1929,9 @@ fn sealed_manual_completion_audit_repair_is_exactly_once() {
         .tempdir()
         .expect("tempdir");
     let audit_dir = temp.path().join("audit");
-    let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open catalog");
+    let mut index = remanence_state::projector::open(temp.path().join("rem-state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open catalog");
     let tape_uuid = [0xa1; 16];
     let operation_id = Uuid::from_u128(0xa101);
     let idempotency_key = Uuid::from_u128(0xa102);
@@ -2239,7 +2280,7 @@ tape_catalog_dir = "{0}/cache/tapes"
     let mut state = StateHandle::open_with_config(paths, config).expect("open locked state");
     let tape_uuid = [0x93; 16];
     state
-        .catalog_index()
+        .write_handle()
         .provision_tape(ProvisionTapeInput {
             tape_uuid,
             voltag: "DRP001L9".to_string(),
@@ -2249,13 +2290,13 @@ tape_catalog_dir = "{0}/cache/tapes"
         })
         .expect("provision first tape");
     state
-        .catalog_index()
+        .write_handle()
         .project_tape_pool_membership(tape_uuid, "direct-replay")
         .expect("assign first tape");
     append_checkpoint_record(&checkpoint_dir, tape_uuid);
     assert!(
         state
-            .catalog_index()
+            .catalog()
             .get_native_object_by_pool_and_caller_object_id(
                 "direct-replay",
                 "checkpoint-selection-test",
@@ -2323,7 +2364,7 @@ tape_catalog_dir = "{0}/cache/tapes"
 
     assert!(
         state
-            .catalog_index()
+            .catalog()
             .get_native_object_by_pool_and_caller_object_id(
                 "direct-replay",
                 "checkpoint-selection-test",
@@ -2411,7 +2452,9 @@ fn startup_replay_repairs_live_restart_cycle_partial_projection() {
     let index_path = temp.path().join("rem-state.sqlite");
     let checkpoint_dir = temp.path().join("tapes");
     let tape_uuid = [0x91; 16];
-    let mut index = CatalogIndex::open(&index_path).expect("open index");
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open index");
     index
         .provision_tape(ProvisionTapeInput {
             tape_uuid,
@@ -2432,7 +2475,9 @@ fn startup_replay_repairs_live_restart_cycle_partial_projection() {
     replay_checkpoint_journal_projections(&mut index, &checkpoint_dir)
         .expect("project first checkpoint");
     drop(index);
-    let mut index = CatalogIndex::open(&index_path).expect("restart after first checkpoint");
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("restart after first checkpoint");
     replay_checkpoint_journal_projections(&mut index, &checkpoint_dir)
         .expect("startup replay after first kill");
 
@@ -2446,7 +2491,9 @@ fn startup_replay_repairs_live_restart_cycle_partial_projection() {
         .expect("project independently visible object metadata");
     drop(index);
 
-    let mut index = CatalogIndex::open(&index_path).expect("restart after projection kill");
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("restart after projection kill");
     replay_checkpoint_journal_projections(&mut index, &checkpoint_dir)
         .expect("journal-authoritative startup repair");
     let second_object_id = second.objects[0].object.object_id.as_str();
@@ -2524,7 +2571,9 @@ fn startup_replay_retires_only_companion_only_manual_acceptance() {
     let operation_id = Uuid::from_u128(0x9301);
     let idempotency_key = Uuid::from_u128(0x9302);
     let request_fingerprint = [0x93; 32];
-    let mut index = CatalogIndex::open(&index_path).expect("open index");
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open index");
     index
         .provision_tape(ProvisionTapeInput {
             tape_uuid,
@@ -2703,7 +2752,9 @@ fn startup_replay_restores_pending_automatic_finalization_through_replica_c() {
     let index_path = temp.path().join("rem-state.sqlite");
     let checkpoint_dir = temp.path().join("tapes");
     let tape_uuid = [0x92; 16];
-    let mut index = CatalogIndex::open(&index_path).expect("open index");
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open index");
     index
         .provision_tape(ProvisionTapeInput {
             tape_uuid,
@@ -2791,7 +2842,9 @@ fn startup_replay_restores_pending_automatic_finalization_through_replica_c() {
     drop(lease);
     drop(index);
 
-    let mut index = CatalogIndex::open(&index_path).expect("restart index");
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("restart index");
     replay_checkpoint_journal_projections(&mut index, &checkpoint_dir)
         .expect("restore pending finalization");
     let tape = index
@@ -2867,8 +2920,9 @@ fn startup_replay_restores_pending_automatic_finalization_through_replica_c() {
     drop(index);
 
     let failed_index_path = temp.path().join("terminal-projection-failure.sqlite");
-    let mut failed_index =
-        CatalogIndex::open(&failed_index_path).expect("open terminal projection-failure catalog");
+    let mut failed_index = remanence_state::projector::open(&failed_index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open terminal projection-failure catalog");
     failed_index
         .provision_tape(ProvisionTapeInput {
             tape_uuid,
@@ -2917,7 +2971,9 @@ fn startup_replay_restores_pending_automatic_finalization_through_replica_c() {
         "Sealed remains durable after a projection failure"
     );
 
-    let mut index = CatalogIndex::open(&index_path).expect("restart after sealed checkpoint");
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("restart after sealed checkpoint");
     replay_checkpoint_journal_projections(&mut index, &checkpoint_dir)
         .expect("sealed checkpoint wins over its stale matching intent");
     let tape = index
@@ -3350,7 +3406,12 @@ fn populated_state() -> ApiState {
             }],
         )
         .expect("populate object");
-    ApiState::new(index)
+    ApiState::new({
+        let index = index;
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    })
 }
 
 fn populated_state_with_file_catalog() -> ApiState {
@@ -3361,7 +3422,9 @@ fn populated_state_with_file_catalog() -> ApiState {
         parity_blocks_per_stripe: 1,
         stripes_per_neighborhood: 3,
     };
-    let mut index = CatalogIndex::open(state.index_path.as_ref()).expect("open test index");
+    let mut index = remanence_state::projector::open(state.index_path.as_ref())
+        .map(|catalog| catalog.write_handle())
+        .expect("open test index");
     index
         .project_native_object_and_committed_tape_file_bundle(
             NativeObjectProjectionInput {
@@ -3572,7 +3635,9 @@ fn foreign_poll_skips_same_serial_collision_rows_without_attribution() {
         )],
         warnings: Vec::new(),
     };
-    let mut index = CatalogIndex::open(&index_path).expect("open catalog");
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open catalog");
     observe_drive_catalog_from_libraries(&mut index, report.libraries.iter(), &HashSet::new())
         .expect("observe duplicate serial foreign rows");
     let collision_rows = index.list_drives(true, false).expect("list drives");
@@ -3594,7 +3659,7 @@ fn foreign_poll_skips_same_serial_collision_rows_without_attribution() {
     };
     let mut reads = Vec::new();
     poll_foreign_drive_counters_once_with_reader(
-        &index_path,
+        &remanence_state::projector::open(&index_path).unwrap(),
         &report,
         &drives_cfg,
         &HashSet::new(),
@@ -3610,7 +3675,9 @@ fn foreign_poll_skips_same_serial_collision_rows_without_attribution() {
         reads.is_empty(),
         "ambiguous duplicate serial bays must not be polled or attributed: {reads:?}"
     );
-    let index = CatalogIndex::open(&index_path).expect("reopen catalog");
+    let index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("reopen catalog");
     for drive in collision_rows {
         assert!(
             index
@@ -3649,7 +3716,9 @@ fn foreign_poll_attributes_unambiguous_row_by_library_and_element_address() {
         )],
         warnings: Vec::new(),
     };
-    let mut index = CatalogIndex::open(&index_path).expect("open catalog");
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open catalog");
     observe_drive_catalog_from_libraries(&mut index, report.libraries.iter(), &HashSet::new())
         .expect("observe foreign rows");
     let other_drive = index
@@ -3675,7 +3744,7 @@ fn foreign_poll_attributes_unambiguous_row_by_library_and_element_address() {
     };
     let mut reads = Vec::new();
     poll_foreign_drive_counters_once_with_reader(
-        &index_path,
+        &remanence_state::projector::open(&index_path).unwrap(),
         &report,
         &drives_cfg,
         &HashSet::new(),
@@ -3689,7 +3758,9 @@ fn foreign_poll_attributes_unambiguous_row_by_library_and_element_address() {
     .expect("poll foreign counters");
 
     assert_eq!(reads, vec![PathBuf::from("/dev/sg-target")]);
-    let index = CatalogIndex::open(&index_path).expect("reopen catalog");
+    let index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("reopen catalog");
     assert!(
         index
             .list_drive_health_snapshots(&other_drive.drive_uuid)
@@ -3736,7 +3807,15 @@ fn pool_state_with_tapes(tape_uuids: &[[u8; 16]]) -> ApiState {
     for tape_uuid in tape_uuids {
         project_eligible_tape(&mut index, "camera.copy-a", *tape_uuid);
     }
-    ApiState::new_with_pool_configs(index, vec![pool_config("camera.copy-a")])
+    ApiState::new_with_pool_configs(
+        {
+            let index = index;
+            let catalog = remanence_state::projector::open(index.path()).unwrap();
+            drop(index);
+            catalog
+        },
+        vec![pool_config("camera.copy-a")],
+    )
 }
 
 fn state_with_operation() -> ApiState {
@@ -3766,7 +3845,12 @@ fn state_with_operation() -> ApiState {
             .project_audit_record(&record)
             .expect("project operation audit record");
     }
-    ApiState::new(index)
+    ApiState::new({
+        let index = index;
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    })
 }
 
 fn state_with_queued_operation() -> ApiState {
@@ -3788,7 +3872,12 @@ fn state_with_queued_operation() -> ApiState {
     index
         .project_audit_record(&record)
         .expect("project queued operation");
-    ApiState::new(index)
+    ApiState::new({
+        let index = index;
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    })
 }
 
 fn state_with_failed_operation() -> ApiState {
@@ -3810,7 +3899,12 @@ fn state_with_failed_operation() -> ApiState {
     index
         .project_audit_record(&record)
         .expect("project failed operation");
-    ApiState::new(index)
+    ApiState::new({
+        let index = index;
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    })
 }
 
 #[derive(Debug)]
@@ -3924,7 +4018,13 @@ fn foreign_test_state() -> (tempfile::TempDir, ApiState, String) {
     registry.register(Arc::new(TestForeignAdapter)).unwrap();
     (
         temp,
-        ApiState::new(index).with_foreign_formats(registry),
+        ApiState::new({
+            let index = index;
+            let catalog = remanence_state::projector::open(index.path()).unwrap();
+            drop(index);
+            catalog
+        })
+        .with_foreign_formats(registry),
         unit_id,
     )
 }
@@ -7039,8 +7139,9 @@ async fn drive_target_read_open_uses_virtual_world_actor_and_proves_bot_identity
         .prefix("remanence-api-drive-target-actor")
         .tempdir()
         .expect("temp dir");
-    let mut index =
-        CatalogIndex::open(temp.path().join("state.sqlite")).expect("open test catalog");
+    let mut index = remanence_state::projector::open(temp.path().join("state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open test catalog");
     project_pool(&mut index, "camera.copy-a");
     project_no_parity_tape(&mut index, "camera.copy-a", TAPE_UUID);
 
@@ -7089,8 +7190,14 @@ async fn drive_target_read_open_uses_virtual_world_actor_and_proves_bot_identity
         AtomicBool::new(false),
     )]));
 
-    let mut state = ApiState::new(index);
+    let mut state = ApiState::new({
+        let index = index;
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    });
     let owner_config = crate::write_owner::WriteOwnerConfig {
+        catalog: remanence_state::projector::open(state.index_path.as_ref()).unwrap(),
         index_path: state.index_path.as_ref().clone(),
         report,
         policy,
@@ -7362,7 +7469,12 @@ fn audit_query_uuid_filters_canonicalize_uppercase_and_unhyphenated_inputs() {
 
 #[tokio::test]
 async fn audit_service_streams_filtered_records() {
-    let state = ApiState::new(test_index());
+    let state = ApiState::new({
+        let index = test_index();
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    });
     let session_id = Uuid::new_v4();
     let mut audit = FileAuditLog::open(state.audit_dir.as_ref(), false).expect("open audit");
     for (current_session, event) in [
@@ -7507,7 +7619,12 @@ async fn daemon_reports_durable_operation_failure_detail() {
 
 #[tokio::test]
 async fn watch_streams_until_terminal_and_cancel_flips_token() {
-    let state = ApiState::new(test_index());
+    let state = ApiState::new({
+        let index = test_index();
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    });
     let operation_id = Uuid::from_u128(7);
     let handle = state.operations.register(operation_id, "reconcile_tape");
     let daemon = state.daemon_service();
@@ -7811,7 +7928,12 @@ fn drive_pool_close_parks_cartridge_and_follow_on_session_claims_it() {
 
 #[tokio::test]
 async fn drive_byte_accounting_uses_session_drive_uuid_for_shared_bay() {
-    let state = ApiState::new(test_index());
+    let state = ApiState::new({
+        let index = test_index();
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    });
     let shared_bay = 0x0101;
     let session_a = crate::write_owner::MountedSession {
         bay: shared_bay,
@@ -7886,8 +8008,15 @@ async fn append_finish_does_not_double_count() {
         .tempdir()
         .expect("tempdir");
     let index_path = temp.path().join("rem-state.sqlite");
-    let index = CatalogIndex::open(&index_path).expect("open catalog");
-    let mut state = ApiState::new(index);
+    let index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open catalog");
+    let mut state = ApiState::new({
+        let index = index;
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    });
     let session_id = Uuid::new_v4();
     let bay = 0x0101;
     let drive_uuid = Uuid::new_v4().as_bytes().to_vec();
@@ -7993,7 +8122,12 @@ async fn append_finish_does_not_double_count() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn overlap_consumer_failure_survives_ring_cancellation() {
-    let mut state = ApiState::new(test_index());
+    let mut state = ApiState::new({
+        let index = test_index();
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    });
     let session_id = Uuid::new_v4();
     let bay = 0x0102;
     let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
@@ -8093,7 +8227,12 @@ async fn overlap_consumer_failure_survives_ring_cancellation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn overlap_idempotent_replay_cancels_the_live_receive_and_returns_the_record() {
-    let mut state = ApiState::new(test_index());
+    let mut state = ApiState::new({
+        let index = test_index();
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    });
     let session_id = Uuid::new_v4();
     let bay = 0x0102;
     let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
@@ -8192,7 +8331,12 @@ async fn overlap_idempotent_replay_cancels_the_live_receive_and_returns_the_reco
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn overlap_success_response_waits_for_checkpointed_receipt() {
-    let mut state = ApiState::new(test_index());
+    let mut state = ApiState::new({
+        let index = test_index();
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    });
     let session_id = Uuid::new_v4();
     let bay = 0x0103;
     let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
@@ -8336,7 +8480,12 @@ async fn overlap_success_response_waits_for_checkpointed_receipt() {
 
 #[test]
 fn drive_byte_accounting_skips_unresolvable_drive_and_warns() {
-    let state = ApiState::new(test_index());
+    let state = ApiState::new({
+        let index = test_index();
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    });
     let warnings = capture_warnings(|| {
         state.record_drive_read_bytes(None, 512);
         state.record_drive_write_bytes(Some(&[]), 1024);
@@ -8666,7 +8815,9 @@ async fn catalog_enumerates_and_fetches_native_objects() {
 fn content_digest_lookup_rejects_ambiguous_or_malformed_keys() {
     let state = populated_state();
     let second_object_id = Uuid::from_u128(0x2222).to_string();
-    let mut index = CatalogIndex::open(state.index_path.as_ref()).expect("open test index");
+    let mut index = remanence_state::projector::open(state.index_path.as_ref())
+        .map(|catalog| catalog.write_handle())
+        .expect("open test index");
     index
         .upsert_native_object_projection(
             NativeObjectProjectionInput {
@@ -9286,7 +9437,13 @@ async fn foreign_unit_reports_unregistered_format_in_core_distribution() {
             created_at_utc: Some("2026-05-28T13:15:01Z".to_string()),
         })
         .expect("project foreign unit");
-    let service = ApiState::new(index).catalog_service();
+    let service = ApiState::new({
+        let index = index;
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    })
+    .catalog_service();
 
     let error = pb::catalog_server::Catalog::list_entries_in_unit(
         &service,
@@ -9310,7 +9467,13 @@ use crate::auth::{authorize_request, AuthPermission};
 /// Malformed timestamps are rejected at ingress, before spool or mount admission.
 #[tokio::test]
 async fn append_rejects_invalid_mtime_before_io() {
-    let service = ApiState::new(test_index()).write_session_service();
+    let service = ApiState::new({
+        let index = test_index();
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    })
+    .write_session_service();
     for invalid in ["", "-1", "1.", "1.2.3", "tomorrow"] {
         let mut start = append_start_message(Uuid::new_v4(), 4);
         let Some(pb::append_object_message::Payload::Start(ref mut fields)) = start.payload else {
@@ -9346,7 +9509,12 @@ async fn reconcile_operation_get_and_list_preserve_stored_status() {
         index.get_operation(&id.to_string()).unwrap().unwrap(),
     )
     .unwrap();
-    let state = ApiState::new(index);
+    let state = ApiState::new({
+        let index = index;
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    });
     let handle = state.operations.register(id, "reconcile_tape");
     assert!(expected.progress.is_empty());
     let service = state.daemon_service();
@@ -9405,7 +9573,12 @@ async fn verification_operation_progress_timestamps_and_terminal_filters() {
             )]),
         ))
         .unwrap();
-    let state = ApiState::new(index);
+    let state = ApiState::new({
+        let index = index;
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    });
     let handle = state.operations.register(id, "tape_verification");
     let service = state.daemon_service();
     let mut created = None;
@@ -9738,7 +9911,7 @@ async fn b9_overlap_checkpoint_claim_survives_catalog_and_later_checkpoint_failu
             if destination == "catalog_error" {
                 std::fs::rename(index_path.as_ref(), index_path.with_extension("held")).unwrap();
                 std::fs::create_dir(index_path.as_ref()).unwrap();
-                assert!(CatalogIndex::open_read_only(index_path.as_ref()).is_err());
+                assert!(remanence_state::CatalogReader::open(index_path.as_ref()).is_err());
             }
             let mut written = record.clone();
             written.append_commit_info.as_mut().unwrap().durability =
@@ -9883,7 +10056,9 @@ fn startup_fences_only_the_tape_below_its_projection_mark() {
     use remanence_state::authority::TapeAuthorityView;
     let dir = tempfile::tempdir().unwrap();
     let tapes = dir.path().join("tapes");
-    let mut index = CatalogIndex::open(dir.path().join("index.sqlite")).unwrap();
+    let mut index = remanence_state::projector::open(dir.path().join("index.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     for id in [[0x51; 16], [0x52; 16]] {
         let authority = remanence_state::authority::fixtures::AuthorityBuilder::new(&tapes, id)
             .build()
@@ -9928,7 +10103,9 @@ fn below_projection_fence_clears_with_audit_only_when_the_log_reaches_the_mark()
     let dir = tempfile::tempdir().unwrap();
     let tapes = dir.path().join("tapes");
     let audit = dir.path().join("audit");
-    let mut index = CatalogIndex::open(dir.path().join("index.sqlite")).unwrap();
+    let mut index = remanence_state::projector::open(dir.path().join("index.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let id = [0x53; 16];
     let authority = remanence_state::authority::fixtures::AuthorityBuilder::new(&tapes, id)
         .build()
@@ -10017,7 +10194,9 @@ fn below_projection_fence_clears_with_audit_only_when_the_log_reaches_the_mark()
     );
     // The automatic release projects like an operator's: a catalog rebuilt from
     // audit evidence alone finds no active fence for the tape.
-    let mut rebuilt = CatalogIndex::open(dir.path().join("rebuilt.sqlite")).unwrap();
+    let mut rebuilt = remanence_state::projector::open(dir.path().join("rebuilt.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     remanence_state::fence::reconcile(&mut rebuilt, &audit).unwrap();
     assert!(active_fences_for(&rebuilt, id).is_empty());
 }
@@ -10031,7 +10210,9 @@ fn only_below_projection_fences_clear_themselves() {
     let dir = tempfile::tempdir().unwrap();
     let tapes = dir.path().join("tapes");
     let audit = dir.path().join("audit");
-    let mut index = CatalogIndex::open(dir.path().join("index.sqlite")).unwrap();
+    let mut index = remanence_state::projector::open(dir.path().join("index.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let id = [0x54; 16];
     let authority = remanence_state::authority::fixtures::AuthorityBuilder::new(&tapes, id)
         .build()
@@ -10141,7 +10322,9 @@ fn below_projection_fence_survives_a_rebuilt_catalog_and_an_older_log() {
     let dir = tempfile::tempdir().unwrap();
     let tapes = dir.path().join("tapes");
     let audit = dir.path().join("audit");
-    let mut index = CatalogIndex::open(dir.path().join("index.sqlite")).unwrap();
+    let mut index = remanence_state::projector::open(dir.path().join("index.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let id = [0x55; 16];
     let (path, below, full) = two_group_log(&tapes, &mut index, id);
     let mark = index.projected_through_sequence(id).unwrap();
@@ -10155,7 +10338,9 @@ fn below_projection_fence_survives_a_rebuilt_catalog_and_an_older_log() {
 
     // The catalog is lost and rebuilt from audit evidence alone: the fence is
     // back, the projection mark is not.
-    let mut rebuilt = CatalogIndex::open(dir.path().join("rebuilt.sqlite")).unwrap();
+    let mut rebuilt = remanence_state::projector::open(dir.path().join("rebuilt.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     remanence_state::fence::reconcile(&mut rebuilt, &audit).unwrap();
     assert_eq!(rebuilt.projected_through_sequence(id).unwrap(), 0);
     replay_checkpoint_journal_projections(&mut rebuilt, &tapes).unwrap();
@@ -10201,7 +10386,9 @@ fn invalid_projection_mark_fences_only_its_tape_and_never_releases_itself() {
     use remanence_state::fence::TAPE_LOG_PROJECTION_MARK_INVALID;
     let dir = tempfile::tempdir().unwrap();
     let tapes = dir.path().join("tapes");
-    let mut index = CatalogIndex::open(dir.path().join("index.sqlite")).unwrap();
+    let mut index = remanence_state::projector::open(dir.path().join("index.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let (bad, good) = ([0x56; 16], [0x57; 16]);
     for id in [bad, good] {
         let authority = remanence_state::authority::fixtures::AuthorityBuilder::new(&tapes, id)
@@ -10240,7 +10427,9 @@ fn restored_log_that_fails_to_project_stays_fenced_and_startup_continues() {
     let dir = tempfile::tempdir().unwrap();
     let tapes = dir.path().join("tapes");
     let audit = dir.path().join("audit");
-    let mut index = CatalogIndex::open(dir.path().join("index.sqlite")).unwrap();
+    let mut index = remanence_state::projector::open(dir.path().join("index.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let id = [0x58; 16];
     let other = [0x59; 16];
     let (path, _, full) = two_group_log(&tapes, &mut index, id);
@@ -10286,7 +10475,9 @@ fn retired_tape_mark_does_not_fence_its_archived_log() {
     use remanence_state::authority::TapeAuthorityView;
     let dir = tempfile::tempdir().unwrap();
     let tapes = dir.path().join("tapes");
-    let mut index = CatalogIndex::open(dir.path().join("index.sqlite")).unwrap();
+    let mut index = remanence_state::projector::open(dir.path().join("index.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let id = [0x5a; 16];
     let authority = remanence_state::authority::fixtures::AuthorityBuilder::new(&tapes, id)
         .build()
@@ -10313,7 +10504,9 @@ fn retired_tape_mark_does_not_fence_its_archived_log() {
 fn startup_checkpoint_replay_leaves_fenced_journal_untouched() {
     let dir = tempfile::tempdir().unwrap();
     let checkpoints = dir.path().join("tapes");
-    let mut index = CatalogIndex::open(dir.path().join("index.sqlite")).unwrap();
+    let mut index = remanence_state::projector::open(dir.path().join("index.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let tape = [0x52; 16];
     let authority = remanence_state::authority::fixtures::AuthorityBuilder::new(&checkpoints, tape)
         .build()
@@ -10348,7 +10541,12 @@ async fn release_fence_rpc_and_live_admission() {
             evidence_json: None,
         })
         .unwrap();
-    let state = ApiState::new(index);
+    let state = ApiState::new({
+        let index = index;
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    });
     let daemon = state.daemon_service();
     let library = state.library_service();
     let request = |id: &str, ack: &str| {
@@ -10425,19 +10623,23 @@ async fn release_fence_rpc_and_live_admission() {
         0
     );
     let endpoint = remanence_state::DriveKey::new("LIB", 1);
-    let fence = state
-        .index_write()
-        .unwrap()
-        .record_tape_io_fence_at_endpoint(
-            remanence_state::TapeIoFenceInput {
-                tape_uuid: [0; 16],
-                barcode: None,
-                reason: "drive uncertainty".into(),
-                evidence_json: None,
-            },
-            Some(&endpoint),
-        )
-        .unwrap();
+    let fence = {
+        let mut index = state.catalog.write_handle();
+        if let Some(pool) = &state.drive_pool {
+            index.set_readiness_observer(pool.readiness_wake.clone());
+        }
+        index
+    }
+    .record_tape_io_fence_at_endpoint(
+        remanence_state::TapeIoFenceInput {
+            tape_uuid: [0; 16],
+            barcode: None,
+            reason: "drive uncertainty".into(),
+            evidence_json: None,
+        },
+        Some(&endpoint),
+    )
+    .unwrap();
     assert!(state
         .index()
         .unwrap()
@@ -10497,7 +10699,9 @@ fn startup_reports_each_fence_and_refuses_malformed_scope() {
 async fn catalog_caller_id_requires_pool_when_two_pools_hold_it() {
     let state = populated_state();
     let service = state.catalog_service();
-    let mut index = CatalogIndex::open(state.index_path.as_ref()).unwrap();
+    let mut index = remanence_state::projector::open(state.index_path.as_ref())
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     index
         .upsert_tape_pool_projection(remanence_state::TapePoolProjectionInput {
             pool_id: "copy-b".into(),
@@ -10617,8 +10821,9 @@ pub(crate) fn assert_fences_survive_empty_rebuild(
         "the caller must exercise its fence path"
     );
     let temp = tempfile::tempdir().unwrap();
-    let mut rebuilt =
-        remanence_state::CatalogIndex::open(temp.path().join("empty.sqlite")).unwrap();
+    let mut rebuilt = remanence_state::projector::open(temp.path().join("empty.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     rebuilt
         .rebuild_from_authoritative_sources(&records, &[])
         .unwrap();

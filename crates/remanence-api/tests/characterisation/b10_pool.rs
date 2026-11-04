@@ -7,7 +7,9 @@ const SECOND: [u8; 16] = [0x36; 16];
 /// Seat a second fresh cartridge in the same pool and model library.
 fn two_tapes(parity: bool) -> Harness {
     let fixture = Harness::new(parity);
-    let mut index = CatalogIndex::open(&fixture.config.index.sqlite_path).unwrap();
+    let mut index = remanence_state::projector::open(&fixture.config.index.sqlite_path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     index
         .upsert_tape_pool_projection(remanence_state::TapePoolProjectionInput {
             pool_id: "archive".into(),
@@ -303,7 +305,8 @@ async fn check_pool_closeout(fence: bool) {
             "pool open waits for the chosen tape"
         );
         if fence {
-            CatalogIndex::open(&fixture.config.index.sqlite_path)
+            remanence_state::projector::open(&fixture.config.index.sqlite_path)
+                .map(|catalog| catalog.write_handle())
                 .unwrap()
                 .record_tape_io_fence(remanence_state::TapeIoFenceInput {
                     tape_uuid: UUID,

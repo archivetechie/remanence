@@ -667,7 +667,13 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
                 .lock()
                 .map_err(|_| Status::internal("audit append lock poisoned"))?;
             remanence_state::fence::release(
-                &mut state.index_write()?,
+                &mut {
+                    let mut index = state.catalog.write_handle();
+                    if let Some(pool) = &state.drive_pool {
+                        index.set_readiness_observer(pool.readiness_wake.clone());
+                    }
+                    index
+                },
                 &state.audit_dir,
                 &request.quarantine_id,
                 &request.acknowledgment,
@@ -840,7 +846,13 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         crate::catalog_conversion::decode_uuid_bytes(&request.drive_uuid, "drive_uuid")?;
         validate_iso_date(request.purchase_date.as_str(), "purchase_date")?;
         validate_iso_date(request.warranty_until.as_str(), "warranty_until")?;
-        let mut index = self.state.index_write()?;
+        let mut index = {
+            let mut index = self.state.catalog.write_handle();
+            if let Some(pool) = &self.state.drive_pool {
+                index.set_readiness_observer(pool.readiness_wake.clone());
+            }
+            index
+        };
         let drive = index
             .get_drive_by_uuid(&request.drive_uuid)
             .map_err(crate::startup_media_readiness::status_from_state_error)?
@@ -898,7 +910,13 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         if request.reason.trim().is_empty() {
             return Err(Status::invalid_argument("reason must not be empty"));
         }
-        let mut index = self.state.index_write()?;
+        let mut index = {
+            let mut index = self.state.catalog.write_handle();
+            if let Some(pool) = &self.state.drive_pool {
+                index.set_readiness_observer(pool.readiness_wake.clone());
+            }
+            index
+        };
         let drive = index
             .get_drive_by_uuid(&request.drive_uuid)
             .map_err(crate::startup_media_readiness::status_from_state_error)?
@@ -953,7 +971,13 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         if request.reason.trim().is_empty() {
             return Err(Status::invalid_argument("reason must not be empty"));
         }
-        let mut index = self.state.index_write()?;
+        let mut index = {
+            let mut index = self.state.catalog.write_handle();
+            if let Some(pool) = &self.state.drive_pool {
+                index.set_readiness_observer(pool.readiness_wake.clone());
+            }
+            index
+        };
         let drive = index
             .get_drive_by_uuid(&request.drive_uuid)
             .map_err(crate::startup_media_readiness::status_from_state_error)?
@@ -1030,7 +1054,7 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
             crate::auth::authorize_request(&request, crate::auth::AuthPermission::Robotics)?;
         let request = request.into_inner();
         crate::catalog_conversion::decode_uuid_bytes(&request.drive_uuid, "drive_uuid")?;
-        let index = self.state.index_write()?;
+        let index = self.state.index()?;
         let drive = index
             .get_drive_by_uuid(&request.drive_uuid)
             .map_err(crate::startup_media_readiness::status_from_state_error)?
@@ -1102,7 +1126,13 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
             request.idempotency_key.as_ref(),
             "AckAlarm",
         )?;
-        let mut index = self.state.index_write()?;
+        let mut index = {
+            let mut index = self.state.catalog.write_handle();
+            if let Some(pool) = &self.state.drive_pool {
+                index.set_readiness_observer(pool.readiness_wake.clone());
+            }
+            index
+        };
         let alarm = index
             .ack_alarm(request.condition_key.as_str(), actor_label(&actor).as_str())
             .map_err(crate::startup_media_readiness::status_from_state_error)?
@@ -1388,11 +1418,18 @@ mod tests {
 
     fn test_index() -> CatalogIndex {
         let dir = std::env::temp_dir().join(format!("remanence-api-lib-{}", Uuid::new_v4()));
-        CatalogIndex::open(dir.join("state.sqlite")).expect("open test index")
+        remanence_state::projector::open(dir.join("state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open test index")
     }
 
     fn state_with_snapshot() -> ApiState {
-        let mut state = ApiState::new(test_index());
+        let mut state = ApiState::new({
+            let index = test_index();
+            let catalog = remanence_state::projector::open(index.path()).unwrap();
+            drop(index);
+            catalog
+        });
         state.default_library_serial = Some(Arc::new("DEC418146K_LL02".to_string()));
         state.library_snapshot = Some(Arc::new(std::sync::RwLock::new(Arc::new(
             crate::live_status::LibrarySnapshot {
@@ -1651,12 +1688,17 @@ mod tests {
 
     #[tokio::test]
     async fn list_libraries_empty_without_snapshot() {
-        let response = ApiState::new(test_index())
-            .library_service()
-            .list_libraries(Request::new(()))
-            .await
-            .expect("list libraries")
-            .into_inner();
+        let response = ApiState::new({
+            let index = test_index();
+            let catalog = remanence_state::projector::open(index.path()).unwrap();
+            drop(index);
+            catalog
+        })
+        .library_service()
+        .list_libraries(Request::new(()))
+        .await
+        .expect("list libraries")
+        .into_inner();
         assert!(response.libraries.is_empty());
     }
 
@@ -1766,7 +1808,12 @@ mod tests {
         );
         assert_ne!(first_drive_uuid, second_drive_uuid);
 
-        let mut state = ApiState::new(index);
+        let mut state = ApiState::new({
+            let index = index;
+            let catalog = remanence_state::projector::open(index.path()).unwrap();
+            drop(index);
+            catalog
+        });
         state.library_snapshot = Some(Arc::new(std::sync::RwLock::new(Arc::new(
             crate::live_status::LibrarySnapshot {
                 report: DiscoveryReport {
@@ -1883,13 +1930,18 @@ mod tests {
 
     #[tokio::test]
     async fn get_library_missing_snapshot_is_not_found() {
-        let err = ApiState::new(test_index())
-            .library_service()
-            .get_library(Request::new(pb::GetLibraryRequest {
-                library_uuid: vec![0u8; 16],
-            }))
-            .await
-            .expect_err("missing snapshot");
+        let err = ApiState::new({
+            let index = test_index();
+            let catalog = remanence_state::projector::open(index.path()).unwrap();
+            drop(index);
+            catalog
+        })
+        .library_service()
+        .get_library(Request::new(pb::GetLibraryRequest {
+            library_uuid: vec![0u8; 16],
+        }))
+        .await
+        .expect_err("missing snapshot");
         assert_eq!(err.code(), tonic::Code::NotFound);
     }
 
@@ -2314,11 +2366,16 @@ mod tests {
             .metadata_mut()
             .insert("x-remanence-role", "readonly".parse().unwrap());
 
-        let err = ApiState::new(index)
-            .library_service()
-            .poll_drive(request)
-            .await
-            .expect_err("readonly role must not poll drive health");
+        let err = ApiState::new({
+            let index = index;
+            let catalog = remanence_state::projector::open(index.path()).unwrap();
+            drop(index);
+            catalog
+        })
+        .library_service()
+        .poll_drive(request)
+        .await
+        .expect_err("readonly role must not poll drive health");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
@@ -2327,14 +2384,19 @@ mod tests {
         let mut index = test_index();
         observe_test_drive(&mut index, "DRV-POLL-DERIVED", "Derived", 0x0100);
 
-        let err = ApiState::new(index)
-            .library_service()
-            .poll_drive(Request::new(pb::PollDriveRequest {
-                drive: "DRV-POLL-DERIVED".to_string(),
-                allow_derived_identity: false,
-            }))
-            .await
-            .expect_err("derived identity must reject before drive pool lookup");
+        let err = ApiState::new({
+            let index = index;
+            let catalog = remanence_state::projector::open(index.path()).unwrap();
+            drop(index);
+            catalog
+        })
+        .library_service()
+        .poll_drive(Request::new(pb::PollDriveRequest {
+            drive: "DRV-POLL-DERIVED".to_string(),
+            allow_derived_identity: false,
+        }))
+        .await
+        .expect_err("derived identity must reject before drive pool lookup");
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         assert!(err.message().contains("Derived"));
     }
@@ -2344,30 +2406,40 @@ mod tests {
     /// reinstatement record cite.
     #[tokio::test]
     async fn retire_drive_rejects_empty_reason_before_lookup() {
-        let err = ApiState::new(test_index())
-            .library_service()
-            .retire_drive(Request::new(pb::RetireDriveRequest {
-                drive_uuid: Uuid::new_v4().as_bytes().to_vec(),
-                reason: "   ".to_string(),
-                allow_derived_identity: false,
-            }))
-            .await
-            .expect_err("an empty reason must reject");
+        let err = ApiState::new({
+            let index = test_index();
+            let catalog = remanence_state::projector::open(index.path()).unwrap();
+            drop(index);
+            catalog
+        })
+        .library_service()
+        .retire_drive(Request::new(pb::RetireDriveRequest {
+            drive_uuid: Uuid::new_v4().as_bytes().to_vec(),
+            reason: "   ".to_string(),
+            allow_derived_identity: false,
+        }))
+        .await
+        .expect_err("an empty reason must reject");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("reason"));
     }
 
     #[tokio::test]
     async fn reinstate_drive_rejects_empty_reason_before_lookup() {
-        let err = ApiState::new(test_index())
-            .library_service()
-            .reinstate_drive(Request::new(pb::ReinstateDriveRequest {
-                drive_uuid: Uuid::new_v4().as_bytes().to_vec(),
-                reason: String::new(),
-                allow_derived_identity: false,
-            }))
-            .await
-            .expect_err("an empty reason must reject");
+        let err = ApiState::new({
+            let index = test_index();
+            let catalog = remanence_state::projector::open(index.path()).unwrap();
+            drop(index);
+            catalog
+        })
+        .library_service()
+        .reinstate_drive(Request::new(pb::ReinstateDriveRequest {
+            drive_uuid: Uuid::new_v4().as_bytes().to_vec(),
+            reason: String::new(),
+            allow_derived_identity: false,
+        }))
+        .await
+        .expect_err("an empty reason must reject");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("reason"));
     }
@@ -2376,15 +2448,20 @@ mod tests {
     async fn retire_drive_rejects_derived_identity_without_opt_in() {
         let mut index = test_index();
         let drive_uuid = observe_test_drive(&mut index, "DRV-DERIVED", "Derived", 0x0100);
-        let err = ApiState::new(index)
-            .library_service()
-            .retire_drive(Request::new(pb::RetireDriveRequest {
-                drive_uuid,
-                reason: "removed from fleet".to_string(),
-                allow_derived_identity: false,
-            }))
-            .await
-            .expect_err("derived identity must reject without opt-in");
+        let err = ApiState::new({
+            let index = index;
+            let catalog = remanence_state::projector::open(index.path()).unwrap();
+            drop(index);
+            catalog
+        })
+        .library_service()
+        .retire_drive(Request::new(pb::RetireDriveRequest {
+            drive_uuid,
+            reason: "removed from fleet".to_string(),
+            allow_derived_identity: false,
+        }))
+        .await
+        .expect_err("derived identity must reject without opt-in");
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         assert!(err.message().contains("Derived"));
     }
@@ -2395,7 +2472,12 @@ mod tests {
         let drive_uuid = observe_test_drive(&mut index, "DRV-BUSY", "DvcidAndInquiry", 0x0101);
         let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
         let reservations = Arc::new(HashMap::from([(0x0101, AtomicBool::new(true))]));
-        let mut state = ApiState::new(index);
+        let mut state = ApiState::new({
+            let index = index;
+            let catalog = remanence_state::projector::open(index.path()).unwrap();
+            drop(index);
+            catalog
+        });
         state.drive_pool = Some(crate::write_owner::DrivePool::new_for_library(
             "DEC418146K_LL02",
             changer_tx,
@@ -2426,7 +2508,12 @@ mod tests {
             .clear_alarm("no-cln-cart:mainlib")
             .expect("clear alarm")
             .expect("cleared row");
-        let state = ApiState::new(index);
+        let state = ApiState::new({
+            let index = index;
+            let catalog = remanence_state::projector::open(index.path()).unwrap();
+            drop(index);
+            catalog
+        });
 
         let err = state
             .library_service()
@@ -2619,41 +2706,51 @@ mod tests {
         );
         state.drive_pool = Some(pool.clone());
         let operation_id = Uuid::from_u128(0x5eed);
-        state
-            .index_write()
-            .expect("open writable catalog")
-            .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+        ({
+            let mut index = state.catalog.write_handle();
+            if let Some(pool) = &state.drive_pool {
+                index.set_readiness_observer(pool.readiness_wake.clone());
+            }
+            Ok::<_, tonic::Status>(index)
+        })
+        .expect("open writable catalog")
+        .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+            operation_id,
+            run_id: None,
+            endpoint: crate::drive_pool::DriveKey::new("DEC418146K_LL02", 1),
+            changer_sg: None,
+            drive_sg: None,
+            drive_serial: Some("8031BDC7D1".to_string()),
+            barcode: Some("S30002L9".to_string()),
+            source_slot: Some(0x040a),
+            media_generation: Some(9),
+            phase: "session_open_short_probe".to_string(),
+            state: "becoming_ready".to_string(),
+            dirty_scope: Some("drive+tape".to_string()),
+            deadline_at_utc: None,
+            evidence_path: None,
+        })
+        .expect("record session-open readiness fence");
+        ({
+            let mut index = state.catalog.write_handle();
+            if let Some(pool) = &state.drive_pool {
+                index.set_readiness_observer(pool.readiness_wake.clone());
+            }
+            Ok::<_, tonic::Status>(index)
+        })
+        .expect("open writable catalog")
+        .record_media_readiness_transition(
+            crate::startup_media_readiness::media_readiness_initializing_load_transition(
                 operation_id,
-                run_id: None,
-                endpoint: crate::drive_pool::DriveKey::new("DEC418146K_LL02", 1),
-                changer_sg: None,
-                drive_sg: None,
-                drive_serial: Some("8031BDC7D1".to_string()),
-                barcode: Some("S30002L9".to_string()),
-                source_slot: Some(0x040a),
-                media_generation: Some(9),
-                phase: "session_open_short_probe".to_string(),
-                state: "becoming_ready".to_string(),
-                dirty_scope: Some("drive+tape".to_string()),
-                deadline_at_utc: None,
-                evidence_path: None,
-            })
-            .expect("record session-open readiness fence");
-        state
-            .index_write()
-            .expect("open writable catalog")
-            .record_media_readiness_transition(
-                crate::startup_media_readiness::media_readiness_initializing_load_transition(
-                    operation_id,
-                    &remanence_library::MediaReadiness::new(
-                        remanence_library::MediaReadinessKind::BecomingReady {
-                            ascq: 0x02,
-                            media_initializing: true,
-                        },
-                    ),
+                &remanence_library::MediaReadiness::new(
+                    remanence_library::MediaReadinessKind::BecomingReady {
+                        ascq: 0x02,
+                        media_initializing: true,
+                    },
                 ),
-            )
-            .expect("record the fence's last sense");
+            ),
+        )
+        .expect("record the fence's last sense");
         let _first_waiter = pool
             .reserve_drive(&crate::drive_pool::DriveKey::new("DEC418146K_LL02", 1))
             .expect("first waiter holds the fenced drive");
@@ -2906,26 +3003,30 @@ mod tests {
             Arc::new(HashMap::from([(1, AtomicBool::new(false))])),
         ));
         let id = Uuid::new_v4();
-        state
-            .index_write()
-            .unwrap()
-            .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
-                operation_id: id,
-                run_id: None,
-                endpoint: remanence_state::DriveKey::new("DEC418146K_LL02", 1),
-                changer_sg: None,
-                drive_sg: None,
-                drive_serial: Some("8031BDC7D1".into()),
-                barcode: Some("S30002L9".into()),
-                source_slot: Some(0x040a),
-                media_generation: Some(9),
-                phase: "session_open_short_probe".into(),
-                state: state_name.into(),
-                dirty_scope: Some("drive+tape".into()),
-                deadline_at_utc: None,
-                evidence_path: None,
-            })
-            .unwrap();
+        {
+            let mut index = state.catalog.write_handle();
+            if let Some(pool) = &state.drive_pool {
+                index.set_readiness_observer(pool.readiness_wake.clone());
+            }
+            index
+        }
+        .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+            operation_id: id,
+            run_id: None,
+            endpoint: remanence_state::DriveKey::new("DEC418146K_LL02", 1),
+            changer_sg: None,
+            drive_sg: None,
+            drive_serial: Some("8031BDC7D1".into()),
+            barcode: Some("S30002L9".into()),
+            source_slot: Some(0x040a),
+            media_generation: Some(9),
+            phase: "session_open_short_probe".into(),
+            state: state_name.into(),
+            dirty_scope: Some("drive+tape".into()),
+            deadline_at_utc: None,
+            evidence_path: None,
+        })
+        .unwrap();
         (state, id, rx)
     }
 
@@ -3052,19 +3153,23 @@ mod tests {
             .media_readiness_operation(id)
             .unwrap()
             .unwrap();
-        let fence = state
-            .index_write()
-            .unwrap()
-            .record_tape_io_fence_at_endpoint(
-                remanence_state::TapeIoFenceInput {
-                    tape_uuid: [0; 16],
-                    barcode: record.barcode,
-                    reason: "transfer_error".into(),
-                    evidence_json: None,
-                },
-                Some(&record.endpoint),
-            )
-            .unwrap();
+        let fence = {
+            let mut index = state.catalog.write_handle();
+            if let Some(pool) = &state.drive_pool {
+                index.set_readiness_observer(pool.readiness_wake.clone());
+            }
+            index
+        }
+        .record_tape_io_fence_at_endpoint(
+            remanence_state::TapeIoFenceInput {
+                tape_uuid: [0; 16],
+                barcode: record.barcode,
+                reason: "transfer_error".into(),
+                evidence_json: None,
+            },
+            Some(&record.endpoint),
+        )
+        .unwrap();
         crate::readiness_wait::spawn_auto_resume(state.clone());
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(rx.try_recv().is_err());
@@ -3547,18 +3652,22 @@ mod tests {
                 assert!(!task.is_finished());
                 let load = state.operations.register(id, "load_drive");
                 load.publish_state(pb::OperationState::Running, &[]);
-                state
-                    .index_write()
-                    .unwrap()
-                    .record_media_readiness_transition(
-                        crate::startup_media_readiness::startup_media_readiness_probe_transition(
-                            id,
-                            &remanence_library::MediaReadiness::new(
-                                remanence_library::MediaReadinessKind::Ready,
-                            ),
+                {
+                    let mut index = state.catalog.write_handle();
+                    if let Some(pool) = &state.drive_pool {
+                        index.set_readiness_observer(pool.readiness_wake.clone());
+                    }
+                    index
+                }
+                .record_media_readiness_transition(
+                    crate::startup_media_readiness::startup_media_readiness_probe_transition(
+                        id,
+                        &remanence_library::MediaReadiness::new(
+                            remanence_library::MediaReadinessKind::Ready,
                         ),
-                    )
-                    .unwrap();
+                    ),
+                )
+                .unwrap();
                 tokio::time::advance(std::time::Duration::from_secs(1)).await;
                 discovery_turn().await;
                 assert!(!task.is_finished());
@@ -3774,7 +3883,12 @@ mod tests {
     /// A daemon without drive actors creates no discovery task or catalog polling.
     #[test]
     fn auto_resume_without_drive_pool_does_not_spawn() {
-        crate::readiness_wait::spawn_auto_resume(ApiState::new(test_index()));
+        crate::readiness_wait::spawn_auto_resume(ApiState::new({
+            let index = test_index();
+            let catalog = remanence_state::projector::open(index.path()).unwrap();
+            drop(index);
+            catalog
+        }));
     }
 
     /// Idle discovery performs no short-interval scans, including after a pending fence clears.
@@ -3788,18 +3902,22 @@ mod tests {
         crate::readiness_wait::spawn_auto_resume(state.clone());
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         // An independent readiness probe clears the row while discovery retries its reservation.
-        state
-            .index_write()
-            .unwrap()
-            .record_media_readiness_transition(
-                crate::startup_media_readiness::startup_media_readiness_probe_transition(
-                    id,
-                    &remanence_library::MediaReadiness::new(
-                        remanence_library::MediaReadinessKind::Ready,
-                    ),
+        {
+            let mut index = state.catalog.write_handle();
+            if let Some(pool) = &state.drive_pool {
+                index.set_readiness_observer(pool.readiness_wake.clone());
+            }
+            index
+        }
+        .record_media_readiness_transition(
+            crate::startup_media_readiness::startup_media_readiness_probe_transition(
+                id,
+                &remanence_library::MediaReadiness::new(
+                    remanence_library::MediaReadinessKind::Ready,
                 ),
-            )
-            .unwrap();
+            ),
+        )
+        .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let scans = pool
             .readiness_wake

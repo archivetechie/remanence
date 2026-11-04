@@ -27,7 +27,12 @@ fn fixture(automatic: bool) -> Fixture {
     let (index, pool_config) = if automatic {
         let config =
             seed_automatic_after_replica_c(&index_path, tape_uuid, "OWN001L9", pool_id, BLOCK_SIZE);
-        (CatalogIndex::open(&index_path).unwrap(), config)
+        (
+            remanence_state::projector::open(&index_path)
+                .map(|catalog| catalog.write_handle())
+                .unwrap(),
+            config,
+        )
     } else {
         let pool_config = TapePoolConfig {
             scheme: None,
@@ -42,7 +47,9 @@ fn fixture(automatic: bool) -> Fixture {
             block_size_bytes: u64::from(BLOCK_SIZE),
             min_object_size_bytes: 0,
         };
-        let mut index = CatalogIndex::open(&index_path).expect("open catalog");
+        let mut index = remanence_state::projector::open(&index_path)
+            .map(|catalog| catalog.write_handle())
+            .expect("open catalog");
         index
             .upsert_tape_pool_projection(TapePoolProjectionInput {
                 pool_id: pool_id.to_string(),
@@ -77,7 +84,15 @@ fn fixture(automatic: bool) -> Fixture {
         (index, pool_config)
     };
 
-    let mut state = ApiState::new_with_pool_configs(index, [pool_config]);
+    let mut state = ApiState::new_with_pool_configs(
+        {
+            let index = index;
+            let catalog = remanence_state::projector::open(index.path()).unwrap();
+            drop(index);
+            catalog
+        },
+        [pool_config],
+    );
     state.default_library_serial = Some(Arc::new("LIB001".to_string()));
     let mut loaded = drive_bay(0x0101, true, Some("OWN001L9"));
     loaded.source_slot = None;
@@ -147,24 +162,34 @@ fn complete_model_tail(
         (AfterSeparationBc, AfterReplicaC),
     ] {
         let current = lease.advance_terminal_finalization(before, after).unwrap();
-        state
-            .index_write()
-            .unwrap()
-            .project_terminal_finalization(remanence_state::TerminalFinalizationProjectionInput {
-                tape_uuid: request.tape_uuid,
-                trigger: current.trigger,
-                operation_id: Some(request.candidate_operation_id),
-                progress: current.progress,
-                edition_digest: current.edition_digest,
-                layout_digest: current.layout.layout_digest,
-                outcome: remanence_state::TerminalFinalizationOutcome::InProgress,
-                updated_at_utc: None,
-            })
-            .unwrap();
+        {
+            let mut index = state.catalog.write_handle();
+            if let Some(pool) = &state.drive_pool {
+                index.set_readiness_observer(pool.readiness_wake.clone());
+            }
+            index
+        }
+        .project_terminal_finalization(remanence_state::TerminalFinalizationProjectionInput {
+            tape_uuid: request.tape_uuid,
+            trigger: current.trigger,
+            operation_id: Some(request.candidate_operation_id),
+            progress: current.progress,
+            edition_digest: current.edition_digest,
+            layout_digest: current.layout.layout_digest,
+            outcome: remanence_state::TerminalFinalizationOutcome::InProgress,
+            updated_at_utc: None,
+        })
+        .unwrap();
     }
     drop(lease);
     crate::write_owner::preflight_manual_finalize_tape(
-        &mut state.index_write().unwrap(),
+        &mut {
+            let mut index = state.catalog.write_handle();
+            if let Some(pool) = &state.drive_pool {
+                index.set_readiness_observer(pool.readiness_wake.clone());
+            }
+            index
+        },
         crate::write_owner::ManualFinalizePreflightConfig {
             mounted_endpoint: None,
             checkpoint_journal_dir: state.checkpoint_journal_dir.as_ref(),

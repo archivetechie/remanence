@@ -886,7 +886,7 @@ mod tests {
         FileRowsKind, FileRowsReport, ParityConfig, SidecarEpochDirectoryEntry, TapeFileEntry,
         TapeFileKind, TerminalTailComponentKind,
     };
-    use remanence_state::{CatalogIndex, ProvisionTapeInput, TapePoolProjectionInput};
+    use remanence_state::{ProvisionTapeInput, TapePoolProjectionInput};
 
     fn plan_value(evidence: &Path) -> Value {
         json!({
@@ -1245,7 +1245,9 @@ mod tests {
         value["cut"] = Value::String("before_assignment_reread".to_string());
         let plan = TerminalFaultPlan::parse(&value).expect("assignment plan");
         let tape_uuid = [0x71; 16];
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("index");
+        let mut index = remanence_state::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("index");
         index
             .provision_tape(ProvisionTapeInput {
                 tape_uuid,

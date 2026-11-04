@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 /// Layer 4 state-management failures.
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
+    /// A callback attempted to acquire the catalog already held by this thread.
+    #[error("catalog method reentered on the same thread")]
+    CatalogReentered,
     /// A long finalization owns this tape; clients can watch the named operation.
     #[error("Busy: tape is finalizing; watch operation {operation_id}")]
     TapeBusy {

@@ -476,7 +476,7 @@ pub fn reconcile_checkpoint_journal_projections(state: &mut StateHandle) -> Resu
     let audit_dir = state.paths().audit_dir.clone();
     let audit_append_lock = Arc::new(std::sync::Mutex::new(()));
     let replay = replay_checkpoint_journal_projections_with_audit(
-        state.catalog_index(),
+        &mut state.write_handle(),
         checkpoint_dir.as_path(),
         audit_dir.as_path(),
         &audit_append_lock,

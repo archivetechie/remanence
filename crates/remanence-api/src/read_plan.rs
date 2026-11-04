@@ -1046,7 +1046,9 @@ mod tests {
             .prefix("rem-api-read-plan")
             .tempdir()
             .expect("tempdir");
-        let index = CatalogIndex::open(dir.path().join("index.sqlite")).expect("open index");
+        let index = remanence_state::projector::open(dir.path().join("index.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open index");
         let store =
             CalibrationControlStore::open(dir.path().join("calibration")).expect("open store");
         World {
@@ -2269,7 +2271,9 @@ mod tests {
             .prefix("rem-api-read-plan-svc")
             .tempdir()
             .expect("tempdir");
-        let index = CatalogIndex::open(dir.path().join("index.sqlite")).expect("open index");
+        let index = remanence_state::projector::open(dir.path().join("index.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open index");
         // ApiState::new opens the calibration store beside the index;
         // seed through a handle onto the same directory.
         let store =
@@ -2281,7 +2285,8 @@ mod tests {
         };
         let generation = seed_calibrated(&mut world);
         let state = ApiState::new(
-            CatalogIndex::open(world._dir.path().join("index.sqlite")).expect("reopen index"),
+            remanence_state::projector::open(world._dir.path().join("index.sqlite"))
+                .expect("reopen index"),
         );
         let service = state.read_plan_service();
 

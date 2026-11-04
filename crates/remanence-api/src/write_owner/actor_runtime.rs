@@ -39,6 +39,7 @@ use remanence_state::TapePoolConfig;
 
 #[derive(Clone)]
 pub(crate) struct WriteOwnerConfig {
+    pub catalog: remanence_state::ProjectionClient,
     pub index_path: PathBuf,
     pub report: DiscoveryReport,
     pub policy: StaticAllowlist,
@@ -170,7 +171,7 @@ pub(super) fn changer_loop(
     cfg: WriteOwnerConfig,
     mut rx: mpsc::Receiver<ChangerCommand>,
 ) {
-    let mut index = match CatalogIndex::open(cfg.index_path.as_path()) {
+    let mut index = match Ok::<_, remanence_state::StateError>(cfg.catalog.write_handle()) {
         Ok(index) => index,
         Err(err) => {
             drain_failed_changer_commands(
@@ -293,7 +294,7 @@ pub(super) fn finish_robotics_and_release(
 
 pub(super) fn refresh_actor_changer(changer: &mut ChangerHandle, cfg: &WriteOwnerConfig) {
     if changer.refresh().is_ok() {
-        match CatalogIndex::open(cfg.index_path.as_path()) {
+        match Ok::<_, remanence_state::StateError>(cfg.catalog.write_handle()) {
             Ok(mut index) => {
                 if let Err(err) = observe_refreshed_library(&mut index, cfg, changer.library()) {
                     tracing::warn!("failed to observe refreshed drive catalog: {err}");
@@ -340,7 +341,7 @@ pub(super) fn drive_loop(
     mut rx: mpsc::Receiver<DriveCommand>,
 ) -> Option<MountedFinish> {
     drive.set_command_deadline(cfg.lifecycle.as_ref().map(|l| l.shutdown_deadline.clone()));
-    let mut index = match CatalogIndex::open(cfg.index_path.as_path()) {
+    let mut index = match Ok::<_, remanence_state::StateError>(cfg.catalog.write_handle()) {
         Ok(index) => index,
         Err(err) => {
             drain_failed_drive_commands(rx, format!("open catalog index: {err}"));

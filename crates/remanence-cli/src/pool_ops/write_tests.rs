@@ -43,9 +43,9 @@ tape_catalog_dir = "{0}/cache"
         root.path().display()
     );
     std::fs::write(&config_path, text).unwrap();
-    let mut state = StateHandle::open_from_config_file(&config_path).unwrap();
+    let state = StateHandle::open_from_config_file(&config_path).unwrap();
     state
-        .catalog_index()
+        .write_handle()
         .provision_tape(remanence_state::ProvisionTapeInput {
             tape_uuid: TAPE,
             voltag: "POOL001L9".into(),
@@ -55,7 +55,7 @@ tape_catalog_dir = "{0}/cache"
         })
         .unwrap();
     state
-        .catalog_index()
+        .write_handle()
         .project_tape_pool_membership(TAPE, "default")
         .unwrap();
     drop(state);
@@ -162,9 +162,9 @@ fn selected_library_actor_preserves_encryption_locators_and_replay_before_load()
         assert_eq!(locator["tape_uuid"], bytes_to_hex(&TAPE));
         assert!(locator["tape_file_number"].is_string());
         assert!(locator["first_body_lba"].is_string());
-        let mut state = StateHandle::open_from_config_file(&config_path).unwrap();
+        let state = StateHandle::open_from_config_file(&config_path).unwrap();
         let native = state
-            .catalog_index()
+            .catalog()
             .get_native_object_by_pool_and_caller_object_id("default", name)
             .unwrap()
             .unwrap();
@@ -362,7 +362,7 @@ fn archive_write_leaves_open_daemon_session_for_daemon_recovery_without_fencing(
         })
         .unwrap();
     state.replay_audit_projection().unwrap();
-    let before = state.catalog_index().non_terminal_sessions().unwrap();
+    let before = state.catalog().non_terminal_sessions().unwrap();
     assert_eq!(
         before[0].drive_key,
         Some(remanence_library::DriveKey::new(LIBRARY, BAY))
@@ -378,13 +378,10 @@ fn archive_write_leaves_open_daemon_session_for_daemon_recovery_without_fencing(
         )),
         "{text}"
     );
-    let mut state = StateHandle::open_from_config_file(&fixture.config_path).unwrap();
-    assert_eq!(
-        state.catalog_index().non_terminal_sessions().unwrap(),
-        before
-    );
+    let state = StateHandle::open_from_config_file(&fixture.config_path).unwrap();
+    assert_eq!(state.catalog().non_terminal_sessions().unwrap(), before);
     assert!(!state
-        .catalog_index()
+        .catalog()
         .tape_io_is_fenced(
             Some(&TAPE),
             None,
@@ -413,9 +410,9 @@ fn archive_write_prints_committed_locator_when_allow_fails() {
     let (code, out, err) = fixture.run(&args, true);
     assert_eq!(code, ExitCode::from(1), "{}", String::from_utf8_lossy(&err));
     let locator: serde_json::Value = serde_json::from_slice(&out).unwrap();
-    let mut state = StateHandle::open_from_config_file(&fixture.config_path).unwrap();
+    let state = StateHandle::open_from_config_file(&fixture.config_path).unwrap();
     let object = state
-        .catalog_index()
+        .catalog()
         .get_native_object(locator["object_id"].as_str().unwrap())
         .unwrap()
         .unwrap();

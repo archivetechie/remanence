@@ -1,4 +1,4 @@
-<!-- code-anchor: crates/remanence-format-driver/src/lib.rs crates/remanence-cli/src/lib.rs crates/remanence-daemon/src/entry.rs crates/remanence-api/src/catalog_conversion.rs crates/remanence-state/src/index.rs @ 8238b7b3 -->
+<!-- code-anchor: crates/remanence-format-driver/src/lib.rs crates/remanence-cli/src/lib.rs crates/remanence-daemon/src/entry.rs crates/remanence-api/src/catalog_conversion.rs crates/remanence-state/src/projector/index.rs @ 8238b7b3 -->
 # Foreign-format adapters
 
 This page is for someone building a Remanence distribution that reads an

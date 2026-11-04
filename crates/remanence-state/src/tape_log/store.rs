@@ -297,7 +297,7 @@ impl Store {
     }
     fn projection_floor(&self) -> Result<u64, StoreError> {
         match &self.projection_path {
-            Some(path) => crate::CatalogIndex::open_read_only(path)
+            Some(path) => crate::CatalogReader::open(path)
                 .and_then(|index| index.projected_through_sequence(self.header.tape_uuid))
                 .map_err(|e| StoreError::Io(io::Error::other(e))),
             None => Ok(0), // explicit low-level fixture/inspection store

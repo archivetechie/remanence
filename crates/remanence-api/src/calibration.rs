@@ -623,7 +623,9 @@ mod tests {
             .expect("tempdir");
         let store =
             CalibrationControlStore::open(dir.path().join("calibration")).expect("open store");
-        let index = CatalogIndex::open(dir.path().join("index.sqlite")).expect("open index");
+        let index = remanence_state::projector::open(dir.path().join("index.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open index");
         World {
             _dir: dir,
             store,

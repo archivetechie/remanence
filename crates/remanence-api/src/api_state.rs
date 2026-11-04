@@ -8,9 +8,7 @@ use std::time::Duration;
 
 use ciborium::value::Value as CborValue;
 use remanence_format_driver::ForeignFormatRegistry;
-use remanence_state::{
-    AuditActor, AuditEvent, CalibrationControlStore, CatalogIndex, RemConfig, TapePoolConfig,
-};
+use remanence_state::{AuditActor, AuditEvent, CalibrationControlStore, RemConfig, TapePoolConfig};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tonic::Status;
@@ -43,6 +41,7 @@ use crate::write_session_ingress::WriteSessionApi;
 /// Shared state for the initial Layer 5 service implementations.
 #[derive(Clone)]
 pub struct ApiState {
+    pub(crate) catalog: remanence_state::ProjectionClient,
     pub(crate) index_path: Arc<PathBuf>,
     pub(crate) audit_dir: Arc<PathBuf>,
     pub(crate) audit_fsync: bool,
@@ -148,14 +147,18 @@ impl ApiState {
     }
 
     /// Build service state around an already-opened rebuildable catalog index.
-    pub fn new(index: CatalogIndex) -> Self {
-        Self::new_with_pool_configs(index, Vec::new())
+    pub fn new(catalog: remanence_state::ProjectionClient) -> Self {
+        Self::new_with_pool_configs(catalog, Vec::new())
     }
 
     /// Build service state with operator-resolved tape-pool selection config.
     /// Call once at daemon startup under state ownership, before admitting any
     /// sessions: prior sessions on configured library bays are marked lost.
-    pub fn new_with_config(mut index: CatalogIndex, config: &RemConfig) -> Result<Self, Status> {
+    pub fn new_with_config(
+        catalog: remanence_state::ProjectionClient,
+        config: &RemConfig,
+    ) -> Result<Self, Status> {
+        let mut index = catalog.write_handle();
         remanence_state::authority_layout::validate_owned_config_layout(config)
             .map_err(status_from_state_error)?;
         remanence_state::state::recover_library_sessions_after_restart(&mut index, config)
@@ -170,7 +173,7 @@ impl ApiState {
             config.audit.dir.as_path(),
             &audit_append_lock,
         )?;
-        let index_path = index.path().to_path_buf();
+        let index_path = catalog.path().to_path_buf();
         let pool_configs = config
             .tape_pools
             .clone()
@@ -179,6 +182,7 @@ impl ApiState {
             .collect();
         let calibration_store = open_calibration_store_for_config(config)?;
         let mut state = Self::new_with_pool_configs_inner(
+            catalog,
             index_path,
             pool_configs,
             // Configured-or-daemon-operated set (never raw config.drives —
@@ -209,10 +213,10 @@ impl ApiState {
 
     /// Build service state with explicit tape-pool selection config.
     pub fn new_with_pool_configs(
-        index: CatalogIndex,
+        catalog: remanence_state::ProjectionClient,
         pool_configs: impl IntoIterator<Item = TapePoolConfig>,
     ) -> Self {
-        let index_path = index.path().to_path_buf();
+        let index_path = catalog.path().to_path_buf();
         let pool_configs = pool_configs
             .into_iter()
             .map(|pool| (pool.id.trim().to_string(), pool))
@@ -222,6 +226,7 @@ impl ApiState {
             CalibrationControlStore::open(default_calibration_dir_for_index(index_path.as_path()))
                 .expect("open calibration-control store beside the index");
         Self::new_with_pool_configs_inner(
+            catalog,
             index_path,
             pool_configs,
             HashSet::new(),
@@ -235,6 +240,7 @@ impl ApiState {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_pool_configs_inner(
+        catalog: remanence_state::ProjectionClient,
         index_path: PathBuf,
         pool_configs: HashMap<String, TapePoolConfig>,
         managed_library_serials: HashSet<String>,
@@ -247,6 +253,7 @@ impl ApiState {
         let daemon_epoch = Uuid::new_v4().as_u128() as u64;
         let checkpoint_journal_dir = default_checkpoint_journal_dir_for_index(index_path.as_path());
         Self {
+            catalog,
             index_path: Arc::new(index_path),
             audit_dir: Arc::new(audit_dir),
             audit_fsync,
@@ -304,7 +311,7 @@ impl ApiState {
     /// Build service state with a live changer/drive actor pool.
     /// The caller retains state ownership from startup through service shutdown.
     pub fn with_drive_pool(
-        index: CatalogIndex,
+        catalog: remanence_state::ProjectionClient,
         config: &RemConfig,
         report: remanence_library::DiscoveryReport,
         policy: remanence_library::StaticAllowlist,
@@ -312,7 +319,7 @@ impl ApiState {
         spool_budget_bytes: u64,
     ) -> Result<Self, Status> {
         Self::with_drive_pool_opener(
-            index,
+            catalog,
             config,
             report,
             policy,
@@ -326,7 +333,7 @@ impl ApiState {
     /// All discovery, admission, reconciliation, and actor setup remain shared.
     /// The caller holds state ownership and admits no sessions before construction.
     pub fn with_drive_pool_opener(
-        mut index: CatalogIndex,
+        catalog: remanence_state::ProjectionClient,
         config: &RemConfig,
         report: remanence_library::DiscoveryReport,
         policy: remanence_library::StaticAllowlist,
@@ -338,7 +345,8 @@ impl ApiState {
         )
             -> Result<remanence_library::LibraryHandle, remanence_library::OpenError>,
     ) -> Result<Self, Status> {
-        let index_path = index.path().to_path_buf();
+        let mut index = catalog.write_handle();
+        let index_path = catalog.path().to_path_buf();
         // The daemon retains state ownership across this constructor and serve.
         // Recover its predecessor before actors or startup tasks can admit work.
         remanence_state::authority_layout::validate_owned_config_layout(config)
@@ -445,6 +453,7 @@ impl ApiState {
             .map_err(Status::invalid_argument)?;
         let calibration_store = open_calibration_store_for_config(config)?;
         let base_cfg = crate::write_owner::WriteOwnerConfig {
+            catalog: catalog.clone(),
             index_path: index_path.clone(),
             report: report.clone(),
             policy,
@@ -501,6 +510,7 @@ impl ApiState {
             drive_pool_lifecycle,
         );
         let mut state = Self::new_with_pool_configs_inner(
+            catalog,
             index_path.clone(),
             pool_configs,
             // Same rule as the write_owner cfg above: configured-or-daemon-
@@ -541,7 +551,7 @@ impl ApiState {
         crate::readiness_wait::spawn_auto_resume(state.clone());
         crate::mount::spawn_startup_terminal_recoveries(state.clone());
         spawn_drive_collection_workers(
-            index_path,
+            state.catalog.clone(),
             report,
             config,
             drive_pool,
@@ -643,18 +653,9 @@ impl ApiState {
         }
     }
 
-    pub(crate) fn index(&self) -> Result<CatalogIndex, Status> {
-        CatalogIndex::open_read_only(self.index_path.as_ref())
+    pub(crate) fn index(&self) -> Result<remanence_state::CatalogReader, Status> {
+        remanence_state::CatalogReader::open(self.index_path.as_ref())
             .map_err(|err| Status::internal(err.to_string()))
-    }
-
-    pub(crate) fn index_write(&self) -> Result<CatalogIndex, Status> {
-        let mut index = CatalogIndex::open(self.index_path.as_ref())
-            .map_err(|err| Status::internal(err.to_string()))?;
-        if let Some(pool) = &self.drive_pool {
-            index.set_readiness_observer(pool.readiness_wake.clone());
-        }
-        Ok(index)
     }
 
     /// Current inventory snapshot. S6b republishes into the shared cell.
@@ -1193,7 +1194,13 @@ impl ApiState {
         config: &RemConfig,
         report: &remanence_library::DiscoveryReport,
     ) -> Result<(), Status> {
-        let mut index = self.index_write()?;
+        let mut index = {
+            let mut index = self.catalog.write_handle();
+            if let Some(pool) = &self.drive_pool {
+                index.set_readiness_observer(pool.readiness_wake.clone());
+            }
+            index
+        };
         observe_drive_catalog_from_libraries(
             &mut index,
             report.libraries.iter(),
@@ -1205,7 +1212,13 @@ impl ApiState {
         &self,
         report: &remanence_library::DiscoveryReport,
     ) -> Result<(), Status> {
-        let mut index = self.index_write()?;
+        let mut index = {
+            let mut index = self.catalog.write_handle();
+            if let Some(pool) = &self.drive_pool {
+                index.set_readiness_observer(pool.readiness_wake.clone());
+            }
+            index
+        };
         let mut reconciled = 0u64;
         for library in &report.libraries {
             reconciled = reconciled.saturating_add(
@@ -1228,8 +1241,7 @@ impl ApiState {
         tape_uuid: &[u8; 16],
         idempotency_key: Option<Uuid>,
     ) -> Result<(), Status> {
-        let mut index = CatalogIndex::open(self.index_path.as_ref())
-            .map_err(|err| Status::internal(err.to_string()))?;
+        let mut index = self.catalog.write_handle();
         let mut detail = BTreeMap::new();
         detail.insert(
             "tape_uuid".to_string(),
@@ -1261,8 +1273,7 @@ impl ApiState {
         library_serial: &str,
         mut detail: BTreeMap<String, CborValue>,
     ) -> Result<(), Status> {
-        let mut index = CatalogIndex::open(self.index_path.as_ref())
-            .map_err(|err| Status::internal(err.to_string()))?;
+        let mut index = self.catalog.write_handle();
         detail.insert(
             "library_serial".to_string(),
             CborValue::Text(library_serial.to_string()),
@@ -1292,8 +1303,7 @@ impl ApiState {
         idempotency_key: Option<Uuid>,
         force: bool,
     ) -> Result<(), Status> {
-        let mut index = CatalogIndex::open(self.index_path.as_ref())
-            .map_err(|err| Status::internal(err.to_string()))?;
+        let mut index = self.catalog.write_handle();
         let mut detail = BTreeMap::new();
         detail.insert("force".to_string(), CborValue::Bool(force));
         append_operation_audit(
@@ -1320,8 +1330,7 @@ impl ApiState {
         operation_kind: &str,
         error_summary: &str,
     ) -> Result<(), Status> {
-        let mut index = CatalogIndex::open(self.index_path.as_ref())
-            .map_err(|err| Status::internal(err.to_string()))?;
+        let mut index = self.catalog.write_handle();
         let mut detail = BTreeMap::new();
         detail.insert(
             "error_summary".to_string(),
@@ -1350,8 +1359,7 @@ impl ApiState {
         actor: AuditActor,
         condition_key: &str,
     ) -> Result<(), Status> {
-        let mut index = CatalogIndex::open(self.index_path.as_ref())
-            .map_err(|err| Status::internal(err.to_string()))?;
+        let mut index = self.catalog.write_handle();
         append_operation_audit(
             &mut index,
             self.audit_dir.as_ref(),
@@ -1377,8 +1385,7 @@ impl ApiState {
         drive_uuid: &[u8],
         detail: BTreeMap<String, CborValue>,
     ) -> Result<(), Status> {
-        let mut index = CatalogIndex::open(self.index_path.as_ref())
-            .map_err(|err| Status::internal(err.to_string()))?;
+        let mut index = self.catalog.write_handle();
         append_operation_audit(
             &mut index,
             self.audit_dir.as_ref(),

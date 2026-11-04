@@ -251,7 +251,8 @@ fn automatic_terminal_preflight_accepts_empty_fresh_authority() {
         .prefix("remanence-empty-automatic-preflight")
         .tempdir()
         .expect("create automatic preflight tempdir");
-    let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite"))
+    let mut index = remanence_state::projector::open(temp.path().join("rem-state.sqlite"))
+        .map(|catalog| catalog.write_handle())
         .expect("open automatic preflight catalog");
     let selected = SelectedTape {
         standalone_endpoint: None,
@@ -665,7 +666,9 @@ fn terminal_authority_fixture(receipt_case: Option<usize>) {
         .begin_terminal_finalization(&intent)
         .expect("publish terminal intent");
 
-    let mut index = CatalogIndex::open(temp.path().join("state.sqlite")).expect("open catalog");
+    let mut index = remanence_state::projector::open(temp.path().join("state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open catalog");
     index
         .provision_tape(ProvisionTapeInput {
             tape_uuid: TAPE_UUID,
@@ -1751,8 +1754,9 @@ fn abort_reason_reaches_the_session_audit_record_only_when_given() {
         .prefix("remanence-abort-reason-audit-")
         .tempdir()
         .expect("tempdir");
-    let mut index =
-        CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open test index");
+    let mut index = remanence_state::projector::open(temp.path().join("rem-state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open test index");
     let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
         "LIB-ABORT-REASON",
         0x0100,
@@ -1822,8 +1826,9 @@ fn session_open_readiness_fence_records_operation_and_guidance() {
         .prefix("remanence-session-open-readiness-")
         .tempdir()
         .expect("tempdir");
-    let mut index =
-        CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open test index");
+    let mut index = remanence_state::projector::open(temp.path().join("rem-state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open test index");
     let ctx = SessionOpenReadinessContext {
         action: "open write session",
         bay: 0x0001,
@@ -1880,8 +1885,9 @@ fn session_open_refuses_active_tape_io_fence_until_operator_release() {
         .prefix("remanence-session-open-tape-io-fence-")
         .tempdir()
         .expect("tempdir");
-    let mut index =
-        CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open test index");
+    let mut index = remanence_state::projector::open(temp.path().join("rem-state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open test index");
     let tape_uuid = [0x44; 16];
     let fence = index
         .record_tape_io_fence(remanence_state::TapeIoFenceInput {
@@ -2114,7 +2120,9 @@ async fn daemon_rejects_corrupt_checkpoint_authority_before_position_or_config_c
         .tempdir()
         .expect("tempdir");
     let index_path = temp.path().join("rem-state.sqlite");
-    let index = CatalogIndex::open(&index_path).expect("open test index");
+    let index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open test index");
     drop(index);
 
     let tape_uuid = [0x47; 16];
@@ -2235,7 +2243,9 @@ async fn bootstrap_projection_never_authorizes_writing_physically_blank_media() 
             .tempdir()
             .expect("tempdir");
         let index_path = temp.path().join("rem-state.sqlite");
-        let mut index = CatalogIndex::open(&index_path).expect("open test index");
+        let mut index = remanence_state::projector::open(&index_path)
+            .map(|catalog| catalog.write_handle())
+            .expect("open test index");
         index
             .provision_tape(ProvisionTapeInput {
                 tape_uuid,
@@ -2383,7 +2393,11 @@ async fn daemon_checkpoint_lease_contention_precedes_conditional_load_for_no_par
         .tempdir()
         .expect("tempdir");
     let index_path = temp.path().join("rem-state.sqlite");
-    drop(CatalogIndex::open(&index_path).expect("open test index"));
+    drop(
+        remanence_state::projector::open(&index_path)
+            .map(|catalog| catalog.write_handle())
+            .expect("open test index"),
+    );
     let tape_uuid = [0x48; 16];
     let mut world = VirtualWorld::single_drive(
         "LIB-CHECKPOINT-LEASE",
@@ -2495,7 +2509,9 @@ fn fresh_parity_bootstrap_short_completion_fences_without_journal_visibility() {
         .tempdir()
         .expect("tempdir");
     let index_path = temp.path().join("rem-state.sqlite");
-    let mut index = CatalogIndex::open(&index_path).expect("open test index");
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open test index");
     let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
         "LIB-FRESH-PARITY-FENCE",
         0x0100,
@@ -2646,7 +2662,9 @@ fn first_parity_raw_write_failure_persists_and_audits_partial_fence() {
         .tempdir()
         .expect("tempdir");
     let index_path = temp.path().join("rem-state.sqlite");
-    let mut index = CatalogIndex::open(&index_path).expect("open test index");
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open test index");
     let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
         "LIB-PARITY-FENCE",
         0x0100,
@@ -2799,7 +2817,9 @@ async fn partial_epoch_checkpoint_projects_replays_and_first_post_checkpoint_sho
         parity_blocks_per_stripe: 1,
         stripes_per_neighborhood: 1,
     };
-    let mut index = CatalogIndex::open(&index_path).expect("open catalog");
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open catalog");
     index
         .upsert_tape_pool_projection(TapePoolProjectionInput {
             pool_id: POOL_ID.to_string(),
@@ -2953,7 +2973,9 @@ async fn partial_epoch_checkpoint_projects_replays_and_first_post_checkpoint_sho
         .expect("open parity actor session");
     let session_id = Uuid::from_slice(&session.session_id).expect("session UUID");
 
-    let bootstrap_index = CatalogIndex::open(&index_path).expect("open bootstrap projection");
+    let bootstrap_index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open bootstrap projection");
     let bootstrap_files = bootstrap_index
         .list_tape_files(&tape_uuid)
         .expect("list freshly projected BOT bootstrap");
@@ -3052,7 +3074,9 @@ async fn partial_epoch_checkpoint_projects_replays_and_first_post_checkpoint_sho
         record.object_tape_file_bundles[0].highest_protected_ordinal,
         0
     );
-    let mut replay_index = CatalogIndex::open(&index_path).expect("open replay projection");
+    let mut replay_index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open replay projection");
     replay_index
         .project_tape_log(&checkpoint_journal.freeze().unwrap())
         .expect("idempotently replay the durable partial-epoch checkpoint into SQLite");
@@ -3116,7 +3140,8 @@ async fn partial_epoch_checkpoint_projects_replays_and_first_post_checkpoint_sho
     .expect_err("the failed raw append must poison the actor session");
     assert_eq!(third.code(), tonic::Code::FailedPrecondition);
 
-    let read_only = CatalogIndex::open_read_only(&index_path).expect("open catalog projection");
+    let read_only =
+        remanence_state::CatalogReader::open(&index_path).expect("open catalog projection");
     assert!(read_only
         .get_native_object_by_pool_and_caller_object_id(POOL_ID, "parity-actor-first")
         .expect("query checkpointed object")
@@ -3164,8 +3189,9 @@ fn session_open_refuses_active_media_readiness_fence_before_drive_probe() {
         .prefix("remanence-session-open-admission-")
         .tempdir()
         .expect("tempdir");
-    let mut index =
-        CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open test index");
+    let mut index = remanence_state::projector::open(temp.path().join("rem-state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open test index");
     let active_operation_id = Uuid::from_u128(0x9100);
     index
         .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
@@ -3227,8 +3253,9 @@ fn session_open_loads_immediate_after_unit_attention_then_load_required() {
         .prefix("remanence-session-open-load-after-ua-")
         .tempdir()
         .expect("tempdir");
-    let mut index =
-        CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open test index");
+    let mut index = remanence_state::projector::open(temp.path().join("rem-state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open test index");
     let (mut drive, log) = open_test_drive_with_tur_script(
         "DEC418146K_LL02",
         vec![
@@ -3283,8 +3310,9 @@ fn session_open_loads_immediate_for_already_loaded_initialization_required() {
         .prefix("remanence-session-open-already-loaded-load-required-")
         .tempdir()
         .expect("tempdir");
-    let mut index =
-        CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open test index");
+    let mut index = remanence_state::projector::open(temp.path().join("rem-state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open test index");
     let (mut drive, log) = open_test_drive_with_tur_script(
         "DEC418146K_LL02",
         vec![Some(readiness_fixed_sense(0x02, 0x04, 0x02)), None],
@@ -3428,7 +3456,9 @@ fn drive_wait_ready_sends_one_load_for_an_unthreaded_cartridge() {
         .tempdir()
         .expect("tempdir");
     let index_path = temp.path().join("rem-state.sqlite");
-    let mut index = CatalogIndex::open(&index_path).expect("open test index");
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open test index");
     let (world, mut library) = unthreaded_cartridge_world("LIB-UNTHREAD");
     let policy = remanence_library::StaticAllowlist::new(["LIB-UNTHREAD"]);
     let mut drive = library.open_drive(0x0100, &policy).expect("drive opens");
@@ -3505,7 +3535,9 @@ fn drive_wait_ready_never_repeats_a_load_or_loads_without_inventory_evidence() {
             .tempdir()
             .expect("tempdir");
         let index_path = temp.path().join("rem-state.sqlite");
-        let mut index = CatalogIndex::open(&index_path).expect("open test index");
+        let mut index = remanence_state::projector::open(&index_path)
+            .map(|catalog| catalog.write_handle())
+            .expect("open test index");
         let (world, mut library) = unthreaded_cartridge_world("LIB-LOADBOUND");
         let policy = remanence_library::StaticAllowlist::new(["LIB-LOADBOUND"]);
         let mut drive = library.open_drive(0x0100, &policy).expect("drive opens");
@@ -3570,7 +3602,9 @@ fn startup_reconcile_loads_an_unthreaded_cartridge_once_and_clears_the_fence() {
         .tempdir()
         .expect("tempdir");
     let index_path = temp.path().join("rem-state.sqlite");
-    let mut index = CatalogIndex::open(&index_path).expect("open test index");
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open test index");
     let (world, mut library) = unthreaded_cartridge_world("LIB-STARTLOAD");
     let policy = remanence_library::StaticAllowlist::new(["LIB-STARTLOAD"]);
     let snapshot = library.library().clone();
@@ -3628,7 +3662,9 @@ fn startup_reconcile_never_repeats_recorded_load_across_restart() {
     let index_path = temp.path().join("state.sqlite");
     let operation_id = Uuid::new_v4();
     {
-        let mut index = CatalogIndex::open(&index_path).expect("open catalog");
+        let mut index = remanence_state::projector::open(&index_path)
+            .map(|catalog| catalog.write_handle())
+            .expect("open catalog");
         record_unthreaded_readiness_operation(&mut index, "LIB-RESTART", operation_id);
         index
             .record_media_readiness_transition(
@@ -3647,7 +3683,9 @@ fn startup_reconcile_never_repeats_recorded_load_across_restart() {
     let (world, library) = unthreaded_cartridge_world("LIB-RESTART");
     drop(library);
     for _ in 0..2 {
-        let mut index = CatalogIndex::open(&index_path).expect("reopen catalog");
+        let mut index = remanence_state::projector::open(&index_path)
+            .map(|catalog| catalog.write_handle())
+            .expect("reopen catalog");
         let mut library = open_model_library(Arc::clone(&world));
         let snapshot = library.library().clone();
         let policy = remanence_library::StaticAllowlist::new(["LIB-RESTART"]);
@@ -3691,7 +3729,9 @@ fn startup_reconcile_never_repeats_recorded_load_across_restart() {
 async fn resume_readiness_rpc_without_inventory_sends_no_load() {
     use crate::pb::library_service_server::LibraryService;
     let temp = tempfile::tempdir().expect("tempdir");
-    let mut index = CatalogIndex::open(temp.path().join("state.sqlite")).expect("catalog");
+    let mut index = remanence_state::projector::open(temp.path().join("state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("catalog");
     let operation_id = Uuid::new_v4();
     // An unlabelled fence reaches the loaded flag instead of the barcode guard.
     index
@@ -3718,7 +3758,12 @@ async fn resume_readiness_rpc_without_inventory_sends_no_load() {
     snapshot.drive_bays[0].loaded_tape = None;
     let policy = remanence_library::StaticAllowlist::new(["LIB001"]);
     let mut drive = library.open_drive(0x0100, &policy).expect("drive");
-    let mut state = crate::ApiState::new(index);
+    let mut state = crate::ApiState::new({
+        let index = index;
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    });
     state.default_library_serial = Some(Arc::new("LIB001".to_string()));
     state.library_snapshot = Some(Arc::new(RwLock::new(Arc::new(
         crate::live_status::LibrarySnapshot {
@@ -3766,7 +3811,14 @@ async fn resume_readiness_rpc_without_inventory_sends_no_load() {
     // Shorten only the actor test clock after checking the RPC admission profile.
     options.timeout = StdDuration::from_millis(20);
     handle_drive_wait_ready(
-        &mut state.index_write().expect("actor index"),
+        &mut ({
+            let mut index = state.catalog.write_handle();
+            if let Some(pool) = &state.drive_pool {
+                index.set_readiness_observer(pool.readiness_wake.clone());
+            }
+            Ok::<_, tonic::Status>(index)
+        })
+        .expect("actor index"),
         &mut drive,
         DriveReadinessPoll {
             bay: 0x0100,
@@ -3797,7 +3849,9 @@ async fn resume_readiness_rpc_without_inventory_sends_no_load() {
 #[tokio::test]
 async fn readiness_poll_logs_sense_and_publishes_shared_progress_keys() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let mut index = CatalogIndex::open(temp.path().join("state.sqlite")).expect("catalog");
+    let mut index = remanence_state::projector::open(temp.path().join("state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("catalog");
     let operation_id = Uuid::new_v4();
     record_unthreaded_readiness_operation(&mut index, "LIB-LOG", operation_id);
     let (_world, mut library) = unthreaded_cartridge_world("LIB-LOG");
@@ -4081,6 +4135,7 @@ fn test_write_owner_config(
     let checkpoint_journal_dir = index_path.parent().unwrap().join("tapes");
     std::fs::create_dir_all(&checkpoint_journal_dir).unwrap();
     WriteOwnerConfig {
+        catalog: remanence_state::projector::open(&(index_path)).unwrap(),
         index_path,
         report: DiscoveryReport {
             unattached_drives: Vec::new(),
@@ -4361,7 +4416,9 @@ async fn checkpoint_actor_deduplicates_in_batch_and_holds_until_checkpoint() {
         .expect("tempdir");
     let index_path = temp.path().join("rem-state.sqlite");
     let tape_uuid = [0x76; 16];
-    let mut index = CatalogIndex::open(&index_path).expect("open catalog");
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open catalog");
     index
         .upsert_tape_pool_projection(TapePoolProjectionInput {
             pool_id: "checkpoint-test".to_string(),
@@ -4527,7 +4584,7 @@ async fn checkpoint_actor_deduplicates_in_batch_and_holds_until_checkpoint() {
     let object_id = Uuid::from_slice(&written.object_id)
         .expect("object UUID")
         .to_string();
-    let read_only = CatalogIndex::open_read_only(&index_path).expect("open projection");
+    let read_only = remanence_state::CatalogReader::open(&index_path).expect("open projection");
     assert!(read_only
         .get_native_object(&object_id)
         .expect("query WRITTEN object")
@@ -4585,7 +4642,7 @@ async fn checkpoint_actor_deduplicates_in_batch_and_holds_until_checkpoint() {
     assert_eq!(checkpointed_object.copies.len(), 1);
     assert_eq!(checkpointed_object.copies[0].tape_uuid, tape_uuid);
     assert_eq!(checkpointed_object.copies[0].tape_file_number, 1);
-    let read_only = CatalogIndex::open_read_only(&index_path).expect("open projection");
+    let read_only = remanence_state::CatalogReader::open(&index_path).expect("open projection");
     assert!(read_only
         .get_native_object(&object_id)
         .expect("query checkpointed object")
@@ -4729,7 +4786,7 @@ async fn checkpoint_actor_deduplicates_in_batch_and_holds_until_checkpoint() {
     )
     .build()
     .expect("open checkpoint journal after session lease release");
-    let read_only = CatalogIndex::open_read_only(&index_path).expect("open projection");
+    let read_only = remanence_state::CatalogReader::open(&index_path).expect("open projection");
     assert!(read_only
         .get_native_object(&fourth_object_id)
         .expect("query close-checkpointed object")
@@ -4751,7 +4808,8 @@ async fn checkpoint_actor_deduplicates_in_batch_and_holds_until_checkpoint() {
         vec![2, 4, 5],
         "each checkpoint names the first free dense tape file"
     );
-    let read_only = CatalogIndex::open_read_only(&index_path).expect("open final projection");
+    let read_only =
+        remanence_state::CatalogReader::open(&index_path).expect("open final projection");
     let tape_files = read_only
         .list_tape_files(&tape_uuid)
         .expect("list tape files");
@@ -4812,7 +4870,9 @@ async fn daemon_watermark_terminalization_is_atomic_and_terminal_failure_stays_f
         let pool_id = format!("terminal.{case}");
         let library_serial = format!("LIB-TERMINAL-{case}");
         let drive_serial = format!("DRV-TERMINAL-{case}");
-        let mut index = CatalogIndex::open(&index_path).expect("open catalog");
+        let mut index = remanence_state::projector::open(&index_path)
+            .map(|catalog| catalog.write_handle())
+            .expect("open catalog");
         index
             .upsert_tape_pool_projection(TapePoolProjectionInput {
                 pool_id: pool_id.clone(),
@@ -4988,7 +5048,7 @@ async fn daemon_watermark_terminalization_is_atomic_and_terminal_failure_stays_f
         )
         .build()
         .expect("open checkpoint journal after lease release");
-        let read_only = CatalogIndex::open_read_only(&index_path).expect("open catalog");
+        let read_only = remanence_state::CatalogReader::open(&index_path).expect("open catalog");
         let tape = read_only
             .get_tape(&tape_uuid)
             .expect("query tape")
@@ -5039,7 +5099,9 @@ async fn manual_finalize_closes_below_low_and_same_key_replay_moves_no_tape() {
     let pool_id = "terminal.operator";
     let library_serial = "LIB-TERMINAL-OPERATOR";
     let drive_serial = "DRV-TERMINAL-OPERATOR";
-    let mut index = CatalogIndex::open(&index_path).expect("open catalog");
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open catalog");
     index
         .upsert_tape_pool_projection(TapePoolProjectionInput {
             pool_id: pool_id.to_string(),
@@ -5221,7 +5283,9 @@ async fn manual_finalize_closes_below_low_and_same_key_replay_moves_no_tape() {
     impossible_policy.watermark_high = 0.0002;
     impossible_policy.capacity_cap_bytes = Some(8_241 * u64::from(BLOCK_SIZE));
     let commands_before_rejection = world.lock().expect("world lock").command_log.len();
-    let mut rejected_index = CatalogIndex::open(&index_path).expect("open writable catalog");
+    let mut rejected_index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open writable catalog");
     let rejected = preflight_manual_finalize_tape(
         &mut rejected_index,
         ManualFinalizePreflightConfig {
@@ -5301,7 +5365,9 @@ async fn manual_finalize_closes_below_low_and_same_key_replay_moves_no_tape() {
     let blocked_intent = remanence_state::authority::fixtures::block_finalization(&checkpoint)
         .expect("block intent temporary file creation");
     let commands_before_crash_cut = world.lock().expect("world lock").command_log.len();
-    let mut crash_index = CatalogIndex::open(&index_path).expect("open crash-cut catalog");
+    let mut crash_index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open crash-cut catalog");
     let crash_error = preflight_manual_finalize_tape(
         &mut crash_index,
         ManualFinalizePreflightConfig {
@@ -5344,7 +5410,9 @@ async fn manual_finalize_closes_below_low_and_same_key_replay_moves_no_tape() {
     let mut recovered_request = request.clone();
     let recovered_operation_id = Uuid::from_u128(0x7d05);
     recovered_request.candidate_operation_id = recovered_operation_id;
-    let mut retry_index = CatalogIndex::open(&index_path).expect("open retry catalog");
+    let mut retry_index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open retry catalog");
     assert!(preflight_manual_finalize_tape(
         &mut retry_index,
         ManualFinalizePreflightConfig {
@@ -5609,7 +5677,9 @@ async fn manual_finalize_closes_below_low_and_same_key_replay_moves_no_tape() {
     // restarting the daemon. The durable sealed record must repair the
     // stale projection before any fence or media-capable path is consulted.
     let commands_before_host_repair = world.lock().expect("world lock").command_log.len();
-    let mut fenced_index = CatalogIndex::open(&index_path).expect("open fenced catalog");
+    let mut fenced_index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open fenced catalog");
     fenced_index
         .record_tape_io_fence(remanence_state::TapeIoFenceInput {
             tape_uuid,
@@ -5626,7 +5696,9 @@ async fn manual_finalize_closes_below_low_and_same_key_replay_moves_no_tape() {
                 rusqlite::params![tape_uuid.to_vec()],
             )
             .expect("downgrade only the disposable SQLite projection");
-    let mut host_index = CatalogIndex::open(&index_path).expect("reopen stale projection");
+    let mut host_index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("reopen stale projection");
     let mut host_retry = request.clone();
     let repaired = preflight_manual_finalize_tape(
         &mut host_index,
@@ -5689,7 +5761,9 @@ async fn sequential_sessions_and_replay_return_catalog_copies_through_mount() {
         .expect("tempdir");
     let index_path = temp.path().join("rem-state.sqlite");
     let tape_uuid = [0x77; 16];
-    let mut index = CatalogIndex::open(&index_path).expect("open catalog");
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open catalog");
     index
         .upsert_tape_pool_projection(TapePoolProjectionInput {
             pool_id: "batch-one-test".to_string(),
@@ -5782,8 +5856,18 @@ async fn sequential_sessions_and_replay_return_catalog_copies_through_mount() {
         HashMap::from([(0x0100, drive_tx.clone())]),
         reservations,
     );
-    let state_index = CatalogIndex::open(&index_path).expect("open mount test catalog");
-    let mut state = crate::ApiState::new_with_pool_configs(state_index, [pool_cfg.clone()]);
+    let state_index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open mount test catalog");
+    let mut state = crate::ApiState::new_with_pool_configs(
+        {
+            let index = state_index;
+            let catalog = remanence_state::projector::open(index.path()).unwrap();
+            drop(index);
+            catalog
+        },
+        [pool_cfg.clone()],
+    );
     state.drive_pool = Some(pool.clone());
 
     let mut previous_session_id = None;
@@ -6018,8 +6102,9 @@ fn cataloged_payload_fixture(payload: &[u8]) -> RangeCatalogFixture {
         .prefix("remanence-api-range-test-")
         .tempdir()
         .expect("tempdir");
-    let mut index =
-        CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open test index");
+    let mut index = remanence_state::projector::open(temp.path().join("rem-state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open test index");
     index
         .provision_tape(ProvisionTapeInput {
             tape_uuid: RANGE_TAPE_UUID,
@@ -6296,7 +6381,9 @@ async fn changer_move_succeeds_and_publishes_snapshot_when_catalog_observation_f
         .tempdir()
         .expect("tempdir");
     let index_path = temp.path().join("rem-state.sqlite");
-    CatalogIndex::open(&index_path).expect("create catalog");
+    remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("create catalog");
     let sqlite = rusqlite::Connection::open(&index_path).expect("open raw sqlite");
     sqlite
         .execute_batch(
@@ -6317,6 +6404,7 @@ async fn changer_move_succeeds_and_publishes_snapshot_when_catalog_observation_f
     let changer = handle.into_changer();
     let policy = remanence_library::StaticAllowlist::new([library.serial.as_str()]);
     let cfg = WriteOwnerConfig {
+        catalog: remanence_state::projector::open(&index_path).unwrap(),
         index_path: index_path.clone(),
         report: DiscoveryReport {
             unattached_drives: Vec::new(),
@@ -6398,7 +6486,8 @@ async fn changer_move_succeeds_and_publishes_snapshot_when_catalog_observation_f
     assert!(!published_library.slots[0].full);
 
     let alarm_key = library_snapshot_persist_alarm_key(library.serial.as_str());
-    let alarm = CatalogIndex::open(&index_path)
+    let alarm = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
         .expect("reopen catalog")
         .get_alarm(alarm_key.as_str())
         .expect("lookup alarm")
@@ -6717,8 +6806,9 @@ fn session_close_snapshot_success_clears_snapshot_persist_alarm() {
         .prefix("remanence-api-snapshot-alarm")
         .tempdir()
         .expect("tempdir");
-    let mut index =
-        CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open test index");
+    let mut index = remanence_state::projector::open(temp.path().join("rem-state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open test index");
     let drive_uuid = Uuid::new_v4().as_bytes().to_vec();
     let condition_key = snapshot_persist_alarm_key(&drive_uuid);
     index
@@ -6751,7 +6841,9 @@ fn failure_snapshots_are_keyed_by_failing_session() {
         .tempdir()
         .expect("tempdir");
     let index_path = temp.path().join("rem-state.sqlite");
-    let mut index = CatalogIndex::open(&index_path).expect("open catalog");
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open catalog");
     let drive_uuid = index
         .observe_drive(DriveObservationInput {
             serial: "DRV-FAIL-SNAPSHOT".to_string(),
@@ -6853,7 +6945,9 @@ fn read_harvest_world_with_lifecycle(
     Arc<Mutex<VirtualWorld>>,
 ) {
     let index_path = temp.path().join("rem-state.sqlite");
-    let mut index = CatalogIndex::open(&index_path).expect("open catalog");
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open catalog");
     index
         .provision_tape(ProvisionTapeInput {
             tape_uuid,
@@ -7015,7 +7109,9 @@ async fn read_only_mount_harvest_calibrates_the_volume() {
         "the read mount's load harvest calibrated the volume"
     );
     assert!(row.calibration_generation > 0);
-    let index = CatalogIndex::open(&index_path).expect("reopen catalog");
+    let index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("reopen catalog");
     match servable_wrap_map(&index, &store, tape_uuid).expect("serve") {
         WrapMapServeOutcome::Servable { map, .. } => {
             assert_eq!(map.wrap_count(), 1);
@@ -7068,7 +7164,9 @@ async fn read_open_succeeds_when_the_harvest_cannot_calibrate() {
         remanence_state::VolumeCalibrationState::UnsupportedFormat,
         "the refusal is recorded durably, not silently dropped"
     );
-    let index = CatalogIndex::open(&index_path).expect("reopen catalog");
+    let index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("reopen catalog");
     match servable_wrap_map(&index, &store, tape_uuid).expect("serve") {
         WrapMapServeOutcome::NotServable { refusal, .. } => {
             assert_eq!(refusal, WrapMapServeRefusal::UnsupportedFormat);
@@ -7084,7 +7182,9 @@ async fn induced_append_and_read_failures_persist_session_snapshots() {
         .tempdir()
         .expect("tempdir");
     let index_path = temp.path().join("rem-state.sqlite");
-    let mut index = CatalogIndex::open(&index_path).expect("open catalog");
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open catalog");
     let tape_uuid = [0x78; 16];
     index
         .upsert_tape_pool_projection(TapePoolProjectionInput {
@@ -7287,7 +7387,7 @@ async fn induced_append_and_read_failures_persist_session_snapshots() {
             commands_before,
             "fenced opens issue no tape commands or append recovery"
         );
-        let api = crate::ApiState::new(CatalogIndex::open(&index_path).unwrap());
+        let api = crate::ApiState::new(remanence_state::projector::open(&index_path).unwrap());
         <crate::LibraryServiceApi as pb::library_service_server::LibraryService>::release_tape_io_fence(
             &api.library_service(),
             tonic::Request::new(pb::ReleaseTapeIoFenceRequest {
@@ -7393,7 +7493,9 @@ async fn induced_append_and_read_failures_persist_session_snapshots() {
         "diagnostics must not add a separate REWIND command: {close_opcodes:?}"
     );
 
-    let check = CatalogIndex::open(&index_path).expect("reopen catalog");
+    let check = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("reopen catalog");
     let rows = check
         .list_drive_health_snapshots(&drive_uuid)
         .expect("list snapshots");
@@ -7531,8 +7633,9 @@ fn prepare_drive_for_read_sets_catalog_fixed_block_size_and_rejects_missing_geom
         .prefix("remanence-read-mode-prepare-")
         .tempdir()
         .expect("tempdir");
-    let mut index =
-        CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open test index");
+    let mut index = remanence_state::projector::open(temp.path().join("rem-state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open test index");
     let tape_uuid = [0x44; 16];
     index
         .provision_tape(ProvisionTapeInput {
@@ -7627,7 +7730,9 @@ fn frequency_cap_alarm_triggers_on_recent_run() {
         .prefix("remanence-cleaning-cap")
         .tempdir()
         .expect("temp dir");
-    let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+    let mut index = remanence_state::projector::open(temp.path().join("rem-state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open");
     let drive_uuid = index
         .observe_drive(DriveObservationInput {
             serial: "DRV-CAP".to_string(),
@@ -7663,7 +7768,9 @@ fn cleaning_alarm_failure_rolls_back_fence_before_error() {
         .tempdir()
         .expect("temp dir");
     let index_path = temp.path().join("rem-state.sqlite");
-    let mut index = CatalogIndex::open(&index_path).expect("open");
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open");
     let db = rusqlite::Connection::open(&index_path).expect("open sqlite");
     db.execute_batch(
         "create trigger fail_alarm_insert
@@ -7746,7 +7853,9 @@ fn periodic_cleaning_defers_on_busy_drive_and_now_fences_after_session_end() {
         .tempdir()
         .expect("temp dir");
     let busy_index_path = busy_temp.path().join("rem-state.sqlite");
-    let mut busy_index = CatalogIndex::open(&busy_index_path).expect("open");
+    let mut busy_index = remanence_state::projector::open(&busy_index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open");
     let busy_drive_uuid = busy_index
         .observe_drive(DriveObservationInput {
             serial: "DRV-POLICY".to_string(),
@@ -7840,7 +7949,9 @@ fn periodic_cleaning_defers_on_busy_drive_and_now_fences_after_session_end() {
         .tempdir()
         .expect("temp dir");
     let now_index_path = now_temp.path().join("rem-state.sqlite");
-    let mut now_index = CatalogIndex::open(&now_index_path).expect("open");
+    let mut now_index = remanence_state::projector::open(&now_index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open");
     let now_drive_uuid = now_index
         .observe_drive(DriveObservationInput {
             serial: "DRV-NOW".to_string(),
@@ -7920,7 +8031,9 @@ fn no_cln_cart_branch_unfences_drive_and_raises_alarm() {
         .tempdir()
         .expect("temp dir");
     let index_path = temp.path().join("rem-state.sqlite");
-    let mut index = CatalogIndex::open(&index_path).expect("open");
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open");
     let drive_uuid = index
         .observe_drive(DriveObservationInput {
             serial: "DRV-NOCART".to_string(),
@@ -7995,7 +8108,9 @@ fn cleaning_frequency_cap_refuses_before_fence_or_run() {
         .tempdir()
         .expect("temp dir");
     let index_path = temp.path().join("rem-state.sqlite");
-    let mut index = CatalogIndex::open(&index_path).expect("open");
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open");
     let drive_uuid = index
         .observe_drive(DriveObservationInput {
             serial: "DRV-CAP".to_string(),
@@ -8094,7 +8209,9 @@ fn inventory_only_cleaning_cart_is_recognized_before_fast_eject() {
         .tempdir()
         .expect("temp dir");
     let index_path = temp.path().join("rem-state.sqlite");
-    let mut index = CatalogIndex::open(&index_path).expect("open");
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open");
     let drive_uuid = index
         .observe_drive(DriveObservationInput {
             serial: "DRV-FAST".to_string(),
@@ -8410,7 +8527,9 @@ fn with_catalog_recovery_tape_faults(
     const BLOCK_SIZE: u32 = 512 * 1024;
     let temp = tempfile::tempdir().expect("recovery test directory");
     let index_path = temp.path().join("catalog.sqlite");
-    let mut index = CatalogIndex::open(&index_path).expect("open recovery catalog");
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open recovery catalog");
     index
         .provision_tape(ProvisionTapeInput {
             tape_uuid: RANGE_TAPE_UUID,
@@ -9460,7 +9579,9 @@ fn resume_vectors_layer5_authorities(refusal: Option<&str>) {
     }
     let authority =
         super::checkpoint::validate_parity_actor_authority(&selected, &mut lease).unwrap();
-    let mut index = CatalogIndex::open(&cfg.index_path).unwrap();
+    let mut index = remanence_state::projector::open(&cfg.index_path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let last = checkpoints.last().unwrap();
     // This fixture tests parity journal reconstruction after an explicit discard.
     // Its synthetic fill is deliberately not automatic append authority.
@@ -9561,7 +9682,9 @@ pub(crate) async fn daemon_rollback_refusal(
     );
     cfg.checkpoint_journal_dir = state.paths().journal_dir.join("tapes");
     std::fs::create_dir_all(&cfg.checkpoint_journal_dir).unwrap();
-    let mut index = CatalogIndex::open(&state.paths().sqlite_path).unwrap();
+    let mut index = remanence_state::projector::open(&state.paths().sqlite_path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let session_id = Uuid::new_v4();
     for event in [AuditEvent::SessionOpened, AuditEvent::SessionOrphaned] {
         record_session_event(
@@ -9607,7 +9730,9 @@ pub(crate) async fn daemon_rollback_refusal(
         .unwrap()
         .expect_err("stale daemon state must refuse");
     if error.message().contains("SessionSuffixContradiction") {
-        let index = CatalogIndex::open(&state.paths().sqlite_path).unwrap();
+        let index = remanence_state::projector::open(&state.paths().sqlite_path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         assert!(index
             .list_active_tape_io_fences()
             .unwrap()
@@ -9616,7 +9741,9 @@ pub(crate) async fn daemon_rollback_refusal(
         return error.to_string();
     }
     assert!(error.message().contains("TailBeyondKnownState"), "{error}");
-    let index = CatalogIndex::open(&state.paths().sqlite_path).unwrap();
+    let index = remanence_state::projector::open(&state.paths().sqlite_path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let fences = index.list_active_tape_io_fences().unwrap();
     assert!(fences.iter().all(|f| f.tape_uuid != tape_uuid));
     assert_eq!(
@@ -9765,7 +9892,9 @@ pub(crate) async fn daemon_append_recovery_roundtrip(
     rx.await.unwrap().unwrap();
 
     {
-        let mut index = CatalogIndex::open(&state.paths().sqlite_path).unwrap();
+        let mut index = remanence_state::projector::open(&state.paths().sqlite_path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         let fences = index.list_active_tape_io_fences().unwrap();
         assert!(
             fences.is_empty(),
@@ -9826,7 +9955,9 @@ pub(crate) async fn daemon_append_recovery_roundtrip(
         refusal.message().contains("TailBeyondKnownState"),
         "{refusal}"
     );
-    let index = CatalogIndex::open(&state.paths().sqlite_path).unwrap();
+    let index = remanence_state::projector::open(&state.paths().sqlite_path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     assert_eq!(
         index.get_tape(&selected.tape_uuid).unwrap().unwrap().state,
         "recovery_required"
@@ -10185,7 +10316,9 @@ impl VerificationActorHarness {
         }
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("catalog.sqlite");
-        let mut index = CatalogIndex::open(&path).unwrap();
+        let mut index = remanence_state::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         index
             .provision_tape(ProvisionTapeInput {
                 tape_uuid,
@@ -10195,7 +10328,12 @@ impl VerificationActorHarness {
                 force: false,
             })
             .unwrap();
-        let mut state = crate::ApiState::new(index);
+        let mut state = crate::ApiState::new({
+            let index = index;
+            let catalog = remanence_state::projector::open(index.path()).unwrap();
+            drop(index);
+            catalog
+        });
         let mut world = VirtualWorld::single_drive("LIB-VERIFY", 0x100, "DRV-VERIFY", 0x400, 1);
         if needs_drive_load {
             world.put_tape_in_slot(0x400, "VERIFY001L9", tape);
@@ -10702,7 +10840,13 @@ async fn detached_verification_waits_for_another_drive_fence() {
     ));
     let readiness_id = Uuid::new_v4();
     let status = record_session_open_readiness_fence_on_operation;
-    let mut index = harness.state.index_write().unwrap();
+    let mut index = {
+        let mut index = harness.state.catalog.write_handle();
+        if let Some(pool) = &harness.state.drive_pool {
+            index.set_readiness_observer(pool.readiness_wake.clone());
+        }
+        index
+    };
     let ctx = SessionOpenReadinessContext {
         action: "open read session",
         bay: 0x101,
@@ -10752,7 +10896,13 @@ async fn detached_verification_waits_for_another_drive_fence() {
     .await
     .unwrap();
     record_session_open_readiness_transition(
-        &mut harness.state.index_write().unwrap(),
+        &mut {
+            let mut index = harness.state.catalog.write_handle();
+            if let Some(pool) = &harness.state.drive_pool {
+                index.set_readiness_observer(pool.readiness_wake.clone());
+            }
+            index
+        },
         readiness_id,
         "ready",
         &remanence_library::MediaReadiness::new(remanence_library::MediaReadinessKind::Ready),
@@ -10823,7 +10973,9 @@ pub(crate) async fn run_readiness_test_command(state: &crate::ApiState, command:
 async fn startup_resumable_fence_gets_an_automatic_wait() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("catalog.sqlite");
-    let mut index = CatalogIndex::open(&path).unwrap();
+    let mut index = remanence_state::projector::open(&path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let id = Uuid::new_v4();
     record_unthreaded_readiness_operation(&mut index, "LIB-STARTAUTO", id);
     index
@@ -10860,7 +11012,12 @@ async fn startup_resumable_fence_gets_an_automatic_wait() {
         .get_mut(&0x100)
         .unwrap()
         .initializing_command_required = false;
-    let mut state = crate::ApiState::new(index);
+    let mut state = crate::ApiState::new({
+        let index = index;
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    });
     let snapshot = library_snapshot_cell(snapshot);
     state.library_snapshot = Some(snapshot.clone());
     state.default_library_serial = Some(Arc::new("LIB-STARTAUTO".into()));
@@ -10943,7 +11100,13 @@ async fn operator_cancelled_auto_wait_stays_stopped() {
         open_test_drive_with_tur_script("LIB-VERIFY", vec![Some(readiness_fixed_sense(2, 4, 1))]);
     assert_eq!(
         crate::startup_media_readiness::reconcile_library_media_readiness_on_startup(
-            &mut harness.state.index_write().unwrap(),
+            &mut {
+                let mut index = harness.state.catalog.write_handle();
+                if let Some(pool) = &harness.state.drive_pool {
+                    index.set_readiness_observer(pool.readiness_wake.clone());
+                }
+                index
+            },
             &snapshot.report.libraries[0],
             &mut [(0x100, drive)]
         )
@@ -11039,8 +11202,9 @@ async fn readiness_shutdown_releases_reservation_and_restart_resumes() {
             .is_err());
 
         // Reopen the catalog and reconcile a still-transient drive before new admission.
-        let mut restarted =
-            crate::ApiState::new(CatalogIndex::open(harness.state.index_path.as_ref()).unwrap());
+        let mut restarted = crate::ApiState::new(
+            remanence_state::projector::open(harness.state.index_path.as_ref()).unwrap(),
+        );
         restarted.library_snapshot = harness.state.library_snapshot.clone();
         restarted.default_library_serial = harness.state.default_library_serial.clone();
         let (probe, _) = open_test_drive_with_tur_script(
@@ -11048,7 +11212,7 @@ async fn readiness_shutdown_releases_reservation_and_restart_resumes() {
             vec![Some(readiness_fixed_sense(2, 4, 1))],
         );
         crate::startup_media_readiness::reconcile_library_media_readiness_on_startup(
-            &mut restarted.index_write().unwrap(),
+            &mut restarted.catalog.write_handle(),
             &restarted
                 .current_library_snapshot()
                 .unwrap()
@@ -11095,7 +11259,9 @@ async fn readiness_shutdown_releases_reservation_and_restart_resumes() {
 fn startup_reconciles_operator_cancelled_ready_and_absent_media() {
     for (absent, needs_load) in [(false, false), (true, false), (false, true)] {
         let temp = tempfile::tempdir().unwrap();
-        let mut index = CatalogIndex::open(temp.path().join("state.sqlite")).unwrap();
+        let mut index = remanence_state::projector::open(temp.path().join("state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         let id = Uuid::new_v4();
         record_unthreaded_readiness_operation(&mut index, "LIB-CANCEL", id);
         let (world, mut library) = unthreaded_cartridge_world("LIB-CANCEL");
@@ -11182,7 +11348,9 @@ fn startup_reconciles_operator_cancelled_ready_and_absent_media() {
 fn readiness_admission_reports_invalid_stored_id() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("state.sqlite");
-    let mut index = CatalogIndex::open(&path).unwrap();
+    let mut index = remanence_state::projector::open(&path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     record_unthreaded_readiness_operation(&mut index, "LIB-BAD-ID", Uuid::new_v4());
     rusqlite::Connection::open(&path)
         .unwrap()
@@ -11277,7 +11445,11 @@ pub(crate) fn fail_readiness_test_command(state: &crate::ApiState, command: Driv
     let (_, mut library) = unthreaded_cartridge_world("DEC418146K_LL02");
     let policy = remanence_library::StaticAllowlist::new(["DEC418146K_LL02"]);
     let mut drive = library.open_drive(0x100, &policy).unwrap();
-    let mut index = CatalogIndex::open_read_only(state.index_path.as_ref()).unwrap();
+    // The public reader cannot be used as a writer. Inject the recording failure
+    // through a raw SQL fixture, without blocking this test's paused clock.
+    let fault = rusqlite::Connection::open(state.index_path.as_ref()).unwrap();
+    fault.execute_batch("CREATE TRIGGER b4a_recording_fault BEFORE UPDATE ON media_readiness_ops BEGIN SELECT RAISE(ABORT, 'readiness recording fault'); END;").unwrap();
+    let mut index = state.catalog.write_handle();
     super::readiness::handle_drive_wait_ready_and_release(
         &mut index,
         &mut drive,
@@ -11292,6 +11464,9 @@ pub(crate) fn fail_readiness_test_command(state: &crate::ApiState, command: Driv
         &handle,
         Some(reservation),
     );
+    fault
+        .execute_batch("DROP TRIGGER b4a_recording_fault")
+        .unwrap();
 }
 
 /// Startup attributes every release-only transition to reconciliation.
@@ -11300,7 +11475,9 @@ fn startup_release_transition_keeps_reconcile_cancel_source() {
     for source in [None, Some("transport"), Some("operator")] {
         for release_only in [false, true] {
             let temp = tempfile::tempdir().unwrap();
-            let mut index = CatalogIndex::open(temp.path().join("state.sqlite")).unwrap();
+            let mut index = remanence_state::projector::open(temp.path().join("state.sqlite"))
+                .map(|catalog| catalog.write_handle())
+                .unwrap();
             let id = Uuid::new_v4();
             record_unthreaded_readiness_operation(&mut index, "LIB-SOURCE", id);
             let mut transition =
@@ -11345,27 +11522,30 @@ async fn detached_verification_waits_for_load_drive_release() {
         pool.set_library_holder("LIB-VERIFY", "load_drive", id);
         let load = harness.state.operations.register(id, "load_drive");
         load.publish_state(pb::OperationState::Running, &[]);
-        harness
-            .state
-            .index_write()
-            .unwrap()
-            .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
-                operation_id: id,
-                run_id: None,
-                endpoint: DriveKey::new("LIB-VERIFY", 0x100),
-                changer_sg: None,
-                drive_sg: None,
-                drive_serial: None,
-                barcode: Some("VERIFY001L9".into()),
-                source_slot: Some(0x400),
-                media_generation: Some(9),
-                phase: "load_drive_readiness".into(),
-                state: "becoming_ready".into(),
-                dirty_scope: Some("drive+tape".into()),
-                deadline_at_utc: None,
-                evidence_path: None,
-            })
-            .unwrap();
+        {
+            let mut index = harness.state.catalog.write_handle();
+            if let Some(pool) = &harness.state.drive_pool {
+                index.set_readiness_observer(pool.readiness_wake.clone());
+            }
+            index
+        }
+        .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
+            operation_id: id,
+            run_id: None,
+            endpoint: DriveKey::new("LIB-VERIFY", 0x100),
+            changer_sg: None,
+            drive_sg: None,
+            drive_serial: None,
+            barcode: Some("VERIFY001L9".into()),
+            source_slot: Some(0x400),
+            media_generation: Some(9),
+            phase: "load_drive_readiness".into(),
+            state: "becoming_ready".into(),
+            dirty_scope: Some("drive+tape".into()),
+            deadline_at_utc: None,
+            evidence_path: None,
+        })
+        .unwrap();
         let (operation, mut result) = crate::tape_verification::start(
             &harness.state,
             AuditActor::System,
@@ -11386,19 +11566,22 @@ async fn detached_verification_waits_for_load_drive_release() {
         })
         .await
         .unwrap();
-        harness
-            .state
-            .index_write()
-            .unwrap()
-            .record_media_readiness_transition(
-                crate::startup_media_readiness::startup_media_readiness_probe_transition(
-                    id,
-                    &remanence_library::MediaReadiness::new(
-                        remanence_library::MediaReadinessKind::Ready,
-                    ),
+        {
+            let mut index = harness.state.catalog.write_handle();
+            if let Some(pool) = &harness.state.drive_pool {
+                index.set_readiness_observer(pool.readiness_wake.clone());
+            }
+            index
+        }
+        .record_media_readiness_transition(
+            crate::startup_media_readiness::startup_media_readiness_probe_transition(
+                id,
+                &remanence_library::MediaReadiness::new(
+                    remanence_library::MediaReadinessKind::Ready,
                 ),
-            )
-            .unwrap();
+            ),
+        )
+        .unwrap();
         tokio::time::sleep(StdDuration::from_millis(400)).await;
         assert!(result.try_recv().is_err());
         if publish_first {
@@ -11428,7 +11611,9 @@ async fn detached_verification_waits_for_load_drive_release() {
 async fn load_drive_readiness_poll_stops_on_shutdown() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("state.sqlite");
-    let mut index = CatalogIndex::open(&path).unwrap();
+    let mut index = remanence_state::projector::open(&path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let id = Uuid::nil();
     let registry = crate::operations::OperationRegistry::default();
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -11518,7 +11703,7 @@ async fn load_drive_readiness_poll_stops_on_shutdown() {
         error.contains(crate::readiness_wait::SHUTDOWN_REASON),
         "{error}"
     );
-    let record = CatalogIndex::open_read_only(&path)
+    let record = remanence_state::CatalogReader::open(&path)
         .unwrap()
         .media_readiness_operation(id)
         .unwrap()
@@ -11532,7 +11717,7 @@ async fn load_drive_readiness_poll_stops_on_shutdown() {
         terminal.progress["sense_name"],
         remanence_library::media_readiness_sense_name(4, 1).unwrap()
     );
-    let mut state = crate::ApiState::new(CatalogIndex::open(&path).unwrap());
+    let mut state = crate::ApiState::new(remanence_state::projector::open(&path).unwrap());
     state.operations = registry.clone();
     for n in 1..=2048 {
         registry
@@ -11542,7 +11727,7 @@ async fn load_drive_readiness_poll_stops_on_shutdown() {
     assert!(registry.latest(&id).is_none(), "load status is pruned");
     for state in [
         state,
-        crate::ApiState::new(CatalogIndex::open(&path).unwrap()),
+        crate::ApiState::new(remanence_state::projector::open(&path).unwrap()),
     ] {
         use crate::pb::daemon_server::Daemon;
         let status = state
@@ -11633,7 +11818,9 @@ pub(crate) fn fail_readiness_actor(rx: mpsc::Receiver<DriveCommand>) {
 fn load_drive_terminal_progress_uses_durable_readiness() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("state.sqlite");
-    let mut index = CatalogIndex::open(&path).unwrap();
+    let mut index = remanence_state::projector::open(&path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let (_, library) = unthreaded_cartridge_world("LIB-END");
     let cfg = test_write_owner_config(
         path,
@@ -11741,7 +11928,9 @@ fn load_drive_shutdown_logs_at_info() {
         .finish();
     let _log = tracing::subscriber::set_default(subscriber);
     let path = temp.path().join("state.sqlite");
-    let mut index = CatalogIndex::open(&path).unwrap();
+    let mut index = remanence_state::projector::open(&path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let (_, library) = unthreaded_cartridge_world("LIB-LOG");
     let cfg = test_write_owner_config(
         path,
@@ -11784,12 +11973,18 @@ fn readiness_operator_cancel_requires_recorded_transition() {
     for writable in [true, false] {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("state.sqlite");
-        let mut index = CatalogIndex::open(&path).unwrap();
+        let mut index = remanence_state::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         let id = Uuid::new_v4();
         record_unthreaded_readiness_operation(&mut index, "LIB-CANCEL", id);
-        if !writable {
-            index = CatalogIndex::open_read_only(&path).unwrap();
-        }
+        // Readers cannot be passed as writers anymore. A deliberate competing
+        // SQLite transaction injects the same persistence failure at the write.
+        let _blocker = (!writable).then(|| {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            conn
+        });
         let (_, mut library) = unthreaded_cartridge_world("LIB-CANCEL");
         let policy = remanence_library::StaticAllowlist::new(["LIB-CANCEL"]);
         let mut drive = library.open_drive(0x100, &policy).unwrap();
@@ -11871,7 +12066,9 @@ async fn attached_load_retry_follows_actor_refresh_and_release() {
     for cancelled in [false, true] {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("state.sqlite");
-        let mut index = CatalogIndex::open(&path).unwrap();
+        let mut index = remanence_state::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         let id = Uuid::new_v4();
         let registry = crate::operations::OperationRegistry::default();
         let handle = registry.register(id, "load_drive");
@@ -11920,7 +12117,7 @@ async fn attached_load_retry_follows_actor_refresh_and_release() {
             reservations.clone(),
             crate::drive_pool::DrivePoolLifecycle::default(),
         );
-        let mut state = crate::ApiState::new(CatalogIndex::open(&path).unwrap());
+        let mut state = crate::ApiState::new(remanence_state::projector::open(&path).unwrap());
         state.operations = registry.clone();
         let attached = state
             .start_readiness_wait(id, 9000, 30, "client", "session_open")
@@ -12050,7 +12247,7 @@ pub(crate) async fn check_overlap_batch_receipts(
         config.daemon.append_staging_mode = remanence_state::AppendStagingMode::Serial;
     }
     let mut api_state = crate::ApiState::new_with_config(
-        CatalogIndex::open(&state.paths().sqlite_path).unwrap(),
+        remanence_state::projector::open(&state.paths().sqlite_path).unwrap(),
         &config,
     )
     .unwrap();
@@ -12300,7 +12497,9 @@ pub(crate) async fn check_context_failure_receipts(
         reply: open_reply,
     };
     let actor = tokio::task::spawn_blocking(move || {
-        let mut index = CatalogIndex::open(&cfg.index_path).unwrap();
+        let mut index = remanence_state::projector::open(&cfg.index_path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         FAIL_APPEND_CONTEXT_AFTER.with(|count| count.set(2));
         handle_drive_open_write(
             0x100, &mut index, &cfg, actor_tx, &mut rx, &mut drive, &mut 0, None, request,
@@ -12405,7 +12604,8 @@ pub(crate) async fn check_context_failure_receipts(
             record.append_commit_info.unwrap().durability,
             pb::AppendDurability::Checkpointed as i32
         );
-        let stored = CatalogIndex::open(&state.paths().sqlite_path)
+        let stored = remanence_state::projector::open(&state.paths().sqlite_path)
+            .map(|catalog| catalog.write_handle())
             .unwrap()
             .get_native_object(&Uuid::from_slice(&record.object_id).unwrap().to_string())
             .unwrap()
@@ -12499,7 +12699,9 @@ async fn magazine_eviction_scenario(
         .expect("tempdir");
     let index_path = temp.path().join("rem-state.sqlite");
     let new_uuid: TapeUuid = [0x5e; 16];
-    let mut index = CatalogIndex::open(&index_path).expect("catalog");
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("catalog");
     index
         .provision_tape(ProvisionTapeInput {
             tape_uuid: new_uuid,
@@ -12590,7 +12792,7 @@ async fn magazine_eviction_scenario(
         lifecycle,
     );
     let mut api = crate::ApiState::new_with_pool_configs(
-        CatalogIndex::open(&index_path).unwrap(),
+        remanence_state::projector::open(&index_path).unwrap(),
         cfg.tape_pools.clone(),
     );
     api.audit_dir = Arc::new(cfg.audit_dir.clone());
@@ -12767,7 +12969,9 @@ async fn changer_actor_move_wait_stops_for_a_gone_caller_and_skips_during_shutdo
             library_snapshot_cell(library.library().clone()),
         );
         std::fs::create_dir_all(&cfg.audit_dir).unwrap();
-        CatalogIndex::open(&cfg.index_path).unwrap();
+        remanence_state::projector::open(&cfg.index_path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         let shutdown = Arc::new(AtomicBool::new(shutting_down));
         cfg.changer_ready_wait =
             remanence_library::ChangerReadyWait::bounded(StdDuration::from_secs(60))
@@ -12976,7 +13180,8 @@ pub(crate) async fn unload_adopted_cartridge(
         prior_session_id: None,
     };
     pool.park_cartridge(seated.clone());
-    let mut api = crate::ApiState::new(CatalogIndex::open(&state.paths().sqlite_path).unwrap());
+    let mut api =
+        crate::ApiState::new(remanence_state::projector::open(&state.paths().sqlite_path).unwrap());
     api.audit_dir = Arc::new(cfg.audit_dir.clone());
     api.library_snapshot = Some(cfg.library().snapshot.clone());
     api.drive_pool = Some(pool);
@@ -12998,7 +13203,9 @@ fn cursor_predecessor_records_and_eod_are_durably_fenced() {
     for length in [None, Some(size), Some(7), Some(size * 2)] {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("state.sqlite");
-        let mut index = CatalogIndex::open(&path).unwrap();
+        let mut index = remanence_state::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         let mut world = VirtualWorld::single_drive("LIB-CURSOR", 0x100, "DRV-CURSOR", 0x400, 0);
         let mut tape = VirtualTape::empty(16 * 1024 * 1024, size as u32);
         tape.records.push(Record::Block(vec![0; size]));
@@ -13070,7 +13277,9 @@ fn admission_fence_evidence_omits_closed_and_unknown_ranges() {
     for range in [None, Some((3, 3)), Some((3, 5))] {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("state.sqlite");
-        let mut index = CatalogIndex::open(&path).unwrap();
+        let mut index = remanence_state::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         let (_, library) = unthreaded_cartridge_world("LIB-ADMISSION");
         let cfg = test_write_owner_config(
             path,
@@ -13147,7 +13356,9 @@ fn check_terminal_fence_precedes_recovery_failure(tail: bool) {
 /// Exercise the production failure handlers without a recoverable terminal intent.
 fn check_terminal_write_failure(tail: bool, reached_drive: bool) {
     let root = tempfile::tempdir().unwrap();
-    let mut index = CatalogIndex::open(root.path().join("index.sqlite")).unwrap();
+    let mut index = remanence_state::projector::open(root.path().join("index.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let uuid = [0x68; 16];
     index
         .provision_tape(ProvisionTapeInput {
@@ -13241,7 +13452,9 @@ fn check_terminal_write_failure(tail: bool, reached_drive: bool) {
 #[test]
 fn robotics_fence_admission_reads_current_catalog() {
     let dir = tempfile::tempdir().unwrap();
-    let mut index = CatalogIndex::open(dir.path().join("index.sqlite")).unwrap();
+    let mut index = remanence_state::projector::open(dir.path().join("index.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let mut library = test_changer_library("LIB");
     let bay = library.drive_bays[0].element_address;
     library.drive_bays[0].loaded_tape = Some("FENCED".into());
@@ -13285,7 +13498,9 @@ async fn two_tape_sessions_checkpoint_concurrently() {
     const BLOCK: u32 = 256 * 1024;
     let temp = tempfile::tempdir().unwrap();
     let index_path = temp.path().join("state.sqlite");
-    let mut index = CatalogIndex::open(&index_path).unwrap();
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let audit_dir = temp.path().join("audit");
     std::fs::create_dir_all(&audit_dir).unwrap();
     let audit_lock = Arc::new(Mutex::new(()));
@@ -13428,7 +13643,9 @@ async fn two_tape_sessions_checkpoint_concurrently() {
 async fn idle_unload_stops_when_live_element_status_finds_empty_bay() {
     let temp = tempfile::tempdir().unwrap();
     let index_path = temp.path().join("state.sqlite");
-    let index = CatalogIndex::open(&index_path).unwrap();
+    let index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let audit_dir = temp.path().join("audit");
     std::fs::create_dir_all(&audit_dir).unwrap();
     let mut world = VirtualWorld::single_drive("LIB-IDLE", 0x100, "DRV-IDLE", 0x400, 1);
@@ -13462,7 +13679,12 @@ async fn idle_unload_stops_when_live_element_status_finds_empty_bay() {
         prior_session_id: None,
     };
     pool.park_cartridge(seated.clone());
-    let mut api = crate::ApiState::new(index);
+    let mut api = crate::ApiState::new({
+        let index = index;
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    });
     api.library_snapshot = Some(cfg.library().snapshot.clone());
     api.drive_pool = Some(pool);
     api.drive_idle_unload_seconds = 1;
@@ -13493,7 +13715,9 @@ async fn idle_unload_stops_when_live_element_status_finds_empty_bay() {
 fn catalog_lock_refusal_logs_write_session_context() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("state.sqlite");
-    let mut index = CatalogIndex::open(&path).unwrap();
+    let mut index = remanence_state::projector::open(&path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let holder = rusqlite::Connection::open(&path).unwrap();
     holder.execute_batch("BEGIN IMMEDIATE").unwrap();
     let log_path = temp.path().join("daemon.log");
@@ -13687,3 +13911,6 @@ pub(crate) mod b3b_carrier_tests;
 
 #[path = "b3b_golden_tests.rs"]
 mod b3b_golden_tests;
+
+#[path = "b4a_tests.rs"]
+mod b4a_tests;

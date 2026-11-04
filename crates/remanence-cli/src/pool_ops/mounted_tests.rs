@@ -133,7 +133,7 @@ tape_catalog_dir = "{0}/cache"
     )
     .unwrap();
     state
-        .catalog_index()
+        .write_handle()
         .provision_tape(remanence_state::ProvisionTapeInput {
             tape_uuid: UUID,
             voltag: "HAND".into(),
@@ -143,7 +143,7 @@ tape_catalog_dir = "{0}/cache"
         })
         .unwrap();
     state
-        .catalog_index()
+        .write_handle()
         .set_tape_generation(
             UUID,
             remanence_state::MediaObservation {
@@ -153,7 +153,7 @@ tape_catalog_dir = "{0}/cache"
         )
         .unwrap();
     state
-        .catalog_index()
+        .write_handle()
         .project_tape_pool_membership(UUID, "default")
         .unwrap();
     let bootstrap = remanence_api::build_tape_bootstrap(
@@ -245,7 +245,7 @@ tape_catalog_dir = "{0}/cache"
                 let mounted = ChangerMount {
                     library: &mut library,
                     policy: &policy,
-                    index: state.catalog_index(),
+                    index: state.catalog(),
                 }
                 .mount(MountTarget::Tape { tape_uuid: UUID })
                 .unwrap();
@@ -261,20 +261,15 @@ tape_catalog_dir = "{0}/cache"
                 let result = match verb {
                     "read" => read_mounted_tape_object(
                         mounted,
-                        state.catalog_index(),
+                        state.catalog(),
                         &locator,
                         key,
                         &mut output,
                     ),
-                    "verify" => {
-                        verify_mounted_tape_object(mounted, state.catalog_index(), &locator, key)
+                    "verify" => verify_mounted_tape_object(mounted, state.catalog(), &locator, key),
+                    _ => {
+                        export_mounted_tape_object(mounted, state.catalog(), &locator, &mut output)
                     }
-                    _ => export_mounted_tape_object(
-                        mounted,
-                        state.catalog_index(),
-                        &locator,
-                        &mut output,
-                    ),
                 };
                 assert_eq!(
                     result.is_ok(),

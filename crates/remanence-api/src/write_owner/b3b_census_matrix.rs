@@ -695,7 +695,9 @@ fn run_cell(
     let _context = drive.scoped_outcome_context(context(path, command));
     let root = tempfile::tempdir().unwrap();
     let index_path = root.path().join("state.sqlite");
-    let mut index = CatalogIndex::open(&index_path).unwrap();
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
         "C9", 0x100, "C9D", 0x400, 1,
     )));

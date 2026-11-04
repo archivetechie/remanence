@@ -9,7 +9,7 @@ use remanence_format_driver::{
     ForeignFormatRegistry, FormatError, NormalizedEntry, ScanIntegrityBasis, SourceRequirement,
 };
 use remanence_state::{
-    AuditActor, CatalogIndex, CatalogUnitFilter, CatalogUnitRecord, DriveCorrelationRollupRecord,
+    AuditActor, CatalogUnitFilter, CatalogUnitRecord, DriveCorrelationRollupRecord,
     NativeObjectCopyRecord, NativeObjectFileRecord, NativeObjectRecord, OperationRecord,
     StateError, TapeFileRecord, TapePoolRecord, TapeRecord,
 };
@@ -120,7 +120,7 @@ pub(crate) fn native_object_stream(
     let (tx, rx) = tokio::sync::mpsc::channel(CATALOG_STREAM_BUFFER);
     tokio::task::spawn_blocking(move || {
         let result = (|| -> Result<(), Status> {
-            let index = CatalogIndex::open_read_only(&index_path)
+            let index = remanence_state::CatalogReader::open(&index_path)
                 .map_err(|err| Status::internal(err.to_string()))?;
             index
                 .for_each_native_object(|record| {
@@ -143,7 +143,7 @@ pub(crate) fn catalog_unit_stream(
     let (tx, rx) = tokio::sync::mpsc::channel(CATALOG_STREAM_BUFFER);
     tokio::task::spawn_blocking(move || {
         let result = (|| -> Result<(), Status> {
-            let index = CatalogIndex::open_read_only(&index_path)
+            let index = remanence_state::CatalogReader::open(&index_path)
                 .map_err(|err| Status::internal(err.to_string()))?;
             index
                 .for_each_catalog_unit(filter, |record| {

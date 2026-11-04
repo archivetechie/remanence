@@ -8,7 +8,7 @@ them, and each builds on the ones before it. The [glossary](reference-glossary.m
 short entry for every term, and the [architecture overview](architecture-overview.md) is the
 next step for a reader who wants the design in detail.
 
-<!-- code-anchor: crates/remanence-library/src/handle/tape_io/mod.rs crates/remanence-api/src/write_owner/checkpoint.rs crates/remanence-state/src/tape_log/mod.rs crates/remanence-state/src/tape_log/projection.rs crates/remanence-state/src/fence.rs crates/remanence-cli/src/standalone.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-library/src/handle/tape_io/mod.rs crates/remanence-api/src/write_owner/checkpoint.rs crates/remanence-state/src/tape_log/mod.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/fence.rs crates/remanence-cli/src/standalone.rs @ 625f7044 -->
 ## 1. How a tape behaves
 
 Remanence's design only makes sense against the behaviour of the medium, so this page starts

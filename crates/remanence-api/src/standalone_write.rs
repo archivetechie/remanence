@@ -152,7 +152,7 @@ pub(crate) fn supersede(
 ) -> Result<Vec<String>, MountError> {
     let uuid = client.tape_uuid();
     let row = state
-        .catalog_index()
+        .catalog()
         .get_tape(&uuid)
         .map_err(refusal)?
         .ok_or_else(|| refusal("adopt the tape before superseding its tail"))?;

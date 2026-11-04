@@ -142,7 +142,13 @@ fn record(
 ) -> Result<(), Status> {
     detail.insert("tape_uuid".into(), Value::Bytes(tape_uuid.to_vec()));
     append_operation_audit(
-        &mut state.index_write()?,
+        &mut {
+            let mut index = state.catalog.write_handle();
+            if let Some(pool) = &state.drive_pool {
+                index.set_readiness_observer(pool.readiness_wake.clone());
+            }
+            index
+        },
         state.audit_dir.as_ref(),
         state.audit_fsync,
         &state.audit_append_lock,

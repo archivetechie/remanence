@@ -543,7 +543,7 @@ impl<'a> OperatorMount<'a> {
 
     /// Catalog view for the common mounted-object read, verify, and export paths.
     pub fn catalog_index(&mut self) -> &CatalogIndex {
-        self.state.catalog_index()
+        self.state.catalog()
     }
 
     pub fn device_lock_path(serial: &str) -> PathBuf {
@@ -671,7 +671,7 @@ impl<'a> OperatorMount<'a> {
         if let Some(endpoint) = context.endpoint.durable_key() {
             state.replay_audit_projection().map_err(refusal)?;
             if matches!(endpoint, DriveKey::Standalone { .. }) {
-                standalone_fence_policy(state.catalog_index(), None, Some(endpoint), false)?;
+                standalone_fence_policy(state.catalog(), None, Some(endpoint), false)?;
                 state
                     .recover_sessions_after_restart(Some(endpoint), |state, session| {
                         if session.session_kind == "write" {
@@ -698,9 +698,9 @@ impl<'a> OperatorMount<'a> {
                         Ok(())
                     })
                     .map_err(refusal)?;
-                standalone_fence_policy(state.catalog_index(), None, Some(endpoint), false)?;
+                standalone_fence_policy(state.catalog(), None, Some(endpoint), false)?;
             } else if let Some(session) = state
-                .catalog_index()
+                .catalog()
                 .non_terminal_sessions()
                 .map_err(refusal)?
                 .into_iter()
@@ -730,7 +730,7 @@ impl<'a> OperatorMount<'a> {
     ) -> Result<T, MountError> {
         self.require_durable_mount(mounted)?;
         standalone_fence_policy(
-            self.state.catalog_index(),
+            self.state.catalog(),
             Some(mounted.tape_uuid),
             mounted.endpoint.durable_key(),
             true,
@@ -789,7 +789,7 @@ impl MountBackend for OperatorMount<'_> {
             .drive
             .take()
             .ok_or_else(|| refusal("one cartridge per invocation; start a new invocation"))?;
-        let result = prove_mount(&mut drive, self.state.catalog_index(), expected_uuid, &path);
+        let result = prove_mount(&mut drive, self.state.catalog(), expected_uuid, &path);
         match result {
             Ok((tape_uuid, label, generation)) => {
                 let proof_generation = drive.identity_generation();
@@ -1007,7 +1007,7 @@ impl OperatorMount<'_> {
     ) -> Result<(), MountError> {
         self.require_durable_mount(mounted)?;
         standalone_fence_policy(
-            self.state.catalog_index(),
+            self.state.catalog(),
             Some(mounted.tape_uuid),
             mounted.endpoint.durable_key(),
             true,
@@ -1020,7 +1020,7 @@ impl OperatorMount<'_> {
         .map_err(refusal)?;
         let tape = self
             .state
-            .catalog_index()
+            .catalog()
             .get_tape(&mounted.tape_uuid)
             .map_err(refusal)?
             .ok_or_else(|| refusal("adopt this tape before importing journals"))?;
@@ -1111,7 +1111,7 @@ impl OperatorMount<'_> {
             ),
         };
         self.state
-            .catalog_index()
+            .write_handle()
             .recover_imported_append_authority(
                 &lease,
                 parity_journal.as_deref(),
@@ -1119,7 +1119,7 @@ impl OperatorMount<'_> {
             )
             .map_err(refusal)?;
         self.state
-            .catalog_index()
+            .write_handle()
             .project_tape_log(&lease.freeze().map_err(refusal)?)
             .map_err(refusal)?;
         self.flush_audit()?;
@@ -1135,13 +1135,13 @@ pub(crate) fn raise_standalone_fence(
     detail: &str,
 ) -> Result<(), MountError> {
     let barcode = state
-        .catalog_index()
+        .catalog()
         .get_tape(&tape_uuid)
         .map_err(refusal)?
         .and_then(|t| t.voltag);
     let audit_dir = state.paths().audit_dir.clone();
     let fence = remanence_state::fence::raise(
-        state.catalog_index(),
+        &mut state.write_handle(),
         &audit_dir,
         remanence_state::TapeIoFenceInput {
             tape_uuid,

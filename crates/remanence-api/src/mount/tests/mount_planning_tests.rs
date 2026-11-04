@@ -167,7 +167,13 @@ fn planning_harness(
     .commit(report)
     .build()
     .unwrap();
-    let mut index = h.state.index_write().unwrap();
+    let mut index = {
+        let mut index = h.state.catalog.write_handle();
+        if let Some(pool) = &h.state.drive_pool {
+            index.set_readiness_observer(pool.readiness_wake.clone());
+        }
+        index
+    };
     index
         .provision_tape(ProvisionTapeInput {
             tape_uuid: uuid,

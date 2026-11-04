@@ -207,7 +207,9 @@ fn b3b_preparation_renderer_census() {
 fn b3b_fence_consumer_census() {
     let root = tempfile::tempdir().unwrap();
     let index_path = root.path().join("state.sqlite");
-    let mut index = CatalogIndex::open(&index_path).unwrap();
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
         "C6", 0x100, "C6D", 0x400, 1,
     )));
@@ -252,7 +254,9 @@ fn b3b_scoped_admission_fence_uses_classified_cause() {
     for scoped in [false, true] {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("state.sqlite");
-        let mut index = CatalogIndex::open(&path).unwrap();
+        let mut index = remanence_state::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         let (_, library) = unthreaded_cartridge_world("B3B-SCOPED");
         let cfg = test_write_owner_config(
             path,
@@ -316,7 +320,9 @@ fn check_settle_audit(scenario: &str) {
     let abandoned = post_write || matches!(scenario, "abandoned" | "abandoned-after-applied");
     let root = tempfile::tempdir().unwrap();
     let index_path = root.path().join("state.sqlite");
-    let mut index = CatalogIndex::open(&index_path).unwrap();
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
         "C6", 0x100, "C6D", 0x400, 1,
     )));
@@ -444,7 +450,9 @@ fn mounted_message_failure(
 ) {
     let root = tempfile::tempdir().unwrap();
     let index_path = root.path().join("state.sqlite");
-    let mut index = CatalogIndex::open(&index_path).unwrap();
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
         "C7", 0x100, "C7D", 0x400, 1,
     )));
@@ -529,7 +537,9 @@ fn b3b_same_cause_two_messages() {
             .map(|message| {
                 let root = tempfile::tempdir().unwrap();
                 let index_path = root.path().join("state.sqlite");
-                let mut index = CatalogIndex::open(&index_path).unwrap();
+                let mut index = remanence_state::projector::open(&index_path)
+                    .map(|catalog| catalog.write_handle())
+                    .unwrap();
                 let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
                     "C7", 0x100, "C7D", 0x400, 1,
                 )));
@@ -673,7 +683,9 @@ fn b3b_mounted_definite_rejection_no_fence() {
     const BLOCK: u32 = 4096;
     let root = tempfile::tempdir().unwrap();
     let index_path = root.path().join("state.sqlite");
-    let mut index = CatalogIndex::open(&index_path).unwrap();
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let world = VirtualWorld::single_drive("C7", 0x100, "C7D", 0x400, 1);
     let bootstrap = crate::build_tape_bootstrap(
         UUID,
@@ -1045,7 +1057,9 @@ fn b3b_fix1_terminal_prefix_eom_fence_precedes_recovery() {
     );
     let outcome =
         crate::write_owner::checkpoint::write_failure_outcome(&mut drive, before, Some(&error));
-    let mut index = CatalogIndex::open(root.path().join("index.sqlite")).unwrap();
+    let mut index = remanence_state::projector::open(root.path().join("index.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     index
         .provision_tape(ProvisionTapeInput {
             tape_uuid: uuid,

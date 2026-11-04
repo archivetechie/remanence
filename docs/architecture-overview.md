@@ -172,7 +172,7 @@ streaming, and ranged opens use a REMP `--private-key` file; the key's epoch id
 selects the matching slot in the key frame. `rem-recover` performs the same
 encrypted open without the daemon, catalog, or config.
 
-<!-- code-anchor: crates/remanence-state/src/state.rs crates/remanence-state/src/tape_log/projection.rs crates/remanence-state/src/index.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
+<!-- code-anchor: crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/projector/index.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
 ## Layer 4: state
 
 `remanence-state` holds everything the daemon remembers: the validated
@@ -229,7 +229,7 @@ promise. `rem-daemon` serves seven services:
 | `ReadPlanService` | `PlanBatchRead` — an advisory read-ordering RPC for a batch of targets on one tape; it moves no tape, and no client in this repository calls it; see [Read-order planning](#read-order-planning) |
 | `Audit` | registered on both the Unix socket and mTLS TCP listeners; its one RPC, `QueryAudit`, streams the append-only audit log back incrementally paged |
 
-<!-- code-anchor: crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/tape_closeout.rs crates/remanence-api/src/mount.rs crates/remanence-state/src/tape_log/mod.rs crates/remanence-state/src/index.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
+<!-- code-anchor: crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-api/src/tape_closeout.rs crates/remanence-api/src/mount.rs crates/remanence-state/src/tape_log/mod.rs crates/remanence-state/src/projector/index.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
 Write sessions own parity epochs from open to end. The native log's
 `SessionOpened`, `SessionEnded`, and `ClosedOut` records select the next
 access's complete suffix proof. A crash-torn final file is identified by its
@@ -304,7 +304,7 @@ The figure shows the multi-drive daemon topology. The standalone `rem` path
 described above runs beside it and deliberately has no changer or service
 process.
 
-<!-- code-anchor: crates/remanence-api/src/mount.rs crates/remanence-api/src/pool_write.rs crates/remanence-api/src/write_owner.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/checkpoint.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/append_admission.rs crates/remanence-state/src/index.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
+<!-- code-anchor: crates/remanence-api/src/mount.rs crates/remanence-api/src/pool_write.rs crates/remanence-api/src/write_owner.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/checkpoint.rs crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/append_admission.rs crates/remanence-state/src/projector/index.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
 ## The write path
 
 This section follows one object from an orchestrator's daemon request to a

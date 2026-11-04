@@ -554,7 +554,9 @@ fn after_durable_report_clears_cached_snapshot_and_has_distinct_error_type() {
 fn every_writer_acquisition_binds_the_current_projection_floor() {
     let dir = tempfile::tempdir().unwrap();
     let id = [0x84; 16];
-    let mut index = crate::CatalogIndex::open(dir.path().join("index.sqlite")).unwrap();
+    let mut index = crate::projector::open(dir.path().join("index.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let authority = TapeAuthority::open(dir.path(), id, index.path()).unwrap();
     let mut writer = authority.acquire_exclusive().unwrap();
     writer.publish_report(&(&record(id)).into()).unwrap();

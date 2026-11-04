@@ -52,7 +52,7 @@ pub(super) async fn due_tape(root: &Path) -> Arc<Mutex<VirtualWorld>> {
 }
 pub(super) fn state(root: &Path) -> crate::ApiState {
     let mut s = crate::ApiState::new_with_pool_configs(
-        CatalogIndex::open(root.join("state.sqlite")).unwrap(),
+        remanence_state::projector::open(root.join("state.sqlite")).unwrap(),
         vec![pool()],
     );
     s.checkpoint_journal_dir = Arc::new(root.join("journals/tapes"));
@@ -127,14 +127,18 @@ async fn current_empty_rebuild_retired_closeout_debt_exclusion_lost() {
         let state = state(root.path());
         scan(&state).unwrap();
         assert!(state.closeout_work.contains((TAPE, 1)));
-        state
-            .index_write()
-            .unwrap()
-            .retire_tape(remanence_state::RetireTapeInput {
-                tape_uuid: TAPE,
-                reason: "retired medium".into(),
-            })
-            .unwrap();
+        {
+            let mut index = state.catalog.write_handle();
+            if let Some(pool) = &state.drive_pool {
+                index.set_readiness_observer(pool.readiness_wake.clone());
+            }
+            index
+        }
+        .retire_tape(remanence_state::RetireTapeInput {
+            tape_uuid: TAPE,
+            reason: "retired medium".into(),
+        })
+        .unwrap();
         scan(&state).unwrap();
         assert!(!state.closeout_work.contains((TAPE, 1)));
     }
@@ -148,7 +152,13 @@ async fn current_empty_rebuild_retired_closeout_debt_exclusion_lost() {
     }
     let state = state(root.path());
     crate::startup_checkpoint::replay_checkpoint_journal_projections_with_audit(
-        &mut state.index_write().unwrap(),
+        &mut {
+            let mut index = state.catalog.write_handle();
+            if let Some(pool) = &state.drive_pool {
+                index.set_readiness_observer(pool.readiness_wake.clone());
+            }
+            index
+        },
         &state.checkpoint_journal_dir,
         &state.audit_dir,
         &state.audit_append_lock,
@@ -217,7 +227,13 @@ async fn b7_projection_failure_preserves_startup_queue_and_read_errors() {
     let db = rusqlite::Connection::open(&*state.index_path).unwrap();
     db.execute_batch("CREATE TRIGGER fail_b7_projection BEFORE UPDATE ON tapes BEGIN SELECT RAISE(ABORT, 'injected projection failure'); END;").unwrap();
     crate::startup_checkpoint::replay_checkpoint_journal_projections_with_audit(
-        &mut state.index_write().unwrap(),
+        &mut {
+            let mut index = state.catalog.write_handle();
+            if let Some(pool) = &state.drive_pool {
+                index.set_readiness_observer(pool.readiness_wake.clone());
+            }
+            index
+        },
         &state.checkpoint_journal_dir,
         &state.audit_dir,
         &state.audit_append_lock,
@@ -251,7 +267,13 @@ async fn b7_selection_prefers_debt_but_keeps_pinned_identity_and_capacity() {
     let mut config = pool();
     config.selection_policy = remanence_state::PoolSelectionPolicyName::FillOldest;
     let state = state(root.path());
-    let mut index = state.index_write().unwrap();
+    let mut index = {
+        let mut index = state.catalog.write_handle();
+        if let Some(pool) = &state.drive_pool {
+            index.set_readiness_observer(pool.readiness_wake.clone());
+        }
+        index
+    };
     let other = [0x11; 16];
     index
         .provision_tape(ProvisionTapeInput {
@@ -682,17 +704,21 @@ async fn b7_fix_partial_catalog_live_and_positive_native_mapping() {
     let bad = [0xb9; 16];
     let fresh = [0xba; 16];
     for (uuid, barcode) in [(bad, "BAD001L9"), (fresh, "NEW001L9")] {
-        state
-            .index_write()
-            .unwrap()
-            .provision_tape(ProvisionTapeInput {
-                tape_uuid: uuid,
-                voltag: barcode.into(),
-                block_size: BLOCK,
-                parity: ParityConfig::Scheme(scheme()),
-                force: false,
-            })
-            .unwrap();
+        {
+            let mut index = state.catalog.write_handle();
+            if let Some(pool) = &state.drive_pool {
+                index.set_readiness_observer(pool.readiness_wake.clone());
+            }
+            index
+        }
+        .provision_tape(ProvisionTapeInput {
+            tape_uuid: uuid,
+            voltag: barcode.into(),
+            block_size: BLOCK,
+            parity: ParityConfig::Scheme(scheme()),
+            force: false,
+        })
+        .unwrap();
     }
     std::fs::write(
         state
@@ -1014,22 +1040,30 @@ async fn b7_fix_pool_skips_excluded_or_failed_preferred_drive_and_never_evicts_e
         let world = due_tape(root.path()).await;
         let mut state = state(root.path());
         let other = [0xbc; 16];
-        state
-            .index_write()
-            .unwrap()
-            .provision_tape(ProvisionTapeInput {
-                tape_uuid: other,
-                voltag: "OTHER1L9".into(),
-                block_size: BLOCK,
-                parity: ParityConfig::Scheme(scheme()),
-                force: false,
-            })
-            .unwrap();
-        state
-            .index_write()
-            .unwrap()
-            .project_tape_pool_membership(other, POOL)
-            .unwrap();
+        {
+            let mut index = state.catalog.write_handle();
+            if let Some(pool) = &state.drive_pool {
+                index.set_readiness_observer(pool.readiness_wake.clone());
+            }
+            index
+        }
+        .provision_tape(ProvisionTapeInput {
+            tape_uuid: other,
+            voltag: "OTHER1L9".into(),
+            block_size: BLOCK,
+            parity: ParityConfig::Scheme(scheme()),
+            force: false,
+        })
+        .unwrap();
+        {
+            let mut index = state.catalog.write_handle();
+            if let Some(pool) = &state.drive_pool {
+                index.set_readiness_observer(pool.readiness_wake.clone());
+            }
+            index
+        }
+        .project_tape_pool_membership(other, POOL)
+        .unwrap();
         let mut inventory = world.lock().unwrap().library_snapshot();
         let mut healthy = inventory.drive_bays[0].clone();
         healthy.element_address = BAY + 1;
@@ -1355,14 +1389,18 @@ async fn b7_fix2_retired_debt_skips_unreadable_and_missing_logs() {
     };
     state.refresh_closeout_surfaces(&mut live).unwrap();
     assert_eq!(live.closeout_debt.len(), 1);
-    state
-        .index_write()
-        .unwrap()
-        .retire_tape(remanence_state::RetireTapeInput {
-            tape_uuid: TAPE,
-            reason: "damaged medium".into(),
-        })
-        .unwrap();
+    {
+        let mut index = state.catalog.write_handle();
+        if let Some(pool) = &state.drive_pool {
+            index.set_readiness_observer(pool.readiness_wake.clone());
+        }
+        index
+    }
+    .retire_tape(remanence_state::RetireTapeInput {
+        tape_uuid: TAPE,
+        reason: "damaged medium".into(),
+    })
+    .unwrap();
     let path = state
         .checkpoint_journal_dir
         .join(format!("{}.remtape", Uuid::from_bytes(TAPE).simple()));
@@ -1506,7 +1544,13 @@ async fn closeout_replay_after_admission_change(finalizing: bool) {
         original
     );
     crate::audit_projection::append_operation_audit(
-        &mut state.index_write().unwrap(),
+        &mut {
+            let mut index = state.catalog.write_handle();
+            if let Some(pool) = &state.drive_pool {
+                index.set_readiness_observer(pool.readiness_wake.clone());
+            }
+            index
+        },
         state.audit_dir.as_ref(),
         true,
         &state.audit_append_lock,
@@ -1524,11 +1568,15 @@ async fn closeout_replay_after_admission_change(finalizing: bool) {
         },
     )
     .unwrap();
-    state
-        .index_write()
-        .unwrap()
-        .clear_tape_pool_membership(TAPE)
-        .unwrap();
+    {
+        let mut index = state.catalog.write_handle();
+        if let Some(pool) = &state.drive_pool {
+            index.set_readiness_observer(pool.readiness_wake.clone());
+        }
+        index
+    }
+    .clear_tape_pool_membership(TAPE)
+    .unwrap();
     state.operations = Default::default();
     assert_eq!(
         crate::tape_closeout::start(&state, AuditActor::System, request).unwrap(),

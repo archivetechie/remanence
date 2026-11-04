@@ -4,8 +4,8 @@
 
 use remanence_api::{pb, ApiState};
 use remanence_state::{
-    AuditActor, AuditEvent, AuditEventRecord, AuditSubject, CatalogIndex, FileAuditLog,
-    SourceLayer, TapePoolProjectionInput,
+    AuditActor, AuditEvent, AuditEventRecord, AuditSubject, FileAuditLog, SourceLayer,
+    TapePoolProjectionInput,
 };
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
@@ -19,7 +19,9 @@ async fn serve_catalog_roundtrips_health_and_pools_over_unix_socket() {
         .expect("tempdir");
     let socket_path = dir.path().join("rem.sock");
 
-    let mut index = CatalogIndex::open(dir.path().join("state.sqlite")).expect("open index");
+    let mut index = remanence_state::projector::open(dir.path().join("state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open index");
     index
         .upsert_tape_pool_projection(TapePoolProjectionInput {
             pool_id: "scenario-a".to_string(),
@@ -46,7 +48,12 @@ async fn serve_catalog_roundtrips_health_and_pools_over_unix_socket() {
             detail: BTreeMap::new(),
         })
         .expect("seed audit");
-    let state = ApiState::new(index);
+    let state = ApiState::new({
+        let index = index;
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    });
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let serve_socket = socket_path.clone();
     let server = tokio::spawn(async move {
@@ -146,7 +153,9 @@ async fn serve_audit_query_roundtrips_over_mtls_transport() {
         .tempdir()
         .expect("tempdir");
     let socket_path = dir.path().join("rem.sock");
-    let index = CatalogIndex::open(dir.path().join("state.sqlite")).expect("open index");
+    let index = remanence_state::projector::open(dir.path().join("state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open index");
     let session_id = uuid::Uuid::new_v4();
     FileAuditLog::open(dir.path().join("audit"), false)
         .expect("open audit")
@@ -182,7 +191,12 @@ async fn serve_audit_query_roundtrips_over_mtls_transport() {
     let serve_socket = socket_path.clone();
     let server = tokio::spawn(async move {
         remanence_daemon::serve(
-            ApiState::new(index),
+            ApiState::new({
+                let index = index;
+                let catalog = remanence_state::projector::open(index.path()).unwrap();
+                drop(index);
+                catalog
+            }),
             &serve_socket,
             Some(tls_listener),
             async {
@@ -259,8 +273,15 @@ async fn serve_exits_when_shutdown_is_already_ready() {
         .tempdir()
         .expect("tempdir");
     let socket_path = dir.path().join("rem.sock");
-    let index = CatalogIndex::open(dir.path().join("state.sqlite")).expect("open index");
-    let state = ApiState::new(index);
+    let index = remanence_state::projector::open(dir.path().join("state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open index");
+    let state = ApiState::new({
+        let index = index;
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    });
 
     remanence_daemon::serve(state, &socket_path, None, async {})
         .await
@@ -280,8 +301,15 @@ async fn serve_hardens_created_socket_directory_and_socket_mode() {
         .expect("tempdir");
     let socket_dir = dir.path().join("runtime");
     let socket_path = socket_dir.join("rem.sock");
-    let index = CatalogIndex::open(dir.path().join("state.sqlite")).expect("open index");
-    let state = ApiState::new(index);
+    let index = remanence_state::projector::open(dir.path().join("state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open index");
+    let state = ApiState::new({
+        let index = index;
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    });
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let serve_socket = socket_path.clone();
@@ -326,8 +354,15 @@ async fn serve_refuses_to_unlink_live_unix_socket() {
         .expect("tempdir");
     let socket_path = dir.path().join("rem.sock");
     let _owner = std::os::unix::net::UnixListener::bind(&socket_path).expect("occupy socket");
-    let index = CatalogIndex::open(dir.path().join("state.sqlite")).expect("open index");
-    let state = ApiState::new(index);
+    let index = remanence_state::projector::open(dir.path().join("state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open index");
+    let state = ApiState::new({
+        let index = index;
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    });
 
     let err = remanence_daemon::serve(state, &socket_path, None, async {})
         .await
@@ -349,8 +384,15 @@ async fn read_only_state_refuses_write_session() {
         .prefix("rem-s2-ro")
         .tempdir()
         .expect("tempdir");
-    let index = CatalogIndex::open(dir.path().join("state.sqlite")).expect("open index");
-    let state = ApiState::new(index);
+    let index = remanence_state::projector::open(dir.path().join("state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open index");
+    let state = ApiState::new({
+        let index = index;
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    });
 
     let err = state
         .write_session_service()

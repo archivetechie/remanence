@@ -8,7 +8,7 @@ cartridge can be recycled or replaced without emptying the catalog. It also cove
 `rem tape rebind`, which moves an operator's label from one identity to another. The page
 is an explanation; nothing here is normative.
 
-<!-- code-anchor: crates/remanence-state/src/index.rs crates/remanence-api/src/tape_init.rs crates/remanence-api/src/pool_write/model.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-state/src/projector/index.rs crates/remanence-api/src/tape_init.rs crates/remanence-api/src/pool_write/model.rs @ 625f7044 -->
 ## 1. A tape has two names, and they mean different things
 
 A cartridge carries one name on the outside and one on the inside.
@@ -242,7 +242,7 @@ With retire:
 3. The workload runs again. The catalog, the audit log and the tape logs are intact, and the
    audit log has gained one `TapeRetired` record.
 
-<!-- code-anchor: crates/remanence-state/src/state.rs crates/remanence-state/src/tape_log/projection.rs crates/remanence-state/src/index.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs crates/remanence-state/src/projector/index.rs @ 625f7044 -->
 ## 5. Retire and catalog rebuild
 
 A retirement has to survive a catalog rebuild. This section explains why that takes more
@@ -326,7 +326,7 @@ catalog says that X is gone.
   `--dry-run` takes no state lock and opens the catalog read-only, so it can be used while
   the daemon runs.
 
-<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-state/src/state.rs crates/remanence-state/src/index.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-cli/src/standalone.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/index.rs @ 625f7044 -->
 ## 7. Rebind: moving an operator label to another identity
 
 On a standalone drive the outside name is the operator's label, and the operator may need

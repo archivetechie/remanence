@@ -1072,7 +1072,9 @@ fn overlap_admission_plans_object_larger_than_legacy_64_gib_cap() {
         .prefix("remanence-large-overlap-admission-")
         .tempdir()
         .expect("tempdir");
-    let mut state = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open catalog");
+    let mut state = remanence_state::projector::open(temp.path().join("rem-state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open catalog");
     let tape_uuid = [0x6b; 16];
     let block_size = 256 * 1024;
     state
@@ -1152,7 +1154,9 @@ fn batched_capacity_uses_session_local_physical_extent() {
         .prefix("remanence-batched-capacity-")
         .tempdir()
         .expect("tempdir");
-    let mut state = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open catalog");
+    let mut state = remanence_state::projector::open(temp.path().join("rem-state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open catalog");
     let tape_uuid = [0x6c; 16];
     let block_size = 256 * 1024;
     state
@@ -1203,7 +1207,9 @@ fn no_parity_exact_close_capacity_rolls_before_whole_object_motion() {
         .prefix("remanence-no-parity-terminal-capacity-")
         .tempdir()
         .expect("tempdir");
-    let mut state = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open catalog");
+    let mut state = remanence_state::projector::open(temp.path().join("rem-state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open catalog");
     let tape_uuid = [0x73; 16];
     let block_size = 256 * 1024;
     state
@@ -1286,7 +1292,9 @@ fn downward_pool_cap_is_the_shared_selection_and_terminal_capacity_basis() {
         .prefix("remanence-downward-capacity-basis-")
         .tempdir()
         .expect("tempdir");
-    let mut state = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open catalog");
+    let mut state = remanence_state::projector::open(temp.path().join("rem-state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open catalog");
     let tape_uuid = [0x74; 16];
     let block_size = 256 * 1024;
     state
@@ -1342,7 +1350,9 @@ fn close_only_authority_uses_capped_c_at_equality_and_below_low() {
         .prefix("remanence-close-only-capacity-authority-")
         .tempdir()
         .expect("tempdir");
-    let mut state = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open catalog");
+    let mut state = remanence_state::projector::open(temp.path().join("rem-state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open catalog");
     let tape_uuid = [0x5c; 16];
     let block_size = 256 * 1024;
     state
@@ -1492,7 +1502,9 @@ fn parity_capacity_reservation_uses_physical_cursor_exact_layout_and_atomic_spoo
         .prefix("remanence-parity-capacity-runtime-")
         .tempdir()
         .expect("tempdir");
-    let mut state = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open catalog");
+    let mut state = remanence_state::projector::open(temp.path().join("rem-state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open catalog");
     let tape_uuid = [0x6d; 16];
     let block_size = 256 * 1024;
     let scheme = ParityScheme {
@@ -1697,7 +1709,9 @@ fn parity_spool_shortfall_is_rejected_before_object_tape_motion() {
         .prefix("remanence-parity-capacity-shortfall-")
         .tempdir()
         .expect("tempdir");
-    let mut state = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open catalog");
+    let mut state = remanence_state::projector::open(temp.path().join("rem-state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open catalog");
     let tape_uuid = [0x6e; 16];
     let block_size = 256 * 1024;
     let scheme = ParityScheme {
@@ -1813,7 +1827,9 @@ fn parity_capacity_distinguishes_fresh_media_limit_from_current_tape_shortfall()
         .prefix("remanence-parity-capacity-boundary-")
         .tempdir()
         .expect("tempdir");
-    let mut state = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open catalog");
+    let mut state = remanence_state::projector::open(temp.path().join("rem-state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open catalog");
     let tape_uuid = [0x6f; 16];
     let block_size = 256 * 1024;
     let scheme = ParityScheme {
@@ -1966,7 +1982,9 @@ fn batched_parity_post_motion_projection_failure_sets_dirty_after_retryable_spoo
         .prefix("remanence-parity-session-retention-")
         .tempdir()
         .expect("tempdir");
-    let mut state = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open catalog");
+    let mut state = remanence_state::projector::open(temp.path().join("rem-state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open catalog");
     let pool_id = "capacity.session";
     let tape_uuid = [0x70; 16];
     let block_size = 256 * 1024;
@@ -2482,7 +2500,9 @@ fn fence_test_fixture() -> (tempfile::TempDir, CatalogIndex, SelectedTape) {
         .prefix("remanence-transfer-fence-")
         .tempdir()
         .expect("tempdir");
-    let mut state = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open catalog");
+    let mut state = remanence_state::projector::open(temp.path().join("rem-state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open catalog");
     let tape_uuid = [0x5a; 16];
     state
         .provision_tape(remanence_state::ProvisionTapeInput {
@@ -3170,7 +3190,9 @@ fn append_finish_does_not_double_count() {
         .tempdir()
         .expect("tempdir");
     let index_path = temp.path().join("rem-state.sqlite");
-    let mut index = CatalogIndex::open(&index_path).expect("open test index");
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open test index");
     let pool_id = "camera.copy-a";
     let tape_uuid = [4u8; 16];
     index
@@ -3394,7 +3416,9 @@ fn pinned_fixture() -> PinnedFixture {
         .prefix("remanence-pinned-admission-")
         .tempdir()
         .expect("tempdir");
-    let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open catalog");
+    let mut index = remanence_state::projector::open(temp.path().join("rem-state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("open catalog");
     index
         .upsert_tape_pool_projection(remanence_state::TapePoolProjectionInput {
             pool_id: PINNED_POOL.to_string(),
@@ -3505,7 +3529,9 @@ fn pinned_admission_refuses_unpooled_tape_under_a_guard() {
     let unpooled: TapeUuid = [0x5b; 16];
     {
         let mut index =
-            CatalogIndex::open(fixture._temp.path().join("rem-state.sqlite")).expect("reopen");
+            remanence_state::projector::open(fixture._temp.path().join("rem-state.sqlite"))
+                .map(|catalog| catalog.write_handle())
+                .expect("reopen");
         index
             .provision_tape(remanence_state::ProvisionTapeInput {
                 tape_uuid: unpooled,
@@ -3516,7 +3542,9 @@ fn pinned_admission_refuses_unpooled_tape_under_a_guard() {
             })
             .expect("provision unpooled tape");
     }
-    let fresh = CatalogIndex::open(fixture._temp.path().join("rem-state.sqlite")).expect("reopen");
+    let fresh = remanence_state::projector::open(fixture._temp.path().join("rem-state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("reopen");
     let error = admit_pinned_tape_for_write_session(
         &fresh,
         unpooled,
@@ -3538,7 +3566,9 @@ fn pinned_admission_refuses_cleaning_cartridge() {
     let fixture = pinned_fixture();
     let cleaning = {
         let mut index =
-            CatalogIndex::open(fixture._temp.path().join("rem-state.sqlite")).expect("reopen");
+            remanence_state::projector::open(fixture._temp.path().join("rem-state.sqlite"))
+                .map(|catalog| catalog.write_handle())
+                .expect("reopen");
         let record = index
             .ensure_cleaning_cartridge("CLN901L9")
             .expect("cleaning cartridge");
@@ -3551,7 +3581,9 @@ fn pinned_admission_refuses_cleaning_cartridge() {
             .expect("project cleaning membership");
         uuid
     };
-    let fresh = CatalogIndex::open(fixture._temp.path().join("rem-state.sqlite")).expect("reopen");
+    let fresh = remanence_state::projector::open(fixture._temp.path().join("rem-state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("reopen");
     let error = admit_pinned_tape_for_write_session(
         &fresh,
         cleaning,
@@ -3571,10 +3603,14 @@ fn pinned_admission_refuses_sealed_tape() {
     let fixture = pinned_fixture();
     {
         let mut index =
-            CatalogIndex::open(fixture._temp.path().join("rem-state.sqlite")).expect("reopen");
+            remanence_state::projector::open(fixture._temp.path().join("rem-state.sqlite"))
+                .map(|catalog| catalog.write_handle())
+                .expect("reopen");
         index.seal_tape(PINNED_TAPE).expect("seal tape");
     }
-    let fresh = CatalogIndex::open(fixture._temp.path().join("rem-state.sqlite")).expect("reopen");
+    let fresh = remanence_state::projector::open(fixture._temp.path().join("rem-state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("reopen");
     let error = admit_pinned_tape_for_write_session(
         &fresh,
         PINNED_TAPE,
@@ -3599,7 +3635,9 @@ fn pinned_admission_refuses_fenced_tape() {
     let fixture = pinned_fixture();
     {
         let mut index =
-            CatalogIndex::open(fixture._temp.path().join("rem-state.sqlite")).expect("reopen");
+            remanence_state::projector::open(fixture._temp.path().join("rem-state.sqlite"))
+                .map(|catalog| catalog.write_handle())
+                .expect("reopen");
         index
             .record_tape_io_fence(remanence_state::TapeIoFenceInput {
                 tape_uuid: PINNED_TAPE,
@@ -3609,7 +3647,9 @@ fn pinned_admission_refuses_fenced_tape() {
             })
             .expect("record fence");
     }
-    let fresh = CatalogIndex::open(fixture._temp.path().join("rem-state.sqlite")).expect("reopen");
+    let fresh = remanence_state::projector::open(fixture._temp.path().join("rem-state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .expect("reopen");
     let error = admit_pinned_tape_for_write_session(
         &fresh,
         PINNED_TAPE,

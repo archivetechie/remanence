@@ -145,11 +145,14 @@ async fn b9_buffered_tail_loss_reopens_without_supersede() {
     let (tx, opened, thread) =
         open_writer_with_selection(root.path(), open_model_library(world.clone()), selected).await;
     close_writer(&tx, opened.expect("lost buffered tail must reopen"), thread).await;
-    assert!(CatalogIndex::open(root.path().join("state.sqlite"))
-        .unwrap()
-        .list_active_tape_io_fences()
-        .unwrap()
-        .is_empty());
+    assert!(
+        remanence_state::projector::open(root.path().join("state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .unwrap()
+            .list_active_tape_io_fences()
+            .unwrap()
+            .is_empty()
+    );
     assert!(native_records(root.path()).iter().any(
         |r| matches!(r, NativeRecord::SessionEnded(e) if e.proved_eod == Some(frontier as u64))
     ));
@@ -451,7 +454,13 @@ async fn fresh_maintenance_settlement(kind: &str) {
             )
             .unwrap();
             assert!(super::super::preflight_manual_finalize_cancellable(
-                &mut state.index_write().unwrap(),
+                &mut {
+                    let mut index = state.catalog.write_handle();
+                    if let Some(pool) = &state.drive_pool {
+                        index.set_readiness_observer(pool.readiness_wake.clone());
+                    }
+                    index
+                },
                 super::super::ManualFinalizePreflightConfig {
                     mounted_endpoint: None,
                     checkpoint_journal_dir: state.checkpoint_journal_dir.as_path(),

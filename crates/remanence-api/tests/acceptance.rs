@@ -22,8 +22,8 @@ use remanence_library::transport::TransferOutcome;
 use remanence_library::{DiscoveryReport, ScsiError, SgTransport, StaticAllowlist, TimeoutClass};
 use remanence_parity::{bootstrap::write_bootstrap_block, parse_parity_arg, ParityConfig};
 use remanence_state::{
-    AuditActor, AuditEvent, AuditEventRecord, AuditSubject, CatalogIndex, RemConfig, SourceLayer,
-    StateHandle, StatePaths,
+    AuditActor, AuditEvent, AuditEventRecord, AuditSubject, RemConfig, SourceLayer, StateHandle,
+    StatePaths,
 };
 use tonic::{Code, Request, Status};
 
@@ -212,7 +212,7 @@ fn start(config: &RemConfig, worlds: &[SharedVirtualWorld], controls: &[Arc<Cont
     };
     let policy = StaticAllowlist::new((0..worlds.len()).map(serial));
     ApiState::with_drive_pool_opener(
-        CatalogIndex::open(&config.index.sqlite_path).unwrap(),
+        remanence_state::projector::open(&config.index.sqlite_path).unwrap(),
         config,
         report,
         policy,
@@ -339,7 +339,7 @@ impl Rig {
         for n in 0..libraries {
             for tape in [n, n + 10] {
                 let generation = state
-                    .catalog_index()
+                    .catalog()
                     .get_tape_assignment_snapshot(&uuid(tape))
                     .unwrap()
                     .unwrap()
@@ -460,7 +460,9 @@ impl Rig {
                 );
             }
         }
-        let index = CatalogIndex::open(&self.config.index.sqlite_path).unwrap();
+        let index = remanence_state::projector::open(&self.config.index.sqlite_path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         assert!(
             index.non_terminal_sessions().unwrap().is_empty(),
             "no durable session remains active"
@@ -867,9 +869,11 @@ fn daemon_startup_leaves_standalone_session_open() {
         state.replay_audit_projection().unwrap();
     }
     let _lock = remanence_state::StateLockGuard::acquire(&config.daemon.state_dir).unwrap();
-    let index = CatalogIndex::open(&config.index.sqlite_path).unwrap();
+    let index = remanence_state::projector::open(&config.index.sqlite_path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let _api = ApiState::new_with_config(
-        CatalogIndex::open(&config.index.sqlite_path).unwrap(),
+        remanence_state::projector::open(&config.index.sqlite_path).unwrap(),
         &config,
     )
     .unwrap();
@@ -922,7 +926,9 @@ async fn restart_marks_open_library_session_lost_before_admitting_writes() {
     let previous =
         uuid::Uuid::from_slice(&std::fs::read(root.path().join("session")).unwrap()).unwrap();
     let _state_lock = remanence_state::StateLockGuard::acquire(&config.daemon.state_dir).unwrap();
-    let index = CatalogIndex::open(&config.index.sqlite_path).unwrap();
+    let index = remanence_state::projector::open(&config.index.sqlite_path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     assert_eq!(
         index.session_state(previous).unwrap().as_deref(),
         Some("open")
@@ -1030,7 +1036,7 @@ async fn busy_changer_does_not_block_another_library() {
 fn release_fences(rig: &Rig) {
     let paths = StatePaths::from_config(rig.root.path().join("config.toml"), &rig.config);
     let mut state = StateHandle::open_with_config(paths, rig.config.clone()).unwrap();
-    let fences = state.catalog_index().list_active_tape_io_fences().unwrap();
+    let fences = state.catalog().list_active_tape_io_fences().unwrap();
     assert!(!fences.is_empty(), "failed append raises a durable fence");
     for fence in fences {
         assert_eq!(fence.tape_uuid, uuid(0));
@@ -1040,7 +1046,7 @@ fn release_fences(rig: &Rig) {
             .unwrap();
     }
     assert!(state
-        .catalog_index()
+        .catalog()
         .list_active_tape_io_fences()
         .unwrap()
         .is_empty());
@@ -1076,11 +1082,14 @@ async fn failed_append_durable_end_leaves_both_libraries_usable() {
     );
     rig.abort(&first).await;
     rig.assert_released().await;
-    assert!(CatalogIndex::open(&rig.config.index.sqlite_path)
-        .unwrap()
-        .list_active_tape_io_fences()
-        .unwrap()
-        .is_empty());
+    assert!(
+        remanence_state::projector::open(&rig.config.index.sqlite_path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap()
+            .list_active_tape_io_fences()
+            .unwrap()
+            .is_empty()
+    );
     let second = rig.open(1).await;
     append(&rig.api, &second, "unaffected").await.unwrap();
     rig.close(&second).await;

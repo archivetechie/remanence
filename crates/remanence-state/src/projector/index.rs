@@ -22,6 +22,7 @@
 //! | `tape_audit_cursors.audit_sequence` | assignment/label replay | replay and rebuild | Audit order prevents an older request from becoming new intent. |
 //! | `tape_audit_cursors.record_uuid` | assignment/label replay | replay integrity checks | The durable event identity distinguishes a repeated event from conflicting authority. |
 
+pub use super::CatalogIndex;
 use crate::authority::TapeAuthorityView as _;
 use remanence_parity::authority::{FilePublication, FilePurpose, StructuralState};
 use std::collections::{HashMap, HashSet};
@@ -49,7 +50,7 @@ use crate::{DriveKey, LabelProvenance, MediaObservation};
 /// Current Layer 4 SQLite schema version.
 pub const SCHEMA_VERSION: u32 = 24;
 
-#[path = "tape_log/projection.rs"]
+#[path = "tape_log_projection.rs"]
 mod tape_log_projection;
 
 /// Oldest clean-break catalog whose tape table can be inspected safely by the
@@ -140,10 +141,9 @@ pub const OBJECT_COPY_REPRESENTATION_UNKNOWN: &str = "unknown";
 
 /// Typed owner for the rebuildable SQLite catalog projection.
 #[derive(Debug)]
-pub struct CatalogIndex {
+pub(super) struct CatalogCore {
     conn: Connection,
     path: PathBuf,
-    readiness_observer: Option<std::sync::Arc<dyn MediaReadinessObserver>>,
 }
 
 /// Process-local notification after durable readiness changes.
@@ -1359,12 +1359,7 @@ pub struct TapeFileRecord {
     pub canonical_metadata_hash_algorithm: Option<String>,
 }
 
-impl CatalogIndex {
-    /// Subscribe this connection to durable readiness changes.
-    pub fn set_readiness_observer(&mut self, observer: std::sync::Arc<dyn MediaReadinessObserver>) {
-        self.readiness_observer = Some(observer);
-    }
-
+impl CatalogCore {
     /// Open the SQLite projection and apply idempotent migrations.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StateError> {
         let path = path.as_ref().to_path_buf();
@@ -1383,11 +1378,7 @@ impl CatalogIndex {
         }
         configure_sqlite(&conn)?;
         migrate(&conn)?;
-        Ok(Self {
-            conn,
-            path,
-            readiness_observer: None,
-        })
+        Ok(Self { conn, path })
     }
 
     /// Read structurally compatible schema-22/23 predecessors only for declared reset admission.
@@ -1407,7 +1398,6 @@ impl CatalogIndex {
         Ok(Self {
             conn,
             path: path.to_path_buf(),
-            readiness_observer: None,
         })
     }
     /// Open the SQLite projection for read-only query serving.
@@ -1421,11 +1411,7 @@ impl CatalogIndex {
             .map_err(|err| sqlite_open_error(&path, err))?;
         configure_read_only_sqlite(&conn)?;
         validate_schema(&conn)?;
-        Ok(Self {
-            conn,
-            path,
-            readiness_observer: None,
-        })
+        Ok(Self { conn, path })
     }
 
     /// Query the catalog in place without a temporary copy or writable read marks.
@@ -1467,11 +1453,7 @@ impl CatalogIndex {
         conn.pragma_update(None, "temp_store", "MEMORY")
             .map_err(|e| sqlite_error("set inventory temp store", e))?;
         validate_schema(&conn)?;
-        Ok(Self {
-            conn,
-            path,
-            readiness_observer: None,
-        })
+        Ok(Self { conn, path })
     }
 
     /// Read only the tape identities needed to admit an exact full-catalog
@@ -1554,8 +1536,8 @@ impl CatalogIndex {
         Ok((schema_version, tapes))
     }
 
-    /// Path backing this projection.
-    pub fn path(&self) -> &Path {
+    /// Path resolved by this connection opener.
+    pub(super) fn path(&self) -> &Path {
         &self.path
     }
 
@@ -1582,6 +1564,7 @@ impl CatalogIndex {
     /// Start or refresh a durable media-readiness operation.
     pub fn record_media_readiness_operation(
         &mut self,
+        readiness_observer: Option<&dyn MediaReadinessObserver>,
         input: MediaReadinessOperationInput,
     ) -> Result<MediaReadinessOperationRecord, StateError> {
         let now = now_utc()?;
@@ -1634,7 +1617,7 @@ impl CatalogIndex {
                 ],
             )
             .map_err(|err| sqlite_error("record media readiness operation", err))?;
-        if let Some(observer) = &self.readiness_observer {
+        if let Some(observer) = readiness_observer {
             observer.changed();
         }
         self.media_readiness_operation(input.operation_id)?
@@ -1644,6 +1627,7 @@ impl CatalogIndex {
     /// Record a durable transition for an existing media-readiness operation.
     pub fn record_media_readiness_transition(
         &mut self,
+        readiness_observer: Option<&dyn MediaReadinessObserver>,
         input: MediaReadinessTransitionInput,
     ) -> Result<MediaReadinessOperationRecord, StateError> {
         let now = now_utc()?;
@@ -1739,7 +1723,7 @@ impl CatalogIndex {
                 ],
             )
             .map_err(|err| sqlite_error("record media readiness transition history", err))?;
-        if let Some(observer) = &self.readiness_observer {
+        if let Some(observer) = readiness_observer {
             observer.changed();
         }
         self.media_readiness_operation(input.operation_id)?
@@ -2172,7 +2156,7 @@ impl CatalogIndex {
 
     /// Checkpoint every WAL frame into the main database and switch to a
     /// single-file journal mode before an atomic catalog-reset swap.
-    pub(crate) fn prepare_catalog_reset_atomic_swap(&self) -> Result<(), StateError> {
+    pub(crate) fn prepare_catalog_reset_atomic_swap(&mut self) -> Result<(), StateError> {
         prepare_catalog_reset_atomic_swap_conn(&self.conn)
     }
 
@@ -14153,10 +14137,25 @@ fn sqlite_error(context: &str, err: rusqlite::Error) -> StateError {
 }
 
 #[cfg(test)]
+impl CatalogCore {
+    /// Inject a panic after a row change but before the transaction commits.
+    pub(super) fn b4a_panic_in_transaction(&mut self) -> Result<(), StateError> {
+        let tx = self.conn.transaction().unwrap();
+        tx.execute(
+            "insert into tape_pools(pool_id, created_at_utc) values ('panic', 'now')",
+            [],
+        )
+        .unwrap();
+        panic!("b4a transaction unwind");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
+    use std::path::PathBuf;
 
     use ciborium::value::Value as CborValue;
     use remanence_library::scsi::Inquiry;
@@ -14175,7 +14174,9 @@ mod tests {
     fn catalog_write_transaction_waits_for_competing_writer() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("state.sqlite");
-        let mut index = CatalogIndex::open(&path).unwrap();
+        let mut index = crate::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         let holder = Connection::open(&path).unwrap();
         holder.execute_batch("BEGIN IMMEDIATE").unwrap();
         let (started, waiting) = std::sync::mpsc::channel();
@@ -14213,8 +14214,10 @@ mod tests {
             drop(conn);
             let before = std::fs::read(&path).unwrap();
             for error in [
-                CatalogIndex::open(&path).unwrap_err(),
-                CatalogIndex::open_read_only(&path).unwrap_err(),
+                crate::projector::open(&path)
+                    .map(|catalog| catalog.write_handle())
+                    .unwrap_err(),
+                crate::CatalogReader::open(&path).unwrap_err(),
             ] {
                 assert!(
                     error
@@ -14234,11 +14237,14 @@ mod tests {
     fn verification_schema_migration_and_exact_erase_columns() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("catalog.sqlite");
-        let index = CatalogIndex::open(&path).unwrap();
-        index.conn.execute_batch("alter table tapes drop column last_verified_at_utc; alter table tapes drop column last_verification_state; alter table tapes drop column last_verified_edition_digest; PRAGMA user_version = 20;").unwrap();
+        let index = crate::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
+        Connection::open(index.path()).unwrap().execute_batch("alter table tapes drop column last_verified_at_utc; alter table tapes drop column last_verification_state; alter table tapes drop column last_verified_edition_digest; PRAGMA user_version = 20;").unwrap();
         drop(index);
-        assert!(CatalogIndex::read_legacy_catalog_reset_erase_source(&path).is_ok());
-        assert!(CatalogIndex::open(&path)
+        assert!(crate::projector::read_legacy_catalog_reset_erase_source(&path).is_ok());
+        assert!(crate::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
             .unwrap_err()
             .to_string()
             .contains(crate::authority_layout::RESET_REQUIRED));
@@ -14246,7 +14252,7 @@ mod tests {
         conn.execute_batch("alter table tapes drop column block_size;")
             .unwrap();
         drop(conn);
-        assert!(CatalogIndex::read_legacy_catalog_reset_erase_source(&path).is_err());
+        assert!(crate::projector::read_legacy_catalog_reset_erase_source(&path).is_err());
     }
 
     /// Checkpoint replay is the sole source of new obligations; legacy cache rows
@@ -14263,7 +14269,9 @@ mod tests {
         ] {
             let root = tempfile::tempdir().unwrap();
             let uuid = [0x64; 16];
-            let mut index = CatalogIndex::open(root.path().join("index.sqlite")).unwrap();
+            let mut index = crate::projector::open(root.path().join("index.sqlite"))
+                .map(|catalog| catalog.write_handle())
+                .unwrap();
             index
                 .provision_tape(ProvisionTapeInput {
                     tape_uuid: uuid,
@@ -14342,7 +14350,9 @@ mod tests {
             assert!(index.get_tape(&uuid).unwrap().unwrap().seal_due.is_none());
             for event in [AuditEvent::TapeSealed, AuditEvent::TapeRetired] {
                 let mut other =
-                    CatalogIndex::open(root.path().join(format!("{event:?}.sqlite"))).unwrap();
+                    crate::projector::open(root.path().join(format!("{event:?}.sqlite")))
+                        .map(|catalog| catalog.write_handle())
+                        .unwrap();
                 other
                     .provision_tape(ProvisionTapeInput {
                         tape_uuid: uuid,
@@ -14370,7 +14380,9 @@ mod tests {
     fn schema_21_seal_due_requires_declared_reset() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("index.sqlite");
-        let mut index = CatalogIndex::open(&path).unwrap();
+        let mut index = crate::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         index
             .provision_tape(ProvisionTapeInput {
                 tape_uuid: [0x62; 16],
@@ -14380,17 +14392,18 @@ mod tests {
                 force: false,
             })
             .unwrap();
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute_batch("alter table tapes drop column seal_due; PRAGMA user_version=21;")
             .unwrap();
         drop(index);
         let before = std::fs::read(&path).unwrap();
-        assert!(CatalogIndex::open(&path)
+        assert!(crate::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
             .unwrap_err()
             .to_string()
             .contains(crate::authority_layout::RESET_REQUIRED));
-        assert!(CatalogIndex::open_read_only(&path)
+        assert!(crate::CatalogReader::open(&path)
             .unwrap_err()
             .to_string()
             .contains(crate::authority_layout::RESET_REQUIRED));
@@ -14404,7 +14417,9 @@ mod tests {
     fn schema_20_verification_requires_declared_reset() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("catalog.sqlite");
-        let mut index = CatalogIndex::open(&path).unwrap();
+        let mut index = crate::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         index
             .provision_tape(ProvisionTapeInput {
                 tape_uuid: [9; 16],
@@ -14414,8 +14429,8 @@ mod tests {
                 force: false,
             })
             .unwrap();
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute_batch(
                 "update tapes set cartridge_generation = null, generation_source = null;
             drop table tape_audit_cursors;
@@ -14428,11 +14443,12 @@ mod tests {
             .unwrap();
         drop(index);
         let before = std::fs::read(&path).unwrap();
-        assert!(CatalogIndex::open(&path)
+        assert!(crate::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
             .unwrap_err()
             .to_string()
             .contains(crate::authority_layout::RESET_REQUIRED));
-        assert!(CatalogIndex::open_read_only(&path)
+        assert!(crate::CatalogReader::open(&path)
             .unwrap_err()
             .to_string()
             .contains(crate::authority_layout::RESET_REQUIRED));
@@ -14472,7 +14488,9 @@ mod tests {
             ]),
         );
         let mut records = vec![provision, verdict];
-        let mut index = CatalogIndex::open(":memory:").unwrap();
+        let mut index = crate::projector::open(":memory:")
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         index
             .rebuild_from_authoritative_sources(&records, &[])
             .unwrap();
@@ -14493,7 +14511,9 @@ mod tests {
             records.push(failure);
         }
         assert_eq!(index.get_tape(&tape_uuid).unwrap().unwrap(), expected);
-        let mut rebuilt = CatalogIndex::open(":memory:").unwrap();
+        let mut rebuilt = crate::projector::open(":memory:")
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         rebuilt
             .rebuild_from_authoritative_sources(&records, &[])
             .unwrap();
@@ -14504,18 +14524,20 @@ mod tests {
     fn schema_19_without_path_index_requires_declared_reset() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("catalog.sqlite");
-        let index = CatalogIndex::open(&path).unwrap();
-        index
-            .conn
+        let index = crate::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
+        Connection::open(index.path()).unwrap()
             .execute_batch("drop index object_files_by_path_idx; drop table tape_audit_cursors; drop table tape_assignment_replay_baselines; PRAGMA user_version = 19;")
             .unwrap();
         drop(index);
         let before = std::fs::read(&path).unwrap();
-        assert!(CatalogIndex::open(&path)
+        assert!(crate::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
             .unwrap_err()
             .to_string()
             .contains(crate::authority_layout::RESET_REQUIRED));
-        assert!(CatalogIndex::open_read_only(&path)
+        assert!(crate::CatalogReader::open(&path)
             .unwrap_err()
             .to_string()
             .contains(crate::authority_layout::RESET_REQUIRED));
@@ -14527,7 +14549,7 @@ mod tests {
 
     #[test]
     fn path_versions_use_copy_pool_and_rowid_ties_with_legacy_caller_ids() {
-        let mut index = CatalogIndex::open(":memory:").unwrap();
+        let mut index = CatalogCore::open(":memory:").unwrap();
         for (tape, label) in [([1; 16], "FIRST"), ([2; 16], "SECOND")] {
             index
                 .provision_tape(ProvisionTapeInput {
@@ -14618,7 +14640,7 @@ mod tests {
 
     fn test_changer_inquiry() -> Inquiry {
         Inquiry::parse(include_bytes!(
-            "../../../fixtures/inquiry/changer-msl-g3.bin"
+            "../../../../fixtures/inquiry/changer-msl-g3.bin"
         ))
         .expect("parse changer inquiry fixture")
     }
@@ -14817,7 +14839,9 @@ mod tests {
             .prefix("remanence-index-watermark-orphans-")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let (input, mut state) = rebuild_fixture();
         state.orphaned_bundles.push(FileRowsReport {
             kind: FileRowsKind::Object,
@@ -15023,7 +15047,10 @@ mod tests {
     }
 
     fn query_strings(index: &CatalogIndex, sql: &str) -> Vec<String> {
-        let mut stmt = index.conn.prepare(sql).expect("prepare snapshot query");
+        let fixture_conn_stmt = Connection::open(index.path()).unwrap();
+        let mut stmt = fixture_conn_stmt
+            .prepare(sql)
+            .expect("prepare snapshot query");
         stmt.query_map([], |row| row.get::<_, String>(0))
             .expect("query snapshot rows")
             .map(|row| row.expect("snapshot row"))
@@ -15118,8 +15145,8 @@ mod tests {
 
     fn count_rows_for_tape(index: &CatalogIndex, table: &str, tape_uuid: [u8; 16]) -> u64 {
         let sql = format!("select count(*) from {table} where tape_uuid = ?1");
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .query_row(&sql, params![tape_uuid.to_vec()], |row| {
                 row.get::<_, u64>(0)
             })
@@ -15127,8 +15154,8 @@ mod tests {
     }
 
     fn highest_protected_ordinal(index: &CatalogIndex, tape_uuid: [u8; 16]) -> u64 {
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .query_row(
                 "select highest_protected_ordinal from tapes where tape_uuid = ?1",
                 params![tape_uuid.to_vec()],
@@ -15143,7 +15170,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [31u8; 16];
 
         index
@@ -15171,8 +15200,8 @@ mod tests {
         assert_eq!(tape.state, "ready");
         assert_eq!(tape.pool_id, None);
         assert_eq!(
-            index
-                .conn
+            Connection::open(index.path())
+                .unwrap()
                 .query_row("select count(*) from object_copies", [], |row| {
                     row.get::<_, u64>(0)
                 })
@@ -15187,7 +15216,9 @@ mod tests {
             .prefix("rem-pool-recon")
             .tempdir()
             .expect("tempdir");
-        let mut index = CatalogIndex::open(dir.path().join("s.sqlite")).expect("open");
+        let mut index = crate::projector::open(dir.path().join("s.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let uuid = [7u8; 16];
         index
             .provision_tape(ProvisionTapeInput {
@@ -15230,7 +15261,9 @@ mod tests {
             .prefix("rem-retired-pool-rebind")
             .tempdir()
             .expect("tempdir");
-        let mut index = CatalogIndex::open(dir.path().join("s.sqlite")).expect("open");
+        let mut index = crate::projector::open(dir.path().join("s.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let retired_uuid = [0x71; 16];
         let replacement_uuid = [0x72; 16];
         let voltag = "RMN009L9";
@@ -15305,7 +15338,9 @@ mod tests {
             .prefix("rem-sealed-pool-history")
             .tempdir()
             .expect("tempdir");
-        let mut index = CatalogIndex::open(dir.path().join("s.sqlite")).expect("open");
+        let mut index = crate::projector::open(dir.path().join("s.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [0x74; 16];
         let pools = [TapePoolProjectionInput {
             pool_id: "terminal-index".to_string(),
@@ -15352,7 +15387,9 @@ mod tests {
             .prefix("rem-pool-list")
             .tempdir()
             .expect("tempdir");
-        let mut index = CatalogIndex::open(dir.path().join("s.sqlite")).expect("open");
+        let mut index = crate::projector::open(dir.path().join("s.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let uuid = [9u8; 16];
         index
             .provision_tape(ProvisionTapeInput {
@@ -15385,7 +15422,9 @@ mod tests {
             .prefix("rem-kind-list")
             .tempdir()
             .expect("tempdir");
-        let mut index = CatalogIndex::open(dir.path().join("s.sqlite")).expect("open");
+        let mut index = crate::projector::open(dir.path().join("s.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let data_uuid = [10u8; 16];
         let cleaning_uuid = [11u8; 16];
         index
@@ -15433,7 +15472,9 @@ mod tests {
             .prefix("rem-cleaning-inventory")
             .tempdir()
             .expect("tempdir");
-        let mut index = CatalogIndex::open(dir.path().join("s.sqlite")).expect("open");
+        let mut index = crate::projector::open(dir.path().join("s.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
 
         let first = index
             .ensure_cleaning_cartridge(" CLNU01L9 ")
@@ -15460,7 +15501,9 @@ mod tests {
             .prefix("rem-kind-guard")
             .tempdir()
             .expect("tempdir");
-        let mut index = CatalogIndex::open(dir.path().join("s.sqlite")).expect("open");
+        let mut index = crate::projector::open(dir.path().join("s.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [12u8; 16];
         index
             .provision_tape(ProvisionTapeInput {
@@ -15471,8 +15514,8 @@ mod tests {
                 force: false,
             })
             .expect("provision tape");
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "insert into object_copies(object_id, tape_uuid, tape_file_number, status)
                  values('obj-guard', ?1, ?2, 'committed')",
@@ -15500,7 +15543,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let default_uuid = [41u8; 16];
         let specific_uuid = [42u8; 16];
         let unmatched_uuid = [43u8; 16];
@@ -15557,7 +15602,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [44u8; 16];
         let scheme = provision_scheme();
 
@@ -15655,7 +15702,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [32u8; 16];
         let scheme = provision_scheme();
 
@@ -15697,7 +15746,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [33u8; 16];
         let input = ProvisionTapeInput {
             tape_uuid,
@@ -15723,7 +15774,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [34u8; 16];
         index
             .provision_tape(ProvisionTapeInput {
@@ -15761,7 +15814,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [35u8; 16];
         index
             .provision_tape(ProvisionTapeInput {
@@ -15810,7 +15865,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let (input, state) = rebuild_fixture();
         let tape_uuid = input.tape_uuid;
         let scheme = input.scheme.clone().expect("scheme");
@@ -15855,7 +15912,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let (input, state) = rebuild_fixture();
         let old_tape_uuid = input.tape_uuid;
         index
@@ -15891,8 +15950,8 @@ mod tests {
                 ))
                 .expect("advance terminal finalization");
         }
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "insert into catalog_units(
                    unit_id, tape_uuid, origin_kind, format_id, adapter_state,
@@ -15952,7 +16011,9 @@ mod tests {
     #[test]
     fn force_reprovision_clears_seal_due() {
         let temp = tempfile::tempdir().unwrap();
-        let mut index = CatalogIndex::open(temp.path().join("index.sqlite")).unwrap();
+        let mut index = crate::projector::open(temp.path().join("index.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         let old_uuid = [0x60; 16];
         index
             .provision_tape(ProvisionTapeInput {
@@ -15963,15 +16024,15 @@ mod tests {
                 force: false,
             })
             .unwrap();
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "update tapes set written_extent_lba = X'0000000000000007' where tape_uuid = ?1",
                 [old_uuid.as_slice()],
             )
             .unwrap();
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "update tapes set seal_due = ?2 where tape_uuid = ?1",
                 params![old_uuid.as_slice(), "reached_low_watermark"],
@@ -16006,7 +16067,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let old_tape_uuid = [37u8; 16];
         let new_tape_uuid = [38u8; 16];
         index
@@ -16038,8 +16101,8 @@ mod tests {
             .expect("get new tape")
             .is_some());
         assert_eq!(
-            index
-                .conn
+            Connection::open(index.path())
+                .unwrap()
                 .query_row(
                     "select count(*) from tapes where voltag = 'RMN008L9'",
                     [],
@@ -16056,7 +16119,9 @@ mod tests {
             .prefix("remanence-index-reprovision-authority")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let old_uuid = [0x39; 16];
         let new_uuid = [0x3A; 16];
         index
@@ -16081,8 +16146,8 @@ mod tests {
                 TerminalFinalizationOutcome::InProgress,
             ))
             .expect("project finalization evidence");
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "update tapes set written_extent_lba = X'0000000000000007',
                                   last_committed_tape_file = null
@@ -16090,8 +16155,8 @@ mod tests {
                 params![old_uuid.as_slice()],
             )
             .expect("project extent without last file");
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "insert into catalog_units(
                    unit_id, tape_uuid, origin_kind, format_id, adapter_state,
@@ -16153,7 +16218,9 @@ mod tests {
             .prefix("remanence-index-reprovision-generation")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let old_uuid = [0x3B; 16];
         let new_uuid = [0x3C; 16];
         index
@@ -16165,8 +16232,8 @@ mod tests {
                 force: false,
             })
             .expect("provision identity");
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "update tapes set assignment_generation = ?2 where tape_uuid = ?1",
                 params![old_uuid.as_slice(), i64::MAX],
@@ -16192,7 +16259,9 @@ mod tests {
             .prefix("remanence-index-reprovision-guards")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let old_uuid = [0x3D; 16];
         let new_uuid = [0x3E; 16];
         index
@@ -16204,8 +16273,8 @@ mod tests {
                 force: false,
             })
             .expect("provision identity");
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "insert into wrap_maps(
                    tape_uuid, descriptors_json, mapped_extent_lba, write_epoch,
@@ -16214,8 +16283,8 @@ mod tests {
                 params![old_uuid.as_slice()],
             )
             .expect("insert stale wrap map");
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "insert into tape_io_fences(
                    tape_uuid, barcode, state, reason, quarantine_id,
@@ -16240,15 +16309,15 @@ mod tests {
         assert!(index.get_tape(&old_uuid).expect("old lookup").is_some());
         assert!(index.get_tape(&new_uuid).expect("new lookup").is_none());
 
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "update tape_io_fences set state = 'released' where tape_uuid = ?1",
                 params![old_uuid.as_slice()],
             )
             .expect("release quarantine");
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "insert into sessions(
                    session_id, session_kind, tape_uuid, state, opened_at_utc, updated_at_utc
@@ -16263,8 +16332,8 @@ mod tests {
         assert!(matches!(open_session, StateError::TapeProvisionConflict(_)));
         assert!(index.get_tape(&old_uuid).expect("old lookup").is_some());
 
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "update sessions set state = 'closed' where tape_uuid = ?1",
                 params![old_uuid.as_slice()],
@@ -16285,7 +16354,7 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let index = CatalogIndex::open(temp.path().join("index/rem-state.sqlite")).expect("open");
+        let index = CatalogCore::open(temp.path().join("index/rem-state.sqlite")).expect("open");
 
         assert_eq!(
             index.schema_version().expect("schema version"),
@@ -16349,7 +16418,9 @@ mod tests {
             .prefix("rem-readiness")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let operation_id = Uuid::from_u128(0x1234);
 
         let planned = index
@@ -16409,8 +16480,8 @@ mod tests {
         assert_eq!(becoming.last_ascq, Some(0x01));
         assert_eq!(becoming.quarantine_id.as_deref(), Some("q-1"));
         assert_eq!(
-            index
-                .conn
+            Connection::open(index.path())
+                .unwrap()
                 .query_row(
                     "select count(*) from media_readiness_transitions where operation_id = ?1",
                     params![operation_id.to_string()],
@@ -16482,8 +16553,8 @@ mod tests {
             .expect("active after ready")
             .is_empty());
         assert_eq!(
-            index
-                .conn
+            Connection::open(index.path())
+                .unwrap()
                 .query_row(
                     "select count(*) from media_readiness_transitions where operation_id = ?1",
                     params![operation_id.to_string()],
@@ -16500,7 +16571,9 @@ mod tests {
             .prefix("remanence-readiness-load-attempts")
             .tempdir()
             .expect("tempdir");
-        let mut index = CatalogIndex::open(temp.path().join("state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let operation_id = Uuid::new_v4();
         index
             .record_media_readiness_operation(MediaReadinessOperationInput {
@@ -16570,7 +16643,9 @@ mod tests {
             .prefix("rem-readiness-nonrebuildable")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let operation_id = Uuid::from_u128(0x5678);
 
         index
@@ -16592,7 +16667,8 @@ mod tests {
             })
             .expect("record readiness");
 
-        let tx = index.conn.transaction().expect("transaction");
+        let mut fixture_conn_tx = Connection::open(index.path()).unwrap();
+        let tx = fixture_conn_tx.transaction().expect("transaction");
         clear_rebuildable_tables(&tx).expect("clear rebuildable");
         tx.commit().expect("commit");
 
@@ -16613,7 +16689,9 @@ mod tests {
         let tape_uuid = [0x44; 16];
         let other_uuid = [0x55; 16];
         let quarantine_id = {
-            let mut index = CatalogIndex::open(&path).expect("open");
+            let mut index = crate::projector::open(&path)
+                .map(|catalog| catalog.write_handle())
+                .expect("open");
             let record = index
                 .record_tape_io_fence(TapeIoFenceInput {
                     tape_uuid,
@@ -16649,13 +16727,16 @@ mod tests {
                 .expect("unrelated no conflict")
                 .is_empty());
 
-            let tx = index.conn.transaction().expect("transaction");
+            let mut fixture_conn_tx = Connection::open(index.path()).unwrap();
+            let tx = fixture_conn_tx.transaction().expect("transaction");
             clear_rebuildable_tables(&tx).expect("clear rebuildable");
             tx.commit().expect("commit");
             record.quarantine_id
         };
 
-        let mut reopened = CatalogIndex::open(&path).expect("reopen");
+        let mut reopened = crate::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .expect("reopen");
         assert_eq!(
             reopened
                 .list_active_tape_io_fences()
@@ -16684,7 +16765,9 @@ mod tests {
             .prefix("rem-readiness-admission")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let operation_id = Uuid::from_u128(0x9012);
 
         index
@@ -16881,7 +16964,9 @@ mod tests {
             .tempdir()
             .expect("tempdir");
         let path = dir.path().join("rem-state.sqlite");
-        let index = CatalogIndex::open(&path).expect("open index");
+        let index = crate::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .expect("open index");
         assert_eq!(
             index.schema_version().expect("schema version"),
             SCHEMA_VERSION
@@ -16951,7 +17036,9 @@ mod tests {
             .expect("mark schema v12");
         drop(conn);
 
-        let error = CatalogIndex::open(&path).expect_err("v12 catalog must require rebuild");
+        let error = crate::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .expect_err("v12 catalog must require rebuild");
         assert!(
             matches!(error, StateError::IndexMigrationFailed(ref message)
                 if message.contains(crate::authority_layout::RESET_REQUIRED)),
@@ -16966,7 +17053,9 @@ mod tests {
             .tempdir()
             .expect("tempdir");
         let path = dir.path().join("s.sqlite");
-        let _index = CatalogIndex::open(&path).expect("open");
+        let _index = crate::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let conn = Connection::open(&path).expect("open raw sqlite");
         let exists: Option<String> = conn
             .query_row(
@@ -16989,9 +17078,11 @@ mod tests {
             .tempdir()
             .expect("temp dir");
         let path = temp.path().join("rem-state.sqlite");
-        let first = CatalogIndex::open(&path).expect("open");
-        first
-            .conn
+        let first = crate::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
+        Connection::open(first.path())
+            .unwrap()
             .execute(
                 "insert into schema_meta(key, value) values('custom', ?1)",
                 params![b"kept".as_slice()],
@@ -16999,9 +17090,11 @@ mod tests {
             .expect("insert custom row");
         drop(first);
 
-        let second = CatalogIndex::open(&path).expect("reopen");
-        let value: Vec<u8> = second
-            .conn
+        let second = crate::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .expect("reopen");
+        let value: Vec<u8> = Connection::open(second.path())
+            .unwrap()
             .query_row(
                 "select value from schema_meta where key = 'custom'",
                 [],
@@ -17092,11 +17185,12 @@ mod tests {
         drop(conn);
 
         let before = std::fs::read(&path).unwrap();
-        assert!(CatalogIndex::open(&path)
+        assert!(crate::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
             .unwrap_err()
             .to_string()
             .contains(crate::authority_layout::RESET_REQUIRED));
-        assert!(CatalogIndex::open_read_only(&path)
+        assert!(crate::CatalogReader::open(&path)
             .unwrap_err()
             .to_string()
             .contains(crate::authority_layout::RESET_REQUIRED));
@@ -17120,7 +17214,9 @@ mod tests {
             .expect("mark pre-DS-M1 version");
         drop(conn);
 
-        let error = CatalogIndex::open(&path).expect_err("v8 catalog must require rebuild");
+        let error = crate::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .expect_err("v8 catalog must require rebuild");
         assert!(
             matches!(error, StateError::IndexMigrationFailed(ref message)
                 if message.contains(crate::authority_layout::RESET_REQUIRED)),
@@ -17135,7 +17231,9 @@ mod tests {
             .tempdir()
             .expect("temp dir");
         let path = temp.path().join("rem-state.sqlite");
-        let mut index = CatalogIndex::open(&path).expect("open");
+        let mut index = crate::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [0x33; 16];
         index
             .provision_tape(ProvisionTapeInput {
@@ -17146,8 +17244,8 @@ mod tests {
                 force: false,
             })
             .expect("provision CLN tape");
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "update tapes
                  set kind = 'cleaning', cleaning_uses = 7, cleaning_state = 'ok'
@@ -17213,8 +17311,8 @@ mod tests {
             .rebuild_from_authoritative_sources(&[session_record], &[])
             .expect("rebuild projections");
 
-        let tape_fields: (String, Option<i64>, Option<String>) = index
-            .conn
+        let tape_fields: (String, Option<i64>, Option<String>) = Connection::open(index.path())
+            .unwrap()
             .query_row(
                 "select kind, cleaning_uses, cleaning_state from tapes where tape_uuid = ?1",
                 params![tape_uuid.to_vec()],
@@ -17241,8 +17339,8 @@ mod tests {
             1
         );
         assert_eq!(index.list_alarms(false).expect("alarms").len(), 1);
-        let projected_drive_uuid: Vec<u8> = index
-            .conn
+        let projected_drive_uuid: Vec<u8> = Connection::open(index.path())
+            .unwrap()
             .query_row(
                 "select drive_uuid from sessions where session_id = ?1",
                 params![session_id.to_string()],
@@ -17255,7 +17353,9 @@ mod tests {
         );
 
         drop(index);
-        let reopened = CatalogIndex::open(&path).expect("reopen after rebuild");
+        let reopened = crate::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .expect("reopen after rebuild");
         assert_eq!(reopened.list_drives(false, false).expect("drives").len(), 1);
         assert_eq!(
             reopened
@@ -17272,7 +17372,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
 
         let first = index
             .observe_drive(DriveObservationInput {
@@ -17344,8 +17446,8 @@ mod tests {
             })
             .expect("observe collided serial");
         assert!(collided.serial_collision);
-        let rows = index
-            .conn
+        let fixture_conn_rows = Connection::open(index.path()).unwrap();
+        let rows = fixture_conn_rows
             .prepare("select actionable from drives where serial = 'SER123'")
             .expect("prepare collision query")
             .query_map([], |row| row.get::<_, i64>(0))
@@ -17369,7 +17471,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
 
         let outcomes = index
             .observe_drive_inventory_snapshot(vec![
@@ -17401,8 +17505,8 @@ mod tests {
         assert_eq!(outcomes.len(), 2);
         assert_ne!(outcomes[0].drive_uuid, outcomes[1].drive_uuid);
         assert!(outcomes.iter().all(|outcome| outcome.serial_collision));
-        let rows = index
-            .conn
+        let fixture_conn_rows = Connection::open(index.path()).unwrap();
+        let rows = fixture_conn_rows
             .prepare(
                 "select actionable, last_element_address
                  from drives
@@ -17431,7 +17535,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
 
         let first = index
             .observe_drive_inventory_snapshot(vec![DriveObservationInput {
@@ -17483,7 +17589,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let drive_uuid = index
             .observe_drive(DriveObservationInput {
                 serial: "SNAP123".to_string(),
@@ -17539,7 +17647,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let drive_uuid = index
             .observe_drive(DriveObservationInput {
                 serial: "MANUAL123".to_string(),
@@ -17598,7 +17708,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let managed = index
             .observe_drive(DriveObservationInput {
                 serial: "CLEAN-M".to_string(),
@@ -17657,7 +17769,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [0x44; 16];
         index
             .provision_tape(ProvisionTapeInput {
@@ -17752,7 +17866,9 @@ mod tests {
             .tempdir()
             .expect("temp dir");
         let path = temp.path().join("rem-state.sqlite");
-        let mut index = CatalogIndex::open(&path).expect("open");
+        let mut index = crate::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
 
         let opened = index
             .raise_alarm("no-cln-cart:mainlib", "no-cln-cart", "critical", Some("{}"))
@@ -17780,7 +17896,9 @@ mod tests {
         );
 
         drop(index);
-        let reopened = CatalogIndex::open(&path).expect("reopen");
+        let reopened = crate::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .expect("reopen");
         assert_eq!(
             reopened
                 .get_alarm("no-cln-cart:mainlib")
@@ -17797,7 +17915,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
 
         index
             .raise_alarm("no-cln-cart:mainlib", "no-cln-cart", "critical", Some("{}"))
@@ -17827,7 +17947,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let drive_uuid = index
             .observe_drive(DriveObservationInput {
                 serial: "D2DRV01".to_string(),
@@ -17892,7 +18014,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let drive_uuid = index
             .observe_drive(DriveObservationInput {
                 serial: "DRV-CLEAN".to_string(),
@@ -17917,8 +18041,8 @@ mod tests {
                 force: false,
             })
             .expect("provision cleaning tape");
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "update tapes
                  set kind = 'cleaning', cleaning_uses = 0, cleaning_state = 'ok'
@@ -17970,8 +18094,8 @@ mod tests {
                 Some("{\"stage\":\"moving-back\"}"),
             )
             .expect("moving back");
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "update drives set cleaning_due = 'now' where drive_uuid = ?1",
                 params![drive_uuid.to_vec()],
@@ -17993,8 +18117,8 @@ mod tests {
             .expect("drive row");
         assert_eq!(drive.cleaning_due, "none");
         assert!(!drive.fenced);
-        let tape: (String, i64, Option<String>) = index
-            .conn
+        let tape: (String, i64, Option<String>) = Connection::open(index.path())
+            .unwrap()
             .query_row(
                 "select kind, cleaning_uses, cleaning_state from tapes where tape_uuid = ?1",
                 params![tape_uuid.to_vec()],
@@ -18015,7 +18139,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let drive_uuid = index
             .observe_drive(DriveObservationInput {
                 serial: "DRV-RESUME".to_string(),
@@ -18040,8 +18166,8 @@ mod tests {
                 force: false,
             })
             .expect("provision cleaning tape");
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "update tapes
                  set kind = 'cleaning', cleaning_uses = 0, cleaning_state = 'ok'
@@ -18104,11 +18230,13 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let run_id = Uuid::new_v4().to_string();
         let drive_uuid = [0x5Au8; 16];
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "insert into clean_runs(
                    run_id, drive_uuid, library_serial, cart_tape_uuid,
@@ -18152,7 +18280,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let drive_uuid = index
             .observe_drive(DriveObservationInput {
                 serial: "DRV-FENCE".to_string(),
@@ -18183,7 +18313,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let drive_uuid = index
             .observe_drive(DriveObservationInput {
                 serial: "DRV-JOIN".to_string(),
@@ -18219,7 +18351,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [0x46; 16];
         index
             .provision_tape(ProvisionTapeInput {
@@ -18230,8 +18364,8 @@ mod tests {
                 force: false,
             })
             .expect("provision cleaning tape");
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "update tapes
                  set kind = 'cleaning', cleaning_uses = 7, cleaning_state = 'expired'
@@ -18245,8 +18379,8 @@ mod tests {
             .expect("state lookup")
             .expect("state row");
         assert_eq!(state, Some("expired".to_string()));
-        let tape: (String, i64, Option<String>) = index
-            .conn
+        let tape: (String, i64, Option<String>) = Connection::open(index.path())
+            .unwrap()
             .query_row(
                 "select kind, cleaning_uses, cleaning_state from tapes where tape_uuid = ?1",
                 params![tape_uuid.to_vec()],
@@ -18264,7 +18398,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [0x47; 16];
         index
             .provision_tape(ProvisionTapeInput {
@@ -18275,8 +18411,8 @@ mod tests {
                 force: false,
             })
             .expect("provision cleaning tape");
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "update tapes
                  set kind = 'cleaning', cleaning_uses = 2, cleaning_state = 'rejected'
@@ -18284,8 +18420,8 @@ mod tests {
                 params![tape_uuid.to_vec()],
             )
             .expect("mark rejected cleaning cartridge");
-        let tape: (String, i64, Option<String>) = index
-            .conn
+        let tape: (String, i64, Option<String>) = Connection::open(index.path())
+            .unwrap()
             .query_row(
                 "select kind, cleaning_uses, cleaning_state from tapes where tape_uuid = ?1",
                 params![tape_uuid.to_vec()],
@@ -18310,7 +18446,9 @@ mod tests {
             .expect("set future version");
         drop(conn);
 
-        let err = CatalogIndex::open(&path).expect_err("future schema must fail");
+        let err = crate::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .expect_err("future schema must fail");
         assert!(err.to_string().contains("newer than supported"), "{err}");
     }
 
@@ -18334,7 +18472,9 @@ mod tests {
             .expect("set v17 version");
         drop(conn);
 
-        let error = CatalogIndex::open(&path).expect_err("v17 catalog must require rebuild");
+        let error = crate::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .expect_err("v17 catalog must require rebuild");
         let StateError::IndexMigrationFailed(message) = error else {
             panic!("expected migration failure, got {error}");
         };
@@ -18370,7 +18510,9 @@ mod tests {
             .expect("spoof current version");
         drop(conn);
 
-        let error = CatalogIndex::open(&path).expect_err("schema shape must be validated");
+        let error = crate::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .expect_err("schema shape must be validated");
         assert!(
             matches!(error, StateError::IndexMigrationFailed(ref message)
                 if message.contains("not a canonical unsigned BLOB column")),
@@ -18383,9 +18525,14 @@ mod tests {
     fn inventory_escapes_paths_and_refuses_writes() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("catalog %?#.sqlite");
-        drop(CatalogIndex::open(&path).unwrap());
+        drop(
+            crate::projector::open(&path)
+                .map(|catalog| catalog.write_handle())
+                .unwrap(),
+        );
         let before = std::fs::read(&path).unwrap();
-        let mut reader = CatalogIndex::open_inventory(&path).unwrap();
+        // Pin the private connection flags as well as the public compile-fail boundary.
+        let mut reader = CatalogCore::open_inventory(&path).unwrap();
         assert!(reader
             .upsert_tape_pool_projection(crate::TapePoolProjectionInput {
                 pool_id: "must-not-exist".into(),
@@ -18411,19 +18558,25 @@ mod tests {
             .tempdir()
             .expect("temp dir");
         let path = temp.path().join("rem-state.sqlite");
-        let index = CatalogIndex::open(&path).expect("open writable");
+        let index = crate::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .expect("open writable");
         drop(index);
 
-        let read_only = CatalogIndex::open_read_only(&path).expect("open read only");
+        let read_only = crate::CatalogReader::open(&path).expect("open read only");
         assert_eq!(read_only.quick_check().expect("quick check"), "ok");
         let busy_timeout_ms: u32 = read_only
-            .conn
-            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
-            .expect("busy timeout");
+            .with_core(|core| {
+                Ok(core
+                    .conn
+                    .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+                    .expect("busy timeout"))
+            })
+            .expect("read catalog connection");
         assert_eq!(busy_timeout_ms, 5000);
 
         let missing = temp.path().join("missing.sqlite");
-        let err = CatalogIndex::open_read_only(&missing).expect_err("missing read-only db");
+        let err = crate::CatalogReader::open(&missing).expect_err("missing read-only db");
         assert!(
             err.to_string().contains("open sqlite"),
             "unexpected error: {err}"
@@ -18436,7 +18589,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [7u8; 16];
         let scheme = ParityScheme {
             id: SchemeId::new_static("test-scheme"),
@@ -18542,8 +18697,8 @@ mod tests {
         assert_eq!(report.tape_files_rebuilt, 4);
         assert_eq!(report.object_copies_rebuilt, 1);
         assert_eq!(
-            index
-                .conn
+            Connection::open(index.path())
+                .unwrap()
                 .query_row(
                     "select state from tapes where tape_uuid = ?1",
                     params![tape_uuid.to_vec()],
@@ -18553,8 +18708,8 @@ mod tests {
             "ingested"
         );
         assert_eq!(
-            index
-                .conn
+            Connection::open(index.path())
+                .unwrap()
                 .query_row("select count(*) from tape_files", [], |row| {
                     row.get::<_, u64>(0)
                 })
@@ -18562,8 +18717,8 @@ mod tests {
             4
         );
         assert_eq!(
-            index
-                .conn
+            Connection::open(index.path())
+                .unwrap()
                 .query_row("select status from object_copies", [], |row| {
                     row.get::<_, String>(0)
                 })
@@ -18571,8 +18726,8 @@ mod tests {
             "committed"
         );
         assert_eq!(
-            index
-                .conn
+            Connection::open(index.path())
+                .unwrap()
                 .query_row("select pool_id from object_copies", [], |row| {
                     row.get::<_, String>(0)
                 })
@@ -18580,8 +18735,8 @@ mod tests {
             "camera.copy-a"
         );
         assert_eq!(
-            index
-                .conn
+            Connection::open(index.path())
+                .unwrap()
                 .query_row(
                     "select origin_kind, format_id, native_object_id from catalog_units",
                     [],
@@ -18674,7 +18829,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let (input, state) = rebuild_fixture();
         let scheme = input.scheme.clone().expect("fixture has parity scheme");
 
@@ -18693,8 +18850,8 @@ mod tests {
             .index_committed_tape_journal(input.clone(), &state)
             .expect("ingest committed journal");
 
-        let (state, last_file): (String, Option<SqliteU64>) = index
-            .conn
+        let (state, last_file): (String, Option<SqliteU64>) = Connection::open(index.path())
+            .unwrap()
             .query_row(
                 "select state, last_committed_tape_file from tapes where tape_uuid = ?1",
                 params![input.tape_uuid.to_vec()],
@@ -18733,8 +18890,8 @@ mod tests {
         index: &CatalogIndex,
         tape_uuid: [u8; 16],
     ) -> (String, Option<String>) {
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .query_row(
                 "select state, voltag from tapes where tape_uuid = ?1",
                 params![tape_uuid.to_vec()],
@@ -18744,8 +18901,8 @@ mod tests {
     }
 
     fn copy_statuses(index: &CatalogIndex, tape_uuid: [u8; 16]) -> Vec<String> {
-        let mut stmt = index
-            .conn
+        let fixture_conn_stmt = Connection::open(index.path()).unwrap();
+        let mut stmt = fixture_conn_stmt
             .prepare("select status from object_copies where tape_uuid = ?1 order by status")
             .expect("prepare copy status query");
         let statuses = stmt
@@ -18762,7 +18919,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let (input, state) = rebuild_fixture();
         let scheme = input.scheme.clone().expect("fixture has parity scheme");
         index
@@ -18825,7 +18984,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let (input, _state) = provisioned_committed_fixture(&mut index, "RMJ102L9");
         index
             .retire_tape(RetireTapeInput {
@@ -18860,7 +19021,9 @@ mod tests {
             .prefix("remanence-retired-seal-audit")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [0x73; 16];
         index
             .provision_tape(ProvisionTapeInput {
@@ -18909,7 +19072,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
 
         let err = index
             .retire_tape(RetireTapeInput {
@@ -18931,7 +19096,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let (input, _state) = provisioned_committed_fixture(&mut index, "RMJ103L9");
         index
             .retire_tape(RetireTapeInput {
@@ -18987,7 +19154,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         // No pool membership on purpose: a pool_id would keep the row
         // preserved through the `pool_id is not null` arm and mask a revert
         // of the `state = 'retired'` preserve-predicate arm.
@@ -19060,8 +19229,8 @@ mod tests {
         // row, simulating the rebuild-internal moment between ingest and
         // merge (this is the layer that survives even if the ingest CASE
         // regresses).
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "update tapes set state = 'ingested' where tape_uuid = ?1",
                 params![input.tape_uuid.to_vec()],
@@ -19097,7 +19266,10 @@ mod tests {
             finalization_outcome: None,
             seal_due: None,
         };
-        let tx = index.conn.transaction().expect("begin merge transaction");
+        let mut fixture_conn_tx = Connection::open(index.path()).unwrap();
+        let tx = fixture_conn_tx
+            .transaction()
+            .expect("begin merge transaction");
         merge_preserved_tape_operator_columns_tx(&tx, &[preserved]).expect("merge retired row");
         tx.commit().expect("commit merge transaction");
         let (tape_state, _) = tape_state_and_voltag(&index, input.tape_uuid);
@@ -19110,7 +19282,9 @@ mod tests {
             .prefix("remanence-index-u64-tape-files")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [0x64; 16];
         index
             .provision_tape(ProvisionTapeInput {
@@ -19155,7 +19329,10 @@ mod tests {
         index
             .reconcile_tape_files_projection(tape_uuid, &entries, u64::MAX, u64::MAX)
             .expect("project unsigned boundary values");
-        let tx = index.conn.transaction().expect("begin extent transaction");
+        let mut fixture_conn_tx = Connection::open(index.path()).unwrap();
+        let tx = fixture_conn_tx
+            .transaction()
+            .expect("begin extent transaction");
         project_tape_written_extent_tx(&tx, tape_uuid, u64::MAX)
             .expect("project maximum written extent");
         tx.commit().expect("commit extent transaction");
@@ -19177,8 +19354,8 @@ mod tests {
         assert_eq!(tape.last_committed_tape_file, Some(u64::MAX));
         assert_eq!(tape.written_extent_lba, Some(u64::MAX));
 
-        let mut stmt = index
-            .conn
+        let fixture_conn_stmt = Connection::open(index.path()).unwrap();
+        let mut stmt = fixture_conn_stmt
             .prepare("select tape_file_number from tape_files order by tape_file_number")
             .expect("prepare raw ordering query");
         let encoded = stmt
@@ -19194,8 +19371,8 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         drop(stmt);
-        let mut range_stmt = index
-            .conn
+        let fixture_conn_range_stmt = Connection::open(index.path()).unwrap();
+        let mut range_stmt = fixture_conn_range_stmt
             .prepare(
                 "select tape_file_number from tape_files
                  where tape_file_number between ?1 and ?2
@@ -19219,34 +19396,36 @@ mod tests {
             .prefix("remanence-index-u64-constraints")
             .tempdir()
             .expect("temp dir");
-        let index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [0x65_u8; 16];
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "insert into tapes(tape_uuid, state, updated_at_utc)
                  values(?1, 'ready', '2026-08-09T00:00:00Z')",
                 params![tape_uuid.to_vec()],
             )
             .expect("seed tape");
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "insert into tape_files(tape_uuid, tape_file_number, kind, block_count)
                  values(?1, ?2, 'object', ?3)",
                 params![tape_uuid.to_vec(), SqliteU64::ZERO, SqliteU64::new(1)],
             )
             .expect("seed tape file");
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "insert into object_copies(object_id, tape_uuid, tape_file_number, status)
                  values('object-u64', ?1, ?2, 'committed')",
                 params![tape_uuid.to_vec(), SqliteU64::ZERO],
             )
             .expect("seed object copy");
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "insert into object_files(
                    object_id, file_id, path, size_bytes, file_sha256, chunk_count
@@ -19257,27 +19436,33 @@ mod tests {
 
         for &(table, column) in STRUCTURAL_U64_COLUMNS {
             let update = format!("update {table} set {column} = ?1");
-            index
-                .conn
+            Connection::open(index.path())
+                .unwrap()
                 .execute(&update, params![SqliteU64::new(1)])
                 .unwrap_or_else(|error| panic!("valid {table}.{column}: {error}"));
             let inspect = format!("select typeof({column}), length({column}) from {table}");
-            let storage: (String, i64) = index
-                .conn
+            let storage: (String, i64) = Connection::open(index.path())
+                .unwrap()
                 .query_row(&inspect, [], |row| Ok((row.get(0)?, row.get(1)?)))
                 .unwrap_or_else(|error| panic!("inspect {table}.{column}: {error}"));
             assert_eq!(storage, ("blob".to_string(), 8), "{table}.{column}");
             assert!(
-                index.conn.execute(&update, params![1_i64]).is_err(),
+                Connection::open(index.path())
+                    .unwrap()
+                    .execute(&update, params![1_i64])
+                    .is_err(),
                 "{table}.{column} accepted INTEGER storage"
             );
             assert!(
-                index.conn.execute(&update, params![vec![0_u8; 7]]).is_err(),
+                Connection::open(index.path())
+                    .unwrap()
+                    .execute(&update, params![vec![0_u8; 7]])
+                    .is_err(),
                 "{table}.{column} accepted a non-canonical BLOB width"
             );
         }
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "update object_copies
                  set representation = 'encrypted',
@@ -19298,7 +19483,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let (input, state) = rebuild_fixture();
         index
             .index_committed_tape_journal(input.clone(), &state)
@@ -19346,8 +19533,8 @@ mod tests {
         assert_eq!(files[0].block_count, 5);
         assert_eq!(files[0].object_id, None);
         assert_eq!(
-            index
-                .conn
+            Connection::open(index.path())
+                .unwrap()
                 .query_row("select count(*) from object_copies", [], |row| {
                     row.get::<_, u64>(0)
                 })
@@ -19362,17 +19549,19 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let (input, state) = rebuild_fixture();
         index
             .index_committed_tape_journal(input.clone(), &state)
             .expect("seed committed projection");
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute("update object_copies set pool_id = 'pool.at.commit'", [])
             .expect("seed copy pool snapshot");
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "update tapes set pool_id = 'pool.after.commit' where tape_uuid = ?1",
                 params![input.tape_uuid.to_vec()],
@@ -19393,8 +19582,8 @@ mod tests {
 
         assert_eq!(report.object_copies_rebuilt, 1);
         assert_eq!(
-            index
-                .conn
+            Connection::open(index.path())
+                .unwrap()
                 .query_row("select pool_id from object_copies", [], |row| {
                     row.get::<_, String>(0)
                 })
@@ -19409,7 +19598,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [21u8; 16];
         index
             .provision_tape(ProvisionTapeInput {
@@ -19473,8 +19664,8 @@ mod tests {
         assert_eq!(tape_files[1].tape_file_number, 1);
         assert_eq!(tape_files[2].tape_file_number, 2);
         assert_eq!(
-            index
-                .conn
+            Connection::open(index.path())
+                .unwrap()
                 .query_row("select count(*) from objects", [], |row| {
                     row.get::<_, u64>(0)
                 })
@@ -19489,7 +19680,9 @@ mod tests {
             .prefix("remanence-checkpoint-crash-cuts")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [0x51; 16];
         index
             .provision_tape(ProvisionTapeInput {
@@ -19634,8 +19827,8 @@ mod tests {
             .project_tape_log(&frozen)
             .expect("project durable tape-log groups");
         assert_eq!(
-            index
-                .conn
+            Connection::open(index.path())
+                .unwrap()
                 .query_row("select count(*) from objects", [], |row| row
                     .get::<_, u64>(0))
                 .expect("object count"),
@@ -19660,8 +19853,8 @@ mod tests {
             .project_tape_log(&frozen)
             .expect("idempotent tape-log projection");
         assert_eq!(
-            index
-                .conn
+            Connection::open(index.path())
+                .unwrap()
                 .query_row("select count(*) from objects", [], |row| row
                     .get::<_, u64>(0))
                 .expect("idempotent object count"),
@@ -19674,8 +19867,8 @@ mod tests {
         // record: bootstrap [0,1) fm@1, object-1 [2,5) fm@5, object-2 [6,8)
         // fm@8, checkpoint EOD 9. Terminal finalization begins there.
         let spans: Vec<(u64, Option<u64>)> = {
-            let mut stmt = index
-                .conn
+            let fixture_conn_stmt = Connection::open(index.path()).unwrap();
+            let mut stmt = fixture_conn_stmt
                 .prepare(
                     "select tape_file_number, physical_start_hint
                      from tape_files where tape_uuid = ?1
@@ -19750,7 +19943,9 @@ mod tests {
             .prefix("remanence-span-agreement")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [0x53; 16];
         index
             .provision_tape(ProvisionTapeInput {
@@ -19844,7 +20039,7 @@ mod tests {
             seal_due: None,
         };
         let original = index.get_native_object("span-object").unwrap().unwrap();
-        index.conn.execute_batch("delete from object_copies; delete from objects; delete from tape_files; delete from catalog_units;").unwrap();
+        Connection::open(index.path()).unwrap().execute_batch("delete from object_copies; delete from objects; delete from tape_files; delete from catalog_units;").unwrap();
         index
             .project_checkpoint_record(&record)
             .expect("replay repairs pre-hint rows without conflicting");
@@ -19853,16 +20048,16 @@ mod tests {
         assert_eq!(repaired.content_hash, original.content_hash);
         assert_eq!(repaired.created_at_utc, original.created_at_utc);
         // Conflicting existing tape-file authority must still refuse repair.
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "update tape_files set object_id='conflict' where kind='object'",
                 [],
             )
             .unwrap();
         assert!(index.project_checkpoint_record(&record).is_err());
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "update tape_files set object_id='span-object' where kind='object'",
                 [],
@@ -19874,8 +20069,8 @@ mod tests {
             .expect("query repaired copies");
         assert_eq!(copies[0].global_start_block, Some(2));
         assert_eq!(copies[0].global_end_block, Some(5));
-        let checkpoint_file_count: u64 = index
-            .conn
+        let checkpoint_file_count: u64 = Connection::open(index.path())
+            .unwrap()
             .query_row(
                 "select count(*) from tape_files
                  where tape_uuid = ?1 and tape_file_number = ?2",
@@ -19919,7 +20114,9 @@ mod tests {
             .prefix("remanence-extent-measurement")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [0x54; 16];
         let scheme = provision_scheme();
         index
@@ -20051,8 +20248,8 @@ mod tests {
             seal_due: None,
         };
         if missing_geometry {
-            index
-                .conn
+            Connection::open(index.path())
+                .unwrap()
                 .execute(
                     "update tapes set scheme_id = NULL, data_blocks_per_stripe = NULL,
                  parity_blocks_per_stripe = NULL, stripes_per_neighborhood = NULL
@@ -20132,7 +20329,9 @@ mod tests {
             .prefix("remanence-checkpoint-global-object")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [0x52; 16];
         index
             .provision_tape(ProvisionTapeInput {
@@ -20212,7 +20411,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [22u8; 16];
         index
             .provision_tape(ProvisionTapeInput {
@@ -20279,7 +20480,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [23u8; 16];
         index
             .provision_tape(ProvisionTapeInput {
@@ -20290,8 +20493,8 @@ mod tests {
                 force: false,
             })
             .expect("provision no-parity append tape");
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "insert into tape_files(tape_uuid, tape_file_number, kind, block_count)
                  values(?1, ?2, 'bootstrap', ?3)",
@@ -20336,7 +20539,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [24u8; 16];
         index
             .provision_tape(ProvisionTapeInput {
@@ -20347,8 +20552,8 @@ mod tests {
                 force: false,
             })
             .expect("provision no-parity append tape");
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "update tapes set state = 'ingested' where tape_uuid = ?1",
                 params![tape_uuid.to_vec()],
@@ -20392,7 +20597,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [25u8; 16];
         index
             .provision_tape(ProvisionTapeInput {
@@ -20403,8 +20610,8 @@ mod tests {
                 force: false,
             })
             .expect("provision no-parity append tape");
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "insert into objects(
                    object_id, caller_object_id, body_format, logical_size_bytes,
@@ -20442,8 +20649,8 @@ mod tests {
             "{err}"
         );
         assert_eq!(
-            index
-                .conn
+            Connection::open(index.path())
+                .unwrap()
                 .query_row("select count(*) from tape_files", [], |row| {
                     row.get::<_, u64>(0)
                 })
@@ -20458,7 +20665,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [26u8; 16];
         index
             .provision_tape(ProvisionTapeInput {
@@ -20496,8 +20705,8 @@ mod tests {
             "{err}"
         );
         assert_eq!(
-            index
-                .conn
+            Connection::open(index.path())
+                .unwrap()
                 .query_row("select count(*) from tape_files", [], |row| {
                     row.get::<_, u64>(0)
                 })
@@ -20512,7 +20721,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [27u8; 16];
         index
             .provision_tape(ProvisionTapeInput {
@@ -20551,8 +20762,8 @@ mod tests {
             "{err}"
         );
         assert_eq!(
-            index
-                .conn
+            Connection::open(index.path())
+                .unwrap()
                 .query_row("select count(*) from tape_files", [], |row| {
                     row.get::<_, u64>(0)
                 })
@@ -20567,7 +20778,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [6u8; 16];
         let scheme = ParityScheme {
             id: SchemeId::new_static("test-scheme"),
@@ -20672,7 +20885,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [9u8; 16];
 
         index
@@ -20769,8 +20984,9 @@ mod tests {
                 .expect("find object copies"),
             objects[0].copies
         );
+        let reader = crate::CatalogReader::open(index.path()).expect("open streaming reader");
         let mut streamed_objects = Vec::new();
-        index
+        reader
             .for_each_native_object(|object| {
                 streamed_objects.push(object);
                 ControlFlow::Continue(())
@@ -20797,7 +21013,7 @@ mod tests {
             .expect("list foreign units")
             .is_empty());
         let mut streamed_units = Vec::new();
-        index
+        reader
             .for_each_catalog_unit(CatalogUnitFilter::All, |unit| {
                 streamed_units.push(unit);
                 ControlFlow::Continue(())
@@ -20818,7 +21034,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_a = [0xA1; 16];
         let tape_b = [0xB2; 16];
         let tape_missing = [0xC3; 16];
@@ -20928,8 +21146,8 @@ mod tests {
             .get_native_object_by_pool_and_caller_object_id("pool-missing", "shared-caller")
             .expect("query missing-only pool")
             .is_none());
-        index
-            .conn
+        Connection::open(index.path())
+            .unwrap()
             .execute(
                 "update object_copies set status = 'missing' where pool_id = 'pool-b'",
                 [],
@@ -20950,7 +21168,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [12u8; 16];
         let scheme = provision_scheme();
         let object_id = "encrypted-object-1";
@@ -21037,8 +21257,8 @@ mod tests {
             metadata_frame_len,
             plaintext_digest,
             stored_digest,
-        ) = index
-            .conn
+        ) = Connection::open(index.path())
+            .unwrap()
             .query_row(
                 "select representation, recipient_epoch_ids, metadata_frame_len,
                         plaintext_digest, stored_digest
@@ -21088,7 +21308,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [14u8; 16];
         let object_id = "journal-unknown-object";
 
@@ -21136,7 +21358,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [13u8; 16];
         let recipient_epoch_ids = vec![[0x35u8; 16], [0x36u8; 16]];
         let object_id = "journal-encrypted-object";
@@ -21206,7 +21430,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let (input, state) = rebuild_fixture();
         let tape_uuid = input.tape_uuid;
 
@@ -21267,7 +21493,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
 
         let unit_id = index
             .upsert_foreign_archive_projection(ForeignArchiveProjectionInput {
@@ -21311,7 +21539,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [8u8; 16];
         let scheme = ParityScheme {
             id: SchemeId::new_static("test-scheme"),
@@ -21326,8 +21556,8 @@ mod tests {
 
         assert!(report.ingestion_pending);
         assert_eq!(
-            index
-                .conn
+            Connection::open(index.path())
+                .unwrap()
                 .query_row(
                     "select state from tapes where tape_uuid = ?1",
                     params![tape_uuid.to_vec()],
@@ -21347,7 +21577,9 @@ mod tests {
         let path = temp.path().join("rem-state.sqlite");
         let (input, state) = rebuild_fixture();
         let expected = {
-            let mut index = CatalogIndex::open(&path).expect("open original");
+            let mut index = crate::projector::open(&path)
+                .map(|catalog| catalog.write_handle())
+                .expect("open original");
             index
                 .index_committed_tape_journal(input.clone(), &state)
                 .expect("index original");
@@ -21358,7 +21590,9 @@ mod tests {
         let _ = fs::remove_file(sqlite_sidecar(&path, "-wal"));
         let _ = fs::remove_file(sqlite_sidecar(&path, "-shm"));
 
-        let mut rebuilt = CatalogIndex::open(&path).expect("open rebuilt");
+        let mut rebuilt = crate::projector::open(&path)
+            .map(|catalog| catalog.write_handle())
+            .expect("open rebuilt");
         let report = rebuilt
             .rebuild_from_authoritative_sources(
                 &[],
@@ -21383,7 +21617,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let (input, state) = rebuild_fixture();
         let written_tape = input.tape_uuid;
         let unwritten_tape = [0x77; 16];
@@ -21452,7 +21688,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [0x42; 16];
         let tape_id = hex_uuid(tape_uuid);
         let drive = index
@@ -21740,7 +21978,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [0x43; 16];
         let stale_binding_tape_uuid = [0x44; 16];
         index
@@ -21887,7 +22127,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let (input, state) = rebuild_fixture();
         index
             .rebuild_from_authoritative_sources(
@@ -21924,7 +22166,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let operation_id = Uuid::from_u128(0xABCD);
         let idempotency_key = Uuid::from_u128(0xCCDD);
         let record = audit_record(
@@ -21969,7 +22213,9 @@ mod tests {
             .prefix("remanence-operation-failure")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let operation_id = Uuid::from_u128(0xDEAD);
         let record = audit_record(
             1,
@@ -22010,7 +22256,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let operation_id = Uuid::from_u128(0xAA);
         let session_id = Uuid::from_u128(0xBB);
         let idempotency_key = Uuid::from_u128(0xCC);
@@ -22092,8 +22340,8 @@ mod tests {
         assert_eq!(report.sessions_rebuilt, 1);
         assert_eq!(report.idempotency_keys_rebuilt, 1);
         assert_eq!(
-            index
-                .conn
+            Connection::open(index.path())
+                .unwrap()
                 .query_row(
                     "select operation_kind, state, session_id, subject from operations",
                     [],
@@ -22134,8 +22382,7 @@ mod tests {
             Some(operations[0].clone())
         );
         assert_eq!(
-            index
-                .conn
+            Connection::open(index.path()).unwrap()
                 .query_row(
                     "select session_kind, tape_uuid, library_serial, drive_bay, state from sessions",
                     [],
@@ -22159,8 +22406,7 @@ mod tests {
             )
         );
         assert_eq!(
-            index
-                .conn
+            Connection::open(index.path()).unwrap()
                 .query_row(
                     "select actor_fingerprint, request_fingerprint, operation_id, terminal_state, response_fingerprint
                      from idempotency_keys",
@@ -22192,7 +22438,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let idempotency_key = Uuid::from_u128(0xCC);
         let first = audit_record(
             1,
@@ -22229,7 +22477,9 @@ mod tests {
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let idempotency_key = Uuid::from_u128(0xCC);
         let first_operation_id = Uuid::from_u128(1);
         let records = vec![
@@ -22259,8 +22509,8 @@ mod tests {
 
         assert_eq!(report.idempotency_keys_rebuilt, 1);
         assert_eq!(
-            index
-                .conn
+            Connection::open(index.path())
+                .unwrap()
                 .query_row(
                     "select request_fingerprint, operation_id
                      from idempotency_keys
@@ -22279,7 +22529,9 @@ mod tests {
             .prefix("remanence-index-assignment-generation")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [0xA5; 16];
         index
             .provision_tape(ProvisionTapeInput {
@@ -22354,7 +22606,9 @@ mod tests {
             .prefix("remanence-index-manual-acceptance")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [0xA6; 16];
         index
             .provision_tape(ProvisionTapeInput {
@@ -22474,7 +22728,9 @@ mod tests {
             .prefix("remanence-index-terminal-finalization")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [0xF1; 16];
         index
             .provision_tape(ProvisionTapeInput {
@@ -22612,7 +22868,9 @@ mod tests {
             .prefix("remanence-index-terminal-degraded")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let tape_uuid = [0xD1; 16];
         index
             .provision_tape(ProvisionTapeInput {
@@ -22675,7 +22933,9 @@ mod tests {
             .prefix("remanence-index-idempotency-scope")
             .tempdir()
             .expect("temp dir");
-        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let mut index = crate::projector::open(temp.path().join("rem-state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .expect("open");
         let key = Uuid::from_u128(0x1D3A);
         let original_operation = Uuid::from_u128(0x0A);
         let duplicate_operation = Uuid::from_u128(0x0B);
@@ -22765,8 +23025,8 @@ mod tests {
             .expect("same kind and key under another actor is independent");
         assert!(other_actor.newly_registered);
 
-        let stored_operation: String = index
-            .conn
+        let stored_operation: String = Connection::open(index.path())
+            .unwrap()
             .query_row(
                 "select operation_id from idempotency_keys
                  where actor_fingerprint = 'user:alice'

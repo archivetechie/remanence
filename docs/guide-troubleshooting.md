@@ -568,7 +568,7 @@ mode. The dual aggregate row names the append leg's object and daemon rate;
 the client aggregate rate includes the concurrent restore. Missing diagnostics
 are `unavailable`; the kit never substitutes another object's latest event.
 
-<!-- code-anchor: crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/checkpoint.rs crates/remanence-api/src/append_admission.rs crates/remanence-api/src/tape_closeout.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-state/src/index.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
+<!-- code-anchor: crates/remanence-api/src/closeout_obligation.rs crates/remanence-api/src/write_owner/write_session.rs crates/remanence-api/src/write_owner/checkpoint.rs crates/remanence-api/src/append_admission.rs crates/remanence-api/src/tape_closeout.rs crates/remanence-api/src/write_owner/terminal_finalize.rs crates/remanence-state/src/projector/index.rs @ cc8d69d5ed17e668613a3691f4b4496322ebc9ad -->
 ## Closeout debt
 
 Committed data is on tape and has a durable record in the tape log. It is

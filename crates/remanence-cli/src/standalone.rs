@@ -897,7 +897,7 @@ fn assign(state: &mut StateHandle, uuid: [u8; 16], pool: Option<&str>) -> Result
         }
     }
     let row = state
-        .catalog_index()
+        .catalog()
         .get_tape(&uuid)
         .map_err(err)?
         .ok_or("tape is not catalogued")?;
@@ -981,7 +981,7 @@ where
         }
         let (rows, fences) = read_catalog_display(&catalog_path, errors, || {
             let index =
-                remanence_state::CatalogIndex::open_inventory(&catalog_path).map_err(err)?;
+                remanence_state::CatalogReader::open_inventory(&catalog_path).map_err(err)?;
             let fences = index.list_active_tape_io_fences().map_err(err)?;
             let rows = index
                 .list_committed_paths(tape.as_deref(), path_prefix.as_deref())
@@ -1119,7 +1119,7 @@ where
     let mut catalog_error = None;
     if discovery_only && catalog_path.exists() {
         let fences = read_catalog_display(&catalog_path, errors, || {
-            remanence_state::CatalogIndex::open_inventory(&catalog_path)
+            remanence_state::CatalogReader::open_inventory(&catalog_path)
                 .map_err(err)
                 .and_then(|catalog| {
                     remanence_api::standalone_fence_policy(&catalog, None, None, false).map_err(err)
@@ -1143,7 +1143,7 @@ where
                 .map_err(err)?;
         state.replay_audit_projection().map_err(err)?;
         output.active_fences =
-            remanence_api::standalone_fence_policy(state.catalog_index(), None, None, false)
+            remanence_api::standalone_fence_policy(state.catalog(), None, None, false)
                 .map_err(err)?
                 .iter()
                 .map(crate::tape_io_fence_json)
@@ -1161,7 +1161,7 @@ where
         return match command {
             Quarantine::List => {
                 let ops = state
-                    .catalog_index()
+                    .catalog()
                     .list_active_media_readiness_operations(None)
                     .map_err(err)?;
                 Ok(
@@ -1172,10 +1172,7 @@ where
                 if ack.trim().is_empty() {
                     return Err("--ack must be non-empty".into());
                 }
-                let fences = state
-                    .catalog_index()
-                    .list_active_tape_io_fences()
-                    .map_err(err)?;
+                let fences = state.catalog().list_active_tape_io_fences().map_err(err)?;
                 if fences.iter().any(|f| {
                     f.quarantine_id == *id && !remanence_api::standalone_fence_releasable(f)
                 }) {
@@ -1185,16 +1182,12 @@ where
                     .release_tape_io_fence(id, ack.trim())
                     .map_err(err)?
                     .ok_or("no active tape-I/O fence with this ID")?;
-                output.active_fences = remanence_api::standalone_fence_policy(
-                    state.catalog_index(),
-                    None,
-                    None,
-                    false,
-                )
-                .map_err(err)?
-                .iter()
-                .map(crate::tape_io_fence_json)
-                .collect();
+                output.active_fences =
+                    remanence_api::standalone_fence_policy(state.catalog(), None, None, false)
+                        .map_err(err)?
+                        .iter()
+                        .map(crate::tape_io_fence_json)
+                        .collect();
                 Ok(crate::tape_io_fence_json(&released))
             }
         };
@@ -2105,7 +2098,7 @@ fn prepare_init(
     if label.is_empty() || label.trim() != label {
         return Err("label must be non-empty and trimmed".into());
     }
-    remanence_api::refuse_tape_init_while_fenced(state.catalog_index(), Some(label), None)?;
+    remanence_api::refuse_tape_init_while_fenced(state.catalog(), Some(label), None)?;
     let ready = drive.wait_for_media_readiness(
         remanence_library::MediaFamily::Unknown,
         None,
@@ -2161,19 +2154,19 @@ fn prepare_init(
     };
     // No init override releases a tape-I/O fence on the label or BOT identity.
     remanence_api::refuse_tape_init_while_fenced(
-        state.catalog_index(),
+        state.catalog(),
         Some(label),
         loaded_uuid.as_ref(),
     )?;
     remanence_api::standalone_fence_policy(
-        state.catalog_index(),
+        state.catalog(),
         loaded_uuid,
         drive.endpoint().durable_key(),
         true,
     )
     .map_err(err)?;
     let facts = remanence_api::project_tape_init_catalog_inputs(
-        state.catalog_index(),
+        state.catalog(),
         label,
         &bot.classification,
         pool,
@@ -2233,7 +2226,7 @@ fn prepare_init(
     );
     if confirm_clobber {
         state
-            .catalog_index()
+            .write_handle()
             .provision_replacing_media(
                 remanence_state::ProvisionTapeInput {
                     tape_uuid: replacement_uuid,
@@ -3593,10 +3586,10 @@ mod tests {
             config.home.as_ref().unwrap().drive_serial.as_deref(),
             Some("DRIVE")
         );
-        let mut state =
+        let state =
             StateHandle::open_with_config(StatePaths::from_config(&path, &config), config).unwrap();
         let fence = state
-            .catalog_index()
+            .write_handle()
             .record_tape_io_fence(remanence_state::TapeIoFenceInput {
                 tape_uuid: [17; 16],
                 barcode: None,

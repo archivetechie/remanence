@@ -95,7 +95,9 @@ fn bootstrap_with_fence_count(fault: Fault, expected_fences: usize) -> (String, 
         .tempdir()
         .expect("tempdir");
     let index_path = temp.path().join("rem-state.sqlite");
-    let mut index = CatalogIndex::open(&index_path).expect("open test index");
+    let mut index = remanence_state::projector::open(&index_path)
+        .map(|catalog| catalog.write_handle())
+        .expect("open test index");
     let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
         "LIB-FRESH-PARITY-FENCE",
         0x0100,

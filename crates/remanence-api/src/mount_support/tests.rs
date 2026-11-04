@@ -191,9 +191,9 @@ tape_catalog_dir = "{0}/cache"
     .unwrap()
 }
 fn state_with_parity(root: &Path, fsync: bool, parity: crate::ParityConfig) -> StateHandle {
-    let mut state = configured_state(root, fsync);
+    let state = configured_state(root, fsync);
     state
-        .catalog_index()
+        .write_handle()
         .provision_tape(remanence_state::ProvisionTapeInput {
             tape_uuid: UUID,
             voltag: "HAND".into(),
@@ -203,7 +203,7 @@ fn state_with_parity(root: &Path, fsync: bool, parity: crate::ParityConfig) -> S
         })
         .unwrap();
     state
-        .catalog_index()
+        .write_handle()
         .set_tape_generation(
             UUID,
             remanence_state::MediaObservation {
@@ -213,7 +213,7 @@ fn state_with_parity(root: &Path, fsync: bool, parity: crate::ParityConfig) -> S
         )
         .unwrap();
     state
-        .catalog_index()
+        .write_handle()
         .project_tape_pool_membership(UUID, "default")
         .unwrap();
     state
@@ -249,12 +249,7 @@ fn adopted_state(root: &Path, parity: crate::ParityConfig) -> StateHandle {
         )
         .unwrap();
     assert_eq!(
-        state
-            .catalog_index()
-            .get_tape(&UUID)
-            .unwrap()
-            .unwrap()
-            .state,
+        state.catalog().get_tape(&UUID).unwrap().unwrap().state,
         "recovery_required"
     );
     state
@@ -349,10 +344,10 @@ fn insertion_removal_and_swap_require_a_new_proof() {
         u64::from(BLOCK)
     );
     let _ = actor.finish();
-    let mut state = reopen_state();
+    let state = reopen_state();
     assert!(
         state
-            .catalog_index()
+            .catalog()
             .list_active_tape_io_fences()
             .unwrap()
             .is_empty(),
@@ -424,7 +419,7 @@ fn uncertain_write_cut_records_a_live_end_and_preserves_prior_checkpoint() {
     let _ = actor.finish();
     let mut state = reopen_state();
     assert!(state
-        .catalog_index()
+        .catalog()
         .list_active_tape_io_fences()
         .unwrap()
         .is_empty());
@@ -435,11 +430,8 @@ fn uncertain_write_cut_records_a_live_end_and_preserves_prior_checkpoint() {
         .write_checkpointed(request(root.path(), "third"))
         .unwrap();
     actor.finish().unwrap();
-    let mut state = reopen_state();
-    assert_eq!(
-        state.catalog_index().list_native_objects().unwrap().len(),
-        2
-    );
+    let state = reopen_state();
+    assert_eq!(state.catalog().list_native_objects().unwrap().len(), 2);
 }
 /// A terminal component whose log record is durable but whose SQLite
 /// projection fails reports the replay retry, and the same request resumes.
@@ -486,7 +478,7 @@ fn durable_terminal_component_projection_failure_asks_for_replay_and_resumes() {
     let mut state = reopen_state();
     // The standalone owner fences the tape on the failed request; after the
     // operator's release the same request resumes from the durable log.
-    let fences = state.catalog_index().list_active_tape_io_fences().unwrap();
+    let fences = state.catalog().list_active_tape_io_fences().unwrap();
     assert!(!fences.is_empty());
     for fence in fences {
         state
@@ -498,14 +490,9 @@ fn durable_terminal_component_projection_failure_asks_for_replay_and_resumes() {
     let (mut actor, reopen_state) = own_mount!(mount, mounted, state);
     actor.finalize_standalone(finalize()).unwrap();
     let _ = actor.finish();
-    let mut state = reopen_state();
+    let state = reopen_state();
     assert_eq!(
-        state
-            .catalog_index()
-            .get_tape(&UUID)
-            .unwrap()
-            .unwrap()
-            .state,
+        state.catalog().get_tape(&UUID).unwrap().unwrap().state,
         "sealed"
     );
 }
@@ -879,7 +866,7 @@ fn combined_transport_and_audit_failure_latches_until_recovery_persists_quaranti
     .unwrap();
     drop(recovered);
     let audit_dir = state.paths().audit_dir.clone();
-    crate::tests::assert_fences_survive_empty_rebuild(state.catalog_index(), &audit_dir);
+    crate::tests::assert_fences_survive_empty_rebuild(state.catalog(), &audit_dir);
 }
 
 #[test]
@@ -963,9 +950,9 @@ fn automatic_terminal_close_reproves_after_checkpoint_publication() {
 #[test]
 fn barcode_mount_preserves_the_legacy_read_command_stream_without_generation() {
     let root = tempfile::tempdir().unwrap();
-    let mut state = configured_state(root.path(), true);
+    let state = configured_state(root.path(), true);
     state
-        .catalog_index()
+        .write_handle()
         .provision_tape(remanence_state::ProvisionTapeInput {
             tape_uuid: UUID,
             voltag: "HAND".into(),
@@ -989,15 +976,14 @@ fn barcode_mount_preserves_the_legacy_read_command_stream_without_generation() {
         world.lock().unwrap().command_log.clear();
         if legacy {
             let mut drive =
-                crate::load_tape_by_uuid(state.catalog_index(), &mut library, &policy, &UUID)
-                    .unwrap();
+                crate::load_tape_by_uuid(state.catalog(), &mut library, &policy, &UUID).unwrap();
             drive.rewind().unwrap();
             crate::verify_tape_identity(&mut DriveHandleSource(&mut drive), &UUID).unwrap();
         } else {
             let mut backend = ChangerMount {
                 library: &mut library,
                 policy: &policy,
-                index: state.catalog_index(),
+                index: state.catalog(),
             };
             let mounted = backend
                 .mount(MountTarget::Tape { tape_uuid: UUID })
@@ -1243,14 +1229,14 @@ fn restart_recovery_is_shared_and_scoped_to_the_owned_endpoint() {
     );
     let before = state.calibration_control().row(library_tape).write_epoch;
     assert!(backend(&mut state, &world(), &root.path().join("locks"), fault()).is_ok());
-    let open = state.catalog_index().non_terminal_sessions().unwrap();
+    let open = state.catalog().non_terminal_sessions().unwrap();
     assert!(open.iter().any(|s| s.session_id == library_session));
     assert!(!open.iter().any(|s| s.session_id == standalone_session));
     assert_eq!(
         state.calibration_control().row(library_tape).write_epoch,
         before
     );
-    let fences = state.catalog_index().list_active_tape_io_fences().unwrap();
+    let fences = state.catalog().list_active_tape_io_fences().unwrap();
     assert!(!fences.is_empty());
     assert!(fences.iter().all(|f| f.tape_uuid == UUID
         && f.endpoint
@@ -1264,11 +1250,7 @@ fn restart_recovery_is_shared_and_scoped_to_the_owned_endpoint() {
             .unwrap(),
         1
     );
-    assert!(state
-        .catalog_index()
-        .non_terminal_sessions()
-        .unwrap()
-        .is_empty());
+    assert!(state.catalog().non_terminal_sessions().unwrap().is_empty());
     assert!(state.calibration_control().row(library_tape).write_epoch > before);
 }
 
@@ -1294,7 +1276,7 @@ fn imported_authority_preserves_quarantine_and_terminal_restrictions() {
         if restricted == "fence" {
             mount
                 .state
-                .catalog_index()
+                .write_handle()
                 .record_tape_io_fence(remanence_state::TapeIoFenceInput {
                     tape_uuid: UUID,
                     barcode: Some("HAND".into()),
@@ -1303,15 +1285,10 @@ fn imported_authority_preserves_quarantine_and_terminal_restrictions() {
                 })
                 .unwrap();
         } else {
-            mount.state.catalog_index().seal_tape(UUID).unwrap();
+            mount.state.write_handle().seal_tape(UUID).unwrap();
         }
         assert!(mount.import_journals(&mut mounted, &from).is_err());
-        let tape = mount
-            .state
-            .catalog_index()
-            .get_tape(&UUID)
-            .unwrap()
-            .unwrap();
+        let tape = mount.state.catalog().get_tape(&UUID).unwrap().unwrap();
         assert_eq!(
             tape.state,
             if restricted == "fence" {
@@ -1337,7 +1314,7 @@ fn library_automatic_sealing_releases_owned_removal_guard() {
         config.tape_pools[0].capacity_cap_bytes = Some(3 * 1024 * 1024 * 1024);
         config.tape_pools[0].watermark_low = 0.000001;
         config.tape_pools[0].watermark_high = 0.25;
-        let mut state = StateHandle::open_with_config(paths, config).unwrap();
+        let state = StateHandle::open_with_config(paths, config).unwrap();
         let world = world();
         let snapshot = world.lock().unwrap().library_snapshot();
         let policy = StaticAllowlist::new(["UNUSED"]);
@@ -1359,7 +1336,7 @@ fn library_automatic_sealing_releases_owned_removal_guard() {
             })
             .unwrap();
         let drive =
-            crate::load_tape_by_uuid(state.catalog_index(), &mut library, &policy, &UUID).unwrap();
+            crate::load_tape_by_uuid(state.catalog(), &mut library, &policy, &UUID).unwrap();
         let mut owner = crate::engine::drive_adapter::MountedDrive::from_placed_library(
             state,
             library,
@@ -1499,13 +1476,13 @@ fn release_context_does_not_run_write_owner_recovery() {
     )
     .unwrap();
     assert!(state
-        .catalog_index()
+        .catalog()
         .non_terminal_sessions()
         .unwrap()
         .iter()
         .any(|s| s.session_id == session));
     assert!(state
-        .catalog_index()
+        .catalog()
         .list_active_tape_io_fences()
         .unwrap()
         .is_empty());
@@ -1518,17 +1495,13 @@ fn release_context_does_not_run_write_owner_recovery() {
         );
     }
     assert!(state
-        .catalog_index()
+        .catalog()
         .non_terminal_sessions()
         .unwrap()
         .iter()
         .all(|s| s.session_id != session));
     assert_eq!(
-        state
-            .catalog_index()
-            .list_active_tape_io_fences()
-            .unwrap()
-            .len(),
+        state.catalog().list_active_tape_io_fences().unwrap().len(),
         1
     );
 }
@@ -1661,7 +1634,7 @@ async fn standalone_and_daemon_state_rollback_refuses_checkpoint_and_fresh_with_
                 let mut state = configured_state(&state_dir, true);
                 let before = dispatched_writes(&world);
                 let old = state
-                    .catalog_index()
+                    .write_handle()
                     .record_tape_io_fence(remanence_state::TapeIoFenceInput {
                         tape_uuid: UUID,
                         barcode: Some("HAND".into()),
@@ -1670,7 +1643,7 @@ async fn standalone_and_daemon_state_rollback_refuses_checkpoint_and_fresh_with_
                     })
                     .unwrap();
                 state
-                    .catalog_index()
+                    .write_handle()
                     .release_tape_io_fence(&old.quarantine_id, "old recovery completed")
                     .unwrap();
                 let error = if daemon {
@@ -2020,7 +1993,7 @@ fn bootstrap_without_filemark_can_be_explicitly_superseded() {
 #[test]
 fn zero_dispatch_probe_failure_is_unavailable_and_not_durable() {
     let root = tempfile::tempdir().unwrap();
-    let mut state = state(root.path());
+    let state = state(root.path());
     let cfg = crate::write_owner::TerminalWriteConfig {
         io_memory: crate::io_memory::IoMemoryReservation::new(1024 * 1024 * 1024).unwrap(),
         mounted_endpoint: None,
@@ -2037,7 +2010,7 @@ fn zero_dispatch_probe_failure_is_unavailable_and_not_durable() {
     let outcome = crate::append_admission::admission_error_outcome(&error);
     let status = crate::append_admission::daemon_admission_error(
         remanence_state::AuditActor::System,
-        state.catalog_index(),
+        &mut state.write_handle(),
         &cfg,
         UUID,
         error,
@@ -2045,16 +2018,11 @@ fn zero_dispatch_probe_failure_is_unavailable_and_not_durable() {
     );
     assert_eq!(status.code(), tonic::Code::Unavailable);
     assert_eq!(
-        state
-            .catalog_index()
-            .get_tape(&UUID)
-            .unwrap()
-            .unwrap()
-            .state,
+        state.catalog().get_tape(&UUID).unwrap().unwrap().state,
         "ready"
     );
     assert!(state
-        .catalog_index()
+        .catalog()
         .list_active_tape_io_fences()
         .unwrap()
         .is_empty());
@@ -2078,7 +2046,7 @@ fn structural_admission_refusals_project_recovery_with_authenticated_actor() {
         ),
     ] {
         let root = tempfile::tempdir().unwrap();
-        let mut state = state(root.path());
+        let state = state(root.path());
         let cfg = crate::write_owner::TerminalWriteConfig {
             io_memory: crate::io_memory::IoMemoryReservation::new(1024 * 1024 * 1024).unwrap(),
             mounted_endpoint: None,
@@ -2092,7 +2060,7 @@ fn structural_admission_refusals_project_recovery_with_authenticated_actor() {
             let outcome = crate::append_admission::admission_error_outcome(&error);
             crate::append_admission::daemon_admission_error(
                 actor.clone(),
-                state.catalog_index(),
+                &mut state.write_handle(),
                 &cfg,
                 UUID,
                 error,
@@ -2101,16 +2069,11 @@ fn structural_admission_refusals_project_recovery_with_authenticated_actor() {
         };
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
         assert_eq!(
-            state
-                .catalog_index()
-                .get_tape(&UUID)
-                .unwrap()
-                .unwrap()
-                .state,
+            state.catalog().get_tape(&UUID).unwrap().unwrap().state,
             "recovery_required"
         );
         assert!(state
-            .catalog_index()
+            .catalog()
             .list_active_tape_io_fences()
             .unwrap()
             .is_empty());
@@ -2126,10 +2089,10 @@ fn structural_admission_refusals_project_recovery_with_authenticated_actor() {
 #[test]
 fn clearing_append_recovery_on_sealed_tape_is_a_precise_precondition() {
     let root = tempfile::tempdir().unwrap();
-    let mut state = state(root.path());
-    state.catalog_index().seal_tape(UUID).unwrap();
+    let state = state(root.path());
+    state.write_handle().seal_tape(UUID).unwrap();
     let error = state
-        .catalog_index()
+        .write_handle()
         .set_append_recovery_required(UUID, false)
         .unwrap_err();
     assert!(matches!(
@@ -2140,12 +2103,7 @@ fn clearing_append_recovery_on_sealed_tape_is_a_precise_precondition() {
     assert_eq!(status.code(), tonic::Code::FailedPrecondition);
     assert!(status.message().contains("cannot clear append recovery"));
     assert_eq!(
-        state
-            .catalog_index()
-            .get_tape(&UUID)
-            .unwrap()
-            .unwrap()
-            .state,
+        state.catalog().get_tape(&UUID).unwrap().unwrap().state,
         "sealed"
     );
 }
@@ -2186,7 +2144,7 @@ fn standalone_fences_match_only_recorded_tape_or_endpoint() {
         (UUID, None, true),
     ] {
         let fence = state
-            .catalog_index()
+            .write_handle()
             .record_tape_io_fence_at_endpoint(
                 remanence_state::TapeIoFenceInput {
                     tape_uuid: tape,
@@ -2198,23 +2156,21 @@ fn standalone_fences_match_only_recorded_tape_or_endpoint() {
             )
             .unwrap();
         assert_eq!(standalone_fence_releasable(&fence), endpoint.is_some());
-        crate::startup_guard::reject_active_tape_io_fences_on_startup(state.catalog_index())
-            .unwrap();
+        crate::startup_guard::reject_active_tape_io_fences_on_startup(state.catalog()).unwrap();
         if blocks {
-            let refusal =
-                standalone_fence_policy(state.catalog_index(), Some(UUID), Some(&here), true)
-                    .unwrap_err();
+            let refusal = standalone_fence_policy(state.catalog(), Some(UUID), Some(&here), true)
+                .unwrap_err();
             assert_eq!(
                 refusal.to_string().contains("--after-settled-inventory"),
                 endpoint.is_none()
             );
         }
         assert_eq!(
-            standalone_fence_policy(state.catalog_index(), Some(UUID), Some(&here), true).is_err(),
+            standalone_fence_policy(state.catalog(), Some(UUID), Some(&here), true).is_err(),
             blocks
         );
         assert_eq!(
-            standalone_fence_policy(state.catalog_index(), Some(UUID), Some(&here), false)
+            standalone_fence_policy(state.catalog(), Some(UUID), Some(&here), false)
                 .unwrap()
                 .len(),
             1
@@ -2257,21 +2213,23 @@ fn standalone_fence_release_rebuild_preserves_endpoint_and_ack() {
     )
     .unwrap();
     let fence = state
-        .catalog_index()
+        .catalog()
         .list_active_tape_io_fences()
         .unwrap()
         .pop()
         .unwrap();
     let audit_dir = state.paths().audit_dir.clone();
-    crate::tests::assert_fences_survive_empty_rebuild(state.catalog_index(), &audit_dir);
+    crate::tests::assert_fences_survive_empty_rebuild(state.catalog(), &audit_dir);
     assert!(standalone_fence_releasable(&fence));
-    crate::startup_guard::reject_active_tape_io_fences_on_startup(state.catalog_index()).unwrap();
+    crate::startup_guard::reject_active_tape_io_fences_on_startup(state.catalog()).unwrap();
     state
         .release_tape_io_fence(&fence.quarantine_id, "rescued files")
         .unwrap()
         .unwrap();
     let audit = remanence_state::FileAuditLog::replay(&state.paths().audit_dir).unwrap();
-    let mut rebuilt = CatalogIndex::open(root.path().join("rebuilt-fence.sqlite")).unwrap();
+    let mut rebuilt = remanence_state::projector::open(root.path().join("rebuilt-fence.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     rebuilt
         .rebuild_from_authoritative_sources(&audit, &[])
         .unwrap();
@@ -2393,12 +2351,12 @@ fn supersede_tail_failure_fence_survives_empty_catalog_rebuild() {
         .is_err());
     assert!(cut.lock().unwrap().is_none(), "the write fault must fire");
     let _ = actor.finish();
-    let mut state = reopen_state();
+    let state = reopen_state();
     let audit_dir = state.paths().audit_dir.clone();
-    let fences = state.catalog_index().list_active_tape_io_fences().unwrap();
+    let fences = state.catalog().list_active_tape_io_fences().unwrap();
     assert_eq!(fences.len(), 1);
     assert_eq!(fences[0].reason, "supersede_tail_failed");
-    crate::tests::assert_fences_survive_empty_rebuild(state.catalog_index(), &audit_dir);
+    crate::tests::assert_fences_survive_empty_rebuild(state.catalog(), &audit_dir);
 }
 
 /// Standalone initialization fences a failed WRITE from its stored outcome; cleanup adds only its CDB.
@@ -2437,11 +2395,7 @@ fn b3b_standalone_init_failure_one_fence_by_cause() {
     );
     assert_eq!(census::normalizations(), finished.get().1);
     assert!(mount.unusable);
-    let fences = mount
-        .state
-        .catalog_index()
-        .list_active_tape_io_fences()
-        .unwrap();
+    let fences = mount.state.catalog().list_active_tape_io_fences().unwrap();
     assert_eq!(fences.len(), 1);
     assert_eq!(fences[0].reason, "transfer_error");
     let records = remanence_state::FileAuditLog::replay(&mount.state.paths().audit_dir).unwrap();
@@ -2646,11 +2600,7 @@ fn fix2_init_adapter(scenario: &str) {
         },
     );
     assert!(result.is_err());
-    let fences = mount
-        .state
-        .catalog_index()
-        .list_active_tape_io_fences()
-        .unwrap();
+    let fences = mount.state.catalog().list_active_tape_io_fences().unwrap();
     assert_eq!(fences.len(), 1, "{scenario}: {result:?}");
     assert_eq!(fences[0].reason, "transfer_error");
     let events = remanence_state::FileAuditLog::replay(&mount.state.paths().audit_dir).unwrap();
@@ -2720,7 +2670,7 @@ fn b3b_fix2_init_r6_definite_rejection() {
     assert!(injected.lock().unwrap().is_none());
     assert!(mount
         .state
-        .catalog_index()
+        .catalog()
         .list_active_tape_io_fences()
         .unwrap()
         .is_empty());

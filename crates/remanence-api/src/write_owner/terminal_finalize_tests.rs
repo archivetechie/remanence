@@ -15,7 +15,9 @@ fn automatic_terminal_plan_preserves_non_operator_seal_reasons() {
         Trigger::NoPendingObjectFits,
     ] {
         let temp = tempfile::tempdir().unwrap();
-        let mut index = CatalogIndex::open(temp.path().join("state.sqlite")).unwrap();
+        let mut index = remanence_state::projector::open(temp.path().join("state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         let selected = SelectedTape {
             standalone_endpoint: None,
             pool_id: "automatic-reasons".into(),

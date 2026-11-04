@@ -18,21 +18,20 @@ use crate::hex_encoding::bytes_to_hex;
 use crate::startup_media_readiness::status_from_state_error;
 
 pub(crate) fn spawn_drive_collection_workers(
-    index_path: PathBuf,
+    catalog: remanence_state::ProjectionClient,
     report: remanence_library::DiscoveryReport,
     config: &RemConfig,
     drive_pool: crate::write_owner::DrivePool,
     audit_append_lock: Arc<std::sync::Mutex<()>>,
 ) {
     let heartbeat = parse_duration_or(&config.drives.heartbeat, Duration::from_secs(60 * 60));
-    let heartbeat_index_path = index_path.clone();
+    let heartbeat_catalog = catalog.clone();
     let heartbeat_pool = drive_pool.clone();
     std::thread::Builder::new()
         .name("rem-drive-heartbeat".to_string())
         .spawn(move || loop {
             std::thread::sleep(heartbeat);
-            if let Err(err) = touch_managed_drive_heartbeats(&heartbeat_index_path, &heartbeat_pool)
-            {
+            if let Err(err) = touch_managed_drive_heartbeats(&heartbeat_catalog, &heartbeat_pool) {
                 tracing::warn!("managed drive heartbeat failed: {err}");
             }
         })
@@ -58,7 +57,7 @@ pub(crate) fn spawn_drive_collection_workers(
         .name("rem-foreign-drive-poll".to_string())
         .spawn(move || {
             foreign_drive_poll_loop(
-                index_path,
+                catalog,
                 report,
                 drives_cfg,
                 daemon_libraries,
@@ -77,10 +76,10 @@ pub(crate) struct AuditAppendContext {
 }
 
 pub(crate) fn touch_managed_drive_heartbeats(
-    index_path: &Path,
+    catalog: &remanence_state::ProjectionClient,
     drive_pool: &crate::write_owner::DrivePool,
 ) -> Result<(), StateError> {
-    let index = CatalogIndex::open(index_path)?;
+    let index = remanence_state::CatalogReader::open(catalog.path())?;
     for drive in index.list_drives(false, false)? {
         if drive.managed == "rem" && drive.state == "active" {
             let Some(bay) = drive
@@ -108,7 +107,7 @@ pub(crate) fn touch_managed_drive_heartbeats(
 }
 
 pub(crate) fn foreign_drive_poll_loop(
-    index_path: PathBuf,
+    catalog: remanence_state::ProjectionClient,
     report: remanence_library::DiscoveryReport,
     drives_cfg: remanence_state::DrivesConfig,
     daemon_libraries: std::collections::HashSet<String>,
@@ -124,7 +123,7 @@ pub(crate) fn foreign_drive_poll_loop(
         };
         std::thread::sleep(delay);
         match poll_foreign_drive_counters_once(
-            &index_path,
+            &catalog,
             &report,
             &drives_cfg,
             &daemon_libraries,
@@ -144,14 +143,14 @@ pub(crate) fn foreign_drive_poll_loop(
 }
 
 pub(crate) fn poll_foreign_drive_counters_once(
-    index_path: &Path,
+    catalog: &remanence_state::ProjectionClient,
     report: &remanence_library::DiscoveryReport,
     drives_cfg: &remanence_state::DrivesConfig,
     daemon_libraries: &std::collections::HashSet<String>,
     audit: &AuditAppendContext,
 ) -> Result<(), ForeignPollError> {
     poll_foreign_drive_counters_once_with_reader(
-        index_path,
+        catalog,
         report,
         drives_cfg,
         daemon_libraries,
@@ -161,15 +160,14 @@ pub(crate) fn poll_foreign_drive_counters_once(
 }
 
 pub(crate) fn poll_foreign_drive_counters_once_with_reader(
-    index_path: &Path,
+    catalog: &remanence_state::ProjectionClient,
     report: &remanence_library::DiscoveryReport,
     drives_cfg: &remanence_state::DrivesConfig,
     daemon_libraries: &std::collections::HashSet<String>,
     audit: &AuditAppendContext,
     mut read_snapshot: impl FnMut(&Path, bool) -> Result<ForeignDriveSnapshot, ForeignPollError>,
 ) -> Result<(), ForeignPollError> {
-    let mut index = CatalogIndex::open(index_path)
-        .map_err(|err| ForeignPollError::Permanent(err.to_string()))?;
+    let mut index = catalog.write_handle();
     for library in &report.libraries {
         if library_is_managed(library.serial.as_str(), drives_cfg, daemon_libraries) {
             continue;

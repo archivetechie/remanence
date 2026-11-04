@@ -30,7 +30,9 @@ pub(super) fn selection(
     if parity {
         return selected();
     }
-    let mut index = CatalogIndex::open(root.join("state.sqlite")).unwrap();
+    let mut index = remanence_state::projector::open(root.join("state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     index
         .provision_tape(ProvisionTapeInput {
             tape_uuid: TAPE,
@@ -140,7 +142,7 @@ async fn pending_serial_deadline_and_shutdown_abort_keep_named_tail() {
                     },
                 );
                 let mut state = crate::ApiState::new(
-                    CatalogIndex::open(root.path().join("state.sqlite")).unwrap(),
+                    remanence_state::projector::open(root.path().join("state.sqlite")).unwrap(),
                 );
                 let spool = root.path().join("spool");
                 std::fs::create_dir(&spool).unwrap();
@@ -202,7 +204,9 @@ async fn pending_serial_deadline_and_shutdown_abort_keep_named_tail() {
                     .any(|r| matches!(r, NativeRecord::ClosedOut(_))),
                 parity
             );
-            let index = CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
+            let index = remanence_state::projector::open(root.path().join("state.sqlite"))
+                .map(|catalog| catalog.write_handle())
+                .unwrap();
             assert!(index.list_active_tape_io_fences().unwrap().is_empty());
             let (tx, opened, thread) = open_writer_with_selection(
                 root.path(),
@@ -312,7 +316,9 @@ async fn post_reply_closeout_and_end_fsync_failures_keep_receipts_and_crash_row(
         );
         thread.join().unwrap();
         files.observe(None);
-        let index = CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
+        let index = remanence_state::projector::open(root.path().join("state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         let fences = index.list_active_tape_io_fences().unwrap();
         assert_eq!(fences.len(), 1, "syncs={}", syncs.load(Ordering::SeqCst));
         assert_eq!(fences[0].reason, "AuthorityAmbiguous");
@@ -409,8 +415,9 @@ async fn closeout_rpc_rejects_nil_reused_key_and_wrong_pool_with_debt() {
     use crate::pb::catalog_server::Catalog;
     let root = tempfile::tempdir().unwrap();
     let world = setup(root.path());
-    let mut state =
-        crate::ApiState::new(CatalogIndex::open(root.path().join("state.sqlite")).unwrap());
+    let mut state = crate::ApiState::new(
+        remanence_state::projector::open(root.path().join("state.sqlite")).unwrap(),
+    );
     state.checkpoint_journal_dir = Arc::new(root.path().join("journals/tapes"));
     std::fs::create_dir_all(state.checkpoint_journal_dir.as_ref()).unwrap();
     let service = state.catalog_service();
@@ -567,8 +574,9 @@ async fn failed_shutdown_barrier_waits_for_durable_named_end() {
             drive_uuid: None,
         },
     );
-    let mut state =
-        crate::ApiState::new(CatalogIndex::open(root.path().join("state.sqlite")).unwrap());
+    let mut state = crate::ApiState::new(
+        remanence_state::projector::open(root.path().join("state.sqlite")).unwrap(),
+    );
     state.drive_pool = Some(pool.clone());
     let authority = TapeAuthority::open(
         root.path().join("journals/tapes"),
@@ -690,7 +698,9 @@ async fn deferred_close_receipts_survive_lease_and_tail_cleanup_failures() {
         assert!(!records
             .iter()
             .any(|r| matches!(r, NativeRecord::SessionEnded(_))));
-        let index = CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
+        let index = remanence_state::projector::open(root.path().join("state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         assert_eq!(
             index.list_active_tape_io_fences().unwrap()[0].reason,
             "AuthorityAmbiguous"

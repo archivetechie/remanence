@@ -32,7 +32,7 @@ use remanence_chaos::model::{
 use remanence_library::transport::TransferOutcome;
 use remanence_library::{DiscoveryReport, ScsiError, SgTransport, StaticAllowlist, TimeoutClass};
 use remanence_parity::{bootstrap::write_bootstrap_block, ParityConfig};
-use remanence_state::{CatalogIndex, ProvisionTapeInput, RemConfig};
+use remanence_state::{ProvisionTapeInput, RemConfig};
 use sha2::{Digest, Sha256};
 use tonic::transport::{Channel, Endpoint, Server};
 
@@ -106,7 +106,9 @@ tape_catalog_dir = "{path}/cache"
                 remanence_state::StateLockGuard::acquire(&config.daemon.state_dir).unwrap();
             remanence_state::authority_layout::admit_owned_config(&config).unwrap();
         }
-        let mut index = CatalogIndex::open(&config.index.sqlite_path).unwrap();
+        let mut index = remanence_state::projector::open(&config.index.sqlite_path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         index
             .provision_tape(ProvisionTapeInput {
                 tape_uuid: UUID,
@@ -154,7 +156,7 @@ tape_catalog_dir = "{path}/cache"
         let spool = self.root.join("spool");
         std::fs::create_dir_all(&spool).unwrap();
         let state = ApiState::with_drive_pool_opener(
-            CatalogIndex::open(&self.config.index.sqlite_path).unwrap(),
+            remanence_state::projector::open(&self.config.index.sqlite_path).unwrap(),
             &self.config,
             report,
             StaticAllowlist::new([LIBRARY]),
@@ -517,7 +519,9 @@ async fn check_graceful_shutdown_restart(other_drive: bool) {
     );
     assert_eq!(end.tail_file_count, 0);
     assert!(end.crash_ack_audit_sequence.is_none());
-    let index = CatalogIndex::open(&fixture.config.index.sqlite_path).unwrap();
+    let index = remanence_state::projector::open(&fixture.config.index.sqlite_path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let tape = index.get_tape(&UUID).unwrap().unwrap();
     assert_eq!(
         tape.highest_protected_ordinal, tape.total_committed_ordinals,
@@ -1780,11 +1784,14 @@ async fn closeout_due_noop_idempotency_and_wrong_pool() {
             "worker's native closeout proof must have a finished audit operation"
         );
     }
-    assert!(CatalogIndex::open(&fixture.config.index.sqlite_path)
-        .unwrap()
-        .list_active_tape_io_fences()
-        .unwrap()
-        .is_empty());
+    assert!(
+        remanence_state::projector::open(&fixture.config.index.sqlite_path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap()
+            .list_active_tape_io_fences()
+            .unwrap()
+            .is_empty()
+    );
     let before = fixture.world.lock().unwrap().command_log.len();
     let retry = catalog
         .closeout_tape(request(key, "archive"))
@@ -1810,7 +1817,9 @@ async fn post_reply_closeout_holds_drive_and_log_until_end() {
         if access == "eviction" {
             let other = [0x36; 16];
             let parity = ParityConfig::None;
-            let mut index = CatalogIndex::open(&fixture.config.index.sqlite_path).unwrap();
+            let mut index = remanence_state::projector::open(&fixture.config.index.sqlite_path)
+                .map(|catalog| catalog.write_handle())
+                .unwrap();
             index
                 .provision_tape(ProvisionTapeInput {
                     tape_uuid: other,
@@ -2026,11 +2035,14 @@ async fn failed_sidecar_names_both_full_epoch_and_post_reply_tails() {
         assert!(matches!(sidecar.identity, TailIdentity::Sidecar(_)));
         assert!(sidecar.unknown_blocks > 0);
         assert_eq!(sidecar.filemark, TailFilemark::Absent);
-        assert!(CatalogIndex::open(&fixture.config.index.sqlite_path)
-            .unwrap()
-            .list_active_tape_io_fences()
-            .unwrap()
-            .is_empty());
+        assert!(
+            remanence_state::projector::open(&fixture.config.index.sqlite_path)
+                .map(|catalog| catalog.write_handle())
+                .unwrap()
+                .list_active_tape_io_fences()
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(fixture.injection.lock().unwrap().lost_write_replies, 1);
     }
 }

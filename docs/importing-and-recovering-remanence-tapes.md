@@ -373,7 +373,7 @@ the catalog. Remanence does not create a tape log from an inventory either, so a
 `recovery_required` tape adopted from another site stays in that state, out of
 write service.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-state/src/state.rs crates/remanence-state/src/tape_log/projection.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs @ 625f7044 -->
 ## Rebuild the catalog from the tape logs
 
 When this host's own state directory holds the tape logs and the audit log, the
@@ -608,7 +608,7 @@ ordinary `finalizing`. It reconciles the next physical component first. A host
 metadata failure after a proved replica C therefore causes no needless tape
 motion, while genuinely uncertain media stays fenced.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-state/src/state.rs crates/remanence-state/src/index.rs crates/remanence-state/src/lock.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/index.rs crates/remanence-state/src/lock.rs @ 625f7044 -->
 ## Refusals to expect
 
 Each refusal is printed on standard error after `error:`, and the command

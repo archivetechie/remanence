@@ -3,14 +3,16 @@
 use super::*;
 use pb::{catalog_server::Catalog, library_service_server::LibraryService};
 use remanence_parity::authority::TapeAuthorityView;
-use remanence_state::{CatalogIndex, ProvisionTapeInput, TapeAuthority};
+use remanence_state::{ProvisionTapeInput, TapeAuthority};
 
 #[tokio::test]
 async fn b7_fix_top_once_json_reads_held_checkpoint_and_partial_lists_exit_nonzero() {
     let root = tempfile::tempdir().unwrap();
     let logs = root.path().join("tapes");
     std::fs::create_dir(&logs).unwrap();
-    let mut index = CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
+    let mut index = remanence_state::projector::open(root.path().join("state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     for (id, barcode) in [(1, "GOOD01L9"), (2, "FRESH1L9"), (3, "BAD001L9")] {
         index
             .provision_tape(ProvisionTapeInput {
@@ -30,15 +32,19 @@ async fn b7_fix_top_once_json_reads_held_checkpoint_and_partial_lists_exit_nonze
         Some(0x400),
         remanence_chaos::model::VirtualTape::empty(1024 * 1024, 262144),
     );
-    let state = remanence_api::ApiState::new(index).with_test_inventory(
-        remanence_library::DiscoveryReport {
-            complete: true,
-            unattached_drives: vec![],
-            incomplete_evidence: vec![],
-            libraries: vec![world.library_snapshot()],
-            warnings: vec![],
-        },
-    );
+    let state = remanence_api::ApiState::new({
+        let index = index;
+        let catalog = remanence_state::projector::open(index.path()).unwrap();
+        drop(index);
+        catalog
+    })
+    .with_test_inventory(remanence_library::DiscoveryReport {
+        complete: true,
+        unattached_drives: vec![],
+        incomplete_evidence: vec![],
+        libraries: vec![world.library_snapshot()],
+        warnings: vec![],
+    });
     let authority = TapeAuthority::open_fixture(&logs, [1; 16]).unwrap();
     let mut lease = authority.acquire_exclusive().unwrap();
     lease
@@ -139,7 +145,9 @@ async fn b7_fix_top_once_json_reads_held_checkpoint_and_partial_lists_exit_nonze
         }
     }
     // Retired unreadable/missing logs must not make either one-shot printer fail.
-    let mut index = CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
+    let mut index = remanence_state::projector::open(root.path().join("state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let authority = TapeAuthority::open_fixture(&logs, [1; 16]).unwrap();
     let lease = authority.acquire_exclusive().unwrap();
     index.project_tape_log(&lease.freeze().unwrap()).unwrap();

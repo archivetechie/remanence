@@ -196,7 +196,7 @@ pub fn admit_owned_config(config: &crate::RemConfig) -> Result<(), StateError> {
         .map_err(|e| StateError::io_at("create journal namespace", &paths.journal_dir, e))?;
     admit(&paths)?;
     if paths.sqlite_path.exists() {
-        crate::CatalogIndex::open_read_only(&paths.sqlite_path)?;
+        crate::CatalogReader::open(&paths.sqlite_path)?;
     }
     Ok(())
 }
@@ -216,7 +216,7 @@ pub fn validate_config_layout(config: &crate::RemConfig) -> Result<(), StateErro
         }
     ) && paths.sqlite_path.exists()
     {
-        crate::CatalogIndex::open_read_only(&paths.sqlite_path)?;
+        crate::CatalogReader::open(&paths.sqlite_path)?;
     }
     Ok(())
 }

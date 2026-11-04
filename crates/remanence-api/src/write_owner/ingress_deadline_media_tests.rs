@@ -45,7 +45,9 @@ async fn check_ingress_ending(disconnect: bool) {
             let world = setup(root.path());
             // Use the no-parity writer to inspect the committed archive's
             // physical blocks as well as reading it through the session engine.
-            let mut index = CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
+            let mut index = remanence_state::projector::open(root.path().join("state.sqlite"))
+                .map(|catalog| catalog.write_handle())
+                .unwrap();
             index
                 .provision_tape(ProvisionTapeInput {
                     tape_uuid: TAPE,
@@ -104,7 +106,9 @@ async fn check_ingress_ending(disconnect: bool) {
                 pb::AppendDurability::Checkpointed as i32
             );
             let object_id = Uuid::from_slice(&receipt.object_id).unwrap().to_string();
-            let index = CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
+            let index = remanence_state::projector::open(root.path().join("state.sqlite"))
+                .map(|catalog| catalog.write_handle())
+                .unwrap();
             let saved = index.get_native_object(&object_id).unwrap().unwrap();
             let copies = index.find_native_object_copies(&object_id).unwrap();
             let before = world.lock().unwrap().tapes[BARCODE].records.clone();
@@ -126,8 +130,9 @@ async fn check_ingress_ending(disconnect: bool) {
                     drive_uuid: None,
                 },
             );
-            let mut state =
-                crate::ApiState::new(CatalogIndex::open(root.path().join("state.sqlite")).unwrap());
+            let mut state = crate::ApiState::new(
+                remanence_state::projector::open(root.path().join("state.sqlite")).unwrap(),
+            );
             let spool = root.path().join("spool");
             std::fs::create_dir_all(&spool).unwrap();
             state.spool_dir = Some(Arc::new(spool.clone()));

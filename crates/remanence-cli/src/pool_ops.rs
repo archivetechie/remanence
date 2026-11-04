@@ -182,7 +182,7 @@ fn run_archive_write_with_lock_root(
     let reserved: HashSet<TapeUuid> = HashSet::new();
     let checkpoint_journal_dir = state_handle.config().journal.dir.join("tapes");
     let selected = {
-        let index = state_handle.catalog_index();
+        let index = state_handle.catalog();
         match select_tape_in_pool_for_write_session(
             index,
             &pool_cfg,
@@ -234,7 +234,7 @@ fn run_archive_write_with_lock_root(
 
     // -- Load tape by UUID ------------------------------------------------
     let drive = {
-        let index = state_handle.catalog_index();
+        let index = state_handle.catalog();
         match load_tape_by_uuid(index, &mut library_handle, &policy, &tape_uuid) {
             Ok(d) => d,
             Err(e) => {
@@ -905,13 +905,13 @@ fn mount_library_tape_object(
         ExitCode::from(1)
     })?;
 
-    let mut state_handle = StateHandle::open_from_config_file(target.config).map_err(|e| {
+    let state_handle = StateHandle::open_from_config_file(target.config).map_err(|e| {
         let _ = writeln!(err, "error: open state: {e}");
         ExitCode::from(1)
     })?;
 
     let plan = {
-        let index = state_handle.catalog_index();
+        let index = state_handle.catalog();
         resolve_object_read_plan(index, &loc).map_err(|e| {
             let _ = writeln!(err, "error: locate object in catalog: {e}");
             ExitCode::from(1)
@@ -934,7 +934,7 @@ fn mount_library_tape_object(
     let mount = ChangerMount {
         library: &mut library_handle,
         policy: &policy,
-        index: state_handle.catalog_index(),
+        index: state_handle.catalog(),
     }
     .mount(MountTarget::Tape {
         tape_uuid: loc.tape_uuid,
@@ -1592,7 +1592,7 @@ pub fn run_archive_list(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    let mut state_handle = match StateHandle::open_from_config_file(&args.config) {
+    let state_handle = match StateHandle::open_from_config_file(&args.config) {
         Ok(h) => h,
         Err(e) => {
             let _ = writeln!(err, "error: open state: {e}");
@@ -1600,7 +1600,7 @@ pub fn run_archive_list(
         }
     };
 
-    let objects = match state_handle.catalog_index().list_native_objects() {
+    let objects = match state_handle.catalog().list_native_objects() {
         Ok(objs) => objs,
         Err(e) => {
             let _ = writeln!(err, "error: list native objects: {e}");

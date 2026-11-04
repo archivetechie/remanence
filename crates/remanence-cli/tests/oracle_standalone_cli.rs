@@ -284,7 +284,9 @@ fn c6_put_uses_loaded_pool_and_refuses_mismatched_override() {
         let config_path = temp.path().join("xdg-state/rem/config.toml");
         let config = remanence_state::load_config(&config_path).unwrap();
         let paths = remanence_state::StatePaths::from_config(config_path, &config);
-        let index = remanence_state::CatalogIndex::open(&paths.sqlite_path).unwrap();
+        let index = remanence_state::projector::open(&paths.sqlite_path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         let tape = index.get_tape_by_voltag("ORACLEL9").unwrap().unwrap();
         let object = index
             .get_native_object_by_content_hash(&Sha256::digest(content))
@@ -303,7 +305,9 @@ fn c6_put_uses_loaded_pool_and_refuses_mismatched_override() {
     let config_path = temp.path().join("xdg-state/rem/config.toml");
     let config = remanence_state::load_config(&config_path).unwrap();
     let paths = remanence_state::StatePaths::from_config(config_path, &config);
-    let index = remanence_state::CatalogIndex::open(&paths.sqlite_path).unwrap();
+    let index = remanence_state::projector::open(&paths.sqlite_path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     let tape = index.get_tape_by_voltag("ORACLEL9").unwrap().unwrap();
     assert_eq!(tape.pool_id.as_deref(), Some("other"));
     assert_eq!(

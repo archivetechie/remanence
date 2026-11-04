@@ -271,7 +271,9 @@ fn wor_cut_publishes_durable_single_object_evidence_before_projection_and_abort(
     );
     let config: remanence_state::RemConfig =
         serde_json::from_slice(&std::fs::read(manifest).unwrap()).unwrap();
-    let index = CatalogIndex::open(&config.index.sqlite_path).unwrap();
+    let index = remanence_state::projector::open(&config.index.sqlite_path)
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     assert!(
         index
             .get_native_object_by_pool_and_caller_object_id("default", "wor-object")
@@ -472,7 +474,7 @@ fn mounted_library_terminal_capacity_refusal_keeps_typed_cause() {
         .expect_err("injected terminal write failure");
     let _ = owner.finish();
     let mut state = fixture.reopen().unwrap();
-    let fences = state.catalog_index().list_active_tape_io_fences().unwrap();
+    let fences = state.catalog().list_active_tape_io_fences().unwrap();
     for fence in fences {
         state
             .release_tape_io_fence(
@@ -502,11 +504,11 @@ fn mounted_library_terminal_capacity_refusal_keeps_typed_cause() {
 
     // Exercise the media recovery funnel too: preflight has already accepted this
     // intent, so a later policy change must retain the same cause at the drive.
-    let mut state = fixture.reopen().unwrap();
+    let state = fixture.reopen().unwrap();
     let actor = AuditActor::local_user();
     let fingerprint = crate::catalog_conversion::audit_actor_fingerprint(&actor);
     let (_, native) = crate::mount::prepare_manual_finalize_request(
-        state.catalog_index(),
+        state.catalog(),
         crate::mount::ManualFinalizeTapeAdmission {
             candidate_operation_id: Uuid::new_v4(),
             actor,
@@ -536,7 +538,7 @@ fn mounted_library_terminal_capacity_refusal_keeps_typed_cause() {
             audit_append_lock: Arc::new(Mutex::new(())),
         };
         let status = write_owner::finalize_mounted_tape(
-            state.catalog_index(),
+            &mut state.write_handle(),
             &cfg,
             &mut drive,
             &native,
@@ -568,7 +570,7 @@ fn mounted_library_terminal_capacity_refusal_keeps_typed_cause() {
 /// Borrowing a seated library drive must not perform standalone calibration transitions.
 #[test]
 fn placed_library_preserves_calibration_and_wrap_map() {
-    let (fixture, mut state) = Fixture::new(false);
+    let (fixture, state) = Fixture::new(false);
     state
         .calibration_control()
         .record_harvest_success(UUID, 0)
@@ -586,7 +588,7 @@ fn placed_library_preserves_calibration_and_wrap_map() {
         calibration_generation: row.calibration_generation,
         harvested_at_utc: "2026-10-30T00:00:00Z".into(),
     };
-    state.catalog_index().upsert_wrap_map(&map).unwrap();
+    state.write_handle().upsert_wrap_map(&map).unwrap();
     let control = state.calibration_control().clone();
     let mut owner = library_owner(&fixture, state, "calibration-object").unwrap();
     assert_eq!(
@@ -603,11 +605,8 @@ fn placed_library_preserves_calibration_and_wrap_map() {
         row,
         "same calibration behavior as the old library writer"
     );
-    let mut state = fixture.reopen().unwrap();
-    assert_eq!(
-        state.catalog_index().get_wrap_map(&UUID).unwrap(),
-        Some(map)
-    );
+    let state = fixture.reopen().unwrap();
+    assert_eq!(state.catalog().get_wrap_map(&UUID).unwrap(), Some(map));
 }
 
 #[test]

@@ -171,8 +171,9 @@ async fn interrupted_session(sidecar: bool, lost: bool) {
             drive_uuid: None,
         },
     );
-    let mut state =
-        crate::ApiState::new(CatalogIndex::open(root.path().join("state.sqlite")).unwrap());
+    let mut state = crate::ApiState::new(
+        remanence_state::projector::open(root.path().join("state.sqlite")).unwrap(),
+    );
     state.drive_pool = Some(pool);
     let shutdown = tokio::spawn(async move { state.shutdown_drive_pool().await });
     tokio::time::sleep(StdDuration::from_millis(60)).await;
@@ -202,7 +203,9 @@ async fn interrupted_session(sidecar: bool, lost: bool) {
     .unwrap();
     let snapshot = authority.freeze().unwrap();
     let summary = snapshot.tape_summary();
-    let mut index = CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
+    let mut index = remanence_state::projector::open(root.path().join("state.sqlite"))
+        .map(|catalog| catalog.write_handle())
+        .unwrap();
     if lost {
         assert!(
             summary.open_session.is_some(),
@@ -331,8 +334,9 @@ async fn shutdown_sessions_share_one_deadline_and_end_in_parallel() {
     for (id, mounted) in sessions {
         pool.record_session(id, mounted);
     }
-    let mut state =
-        crate::ApiState::new(CatalogIndex::open(root.path().join("state.sqlite")).unwrap());
+    let mut state = crate::ApiState::new(
+        remanence_state::projector::open(root.path().join("state.sqlite")).unwrap(),
+    );
     state.shutdown_close_deadline_secs = 1;
     state.drive_pool = Some(pool);
     let started = std::time::Instant::now();
@@ -392,8 +396,9 @@ async fn shutdown_deadline_wakes_stalled_overlap_ingress_and_ends_actor() {
             drive_uuid: None,
         },
     );
-    let mut state =
-        crate::ApiState::new(CatalogIndex::open(root.path().join("state.sqlite")).unwrap());
+    let mut state = crate::ApiState::new(
+        remanence_state::projector::open(root.path().join("state.sqlite")).unwrap(),
+    );
     let spool = root.path().join("spool");
     std::fs::create_dir(&spool).unwrap();
     state.spool_dir = Some(Arc::new(spool));
@@ -601,8 +606,9 @@ async fn shutdown_ends_session_registered_after_initial_snapshot() {
         reservations,
         lifecycle,
     );
-    let mut state =
-        crate::ApiState::new(CatalogIndex::open(root.path().join("state.sqlite")).unwrap());
+    let mut state = crate::ApiState::new(
+        remanence_state::projector::open(root.path().join("state.sqlite")).unwrap(),
+    );
     state.drive_pool = Some(pool.clone());
     let shutdown = tokio::spawn(async move { state.shutdown_drive_pool().await });
     tokio::time::timeout(StdDuration::from_secs(2), async {

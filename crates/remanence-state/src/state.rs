@@ -72,6 +72,7 @@ pub struct StateHandle {
     config_warnings: Vec<StateConfigWarning>,
     _lock: StateLockGuard,
     audit: FileAuditLog,
+    catalog: crate::ProjectionClient,
     index: CatalogIndex,
     calibration: CalibrationControlStore,
 }
@@ -502,7 +503,8 @@ impl StateHandle {
                 config.audit.clock_forward_tolerance_seconds as i64,
             )),
         )?;
-        let mut index = CatalogIndex::open(&paths.sqlite_path)?;
+        let catalog = crate::projector::open(&paths.sqlite_path)?;
+        let mut index = catalog.write_handle();
         crate::fence::reconcile(&mut index, &paths.audit_dir)?;
         let config_warnings = project_configured_tape_pools(&mut index, &config)?;
         index.reconcile_cleaning_prefixes(&config.cleaning.voltag_prefixes)?;
@@ -513,6 +515,7 @@ impl StateHandle {
             config_warnings,
             _lock: lock,
             audit,
+            catalog,
             index,
             calibration,
         })
@@ -747,9 +750,19 @@ impl StateHandle {
         Ok(())
     }
 
-    /// Return the mutable catalog projection owner.
-    pub fn catalog_index(&mut self) -> &mut CatalogIndex {
-        &mut self.index
+    /// Read the catalog through the state's existing handle.
+    pub fn catalog(&self) -> &CatalogIndex {
+        &self.index
+    }
+
+    /// Issue a writer from the state's projector owner.
+    pub fn write_handle(&self) -> CatalogIndex {
+        self.catalog.write_handle()
+    }
+
+    /// Share the projector owner with standalone drive actors.
+    pub fn projection_client(&self) -> crate::ProjectionClient {
+        self.catalog.clone()
     }
 
     /// Provision or reprovision one tape while coordinating any old physical
@@ -1261,7 +1274,8 @@ impl StateHandle {
                 "projection rebuild requires an existing authority-format marker".into(),
             ));
         }
-        let mut index = CatalogIndex::open(&paths.sqlite_path)?;
+        let catalog = crate::projector::open(&paths.sqlite_path)?;
+        let mut index = catalog.write_handle();
         project_configured_tape_pools(&mut index, &config)?;
         index.reconcile_cleaning_prefixes(&config.cleaning.voltag_prefixes)?;
         let calibration = CalibrationControlStore::open(&paths.calibration_dir)?;
@@ -1891,7 +1905,7 @@ fn preflight_catalog_reset_source(
     ),
     StateError,
 > {
-    match CatalogIndex::open_reset_source(&paths.sqlite_path) {
+    match crate::projector::open_reset_source(&paths.sqlite_path) {
         Ok(index) => preflight_catalog_reset_index(
             &index,
             paths,
@@ -1905,7 +1919,7 @@ fn preflight_catalog_reset_source(
                 return Err(current_schema_error);
             }
             let (source_schema_version, source_tapes) =
-                CatalogIndex::read_legacy_catalog_reset_erase_source(&paths.sqlite_path)?;
+                crate::projector::read_legacy_catalog_reset_erase_source(&paths.sqlite_path)?;
             preflight_catalog_reset_rows(
                 paths,
                 config_bytes,
@@ -2749,15 +2763,15 @@ where
     // rename. Checkpointing first makes removal of its stale sidecars safe.
     if paths.sqlite_path.exists() {
         if let Some(expected_schema_version) = admission.source_schema_version {
-            CatalogIndex::prepare_admitted_catalog_reset_source_atomic_swap(
+            crate::projector::prepare_admitted_catalog_reset_source_atomic_swap(
                 &paths.sqlite_path,
                 expected_schema_version,
             )?;
         } else {
-            let source = CatalogIndex::open_reset_source(&paths.sqlite_path)?;
+            let source = crate::projector::open_reset_source(&paths.sqlite_path)?;
             let version = source.schema_version()?;
             drop(source);
-            CatalogIndex::prepare_admitted_catalog_reset_source_atomic_swap(
+            crate::projector::prepare_admitted_catalog_reset_source_atomic_swap(
                 &paths.sqlite_path,
                 version,
             )?;
@@ -2767,7 +2781,7 @@ where
 
     let replacement_path = create_unique_reset_sqlite_path(&paths.sqlite_path)?;
     let replacement_result = (|| {
-        let mut replacement = CatalogIndex::open(&replacement_path)?;
+        let mut replacement = crate::projector::open_reset_replacement(&replacement_path)?;
         phase_hook(CatalogResetPhase::ReplacementSchemaCreated)?;
         let _config_warnings = project_configured_tape_pools(&mut replacement, config)?;
         replacement.reconcile_cleaning_prefixes(&config.cleaning.voltag_prefixes)?;
@@ -3296,7 +3310,7 @@ pool_id = "camera.copy-a"
         let config_path = temp.path().join("config.toml");
         fs::write(&config_path, config_text(temp.path())).expect("write config");
 
-        let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+        let handle = StateHandle::open_from_config_file(&config_path).expect("open state");
 
         assert_eq!(handle.config().libraries[0].serial, "LIB001");
         assert_eq!(handle.config().tape_pools[0].id, "camera.copy-a");
@@ -3308,15 +3322,12 @@ pool_id = "camera.copy-a"
         assert!(temp.path().join("index/rem-state.sqlite").is_file());
         assert!(temp.path().join("cache/tapes").is_dir());
         assert_eq!(
-            handle
-                .catalog_index()
-                .schema_version()
-                .expect("schema version"),
+            handle.catalog().schema_version().expect("schema version"),
             crate::index::SCHEMA_VERSION
         );
         assert_eq!(
             handle
-                .catalog_index()
+                .catalog()
                 .get_tape_pool("camera.copy-a")
                 .expect("get configured pool")
                 .expect("pool exists")
@@ -3347,7 +3358,9 @@ pool_id = "camera.copy-a"
             )
             .unwrap();
         let records = FileAuditLog::replay(&handle.paths.audit_dir).unwrap();
-        let mut restored = CatalogIndex::open(":memory:").unwrap();
+        let mut restored = crate::projector::open(":memory:")
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         restored.replay_audit_records(&records).unwrap();
         for index in [&mut handle.index, &mut restored] {
             index
@@ -3434,7 +3447,9 @@ pool_id = "camera.copy-a"
                 records.last().unwrap().event,
                 AuditEvent::TapeGenerationChanged
             );
-            let mut restored = CatalogIndex::open(":memory:").unwrap();
+            let mut restored = crate::projector::open(":memory:")
+                .map(|catalog| catalog.write_handle())
+                .unwrap();
             for full_rebuild in [false, false, true] {
                 if full_rebuild {
                     restored
@@ -3503,7 +3518,9 @@ pool_id = "camera.copy-a"
         ] {
             assert!(!record.detail.contains_key(field));
         }
-        let mut restored = CatalogIndex::open(":memory:").unwrap();
+        let mut restored = crate::projector::open(":memory:")
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         restored.replay_audit_records(&records).unwrap();
         restored
             .rebuild_from_authoritative_sources(&records, &[])
@@ -3533,7 +3550,9 @@ pool_id = "camera.copy-a"
             .unwrap()
             .detail
             .insert("drive_serial".into(), CborValue::Text("different".into()));
-        let mut rejected = CatalogIndex::open(":memory:").unwrap();
+        let mut rejected = crate::projector::open(":memory:")
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         rejected.replay_audit_records(&bad_records).unwrap();
         assert!(rejected.get_tape(&input.tape_uuid).unwrap().is_none());
         // Bay admission still requires revision and return slot, live and replay.
@@ -3558,7 +3577,9 @@ pool_id = "camera.copy-a"
                 bad.detail
                     .insert("library_revision".into(), CborValue::Text("D.00".into()));
             }
-            let mut rejected = CatalogIndex::open(":memory:").unwrap();
+            let mut rejected = crate::projector::open(":memory:")
+                .map(|catalog| catalog.write_handle())
+                .unwrap();
             rejected.replay_audit_records(&[bad]).unwrap();
             assert!(rejected.get_tape(&input.tape_uuid).unwrap().is_none());
         }
@@ -3857,7 +3878,7 @@ pool_id = "camera.copy-a"
         );
 
         let tape = handle
-            .catalog_index()
+            .catalog()
             .get_tape(&adoption_input(operation_id).tape_uuid)
             .expect("lookup")
             .expect("adopted row");
@@ -3865,7 +3886,7 @@ pool_id = "camera.copy-a"
         assert_eq!(tape.pool_id.as_deref(), Some("camera.copy-a"));
         assert_eq!(tape.total_committed_ordinals, 0);
         assert!(handle
-            .catalog_index()
+            .catalog()
             .list_tape_files(&adoption_input(operation_id).tape_uuid)
             .expect("list tape files")
             .is_empty());
@@ -3879,7 +3900,7 @@ pool_id = "camera.copy-a"
         assert_eq!(adoption_records[0].idempotency_key, Some(operation_id));
 
         handle
-            .catalog_index()
+            .write_handle()
             .record_media_readiness_operation(crate::index::MediaReadinessOperationInput {
                 operation_id: Uuid::new_v4(),
                 run_id: None,
@@ -3946,7 +3967,7 @@ pool_id = "camera.copy-a"
         assert_eq!(outcome.state, AdoptedTapeState::RecoveryRequired);
         assert_eq!(
             handle
-                .catalog_index()
+                .catalog()
                 .get_tape(&adoption_input(operation_id).tape_uuid)
                 .expect("lookup")
                 .expect("reprojected row")
@@ -4011,7 +4032,7 @@ pool_id = "camera.copy-a"
         assert!(error.to_string().contains("conflicts with existing"));
 
         let conflicting = handle
-            .catalog_index()
+            .catalog()
             .get_tape(&conflicting_uuid)
             .expect("lookup conflicting row")
             .expect("conflicting row remains");
@@ -4021,7 +4042,7 @@ pool_id = "camera.copy-a"
         );
         assert_eq!(conflicting.written_extent_lba, Some(1));
         assert!(handle
-            .catalog_index()
+            .catalog()
             .get_tape(&original.tape_uuid)
             .expect("lookup original projection")
             .is_none());
@@ -4134,7 +4155,7 @@ pool_id = "camera.copy-a"
         assert!(error.to_string().contains("conflicts with existing"));
         assert_eq!(
             handle
-                .catalog_index()
+                .catalog()
                 .get_tape(&adoption_input(operation_id).tape_uuid)
                 .expect("lookup")
                 .expect("evolved row")
@@ -4274,9 +4295,9 @@ pool_id = "camera.copy-a"
             .as_bytes();
 
         {
-            let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+            let handle = StateHandle::open_from_config_file(&config_path).expect("open state");
             handle
-                .catalog_index()
+                .write_handle()
                 .provision_tape(crate::index::ProvisionTapeInput {
                     tape_uuid,
                     voltag: "ACM001L9".to_string(),
@@ -4329,15 +4350,15 @@ pool_id = "camera.copy-a"
             "derived cache must not be archived"
         );
 
-        let mut handle = StateHandle::open_from_config_file(&config_path).expect("reopen state");
+        let handle = StateHandle::open_from_config_file(&config_path).expect("reopen state");
         assert!(handle
-            .catalog_index()
+            .catalog()
             .list_tapes(None, TapeKindFilter::Data)
             .expect("list tapes")
             .is_empty());
         assert_eq!(
             handle
-                .catalog_index()
+                .catalog()
                 .get_tape_pool("camera.copy-a")
                 .expect("pool lookup")
                 .expect("pool projected")
@@ -4375,9 +4396,9 @@ pool_id = "camera.copy-a"
             let config_path = temp.path().join("config.toml");
             fs::write(&config_path, config_text(temp.path())).unwrap();
             {
-                let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
+                let handle = StateHandle::open_from_config_file(&config_path).unwrap();
                 handle
-                    .catalog_index()
+                    .write_handle()
                     .provision_tape(crate::index::ProvisionTapeInput {
                         tape_uuid: [0x93; 16],
                         voltag: "ACM001L9".to_string(),
@@ -4428,10 +4449,10 @@ pool_id = "camera.copy-a"
         let selected_uuid = [0x91; 16];
         let discarded_uuid = [0x92; 16];
         {
-            let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+            let handle = StateHandle::open_from_config_file(&config_path).expect("open state");
             for (tape_uuid, voltag) in [(selected_uuid, "ACM001L9"), (discarded_uuid, "ACM002L9")] {
                 handle
-                    .catalog_index()
+                    .write_handle()
                     .provision_tape(crate::index::ProvisionTapeInput {
                         tape_uuid,
                         voltag: voltag.to_string(),
@@ -4472,9 +4493,9 @@ pool_id = "camera.copy-a"
             report.preserved_tapes[0].state,
             CatalogResetTapeState::Ready
         );
-        let mut handle = StateHandle::open_from_config_file(&config_path).expect("reopen state");
+        let handle = StateHandle::open_from_config_file(&config_path).expect("reopen state");
         let tapes = handle
-            .catalog_index()
+            .catalog()
             .list_tapes(None, TapeKindFilter::All)
             .expect("list tapes");
         assert_eq!(tapes.len(), 1);
@@ -4497,7 +4518,7 @@ pool_id = "camera.copy-a"
             0
         );
         assert!(handle
-            .catalog_index()
+            .catalog()
             .get_tape(&discarded_uuid)
             .expect("discarded lookup")
             .is_none());
@@ -4544,10 +4565,10 @@ pool_id = "camera.copy-a"
         let written_uuid = [0x93; 16];
         let finalized_uuid = [0x94; 16];
         {
-            let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+            let handle = StateHandle::open_from_config_file(&config_path).expect("open state");
             for (tape_uuid, voltag) in [(written_uuid, "ACM003L9"), (finalized_uuid, "ACM004L9")] {
                 handle
-                    .catalog_index()
+                    .write_handle()
                     .provision_tape(crate::index::ProvisionTapeInput {
                         tape_uuid,
                         voltag: voltag.to_string(),
@@ -4558,11 +4579,11 @@ pool_id = "camera.copy-a"
                     .expect("provision tape");
             }
             handle
-                .catalog_index()
+                .write_handle()
                 .seal_tape(written_uuid)
                 .expect("seal written tape");
             handle
-                .catalog_index()
+                .write_handle()
                 .project_terminal_finalization(crate::index::TerminalFinalizationProjectionInput {
                     tape_uuid: finalized_uuid,
                     trigger: crate::checkpoint::TerminalFinalizationTrigger::ReachedLowWatermark,
@@ -4586,10 +4607,10 @@ pool_id = "camera.copy-a"
             .iter()
             .all(|tape| tape.state == CatalogResetTapeState::RecoveryRequired));
 
-        let mut handle = StateHandle::open_from_config_file(&config_path).expect("reopen state");
+        let handle = StateHandle::open_from_config_file(&config_path).expect("reopen state");
         for tape_uuid in [written_uuid, finalized_uuid] {
             let tape = handle
-                .catalog_index()
+                .catalog()
                 .get_tape(&tape_uuid)
                 .expect("get tape")
                 .expect("preserved tape");
@@ -4616,10 +4637,10 @@ pool_id = "camera.copy-a"
             ([0xA4; 16], "ACM024L9"),
         ];
         {
-            let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+            let handle = StateHandle::open_from_config_file(&config_path).expect("open state");
             for (tape_uuid, voltag) in guarded {
                 handle
-                    .catalog_index()
+                    .write_handle()
                     .provision_tape(ProvisionTapeInput {
                         tape_uuid,
                         voltag: voltag.to_string(),
@@ -4682,11 +4703,11 @@ pool_id = "camera.copy-a"
             .iter()
             .all(|tape| tape.state == CatalogResetTapeState::RecoveryRequired));
 
-        let mut handle = StateHandle::open_from_config_file(&config_path).expect("reopen state");
+        let handle = StateHandle::open_from_config_file(&config_path).expect("reopen state");
         for (tape_uuid, _) in guarded {
             assert_eq!(
                 handle
-                    .catalog_index()
+                    .catalog()
                     .get_tape(&tape_uuid)
                     .expect("lookup guarded tape")
                     .expect("preserved tape")
@@ -4720,9 +4741,9 @@ pool_id = "camera.copy-a"
         let config_path = temp.path().join("config.toml");
         fs::write(&config_path, config_text(temp.path())).expect("write config");
         {
-            let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+            let handle = StateHandle::open_from_config_file(&config_path).expect("open state");
             handle
-                .catalog_index()
+                .write_handle()
                 .provision_tape(crate::index::ProvisionTapeInput {
                     tape_uuid: [0x95; 16],
                     voltag: "ACM005L9".to_string(),
@@ -4748,7 +4769,7 @@ pool_id = "camera.copy-a"
                 b"unchanged"
             );
             assert!(!temp.path().join("reset-archives").exists());
-            let index = CatalogIndex::open_read_only(temp.path().join("index/rem-state.sqlite"))
+            let index = crate::CatalogReader::open(temp.path().join("index/rem-state.sqlite"))
                 .expect("catalog survives");
             assert!(index
                 .get_tape_by_voltag("ACM005L9")
@@ -4803,10 +4824,10 @@ pool_id = "camera.copy-a"
             let config_path = temp.path().join("config.toml");
             fs::write(&config_path, config_text(temp.path())).expect("write config");
             {
-                let mut handle =
+                let handle =
                     StateHandle::open_from_config_file(&config_path).expect("open state");
                 handle
-                    .catalog_index()
+                    .write_handle()
                     .provision_tape(ProvisionTapeInput {
                         tape_uuid: [0xBA; 16],
                         voltag: "ACM031L9".to_string(),
@@ -4816,7 +4837,7 @@ pool_id = "camera.copy-a"
                     })
                     .expect("provision source");
                 handle
-                    .catalog_index()
+                    .write_handle()
                     .project_tape_pool_membership([0xBA; 16], "camera.copy-a")
                     .expect("assign source pool");
             }
@@ -4874,10 +4895,9 @@ pool_id = "camera.copy-a"
             let config_link = temp.path().join("config-link.toml");
             fs::write(&config_path, config_text(temp.path())).expect("write config");
             {
-                let mut handle =
-                    StateHandle::open_from_config_file(&config_path).expect("open state");
+                let handle = StateHandle::open_from_config_file(&config_path).expect("open state");
                 handle
-                    .catalog_index()
+                    .write_handle()
                     .provision_tape(ProvisionTapeInput {
                         tape_uuid: [0xBC; 16],
                         voltag: "ACM032L9".to_string(),
@@ -4916,9 +4936,9 @@ pool_id = "camera.copy-a"
         let config_path = temp.path().join("config.toml");
         fs::write(&config_path, config_text(temp.path())).expect("write config");
         {
-            let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+            let handle = StateHandle::open_from_config_file(&config_path).expect("open state");
             handle
-                .catalog_index()
+                .write_handle()
                 .provision_tape(crate::index::ProvisionTapeInput {
                     tape_uuid: [0x96; 16],
                     voltag: "ACM006L9".to_string(),
@@ -5032,10 +5052,9 @@ pool_id = "camera.copy-a"
             fs::write(&config_path, config_text(temp.path())).expect("write config");
             let tape_uuid = [0x98; 16];
             {
-                let mut handle =
-                    StateHandle::open_from_config_file(&config_path).expect("open state");
+                let handle = StateHandle::open_from_config_file(&config_path).expect("open state");
                 handle
-                    .catalog_index()
+                    .write_handle()
                     .provision_tape(crate::index::ProvisionTapeInput {
                         tape_uuid,
                         voltag: "ACM008L9".to_string(),
@@ -5045,7 +5064,7 @@ pool_id = "camera.copy-a"
                     })
                     .expect("provision tape");
                 handle
-                    .catalog_index()
+                    .write_handle()
                     .seal_tape(tape_uuid)
                     .expect("seal tape");
             }
@@ -5069,7 +5088,7 @@ pool_id = "camera.copy-a"
             )
             .expect("request digest");
             let lock = StateLockGuard::acquire(&paths.state_dir).expect("acquire reset lock");
-            let preserved = CatalogIndex::open_read_only(&paths.sqlite_path)
+            let preserved = crate::CatalogReader::open(&paths.sqlite_path)
                 .expect("open source")
                 .capture_catalog_reset_tapes(&["ACM008L9".to_string()], &config.tape_pool_rules)
                 .expect("capture source");
@@ -5106,7 +5125,7 @@ pool_id = "camera.copy-a"
                 "{open_error}"
             );
 
-            let source_after_cut = CatalogIndex::open_read_only(&paths.sqlite_path)
+            let source_after_cut = crate::CatalogReader::open(&paths.sqlite_path)
                 .expect("a complete catalog survives every cut");
             let tape_after_cut = source_after_cut
                 .get_tape_by_voltag("ACM008L9")
@@ -5269,7 +5288,7 @@ pool_id = "camera.copy-a"
                 (retired_uuid, "ACM012L9"),
             ] {
                 handle
-                    .catalog_index()
+                    .write_handle()
                     .provision_tape(crate::index::ProvisionTapeInput {
                         tape_uuid,
                         voltag: voltag.to_string(),
@@ -5280,7 +5299,7 @@ pool_id = "camera.copy-a"
                     .expect("provision tape");
             }
             handle
-                .catalog_index()
+                .write_handle()
                 .set_tape_kind(&cleaning_uuid, "cleaning")
                 .expect("set cleaning kind");
             handle
@@ -5338,10 +5357,9 @@ pool_id = "camera.copy-a"
         // Advisory preflight does not authorize a later changed catalog. The
         // mutating API repeats admission under its own exclusive lock.
         {
-            let mut handle =
-                StateHandle::open_from_config_file(&config_path).expect("reopen state");
+            let handle = StateHandle::open_from_config_file(&config_path).expect("reopen state");
             handle
-                .catalog_index()
+                .write_handle()
                 .provision_tape(crate::index::ProvisionTapeInput {
                     tape_uuid: [0xA4; 16],
                     voltag: "ACM013L9".to_string(),
@@ -5498,9 +5516,9 @@ pool_id = "camera.copy-a"
         let original_config = config_text(temp.path());
         fs::write(&config_path, &original_config).expect("write config");
         {
-            let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+            let handle = StateHandle::open_from_config_file(&config_path).expect("open state");
             handle
-                .catalog_index()
+                .write_handle()
                 .provision_tape(crate::index::ProvisionTapeInput {
                     tape_uuid: [0xA5; 16],
                     voltag: "ACM014L9".to_string(),
@@ -5529,7 +5547,7 @@ pool_id = "camera.copy-a"
         )
         .expect("request digest");
         let lock = StateLockGuard::acquire(&paths.state_dir).expect("reset lock");
-        let preserved = CatalogIndex::open_read_only(&paths.sqlite_path)
+        let preserved = crate::CatalogReader::open(&paths.sqlite_path)
             .expect("source")
             .capture_catalog_reset_tapes(&["ACM014L9".to_string()], &config.tape_pool_rules)
             .expect("capture");
@@ -5609,10 +5627,10 @@ pool_id = "camera.copy-a"
             .as_bytes();
 
         {
-            let mut handle =
+            let handle =
                 StateHandle::open_with_config(paths.clone(), config).expect("open with pool");
             handle
-                .catalog_index()
+                .write_handle()
                 .provision_tape(crate::index::ProvisionTapeInput {
                     tape_uuid,
                     voltag: "ACM001L9".to_string(),
@@ -5625,11 +5643,11 @@ pool_id = "camera.copy-a"
 
         {
             let config = parse_config_toml(&config_text(temp.path())).expect("config");
-            let mut handle =
+            let handle =
                 StateHandle::open_with_config(paths.clone(), config).expect("reopen with pool");
             assert_eq!(
                 handle
-                    .catalog_index()
+                    .catalog()
                     .list_tapes(Some("camera.copy-a"), TapeKindFilter::Data)
                     .expect("pool tapes")
                     .len(),
@@ -5638,21 +5656,21 @@ pool_id = "camera.copy-a"
         }
 
         let config = parse_config_toml(&config_without_pools(temp.path())).expect("config");
-        let mut handle = StateHandle::open_with_config(paths, config).expect("reopen without pool");
+        let handle = StateHandle::open_with_config(paths, config).expect("reopen without pool");
 
         assert!(handle
-            .catalog_index()
+            .catalog()
             .get_tape_pool("camera.copy-a")
             .expect("pool lookup")
             .is_none());
         let tapes = handle
-            .catalog_index()
+            .catalog()
             .list_tapes(None, TapeKindFilter::Data)
             .expect("list tapes");
         assert_eq!(tapes.len(), 1);
         assert_eq!(tapes[0].pool_id, None);
         assert!(handle
-            .catalog_index()
+            .catalog()
             .list_tapes(Some("camera.copy-a"), TapeKindFilter::Data)
             .expect("pool tapes after removal")
             .is_empty());
@@ -5671,10 +5689,10 @@ pool_id = "camera.copy-a"
             .as_bytes();
 
         {
-            let mut handle =
+            let handle =
                 StateHandle::open_with_config(paths.clone(), config).expect("open with pool");
             handle
-                .catalog_index()
+                .write_handle()
                 .provision_tape(crate::index::ProvisionTapeInput {
                     tape_uuid,
                     voltag: "ACM001L9".to_string(),
@@ -5686,15 +5704,15 @@ pool_id = "camera.copy-a"
         }
 
         let config = parse_config_toml(&config_with_pool_b(temp.path())).expect("config");
-        let mut handle = StateHandle::open_with_config(paths, config).expect("reopen with pool b");
+        let handle = StateHandle::open_with_config(paths, config).expect("reopen with pool b");
         let tapes = handle
-            .catalog_index()
+            .catalog()
             .list_tapes(None, TapeKindFilter::Data)
             .expect("list tapes");
         assert_eq!(tapes.len(), 1);
         assert_eq!(tapes[0].pool_id.as_deref(), Some("camera.copy-b"));
         assert!(handle
-            .catalog_index()
+            .catalog()
             .get_tape_pool("camera.copy-a")
             .expect("pool lookup")
             .is_none());
@@ -5744,7 +5762,7 @@ pool_id = "camera.copy-a"
         let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
         let tape_uuid = [0xc3; 16];
         handle
-            .catalog_index()
+            .write_handle()
             .provision_tape(crate::index::ProvisionTapeInput {
                 tape_uuid,
                 voltag: "BUSY01L9".into(),
@@ -5773,7 +5791,7 @@ pool_id = "camera.copy-a"
         assert!(before.elapsed() < std::time::Duration::from_millis(250));
         assert_ne!(
             handle
-                .catalog_index()
+                .catalog()
                 .get_tape(&tape_uuid)
                 .unwrap()
                 .unwrap()
@@ -5796,7 +5814,7 @@ pool_id = "camera.copy-a"
         let tape_uuid = [0x5Eu8; 16];
         let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
         handle
-            .catalog_index()
+            .write_handle()
             .provision_tape(crate::index::ProvisionTapeInput {
                 tape_uuid,
                 voltag: "ACM001L9".to_string(),
@@ -5963,7 +5981,7 @@ pool_id = "camera.copy-a"
         assert_eq!(report.lost_sessions_marked, 0);
         assert_eq!(
             restarted
-                .catalog_index()
+                .catalog()
                 .get_tape(&[0x21; 16])
                 .expect("tape lookup")
                 .expect("audit-projected tape")
@@ -5972,7 +5990,7 @@ pool_id = "camera.copy-a"
         );
         assert_eq!(
             restarted
-                .catalog_index()
+                .catalog()
                 .session_state(session_id)
                 .expect("session state")
                 .as_deref(),
@@ -6039,7 +6057,9 @@ pool_id = "camera.copy-a"
                 .unwrap();
         }
         let _lock = StateLockGuard::acquire(&paths.state_dir).unwrap();
-        let mut index = CatalogIndex::open(&paths.sqlite_path).unwrap();
+        let mut index = crate::projector::open(&paths.sqlite_path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         assert_eq!(
             index.session_state(session_id).unwrap().as_deref(),
             Some("open")
@@ -6082,7 +6102,9 @@ pool_id = "camera.copy-a"
                 .unwrap();
         }
         let _lock = StateLockGuard::acquire(&paths.state_dir).unwrap();
-        let mut index = CatalogIndex::open(&paths.sqlite_path).unwrap();
+        let mut index = crate::projector::open(&paths.sqlite_path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         assert_eq!(index.session_state(session_id).unwrap(), None);
 
         let lost = recover_library_sessions_after_restart(&mut index, &config).unwrap();
@@ -6180,7 +6202,9 @@ pool_id = "camera.copy-a"
             state.replay_audit_projection().unwrap();
         }
         let _lock = StateLockGuard::acquire(&paths.state_dir).unwrap();
-        let mut index = CatalogIndex::open(&paths.sqlite_path).unwrap();
+        let mut index = crate::projector::open(&paths.sqlite_path)
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         assert_eq!(
             recover_library_sessions_after_restart(&mut index, &config).unwrap(),
             3
@@ -6314,7 +6338,7 @@ pool_id = "camera.copy-a"
         assert_eq!(report.lost_sessions_marked, 1);
         assert_eq!(
             restarted
-                .catalog_index()
+                .catalog()
                 .operation_state(operation_id)
                 .expect("operation state")
                 .as_deref(),
@@ -6322,7 +6346,7 @@ pool_id = "camera.copy-a"
         );
         assert_eq!(
             restarted
-                .catalog_index()
+                .catalog()
                 .session_state(session_id)
                 .expect("session state")
                 .as_deref(),
@@ -6330,7 +6354,7 @@ pool_id = "camera.copy-a"
         );
         assert_eq!(
             restarted
-                .catalog_index()
+                .catalog()
                 .idempotency_terminal_state("user:alice", idempotency_key)
                 .expect("idempotency terminal state")
                 .as_deref(),
@@ -6398,16 +6422,16 @@ pool_id = "camera.copy-a"
             .expect("temp dir");
         let config_path = temp.path().join("config.toml");
         fs::write(&config_path, config_text(temp.path())).expect("write config");
-        let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+        let handle = StateHandle::open_from_config_file(&config_path).expect("open state");
         let tape_uuid = [0x42u8; 16];
 
         let record = wrap_map_record(tape_uuid, 3, 17);
         handle
-            .catalog_index()
+            .write_handle()
             .upsert_wrap_map(&record)
             .expect("upsert wrap map");
         let fetched = handle
-            .catalog_index()
+            .catalog()
             .get_wrap_map(&tape_uuid)
             .expect("get wrap map")
             .expect("row present");
@@ -6416,28 +6440,28 @@ pool_id = "camera.copy-a"
         // Replacement at the next load harvest overwrites in place.
         let extended = wrap_map_record(tape_uuid, 4, 21);
         handle
-            .catalog_index()
+            .write_handle()
             .upsert_wrap_map(&extended)
             .expect("replace wrap map");
         let fetched = handle
-            .catalog_index()
+            .catalog()
             .get_wrap_map(&tape_uuid)
             .expect("get wrap map")
             .expect("row present");
         assert_eq!(fetched.write_epoch, 4);
 
         assert!(handle
-            .catalog_index()
+            .write_handle()
             .delete_wrap_map(&tape_uuid)
             .expect("delete"));
         assert!(handle
-            .catalog_index()
+            .catalog()
             .get_wrap_map(&tape_uuid)
             .expect("get after delete")
             .is_none());
         assert!(
             !handle
-                .catalog_index()
+                .write_handle()
                 .delete_wrap_map(&tape_uuid)
                 .expect("second delete"),
             "eviction is idempotent"
@@ -6476,7 +6500,7 @@ pool_id = "camera.copy-a"
             panic!("expected calibrated transition: {transition:?}");
         };
         handle
-            .catalog_index()
+            .write_handle()
             .upsert_wrap_map(&wrap_map_record(
                 old_uuid,
                 write_epoch,
@@ -6500,7 +6524,7 @@ pool_id = "camera.copy-a"
         );
         assert!(after_geometry_change.calibration_generation > calibration_generation);
         assert!(handle
-            .catalog_index()
+            .catalog()
             .get_wrap_map(&old_uuid)
             .expect("map lookup after geometry change")
             .is_none());
@@ -6517,7 +6541,7 @@ pool_id = "camera.copy-a"
             panic!("expected recalibrated transition: {recalibrated:?}");
         };
         handle
-            .catalog_index()
+            .write_handle()
             .upsert_wrap_map(&wrap_map_record(
                 old_uuid,
                 write_epoch,
@@ -6536,7 +6560,7 @@ pool_id = "camera.copy-a"
             .expect("reprovision physical identity");
 
         assert!(handle
-            .catalog_index()
+            .catalog()
             .get_wrap_map(&old_uuid)
             .expect("old wrap map lookup")
             .is_none());
@@ -6577,7 +6601,7 @@ pool_id = "camera.copy-a"
             panic!("expected calibration, got {transition:?}");
         };
         handle
-            .catalog_index()
+            .write_handle()
             .upsert_wrap_map(&wrap_map_record(
                 tape_uuid,
                 write_epoch,
@@ -6592,7 +6616,7 @@ pool_id = "camera.copy-a"
 
         assert!(
             handle
-                .catalog_index()
+                .catalog()
                 .get_wrap_map(&tape_uuid)
                 .expect("get after rebuild")
                 .is_none(),
@@ -6630,7 +6654,7 @@ pool_id = "camera.copy-a"
         let tape_uuid = [0x44u8; 16];
 
         let (pre_reset_generation, map_epoch) = {
-            let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+            let handle = StateHandle::open_from_config_file(&config_path).expect("open state");
             let transition = handle
                 .calibration_control()
                 .record_harvest_success(tape_uuid, 0)
@@ -6643,7 +6667,7 @@ pool_id = "camera.copy-a"
                 panic!("expected calibration, got {transition:?}");
             };
             handle
-                .catalog_index()
+                .write_handle()
                 .upsert_wrap_map(&wrap_map_record(
                     tape_uuid,
                     write_epoch,
@@ -6662,10 +6686,10 @@ pool_id = "camera.copy-a"
             .join(crate::calibration::CALIBRATION_CONTROL_FILENAME)
             .is_file());
 
-        let mut handle = StateHandle::open_from_config_file(&config_path).expect("reopen");
+        let handle = StateHandle::open_from_config_file(&config_path).expect("reopen");
         assert!(
             handle
-                .catalog_index()
+                .catalog()
                 .get_wrap_map(&tape_uuid)
                 .expect("get after reset")
                 .is_none(),
@@ -6880,7 +6904,11 @@ mod cutover_tests {
                 .count(),
             0
         );
-        drop(CatalogIndex::open(&paths.sqlite_path).unwrap());
+        drop(
+            crate::projector::open(&paths.sqlite_path)
+                .map(|catalog| catalog.write_handle())
+                .unwrap(),
+        );
         crate::authority_layout::admit_owned_config(&config).unwrap();
         drop(lock);
         StateHandle::open_from_config_file(&config_path).unwrap();
@@ -6901,7 +6929,8 @@ mod cutover_tests {
             .unwrap_err()
             .to_string()
             .contains(crate::authority_layout::RESET_REQUIRED));
-        assert!(CatalogIndex::open(&paths.sqlite_path)
+        assert!(crate::projector::open(&paths.sqlite_path)
+            .map(|catalog| catalog.write_handle())
             .unwrap_err()
             .to_string()
             .contains(crate::authority_layout::RESET_REQUIRED));

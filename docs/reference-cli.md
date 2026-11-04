@@ -1227,7 +1227,7 @@ rem tape quarantine release mrq-9b1d2c3e-4f50-4a61-8b72-93a4b5c6d7e8 \
     --after-settled-inventory --ack "inventory settled; cartridge is in its home slot"
 ```
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-state/src/index.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-state/src/projector/index.rs @ e4d4f53f433998602c4e2baa56747f68e4e2684e -->
 ### rem tape retire
 
 Retire one tape identity permanently in the local catalog.
@@ -2473,7 +2473,7 @@ configuration. `tape retire` and `catalog reset` change local state and carry th
 confirmations. `tape quarantine release` uses the daemon for tape-I/O fences when it runs;
 offline release needs exclusive state ownership.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-state/src/state.rs crates/remanence-state/src/tape_log/projection.rs @ 625f7044 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-state/src/state.rs crates/remanence-state/src/projector/tape_log_projection.rs @ 625f7044 -->
 ## Catalog rebuild
 
 ### rem rebuild-catalog-from-journals

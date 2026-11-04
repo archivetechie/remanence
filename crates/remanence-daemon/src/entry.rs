@@ -134,7 +134,7 @@ pub async fn main_entry_with_registry(
         .socket
         .unwrap_or_else(|| config.daemon.socket_path_or_default());
 
-    let index = match remanence_state::CatalogIndex::open(&config.index.sqlite_path) {
+    let index = match remanence_state::projector::open(&config.index.sqlite_path) {
         Ok(index) => index,
         Err(error) => {
             stderr_message!(

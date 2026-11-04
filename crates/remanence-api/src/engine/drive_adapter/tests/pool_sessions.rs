@@ -1078,14 +1078,10 @@ fn bootstrap_barrier_crashes_recover_without_publishing_initialized() {
             )
             .unwrap();
             mount.finish().unwrap();
-            let fences = state.catalog_index().list_active_tape_io_fences().unwrap();
+            let fences = state.catalog().list_active_tape_io_fences().unwrap();
             assert_eq!(fences.len(), 1);
             assert_eq!(fences[0].reason, "standalone_write_lost_by_restart");
-            assert!(state
-                .catalog_index()
-                .non_terminal_sessions()
-                .unwrap()
-                .is_empty());
+            assert!(state.catalog().non_terminal_sessions().unwrap().is_empty());
             assert!(!remanence_state::TapeAuthority::exists(
                 config.journal.dir.join("tapes"),
                 UUID

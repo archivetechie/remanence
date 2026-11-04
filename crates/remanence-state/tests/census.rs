@@ -739,6 +739,21 @@ fn scan_with_builders(
     kind: &str,
     builders: &BTreeSet<String>,
 ) -> BTreeMap<String, usize> {
+    // Preserve B1/B3b identities for unchanged audit and policy code moved under
+    // projector; the SQL and catalog capability censuses use the physical path.
+    let path = if !matches!(kind, "sql-mutation" | "catalog-writer") {
+        match path {
+            "crates/remanence-state/src/projector/index.rs" => {
+                "crates/remanence-state/src/index.rs"
+            }
+            "crates/remanence-state/src/projector/tape_log_projection.rs" => {
+                "crates/remanence-state/src/tape_log/projection.rs"
+            }
+            _ => path,
+        }
+    } else {
+        path
+    };
     let t = production_tokens(source);
     let names = audit_names(&t);
     let impls = record_impls(&t);
@@ -821,6 +836,34 @@ fn scan_with_builders(
                 .or_insert(0) += 1;
         };
         match kind {
+            "catalog-writer" => {
+                assert!(
+                    !sequence(rest, &["CatalogIndex", ":", ":", "open"])
+                        && !sequence(rest, &["CatalogIndex", ":", ":", "open_read_only"])
+                        && !sequence(rest, &["CatalogIndex", ":", ":", "open_inventory"])
+                        && !sequence(rest, &["CatalogIndex", ":", ":", "open_reset_source"])
+                        && !sequence(rest, &["index_write"]),
+                    "forbidden catalog escape in {path}::{name}"
+                );
+                if sequence(rest, &["fn", "catalog_index"]) {
+                    let end = function_end(&t, i);
+                    assert!(
+                        !t[i..end]
+                            .windows(4)
+                            .any(|w| sequence(w, &["-", ">", "&", "mut"])),
+                        "mutable catalog_index in {path}"
+                    );
+                }
+                if sequence(rest, &["projector", ":", ":", "open", "("]) {
+                    add("projector::open");
+                }
+                if sequence(rest, &[".", "write_handle", "("]) {
+                    add("write_handle");
+                }
+                if sequence(rest, &["CatalogReader", ":", ":", "empty", "("]) {
+                    add("CatalogReader::empty");
+                }
+            }
             "sql-mutation" => {
                 if sequence(rest, &["Connection", ":", ":"])
                     && t.get(i + 3).is_some_and(|x| x.text.starts_with("open"))
@@ -1142,6 +1185,16 @@ fn census(kind: &str) {
                     && matches!(t.text.as_str(), "set_len" | "ftruncate" | "truncate")),
                 "log authority must not truncate: {path}"
             );
+        }
+    }
+    if kind == "sql-mutation" {
+        for key in actual.keys() {
+            assert!(key.starts_with("crates/remanence-state/src/projector/")
+                || key.starts_with("crates/remanence-chaos/src/")
+                || key.starts_with("crates/remanence-state/src/authority_layout.rs::validate_layout::")
+                || key.starts_with("crates/remanence-cli/src/pool_ops.rs::run_archive_export_object::mutating-sql")
+                || key.starts_with("crates/remanence-cli/src/pool_ops.rs::run_archive_read::mutating-sql"),
+                "SQL outside projector and named exceptions: {key}");
         }
     }
     println!(
@@ -1985,6 +2038,37 @@ fn b3b_finishing_site_scanner_detects_consumer_reclassification() {
         assert_eq!(
             found.get(&format!("crates/example/src/lib.rs::renderer::{name}")),
             Some(&1)
+        );
+    }
+}
+
+/// Writer creation sites are reviewed and obsolete writable escapes are absent.
+#[test]
+fn b4a_catalog_writer_census() {
+    census("catalog-writer");
+}
+
+/// Capability scanning uses the shared tokenizer and distinguishes mutable receivers from mutable returns.
+#[test]
+fn b4a_catalog_writer_scanner() {
+    let source = r#"
+        // CatalogIndex::open("comment");
+        fn issue() { let c = projector::open(p); c.write_handle(); CatalogReader::empty(); }
+        fn catalog_index(&mut self) -> &CatalogIndex { &self.index }
+        #[cfg(test)] fn fixture() { CatalogIndex::open(p); }
+    "#;
+    let found = scan("example.rs", source, "catalog-writer");
+    assert_eq!(found.len(), 3);
+    assert_eq!(found["example.rs::issue::projector::open"], 1);
+    assert_eq!(found["example.rs::issue::write_handle"], 1);
+    assert_eq!(found["example.rs::issue::CatalogReader::empty"], 1);
+    for forbidden in [
+        "fn leak() { CatalogIndex::open(p); }",
+        "fn leak() { c.index_write(); }",
+        "fn catalog_index(&mut self) -> &mut CatalogIndex { &mut self.index }",
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| scan("example.rs", forbidden, "catalog-writer")).is_err()
         );
     }
 }

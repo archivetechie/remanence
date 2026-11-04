@@ -686,10 +686,15 @@ fn retry_projection(state: &ApiState, uuid: [u8; 16], sequence: u64) -> Result<(
     )
     .and_then(|a| a.freeze())
     .map_err(crate::status_from_state_error)?;
-    state
-        .index_write()?
-        .project_tape_log(&snapshot)
-        .map_err(crate::status_from_state_error)
+    {
+        let mut index = state.catalog.write_handle();
+        if let Some(pool) = &state.drive_pool {
+            index.set_readiness_observer(pool.readiness_wake.clone());
+        }
+        index
+    }
+    .project_tape_log(&snapshot)
+    .map_err(crate::status_from_state_error)
 }
 
 fn alarm(state: &ApiState, key: Key, s: &TapeSummary) -> Result<(), Status> {
@@ -731,7 +736,13 @@ fn alarm(state: &ApiState, key: Key, s: &TapeSummary) -> Result<(), Status> {
         return Ok(());
     }
     crate::audit_projection::append_operation_audit(
-        &mut state.index_write()?,
+        &mut {
+            let mut index = state.catalog.write_handle();
+            if let Some(pool) = &state.drive_pool {
+                index.set_readiness_observer(pool.readiness_wake.clone());
+            }
+            index
+        },
         &state.audit_dir,
         state.audit_fsync,
         &state.audit_append_lock,
@@ -969,7 +980,7 @@ mod tests {
         std::fs::create_dir(root.path().join("audit")).unwrap();
         let make = || {
             let mut state = ApiState::new(
-                remanence_state::CatalogIndex::open(root.path().join("state.sqlite")).unwrap(),
+                remanence_state::projector::open(root.path().join("state.sqlite")).unwrap(),
             );
             state.audit_dir = std::sync::Arc::new(root.path().join("audit"));
             state
@@ -1244,8 +1255,9 @@ mod fix_tests {
     #[test]
     fn b7_fix2_readiness_clearance_wakes_only_affected_tape() {
         let root = tempfile::tempdir().unwrap();
-        let mut index =
-            remanence_state::CatalogIndex::open(root.path().join("state.sqlite")).unwrap();
+        let mut index = remanence_state::projector::open(root.path().join("state.sqlite"))
+            .map(|catalog| catalog.write_handle())
+            .unwrap();
         let id = Uuid::new_v4();
         index
             .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
@@ -1265,7 +1277,12 @@ mod fix_tests {
                 evidence_path: None,
             })
             .unwrap();
-        let state = ApiState::new(index);
+        let state = ApiState::new({
+            let index = index;
+            let catalog = remanence_state::projector::open(index.path()).unwrap();
+            drop(index);
+            catalog
+        });
         let key = ([0xf3; 16], 1);
         let other = ([0xf4; 16], 1);
         for key in [key, other] {
@@ -1279,30 +1296,34 @@ mod fix_tests {
         assert_eq!(state.closeout_work.claim(Instant::now(), false), vec![key]);
         // Clearance can precede publication of the refusal: polling the typed
         // operation after failure must still remember it.
-        state
-            .index_write()
-            .unwrap()
-            .record_media_readiness_transition(remanence_state::MediaReadinessTransitionInput {
-                operation_id: id,
-                phase: None,
-                state: "ready".into(),
-                dirty_scope: Some("none".into()),
-                last_cdb_opcode: None,
-                last_sense_raw: None,
-                last_sense_key: None,
-                last_asc: None,
-                last_ascq: None,
-                last_host_status: None,
-                last_driver_status: None,
-                target_status: None,
-                transport_class: None,
-                cancel_source: None,
-                signal: None,
-                evidence_path: None,
-                last_error_json: None,
-                quarantine_id: None,
-            })
-            .unwrap();
+        {
+            let mut index = state.catalog.write_handle();
+            if let Some(pool) = &state.drive_pool {
+                index.set_readiness_observer(pool.readiness_wake.clone());
+            }
+            index
+        }
+        .record_media_readiness_transition(remanence_state::MediaReadinessTransitionInput {
+            operation_id: id,
+            phase: None,
+            state: "ready".into(),
+            dirty_scope: Some("none".into()),
+            last_cdb_opcode: None,
+            last_sense_raw: None,
+            last_sense_key: None,
+            last_asc: None,
+            last_ascq: None,
+            last_host_status: None,
+            last_driver_status: None,
+            target_status: None,
+            transport_class: None,
+            cancel_source: None,
+            signal: None,
+            evidence_path: None,
+            last_error_json: None,
+            quarantine_id: None,
+        })
+        .unwrap();
         state.closeout_work.failed(
             key,
             &crate::readiness_wait::ReadinessFence(id).status("opaque"),
