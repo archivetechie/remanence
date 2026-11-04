@@ -13838,7 +13838,9 @@ fn ioctl_capacity_write_refusals_raise_no_failure_fence() {
                 audit_session: Arc::new(Mutex::new(None)),
                 direct_replay_fault: None,
             });
-            let mut index = CatalogIndex::open(&cfg.index_path).unwrap();
+            let mut index = remanence_state::projector::open(&cfg.index_path)
+                .map(|catalog| catalog.write_handle())
+                .expect("open test index");
             let before = drive.media_write_dispatch_count();
             let mut attempted = false;
             let counts = (census::total(), census::normalizations());
