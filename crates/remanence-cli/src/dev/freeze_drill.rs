@@ -422,6 +422,7 @@ fn authorize_bot(
         {
             Ok(*uuid)
         }
+        remanence_api::BotClassification::HostCapacityRefused { detail } => Err(detail.clone()),
         remanence_api::BotClassification::ReadError if unreadable_bot_ack => {
             Ok(new_drill_tape_uuid())
         }

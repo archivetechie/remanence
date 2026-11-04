@@ -2220,7 +2220,30 @@ impl DriveHandle {
         self.position_check_bytes
     }
 
-    /// Actual sg reserved buffer size reported by the transport.
+    /// Report the nonzero READ BLOCK LIMITS maximum learned by `read_config`.
+    /// A zero maximum or an unread configuration supplies no known record bound.
+    pub fn known_max_block_size_bytes(&self) -> Option<u32> {
+        self.max_write_block_size_bytes.filter(|limit| *limit != 0)
+    }
+
+    /// Obtain the single identity READ bound through the same sg allocation as batches.
+    /// Batch configuration and its cached sizing remain unchanged.
+    pub fn configure_identity_read_buffer(
+        &mut self,
+        wanted: u32,
+    ) -> Result<u32, tape_io::TapeIoError> {
+        let wanted = wanted.min(remanence_scsi::read_write::MAX_TRANSFER_LEN);
+        // Do not shrink a buffer already reserved for larger fixed-block batches.
+        if self.sg_reserved_size_bytes >= wanted {
+            return Ok(wanted);
+        }
+        self.transport
+            .configure_reserved_buffer(wanted)
+            .map(|granted| granted.min(wanted))
+            .map_err(tape_io::map_scsi)
+    }
+
+    /// Actual sg reserved buffer size reported for batch sizing at open.
     pub fn sg_reserved_size_bytes(&self) -> u32 {
         self.sg_reserved_size_bytes
     }

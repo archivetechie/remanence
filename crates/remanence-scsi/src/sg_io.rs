@@ -21,7 +21,7 @@
 //!   (WRITE block, MODE SELECT).
 //!
 //! All three share the same error vocabulary on [`ScsiError`]:
-//! `InvalidInput` for caller-side limit violations, `Io` for ioctl
+//! `InvalidInput` for caller-side limits and pre-dispatch ENOMEM/EINVAL, `Io` for other ioctl
 //! failures, `CheckCondition` for target-reported CHECK CONDITION
 //! (with sense bytes and bytes_transferred derived from `resid`), and
 //! `TransportError` for host/driver/transport-level faults that the
@@ -123,6 +123,24 @@ const STATUS_CHECK_CONDITION: u8 = 0x02;
 /// Largest CDB the sg v3 interface accepts.
 const MAX_CDB_LEN: usize = 16;
 
+/// Allocation/size rejection at the ioctl boundary dispatched no SCSI command.
+/// Other errno values retain the conservative completion-unknown path.
+/// Manual premise K-F1-P1 in `.kit-fix-report.md` (Fix round 1): upstream Linux
+/// 5.14 sg_new_write -> sg_start_req / blk_rq_map_user* rejects ENOMEM/EINVAL
+/// before blk_execute_rq_nowait. The post-dispatch path does not return either.
+/// This is a kernel-source premise, not a runtime proof for vendor backports.
+pub fn classify_ioctl_error(error: nix::errno::Errno) -> ScsiError {
+    match error {
+        nix::errno::Errno::ENOMEM => ScsiError::InvalidInput(
+            "host capacity refusal: SG_IO allocation failed (ENOMEM); no command issued; raise sg scatter_elem_sz or use a host with a larger per-command limit",
+        ),
+        nix::errno::Errno::EINVAL => ScsiError::InvalidInput(
+            "host capacity/input refusal: SG_IO rejected the request (EINVAL); no command issued; for size limits raise sg scatter_elem_sz or use a host with a larger per-command limit",
+        ),
+        other => ScsiError::Io(other.into()),
+    }
+}
+
 fn captured_sense(sense: &[u8; SENSE_BUF_LEN as usize], len: u8) -> Vec<u8> {
     sense.get(..len as usize).unwrap_or(&[]).to_vec()
 }
@@ -223,8 +241,9 @@ mod ioctl {
 /// Error variants:
 /// - [`ScsiError::InvalidInput`] — the caller's `cdb` or `data_in` violated
 ///   a documented limit of the sg v3 interface (1..=16-byte CDB, transfer
-///   length must fit in a `u32`).
-/// - [`ScsiError::Io`] — the kernel rejected the ioctl outright.
+///   length must fit in a `u32`), or the kernel refused allocation/input
+///   before dispatch (ENOMEM/EINVAL).
+/// - [`ScsiError::Io`] — other ioctl failures, conservatively completion unknown.
 /// - [`ScsiError::CheckCondition`] — the target replied CHECK CONDITION;
 ///   the truncated REQUEST SENSE buffer is included.
 /// - [`ScsiError::TransportError`] — the ioctl returned success but a
@@ -284,7 +303,7 @@ pub fn execute_in(
     // locals (`sense`) or borrowed for the duration (`data_in`, `cdb`). The
     // ioctl number 0x2285 matches the kernel's SG_IO definition.
     unsafe {
-        ioctl::sg_io(dev.as_raw_fd(), &mut hdr).map_err(|e| ScsiError::Io(e.into()))?;
+        ioctl::sg_io(dev.as_raw_fd(), &mut hdr).map_err(classify_ioctl_error)?;
     }
 
     classify_completion(
@@ -346,7 +365,7 @@ pub fn execute_none(dev: &File, cdb: &[u8], timeout_ms: u32) -> Result<(), ScsiE
     // and the kernel won't dereference it because `dxfer_direction =
     // SG_DXFER_NONE` and `dxfer_len = 0`.
     unsafe {
-        ioctl::sg_io(dev.as_raw_fd(), &mut hdr).map_err(|e| ScsiError::Io(e.into()))?;
+        ioctl::sg_io(dev.as_raw_fd(), &mut hdr).map_err(classify_ioctl_error)?;
     }
 
     classify_completion(
@@ -428,7 +447,7 @@ pub fn execute_out(
     // `dxferp`, not write through it. Ioctl number 0x2285 matches
     // the kernel's SG_IO definition.
     unsafe {
-        ioctl::sg_io(dev.as_raw_fd(), &mut hdr).map_err(|e| ScsiError::Io(e.into()))?;
+        ioctl::sg_io(dev.as_raw_fd(), &mut hdr).map_err(classify_ioctl_error)?;
     }
 
     classify_completion(
@@ -689,5 +708,24 @@ mod tests {
         let payload = [0u8; 4];
         let r = execute_out(&dev, &cdb, &payload, 0);
         assert!(matches!(r, Err(ScsiError::InvalidInput(_))), "got {r:?}");
+    }
+
+    /// Pre-dispatch allocation/input rejection must not become completion unknown.
+    #[test]
+    fn ioctl_capacity_errors_are_not_issued() {
+        for errno in [nix::errno::Errno::ENOMEM, nix::errno::Errno::EINVAL] {
+            let error = classify_ioctl_error(errno);
+            assert!(matches!(error, ScsiError::InvalidInput(_)));
+            assert!(error.to_string().contains("no command issued"));
+            assert!(error.to_string().contains("scatter_elem_sz"));
+        }
+        assert!(matches!(
+            classify_ioctl_error(nix::errno::Errno::EIO),
+            ScsiError::Io(_)
+        ));
+        assert!(matches!(
+            classify_ioctl_error(nix::errno::Errno::EINTR),
+            ScsiError::Io(_)
+        ));
     }
 }

@@ -65,3 +65,6 @@ fuzz/corpus/
 # Isolated Cargo build directories alongside target/.
 /target-*/
 .gstack/
+
+# Local field-kit implementation and verification report.
+/.kit-fix-report.md

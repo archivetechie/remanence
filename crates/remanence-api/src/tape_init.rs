@@ -81,6 +81,11 @@ pub const CANONICAL_ADOPTION_BLOCK_SIZE_BYTES: u32 = 1024 * 1024;
 /// Typed result of one BOT-only physical identity probe.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BotIdentityClassification {
+    /// A host, drive or classifier limit prevents identity; never authorizes a write.
+    HostCapacityRefused {
+        /// Exact record/buffer sizes when available, and an operator remedy.
+        detail: String,
+    },
     /// The drive reported BLANK CHECK/EOD immediately at BOT.
     BlankCheckEod,
     /// A checksum-valid native Bootstrap was decoded.
@@ -115,6 +120,11 @@ pub enum BotIdentityClassification {
 /// Physical layout immediately following one checksum-valid BOT Bootstrap.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BootstrapTailClassification {
+    /// A host, drive or classifier limit prevents identity; never authorizes a write.
+    HostCapacityRefused {
+        /// Exact record/buffer sizes when available, and an operator remedy.
+        detail: String,
+    },
     /// Exactly one Bootstrap data block, its required filemark, then EOD.
     ExactBootstrapFilemarkEod,
     /// A data record followed the Bootstrap instead of its filemark.
@@ -153,6 +163,11 @@ pub struct TapeInitGeometry {
 /// BOT classification projected from the physical read path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BotClassification {
+    /// A host, drive or classifier limit prevents identity; never authorizes a write.
+    HostCapacityRefused {
+        /// Exact record/buffer sizes when available, and an operator remedy.
+        detail: String,
+    },
     /// The drive reported BLANK CHECK/EOD immediately at BOT.
     BlankCheckEod,
     /// BOT contains a Remanence bootstrap.
@@ -267,6 +282,11 @@ impl CommittedCopyState {
 /// Stable reason code for an init refusal, anomaly, rebuild, or force path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TapeInitError {
+    /// A host, drive or classifier limit prevents identity; never authorizes a write.
+    HostCapacityRefused {
+        /// Exact record/buffer sizes when available, and an operator remedy.
+        detail: String,
+    },
     /// A barcode is already assigned to a different physical UUID.
     BarcodeAssignedToDifferentUuid {
         /// UUID currently assigned to the barcode.
@@ -490,6 +510,11 @@ pub fn decide_tape_init(
     }
 
     match bot {
+        BotClassification::HostCapacityRefused { detail } => {
+            refuse(TapeInitError::HostCapacityRefused {
+                detail: detail.clone(),
+            })
+        }
         BotClassification::ReadError => refuse(TapeInitError::BotReadError),
         BotClassification::ForeignFormat { name } => {
             refuse(TapeInitError::ForeignFormat(name.clone()))
@@ -597,6 +622,64 @@ pub fn classify_bot_identity_bytes(bot_bytes: &[u8]) -> BotIdentityClassificatio
     }
 }
 
+/// The binding bound for this allocation, retained for an accurate refusal remedy.
+#[derive(Clone, Copy)]
+enum IdentityReadLimit {
+    Host,
+    Drive,
+    Classifier,
+}
+
+/// Allocate within the classifier, READ(6), known drive maximum and host grant.
+fn identity_read_buffer(
+    source: &mut dyn remanence_library::BlockSource,
+    wanted: usize,
+) -> Result<(Vec<u8>, IdentityReadLimit), remanence_library::TapeIoError> {
+    let wanted = wanted.min(BOT_IDENTITY_READ_BYTES) as u32;
+    let drive_limit = source
+        .max_read_block_size_bytes()
+        .filter(|limit| *limit != 0);
+    let requested = wanted.min(drive_limit.unwrap_or(wanted));
+    let granted = source.configure_read_buffer(requested)?.min(requested);
+    if granted == 0 {
+        return Err(remanence_library::TapeIoError::InvalidRequest(
+            remanence_library::scsi::ScsiError::InvalidInput("host capacity refusal: reserved buffer grant is zero; raise sg scatter_elem_sz or use a host with a larger per-command limit"),
+        ));
+    }
+    let limit = if granted < requested {
+        IdentityReadLimit::Host
+    } else if drive_limit.is_some_and(|limit| limit <= wanted) {
+        IdentityReadLimit::Drive
+    } else {
+        IdentityReadLimit::Classifier
+    };
+    Ok((vec![0; granted as usize], limit))
+}
+
+/// Preserve the existing ILI decision; never parse an incomplete physical record.
+fn identity_capacity_refusal(
+    error: &remanence_library::TapeIoError,
+    limit: Option<IdentityReadLimit>,
+) -> Option<String> {
+    use remanence_library::{scsi::ScsiError, TapeIoError};
+    match error {
+        TapeIoError::ReadBufferTooSmall { actual, provided } => {
+            let reason = match limit {
+                Some(IdentityReadLimit::Host) => "host-granted identity READ buffer; raise the sg driver's scatter_elem_sz, or read on a host with a larger per-command limit",
+                Some(IdentityReadLimit::Drive) => "drive's reported READ BLOCK LIMITS maximum; this drive does not report support for a record this large",
+                _ => "classifier's identity READ buffer limit; this classifier cannot inspect a record this large",
+            };
+            Some(format!("record is {actual} bytes, but the identity READ is limited to {provided} bytes by the {reason}"))
+        }
+        TapeIoError::InvalidRequest(ScsiError::InvalidInput(detail))
+            if detail.starts_with("host capacity") =>
+        {
+            Some(detail.to_string())
+        }
+        _ => None,
+    }
+}
+
 /// Perform the advisory BOT-only probe used by offline ownership tooling.
 ///
 /// This issues one LOCATE(0) and at most one READ. It never checks the next
@@ -620,11 +703,25 @@ pub fn probe_bot_identity_from_source(
             )),
         };
     }
-    let mut block = vec![0u8; BOT_IDENTITY_READ_BYTES];
+    let (mut block, limit) = match identity_read_buffer(source, BOT_IDENTITY_READ_BYTES) {
+        Ok(buffer) => buffer,
+        Err(error) => return identity_probe_error(error, None),
+    };
     match source.read_block(&mut block) {
         Ok(read) => classify_bot_identity_bytes(&block[..read]),
         Err(error) if is_blank_check_eod(&error) => BotIdentityClassification::BlankCheckEod,
-        Err(error) => BotIdentityClassification::ReadError {
+        Err(error) => identity_probe_error(error, Some(limit)),
+    }
+}
+
+/// Translate capacity refusals separately from uncertain physical reads.
+fn identity_probe_error(
+    error: remanence_library::TapeIoError,
+    limit: Option<IdentityReadLimit>,
+) -> BotIdentityClassification {
+    match identity_capacity_refusal(&error, limit) {
+        Some(detail) => BotIdentityClassification::HostCapacityRefused { detail },
+        None => BotIdentityClassification::ReadError {
             detail: bounded_detail(format!("read BOT: {error}")),
         },
     }
@@ -648,7 +745,15 @@ pub fn classify_bootstrap_adoption_from_source(
         };
     };
 
-    let mut next = vec![0u8; BOT_IDENTITY_READ_BYTES];
+    let (mut next, limit) = match identity_read_buffer(source, BOT_IDENTITY_READ_BYTES) {
+        Ok(buffer) => buffer,
+        Err(error) => {
+            return BootstrapAdoptionProjection {
+                payload: Some(payload),
+                tail: identity_tail_error(error, None),
+            }
+        }
+    };
     let tail = match source.read_block(&mut next) {
         Ok(_) => BootstrapTailClassification::DataAfterBootstrap,
         Err(remanence_library::TapeIoError::FilemarkEncountered) => {
@@ -660,19 +765,28 @@ pub fn classify_bootstrap_adoption_from_source(
                 Err(error) if is_blank_check_eod(&error) => {
                     BootstrapTailClassification::ExactBootstrapFilemarkEod
                 }
-                Err(error) => BootstrapTailClassification::Ambiguous {
-                    detail: bounded_detail(format!("read after Bootstrap filemark: {error}")),
-                },
+                Err(error) => identity_tail_error(error, Some(limit)),
             }
         }
         Err(error) if is_blank_check_eod(&error) => BootstrapTailClassification::MissingFilemark,
-        Err(error) => BootstrapTailClassification::Ambiguous {
-            detail: bounded_detail(format!("read Bootstrap tail: {error}")),
-        },
+        Err(error) => identity_tail_error(error, Some(limit)),
     };
     BootstrapAdoptionProjection {
         payload: Some(payload),
         tail,
+    }
+}
+
+/// Tail capacity failures remain refusals, with no claim of an exact boundary.
+fn identity_tail_error(
+    error: remanence_library::TapeIoError,
+    limit: Option<IdentityReadLimit>,
+) -> BootstrapTailClassification {
+    match identity_capacity_refusal(&error, limit) {
+        Some(detail) => BootstrapTailClassification::HostCapacityRefused { detail },
+        None => BootstrapTailClassification::Ambiguous {
+            detail: bounded_detail(format!("read Bootstrap tail: {error}")),
+        },
     }
 }
 
@@ -906,11 +1020,19 @@ pub fn classify_bot_from_source(
         };
     }
 
-    let mut block = vec![0u8; BOT_CLASSIFY_READ_BYTES];
+    let (mut block, limit) = match identity_read_buffer(source, BOT_CLASSIFY_READ_BYTES) {
+        Ok(buffer) => buffer,
+        Err(error) => {
+            return BotInitProjection {
+                classification: init_probe_error(error, None),
+                physical_data_past_bootstrap: false,
+            }
+        }
+    };
     let classification = match source.read_block(&mut block) {
         Ok(read) => classify_bot_bytes(&block[..read]),
         Err(err) if is_blank_check_eod(&err) => BotClassification::BlankCheckEod,
-        Err(_) => BotClassification::ReadError,
+        Err(error) => init_probe_error(error, Some(limit)),
     };
 
     let physical_data_past_bootstrap =
@@ -959,7 +1081,7 @@ pub fn maybe_write_tape_init_bootstrap(
         InitDecision::FreshInit => true,
         InitDecision::RequireForce { .. } => options.force,
         InitDecision::RefuseClobber {
-            reason: TapeInitError::BotReadError,
+            reason: TapeInitError::BotReadError | TapeInitError::HostCapacityRefused { .. },
         } => false,
         InitDecision::RefuseClobber { .. } => options.clobber_data_confirmed,
         InitDecision::IdempotentNoOp
@@ -1256,8 +1378,22 @@ fn uuid_display(bytes: &[u8]) -> String {
     }
 }
 
+/// Keep init capacity refusals distinct from ordinary read failures.
+fn init_probe_error(
+    error: remanence_library::TapeIoError,
+    limit: Option<IdentityReadLimit>,
+) -> BotClassification {
+    match identity_capacity_refusal(&error, limit) {
+        Some(detail) => BotClassification::HostCapacityRefused { detail },
+        None => BotClassification::ReadError,
+    }
+}
+
 fn data_exists_at_current_position(source: &mut dyn remanence_library::BlockSource) -> bool {
-    let mut next = vec![0u8; BOT_CLASSIFY_READ_BYTES];
+    let (mut next, _) = match identity_read_buffer(source, BOT_CLASSIFY_READ_BYTES) {
+        Ok(buffer) => buffer,
+        Err(_) => return true,
+    };
     match source.read_block(&mut next) {
         Ok(_) => true,
         Err(err) if is_blank_check_eod(&err) => false,
@@ -2499,6 +2635,48 @@ mod tests {
         assert!(sink.filemarks.is_empty());
     }
 
+    /// A truncated unknown first record cannot be clobbered through any override.
+    #[test]
+    fn host_capacity_refusal_never_authorizes_bootstrap_write() {
+        let mut drive = host_limited_drive(64 * 1024, vec![Some(vec![0x42; 128 * 1024])]);
+        let bot = classify_bot_from_source(&mut remanence_library::DriveHandleSource(&mut drive));
+        assert!(matches!(
+            bot.classification,
+            BotClassification::HostCapacityRefused { .. }
+        ));
+        let decision = decide(
+            &bot.classification,
+            None,
+            &LabelLifecycleState::Available,
+            false,
+            &CommittedCopyState::None,
+        );
+        for force in [false, true] {
+            for confirmed in [false, true] {
+                for named in [None, Some(UnknownTapeClobber { bot_uuid: BOT_UUID })] {
+                    let mut sink = VecBlockSink::new();
+                    let action = maybe_write_tape_init_bootstrap(
+                        &mut sink,
+                        &decision,
+                        TapeInitWriteOptions {
+                            dry_run: false,
+                            force,
+                            clobber_data_confirmed: confirmed,
+                            clobber_unknown_tape: named,
+                        },
+                        BOT_UUID,
+                        4096,
+                        ParityConfig::None,
+                        &test_identity(),
+                    )
+                    .unwrap();
+                    assert_eq!(action, TapeInitWriteAction::Refused);
+                    assert!(sink.blocks.is_empty() && sink.filemarks.is_empty());
+                }
+            }
+        }
+    }
+
     #[test]
     fn fresh_init_reaches_bootstrap_write() {
         let mut sink = VecBlockSink::new();
@@ -2980,5 +3158,304 @@ mod tests {
             .expect("released fence");
         refuse_tape_init_while_fenced(&catalog, Some("RMT001L9"), Some(&BOT_UUID))
             .expect("a released fence no longer refuses init");
+    }
+
+    /// Model the two host rejection thresholds without opening any device node.
+    struct HostLimitedTransport {
+        records: VecDeque<Option<Vec<u8>>>,
+        limit: usize,
+        drive_max: Option<u32>,
+    }
+
+    impl remanence_library::SgTransport for HostLimitedTransport {
+        fn configure_reserved_buffer(
+            &mut self,
+            wanted: u32,
+        ) -> Result<u32, remanence_library::scsi::ScsiError> {
+            assert!(wanted <= 0xFF_FFFF, "identity reserve exceeds READ(6)");
+            Ok(wanted.min(self.limit as u32))
+        }
+        fn execute_in(
+            &mut self,
+            cdb: &[u8],
+            buf: &mut [u8],
+        ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::scsi::ScsiError>
+        {
+            use remanence_library::scsi::ScsiError;
+            if buf.len() > self.limit {
+                let errno = if buf.len() > self.limit * 2 { 22 } else { 12 };
+                return Err(ScsiError::Io(std::io::Error::from_raw_os_error(errno)));
+            }
+            let data = match cdb[0] {
+                0x12 if cdb[1] & 1 != 0 => vec![1, 0x80, 0, 4, b'T', b'E', b'S', b'T'],
+                0x12 => include_bytes!("../../../fixtures/inquiry/drive1-lto9.bin").to_vec(),
+                0x34 => vec![0; 32],
+                0x05 => {
+                    let mut response = vec![0; 6];
+                    response[1..4].copy_from_slice(&self.drive_max.unwrap_or(0).to_be_bytes()[1..]);
+                    response[5] = 1;
+                    response
+                }
+                0x1a => {
+                    let mut response = vec![0; 28];
+                    response[0] = 27;
+                    response[3] = 8;
+                    response[12] = 0x0f;
+                    response[13] = 14;
+                    response
+                }
+                0x08 => {
+                    if let Some(max) = self.drive_max.filter(|max| *max != 0) {
+                        assert!(
+                            buf.len() <= max as usize,
+                            "READ exceeds reported drive maximum"
+                        );
+                    }
+                    assert_eq!(
+                        u32::from_be_bytes([0, cdb[2], cdb[3], cdb[4]]) as usize,
+                        buf.len()
+                    );
+                    let mut sense = vec![0; 18];
+                    sense[0] = 0xf0;
+                    sense[7] = 10;
+                    match self.records.pop_front() {
+                        None => {
+                            sense[2] = 8;
+                            sense[13] = 5;
+                        }
+                        Some(None) => {
+                            sense[2] = 0x80;
+                        }
+                        Some(Some(data)) if data.len() == buf.len() => {
+                            buf.copy_from_slice(&data);
+                            return Ok(remanence_library::transport::TransferOutcome::clean(
+                                buf.len() as u32,
+                            ));
+                        }
+                        Some(Some(data)) => {
+                            sense[2] = 0x20;
+                            let residue = (buf.len() as i32) - (data.len() as i32);
+                            sense[3..7].copy_from_slice(&residue.to_be_bytes());
+                            let n = buf.len().min(data.len());
+                            buf[..n].copy_from_slice(&data[..n]);
+                            return Err(ScsiError::CheckCondition {
+                                sense,
+                                bytes_transferred: n as u32,
+                            });
+                        }
+                    }
+                    return Err(ScsiError::CheckCondition {
+                        sense,
+                        bytes_transferred: 0,
+                    });
+                }
+                other => panic!("unexpected model CDB {other:x}"),
+            };
+            buf[..data.len()].copy_from_slice(&data);
+            Ok(remanence_library::transport::TransferOutcome::clean(
+                data.len() as u32,
+            ))
+        }
+        fn execute_none(&mut self, cdb: &[u8]) -> Result<(), remanence_library::scsi::ScsiError> {
+            assert_eq!(cdb[0], 0x92); // LOCATE(16)
+            Ok(())
+        }
+        fn execute_out(
+            &mut self,
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::scsi::ScsiError>
+        {
+            panic!("identity probe must never write")
+        }
+    }
+
+    fn host_limited_drive(
+        limit: usize,
+        records: Vec<Option<Vec<u8>>>,
+    ) -> remanence_library::DriveHandle {
+        drive_limited_model(limit, None, records)
+    }
+
+    /// The model reports its maximum through the same READ BLOCK LIMITS path as hardware.
+    fn drive_limited_model(
+        limit: usize,
+        drive_max: Option<u32>,
+        records: Vec<Option<Vec<u8>>>,
+    ) -> remanence_library::DriveHandle {
+        let mut drive = remanence_library::DriveHandle::open_standalone_with_transport(
+            std::path::Path::new("/fixture/identity-drive"),
+            Box::new(HostLimitedTransport {
+                limit,
+                drive_max,
+                records: records.into(),
+            }),
+            &remanence_library::StaticAllowlist::new(["TEST"]),
+        )
+        .unwrap();
+        if drive_max.is_some() {
+            drive.read_config().unwrap();
+        }
+        drive
+    }
+
+    /// This fails on a1843eab: the BOT READ exceeds the host grant and returns Io.
+    #[test]
+    fn identity_probe_respects_host_grant_model() {
+        for limit in [64 * 1024, 10 * 1024 * 1024] {
+            let mut blank = host_limited_drive(limit, vec![]);
+            assert_eq!(
+                probe_bot_identity_from_source(&mut remanence_library::DriveHandleSource(
+                    &mut blank
+                )),
+                BotIdentityClassification::BlankCheckEod
+            );
+            let payload = build_tape_bootstrap(
+                ADOPTION_UUID,
+                32 * 1024,
+                ParityConfig::None,
+                "2026-11-04T00:00:00Z",
+                "test",
+            );
+            let mut record = vec![0; 32 * 1024];
+            write_bootstrap_block(&payload, &mut record).unwrap();
+            let mut ours = host_limited_drive(limit, vec![Some(record.clone()), None]);
+            let projection = classify_bootstrap_adoption_from_source(
+                &mut remanence_library::DriveHandleSource(&mut ours),
+            );
+            assert_eq!(projection.payload, Some(payload));
+            assert_eq!(
+                projection.tail,
+                BootstrapTailClassification::ExactBootstrapFilemarkEod
+            );
+            let foreign = vec![0x42; limit + 512];
+            let mut unknown = host_limited_drive(limit, vec![Some(foreign.clone())]);
+            let refusal = probe_bot_identity_from_source(
+                &mut remanence_library::DriveHandleSource(&mut unknown),
+            );
+            let detail = format!("{refusal:?}");
+            assert!(detail.contains("HostCapacityRefused"), "{detail}");
+            assert!(
+                detail.contains(&(limit + 512).to_string()) && detail.contains(&limit.to_string()),
+                "{detail}"
+            );
+            assert!(
+                detail.contains("scatter_elem_sz") && detail.contains("larger per-command limit")
+            );
+            for records in [
+                vec![Some(record.clone()), Some(foreign.clone())],
+                vec![Some(record.clone()), None, Some(foreign.clone())],
+            ] {
+                let mut tail = host_limited_drive(limit, records);
+                let projection = classify_bootstrap_adoption_from_source(
+                    &mut remanence_library::DriveHandleSource(&mut tail),
+                );
+                assert!(format!("{:?}", projection.tail).contains("HostCapacityRefused"));
+            }
+            let mut legacy = host_limited_drive(limit, vec![]);
+            assert_eq!(
+                classify_bot_from_source(&mut remanence_library::DriveHandleSource(&mut legacy))
+                    .classification,
+                BotClassification::BlankCheckEod
+            );
+        }
+    }
+
+    /// Reviewer reproducer: a 2 MiB record, 10 MiB host, and 1 MiB legacy classifier.
+    /// Only an actual host reduction may recommend changing sg module parameters.
+    #[test]
+    fn reviewer_init_classifier_blames_only_the_binding_limit() {
+        for (host, expected, host_remedy) in [
+            (
+                10 * 1024 * 1024,
+                "classifier's identity READ buffer limit",
+                false,
+            ),
+            (
+                BOT_CLASSIFY_READ_BYTES,
+                "classifier's identity READ buffer limit",
+                false,
+            ),
+            (512 * 1024, "host-granted identity READ buffer", true),
+        ] {
+            let mut drive = host_limited_drive(host, vec![Some(vec![0; 2 * 1024 * 1024])]);
+            let projection =
+                classify_bot_from_source(&mut remanence_library::DriveHandleSource(&mut drive));
+            let BotClassification::HostCapacityRefused { detail } = projection.classification
+            else {
+                panic!("oversized BOT must refuse: {projection:?}");
+            };
+            assert!(detail.contains("2097152"), "{detail}");
+            assert!(
+                detail.contains(&host.min(BOT_CLASSIFY_READ_BYTES).to_string()),
+                "{detail}"
+            );
+            assert!(detail.contains(expected), "{detail}");
+            assert_eq!(detail.contains("scatter_elem_sz"), host_remedy, "{detail}");
+            assert_eq!(detail.contains("host-granted"), host_remedy, "{detail}");
+        }
+    }
+
+    /// A known drive maximum caps both BOT and adoption tail READs below the host grant.
+    #[test]
+    fn identity_reads_respect_reported_drive_maximum() {
+        for max in [512 * 1024, 8 * 1024 * 1024] {
+            let host = 10 * 1024 * 1024;
+            let mut blank = drive_limited_model(host, Some(max), vec![]);
+            assert_eq!(
+                probe_bot_identity_from_source(&mut remanence_library::DriveHandleSource(
+                    &mut blank
+                )),
+                BotIdentityClassification::BlankCheckEod
+            );
+            let mut oversized =
+                drive_limited_model(host, Some(max), vec![Some(vec![0; max as usize + 512])]);
+            let refusal = probe_bot_identity_from_source(
+                &mut remanence_library::DriveHandleSource(&mut oversized),
+            );
+            let BotIdentityClassification::HostCapacityRefused { detail } = refusal else {
+                panic!("oversized record must refuse: {refusal:?}");
+            };
+            assert!(
+                detail.contains("drive's reported READ BLOCK LIMITS maximum"),
+                "{detail}"
+            );
+            assert!(
+                detail.contains(&max.to_string()) && detail.contains(&(max + 512).to_string()),
+                "{detail}"
+            );
+            assert!(
+                !detail.contains("scatter_elem_sz") && !detail.contains("host-granted"),
+                "{detail}"
+            );
+            let payload = build_tape_bootstrap(
+                ADOPTION_UUID,
+                32 * 1024,
+                ParityConfig::None,
+                "2026-11-05T00:00:00Z",
+                "test",
+            );
+            let mut record = vec![0; 32 * 1024];
+            write_bootstrap_block(&payload, &mut record).unwrap();
+            let mut ours = drive_limited_model(host, Some(max), vec![Some(record), None]);
+            let projection = classify_bootstrap_adoption_from_source(
+                &mut remanence_library::DriveHandleSource(&mut ours),
+            );
+            assert_eq!(projection.payload, Some(payload));
+            assert_eq!(
+                projection.tail,
+                BootstrapTailClassification::ExactBootstrapFilemarkEod
+            );
+        }
+        // Unknown and zero-reported maxima fall back to the host/wire bounds.
+        for max in [None, Some(0)] {
+            let mut drive = drive_limited_model(32 * 1024 * 1024, max, vec![]);
+            let (buf, _) = identity_read_buffer(
+                &mut remanence_library::DriveHandleSource(&mut drive),
+                usize::MAX,
+            )
+            .unwrap();
+            assert_eq!(buf.len(), BOT_IDENTITY_READ_BYTES);
+        }
     }
 }

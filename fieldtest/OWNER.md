@@ -33,16 +33,34 @@ way, the kit user no longer needs a sudo rule for `setcap`. Delete that rule.
 ## 3. Before each run (root)
 
 - Quiesce Miria on the partition the plan uses.
-- Give the kit user the plan's changer and drive device nodes, and nothing else:
-  `setfacl -m u:remfield:rw /dev/sgN ...`. Get the nodes from discovery; sg
-  numbers move after a drive firmware flash.
+- Give the kit user the plan's changer and drive **sg** nodes, and nothing else:
+  `setfacl -m u:remfield:rw /dev/sgN ...`. A drive grant must be on its sg node,
+  not `/dev/nstN` or `/dev/stN`. The plan's drive serial is in discovery's output
+  (LL01 on the November 4 run: `8031BDC7F9`). Match that serial before granting;
+  sg numbers can change:
+
+  ```bash
+  for d in $(lsscsi -g | awk '$2=="tape"{print $NF}'); do printf '%s  ' "$d"; sg_inq -p 0x80 "$d" | grep -i serial; done
+  ```
 - Make sure the spool is the capped home or a tmpfs you sized. The kit's disk
   guard refuses payloads that would leave the shared `/home` short. See
   "Disk guard" in RUNBOOK.md.
 - Raise `max_sectors_kb` for throughput plans. See "Host I/O setup" in RUNBOOK.md.
+  `sudo echo … > file` does not elevate the shell's redirection. Use
+  `printf '%s\n' VALUE | sudo tee /sys/PATH/TO/SETTING` for approved sysfs changes.
+  Preflight records sg module parameters, SCSI host limits and each drive's
+  actual reserved-buffer grant. A grant below 16 MiB limits identity reads;
+  oversized records are refused. Raising `scatter_elem_sz` may help sg allocation,
+  but cannot remove an adapter's per-command ceiling.
 - The kit needs Python 3.11 or later (it reads its configuration with `tomllib`):
   `dnf install python3.11` on RHEL 9, or set `FIELD_PYTHON` for the kit user. Every plan
   refuses before its first leg without it. Confirm it on the host before the window.
+  If no compatible Python 3.11+ package is available, install a standalone build
+  under `/opt/remfield/python` and export `FIELD_PYTHON=/opt/remfield/python/bin/python3`
+  as the kit user. The November 4 datamover run used **python-build-standalone
+  3.12.13, glibc 2.17 baseline**. Its repositories only offered an EPEL 3.13 that
+  required newer system libraries. Never update a production host's system
+  libraries for the kit; use the standalone build.
 
 The plan refuses to start unless `~/remfield/allowlist.txt` lists exactly the
 plan's barcodes, with no cleaning cartridge. It also refuses if the kit state has

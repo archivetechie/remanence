@@ -11410,7 +11410,8 @@ fn run_tape_adopt_bootstrap(
         remanence_api::BootstrapTailClassification::ExtraFilemark => {
             remanence_state::BootstrapAdoptionTailEvidence::ExtraFilemark
         }
-        remanence_api::BootstrapTailClassification::Ambiguous { .. } => {
+        remanence_api::BootstrapTailClassification::HostCapacityRefused { .. }
+        | remanence_api::BootstrapTailClassification::Ambiguous { .. } => {
             remanence_state::BootstrapAdoptionTailEvidence::Ambiguous
         }
         remanence_api::BootstrapTailClassification::InvalidBot(_) => {
@@ -11554,6 +11555,13 @@ fn bot_probe_json(result: &PhysicalBotIdentityResult) -> Value {
             remanence_api::BotIdentityClassification::UnrecognizedData => {
                 ("unrecognized_data", None, None, Some(false), None)
             }
+            remanence_api::BotIdentityClassification::HostCapacityRefused { detail } => (
+                "host_capacity_refused",
+                None,
+                None,
+                Some(false),
+                Some(detail.clone()),
+            ),
             remanence_api::BotIdentityClassification::ReadError { detail } => {
                 ("read_error", None, None, Some(false), Some(detail.clone()))
             }
@@ -11610,12 +11618,14 @@ fn bootstrap_tail_reason(tail: &remanence_api::BootstrapTailClassification) -> S
             Bot::DamagedRemBootstrap { detail } => format!("damaged Bootstrap: {detail}"),
             Bot::ForeignFormat { name } => format!("foreign format {name}"),
             Bot::UnrecognizedData => "unrecognized BOT data".to_string(),
+            Bot::HostCapacityRefused { detail } => detail.clone(),
             Bot::ReadError { detail } => format!("BOT read failed: {detail}"),
         },
         Tail::ExactBootstrapFilemarkEod => "Bootstrap followed by its filemark and EOD".to_string(),
         Tail::DataAfterBootstrap => "data follows the Bootstrap".to_string(),
         Tail::MissingFilemark => "Bootstrap filemark is missing".to_string(),
         Tail::ExtraFilemark => "an extra filemark follows the Bootstrap".to_string(),
+        Tail::HostCapacityRefused { detail } => detail.clone(),
         Tail::Ambiguous { detail } => format!("Bootstrap tail is ambiguous: {detail}"),
     }
 }
@@ -11628,6 +11638,9 @@ fn bootstrap_tail_name(tail: &remanence_api::BootstrapTailClassification) -> &'s
         remanence_api::BootstrapTailClassification::DataAfterBootstrap => "data_after_bootstrap",
         remanence_api::BootstrapTailClassification::MissingFilemark => "missing_filemark",
         remanence_api::BootstrapTailClassification::ExtraFilemark => "extra_filemark",
+        remanence_api::BootstrapTailClassification::HostCapacityRefused { .. } => {
+            "host_capacity_refused"
+        }
         remanence_api::BootstrapTailClassification::Ambiguous { .. } => "ambiguous",
         remanence_api::BootstrapTailClassification::InvalidBot(_) => "invalid_bot",
     }
@@ -12997,6 +13010,7 @@ fn init_error_label(error: &remanence_api::TapeInitError) -> String {
         remanence_api::TapeInitError::BarcodeChangedWithoutRelabel => {
             "barcode changed without relabel record".to_string()
         }
+        remanence_api::TapeInitError::HostCapacityRefused { detail } => detail.clone(),
         remanence_api::TapeInitError::BotReadError => "BOT read error".to_string(),
         remanence_api::TapeInitError::ForeignFormat(name) => format!("foreign format {name}"),
         remanence_api::TapeInitError::UnrecognizedData => "unrecognized BOT data".to_string(),
@@ -18823,6 +18837,29 @@ mod tests {
             "--json",
         ])
         .is_err());
+    }
+
+    /// Owner tooling must see a refusal, not read_error or a guessed tape identity.
+    #[test]
+    fn bot_probe_json_exposes_host_capacity_refusal() {
+        let detail = "record is 8389120 bytes, exceeding the host per-command read limit of 8388608 bytes; raise sg scatter_elem_sz or use a host with a larger per-command limit";
+        let report = bot_probe_json(&PhysicalBotIdentityResult {
+            library_serial: "LIB001".into(),
+            library_revision: "D.00".into(),
+            voltag: "ACM901L9".into(),
+            home_slot: 0x0401,
+            drive_element: 0x0101,
+            drive_serial: "DRV001".into(),
+            configured_drive_compression: false,
+            classification: remanence_api::BotIdentityClassification::HostCapacityRefused {
+                detail: detail.into(),
+            },
+            adoption: None,
+        });
+        assert_eq!(report["physical_disposition"], "host_capacity_refused");
+        assert_eq!(report["detail"], detail);
+        assert!(report["tape_uuid"].is_null());
+        assert_eq!(report["canonical_adoption_geometry"], false);
     }
 
     #[test]
