@@ -344,6 +344,8 @@ type ReservationHook = Box<dyn FnOnce(&DrivePool) + Send>;
 #[derive(Clone)]
 pub(crate) struct DrivePool {
     #[cfg(test)]
+    pub(crate) mount_busy_snapshot_hook: Arc<Mutex<Option<ReservationHook>>>,
+    #[cfg(test)]
     pub(crate) post_wait_reservation_hook: Arc<Mutex<Option<ReservationHook>>>,
     closing: ClosingWork,
     worker_closing: ClosingWork,
@@ -497,6 +499,8 @@ impl DrivePool {
         lifecycle: DrivePoolLifecycle,
     ) -> Self {
         Self {
+            #[cfg(test)]
+            mount_busy_snapshot_hook: Arc::default(),
             #[cfg(test)]
             post_wait_reservation_hook: Arc::default(),
             changers: Arc::new(changers),
