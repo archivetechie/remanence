@@ -129,7 +129,7 @@ assert '/dev/' not in plan
 assert 'AOX032L9 AOX036L9 AOX038L9 AOX058L9' in plan
 for leg in ['00-preflight.sh --session-epoch-a','01-allowlist.sh --verify-session-epoch-a','10-init-pools.sh --session-epoch-a','kill-mid-write','abort-mid-object','failed-append','measure-full-epoch','--verify-prefixes','--capture-sense','90-collect-evidence.sh']:
     assert leg in plan,leg
-positions=[plan.index(v) for v in ['00-preflight.sh','01-allowlist.sh','02-discovery.sh','03-bringup.sh','09-media-ready.sh','10-init-pools.sh','kill-mid-write','abort-mid-object','failed-append','measure-full-epoch','--verify-prefixes','--capture-sense','90-collect-evidence.sh']]
+positions=[plan.index(v) for v in ['00-preflight.sh','01-allowlist.sh','09-media-ready.sh','03-bringup.sh','02-discovery.sh','10-init-pools.sh','kill-mid-write','abort-mid-object','failed-append','measure-full-epoch','--verify-prefixes','--capture-sense','90-collect-evidence.sh']]
 assert positions==sorted(positions)
 print('PASS: session modes, argument/allowlist refusal, ordered gates, missing-evidence refusal, failure teardown and plan')
 PY

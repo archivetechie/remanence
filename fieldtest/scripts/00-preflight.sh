@@ -148,6 +148,23 @@ PY
   fi
   fieldtest_write_selected_library_serial "$selected_serial"
 
+  # Host-only ioctls precede bring-up, loading, and every tape READ.
+  local io_limits io_status=PASS
+  io_limits="$(fieldtest_artifact_path "$SCRIPT_NAME" host-io-limits "$stamp")"
+  if python3 "$(fieldtest_script_dir)/host-io-limits.py" "$rem_libraries_json" "$selected_serial" > "$io_limits"; then
+    if ! python3 - "$io_limits" <<'PYLIMIT'
+import json, sys
+report = json.load(open(sys.argv[1]))
+for warning in report["warnings"]:
+    print("WARN: " + warning)
+raise SystemExit(bool(report["warnings"]))
+PYLIMIT
+    then io_status=WARN; fi
+    fieldtest_evidence_record "$SCRIPT_NAME" host-io-limits "$io_status" "captured sg parameters, drive SCSI host limits and actual reserved-buffer grants before tape access" "$io_limits"
+  else
+    fieldtest_evidence_record "$SCRIPT_NAME" host-io-limits WARN "host I/O limit capture unavailable; inspect evidence before tape access" "$io_limits"
+  fi
+
   selected_library_json="$(fieldtest_artifact_path "$SCRIPT_NAME" library-slots "$stamp")"
   if ! fieldtest_capture_text "$selected_library_json" "$bin" library "$selected_serial" --slots; then
     fieldtest_evidence_record "$SCRIPT_NAME" library-slots FAIL "rem library $selected_serial --slots failed" "$selected_library_json"

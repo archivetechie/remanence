@@ -190,6 +190,10 @@ main() {
       ;;
     --stop)
       fieldtest_init_layout
+      if [[ ! -e "$(fieldtest_config_path)" ]]; then
+        fieldtest_evidence_record "$SCRIPT_NAME" stop PASS "nothing to stop: kit config does not exist"
+        return 0
+      fi
       local py
       py="$(fieldtest_python)" || exit 2
       local session pid started elapsed retry_window stop_timeout forced=0

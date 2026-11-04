@@ -14,6 +14,15 @@ import time
 scripts = Path(sys.argv[1])
 with tempfile.TemporaryDirectory(prefix="bringup-stop-") as tmp:
     root = Path(tmp)
+    # Discovery may fail before config generation: stop must be a quiet no-op.
+    missing = root / "missing-config"
+    result = subprocess.run(["bash", str(scripts / "03-bringup.sh"), "--stop"],
+                            env=dict(os.environ, REMFIELD_HOME=str(missing), FIELDTEST_LOCK_HELD="1"),
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert "Traceback" not in result.stderr and "non-negative integer" not in result.stderr
+    rows = [json.loads(line) for line in (missing / "evidence/records.jsonl").read_text().splitlines()]
+    assert any(row["test_id"] == "stop" and "nothing to stop" in row["summary"] for row in rows)
     bin_dir = root / "bin"
     bin_dir.mkdir()
     tmux = bin_dir / "tmux"

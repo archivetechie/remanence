@@ -265,6 +265,18 @@ pub trait BlockRead {
 /// Implemented by [`DriveHandleSource`] for production and
 /// [`VecBlockSource`] for tests. Format decoders accept [`BlockRead`] instead.
 pub trait BlockSource: BlockRead {
+    /// Request a host buffer for one variable READ and return the granted bound.
+    /// Memory/file sources have no host DMA limit; drive sources use the sg grant.
+    fn configure_read_buffer(&mut self, wanted: u32) -> Result<u32, TapeIoError> {
+        Ok(wanted)
+    }
+
+    /// Maximum record length already learned from READ BLOCK LIMITS, if known.
+    /// Memory/file sources and drives whose configuration has not been read have no bound.
+    fn max_read_block_size_bytes(&self) -> Option<u32> {
+        None
+    }
+
     /// Prove and re-arm an append cursor through its owning drive. Sources that
     /// cannot bind a proof to the write session refuse without moving the head.
     fn prove_cursor(&mut self, _cursor: TapePosition, _block_size: u32) -> Result<(), TapeIoError> {
@@ -570,6 +582,14 @@ impl BlockRead for DriveHandleSource<'_> {
 }
 
 impl BlockSource for DriveHandleSource<'_> {
+    fn max_read_block_size_bytes(&self) -> Option<u32> {
+        self.0.known_max_block_size_bytes()
+    }
+
+    fn configure_read_buffer(&mut self, wanted: u32) -> Result<u32, TapeIoError> {
+        self.0.configure_identity_read_buffer(wanted)
+    }
+
     fn prove_cursor(&mut self, cursor: TapePosition, block_size: u32) -> Result<(), TapeIoError> {
         self.0
             .prove_cursor(cursor, block_size, self.0.identity_generation())?;

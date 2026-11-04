@@ -54,11 +54,11 @@ calls() { tr '\n' '|' <"$1/home/calls" 2>/dev/null; }
 c="$(make_case)"
 rc=0; run_case "$c" plan/smoke.env || rc=$?
 check "pass: exit 0" "[[ $rc -eq 0 ]]"
-check "pass: leg order and teardown" "[[ '$(calls "$c")' == '00-preflight.sh |09-media-ready.sh --count 4 --no-wait|03-bringup.sh |02-discovery.sh |11-happy-path.sh |33-diag-capture.sh --note smoke-plan-baseline|03-bringup.sh --stop|90-collect-evidence.sh |' ]]"
+check "pass: leg order and teardown" "[[ '$(calls "$c")' == '00-preflight.sh |09-media-ready.sh --count 4 --no-wait|03-bringup.sh |02-discovery.sh |11-happy-path.sh |03-bringup.sh --stop|33-diag-capture.sh --note smoke-plan-baseline|03-bringup.sh --stop|90-collect-evidence.sh |' ]]"
 check "pass: result line" "grep -q '^result: PASS' '$c/out'"
 check "pass: named pack reported" "grep -q 'evidence pack: .*/evidence-pack-smoke-.*tar.gz' '$c/out'"
 check "pass: the log and result are in evidence before packing" "grep -q '11-happy-path.sh exit 0' '$c/home/remfield/packed-log' && grep -q '^result: PASS' '$c'/home/remfield/evidence/run-smoke-*.result"
-check "pass: table has six legs" "[[ \$(tail -n +2 '$c'/home/remfield/evidence/run-smoke-*.tsv | wc -l) -eq 6 ]]"
+check "pass: table has seven legs" "[[ \$(tail -n +2 '$c'/home/remfield/evidence/run-smoke-*.tsv | wc -l) -eq 7 ]]"
 check "pass: legs see the package bins and the plan's library" "[[ \"\$(cat '$c/home/env')\" == \"\$(cd '$c/pkg/bin' && pwd -P) DEC418146K_LL01\" ]]"
 
 # A fatal leg stops the plan, captures diagnostics, then tears down.

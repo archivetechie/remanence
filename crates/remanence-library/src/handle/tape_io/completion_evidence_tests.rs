@@ -499,3 +499,92 @@ fn b3a_variable_blank_check_is_physical_eod() {
         .unwrap_err()
         .is_physical_eod());
 }
+
+/// The real sg errno classifier feeds every WRITE form through the media gate.
+/// A not-issued refusal preserves the cursor, dispatch watermark and clean snapshot.
+#[test]
+fn ioctl_capacity_write_refusals_keep_cursor_and_dispatch_watermark() {
+    for errno in [nix::errno::Errno::ENOMEM, nix::errno::Errno::EINVAL] {
+        for form in 0..8 {
+            let opcode = if form < 4 { 0x0a } else { 0x10 };
+            let (mut drive, log, outcomes) = open(
+                opcode,
+                remanence_scsi::sg_io::classify_ioctl_error(errno),
+                vec![position_reply(10)],
+            );
+            drive.position().unwrap();
+            let before = drive.media_write_dispatch_count();
+            let generation = drive.identity_generation();
+            let error = match form {
+                0 => drive.write_block(&[0; 512]).unwrap_err(),
+                1 => drive.write_block_unpositioned(&[0; 512]).unwrap_err(),
+                2 => drive.write_block_batch(&[0; 2048], 512).unwrap_err(),
+                3 => drive
+                    .write_block_batch_pipelined(
+                        &[0; 2048],
+                        512,
+                        &remanence_scsi::read_write::build_write_fixed_cdb(4),
+                    )
+                    .unwrap_err(),
+                4 => drive.write_filemarks(0).unwrap_err(),
+                5 => drive.write_filemarks(1).unwrap_err(),
+                6 => drive.write_filemarks_immediate(1).unwrap_err(),
+                _ => drive.write_filemarks_pipelined(1).unwrap_err(),
+            };
+            assert!(
+                matches!(error, TapeIoError::InvalidRequest(_)),
+                "{errno}, form {form}: {error:?}"
+            );
+            assert!(!error.is_completion_unknown());
+            assert_eq!(drive.known_position().map(|p| p.lba), Some(10));
+            assert_eq!(drive.identity_generation(), generation);
+            assert_eq!(
+                drive.media_write_dispatch_count(),
+                before,
+                "{errno}, form {form}"
+            );
+            assert_eq!(lock_drive_shared(&drive.shared).dirty.cause(), None);
+            drive.flush_pending_pipeline_audit();
+            assert!(matches!(
+                outcomes.lock().unwrap().last(),
+                Some(AuditOutcome::ScsiError { dirty: false, .. })
+            ));
+            assert_eq!(
+                log.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|c| c[0] == opcode)
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+/// Other ioctl errors still carry uncertain write evidence and must advance the watermark.
+#[test]
+fn ioctl_other_write_errors_remain_completion_unknown() {
+    for errno in [nix::errno::Errno::EIO, nix::errno::Errno::EINTR] {
+        for opcode in [0x0a, 0x10] {
+            let (mut drive, _, _) = open(
+                opcode,
+                remanence_scsi::sg_io::classify_ioctl_error(errno),
+                vec![position_reply(10)],
+            );
+            drive.position().unwrap();
+            let before = drive.media_write_dispatch_count();
+            let error = if opcode == 0x0a {
+                drive.write_block(&[0; 512]).unwrap_err()
+            } else {
+                drive.write_filemarks(1).unwrap_err()
+            };
+            assert!(error.is_completion_unknown());
+            assert_eq!(drive.media_write_dispatch_count(), before + 1);
+            assert_eq!(drive.known_position(), None);
+            assert_eq!(
+                lock_drive_shared(&drive.shared).dirty.cause(),
+                Some(DirtyCause::CompletionUnknown)
+            );
+        }
+    }
+}

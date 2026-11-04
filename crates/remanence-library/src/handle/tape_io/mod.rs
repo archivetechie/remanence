@@ -3435,7 +3435,7 @@ impl super::DriveHandle {
         self.transport.install_media_write_fence(fence);
     }
 
-    /// Number of media-modifying commands handed to this handle's transport.
+    /// Number of media-modifying commands not explicitly refused before issue.
     /// Unlike the per-load fence flag, this survives proof invalidation and
     /// distinguishes an input refusal from an uncertain write after a checkpoint.
     pub fn media_write_dispatch_count(&self) -> u64 {

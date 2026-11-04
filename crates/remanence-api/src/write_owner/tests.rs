@@ -13447,3 +13447,125 @@ fn catalog_lock_refusal_logs_write_session_context() {
         assert!(log.contains(expected), "missing {expected}: {log}");
     }
 }
+
+/// Exercise the real errno mapper and mounted failure settlement without device I/O.
+/// Refused WRITE/WRITE FILEMARKS must not create a catalog tape-I/O fence.
+#[test]
+fn ioctl_capacity_write_refusals_raise_no_failure_fence() {
+    struct RefusingTransport {
+        inner: FixtureTransport,
+        errno: nix::errno::Errno,
+        opcode: u8,
+    }
+    impl SgTransport for RefusingTransport {
+        fn execute_in(
+            &mut self,
+            cdb: &[u8],
+            buf: &mut [u8],
+        ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError>
+        {
+            self.inner.execute_in(cdb, buf)
+        }
+        fn execute_out(
+            &mut self,
+            cdb: &[u8],
+            _buf: &[u8],
+        ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError>
+        {
+            assert_eq!(cdb[0], self.opcode);
+            Err(remanence_library::scsi::sg_io::classify_ioctl_error(
+                self.errno,
+            ))
+        }
+        fn execute_none(&mut self, cdb: &[u8]) -> Result<(), remanence_library::ScsiError> {
+            assert_eq!(cdb[0], self.opcode);
+            Err(remanence_library::scsi::sg_io::classify_ioctl_error(
+                self.errno,
+            ))
+        }
+    }
+    for errno in [nix::errno::Errno::ENOMEM, nix::errno::Errno::EINVAL] {
+        for opcode in [0x0a, 0x10] {
+            let tmp = tempfile::tempdir().unwrap();
+            let tape_uuid = [0x48; 16];
+            let mut position = vec![0; 32];
+            position[8..16].copy_from_slice(&10u64.to_be_bytes());
+            let fixture = FixtureTransport::new().with_responses([
+                include_bytes!("../../../../fixtures/inquiry/drive1-lto9.bin").to_vec(),
+                vec![1, 0x80, 0, 3, b'K', b'I', b'T'],
+                position,
+            ]);
+            let mut drive = DriveHandle::open_standalone_with_transport(
+                Path::new("/fixture/kit-refusal"),
+                Box::new(RefusingTransport {
+                    inner: fixture,
+                    errno,
+                    opcode,
+                }),
+                &remanence_library::StaticAllowlist::new(["KIT"]),
+            )
+            .unwrap();
+            drive.position().unwrap();
+            let world = Arc::new(Mutex::new(VirtualWorld::single_drive(
+                "LIB-KIT", 0x100, "KIT", 0x400, 1,
+            )));
+            let library = open_model_library(world);
+            let mut cfg = test_write_owner_config(
+                tmp.path().join("catalog.sqlite"),
+                tmp.path().join("audit"),
+                &library,
+                library_snapshot_cell(library.library().clone()),
+            );
+            cfg.placement = super::ActorPlacement::Mounted(super::MountedDriveContext {
+                endpoint: remanence_library::DriveKey::Standalone {
+                    drive_serial: "KIT".into(),
+                },
+                tape_uuid,
+                barcode: None,
+                cartridge_generation: None,
+                identity_generation: drive.identity_generation(),
+                actor: AuditActor::System,
+                audit_error: Arc::new(Mutex::new(None)),
+                audit_session: Arc::new(Mutex::new(None)),
+                direct_replay_fault: None,
+            });
+            let mut index = CatalogIndex::open(&cfg.index_path).unwrap();
+            let before = drive.media_write_dispatch_count();
+            let mut attempted = false;
+            let refusal =
+                super::mounted_commands::with_evidence(&mut index, &cfg, &mut drive, |_, drive| {
+                    attempted = true;
+                    let error = if opcode == 0x0a {
+                        drive.write_block(&[0; 512]).unwrap_err()
+                    } else {
+                        drive.write_filemarks(1).unwrap_err()
+                    };
+                    assert!(matches!(error, TapeIoError::InvalidRequest(_)));
+                    assert!(!error.is_completion_unknown());
+                    Err::<(), _>(Status::invalid_argument(error.to_string()))
+                })
+                .unwrap_err();
+            assert!(
+                attempted,
+                "the write must reach the injected transport error"
+            );
+            assert_eq!(refusal.code(), tonic::Code::InvalidArgument);
+            assert!(refusal.message().contains("no command issued"));
+            assert_eq!(drive.known_position().map(|p| p.lba), Some(10));
+            assert_eq!(drive.media_write_dispatch_count(), before);
+            assert!(!raw_write_reached_drive(&drive, before, true));
+            assert!(index
+                .tape_io_admission_conflicts(&tape_uuid, None)
+                .unwrap()
+                .is_empty());
+            assert!(cfg.mounted().unwrap().audit_error.lock().unwrap().is_none());
+            assert!(cfg
+                .mounted()
+                .unwrap()
+                .audit_session
+                .lock()
+                .unwrap()
+                .is_none());
+        }
+    }
+}

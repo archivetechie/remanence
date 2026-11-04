@@ -541,6 +541,14 @@ impl MediaFencedTransport {
         result
     }
 
+    /// Host allocation only: no media command or write-fence transition.
+    pub(in crate::handle) fn configure_reserved_buffer(
+        &mut self,
+        wanted: u32,
+    ) -> Result<u32, ScsiError> {
+        self.inner.configure_reserved_buffer(wanted)
+    }
+
     /// Set the per-CDB timeout on the wrapped transport.
     pub(in crate::handle) fn set_timeout_for(&mut self, class: TimeoutClass) {
         self.inner.set_timeout_for(class);
@@ -651,7 +659,6 @@ impl MediaFencedTransport {
                 .dispatching(cdb, data_out)
                 .map_err(MediaDispatchError::NotDispatched)?;
         }
-        self.media_write_dispatch_count = next_dispatch_count;
         let result = match data_out {
             Some(buf) => {
                 let started = Instant::now();
@@ -691,6 +698,12 @@ impl MediaFencedTransport {
                 result.map(|()| None)
             }
         };
+        // InvalidInput (including sg ENOMEM/EINVAL) proves the CDB was not
+        // issued. Do not make a refused write look fenceable to session owners.
+        // The pre-dispatch calibration fence deliberately remains in force.
+        if !matches!(&result, Err(ScsiError::InvalidInput(_))) {
+            self.media_write_dispatch_count = next_dispatch_count;
+        }
         if let Some(observer) = self.observer.as_mut() {
             observer.settled(cdb, &result);
         }
