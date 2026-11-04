@@ -72,7 +72,7 @@ prost               = "=0.14.4"
 prost-derive        = "=0.14.4"
 prost-types         = "=0.14.4"
 # Rust implementation of protoc: the build needs no system protobuf compiler.
-protox              = "=0.9.1"
+protox              = "=0.10.0"
 tonic               = "=0.14.6"
 tonic-build         = "=0.14.6"
 tonic-prost         = "=0.14.6"
