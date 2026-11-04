@@ -255,6 +255,8 @@ pub struct TapeState {
     pub media_revision: u64,
     /// Current capabilities, retained to validate subsequent revisions.
     pub medium: MediumSpec,
+    /// Whether any committed spec in this incarnation had measured provenance.
+    pub ever_measured: bool,
     /// Live shell label.
     pub label: Option<LabelText>,
     /// Current pool.
@@ -1040,7 +1042,7 @@ impl LibraryFold {
                 }
                 match (old.medium.family, v.medium.family) {
                     (MediumFamily::Lto(old_gen), MediumFamily::Lto(new_gen)) => {
-                        if old_gen != new_gen && old.medium.source == GenerationSource::Measured {
+                        if old_gen != new_gen && old.ever_measured {
                             return Err(FoldError::MediumFamilyChanged);
                         }
                     }
@@ -1514,6 +1516,7 @@ impl LibraryFold {
                         label_generation: 1,
                         media_revision: 1,
                         medium: v.medium.clone(),
+                        ever_measured: v.medium.source == GenerationSource::Measured,
                         label: v.label.clone(),
                         pool: v.pool.clone(),
                         calibration_generation: 0,
@@ -1554,6 +1557,7 @@ impl LibraryFold {
             MediumSpecSet(v) => {
                 let t = self.tapes.get_mut(&v.tape.uuid).unwrap();
                 t.media_revision = v.change.next;
+                t.ever_measured |= v.medium.source == GenerationSource::Measured;
                 t.medium = v.medium.clone();
             }
             FenceRaised(v) => {

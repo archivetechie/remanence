@@ -2236,9 +2236,9 @@ fn medium_fixed_fields_are_immutable() {
     }
 }
 
-/// Correction authority comes from the current spec's source, not the new one.
+/// A first correction depends on committed measurement history, not the incoming source.
 #[test]
-fn lto_generation_correction_uses_current_source() {
+fn lto_generation_correction_uses_committed_measurement() {
     for old_source in [
         GenerationSource::Label,
         GenerationSource::Operator,
@@ -2293,4 +2293,222 @@ fn lto_generation_correction_uses_current_source() {
             f.assert_same_state(&before);
         }
     }
+}
+
+/// The reviewer's two-step re-source attempt cannot erase a committed measurement.
+#[test]
+fn rv_measured_guard_two_step_bypass() {
+    for measured_at_provision in [true, false] {
+        for source in [GenerationSource::Operator, GenerationSource::Label] {
+            let mut f = LibraryFold::default();
+            let mut initial = provision(1, None);
+            if let Body::Reprovision(v) = &mut initial {
+                if !measured_at_provision {
+                    v.medium.source = GenerationSource::Label;
+                }
+            }
+            feed(&mut f, initial, &Present).unwrap();
+            assert_eq!(f.tapes[&tape(1).uuid].ever_measured, measured_at_provision);
+            if !measured_at_provision {
+                feed(&mut f, medium_change(medium_spec(), 1), &Present).unwrap();
+            }
+            let revision = f.tapes[&tape(1).uuid].media_revision;
+            let resourced = MediumSpec {
+                source,
+                ..medium_spec()
+            };
+            feed(&mut f, medium_change(resourced.clone(), revision), &Present).unwrap();
+            assert!(f.tapes[&tape(1).uuid].ever_measured);
+            assert_eq!(f.tapes[&tape(1).uuid].medium, resourced);
+            for incoming in [
+                GenerationSource::Operator,
+                GenerationSource::Label,
+                GenerationSource::Measured,
+            ] {
+                let before = f.clone();
+                assert_eq!(
+                    feed(
+                        &mut f,
+                        medium_change(
+                            MediumSpec {
+                                family: MediumFamily::Lto(LtoGen::Lto8),
+                                source: incoming,
+                                ..resourced.clone()
+                            },
+                            revision + 1
+                        ),
+                        &Present
+                    )
+                    .unwrap_err(),
+                    FoldError::MediumFamilyChanged
+                );
+                f.assert_same_state(&before);
+            }
+            // Re-sourcing and then decreasing capacity remain independent of the guard.
+            let reduced = MediumSpec {
+                usable_logical_bytes: 100,
+                ..resourced
+            };
+            feed(
+                &mut f,
+                medium_change(reduced.clone(), revision + 1),
+                &Present,
+            )
+            .unwrap();
+            assert_eq!(f.tapes[&tape(1).uuid].medium, reduced);
+            assert_eq!(f.tapes[&tape(1).uuid].media_revision, revision + 2);
+            assert!(f.tapes[&tape(1).uuid].ever_measured);
+        }
+    }
+}
+
+/// Repeated Label corrections remain allowed until a measured revision commits.
+#[test]
+fn label_generation_can_be_corrected_twice() {
+    let mut f = LibraryFold::default();
+    let mut initial = provision(1, None);
+    if let Body::Reprovision(v) = &mut initial {
+        v.medium.source = GenerationSource::Label;
+    }
+    feed(&mut f, initial, &Present).unwrap();
+    for (revision, generation) in [(1, LtoGen::Lto8), (2, LtoGen::Lto7)] {
+        let corrected = MediumSpec {
+            family: MediumFamily::Lto(generation),
+            source: GenerationSource::Label,
+            ..medium_spec()
+        };
+        feed(&mut f, medium_change(corrected.clone(), revision), &Present).unwrap();
+        assert_eq!(f.tapes[&tape(1).uuid].medium, corrected);
+        assert_eq!(f.tapes[&tape(1).uuid].media_revision, revision + 1);
+        assert!(!f.tapes[&tape(1).uuid].ever_measured);
+    }
+}
+
+/// A replacement incarnation derives its bit from its own provisioning record.
+#[test]
+fn reprovision_starts_its_own_measurement_history() {
+    for source in [
+        GenerationSource::Label,
+        GenerationSource::Operator,
+        GenerationSource::Measured,
+    ] {
+        let mut f = LibraryFold::default();
+        feed(&mut f, provision(1, None), &Present).unwrap();
+        feed(
+            &mut f,
+            Body::Retire(Retire {
+                tape: tape(1),
+                reason: RetireReason::OperatorRequested,
+                observed_tape_sequence: None,
+                assignment_generation: 1,
+                detail: None,
+            }),
+            &Present,
+        )
+        .unwrap();
+        let mut replacement = provision(2, None);
+        if let Body::Reprovision(v) = &mut replacement {
+            v.predecessor = Some(tape(1));
+            v.medium.source = source;
+        }
+        feed(&mut f, replacement, &Present).unwrap();
+        assert!(f.tapes[&tape(1).uuid].ever_measured);
+        assert_eq!(
+            f.tapes[&tape(2).uuid].ever_measured,
+            source == GenerationSource::Measured
+        );
+        let mut correction = medium_change(
+            MediumSpec {
+                family: MediumFamily::Lto(LtoGen::Lto8),
+                source: GenerationSource::Operator,
+                ..medium_spec()
+            },
+            1,
+        );
+        if let Body::MediumSpecSet(v) = &mut correction {
+            v.tape = tape(2);
+        }
+        let before = f.clone();
+        let result = feed(&mut f, correction, &Present);
+        if source == GenerationSource::Measured {
+            assert_eq!(result.unwrap_err(), FoldError::MediumFamilyChanged);
+            f.assert_same_state(&before);
+        } else {
+            result.unwrap();
+            assert_eq!(f.tapes[&tape(2).uuid].media_revision, 2);
+        }
+    }
+}
+
+/// Queued revisions commit the measured bit in order and refuse the bypass on drain.
+#[test]
+fn queued_measured_two_step_generation_change_is_refused_on_drain() {
+    let mut f = LibraryFold::default();
+    let mut initial = provision(1, None);
+    if let Body::Reprovision(v) = &mut initial {
+        v.medium.source = GenerationSource::Label;
+    }
+    feed(&mut f, initial, &Present).unwrap();
+    let resourced = MediumSpec {
+        source: GenerationSource::Operator,
+        ..medium_spec()
+    };
+    let bodies = [
+        Body::SupersedeTail(SupersedeTail {
+            at: at(1, 9),
+            operation: [7; 16],
+            session_id: [3; 16],
+            preview_digest: [0; 32],
+            tail_file_count: 1,
+        }),
+        medium_change(medium_spec(), 1),
+        medium_change(resourced.clone(), 2),
+        medium_change(
+            MediumSpec {
+                family: MediumFamily::Lto(LtoGen::Lto8),
+                ..resourced.clone()
+            },
+            3,
+        ),
+    ];
+    let mut history = History::default();
+    for (i, body) in bodies.into_iter().enumerate() {
+        let n = i as u64 + 2;
+        let r = record(body, n);
+        if n > 2 {
+            assert_eq!(
+                f.validate(&r, &View::default(), &history).unwrap_err(),
+                FoldError::Unresolved
+            );
+        }
+        // Use byte-decoded replay input, as production drain does.
+        let mut bytes = Vec::new();
+        wire::encode(&r, &mut bytes).unwrap();
+        let decoded = wire::decode(r.body.tag() as u16, &bytes).unwrap();
+        f.receive(n, decoded, receipt(&r, n), &View::default(), &history)
+            .unwrap();
+        history.0.insert(n, r);
+    }
+    assert_eq!(f.pending.len(), 4);
+    assert!(!f.tapes[&tape(1).uuid].ever_measured);
+    assert_eq!(
+        f.resolve(&Present, &history),
+        Err(FoldError::MediumFamilyChanged)
+    );
+    assert_eq!(f.applied_through, 4);
+    assert_eq!(f.received_through, 5);
+    assert_eq!(f.tapes[&tape(1).uuid].medium, resourced);
+    assert_eq!(f.tapes[&tape(1).uuid].media_revision, 3);
+    assert!(f.tapes[&tape(1).uuid].ever_measured);
+    assert_eq!(f.pending.len(), 1);
+    assert_eq!(f.pending[0].sequence, 5);
+    let mut bytes = Vec::new();
+    wire::encode(&history.0[&5], &mut bytes).unwrap();
+    assert_eq!(f.pending_bytes(), bytes.len());
+    let before = f.clone();
+    assert_eq!(
+        f.resolve(&Present, &history),
+        Err(FoldError::MediumFamilyChanged)
+    );
+    f.assert_same_state(&before);
 }

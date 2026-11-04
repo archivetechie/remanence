@@ -227,6 +227,23 @@ Authoritative prefix end: 1506 bytes; tail Complete.
 | 3 | RecoveryRecorded | 00000000000000000001-2026-11-03.remlib | 554 | 858 | `87360a836bd438af24383cb23cdd891c5a23302db2f193067d0e54c6dc8ad13e` |
 | 4 | RecoveryRecorded | 00000000000000000001-2026-11-03.remlib | 858 | 1182 | `b06d8651922de8007371c207a4706756719d5f335409e195b00761290762f8f3` |
 | 5 | RecoveryRecorded | 00000000000000000001-2026-11-03.remlib | 1182 | 1506 | `ba29db673d677d44afe53f0da715b9816a01db6d5988cea90c78d625e74143f8` |
+## medium-label-generation-correction
+
+Tail: `Some(Complete)`. Authoritative sequence 3; applied 3; pending 0; tapes 1; fences 0; duplicates 0.
+
+`00000000000000000001-2026-11-03.remlib`: 766 bytes, SHA-256 `affaaa0a1912ac81788cf23cb989afb767a9e37d954bb7d802cf7fdad3def560`.
+
+Raw header (unvalidated): magic `52454d4c49420001`, version 1, log UUID `b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1`, first sequence 1, previous hash `0000000000000000000000000000000000000000000000000000000000000000`, date `2026-11-03`, stored CRC `678a79f09c0bd1e9`, computed CRC `678a79f09c0bd1e9`.
+
+Header: `Header { log_uuid: [177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177], first_sequence: 1, previous_segment_hash: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], date: [50, 48, 50, 54, 45, 49, 49, 45, 48, 51] }`.
+
+Authoritative prefix end: 766 bytes; tail Complete.
+
+| Sequence | Tag | Segment | Offset | End | Record hash |
+|---:|---|---|---:|---:|---|
+| 1 | Reprovision | 00000000000000000001-2026-11-03.remlib | 84 | 318 | `02a94ff849e7f500fbcd102be2c1504b483257a14cb2f1ce627b7dbe9120e533` |
+| 2 | MediumSpecSet | 00000000000000000001-2026-11-03.remlib | 318 | 542 | `6b7a3b8fc65f5349f130238fb3d51e821dc527921b9c9bd5513a990c9ce147a4` |
+| 3 | MediumSpecSet | 00000000000000000001-2026-11-03.remlib | 542 | 766 | `5cb1f456c0671d8b93e372e843463feaad9cff992059b41ada4a6a0911781758` |
 ## pending-cross-log
 
 Tail: `Some(Complete)`. Authoritative sequence 15; applied 10; pending 3; tapes 2; fences 1; duplicates 0.
@@ -746,6 +763,41 @@ Authoritative prefix end: 554 bytes; tail Complete.
 | 1 | Reprovision | 00000000000000000001-2026-11-03.remlib | 84 | 319 | `11f1bc3f654ddbffea9c861c08d00fda3b3b70f3146434f78b1e0a3914c5352b` |
 | 2 | Reprovision | 00000000000000000001-2026-11-03.remlib | 319 | 554 | `dec958f138a9d0238b6c0555c63f7fd6b7de0a5d93101ab5a5055850f99104d3` |
 | 3 | MediumSpecSet | 00000000000000000001-2026-11-03.remlib | 554 | 770 | `46d276cbbc05b88b667560daf41f2b451dcb917494da58771f5aba2d1e239ba0` |
+## rejected/medium-measured-generation-change
+
+Tail: `00000000000000000001-2026-11-03.remlib@554:Some(3):MediumFamilyChanged`. Authoritative sequence 2; applied 2; pending 0; tapes 2; fences 0; duplicates 0.
+
+`00000000000000000001-2026-11-03.remlib`: 770 bytes, SHA-256 `b4b91bf087f23d16e63ad8cac97425cea434bf9238d0a78bfa749b9db9e6e947`.
+
+Raw header (unvalidated): magic `52454d4c49420001`, version 1, log UUID `b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1`, first sequence 1, previous hash `0000000000000000000000000000000000000000000000000000000000000000`, date `2026-11-03`, stored CRC `678a79f09c0bd1e9`, computed CRC `678a79f09c0bd1e9`.
+
+Header: `Header { log_uuid: [177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177], first_sequence: 1, previous_segment_hash: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], date: [50, 48, 50, 54, 45, 49, 49, 45, 48, 51] }`.
+
+Authoritative prefix end: 554 bytes; tail Complete.
+
+| Sequence | Tag | Segment | Offset | End | Record hash |
+|---:|---|---|---:|---:|---|
+| 1 | Reprovision | 00000000000000000001-2026-11-03.remlib | 84 | 319 | `11f1bc3f654ddbffea9c861c08d00fda3b3b70f3146434f78b1e0a3914c5352b` |
+| 2 | Reprovision | 00000000000000000001-2026-11-03.remlib | 319 | 554 | `dec958f138a9d0238b6c0555c63f7fd6b7de0a5d93101ab5a5055850f99104d3` |
+| 3 | MediumSpecSet | 00000000000000000001-2026-11-03.remlib | 554 | 770 | `40812ee45ace4d7e9ae436c1f0dde9f90cc1ef3f658fe0eda46c69a2cb8ac773` |
+## rejected/medium-measured-two-step-generation-change
+
+Tail: `00000000000000000001-2026-11-03.remlib@778:Some(4):MediumFamilyChanged`. Authoritative sequence 3; applied 3; pending 0; tapes 2; fences 0; duplicates 0.
+
+`00000000000000000001-2026-11-03.remlib`: 994 bytes, SHA-256 `c5946aec90a9210fe51565f99954e26556de959124cb6782ae47909438140a06`.
+
+Raw header (unvalidated): magic `52454d4c49420001`, version 1, log UUID `b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1`, first sequence 1, previous hash `0000000000000000000000000000000000000000000000000000000000000000`, date `2026-11-03`, stored CRC `678a79f09c0bd1e9`, computed CRC `678a79f09c0bd1e9`.
+
+Header: `Header { log_uuid: [177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177, 177], first_sequence: 1, previous_segment_hash: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], date: [50, 48, 50, 54, 45, 49, 49, 45, 48, 51] }`.
+
+Authoritative prefix end: 778 bytes; tail Complete.
+
+| Sequence | Tag | Segment | Offset | End | Record hash |
+|---:|---|---|---:|---:|---|
+| 1 | Reprovision | 00000000000000000001-2026-11-03.remlib | 84 | 319 | `11f1bc3f654ddbffea9c861c08d00fda3b3b70f3146434f78b1e0a3914c5352b` |
+| 2 | Reprovision | 00000000000000000001-2026-11-03.remlib | 319 | 554 | `dec958f138a9d0238b6c0555c63f7fd6b7de0a5d93101ab5a5055850f99104d3` |
+| 3 | MediumSpecSet | 00000000000000000001-2026-11-03.remlib | 554 | 778 | `55aaa8cf9651af59742b303fb7f5e3e744864cb68b70d7d9d142d613a67a171b` |
+| 4 | MediumSpecSet | 00000000000000000001-2026-11-03.remlib | 778 | 994 | `a989c9f156f0a04fd23feb0aac390284d1d9a6bb63e81d023cc539a129e42c09` |
 ## rejected/medium-record-size-change
 
 Tail: `00000000000000000001-2026-11-03.remlib@554:Some(3):ImmutableMediumField { field: record_size }`. Authoritative sequence 2; applied 2; pending 0; tapes 2; fences 0; duplicates 0.

@@ -82,6 +82,7 @@ def medium(value):
 def main(root):
     seen = set()
     count = 0
+    medium_cases = {}
     # FRAMES contains frames successfully decoded by the production reader;
     # offsets let this independent decoder inspect exactly the same raw bytes.
     for line in (root / "FRAMES.tsv").read_text().splitlines()[1:]:
@@ -105,6 +106,7 @@ def main(root):
             keys(body, 10)
             seen.add(("family", medium(body[6])))
             count += 1
+            medium_cases[case] = medium_cases.get(case, 0) + 1
         elif code == 5:
             if tag != "MediumSpecSet":
                 raise ValueError("MediumSpecSet tag mismatch")
@@ -113,6 +115,7 @@ def main(root):
             keys(body[2], 2)
             seen.add(("tag", 5))
             count += 1
+            medium_cases[case] = medium_cases.get(case, 0) + 1
         elif code == 8:
             keys(body, 6)
             scope = body[1]
@@ -135,7 +138,15 @@ def main(root):
                 ("reserved", "model"), ("reserved", "quarantine")}
     if not required <= seen:
         raise ValueError(f"missing corpus coverage: {required - seen}")
-    print(f"independent decoder: {count} medium records; both families and reserved fence codes")
+    # These complete histories pin the measured-generation ruling before corpus freeze.
+    for case, expected in {
+        "medium-label-generation-correction": 3,
+        "rejected/medium-measured-generation-change": 3,
+        "rejected/medium-measured-two-step-generation-change": 4,
+    }.items():
+        if medium_cases.get(case) != expected:
+            raise ValueError(f"missing medium history frames: {case}")
+    print(f"independent decoder: {count} medium records; both families and reserved fence codes; all three generation histories")
 
 
 if __name__ == "__main__":

@@ -153,7 +153,8 @@ pub enum MediumFamily {
 }
 /// Medium spec recorded at provisioning and revised under media_revision.
 /// Geometry and capabilities are fixed per incarnation. Capacity and source are revisable;
-/// an LTO generation correction additionally requires the current source to be unmeasured.
+/// an LTO generation correction additionally requires that no committed spec in this
+/// incarnation has had measured provenance.
 /// Rerecord implies regenerative use; role is never stored separately.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MediumSpec {
